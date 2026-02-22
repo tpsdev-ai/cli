@@ -61,5 +61,8 @@
     "personas",
     "reports"
   ],
-  "author": "tpsdev-ai"
+  "author": "tpsdev-ai",
+  "publishConfig": {
+    "access": "public"
+  }
 }
