@@ -1,0 +1,35 @@
+services:
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: bun test
+    environment:
+      - HOME=/home/tps
+      - TPS_TEST_MODE=docker
+    tmpfs:
+      - /tmp:exec,size=64M
+
+  integration:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: bun test test/integration.test.ts
+    environment:
+      - HOME=/home/tps
+      - TPS_TEST_MODE=docker
+    tmpfs:
+      - /tmp:exec,size=64M
+
+  office:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: /bin/sh
+    stdin_open: true
+    tty: true
+    environment:
+      - HOME=/home/tps
+      - TPS_TEST_MODE=sandbox
+    tmpfs:
+      - /tmp:exec,size=64M

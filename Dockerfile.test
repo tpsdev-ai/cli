@@ -1,0 +1,29 @@
+FROM oven/bun:1-slim
+
+WORKDIR /app
+
+# Create fake home directory with OpenClaw structure
+RUN mkdir -p /home/tps/.openclaw/workspace-test \
+    && mkdir -p /home/tps/.openclaw/agents
+
+ENV HOME=/home/tps
+
+# Mock openclaw binary — returns canned JSON for common commands
+RUN printf '#!/bin/sh\n\
+case "$1" in\n\
+  status) echo '"'"'{"status":"running","version":"0.1.0"}'"'"';;\n\
+  "config") echo '"'"'{"agents":{"list":[]}}'"'"';;\n\
+  *) echo "mock openclaw: $@";;\n\
+esac\n' > /usr/local/bin/openclaw \
+    && chmod +x /usr/local/bin/openclaw
+
+# Copy project files
+COPY package.json bun.lock* ./
+RUN bun install --frozen-lockfile 2>/dev/null || bun install
+
+COPY . .
+
+# Build TypeScript
+RUN bun run build
+
+CMD ["bun", "test"]

@@ -1,0 +1,16 @@
+[meta]
+name = "tps-roster"
+version = "1.0.0"
+description = "tps roster — read-only org chart. Single file, no writes, no network."
+
+[workdir]
+access = "none"
+
+[filesystem]
+# read_file = single file access (non-recursive) — more precise than read = [dir]
+read_file = [
+  "$HOME/.openclaw/openclaw.json"
+]
+
+[network]
+block = true

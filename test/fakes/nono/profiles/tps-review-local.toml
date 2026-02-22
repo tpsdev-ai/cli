@@ -1,0 +1,21 @@
+[meta]
+name = "tps-review-local"
+version = "1.0.0"
+description = "tps review (default) — reads named agent workspace, no LLM, no network."
+
+# workdir = the specific named agent workspace (set via --workdir by tps CLI)
+# This naturally enforces S3.2: sibling workspaces are inaccessible because
+# only $WORKDIR is in the read allowlist.
+[workdir]
+access = "none"
+
+[filesystem]
+read_file = [
+  "$HOME/.openclaw/openclaw.json"  # Agent metadata lookup
+]
+read = [
+  "$WORKDIR"  # Named agent workspace only. No siblings.
+]
+
+[network]
+block = true

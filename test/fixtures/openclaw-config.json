@@ -1,0 +1,25 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/tmp/tps-test-default-workspace"
+    },
+    "list": [
+      {
+        "id": "flint",
+        "name": "Flint",
+        "model": { "primary": "anthropic/claude-opus-4-6" },
+        "workspace": "/tmp/tps-test-flint-workspace"
+      },
+      {
+        "id": "anvil",
+        "name": "Anvil",
+        "model": "anthropic/claude-opus-4-6",
+        "workspace": "/tmp/tps-test-anvil-workspace"
+      },
+      {
+        "id": "no-workspace",
+        "name": "NoWorkspace"
+      }
+    ]
+  }
+}
