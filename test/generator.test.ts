@@ -105,7 +105,7 @@ describe("writeWorkspace", () => {
     const generated = generateWorkspace(report, { workspace: tmpDir });
     const written = writeWorkspace(generated);
 
-    expect(written.length).toBe(8); // now includes package.json + lockfile
+    expect(written.length).toBe(9); // now includes package.json + lockfile + OPERATIONS.md
     for (const name of written) {
       const filePath = join(tmpDir, name);
       expect(existsSync(filePath)).toBe(true);
