@@ -60,7 +60,7 @@ describe("roster command", () => {
   });
 
   function run(args: string[]) {
-    return spawnSync("node", [TPS_BIN, ...args], {
+    return spawnSync("bun", [TPS_BIN, ...args], {
       encoding: "utf-8",
       cwd: tempDir,
       env: { ...process.env },

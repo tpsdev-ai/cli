@@ -34,6 +34,7 @@ describe("deliverToRemoteBranch", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-mail-remote-"));
     process.env.HOME = root;
+    process.env.TPS_VAULT_KEY = "test-passphrase";
     process.env.TPS_IDENTITY_DIR = join(root, ".tps", "identity");
     process.env.TPS_REGISTRY_DIR = join(root, ".tps", "registry");
     mkdirSync(process.env.TPS_IDENTITY_DIR, { recursive: true });
@@ -43,6 +44,7 @@ describe("deliverToRemoteBranch", () => {
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
     delete process.env.HOME;
+    delete process.env.TPS_VAULT_KEY;
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;
   });

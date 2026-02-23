@@ -11,10 +11,12 @@ describe("soundstage", () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), "tps-soundstage-"));
     process.env.HOME = tempDir;
+    process.env.TPS_VAULT_KEY = "test-passphrase";
   });
 
   afterEach(() => {
     if (originalHome) process.env.HOME = originalHome;
+    delete process.env.TPS_VAULT_KEY;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

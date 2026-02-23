@@ -54,7 +54,7 @@ function runTps(
   env: Record<string, string | undefined> = {},
   cwd?: string
 ) {
-  return spawnSync("node", [TPS_BIN, ...args], {
+  return spawnSync("bun", [TPS_BIN, ...args], {
     encoding: "utf-8",
     cwd: cwd ?? tmpDir,
     env: {

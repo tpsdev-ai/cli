@@ -11,7 +11,7 @@ describe("branch start self-daemonization", () => {
     const home = mkdtempSync(join(tmpdir(), "tps-branch-daemon-"));
 
     const start = Date.now();
-    const r = spawnSync("node", [TPS_BIN, "branch", "start"], {
+    const r = spawnSync("bun", [TPS_BIN, "branch", "start"], {
       encoding: "utf-8",
       env: { ...process.env, HOME: home, NODE_ENV: "production" },
       timeout: 3000,

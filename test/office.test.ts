@@ -34,7 +34,7 @@ describe("office command", () => {
   });
 
   function run(args: string[], env: Record<string, string> = {}) {
-    return spawnSync("node", [TPS_BIN, ...args], {
+    return spawnSync("bun", [TPS_BIN, ...args], {
       encoding: "utf-8",
       cwd: tempRoot,
       env: {
