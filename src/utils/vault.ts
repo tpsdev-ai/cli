@@ -1,6 +1,7 @@
 import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
 import { hashRaw, Algorithm } from "@node-rs/argon2";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export interface VaultData {
   salt: string;
@@ -61,6 +62,7 @@ export async function decryptVault(vault: VaultData, passphrase: string): Promis
 }
 
 export function saveVault(path: string, vault: VaultData): void {
+  mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(vault, null, 2), "utf-8");
 }
 
