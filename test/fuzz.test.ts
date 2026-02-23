@@ -59,9 +59,9 @@ describe("Fuzz Testing (Property-Based)", () => {
         const buf = Buffer.from(inputArray);
         try {
           // This should either parse valid frames, return empty/partial, or throw cleanly
-          const { messages } = extractWireFrames(buf);
-          for (const msg of messages) {
-            decodeWireMessage(msg);
+          extractWireFrames(buf);
+          if (buf.length >= 6) {
+            decodeWireMessage(buf);
           }
         } catch (e) {
           expect(e).toBeInstanceOf(Error);
