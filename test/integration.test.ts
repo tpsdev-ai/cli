@@ -62,7 +62,7 @@ describe("integration: hire → roster → review lifecycle", () => {
 
     // Write workspace files
     const written = writeWorkspace(generated);
-    expect(written.length).toBe(8); // + package.json + lockfile
+    expect(written.length).toBe(9); // + package.json + lockfile + OPERATIONS.md
     expect(existsSync(join(workspacePath, "SOUL.md"))).toBe(true);
     expect(existsSync(join(workspacePath, "IDENTITY.md"))).toBe(true);
     expect(existsSync(join(workspacePath, "AGENTS.md"))).toBe(true);
@@ -148,7 +148,7 @@ describe("integration: hire → roster → review lifecycle", () => {
 
     // Don't call writeWorkspace — simulating --dry-run
     expect(generated.files).toBeDefined();
-    expect(Object.keys(generated.files).length).toBe(8);
+    expect(Object.keys(generated.files).length).toBe(9);
     expect(generated.config.id).toBe("testy");
 
     // Workspace should NOT exist
