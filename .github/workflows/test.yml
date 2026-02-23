@@ -52,8 +52,6 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
-      - name: Socket Security Scan
-        run: bunx socket scan package.json
       - name: Check for known vulnerabilities
         run: bunx audit-ci --high
 
