@@ -21,6 +21,8 @@ describe("tps git worktree", () => {
     repoPath = join(tempDir, "dummy-repo");
     mkdirSync(repoPath, { recursive: true });
     spawnSync("git", ["init"], { cwd: repoPath });
+    spawnSync("git", ["config", "user.email", "test@example.com"], { cwd: repoPath });
+    spawnSync("git", ["config", "user.name", "Test User"], { cwd: repoPath });
     writeFileSync(join(repoPath, "README.md"), "# Dummy Repo");
     spawnSync("git", ["add", "README.md"], { cwd: repoPath });
     spawnSync("git", ["commit", "-m", "initial commit"], { cwd: repoPath });
@@ -32,7 +34,7 @@ describe("tps git worktree", () => {
   });
 
   test("creates a worktree in the agent workspace", () => {
-    const result = spawnSync("node", [TPS_BIN, "git", "worktree", "testbot", repoPath], {
+    const result = spawnSync("bun", [TPS_BIN, "git", "worktree", "testbot", repoPath], {
       encoding: "utf8",
       env: { ...process.env }
     });
@@ -55,7 +57,7 @@ describe("tps git worktree", () => {
     const notARepo = join(tempDir, "not-a-repo");
     mkdirSync(notARepo, { recursive: true });
 
-    const result = spawnSync("node", [TPS_BIN, "git", "worktree", "testbot", notARepo], {
+    const result = spawnSync("bun", [TPS_BIN, "git", "worktree", "testbot", notARepo], {
       encoding: "utf8",
       env: { ...process.env }
     });
