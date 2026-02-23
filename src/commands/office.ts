@@ -98,6 +98,32 @@ function resolveSandboxId(agentId: string): string | null {
   }
 }
 
+export function parseJoinToken(tokenUrl: string): any {
+  const url = new URL(tokenUrl);
+  if (url.protocol !== "tps:" || url.host !== "join") {
+    throw new Error("Invalid join token protocol. Must be tps://join?...");
+  }
+
+  const host = url.searchParams.get("host");
+  const port = Number(url.searchParams.get("port"));
+  const pubkey = url.searchParams.get("pubkey");
+  const sigpubkey = url.searchParams.get("sigpubkey");
+  const fp = url.searchParams.get("fp");
+
+  if (!host || isNaN(port) || !pubkey || !sigpubkey || !fp) {
+    throw new Error("Invalid join token: missing required parameters");
+  }
+
+  return {
+    host,
+    port,
+    transport: (url.searchParams.get("transport") as "ws" | "tcp") || "ws",
+    encryptionPubkey: new Uint8Array(Buffer.from(pubkey, "base64url")),
+    signingPubkey: new Uint8Array(Buffer.from(sigpubkey, "base64url")),
+    fingerprint: fp,
+  };
+}
+
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
@@ -272,20 +298,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         process.exit(1);
       }
       const agent = validateAgent(args.agent);
-      const tokenUrl = args.joinToken;
-      const url = new URL(tokenUrl);
-      if (url.protocol !== "tps:" || url.host !== "join") {
-        throw new Error("Invalid join token protocol. Must be tps://join?...");
-      }
-
-      const token = {
-        host: url.searchParams.get("host")!,
-        port: Number(url.searchParams.get("port")),
-        transport: (url.searchParams.get("transport") as "ws" | "tcp") || "ws",
-        encryptionPubkey: new Uint8Array(Buffer.from(url.searchParams.get("pubkey")!, "base64url")),
-        signingPubkey: new Uint8Array(Buffer.from(url.searchParams.get("sigpubkey")!, "base64url")),
-        fingerprint: url.searchParams.get("fp")!,
-      };
+      
+      const token = parseJoinToken(args.joinToken);
 
       registerBranch(
         agent,

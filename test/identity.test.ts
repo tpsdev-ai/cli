@@ -25,12 +25,14 @@ let tempDir: string;
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "tps-identity-test-"));
+  process.env.TPS_VAULT_KEY = "test-passphrase";
   process.env.TPS_IDENTITY_DIR = join(tempDir, "identity");
   process.env.TPS_REGISTRY_DIR = join(tempDir, "registry");
 });
 
 afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });
+  delete process.env.TPS_VAULT_KEY;
   delete process.env.TPS_IDENTITY_DIR;
   delete process.env.TPS_REGISTRY_DIR;
 });
@@ -298,10 +300,10 @@ describe("CLI integration", () => {
   test("identity init shows signing and encryption keys via CLI", () => {
     const { execSync } = require("node:child_process");
     const result = execSync(
-      `node dist/bin/tps.js identity init --json --nonono`,
+      `bun dist/bin/tps.js identity init --json --nonono`,
       {
         encoding: "utf-8",
-        env: { ...process.env, TPS_IDENTITY_DIR: join(tempDir, "cli-identity"), TPS_REGISTRY_DIR: join(tempDir, "cli-registry") },
+        env: { ...process.env, TPS_VAULT_KEY: "test-passphrase", TPS_IDENTITY_DIR: join(tempDir, "cli-identity"), TPS_REGISTRY_DIR: join(tempDir, "cli-registry") },
       }
     );
     const parsed = JSON.parse(result);
@@ -326,7 +328,7 @@ describe("CLI integration", () => {
 
     // Host registers branch's PUBLIC keys (never sees private keys)
     const regResult = execSync(
-      `node dist/bin/tps.js identity register test-branch --pubkey ${sigHex} --enc-pubkey ${encHex} --json --expires-in 90d --nonono`,
+      `bun dist/bin/tps.js identity register test-branch --pubkey ${sigHex} --enc-pubkey ${encHex} --json --expires-in 90d --nonono`,
       { encoding: "utf-8", env }
     );
     const reg = JSON.parse(regResult);
@@ -336,7 +338,7 @@ describe("CLI integration", () => {
 
     // List
     const listResult = execSync(
-      `node dist/bin/tps.js identity list --json --nonono`,
+      `bun dist/bin/tps.js identity list --json --nonono`,
       { encoding: "utf-8", env }
     );
     const list = JSON.parse(listResult);
@@ -345,7 +347,7 @@ describe("CLI integration", () => {
 
     // Verify
     const verifyResult = execSync(
-      `node dist/bin/tps.js identity verify test-branch --json --nonono`,
+      `bun dist/bin/tps.js identity verify test-branch --json --nonono`,
       { encoding: "utf-8", env }
     );
     const ver = JSON.parse(verifyResult);
@@ -353,14 +355,14 @@ describe("CLI integration", () => {
 
     // Revoke
     execSync(
-      `node dist/bin/tps.js identity revoke test-branch --reason "test revocation" --nonono`,
+      `bun dist/bin/tps.js identity revoke test-branch --reason "test revocation" --nonono`,
       { env }
     );
 
     // Verify after revoke should fail
     try {
       execSync(
-        `node dist/bin/tps.js identity verify test-branch --json --nonono`,
+        `bun dist/bin/tps.js identity verify test-branch --json --nonono`,
         { encoding: "utf-8", env }
       );
       expect(true).toBe(false);
