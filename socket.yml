@@ -1,0 +1,14 @@
+version: 2
+projectIgnorePaths:
+  - "node_modules"
+  - "test"
+  - "docs"
+issueRules:
+  supplyChainRisk:
+    deferTo: error
+  vulnerabilities:
+    deferTo: error
+  quality:
+    deferTo: warn
+  anomalies:
+    deferTo: error
