@@ -41,7 +41,12 @@ function vaultPath(): string {
 }
 
 function getVaultPassphrase(): string {
-  return process.env.TPS_VAULT_KEY || "default-passphrase";
+  const key = process.env.TPS_VAULT_KEY;
+  if (!key) {
+    console.error("❌ TPS_VAULT_KEY environment variable is required to unlock the identity vault.");
+    process.exit(1);
+  }
+  return key;
 }
 
 export async function saveToVault(data: TpsVault): Promise<void> {
