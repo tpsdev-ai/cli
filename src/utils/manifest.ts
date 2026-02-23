@@ -65,7 +65,8 @@ export function loadManifest(tpsYamlPath: string): AgentManifest | null {
 
       if (mh.exec) {
         const resolvedExec = resolve(agentDir, mh.exec);
-        if (!resolvedExec.startsWith(agentDir)) {
+        const { sep } = require("node:path");
+        if (!resolvedExec.startsWith(agentDir + sep) && resolvedExec !== agentDir) {
           return null; // Boundary check from S15
         }
         mail_handler.exec = resolvedExec;

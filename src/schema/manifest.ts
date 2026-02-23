@@ -1,8 +1,17 @@
 import { z } from "zod";
 
+const RegexStringSchema = z.string().refine((val) => {
+  try {
+    new RegExp(val);
+    return true;
+  } catch {
+    return false;
+  }
+}, { message: "Invalid regular expression" });
+
 export const MailHandlerMatchSchema = z.object({
   from: z.array(z.string()).optional(),
-  bodyPattern: z.string().optional(),
+  bodyPattern: RegexStringSchema.optional(),
 }).strict();
 
 export const MailHandlerCapabilitySchema = z.object({
@@ -15,7 +24,7 @@ export const MailHandlerCapabilitySchema = z.object({
 }).strict();
 
 export const RoutingRuleSchema = z.object({
-  pattern: z.string(),
+  pattern: RegexStringSchema,
   to: z.string(),
 }).strict();
 
