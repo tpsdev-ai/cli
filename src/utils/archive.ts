@@ -1,12 +1,8 @@
-/**
- * Communication archive — append-only JSONL log of all mail events.
- * 
- * Every send, read, and list operation appends one line to archive.jsonl.
- * This creates a searchable, complete audit trail of agent communication.
- */
-import { appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { mkdirSync } from "node:fs";
+// @ts-ignore
+import { Database } from "bun:sqlite";
 
 export interface ArchiveEvent {
   event: "sent" | "read" | "listed";
@@ -14,7 +10,8 @@ export interface ArchiveEvent {
   from: string;
   to: string;
   messageId: string;
-  bodyPreview?: string;
+  body?: string;
+  bodyPreview?: string; // For backward compatibility with some list views
 }
 
 export interface ArchiveQuery {
@@ -22,82 +19,115 @@ export interface ArchiveQuery {
   since?: string;
   until?: string;
   event?: "sent" | "read" | "listed";
+  search?: string;
   limit?: number;
 }
 
-function getArchivePath(): string {
+function getDb(): Database {
   const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
   mkdirSync(dir, { recursive: true });
-  return join(dir, "archive.jsonl");
+  const dbPath = join(dir, "archive.db");
+  const db = new Database(dbPath, { create: true });
+  
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS archive (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event TEXT,
+      timestamp TEXT,
+      sender TEXT,
+      recipient TEXT,
+      messageId TEXT,
+      body TEXT
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(body, content='archive', content_rowid='id');
+    
+    -- Drop triggers if they exist to avoid errors on multiple calls
+    DROP TRIGGER IF EXISTS archive_ai;
+    DROP TRIGGER IF EXISTS archive_ad;
+    DROP TRIGGER IF EXISTS archive_au;
+
+    CREATE TRIGGER archive_ai AFTER INSERT ON archive BEGIN
+      INSERT INTO archive_fts(rowid, body) VALUES (new.id, new.body);
+    END;
+    CREATE TRIGGER archive_ad AFTER DELETE ON archive BEGIN
+      INSERT INTO archive_fts(archive_fts, rowid, body) VALUES('delete', old.id, old.body);
+    END;
+    CREATE TRIGGER archive_au AFTER UPDATE ON archive BEGIN
+      INSERT INTO archive_fts(archive_fts, rowid, body) VALUES('delete', old.id, old.body);
+      INSERT INTO archive_fts(rowid, body) VALUES (new.id, new.body);
+    END;
+  `);
+  
+  return db;
 }
 
-function makePreview(body: string, maxLen = 100): string {
-  const firstLine = body.split("\n")[0] || "";
-  return firstLine.length > maxLen ? firstLine.slice(0, maxLen) + "…" : firstLine;
-}
-
-/**
- * Append an event to the archive. Fire-and-forget — archive failures
- * never block mail operations.
- */
 export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string): void {
+  let db: Database | null = null;
   try {
-    const entry: ArchiveEvent = {
-      ...event,
-      timestamp: new Date().toISOString(),
-    };
-    if (body) {
-      entry.bodyPreview = makePreview(body);
-    }
-    const line = JSON.stringify(entry) + "\n";
-    appendFileSync(getArchivePath(), line, "utf-8");
-  } catch {
-    // Archive is best-effort. Never break mail for logging.
+    db = getDb();
+    const stmt = db.prepare(`
+      INSERT INTO archive (event, timestamp, sender, recipient, messageId, body)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(event.event, new Date().toISOString(), event.from, event.to, event.messageId, body || null);
+  } catch (err) {
+    // Best-effort audit logging.
+  } finally {
+    try { db?.close(); } catch {}
   }
 }
 
-/**
- * Query the archive with optional filters.
- * Reads the full file and filters in memory — fine for reasonable volumes.
- * For massive archives, we'd add rotation or indexing later.
- */
 export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
-  const archivePath = getArchivePath();
-  if (!existsSync(archivePath)) return [];
+  let db: Database | null = null;
+  try {
+    db = getDb();
+    let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.body FROM archive";
+    const conditions: string[] = [];
+    const params: any[] = [];
 
-  const raw = readFileSync(archivePath, "utf-8");
-  const lines = raw.trim().split("\n").filter(Boolean);
-
-  let events: ArchiveEvent[] = [];
-  for (const line of lines) {
-    try {
-      events.push(JSON.parse(line) as ArchiveEvent);
-    } catch {
-      // Skip malformed lines
+    if (query.search) {
+      sql += " JOIN archive_fts ON archive.id = archive_fts.rowid";
+      conditions.push("archive_fts MATCH ?");
+      params.push(query.search);
     }
-  }
+    if (query.agent) {
+      conditions.push("(archive.sender = ? OR archive.recipient = ?)");
+      params.push(query.agent, query.agent);
+    }
+    if (query.event) {
+      conditions.push("archive.event = ?");
+      params.push(query.event);
+    }
+    if (query.since) {
+      conditions.push("archive.timestamp >= ?");
+      params.push(query.since);
+    }
+    if (query.until) {
+      conditions.push("archive.timestamp <= ?");
+      params.push(query.until);
+    }
 
-  // Apply filters
-  if (query.agent) {
-    const a = query.agent;
-    events = events.filter((e) => e.from === a || e.to === a);
-  }
-  if (query.event) {
-    events = events.filter((e) => e.event === query.event);
-  }
-  if (query.since) {
-    events = events.filter((e) => e.timestamp >= query.since!);
-  }
-  if (query.until) {
-    events = events.filter((e) => e.timestamp <= query.until!);
-  }
+    if (conditions.length > 0) {
+      sql += " WHERE " + conditions.join(" AND ");
+    }
+    sql += " ORDER BY archive.timestamp DESC";
 
-  // Sort newest first
-  events.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+    if (query.limit && query.limit > 0) {
+      sql += " LIMIT ?";
+      params.push(query.limit);
+    }
 
-  if (query.limit && query.limit > 0) {
-    events = events.slice(0, query.limit);
+    const stmt = db.prepare(sql);
+    const results = stmt.all(...params) as any[];
+    
+    return results.map(r => ({
+      ...r,
+      bodyPreview: r.body ? r.body.slice(0, 50) : undefined
+    })) as ArchiveEvent[];
+  } catch (err) {
+    console.error("queryArchive error:", err);
+    return [];
+  } finally {
+    try { db?.close(); } catch {}
   }
-
-  return events;
 }

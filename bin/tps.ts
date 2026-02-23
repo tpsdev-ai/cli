@@ -10,9 +10,9 @@ const cli = meow(
     hire <report>     Onboard a new agent from a .tps report or persona
     roster <action>   Agent directory (list/show/find)
     review <name>     Performance review for a specific agent
-    office <action>   Branch office sandbox lifecycle (start/stop/list/status)
+    office <action>   Branch office sandbox lifecycle (start/stop/list/status/kill)
     context <action>  Workstream context memory (read/update/list)
-    mail <action>     Mailroom operations (send/check/list)
+    mail <action>     Mailroom operations (send/check/list/search)
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
     branch <action>   Branch office node (init/start/stop/status/log)
@@ -160,13 +160,13 @@ async function main() {
       break;
     }
     case "office": {
-      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | undefined;
-      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect"];
+      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | undefined;
+      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill"];
       // Backward compatibility: `tps office <agent>` maps to `start <agent>`.
       const isLegacy = action && !validActions.includes(action);
       if ((!action && !isLegacy) || (!isLegacy && !validActions.includes(action!))) {
         console.error(
-          "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>"
+          "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office kill"
         );
         process.exit(1);
       }
@@ -220,10 +220,10 @@ async function main() {
       break;
     }
     case "mail": {
-      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | undefined;
-      if (cli.flags.help || !action || !["send", "check", "list", "log", "read", "watch"].includes(action)) {
+      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | undefined;
+      if (cli.flags.help || !action || !["send", "check", "list", "log", "read", "watch", "search"].includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }

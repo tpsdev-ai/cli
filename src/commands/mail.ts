@@ -9,7 +9,7 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 
 interface MailArgs {
-  action: "send" | "check" | "list" | "log" | "read" | "watch";
+  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search";
   agent?: string;
   message?: string;
   messageId?: string;
@@ -229,6 +229,31 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
       }
       return;
+    }
+
+    case "search": {
+      if (!args.agent) {
+        console.error("Usage: tps mail search <query>");
+        process.exit(1);
+      }
+      const { queryArchive } = await import("../utils/archive.js");
+      const results = queryArchive({ search: args.agent, limit: 50 });
+      if (args.json) {
+        console.log(JSON.stringify(results, null, 2));
+      } else {
+        if (results.length === 0) {
+          console.log("No results found.");
+        } else {
+          for (const r of results) {
+            console.log(`[${r.timestamp}] ${r.event}: ${r.from} -> ${r.to}`);
+            if (r.body) {
+              console.log(r.body.slice(0, 100) + (r.body.length > 100 ? "..." : ""));
+            }
+            console.log("---");
+          }
+        }
+      }
+      break;
     }
   }
 }
