@@ -53,7 +53,9 @@ export function sanitizeFreeText(value: string): string {
     .replace(/\|/g, "\\|")  // Escape pipes
     .replace(/&/g, "\\&")   // Escape ampersands
     .replace(/\(/g, "\\(")  // Escape parentheses
-    .replace(/\)/g, "\\)"); // Escape parentheses
+    .replace(/\)/g, "\\)") // Escape parentheses
+    .replace(/</g, "\\<")  // Escape redirects
+    .replace(/>/g, "\\>"); // Escape redirects
 }
 
 /**
