@@ -1,17 +1,17 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, openSync, closeSync, copyFileSync, unlinkSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
-import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/relay.js";
-import { connectionAlive, listHostStates } from "../utils/connection-state.js";
-import { sandboxSocketPath, isSandboxReady, waitForSandbox, sandboxExec, loadImageIntoSandbox } from "../utils/sandbox.js";
-import { provisionTeam } from "../utils/provision.js";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sanitizeIdentifier } from "../schema/sanitizer.js";
+import { connectionAlive, listHostStates } from "../utils/connection-state.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
-import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
+import { provisionTeam } from "../utils/provision.js";
+import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/relay.js";
+import { isSandboxReady, loadImageIntoSandbox, sandboxExec, sandboxSocketPath, waitForSandbox } from "../utils/sandbox.js";
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
+import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -390,6 +390,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       if (result.stdout) process.stdout.write(result.stdout);
       if (result.stderr) process.stderr.write(result.stderr);
       process.exit(result.status ?? 1);
+      return;
     }
 
     case "join": {
