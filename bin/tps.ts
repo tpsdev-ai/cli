@@ -15,6 +15,7 @@ const cli = meow(
     mail <action>     Mailroom operations (send/check/list/search)
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
+    git <action>      Git utilities (worktree)
     branch <action>   Branch office node (init/start/stop/status/log)
 
   Options
@@ -296,6 +297,24 @@ async function main() {
         lines: typeof cli.flags.lines === "number" ? Number(cli.flags.lines) : undefined,
         follow: !!cli.flags.follow,
       });
+      break;
+    }
+    case "git": {
+      const action = rest[0];
+      if (action === "worktree") {
+        const agent = rest[1];
+        const repoPath = rest[2];
+        const branchName = rest[3];
+        if (!agent || !repoPath) {
+          console.error("Usage: tps git worktree <agent> <repo-path> [branch-name]");
+          process.exit(1);
+        }
+        const { runGit } = await import("../src/commands/git.js");
+        await runGit({ action, agent, repoPath, branchName });
+      } else {
+        console.error("Unknown git action. Supported: worktree");
+        process.exit(1);
+      }
       break;
     }
     default:
