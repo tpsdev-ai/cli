@@ -34,7 +34,7 @@ describe("wire mail", () => {
   });
 
   async function setupChannels() {
-    const host = initHostIdentity();
+    const host = await initHostIdentity();
     const branch = generateKeyPair();
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
 
@@ -51,7 +51,7 @@ describe("wire mail", () => {
       host: "127.0.0.1",
       port,
       branchId: "brancha",
-      hostPublicKey: loadHostIdentity().signing.publicKey,
+      hostPublicKey: host.signing.publicKey,
     });
 
     const serverChannel = await serverChannelPromise;

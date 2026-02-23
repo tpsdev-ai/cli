@@ -201,25 +201,23 @@ describe("key storage", () => {
 });
 
 describe("host identity", () => {
-  test("init creates host keypair", () => {
-    const kp = initHostIdentity();
+  test("init creates host keypair", async () => {
+    const kp = await initHostIdentity();
     expect(kp.fingerprint).toMatch(/^[0-9a-f]{64}$/);
 
     const identityDir = process.env.TPS_IDENTITY_DIR!;
-    expect(existsSync(join(identityDir, "host.key"))).toBe(true);
-    expect(existsSync(join(identityDir, "host.pub"))).toBe(true);
-    expect(existsSync(join(identityDir, "host.meta.json"))).toBe(true);
+    expect(existsSync(join(identityDir, "vault.json"))).toBe(true);
   });
 
-  test("init returns existing keypair if already initialized", () => {
-    const kp1 = initHostIdentity();
-    const kp2 = initHostIdentity();
+  test("init returns existing keypair if already initialized", async () => {
+    const kp1 = await initHostIdentity();
+    const kp2 = await initHostIdentity();
     expect(kp1.fingerprint).toBe(kp2.fingerprint);
   });
 
-  test("init with force regenerates keypair", () => {
-    const kp1 = initHostIdentity();
-    const kp2 = initHostIdentity({ force: true });
+  test("init with force regenerates keypair", async () => {
+    const kp1 = await initHostIdentity();
+    const kp2 = await initHostIdentity({ force: true });
     expect(kp1.fingerprint).not.toBe(kp2.fingerprint);
   });
 });

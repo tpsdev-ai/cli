@@ -33,7 +33,7 @@ describe("plain tcp transport", () => {
   });
 
   test("connect/listen handshake establishes channel with verified peer fingerprint", async () => {
-    const host = initHostIdentity();
+    const host = await initHostIdentity();
     const branch = generateKeyPair();
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
 
@@ -54,7 +54,7 @@ describe("plain tcp transport", () => {
       host: "127.0.0.1",
       port,
       branchId: "brancha",
-      hostPublicKey: loadHostIdentity().signing.publicKey,
+      hostPublicKey: host.signing.publicKey,
     });
 
     expect(ch.isAlive()).toBe(true);
@@ -73,7 +73,7 @@ describe("plain tcp transport", () => {
   });
 
   test("rejects unknown branch during handshake", async () => {
-    const host = initHostIdentity();
+    const host = await initHostIdentity();
     const branch = generateKeyPair();
     const serverTransport = new PlainTcpTransport(branch, host);
     const server = await serverTransport.listen(0);
@@ -93,7 +93,7 @@ describe("plain tcp transport", () => {
   });
 
   test("rejects oversized handshake payload without newline", async () => {
-    const host = initHostIdentity();
+    const host = await initHostIdentity();
     const branch = generateKeyPair();
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
     const serverTransport = new PlainTcpTransport(branch, host);
@@ -119,7 +119,7 @@ describe("plain tcp transport", () => {
   });
 
   test("drops connection when rxBuffer grows beyond frame cap", async () => {
-    const host = initHostIdentity();
+    const host = await initHostIdentity();
     const branch = generateKeyPair();
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
 

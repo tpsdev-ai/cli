@@ -42,7 +42,7 @@ describe("WsNoiseTransport", () => {
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
 
     const port = await freePort();
-    const serverTransport = new WsNoiseTransport(host);
+    const serverTransport = new WsNoiseTransport(host, host);
     const server = await serverTransport.listen(port);
 
     const recv = new Promise<string>((resolve) => {
@@ -83,7 +83,7 @@ describe("WsNoiseTransport", () => {
       const host = generateKeyPair();
       const branch = generateKeyPair();
       const port = 30000 + Math.floor(Math.random() * 10000);
-      const server = await new WsNoiseTransport(host).listen(port);
+      const server = await new WsNoiseTransport(host, host).listen(port);
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "unknown",
@@ -112,7 +112,7 @@ describe("WsNoiseTransport", () => {
       const branch = generateKeyPair();
       registerBranch("branch2", branch.signing.publicKey, undefined, branch.encryption.publicKey);
       const port = 30000 + Math.floor(Math.random() * 10000);
-      const server = await new WsNoiseTransport(host).listen(port);
+      const server = await new WsNoiseTransport(host, host).listen(port);
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "branch2",
@@ -139,7 +139,7 @@ describe("WsNoiseTransport", () => {
       return origSend.call(this, data, ...args);
     };
 
-    const server = await new WsNoiseTransport(host).listen(port);
+    const server = await new WsNoiseTransport(host, host).listen(port);
     server.onConnection((ch) => {
       ch.onMessage(() => {});
     });
