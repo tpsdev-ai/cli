@@ -30,6 +30,7 @@ describe("provisionTeam", () => {
     writeFileSync(manifestPath, `
 name: test-team
 purpose: development
+wall: true
 manager:
   persona: ops
   name: Manager
