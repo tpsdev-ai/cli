@@ -15,11 +15,14 @@ const STALL_REPO = process.env.STALL_REPO || process.cwd();
 const STALL_TIMEOUT_MIN = parseInt(process.env.STALL_TIMEOUT_MIN || "20", 10);
 const STALL_NOTIFY = process.env.STALL_NOTIFY || STALL_AGENT;
 
-const STATE_FILE = join(process.env.HOME || homedir(), ".tps", `stall-monitor-${STALL_AGENT}.json`);
+// Fix 3 (S21-C): Sanitize agent name to prevent path traversal
+const safeAgent = STALL_AGENT.replace(/[^a-zA-Z0-9_-]/g, "");
+const STATE_FILE = join(process.env.HOME || homedir(), ".tps", `stall-monitor-${safeAgent}.json`);
 
 function getLastCommitTime(): number {
   try {
-    const result = spawnSync("git", ["-C", STALL_REPO, "log", "-1", `--author=${STALL_AUTHOR}`, "--format=%cI"], { encoding: "utf8" });
+    // Fix 1 (S21-A): Separate author flag and value, use -- separator
+    const result = spawnSync("git", ["-C", STALL_REPO, "log", "-1", "--author", STALL_AUTHOR, "--format=%cI", "--"], { encoding: "utf8" });
     if (result.status === 0 && result.stdout.trim()) {
       return new Date(result.stdout.trim()).getTime();
     }
@@ -67,9 +70,11 @@ async function run() {
       
       // Use the local tps binary to send the mail
       const tpsBin = join(process.cwd(), "dist/bin/tps.js");
+      
+      // Fix 2 (S21-B): Inherit environment without hardcoded fallback
       const result = spawnSync("node", [tpsBin, "mail", "send", STALL_NOTIFY, message], { 
         encoding: "utf8",
-        env: { ...process.env, TPS_VAULT_KEY: process.env.TPS_VAULT_KEY || "test-passphrase" }
+        env: { ...process.env }
       });
 
       if (result.status === 0) {
