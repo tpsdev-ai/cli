@@ -96,7 +96,8 @@ export function provisionTeam(manifestPath: string, branchRoot: string): string 
     }
     agentIds.add(agentId);
 
-    const agentDir = join(agentsRoot, agentId, "agent");
+    const agentRoot = join(agentsRoot, agentId);
+    const agentDir = join(agentRoot, "agent");
 
     const isManager = agentSpec === manifest.manager;
     // Generate with correct paths
@@ -117,6 +118,13 @@ export function provisionTeam(manifestPath: string, branchRoot: string): string 
         }
         writeFileSync(join(agentDir, name), content, "utf-8");
     }
+
+    // Write tps.yaml for the agent
+    const tpsYamlContent = `name: ${agentId}
+version: "1.0.0"
+description: ${report.description?.trim().split('\n')[0] || "Generated agent"}
+`;
+    writeFileSync(join(agentRoot, "tps.yaml"), tpsYamlContent, "utf-8");
 
     agentConfigs.push(generated.config);
   }
@@ -186,7 +194,7 @@ export function provisionTeam(manifestPath: string, branchRoot: string): string 
     const content = [
       "# CONTEXT",
       "",
-      ...manifest.context.briefs.map((b, i) => `- ${i + 1}. ${b}`),
+      ...manifest.context.briefs.map((b: string, i: number) => `- ${i + 1}. ${b}`),
       "",
     ].join("\n");
     writeFileSync(join(sharedWorkspace, "CONTEXT.md"), content, "utf-8");

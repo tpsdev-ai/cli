@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { load } from "js-yaml";
+import { TpsYamlSchema } from "../schema/manifest.js";
 
 export interface MailHandlerCapability {
   enabled: boolean;
@@ -34,37 +35,38 @@ export function loadManifest(tpsYamlPath: string): AgentManifest | null {
   try {
     if (!existsSync(tpsYamlPath)) return null;
     const content = readFileSync(tpsYamlPath, "utf-8");
-    const doc = load(content) as any;
+    const doc = load(content);
 
-    if (!doc || typeof doc !== "object" || !doc.name) return null;
+    const parsed = TpsYamlSchema.safeParse(doc);
+    if (!parsed.success) return null;
 
+    const data = parsed.data;
     const agentDir = dirname(resolve(tpsYamlPath));
     const manifestPath = resolve(tpsYamlPath);
 
     const manifest: AgentManifest = {
-      name: doc.name,
-      version: doc.version,
-      description: doc.description,
-      routing: doc.routing,
+      name: data.name,
+      version: data.version,
+      description: data.description,
+      routing: data.routing,
       manifestPath,
       agentDir,
     };
 
-    if (doc.capabilities?.mail_handler) {
-      const mh = doc.capabilities.mail_handler;
+    if (data.capabilities?.mail_handler) {
+      const mh = data.capabilities.mail_handler;
       const mail_handler: MailHandlerCapability = {
-        enabled: mh.enabled !== false,
-        priority: typeof mh.priority === "number" ? mh.priority : 100,
-        timeout: typeof mh.timeout === "number" ? mh.timeout : 30,
-        needs_roster: !!mh.needs_roster,
+        enabled: mh.enabled,
+        priority: mh.priority,
+        timeout: mh.timeout,
+        needs_roster: mh.needs_roster,
         match: mh.match,
       };
 
       if (mh.exec) {
         const resolvedExec = resolve(agentDir, mh.exec);
-        const { sep } = require("node:path");
-        if (!resolvedExec.startsWith(agentDir + sep) && resolvedExec !== agentDir) {
-          return null;
+        if (!resolvedExec.startsWith(agentDir)) {
+          return null; // Boundary check from S15
         }
         mail_handler.exec = resolvedExec;
       }
@@ -118,7 +120,7 @@ export function matchesFilter(
 
   if (filter.bodyPattern) {
     const re = new RegExp(filter.bodyPattern);
-    const bodyToTest = msg.body.trim().slice(0, 1024);
+    const bodyToTest = msg.body.trim().slice(0, 1024); // Capped at 1024 (S15)
     if (!re.test(bodyToTest)) return false;
   }
 
