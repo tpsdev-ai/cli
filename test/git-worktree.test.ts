@@ -3,6 +3,7 @@ import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { runGit } from "../src/commands/git.js";
 
 const TPS_BIN = join(import.meta.dir, "../dist/bin/tps.js");
 
@@ -44,7 +45,7 @@ describe("tps git worktree", () => {
     }
     expect(result.status).toBe(0);
 
-    const targetDir = join(tempDir, ".tps", "branch-office", "testbot", "workspace", "dummy-repo");
+    const targetDir = join(tempDir, ".tps", "branch-office", "testbot", "dummy-repo");
     expect(existsSync(targetDir)).toBe(true);
     expect(existsSync(join(targetDir, ".git"))).toBe(true);
     
@@ -64,5 +65,40 @@ describe("tps git worktree", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("Path is not a git repository");
+  });
+
+  test("rejects branch names starting with a dash (S20-A)", async () => {
+    let exited = false;
+    const oldExit = process.exit;
+    // @ts-ignore
+    process.exit = ((code?: number) => {
+      exited = true;
+      throw new Error(`exit:${code}`);
+    }) as any;
+
+    try {
+      await runGit({ action: "worktree", agent: "testbot", repoPath, branchName: "-b" });
+    } catch {
+      // expected
+    } finally {
+      process.exit = oldExit;
+    }
+
+    expect(exited).toBe(true);
+  });
+
+  test("rejects repoPath outside HOME (S20-B/C)", () => {
+    const outsidePath = join(tmpdir(), `tps-outside-${Date.now()}`);
+    mkdirSync(outsidePath, { recursive: true });
+
+    const result = spawnSync("bun", [TPS_BIN, "git", "worktree", "testbot", outsidePath], {
+      encoding: "utf8",
+      env: { ...process.env }
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Repository path must be within the user's home directory");
+
+    rmSync(outsidePath, { recursive: true, force: true });
   });
 });

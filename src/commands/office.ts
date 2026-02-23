@@ -12,6 +12,7 @@ import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/rela
 import { isSandboxReady, loadImageIntoSandbox, sandboxExec, sandboxSocketPath, waitForSandbox } from "../utils/sandbox.js";
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
+import { branchRoot as sharedBranchRoot, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -63,33 +64,11 @@ echo "Branch office agent ready (gateway pid $!)"
 `;
 
 function branchRoot(): string {
-  return join(process.env.HOME || homedir(), ".tps", "branch-office");
+  return sharedBranchRoot();
 }
 
 function workspacePath(agentId: string): string {
-  const teamPath = join(branchRoot(), agentId);
-  const teamSidecar = join(teamPath, "team.json");
-  if (existsSync(teamSidecar)) {
-    return join(teamPath, "workspace");
-  }
-
-  try {
-    const teams = readdirSync(branchRoot()).filter(d => {
-      return existsSync(join(branchRoot(), d, "team.json"));
-    });
-
-    for (const team of teams) {
-      const sidecarPath = join(branchRoot(), team, "team.json");
-      const sidecar = JSON.parse(readFileSync(sidecarPath, "utf-8"));
-      if (Array.isArray(sidecar.members) && sidecar.members.includes(agentId)) {
-        return join(branchRoot(), team, "workspace");
-      }
-    }
-  } catch {
-    // Fallback
-  }
-
-  return join(branchRoot(), agentId);
+  return sharedWorkspacePath(agentId);
 }
 
 function sandboxName(agentId: string): string {
