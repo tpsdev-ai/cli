@@ -11,7 +11,7 @@ export interface ArchiveEvent {
   to: string;
   messageId: string;
   body?: string;
-  bodyPreview?: string; // For backward compatibility with some list views
+  bodyPreview?: string;
 }
 
 export interface ArchiveQuery {
@@ -23,7 +23,7 @@ export interface ArchiveQuery {
   limit?: number;
 }
 
-function getDb(): Database {
+function getDb(): any {
   const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
   mkdirSync(dir, { recursive: true });
   const dbPath = join(dir, "archive.db");
@@ -41,17 +41,17 @@ function getDb(): Database {
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS archive_fts USING fts5(body, content='archive', content_rowid='id');
     
-    -- Drop triggers if they exist to avoid errors on multiple calls
     DROP TRIGGER IF EXISTS archive_ai;
-    DROP TRIGGER IF EXISTS archive_ad;
-    DROP TRIGGER IF EXISTS archive_au;
-
     CREATE TRIGGER archive_ai AFTER INSERT ON archive BEGIN
       INSERT INTO archive_fts(rowid, body) VALUES (new.id, new.body);
     END;
+    
+    DROP TRIGGER IF EXISTS archive_ad;
     CREATE TRIGGER archive_ad AFTER DELETE ON archive BEGIN
       INSERT INTO archive_fts(archive_fts, rowid, body) VALUES('delete', old.id, old.body);
     END;
+    
+    DROP TRIGGER IF EXISTS archive_au;
     CREATE TRIGGER archive_au AFTER UPDATE ON archive BEGIN
       INSERT INTO archive_fts(archive_fts, rowid, body) VALUES('delete', old.id, old.body);
       INSERT INTO archive_fts(rowid, body) VALUES (new.id, new.body);
@@ -62,7 +62,7 @@ function getDb(): Database {
 }
 
 export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string): void {
-  let db: Database | null = null;
+  let db: any | null = null;
   try {
     db = getDb();
     const stmt = db.prepare(`
@@ -73,12 +73,12 @@ export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string):
   } catch (err) {
     // Best-effort audit logging.
   } finally {
-    try { db?.close(); } catch {}
+    db?.close();
   }
 }
 
 export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
-  let db: Database | null = null;
+  let db: any | null = null;
   try {
     db = getDb();
     let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.body FROM archive";
@@ -122,12 +122,11 @@ export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
     
     return results.map(r => ({
       ...r,
-      bodyPreview: r.body ? r.body.slice(0, 50) : undefined
+      bodyPreview: r.body ? (r.body.length > 100 ? r.body.slice(0, 100) + "..." : r.body) : undefined
     })) as ArchiveEvent[];
   } catch (err) {
-    console.error("queryArchive error:", err);
     return [];
   } finally {
-    try { db?.close(); } catch {}
+    db?.close();
   }
 }

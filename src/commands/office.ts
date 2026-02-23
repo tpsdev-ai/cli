@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, openSync, closeSync, copyFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, openSync, closeSync, copyFileSync, unlinkSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -29,14 +29,12 @@ function branchRoot(): string {
 }
 
 function workspacePath(agentId: string): string {
-  // Case 1: agentId is a team (has team.json in its root)
   const teamPath = join(branchRoot(), agentId);
   const teamSidecar = join(teamPath, "team.json");
   if (existsSync(teamSidecar)) {
     return join(teamPath, "workspace");
   }
 
-  // Case 2: agentId is a member of a team
   try {
     const teams = readdirSync(branchRoot()).filter(d => {
       return existsSync(join(branchRoot(), d, "team.json"));
@@ -50,7 +48,7 @@ function workspacePath(agentId: string): string {
       }
     }
   } catch {
-    // Fallback to per-agent path on any read error
+    // Fallback
   }
 
   return join(branchRoot(), agentId);
@@ -103,10 +101,8 @@ function resolveSandboxId(agentId: string): string | null {
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
-      // ops-17: Check for manifest mode (team provisioning)
       if (args.manifest) {
         try {
-          // validateAgent not needed here, provisionTeam takes manifestPath and branchRoot
           provisionTeam(args.manifest, branchRoot());
           console.log(`Team provisioned from manifest.`);
         } catch (e: any) {
@@ -121,7 +117,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const ws = workspacePath(agent);
       mkdirSync(ws, { recursive: true });
 
-      // Load soundstage image if --soundstage was passed
       if (args.soundstage) {
         console.log("🎬 Soundstage mode enabled (Mock LLM, local isolation)");
         const marker = join(branchRoot(), agent, "soundstage.json");
@@ -150,8 +145,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "stop": {
       const agent = validateAgent(args.agent);
       const sName = sandboxName(agent);
-      
-      // Cleanup soundstage marker if it exists
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       if (existsSync(soundstageMarker)) {
         try { unlinkSync(soundstageMarker); } catch {}
@@ -214,16 +207,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       
       if (isSoundstage) {
         console.log(`Mode: 🎬 soundstage (mock LLM, real sandbox)`);
-        console.log(`Sandbox: ${sid || "not running"}${vmReady ? " (VM ready)" : ""}`);
-      } else {
-        console.log(`Sandbox: ${sid || "not running"}${vmReady ? " (VM ready)" : ""}`);
       }
+      console.log(`Sandbox: ${sid || "not running"}${vmReady ? " (VM ready)" : ""}`);
       
       if (sid) console.log(`Socket: ${sandboxSocketPath(sName2)}`);
       console.log(`Relay: ${relayRunning ? "running" : "stopped"}`);
       console.log(`Outbox pending: ${counts.newCount} (cur=${counts.curCount}, failed=${counts.failedCount})`);
 
-      // Check for paused messages (loop detection)
       const pausedDir = join(ws, "mail", "outbox", "paused");
       if (existsSync(pausedDir)) {
         const pausedCount = readdirSync(pausedDir).filter((f) => f.endsWith(".json")).length;
@@ -246,7 +236,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         stop();
         process.exit(0);
       });
-      // keep process alive
       setInterval(() => {}, 60_000);
       return;
     }
@@ -355,8 +344,9 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const agent = validateAgent(args.agent);
       revokeBranch(agent, "manual revocation");
       const ws = workspacePath(agent);
-      if (existsSync(join(ws, "remote.json"))) {
-        try { unlinkSync(join(ws, "remote.json")); } catch {}
+      const rPath = join(ws, "remote.json");
+      if (existsSync(rPath)) {
+        try { unlinkSync(rPath); } catch {}
       }
       console.log(`Branch '${agent}' revoked.`);
       return;
@@ -367,8 +357,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         console.error("Usage: tps office sync <name>");
         process.exit(1);
       }
-      const { syncRemoteBranch } = await import("../utils/relay.js");
-      const { received } = await syncRemoteBranch(args.agent);
+      const { syncRemoteBranch: syncRemote } = await import("../utils/relay.js");
+      const { received } = await syncRemote(args.agent);
       console.log(`Sync complete. Received ${received} message(s).`);
       return;
     }
@@ -392,14 +382,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         await stop();
         process.exit(0);
       });
-      // Keep alive
       setInterval(() => {}, 60_000);
       return;
     }
 
     case "kill": {
       let killed = 0;
-      // 1. Kill all active persistent relays
       const { listHostStates, clearHostState } = await import("../utils/connection-state.js");
       const states = listHostStates();
       for (const s of states) {
@@ -408,21 +396,18 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           clearHostState(s.branch);
           killed++;
         } catch {
-          // Might already be dead, clear it anyway
           clearHostState(s.branch);
         }
       }
 
-      // 2. Kill local branch daemon if running
-      const { homedir } = require("node:os");
-      const { join } = require("node:path");
-      const { existsSync, readFileSync, rmSync } = require("node:fs");
       const pidPath = join(process.env.HOME || homedir(), ".tps", "branch", "branch.pid");
       if (existsSync(pidPath)) {
         try {
           const pid = Number(readFileSync(pidPath, "utf-8").trim());
-          process.kill(pid, "SIGTERM");
-          killed++;
+          if (pid) {
+            process.kill(pid, "SIGTERM");
+            killed++;
+          }
         } catch {}
         try { rmSync(pidPath, { force: true }); } catch {}
       }
