@@ -24,6 +24,44 @@ export interface OfficeArgs {
   joinToken?: string;
 }
 
+const BOOTSTRAP_TEMPLATE = `#!/bin/bash
+set -e
+
+# Install dependencies (skip if already available, e.g., soundstage image)
+if ! command -v openclaw >/dev/null 2>&1; then
+  npm install -g openclaw || { echo "ERROR: openclaw install failed"; exit 1; }
+  npm install -g @tpsdev-ai/cli || echo "TPS not on npm yet, skipping"
+fi
+
+openclaw --version
+
+# Detect config location
+# Standard branch office: workspace/.openclaw/openclaw.json
+# Multi-agent office: team-root/.openclaw/openclaw.json (workspace is a subdir)
+if [ -f "__WORKSPACE__/.openclaw/openclaw.json" ]; then
+  CONFIG="__WORKSPACE__/.openclaw/openclaw.json"
+elif [ -f "__WORKSPACE__/../.openclaw/openclaw.json" ]; then
+  CONFIG="__WORKSPACE__/../.openclaw/openclaw.json"
+else
+  echo "No openclaw.json found"
+  exit 1
+fi
+
+echo "Starting gateway with config: $CONFIG"
+
+# If mock LLM script exists, start it (soundstage mode)
+# mock-llm.js lives in team root (outside workspace) so agents can't modify it
+if [ -f "__TEAM_ROOT__/mock-llm.js" ]; then
+  echo "Starting mock LLM (soundstage mode)..."
+  nohup node __TEAM_ROOT__/mock-llm.js > __TEAM_ROOT__/mock-llm.log 2>&1 &
+  sleep 1
+fi
+
+# Run gateway in background (nohup to survive shell exit)
+nohup openclaw gateway run --config "$CONFIG" > __WORKSPACE__/gateway.log 2>&1 &
+echo "Branch office agent ready (gateway pid $!)"
+`;
+
 function branchRoot(): string {
   return join(process.env.HOME || homedir(), ".tps", "branch-office");
 }
@@ -59,11 +97,12 @@ function sandboxName(agentId: string): string {
 }
 
 function relayPidFile(agentId: string): string {
-  return join(branchRoot(), agentId, "relay.pid");
+  return join(workspacePath(agentId), "relay.pid");
 }
 
 function outboxCounts(agentId: string): { newCount: number; curCount: number; failedCount: number } {
-  const root = join(workspacePath(agentId), "mail", "outbox");
+  const ws = workspacePath(agentId);
+  const root = join(ws, "mail", "outbox");
   const countDir = (dir: string) => existsSync(dir) ? readdirSync(dir).filter(f => f.endsWith(".json")).length : 0;
   return {
     newCount: countDir(join(root, "new")),
@@ -124,12 +163,53 @@ export function parseJoinToken(tokenUrl: string): any {
   };
 }
 
+function setupWorkspace(agent: string): string {
+  const ws = workspacePath(agent);
+  mkdirSync(join(ws, "mail", "inbox", "new"), { recursive: true });
+  mkdirSync(join(ws, "mail", "inbox", "cur"), { recursive: true });
+  mkdirSync(join(ws, "mail", "outbox", "new"), { recursive: true });
+  mkdirSync(join(ws, "mail", "outbox", "cur"), { recursive: true });
+  mkdirSync(join(ws, "mail", "outbox", "failed"), { recursive: true });
+  mkdirSync(join(ws, "mail", "outbox", "paused"), { recursive: true });
+
+  const bootstrap = join(ws, "bootstrap.sh");
+  if (!existsSync(bootstrap)) {
+    const teamRoot = join(branchRoot(), agent);
+    const template = BOOTSTRAP_TEMPLATE
+      .replaceAll("__WORKSPACE__", ws)
+      .replaceAll("__TEAM_ROOT__", teamRoot);
+    writeFileSync(bootstrap, template, { mode: 0o755 });
+  } else {
+    console.log("Using existing bootstrap.sh");
+  }
+
+  return ws;
+}
+
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
       if (args.manifest) {
         try {
           provisionTeam(args.manifest, branchRoot());
+          if (args.soundstage && args.agent) {
+            const team = validateAgent(args.agent);
+            const teamRoot = join(branchRoot(), team);
+            const ws = join(teamRoot, "workspace");
+            const marker = join(teamRoot, "soundstage.json");
+            mkdirSync(teamRoot, { recursive: true });
+            writeFileSync(marker, JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
+
+            const teamBootstrap = join(teamRoot, "bootstrap.sh");
+            let bs = BOOTSTRAP_TEMPLATE
+              .replaceAll("__WORKSPACE__", ws)
+              .replaceAll("__TEAM_ROOT__", teamRoot);
+            const workspaceBootstrap = join(ws, "bootstrap.sh");
+            if (existsSync(workspaceBootstrap)) {
+              bs = readFileSync(workspaceBootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
+            }
+            writeFileSync(teamBootstrap, bs, { mode: 0o755 });
+          }
           console.log(`Team provisioned from manifest.`);
         } catch (e: any) {
           console.error(`Failed to provision team: ${e.message}`);
@@ -140,13 +220,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       const agent = validateAgent(args.agent);
       const sName = sandboxName(agent);
-      const ws = workspacePath(agent);
-      mkdirSync(ws, { recursive: true });
+      const ws = setupWorkspace(agent);
 
       if (args.soundstage) {
         console.log("🎬 Soundstage mode enabled (Mock LLM, local isolation)");
-        const marker = join(branchRoot(), agent, "soundstage.json");
-        mkdirSync(join(branchRoot(), agent), { recursive: true });
+        const teamRoot = join(branchRoot(), agent);
+        const marker = join(teamRoot, "soundstage.json");
+        mkdirSync(teamRoot, { recursive: true });
         writeFileSync(marker, JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
         
         const soundstageImage = join(__dirname, "..", "..", "images", "tps-soundstage.tar");
@@ -154,6 +234,17 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           console.log(`Loading soundstage image: ${soundstageImage}`);
           loadImageIntoSandbox(sName, soundstageImage);
         }
+
+        const bootstrap = join(ws, "bootstrap.sh");
+        if (existsSync(bootstrap)) {
+          const bs = readFileSync(bootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
+          writeFileSync(bootstrap, bs, { mode: 0o755 });
+        }
+      }
+
+      if (process.env.TPS_OFFICE_SKIP_VM === "1") {
+        console.log(`✓ Sandbox ready for ${agent} (SKIPPED).`);
+        return;
       }
 
       console.log(`Starting sandbox VM for ${agent}...`);
@@ -176,8 +267,17 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         try { unlinkSync(soundstageMarker); } catch {}
       }
 
+      const sid = resolveSandboxId(agent);
+      if (!sid) {
+        process.stderr.write("No sandbox found for agent\n");
+        process.exit(1);
+      }
+
       console.log(`Stopping sandbox VM for ${agent}...`);
-      spawnSync("nono", ["stop", sName], { stdio: "inherit" });
+      const stopResult = spawnSync("nono", ["stop", sName], { stdio: "inherit" });
+      if (stopResult.status !== 0) {
+        process.exit(stopResult.status ?? 1);
+      }
       return;
     }
 
