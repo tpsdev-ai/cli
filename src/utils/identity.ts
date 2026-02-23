@@ -23,6 +23,77 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
+import { encryptVault, decryptVault, saveVault, loadVaultFile } from "./vault.js";
+
+// --- Vaulted Storage (ops-24.1) ---
+
+export interface TpsVault {
+  identity: {
+    seed: string; // base64
+    createdAt: string;
+    expiresAt?: string;
+  };
+  secrets: Record<string, string>;
+}
+
+function vaultPath(): string {
+  return join(getIdentityDir(), "vault.json");
+}
+
+function getVaultPassphrase(): string {
+  return process.env.TPS_VAULT_KEY || "default-passphrase";
+}
+
+export async function saveToVault(data: TpsVault): Promise<void> {
+  const passphrase = getVaultPassphrase();
+  const vaultData = await encryptVault(data, passphrase);
+  saveVault(vaultPath(), vaultData);
+}
+
+export async function loadFromVault(): Promise<TpsVault | null> {
+  const path = vaultPath();
+  const vaultFile = loadVaultFile(path);
+  if (!vaultFile) return null;
+
+  const passphrase = getVaultPassphrase();
+  try {
+    return await decryptVault(vaultFile, passphrase);
+  } catch (err) {
+    throw new Error("Failed to decrypt vault. Check passphrase.");
+  }
+}
+
+async function migrateToVault(): Promise<void> {
+  const dir = getIdentityDir();
+  const seedPath = join(dir, "host.seed");
+  const metaPath = join(dir, "host.meta.json");
+
+  if (existsSync(seedPath)) {
+    const seed = new Uint8Array(readFileSync(seedPath));
+    const meta = existsSync(metaPath) ? JSON.parse(readFileSync(metaPath, "utf-8")) : {};
+    
+    const vault: TpsVault = {
+      identity: {
+        seed: Buffer.from(seed).toString("base64"),
+        createdAt: meta.createdAt || new Date().toISOString(),
+        expiresAt: meta.expiresAt,
+      },
+      secrets: {},
+    };
+
+    await saveToVault(vault);
+
+    const filesToDelete = [
+      "host.seed", "host.key", "host.pub",
+      "host.x25519.key", "host.x25519.pub", "host.meta.json"
+    ];
+    for (const f of filesToDelete) {
+      const p = join(dir, f);
+      if (existsSync(p)) unlinkSync(p);
+    }
+  }
+}
+
 
 // noble/ed25519 v3 needs hashes.sha512 set for sync operations.
 import { hashes } from "@noble/ed25519";
@@ -266,43 +337,83 @@ export function checkKeyPermissions(keyPath: string): boolean {
  * Initialize host identity (generate keypair if not exists).
  * Returns the keypair (existing or newly generated).
  */
-export function initHostIdentity(options?: {
+export async function initHostIdentity(options?: {
   expiresIn?: number;
   force?: boolean;
-}): TpsKeyPair {
+}): Promise<TpsKeyPair> {
   const dir = getIdentityDir();
-  const keyPath = join(dir, "host.key");
 
-  if (existsSync(keyPath) && !options?.force) {
-    return loadKeyPair(dir, "host");
+  if (existsSync(join(dir, "host.seed")) && !options?.force) {
+    await migrateToVault();
+  }
+
+  const existing = await loadFromVault();
+  if (existing && !options?.force) {
+    const seed = new Uint8Array(Buffer.from(existing.identity.seed, "base64"));
+    return deriveFromSeed(seed, {
+      createdAt: existing.identity.createdAt,
+      expiresAt: existing.identity.expiresAt,
+    });
   }
 
   const kp = generateKeyPair({ expiresIn: options?.expiresIn });
-  saveKeyPair(kp, dir, "host");
+  const vault: TpsVault = {
+    identity: {
+      seed: Buffer.from(kp.seed).toString("base64"),
+      createdAt: kp.createdAt,
+      expiresAt: kp.expiresAt,
+    },
+    secrets: {},
+  };
+  await saveToVault(vault);
   return kp;
+}
+
+function deriveFromSeed(seed: Uint8Array, meta: any): TpsKeyPair {
+  const edPublic = ed.getPublicKey(seed);
+  const xPrivate = edSeedToX25519Private(seed);
+  const xPublic = x25519.getPublicKey(xPrivate);
+
+  return {
+    signing: { publicKey: edPublic, privateKey: seed },
+    encryption: { publicKey: xPublic, privateKey: xPrivate },
+    seed,
+    fingerprint: fingerprint(edPublic),
+    createdAt: meta.createdAt,
+    expiresAt: meta.expiresAt,
+    publicKey: edPublic,
+    privateKey: seed,
+  };
 }
 
 /**
  * Load the host identity. Throws if not initialized.
  */
-export function loadHostIdentity(): TpsKeyPair {
-  const dir = getIdentityDir();
-  return loadKeyPair(dir, "host");
+export async function loadHostIdentity(): Promise<TpsKeyPair> {
+  const vault = await loadFromVault();
+  if (!vault) {
+    if (existsSync(join(getIdentityDir(), "host.seed"))) {
+      await migrateToVault();
+      return loadHostIdentity();
+    }
+    throw new Error("No host identity found. Run `tps office init` first.");
+  }
+  return deriveFromSeed(new Uint8Array(Buffer.from(vault.identity.seed, "base64")), vault.identity);
 }
 
-export function loadHostIdentityId(): string {
+export async function loadHostIdentityId(): Promise<string> {
   const safeHostname = () => hostname().split(".")[0]!;
-  const metaPath = join(getIdentityDir(), "host.meta.json");
-  if (existsSync(metaPath)) {
-    try {
-      const data = JSON.parse(readFileSync(metaPath, "utf-8"));
-      return String(data.id || data.hostId || safeHostname());
-    } catch {
+  try {
+    const vault = await loadFromVault();
+    if (vault) {
       return safeHostname();
     }
+  } catch {
+    return safeHostname();
   }
   return safeHostname();
 }
+
 
 // --- Registry ---
 

@@ -14,6 +14,7 @@ const cli = meow(
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list)
     identity <action> Key management (init/show/register/list/revoke/verify)
+    secrets <action>  Secret management (set/list/remove)
     branch <action>   Branch office node (init/start/stop/status/log)
 
   Options
@@ -247,7 +248,7 @@ async function main() {
         process.exit(1);
       }
       const { runIdentity } = await import("../src/commands/identity.js");
-      runIdentity({
+      await runIdentity({
         action,
         branch: rest[1],
         reason: cli.flags.reason,
@@ -257,6 +258,25 @@ async function main() {
         pubkey: cli.flags.pubkey,
         encPubkey: cli.flags.encPubkey,
       });
+      break;
+    }
+    case "secrets": {
+      const action = rest[0] as "set" | "list" | "remove" | undefined;
+      if (!action || !["set", "list", "remove"].includes(action)) {
+        console.error("Usage:\n  tps secrets set <KEY>=<VALUE>\n  tps secrets list\n  tps secrets remove <KEY>");
+        process.exit(1);
+      }
+      const { runSecrets } = await import("../src/commands/secrets.js");
+      let key: string | undefined;
+      let value: string | undefined;
+      if (action === "set") {
+        const parts = rest[1]?.split("=");
+        key = parts?.[0];
+        value = parts?.slice(1).join("=");
+      } else {
+        key = rest[1];
+      }
+      await runSecrets({ action, key, value, json: cli.flags.json });
       break;
     }
     case "branch": {

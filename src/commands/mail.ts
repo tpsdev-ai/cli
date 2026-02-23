@@ -18,8 +18,8 @@ interface MailArgs {
   limit?: number;
 }
 
-function resolveAgentId(override?: string): string {
-  const id = override || process.env.TPS_AGENT_ID || loadHostIdentityId() || "unknown";
+async function resolveAgentId(override?: string): Promise<string> {
+  const id = override || process.env.TPS_AGENT_ID || await loadHostIdentityId() || "unknown";
   const safe = sanitizeIdentifier(id);
   if (safe !== id) {
     console.error(`Invalid agent id: ${id}`);
@@ -49,7 +49,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         console.error("Usage: tps mail send <agent> <message>");
         process.exit(1);
       }
-      const from = resolveAgentId();
+      const from = await resolveAgentId();
 
       // Branch mode: queue outbound to be picked up by host on next connect
       const branchHostFile = join(process.env.HOME || homedir(), ".tps", "identity", "host.json");
@@ -110,7 +110,7 @@ export async function runMail(args: MailArgs): Promise<void> {
     }
 
     case "check": {
-      const agent = resolveAgentId(args.agent);
+      const agent = await resolveAgentId(args.agent);
       const messages = checkMessages(agent);
       if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
@@ -127,7 +127,7 @@ export async function runMail(args: MailArgs): Promise<void> {
     }
 
     case "list": {
-      const agent = resolveAgentId(args.agent);
+      const agent = await resolveAgentId(args.agent);
       const messages = listMessages(agent);
       if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
@@ -143,7 +143,7 @@ export async function runMail(args: MailArgs): Promise<void> {
     }
 
     case "read": {
-      const agent = resolveAgentId(args.agent);
+      const agent = await resolveAgentId(args.agent);
       const id = args.messageId;
       if (!id) {
         console.error("Usage: tps mail read <agent> <message-id>");
@@ -178,7 +178,7 @@ export async function runMail(args: MailArgs): Promise<void> {
     }
 
     case "watch": {
-      const agent = resolveAgentId(args.agent);
+      const agent = await resolveAgentId(args.agent);
       const { fresh, cur } = getInbox(agent);
       console.log(`Watching ${agent} inbox... (Ctrl-C to stop)`);
 

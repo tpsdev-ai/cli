@@ -217,7 +217,7 @@ export async function connectRemoteBranches(
     return { connected: [], cleanup: async () => {} };
   }
 
-  const hostKp = loadHostIdentity();
+  const hostKp = await loadHostIdentity();
 
   for (const name of entries) {
     const remotePath = join(branchDir, name, "remote.json");
@@ -358,7 +358,7 @@ export async function deliverToRemoteBranch(
     throw new Error(`Remote branch '${branchId}': not registered or missing encryption key`);
   }
 
-  const hostKp = loadHostIdentity();
+  const hostKp = await loadHostIdentity();
   const transport = transportType === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
   
   const channel = await transport.connect({
@@ -444,7 +444,7 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
     throw new Error(`Remote branch '${branchId}': not registered or missing encryption key`);
   }
 
-  const hostKp = loadHostIdentity();
+  const hostKp = await loadHostIdentity();
   const transport = transportType === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
   const channel = await transport.connect({ host, port, branchId, hostPublicKey: branch.encryptionKey });
 
@@ -495,7 +495,7 @@ export async function connectAndKeepAlive(
   const remote = JSON.parse(readFileSync(remotePath, "utf-8"));
   const branch = lookupBranch(branchId);
   if (!branch?.encryptionKey) throw new Error(`Branch '${branchId}' missing encryption key`);
-  const hostKp = loadHostIdentity();
+  const hostKp = await loadHostIdentity();
 
   const loop = async () => {
     let backoff = RECONNECT_BASE_MS;

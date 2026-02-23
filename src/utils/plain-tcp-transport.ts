@@ -170,7 +170,7 @@ export class PlainTcpTransport implements WireTransport {
   ) {}
 
   async listen(port: number): Promise<TransportServer> {
-    const host = this.hostKeyPair ?? loadHostIdentity();
+    const host = this.hostKeyPair ?? await loadHostIdentity();
     const server = net.createServer();
     const wrapper = new PlainTcpServer(server);
 

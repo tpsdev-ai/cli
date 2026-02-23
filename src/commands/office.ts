@@ -289,7 +289,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       console.log(`Connecting to ${token.host}:${token.port}...`);
 
-      const hostKp = loadHostIdentity();
+      const hostKp = await loadHostIdentity();
       const wire = token.transport === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
       const channel = await wire.connect({
         host: token.host,

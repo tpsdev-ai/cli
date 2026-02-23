@@ -45,11 +45,11 @@ function parseDuration(s: string): number {
   }
 }
 
-export function runIdentity(args: IdentityArgs): void {
+export async function runIdentity(args: IdentityArgs): Promise<void> {
   switch (args.action) {
     case "init": {
       const expiresIn = args.expiresIn ? parseDuration(args.expiresIn) : undefined;
-      const kp = initHostIdentity({ expiresIn });
+      const kp = await initHostIdentity({ expiresIn });
       installNonoProfiles(undefined, args.json);
       const sigPubHex = Buffer.from(kp.signing.publicKey).toString("hex");
       const encPubHex = Buffer.from(kp.encryption.publicKey).toString("hex");
@@ -82,7 +82,7 @@ export function runIdentity(args: IdentityArgs): void {
     case "show": {
       let kp;
       try {
-        kp = loadHostIdentity();
+        kp = await loadHostIdentity();
       } catch {
         console.error(
           "No host identity found. Run: tps identity init"
@@ -93,8 +93,8 @@ export function runIdentity(args: IdentityArgs): void {
       const identityDir =
         process.env.TPS_IDENTITY_DIR ||
         join(process.env.HOME || homedir(), ".tps", "identity");
-      const keyPath = join(identityDir, "host.key");
-      const permOk = checkKeyPermissions(keyPath);
+      const vaultPath = join(identityDir, "vault.json");
+      const permOk = checkKeyPermissions(vaultPath);
 
       if (args.json) {
         console.log(
@@ -123,7 +123,7 @@ export function runIdentity(args: IdentityArgs): void {
           );
         }
         console.log(
-          `  Key perms:   ${permOk ? "✅ secure (0600)" : "⚠️  insecure — run chmod 600 on host.key"}`
+          `  Vault perms: ${permOk ? "✅ secure (0600)" : "⚠️  insecure — run chmod 600 on vault.json"}`
         );
       }
       return;

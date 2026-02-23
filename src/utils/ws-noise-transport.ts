@@ -154,7 +154,7 @@ export class WsNoiseTransport implements WireTransport {
   ) {}
 
   async listen(port: number): Promise<TransportServer> {
-    const host = this.hostKeyPair ?? this.localKeyPair;
+    const host = this.hostKeyPair ?? await loadHostIdentity();
     const httpServer = createServer((_req, res) => {
       res.statusCode = 404;
       res.end();
