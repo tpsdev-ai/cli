@@ -7,6 +7,7 @@ import { sanitizeTPSReport, sanitizeIdentifier } from "../schema/sanitizer.js";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { generateOperationalBrief } from "./brief.js";
 
 export interface GeneratedClaudeCode {
   files: Record<string, string>;
@@ -17,7 +18,7 @@ export interface GeneratedClaudeCode {
 
 export function generateClaudeCode(
   rawReport: TPSReport,
-  options: { name?: string; workspace?: string } = {}
+  options: { name?: string; workspace?: string; branch?: boolean } = {}
 ): GeneratedClaudeCode {
   const report = sanitizeTPSReport(rawReport);
   const agentName = options.name ? sanitizeIdentifier(options.name) : report.identity.default_name;
@@ -44,6 +45,9 @@ export function generateClaudeCode(
     "## Communication Style",
     "",
     report.identity.communication_style,
+    "",
+    "## Operations",
+    "Read OPERATIONS.md to understand your environment and how to use the TPS CLI.",
     "",
   ];
 
@@ -79,6 +83,7 @@ export function generateClaudeCode(
 
   const files: Record<string, string> = {
     "CLAUDE.md": claudeMd.join("\n"),
+    "OPERATIONS.md": generateOperationalBrief(report, !!options.branch),
     ".claude/settings.json": JSON.stringify(settings, null, 2) + "\n",
   };
 

@@ -11,6 +11,7 @@ import { sanitizeTPSReport, sanitizeIdentifier } from "../schema/sanitizer.js";
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { generateOperationalBrief } from "./brief.js";
 
 export interface GeneratedCodex {
   files: Record<string, string>;
@@ -21,7 +22,7 @@ export interface GeneratedCodex {
 
 export function generateCodex(
   rawReport: TPSReport,
-  options: { name?: string; workspace?: string; model?: string } = {}
+  options: { name?: string; workspace?: string; model?: string; branch?: boolean } = {}
 ): GeneratedCodex {
   const report = sanitizeTPSReport(rawReport);
   const agentName = options.name ? sanitizeIdentifier(options.name) : report.identity.default_name;
@@ -41,6 +42,9 @@ export function generateCodex(
     `**Role:** ${report.name}`,
     "",
     report.description,
+    "",
+    "## Operations",
+    "Read OPERATIONS.md to understand your environment and how to use the TPS CLI.",
     "",
     "## Personality",
     "",
@@ -85,6 +89,7 @@ export function generateCodex(
 
   const files: Record<string, string> = {
     "AGENTS.md": instructions.join("\n"),
+    "OPERATIONS.md": generateOperationalBrief(report, !!options.branch),
     ".codex/config.json": JSON.stringify(config, null, 2) + "\n",
   };
 

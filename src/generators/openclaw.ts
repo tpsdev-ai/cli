@@ -27,6 +27,10 @@ function loadTemplate(name: string): HandlebarsTemplateDelegate {
   return Handlebars.compile(raw);
 }
 
+import { generateOperationalBrief } from "./brief.js";
+
+// ... previous helper functions ...
+
 Handlebars.registerHelper("json", (ctx: unknown) => JSON.stringify(ctx, null, 2));
 
 export interface GeneratedWorkspace {
@@ -113,6 +117,9 @@ export function generateWorkspace(
     const tmpl = loadTemplate(t);
     files[outName] = tmpl(templateData);
   }
+
+  // Inject OPERATIONS.md brief
+  files["OPERATIONS.md"] = generateOperationalBrief(report, !!options.branch);
 
   // Generate config matching actual OpenClaw agent schema
   const config: Record<string, unknown> = {
