@@ -1,20 +1,27 @@
-import { randomBytes, createCipheriv, createDecipheriv, pbkdf2Sync } from "node:crypto";
+import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
+import { hashRaw, Algorithm } from "@node-rs/argon2";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
-// Vault File Format
 export interface VaultData {
-  salt: string;       // base64
-  iv: string;         // base64
-  authTag: string;    // base64
-  ciphertext: string; // base64
+  salt: string;
+  iv: string;
+  authTag: string;
+  ciphertext: string;
 }
 
-// Derive a 32-byte key using PBKDF2-SHA256 (64MB memory cost for Argon2id simulated by high iterations)
 export async function deriveKey(passphrase: string, salt: Buffer): Promise<Buffer> {
-  return pbkdf2Sync(passphrase, salt, 100000, 32, "sha256");
+  const key = await hashRaw(passphrase, {
+    algorithm: Algorithm.Argon2id,
+    memoryCost: 65536,
+    timeCost: 3,
+    parallelism: 4,
+    outputLen: 32,
+    salt,
+  });
+  return Buffer.from(key);
 }
 
-export async function encryptVault(data: any, passphrase: string): Promise<VaultData> {
+export async function encryptVault(data: unknown, passphrase: string): Promise<VaultData> {
   const salt = randomBytes(16);
   const key = await deriveKey(passphrase, salt);
   const iv = randomBytes(12);
@@ -25,7 +32,7 @@ export async function encryptVault(data: any, passphrase: string): Promise<Vault
   ciphertext += cipher.final("base64");
   const authTag = cipher.getAuthTag();
 
-  key.fill(0); // Zeroize key
+  key.fill(0);
 
   return {
     salt: salt.toString("base64"),
@@ -39,16 +46,16 @@ export async function decryptVault(vault: VaultData, passphrase: string): Promis
   const salt = Buffer.from(vault.salt, "base64");
   const iv = Buffer.from(vault.iv, "base64");
   const authTag = Buffer.from(vault.authTag, "base64");
-  
+
   const key = await deriveKey(passphrase, salt);
-  
+
   const decipher = createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(authTag);
-  
+
   let plaintext = decipher.update(vault.ciphertext, "base64", "utf8");
   plaintext += decipher.final("utf8");
 
-  key.fill(0); // Zeroize key
+  key.fill(0);
 
   return JSON.parse(plaintext);
 }
