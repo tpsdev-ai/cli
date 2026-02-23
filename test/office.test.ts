@@ -16,6 +16,7 @@ describe("office command", () => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-office-test-"));
     originalHome = process.env.HOME;
     process.env.HOME = tempRoot;
+    process.env.TPS_VAULT_KEY = "test-passphrase";
     // Ensure fake docker is executable (git permission might be lost in some CI/checkouts)
     const fakeDocker = join(FAKE_DOCKER_BIN_DIR, "docker");
     try {
@@ -28,6 +29,7 @@ describe("office command", () => {
   afterEach(() => {
     if (originalHome) process.env.HOME = originalHome;
     else delete process.env.HOME;
+    delete process.env.TPS_VAULT_KEY;
     rmSync(tempRoot, { recursive: true, force: true });
   });
 

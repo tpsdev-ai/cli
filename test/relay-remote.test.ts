@@ -10,12 +10,14 @@ describe("connectRemoteBranches", () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-relay-remote-"));
     originalHome = process.env.HOME;
+    process.env.TPS_VAULT_KEY = "test-passphrase";
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
     if (originalHome) process.env.HOME = originalHome;
     else delete process.env.HOME;
+    delete process.env.TPS_VAULT_KEY;
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;
   });

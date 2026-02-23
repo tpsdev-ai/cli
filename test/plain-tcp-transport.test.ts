@@ -20,6 +20,7 @@ describe("plain tcp transport", () => {
     root = mkdtempSync(join(tmpdir(), "tps-plain-tcp-test-"));
     originalHome = process.env.HOME;
     process.env.HOME = root;
+    process.env.TPS_VAULT_KEY = "test-passphrase";
     process.env.TPS_IDENTITY_DIR = join(root, ".tps", "identity");
     process.env.TPS_REGISTRY_DIR = join(root, ".tps", "registry");
   });
@@ -27,6 +28,7 @@ describe("plain tcp transport", () => {
   afterEach(() => {
     if (originalHome) process.env.HOME = originalHome;
     else delete process.env.HOME;
+    delete process.env.TPS_VAULT_KEY;
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;
     rmSync(root, { recursive: true, force: true });
