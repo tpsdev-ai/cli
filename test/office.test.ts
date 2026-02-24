@@ -110,4 +110,22 @@ describe("office command", () => {
     expect(status.stdout).toContain("Paused messages (loop detected): 1");
     expect(status.stdout).toContain("Review:");
   });
+
+  test("team members resolve to the shared team sandbox (ops-17)", () => {
+    const teamRoot = join(tempRoot, ".tps", "branch-office", "team-x");
+    mkdirSync(join(teamRoot, "workspace"), { recursive: true });
+    writeFileSync(
+      join(teamRoot, "team.json"),
+      JSON.stringify({ members: ["dev-1", "dev-2"] }),
+      "utf-8"
+    );
+
+    const start1 = run(["office", "start", "dev-1"]);
+    expect(start1.status).toBe(0);
+    expect(start1.stdout).toContain("Shared team sandbox: team-x");
+
+    const start2 = run(["office", "start", "dev-2"]);
+    expect(start2.status).toBe(0);
+    expect(start2.stdout).toContain("Shared team sandbox: team-x");
+  });
 });

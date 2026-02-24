@@ -12,7 +12,7 @@ import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/rela
 import { isSandboxReady, loadImageIntoSandbox, sandboxExec, sandboxSocketPath, waitForSandbox } from "../utils/sandbox.js";
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
-import { branchRoot as sharedBranchRoot, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
+import { branchRoot as sharedBranchRoot, resolveTeamId, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -72,7 +72,8 @@ function workspacePath(agentId: string): string {
 }
 
 function sandboxName(agentId: string): string {
-  return `tps-agent-${agentId}`;
+  const teamId = resolveTeamId(agentId);
+  return `tps-agent-${teamId}`;
 }
 
 function relayPidFile(agentId: string): string {
@@ -219,6 +220,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           const bs = readFileSync(bootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
           writeFileSync(bootstrap, bs, { mode: 0o755 });
         }
+      }
+
+      const teamId = resolveTeamId(agent);
+      const isTeam = teamId !== agent;
+      if (isTeam) {
+        console.log(`(Shared team sandbox: ${teamId})`);
       }
 
       if (process.env.TPS_OFFICE_SKIP_VM === "1") {
