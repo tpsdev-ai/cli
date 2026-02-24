@@ -23,7 +23,7 @@ export class BoundaryManager {
 
   isPathAllowed(path: string): boolean {
     for (const allowed of this.allowedPaths) {
-      if (path.startsWith(allowed)) return true;
+      if (path === allowed || path.startsWith(allowed + "/")) return true;
     }
     return false;
   }

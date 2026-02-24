@@ -31,7 +31,7 @@ export class MailClient {
   async checkNewMail(): Promise<MailMessage[]> {
     if (!existsSync(this.inboxNew)) return [];
 
-    const files = readdirSync(this.inboxNew).filter((f) => !f.startsWith("."));
+    const files = readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
     const messages: MailMessage[] = [];
 
     for (const file of files) {
