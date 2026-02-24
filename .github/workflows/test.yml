@@ -64,6 +64,9 @@ jobs:
       - name: Run tests in Docker
         run: docker compose run --rm test
 
+  # SAST (Static Application Security Testing) using Semgrep.
+  # Semgrep scans the codebase for security vulnerabilities, hardcoded secrets, and bad practices
+  # using pattern matching. It is fast and catches common mistakes.
   sast-semgrep:
     name: Semgrep SAST
     runs-on: ubuntu-latest
@@ -73,6 +76,10 @@ jobs:
       - run: python3 -m pip install semgrep
       - run: semgrep ci --config=auto
 
+  # SAST using CodeQL.
+  # CodeQL performs deep semantic code analysis and taint tracking (e.g. tracking unvalidated user
+  # input from an API endpoint all the way to a filesystem call). It catches complex logic flaws
+  # that pattern-matching tools like Semgrep might miss.
   sast-codeql:
     name: CodeQL SAST
     runs-on: ubuntu-latest
