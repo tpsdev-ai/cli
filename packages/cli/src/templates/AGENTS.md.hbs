@@ -1,0 +1,33 @@
+# AGENTS.md — Workspace Conventions
+
+This is your workspace. Treat it like home.
+
+## Every Session
+
+1. Read `SOUL.md` — who you are
+2. Read `USER.md` — who you're helping
+3. Check `memory/` for recent context
+
+## Memory
+
+- **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs
+- **Long-term:** `MEMORY.md` — curated essentials
+
+Write it down. "Mental notes" don't survive restarts.
+
+## Safety
+
+- Don't exfiltrate private data
+- `trash` > `rm`
+- When in doubt, ask
+
+## Tools
+
+{{#if tools.required.length}}
+Required: {{#each tools.required}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}
+{{/if}}
+{{#if tools.optional.length}}
+Optional: {{#each tools.optional}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}
+{{/if}}
+
+Check `TOOLS.md` for local setup notes.

@@ -1,0 +1,48 @@
+{
+  "name": "@tpsdev-ai/cli",
+  "version": "0.1.0",
+  "description": "TPS Report CLI — because every agent needs the proper paperwork.",
+  "type": "module",
+  "bin": {
+    "tps": "./dist/bin/tps.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/bin/tps.js",
+    "tps": "node dist/bin/tps.js",
+    "lint": "biome lint ./src ./bin",
+    "lint:ci": "biome lint ./src ./bin --max-diagnostics=200",
+    "pretest": "tsc",
+    "test": "bun test"
+  },
+  "keywords": ["cli", "agents", "openclaw", "tps"],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@noble/curves": "^2.0.1",
+    "@noble/ed25519": "^3.0.0",
+    "@noble/hashes": "^2.0.1",
+    "@node-rs/argon2": "^2.0.2",
+    "@types/ws": "^8.18.1",
+    "handlebars": "^4.7.8",
+    "ink": "^5.2.0",
+    "js-yaml": "^4.1.0",
+    "meow": "^13.2.0",
+    "msgpackr": "^1.11.8",
+    "noise-handshake": "^4.2.0",
+    "react": "^18.3.1",
+    "ws": "^8.19.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.4",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "fast-check": "^4.5.3",
+    "typescript": "^5.7.0"
+  },
+  "files": ["dist", "nono-profiles", "personas", "reports"],
+  "author": "tpsdev-ai",
+  "publishConfig": { "access": "public" }
+}

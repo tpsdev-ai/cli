@@ -1,0 +1,35 @@
+{
+  "name": "@tpsdev-ai/agent",
+  "version": "0.1.0",
+  "description": "Native TPS Agent Runtime — headless, mail-driven, nono-sandboxed",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "bun test",
+    "lint": "biome lint ./src",
+    "lint:ci": "biome lint ./src --max-diagnostics=200"
+  },
+  "keywords": ["agents", "tps", "runtime", "mail-driven"],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.4",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "author": "tpsdev-ai",
+  "publishConfig": { "access": "public" }
+}
