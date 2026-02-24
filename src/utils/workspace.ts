@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { sanitizeIdentifier } from "../schema/sanitizer.js";
 
 /**
  * Get the root directory where branch-office workspaces are stored.
@@ -14,21 +15,25 @@ export function branchRoot(): string {
  * returns the team's ID. If standalone, returns the agent's ID.
  */
 export function resolveTeamId(agentId: string): string {
-  const teamPath = join(branchRoot(), agentId);
+  const safeId = sanitizeIdentifier(agentId);
+  const root = branchRoot();
+
+  const teamPath = join(root, safeId);
   const teamSidecar = join(teamPath, "team.json");
   if (existsSync(teamSidecar)) {
-    return agentId; // The provided ID is already a team
+    return safeId; // The provided ID is already a team
   }
 
   try {
-    const teams = readdirSync(branchRoot()).filter((d) => {
-      return existsSync(join(branchRoot(), d, "team.json"));
+    const teams = readdirSync(root).filter((d) => {
+      return existsSync(join(root, d, "team.json"));
     });
 
     for (const team of teams) {
-      const sidecarPath = join(branchRoot(), team, "team.json");
+      const sidecarPath = join(root, team, "team.json");
       const sidecar = JSON.parse(readFileSync(sidecarPath, "utf-8"));
-      if (Array.isArray(sidecar.members) && sidecar.members.includes(agentId)) {
+      // Note: team.json uses 'members' for agent IDs
+      if (Array.isArray(sidecar.members) && sidecar.members.includes(safeId)) {
         return team; // Agent is a member of this team
       }
     }
@@ -36,7 +41,7 @@ export function resolveTeamId(agentId: string): string {
     // Fallback
   }
 
-  return agentId; // Standalone agent
+  return safeId; // Standalone agent
 }
 
 /**

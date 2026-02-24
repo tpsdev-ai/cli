@@ -73,7 +73,7 @@ function workspacePath(agentId: string): string {
 
 function sandboxName(agentId: string): string {
   const teamId = resolveTeamId(agentId);
-  return `tps-agent-${teamId}`;
+  return `tps-${teamId}`;
 }
 
 function relayPidFile(agentId: string): string {
