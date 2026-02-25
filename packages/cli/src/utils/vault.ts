@@ -71,6 +71,7 @@ export async function decryptVault(vault: VaultData, passphrase: string): Promis
 
   const key = await deriveKey(passphrase, salt, params);
   
+  // nosemgrep: javascript.node-crypto.security.gcm-no-tag-length.gcm-no-tag-length — authTagLength is set to 16
   const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   decipher.setAuthTag(authTag);
   

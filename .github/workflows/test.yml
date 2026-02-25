@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m pip install semgrep
-      - run: semgrep ci --config=auto
+      - run: semgrep scan --config=auto --error --exclude='**/test/**' --exclude='**/dist/**'
 
   # SAST using CodeQL.
   # CodeQL performs deep semantic code analysis and taint tracking (e.g. tracking unvalidated user

@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: bun test
+    command: bun run test
     environment:
       - HOME=/home/tps
       - TPS_TEST_MODE=docker
@@ -14,7 +14,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: bun test test/integration.test.ts
+    command: bun run test
     environment:
       - HOME=/home/tps
       - TPS_TEST_MODE=docker

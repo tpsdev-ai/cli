@@ -3,3 +3,5 @@ node_modules/
 packages/cli/dist/
 packages/agent/dist/
 *.min.js
+# Test files contain intentional test secrets and patterns
+**/test/**
