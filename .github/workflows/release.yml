@@ -41,7 +41,7 @@ jobs:
           ART: ${{ matrix.artifact }}
         run: |
           cd packages/cli
-          bun build --compile packages/cli/bin/tps.ts \
+          bun build --compile ./bin/tps.ts \
             --target=${TARGET} \
             --outfile=dist/${ART}
           sha256sum dist/${ART} > dist/${ART}.sha256
