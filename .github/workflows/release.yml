@@ -79,7 +79,7 @@ jobs:
           path: /tmp/release
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: https://registry.npmjs.org/
       - name: Restore binary payloads into workspace
         run: |
@@ -89,16 +89,12 @@ jobs:
           cp -R /tmp/release/cli-linux-x64/. packages/cli-linux-x64/
       - name: Publish platform packages
         run: |
-          npm publish --provenance --access public --workspace @tpsdev-ai/cli-darwin-arm64
-          npm publish --provenance --access public --workspace @tpsdev-ai/cli-darwin-x64
-          npm publish --provenance --access public --workspace @tpsdev-ai/cli-linux-arm64
-          npm publish --provenance --access public --workspace @tpsdev-ai/cli-linux-x64
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          npm publish --access public --workspace @tpsdev-ai/cli-darwin-arm64
+          npm publish --access public --workspace @tpsdev-ai/cli-darwin-x64
+          npm publish --access public --workspace @tpsdev-ai/cli-linux-arm64
+          npm publish --access public --workspace @tpsdev-ai/cli-linux-x64
       - name: Publish meta package
-        run: npm publish --provenance --access public --workspace @tpsdev-ai/cli
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --workspace @tpsdev-ai/cli
 
   github-release:
     name: GitHub release checksums
