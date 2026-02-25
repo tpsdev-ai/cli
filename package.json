@@ -6,10 +6,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
-    "test": "npm run test --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present",
-    "lint:ci": "npm run lint:ci --workspaces --if-present",
+    "build": "bun run --filter '*' build",
+    "test": "bun test",
+    "lint": "bun run --filter '*' lint",
+    "lint:ci": "bun run --filter '*' lint:ci",
     "tps": "node packages/cli/dist/bin/tps.js"
   },
   "devDependencies": {
