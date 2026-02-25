@@ -11,7 +11,7 @@
     },
     "packages/agent": {
       "name": "@tpsdev-ai/agent",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
         "js-yaml": "^4.1.0",
         "zod": "^3.24.0",
@@ -25,9 +25,9 @@
     },
     "packages/cli": {
       "name": "@tpsdev-ai/cli",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "bin": {
-        "tps": "./dist/bin/tps.js",
+        "tps": "./bin/tps.cjs",
       },
       "dependencies": {
         "@noble/curves": "^2.0.1",
@@ -52,6 +52,40 @@
         "@types/react": "^18.3.0",
         "fast-check": "^4.5.3",
         "typescript": "^5.7.0",
+      },
+      "optionalDependencies": {
+        "@tpsdev-ai/cli-darwin-arm64": "0.3.0",
+        "@tpsdev-ai/cli-darwin-x64": "0.3.0",
+        "@tpsdev-ai/cli-linux-arm64": "0.3.0",
+        "@tpsdev-ai/cli-linux-x64": "0.3.0",
+      },
+    },
+    "packages/cli-darwin-arm64": {
+      "name": "@tpsdev-ai/cli-darwin-arm64",
+      "version": "0.3.0",
+      "bin": {
+        "tps": "./tps",
+      },
+    },
+    "packages/cli-darwin-x64": {
+      "name": "@tpsdev-ai/cli-darwin-x64",
+      "version": "0.3.0",
+      "bin": {
+        "tps": "./tps",
+      },
+    },
+    "packages/cli-linux-arm64": {
+      "name": "@tpsdev-ai/cli-linux-arm64",
+      "version": "0.3.0",
+      "bin": {
+        "tps": "./tps",
+      },
+    },
+    "packages/cli-linux-x64": {
+      "name": "@tpsdev-ai/cli-linux-x64",
+      "version": "0.3.0",
+      "bin": {
+        "tps": "./tps",
       },
     },
   },
@@ -135,6 +169,14 @@
     "@tpsdev-ai/agent": ["@tpsdev-ai/agent@workspace:packages/agent"],
 
     "@tpsdev-ai/cli": ["@tpsdev-ai/cli@workspace:packages/cli"],
+
+    "@tpsdev-ai/cli-darwin-arm64": ["@tpsdev-ai/cli-darwin-arm64@workspace:packages/cli-darwin-arm64"],
+
+    "@tpsdev-ai/cli-darwin-x64": ["@tpsdev-ai/cli-darwin-x64@workspace:packages/cli-darwin-x64"],
+
+    "@tpsdev-ai/cli-linux-arm64": ["@tpsdev-ai/cli-linux-arm64@workspace:packages/cli-linux-arm64"],
+
+    "@tpsdev-ai/cli-linux-x64": ["@tpsdev-ai/cli-linux-x64@workspace:packages/cli-linux-x64"],
 
     "@tybys/wasm-util": ["@tybys/wasm-util@0.10.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg=="],
 
