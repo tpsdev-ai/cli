@@ -61,11 +61,7 @@ exit 0
       encoding: "utf-8",
       env: process.env,
     });
-    if (result.status !== 0) {
-      console.error(`[backup-test] exit=${result.status} HOME=${process.env.HOME}`);
-      console.error(`[backup-test] stderr=${result.stderr}`);
-      console.error(`[backup-test] stdout=${result.stdout}`);
-    }
+    
     return result;
   }
 
