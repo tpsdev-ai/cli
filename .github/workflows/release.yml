@@ -89,14 +89,26 @@ jobs:
           cp -R /tmp/release/cli-linux-x64/. packages/cli-linux-x64/
       - name: Publish platform packages
         run: |
-          npm publish --access public --workspace @tpsdev-ai/cli-darwin-arm64
-          npm publish --access public --workspace @tpsdev-ai/cli-darwin-x64
-          npm publish --access public --workspace @tpsdev-ai/cli-linux-arm64
-          npm publish --access public --workspace @tpsdev-ai/cli-linux-x64
+          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64; do
+            npm publish --access public --workspace "@tpsdev-ai/$pkg" || {
+              if npm view "@tpsdev-ai/$pkg@${{ github.ref_name }}" version 2>/dev/null; then
+                echo "⏭️ @tpsdev-ai/$pkg already published, skipping"
+              else
+                echo "❌ Failed to publish @tpsdev-ai/$pkg" && exit 1
+              fi
+            }
+          done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish meta package
-        run: npm publish --access public --workspace @tpsdev-ai/cli
+        run: |
+          npm publish --access public --workspace @tpsdev-ai/cli || {
+            if npm view "@tpsdev-ai/cli@${{ github.ref_name }}" version 2>/dev/null; then
+              echo "⏭️ @tpsdev-ai/cli already published, skipping"
+            else
+              exit 1
+            fi
+          }
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
