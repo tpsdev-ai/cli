@@ -11,6 +11,7 @@ const cli = meow(
     roster <action>   Agent directory (list/show/find)
     review <name>     Performance review for a specific agent
     office <action>   Branch office sandbox lifecycle (start/stop/list/status/kill)
+    bootstrap <agent-id>  Bring a hired agent to operational state
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
     identity <action> Key management (init/show/register/list/revoke/verify)
@@ -39,6 +40,7 @@ const cli = meow(
     $ tps mail log flint --since 2026-02-20
     $ tps office start branch-a
     $ tps office status branch-a
+    $ tps bootstrap flint
     $ tps review flint
 
   Built-in personas: developer, designer, support, ea, ops, strategy, security
@@ -160,6 +162,22 @@ async function main() {
       runReview({ agentName, configPath: cli.flags.config, deep: cli.flags.deep });
       break;
     }
+    case "bootstrap": {
+      const agentId = rest[0];
+      if (!agentId) {
+        console.error("Usage: tps bootstrap <agent-id>");
+        process.exit(1);
+      }
+
+      const { runBootstrap } = await import("../src/commands/bootstrap.js");
+      await runBootstrap({
+        agentId,
+        configPath: cli.flags.config,
+        channel: cli.flags.channel,
+      });
+      break;
+    }
+
     case "office": {
       const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup" | undefined;
       const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill", "setup"];

@@ -1,0 +1,20 @@
+[meta]
+name = "tps-bootstrap"
+version = "1.0.0"
+description = "Bootstrap protocol checks and health verification."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+# Workspace write access for generated files and health checks
+paths = [
+  { path = "/workspace", access = "readwrite" },
+  { path = "/tmp", access = "readwrite" },
+]
+
+# Restrict network to local gateway verification only.
+[network]
+block = false
+# NOTE: nono parser expects allowlist entries in policy tests; keep explicit local host scope.
+allow = ["127.0.0.1"]
