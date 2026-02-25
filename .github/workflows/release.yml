@@ -44,6 +44,7 @@ jobs:
           cd packages/cli
           bun build --compile ./bin/tps.ts \
             --target=${TARGET} \
+            --external react-devtools-core \
             --outfile=dist/${ART}
           sha256sum dist/${ART} > dist/${ART}.sha256
       - name: Stage binary
