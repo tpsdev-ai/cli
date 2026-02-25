@@ -60,6 +60,9 @@ The backup must **NOT** include:
 - **[ARCH-3]** Archive must be scanned before finalization to ensure zero absolute paths leak into manifest or file contents.
 - **[ARCH-4]** Restore must be transactional: move existing workspace to `.backup` suffix, restore into clean directory, run health check. Only delete `.backup` on success. On failure, roll back.
 - **[ARCH-5]** Temp directories used during backup/restore must be cleaned up via `try/finally` even on failure.
+- **[S27-F]** Tar extraction must validate every file path resolves within the target directory (Zip Slip prevention). Use `path.resolve()` and verify it starts with `targetDir + path.sep`.
+- **[S27-G]** Backup archives must be written with `0600` permissions — memory files may contain sensitive context.
+- **[S27-H]** Cron schedule registration must use sanitized agent IDs only (via `sanitizeIdentifier`) and strict string templating. Never pass raw input to `exec('crontab')`. Prefer OpenClaw cron over system crontab.
 
 ## Non-Goals
 - Cross-host network transfer (use `scp`/`rsync` externally for now)
