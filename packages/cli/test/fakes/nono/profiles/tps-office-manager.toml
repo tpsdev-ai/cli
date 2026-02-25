@@ -1,0 +1,21 @@
+[meta]
+name = "tps-office-manager"
+version = "1.0.0"
+description = "tps office manager — installs dependencies and tools."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+# Allow read/write to system binary and package directories to install tools
+paths = [
+  { path = "/usr/local/bin", access = "readwrite" },
+  { path = "/usr/bin", access = "readwrite" },
+  { path = "/usr/lib/node_modules", access = "readwrite" },
+  { path = "/var/cache/apk", access = "readwrite" },
+  { path = "/lib/apk", access = "readwrite" },
+  { path = "/etc/apk", access = "readwrite" }
+]
+
+[network]
+block = false # Must allow network to download packages

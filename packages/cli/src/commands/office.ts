@@ -13,16 +13,18 @@ import { isSandboxReady, loadImageIntoSandbox, sandboxExec, sandboxSocketPath, w
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
 import { branchRoot as sharedBranchRoot, resolveTeamId, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
+import { runOfficeManager, OFFICE_READY_MARKER, loadWorkspaceManifest } from "./office-manager.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface OfficeArgs {
-  action: "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill";
+  action: "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup";
   agent?: string;
   command?: string[];
   manifest?: string;
   soundstage?: boolean;
   joinToken?: string;
+  dryRun?: boolean;
 }
 
 const BOOTSTRAP_TEMPLATE = `#!/bin/bash
@@ -242,6 +244,21 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       console.log(`✓ Sandbox ready for ${agent}.`);
+
+      // Auto-run Office Manager if a workspace manifest exists
+      if (loadWorkspaceManifest(ws)) {
+        console.log("Workspace manifest found — running Office Manager...");
+        await runOfficeManager(ws, { dryRun: false });
+      }
+
+      return;
+    }
+
+    case "setup": {
+      const agent = validateAgent(args.agent);
+      const ws = workspacePath(agent);
+      const ok = await runOfficeManager(ws, { dryRun: args.dryRun ?? false });
+      if (!ok) process.exit(1);
       return;
     }
 

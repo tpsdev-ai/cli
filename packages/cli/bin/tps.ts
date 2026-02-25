@@ -161,13 +161,13 @@ async function main() {
       break;
     }
     case "office": {
-      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | undefined;
-      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill"];
+      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup" | undefined;
+      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill", "setup"];
       // Backward compatibility: `tps office <agent>` maps to `start <agent>`.
       const isLegacy = action && !validActions.includes(action);
       if ((!action && !isLegacy) || (!isLegacy && !validActions.includes(action!))) {
         console.error(
-          "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office kill"
+          "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill"
         );
         process.exit(1);
       }
@@ -193,6 +193,9 @@ async function main() {
           process.exit(1);
         }
         await runOffice({ action: "revoke", agent: rest[1] });
+      } else if (action === "setup") {
+        const dryRun = process.argv.includes("--dry-run") || process.argv.includes("--dry");
+        await runOffice({ action: "setup", agent: rest[1], dryRun });
       } else {
         const soundstageIdx = process.argv.indexOf("--soundstage");
         const isSoundstage = soundstageIdx >= 0 || cli.flags.soundstage;

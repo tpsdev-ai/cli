@@ -71,7 +71,7 @@ export async function decryptVault(vault: VaultData, passphrase: string): Promis
 
   const key = await deriveKey(passphrase, salt, params);
   
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   decipher.setAuthTag(authTag);
   
   let plaintext = decipher.update(vault.ciphertext, "base64", "utf8");
