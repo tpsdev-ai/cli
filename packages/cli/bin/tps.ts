@@ -12,6 +12,8 @@ const cli = meow(
     review <name>     Performance review for a specific agent
     office <action>   Branch office sandbox lifecycle (start/stop/list/status/kill)
     bootstrap <agent-id>  Bring a hired agent to operational state
+    backup <agent-id> [--schedule daily|off] [--keep n] [--sanitize]  Backup agent workspace
+    restore <agent-id> <archive> [--clone] [--overwrite] [--from <archive>] Restore agent workspace from a backup
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
     identity <action> Key management (init/show/register/list/revoke/verify)
@@ -41,6 +43,8 @@ const cli = meow(
     $ tps office start branch-a
     $ tps office status branch-a
     $ tps bootstrap flint
+    $ tps backup flint --schedule daily
+    $ tps restore flint ~/.tps/backups/flint/old.tps-backup.tar.gz
     $ tps review flint
 
   Built-in personas: developer, designer, support, ea, ops, strategy, security
@@ -72,6 +76,12 @@ const cli = meow(
       baseModel: { type: "string" },
       since: { type: "string" },
       limit: { type: "number" },
+      from: { type: "string" },
+      clone: { type: "boolean", default: false },
+      overwrite: { type: "boolean", default: false },
+      schedule: { type: "string" },
+      keep: { type: "number" },
+      sanitize: { type: "boolean", default: true },
       listen: { type: "number" },
       host: { type: "string" },
       force: { type: "boolean", default: false },
@@ -299,6 +309,40 @@ async function main() {
         key = rest[1];
       }
       await runSecrets({ action, key, value, json: cli.flags.json });
+      break;
+    }
+    case "backup": {
+      const agentId = rest[0];
+      if (!agentId) {
+        console.error("Usage: tps backup <agent-id> [--schedule daily|off] [--keep n]");
+        process.exit(1);
+      }
+      const { runBackup } = await import("../src/commands/backup.js");
+      await runBackup({
+        agentId,
+        keep: typeof cli.flags.keep === "number" ? Number(cli.flags.keep) : undefined,
+        schedule: cli.flags.schedule,
+        sanitize: cli.flags.sanitize,
+        configPath: cli.flags.config,
+      });
+      break;
+    }
+    case "restore": {
+      const agentId = rest[0];
+      const archivePath = cli.flags.from || rest[1];
+      if (!agentId || !archivePath) {
+        console.error("Usage: tps restore <agent-id> <archive> [--from <archive>] [--clone] [--overwrite] [--force]");
+        process.exit(1);
+      }
+      const { runRestore } = await import("../src/commands/backup.js");
+      await runRestore({
+        agentId,
+        archivePath,
+        force: !!cli.flags.force,
+        overwrite: !!cli.flags.overwrite,
+        clone: !!cli.flags.clone,
+        configPath: cli.flags.config,
+      });
       break;
     }
     case "branch": {

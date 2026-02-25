@@ -32,7 +32,9 @@ export type NonoProfile =
   | "tps-roster"
   | "tps-review-local"
   | "tps-review-deep"
-  | "tps-bootstrap";
+  | "tps-bootstrap"
+  | "tps-backup"
+  | "tps-restore";
 
 export interface NonoOptions {
   /** Override workdir for the nono sandbox (--workdir flag) */

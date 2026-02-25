@@ -1,0 +1,18 @@
+[meta]
+name = "tps-backup"
+version = "1.0.0"
+description = "Backup agent workspace for portability and recovery."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+paths = [
+  { path = "/workspace", access = "readwrite" },
+  { path = "/tmp", access = "readwrite" },
+  { path = "/home", access = "readwrite" }
+]
+
+[network]
+# Backup creation stays local.
+block = true

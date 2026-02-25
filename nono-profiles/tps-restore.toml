@@ -1,0 +1,18 @@
+[meta]
+name = "tps-restore"
+version = "1.0.0"
+description = "Restore agent workspace and run post-restore health check."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+paths = [
+  { path = "/tmp", access = "readwrite" },
+  { path = "/home", access = "readwrite" }
+]
+
+[network]
+# Health checks may hit local gateway.
+block = false
+allow = ["127.0.0.1", "localhost"]
