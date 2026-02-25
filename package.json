@@ -9,6 +9,7 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
+    "lint:ci": "npm run lint:ci --workspaces --if-present",
     "tps": "node packages/cli/dist/bin/tps.js"
   },
   "devDependencies": {

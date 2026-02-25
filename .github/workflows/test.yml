@@ -40,8 +40,10 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - run: bun run build
-      - run: chmod +x test/fakes/nono/bin/nono
-      - run: bun test --coverage
+      - run: |
+          chmod +x test/fakes/nono/bin/nono 2>/dev/null || true
+          chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
+      - run: bun run test
 
   audit:
     name: Dependency Audit
