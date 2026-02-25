@@ -1,6 +1,6 @@
 {
   "name": "@tpsdev-ai/cli-darwin-x64",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "TPS CLI native binary for darwin-x64",
   "os": ["darwin"],
   "cpu": ["x64"],
