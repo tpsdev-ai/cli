@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build Binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            pkg: cli-darwin-arm64
+            artifact: tps-darwin-arm64
+          - target: bun-darwin-x64
+            pkg: cli-darwin-x64
+            artifact: tps-darwin-x64
+          - target: bun-linux-arm64
+            pkg: cli-linux-arm64
+            artifact: tps-linux-arm64
+          - target: bun-linux-x64
+            pkg: cli-linux-x64
+            artifact: tps-linux-x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Build ${TARGET}
+        env:
+          TARGET: ${{ matrix.target }}
+          PKG: ${{ matrix.pkg }}
+          ART: ${{ matrix.artifact }}
+        run: |
+          cd packages/cli
+          bun build --compile packages/cli/bin/tps.ts \
+            --target=${TARGET} \
+            --outfile=dist/${ART}
+          sha256sum dist/${ART} > dist/${ART}.sha256
+      - name: Stage binary
+        env:
+          PKG: ${{ matrix.pkg }}
+          ART: ${{ matrix.artifact }}
+        run: |
+          mkdir -p /tmp/release/${PKG}
+          cp packages/cli/dist/${ART} /tmp/release/${PKG}/tps
+          cp packages/cli/dist/${ART}.sha256 /tmp/release/${PKG}/${ART}.sha256
+          chmod +x /tmp/release/${PKG}/tps
+          cp packages/${PKG}/README.md /tmp/release/${PKG}/README.md
+      - name: Upload staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.pkg }}
+          path: /tmp/release/${{ matrix.pkg }}
+          if-no-files-found: error
+
+  publish-packages:
+    name: Publish npm packages
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: https://registry.npmjs.org/
+      - name: Restore binary payloads into workspace
+        run: |
+          cp -R /tmp/release/cli-darwin-arm64/. packages/cli-darwin-arm64/
+          cp -R /tmp/release/cli-darwin-x64/. packages/cli-darwin-x64/
+          cp -R /tmp/release/cli-linux-arm64/. packages/cli-linux-arm64/
+          cp -R /tmp/release/cli-linux-x64/. packages/cli-linux-x64/
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm publish --workspace @tpsdev-ai/cli-darwin-arm64
+          npm publish --workspace @tpsdev-ai/cli-darwin-x64
+          npm publish --workspace @tpsdev-ai/cli-linux-arm64
+          npm publish --workspace @tpsdev-ai/cli-linux-x64
+      - name: Publish meta package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --workspace @tpsdev-ai/cli
+
+  github-release:
+    name: GitHub release checksums
+    needs: [build-binaries, publish-packages]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/release
+      - name: Create release artifacts
+        run: |
+          cat /tmp/release/cli-darwin-arm64/tps-darwin-arm64.sha256
+          cat /tmp/release/cli-darwin-x64/tps-darwin-x64.sha256
+          cat /tmp/release/cli-linux-arm64/tps-linux-arm64.sha256
+          cat /tmp/release/cli-linux-x64/tps-linux-x64.sha256
+      - name: Publish checksums to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /tmp/release/cli-darwin-arm64/tps-darwin-arm64
+            /tmp/release/cli-darwin-arm64/tps-darwin-arm64.sha256
+            /tmp/release/cli-darwin-x64/tps-darwin-x64
+            /tmp/release/cli-darwin-x64/tps-darwin-x64.sha256
+            /tmp/release/cli-linux-arm64/tps-linux-arm64
+            /tmp/release/cli-linux-arm64/tps-linux-arm64.sha256
+            /tmp/release/cli-linux-x64/tps-linux-x64
+            /tmp/release/cli-linux-x64/tps-linux-x64.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

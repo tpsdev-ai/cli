@@ -1,13 +1,24 @@
 {
   "name": "@tpsdev-ai/cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TPS Report CLI — because every agent needs the proper paperwork.",
   "type": "module",
   "bin": {
-    "tps": "./dist/bin/tps.js"
+    "tps": "./bin/tps.cjs"
+  },
+  "optionalDependencies": {
+    "@tpsdev-ai/cli-darwin-arm64": "0.3.0",
+    "@tpsdev-ai/cli-darwin-x64": "0.3.0",
+    "@tpsdev-ai/cli-linux-arm64": "0.3.0",
+    "@tpsdev-ai/cli-linux-x64": "0.3.0"
   },
   "scripts": {
     "build": "tsc",
+    "build:binary": "bun run build:binary:darwin-arm64 && bun run build:binary:darwin-x64 && bun run build:binary:linux-arm64 && bun run build:binary:linux-x64",
+    "build:binary:darwin-arm64": "bun build --compile bin/tps.ts --target=bun-darwin-arm64 --outfile=dist/tps-darwin-arm64",
+    "build:binary:darwin-x64": "bun build --compile bin/tps.ts --target=bun-darwin-x64 --outfile=dist/tps-darwin-x64",
+    "build:binary:linux-arm64": "bun build --compile bin/tps.ts --target=bun-linux-arm64 --outfile=dist/tps-linux-arm64",
+    "build:binary:linux-x64": "bun build --compile bin/tps.ts --target=bun-linux-x64 --outfile=dist/tps-linux-x64",
     "dev": "tsc --watch",
     "start": "node dist/bin/tps.js",
     "tps": "node dist/bin/tps.js",
@@ -16,7 +27,12 @@
     "pretest": "tsc",
     "test": "bun test"
   },
-  "keywords": ["cli", "agents", "openclaw", "tps"],
+  "keywords": [
+    "cli",
+    "agents",
+    "openclaw",
+    "tps"
+  ],
   "license": "Apache-2.0",
   "dependencies": {
     "@noble/curves": "^2.0.1",
@@ -42,7 +58,15 @@
     "fast-check": "^4.5.3",
     "typescript": "^5.7.0"
   },
-  "files": ["dist", "nono-profiles", "personas", "reports"],
+  "files": [
+    "bin",
+    "nono-profiles",
+    "personas",
+    "reports",
+    "README.md"
+  ],
   "author": "tpsdev-ai",
-  "publishConfig": { "access": "public" }
+  "publishConfig": {
+    "access": "public"
+  }
 }
