@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "build": "bun run --filter '*' build",
-    "test": "bun test",
+    "test": "bun run --filter '*' test",
     "lint": "bun run --filter '*' lint",
     "lint:ci": "bun run --filter '*' lint:ci",
     "tps": "node packages/cli/dist/bin/tps.js"
