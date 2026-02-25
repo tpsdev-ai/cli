@@ -1,0 +1,19 @@
+[meta]
+name = "tps-status"
+version = "1.0.0"
+description = "Agent status/heartbeat updates and dashboard reads for sandbox-safe host reporting."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+paths = [
+  { path = "/workspace", access = "readwrite" },
+  { path = "$HOME/.tps/status/nodes/$TPS_AGENT_ID", access = "readwrite" },
+  { path = "$HOME/.tps/status/archive", access = "write" }
+]
+
+[network]
+# Status collection may read local gateway/ping only.
+block = false
+allow = ["127.0.0.1", "localhost"]

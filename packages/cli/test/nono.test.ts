@@ -224,6 +224,16 @@ describe("fake nono binary", () => {
     expect(log).toContain("PROFILE_LOADED profile=tps-restore");
   });
 
+  test("loads tps-status profile", () => {
+    const r = runFakeNono(
+      ["run", "--profile", "tps-status", "--", "echo", "status-ok"],
+      { NONO_FAKE_LOG: fakeLog }
+    );
+    expect(r.status).toBe(0);
+    const log = readLog();
+    expect(log).toContain("PROFILE_LOADED profile=tps-status");
+  });
+
   test("exits non-zero for unknown profile", () => {
     const r = runFakeNono(
       ["run", "--profile", "nonexistent-profile", "--", "echo", "x"],

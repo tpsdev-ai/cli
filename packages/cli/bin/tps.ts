@@ -14,6 +14,8 @@ const cli = meow(
     bootstrap <agent-id>  Bring a hired agent to operational state
     backup <agent-id> [--schedule daily|off] [--keep n] [--sanitize]  Backup agent workspace
     restore <agent-id> <archive> [--clone] [--overwrite] [--from <archive>] Restore agent workspace from a backup
+    status [agent-id] [--auto-prune] [--prune] [--json] [--cost] [--shared]
+    heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
     identity <action> Key management (init/show/register/list/revoke/verify)
@@ -45,6 +47,9 @@ const cli = meow(
     $ tps bootstrap flint
     $ tps backup flint --schedule daily
     $ tps restore flint ~/.tps/backups/flint/old.tps-backup.tar.gz
+    $ tps status
+    $ tps status flint --cost
+    $ tps heartbeat flint
     $ tps review flint
 
   Built-in personas: developer, designer, support, ea, ops, strategy, security
@@ -88,6 +93,13 @@ const cli = meow(
       follow: { type: "boolean", default: false },
       lines: { type: "number" },
       transport: { type: "string" },
+      autoPrune: { type: "boolean", default: false },
+      prune: { type: "boolean", default: false },
+      staleMinutes: { type: "number" },
+      offlineHours: { type: "number" },
+      shared: { type: "boolean", default: false },
+      cost: { type: "boolean", default: false },
+      statusOverride: { type: "string" },
     },
   }
 );
@@ -342,6 +354,36 @@ async function main() {
         overwrite: !!cli.flags.overwrite,
         clone: !!cli.flags.clone,
         configPath: cli.flags.config,
+      });
+      break;
+    }
+    case "heartbeat": {
+      const agentId = rest[0];
+      if (!agentId) {
+        console.error("Usage: tps heartbeat <agent-id>");
+        process.exit(1);
+      }
+      const { runHeartbeat } = await import("../src/commands/status.js");
+      await runHeartbeat({
+        agentId,
+        status: (cli.flags.statusOverride as any) || undefined,
+        nonono: !!cli.flags.nonono,
+        profile: "tps-status",
+      });
+      break;
+    }
+    case "status": {
+      const agentId = rest[0];
+      const { runStatus } = await import("../src/commands/status.js");
+      await runStatus({
+        agentId,
+        autoPrune: !!cli.flags.autoPrune,
+        prune: !!cli.flags.prune,
+        json: !!cli.flags.json,
+        staleMinutes: cli.flags.staleMinutes ? Number(cli.flags.staleMinutes) : undefined,
+        offlineHours: cli.flags.offlineHours ? Number(cli.flags.offlineHours) : undefined,
+        cost: !!cli.flags.cost,
+        shared: !!cli.flags.shared,
       });
       break;
     }
