@@ -6,10 +6,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "bun run --filter '*' build",
-    "test": "bun run --filter '*' test",
-    "lint": "bun run --filter '*' lint",
-    "lint:ci": "bun run --filter '*' lint:ci",
+    "build": "cd packages/agent && bun run build && cd ../cli && bun run build",
+    "test": "cd packages/agent && bun test && cd ../cli && bun test",
+    "lint": "cd packages/cli && bun run lint",
+    "lint:ci": "cd packages/cli && bun run lint:ci",
     "tps": "node packages/cli/dist/bin/tps.js"
   },
   "devDependencies": {
