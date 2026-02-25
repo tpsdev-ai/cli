@@ -56,11 +56,13 @@ exit 0
   });
 
   function run(args: string[]) {
-    return spawnSync("bun", [TPS_BIN, ...args], {
+    const result = spawnSync("bun", [TPS_BIN, ...args], {
       cwd: tempRoot,
       encoding: "utf-8",
       env: process.env,
     });
+    
+    return result;
   }
 
   function createWorkspace(agent: string) {

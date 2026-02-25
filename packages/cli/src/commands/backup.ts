@@ -220,8 +220,9 @@ function readManifestFromArchive(tmpDir: string): Manifest {
 function runTarCreate(stagingDir: string, archivePath: string): void {
   const cmd = ["tar", "-czf", archivePath, "-C", stagingDir, "."];
   const res = spawnSync(cmd[0], cmd.slice(1), { encoding: "utf-8" });
-  if (res.status !== 0) {
-    throw new Error(`tar create failed: ${res.stderr || res.stdout}`);
+  // GNU tar exits 1 for "file changed as we read it" — archive is still valid
+  if (res.status !== 0 && res.status !== 1) {
+    throw new Error(`tar create failed (exit ${res.status}): ${res.stderr || res.stdout}`);
   }
 }
 
