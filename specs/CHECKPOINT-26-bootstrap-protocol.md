@@ -24,11 +24,13 @@ The bootstrap command must verify (and scaffold if missing) these workspace file
 - Generate or validate `openclaw.json` fragment for the agent
 - Set model, workspace path, channel bindings
 - Wire up Discord bot token and channel mappings if provided
+- **[S26-D]** The bootstrap process MUST NOT allow an agent to grant itself elevated capabilities or modify other agents' configurations. Config generation is scoped to the target agent's own fragment only.
 
 ### 3. Team Introduction Protocol
 - After bootstrap completes, send an introduction mail to the team mailbox
 - Include: agent name, role, model, capabilities summary
 - Other agents can discover the new agent via `tps roster`
+- **[S26-C]** The `from` field on introduction mail MUST be `system:bootstrap`, not the new agent's identity. Prevents identity spoofing during onboarding.
 
 ### 4. Operational Verification
 After bootstrap, run a health check:
@@ -37,10 +39,11 @@ After bootstrap, run a health check:
 - Can it send/receive mail?
 - Is it registered in the roster?
 
-Write a `.bootstrap-complete` marker with timestamp on success.
+**[S26-B]** Write the `.bootstrap-complete` marker OUTSIDE the agent's writable workspace — in the team root or a dedicated state directory (following the `soundstage.json` pattern). This prevents a compromised agent from faking completion to bypass health checks.
 
 ### 5. Nono Profile
 Create `tps-bootstrap` profile — needs workspace write access and network access for gateway verification, but should NOT have broad system access.
+- **[S26-A]** Network access MUST be restricted to `127.0.0.1` (local gateway only). No outbound internet access during bootstrap. A compromised base image or init script must not be able to exfiltrate data or reach external servers.
 
 ## Non-Goals
 - Automated Discord bot creation (requires human OAuth flow)
