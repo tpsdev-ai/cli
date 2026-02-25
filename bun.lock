@@ -4,6 +4,31 @@
   "workspaces": {
     "": {
       "name": "@tpsdev-ai/cli",
+      "devDependencies": {
+        "@biomejs/biome": "^2.4.4",
+        "typescript": "^5.7.0",
+      },
+    },
+    "packages/agent": {
+      "name": "@tpsdev-ai/agent",
+      "version": "0.1.0",
+      "dependencies": {
+        "js-yaml": "^4.1.0",
+        "zod": "^3.24.0",
+      },
+      "devDependencies": {
+        "@biomejs/biome": "^2.4.4",
+        "@types/js-yaml": "^4.0.9",
+        "@types/node": "^22.0.0",
+        "typescript": "^5.7.0",
+      },
+    },
+    "packages/cli": {
+      "name": "@tpsdev-ai/cli",
+      "version": "0.1.0",
+      "bin": {
+        "tps": "./dist/bin/tps.js",
+      },
       "dependencies": {
         "@noble/curves": "^2.0.1",
         "@noble/ed25519": "^3.0.0",
@@ -106,6 +131,10 @@
     "@node-rs/argon2-win32-ia32-msvc": ["@node-rs/argon2-win32-ia32-msvc@2.0.2", "", { "os": "win32", "cpu": "ia32" }, "sha512-GsE2ezwAYwh72f9gIjbGTZOf4HxEksb5M2eCaj+Y5rGYVwAdt7C12Q2e9H5LRYxWcFvLH4m4jiSZpQQ4upnPAQ=="],
 
     "@node-rs/argon2-win32-x64-msvc": ["@node-rs/argon2-win32-x64-msvc@2.0.2", "", { "os": "win32", "cpu": "x64" }, "sha512-cJxWXanH4Ew9CfuZ4IAEiafpOBCe97bzoKowHCGk5lG/7kR4WF/eknnBlHW9m8q7t10mKq75kruPLtbSDqgRTw=="],
+
+    "@tpsdev-ai/agent": ["@tpsdev-ai/agent@workspace:packages/agent"],
+
+    "@tpsdev-ai/cli": ["@tpsdev-ai/cli@workspace:packages/cli"],
 
     "@tybys/wasm-util": ["@tybys/wasm-util@0.10.1", "", { "dependencies": { "tslib": "^2.4.0" } }, "sha512-9tTaPJLSiejZKx+Bmog4uSubteqTvFrVrURwkmHixBo0G4seD0zUxp98E1DzUBJxLQ3NPwXrGKDiVjwx/DpPsg=="],
 

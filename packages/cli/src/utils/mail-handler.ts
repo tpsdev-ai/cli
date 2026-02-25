@@ -41,7 +41,7 @@ export async function runHandlerPipeline(
     if (manifest.routing) {
       for (const rule of manifest.routing) {
         try {
-          const re = new RegExp(rule.pattern);
+          const re = new RegExp(rule.pattern); // nosemgrep: detect-non-literal-regexp — pattern from validated tps.yaml config
           if (re.test(bodyToTest)) {
             return { type: "forward", to: rule.to, body: msg.body };
           }
@@ -112,7 +112,7 @@ export async function runHandlerPipeline(
           continue;
         }
       } catch (err) {
-        console.error(`[HANDLER] exception running ${manifest.name}:`, err);
+        console.error("[HANDLER] exception running %s:", manifest.name, err); // nosemgrep: unsafe-formatstring
         continue;
       }
     }

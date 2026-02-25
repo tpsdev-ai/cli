@@ -2,7 +2,7 @@ import { z } from "zod";
 
 const RegexStringSchema = z.string().refine((val) => {
   try {
-    new RegExp(val);
+    new RegExp(val); // nosemgrep: detect-non-literal-regexp — validating user-provided pattern from config
     return true;
   } catch {
     return false;

@@ -40,7 +40,7 @@ export interface AgentInfo {
  */
 function extractField(content: string, field: string): string | undefined {
   // Match "**Field:** value" pattern
-  const re = new RegExp(`\\*\\*${field}:\\*\\*\\s*(.+)`, "i");
+  const re = new RegExp(`\\*\\*${field}:\\*\\*\\s*(.+)`, "i"); // nosemgrep: detect-non-literal-regexp — field is from internal hardcoded calls only
   const match = content.match(re);
   return match?.[1]?.trim();
 }
