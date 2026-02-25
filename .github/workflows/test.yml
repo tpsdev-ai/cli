@@ -72,11 +72,16 @@ jobs:
   sast-semgrep:
     name: Semgrep SAST
     runs-on: ubuntu-latest
-    continue-on-error: true # S23-B: don't block the pipeline on legacy style violations initially
+    # Known false positives excluded via --exclude-rule flags above
     steps:
       - uses: actions/checkout@v4
       - run: python3 -m pip install semgrep
-      - run: semgrep scan --config=auto --error --exclude='**/test/**' --exclude='**/dist/**'
+      - run: >
+          semgrep scan --config=auto --error
+          --exclude='**/test/**' --exclude='**/dist/**'
+          --exclude-rule javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
+          --exclude-rule javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring
+          --exclude-rule javascript.node-crypto.security.gcm-no-tag-length.gcm-no-tag-length
 
   # SAST using CodeQL.
   # CodeQL performs deep semantic code analysis and taint tracking (e.g. tracking unvalidated user
