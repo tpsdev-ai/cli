@@ -93,8 +93,12 @@ jobs:
           npm publish --access public --workspace @tpsdev-ai/cli-darwin-x64
           npm publish --access public --workspace @tpsdev-ai/cli-linux-arm64
           npm publish --access public --workspace @tpsdev-ai/cli-linux-x64
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish meta package
         run: npm publish --access public --workspace @tpsdev-ai/cli
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   github-release:
     name: GitHub release checksums
