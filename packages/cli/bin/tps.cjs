@@ -8,7 +8,9 @@ const pkg = `@tpsdev-ai/cli-${platform}-${arch}`;
 
 function runBinary() {
   try {
-    const binPath = require.resolve(`${pkg}/tps`);
+    const path = require('path');
+    const pkgJson = require.resolve(`${pkg}/package.json`);
+    const binPath = path.join(path.dirname(pkgJson), 'tps');
     execFileSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
     return;
   } catch (err) {
