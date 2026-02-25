@@ -62,10 +62,9 @@ exit 0
       env: process.env,
     });
     if (result.status !== 0) {
-      console.error(`[backup-test] exit=${result.status} HOME=${process.env.HOME} cwd=${tempRoot}`);
+      console.error(`[backup-test] exit=${result.status} HOME=${process.env.HOME}`);
       console.error(`[backup-test] stderr=${result.stderr}`);
       console.error(`[backup-test] stdout=${result.stdout}`);
-      console.error(`[backup-test] error=${result.error}`);
     }
     return result;
   }
