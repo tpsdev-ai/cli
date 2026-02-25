@@ -52,6 +52,15 @@ The backup must **NOT** include:
 - `tps-backup` — read-only access to agent workspace + write to `~/.tps/backups/`
 - `tps-restore` — write access to target agent workspace + `~/.tps/restore-state/`. Network: localhost only.
 
+### 7. Security & Robustness Constraints (from K&S review)
+- **[S27-D]** `tps backup` must warn if `TOOLS.md` contains patterns that look like IPs, hostnames, or credentials. Add `--sanitize` flag (default: warn).
+- **[S27-E]** `tps backup --schedule` must verify a valid vault key is available to the cron environment before registering the schedule.
+- **[ARCH-1]** `tps restore` must verify source host fingerprint matches current host, or require `--force` to acknowledge cross-host restore.
+- **[ARCH-2]** Clone name replacement must use structured marker-based replacement (e.g., `**Name:**` in IDENTITY.md, `name:` fields), not naive find-and-replace.
+- **[ARCH-3]** Archive must be scanned before finalization to ensure zero absolute paths leak into manifest or file contents.
+- **[ARCH-4]** Restore must be transactional: move existing workspace to `.backup` suffix, restore into clean directory, run health check. Only delete `.backup` on success. On failure, roll back.
+- **[ARCH-5]** Temp directories used during backup/restore must be cleaned up via `try/finally` even on failure.
+
 ## Non-Goals
 - Cross-host network transfer (use `scp`/`rsync` externally for now)
 - Incremental/differential backups (full snapshot only for v1)
