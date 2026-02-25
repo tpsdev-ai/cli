@@ -55,7 +55,7 @@ jobs:
           bun-version: latest
       - run: bun install --frozen-lockfile
       - name: Check for known vulnerabilities
-        run: bunx audit-ci --high
+        run: bun audit
 
   docker:
     name: Docker Integration
