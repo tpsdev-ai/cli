@@ -56,11 +56,15 @@ exit 0
   });
 
   function run(args: string[]) {
-    return spawnSync("bun", [TPS_BIN, ...args], {
+    const result = spawnSync("bun", [TPS_BIN, ...args], {
       cwd: tempRoot,
       encoding: "utf-8",
       env: process.env,
     });
+    if (result.status !== 0) {
+      console.error(`[backup-test] exit=${result.status} stderr=${result.stderr} stdout=${result.stdout}`);
+    }
+    return result;
   }
 
   function createWorkspace(agent: string) {
