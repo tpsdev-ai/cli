@@ -1,7 +1,7 @@
 {
   "name": "@tpsdev-ai/cli",
-  "version": "0.4.2",
-  "description": "TPS Report CLI \u2014 because every agent needs the proper paperwork.",
+  "version": "0.5.0",
+  "description": "TPS Report CLI — because every agent needs the proper paperwork.",
   "type": "module",
   "bin": {
     "tps": "./bin/tps.cjs"
