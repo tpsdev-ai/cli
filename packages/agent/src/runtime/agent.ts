@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { AgentConfig } from "./types.js";
 import { EventLoop } from "./event-loop.js";
 import { MailClient } from "../io/mail.js";
@@ -32,7 +34,24 @@ export class AgentRuntime {
 
   async start(): Promise<void> {
     const checkInbox = async () => this.mail.checkNewMail();
-    await this.loop.run(checkInbox);
+    const pidPath = join(this.config.workspace, ".tps-agent.pid");
+    mkdirSync(dirname(pidPath), { recursive: true });
+    writeFileSync(pidPath, `${process.pid}\n`, "utf-8");
+
+    const shutdown = new Promise<void>((resolve) => {
+      const onStop = async () => {
+        await this.loop.stop();
+        resolve();
+      };
+      process.once("SIGINT", onStop);
+      process.once("SIGTERM", onStop);
+    });
+
+    try {
+      await Promise.race([this.loop.run(checkInbox), shutdown]);
+    } finally {
+      rmSync(pidPath, { force: true });
+    }
   }
 
   async stop(): Promise<void> {
@@ -45,6 +64,10 @@ export class AgentRuntime {
 
   getState(): string {
     return this.loop.getState();
+  }
+
+  isHealthy(): boolean {
+    return this.getState() !== "stopped";
   }
 
   describeBoundaries(): string {

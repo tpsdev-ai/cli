@@ -1,12 +1,5 @@
 import type { MailMessage } from "../io/mail.js";
-import type {
-  AgentConfig,
-  AgentState,
-  CompletionRequest,
-  CompletionResponse,
-  ToolCall,
-  ToolSpec,
-} from "./types.js";
+import type { AgentConfig, CompletionRequest, ToolCall, ToolSpec, AgentState } from "./types.js";
 import type { MemoryStore } from "../io/memory.js";
 import type { ContextManager } from "../io/context.js";
 import type { ProviderManager } from "../llm/provider.js";
@@ -72,7 +65,8 @@ export class EventLoop {
   }
 
   private async processMail(message: MailMessage): Promise<void> {
-    await this.processMessage(message.body);
+    const body = typeof message.body === "string" ? message.body : JSON.stringify(message.body);
+    await this.processMessage(body);
   }
 
   private async processMessage(promptRaw: string): Promise<void> {
@@ -96,15 +90,14 @@ export class EventLoop {
       data: { direction: "in", body: prompt },
     });
 
-    const request: CompletionRequest = {
+    let completion = await this.deps.provider.complete({
       systemPrompt: await this.buildSystemPrompt(),
       messages: [{ role: "user", content: prompt }],
       tools,
       toolChoice: "auto",
       maxTokens: this.deps.config.maxTokens ?? 1024,
-    };
+    });
 
-    let completion = await this.deps.provider.complete(request);
     let turns = 0;
 
     while (true) {
@@ -120,9 +113,7 @@ export class EventLoop {
         });
       }
 
-      if (!completion.toolCalls || completion.toolCalls.length === 0) {
-        return;
-      }
+      if (!completion.toolCalls || completion.toolCalls.length === 0) return;
 
       if (turns++ > 8) {
         await this.deps.memory.append({
@@ -141,8 +132,9 @@ export class EventLoop {
           data: { tool: call.name, args: call.input },
         });
 
-        if (this.deps.reviewGate && this.deps.reviewGate.isHighRisk(call.name)) {
-          await this.deps.reviewGate.requestApproval(call.name, call.input);
+        const reviewBlocked = this.deps.reviewGate?.isHighRisk(call.name) ?? false;
+        if (reviewBlocked) {
+          await this.deps.reviewGate!.requestApproval(call.name, call.input);
           await this.deps.memory.append({
             type: "approval_request",
             ts: new Date().toISOString(),
@@ -172,15 +164,13 @@ export class EventLoop {
         });
       }
 
-      const nextMessages = [
-        ...request.messages,
-        { role: "assistant", content: completion.content ?? "" },
-        ...toolMessages,
-      ];
-
       completion = await this.deps.provider.complete({
-        systemPrompt: request.systemPrompt,
-        messages: nextMessages,
+        systemPrompt: await this.buildSystemPrompt(),
+        messages: [
+          { role: "user", content: prompt },
+          { role: "assistant", content: completion.content ?? "" },
+          ...toolMessages,
+        ] as any,
         tools,
         toolChoice: "auto",
         maxTokens: this.deps.config.maxTokens ?? 1024,
@@ -189,7 +179,6 @@ export class EventLoop {
   }
 
   private async buildSystemPrompt(): Promise<string> {
-    const fs = await import("node:fs/promises");
     const docs = await Promise.all([
       this.fileOrEmpty(`${this.deps.config.workspace}/SOUL.md`),
       this.fileOrEmpty(`${this.deps.config.workspace}/AGENTS.md`),
@@ -197,14 +186,13 @@ export class EventLoop {
       Promise.resolve(this.deps.config.systemPrompt || ""),
     ]);
 
-    const sections = [
+    const docBlock = docs.filter(Boolean).join("\n\n");
+    return [
+      docBlock,
       `Role: ${this.deps.config.name}`,
       `Tools: ${this.deps.tools.list().map((t) => t.name).join(", ") || "(none)"}`,
       `Context: ${this.deps.config.agentId}`,
-    ];
-
-    const docBlock = docs.filter(Boolean).join("\n\n");
-    return `${docBlock}\n\n${sections.join("\n")}`;
+    ].join("\n");
   }
 
   private async fileOrEmpty(path: string): Promise<string> {
