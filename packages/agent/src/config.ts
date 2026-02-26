@@ -22,9 +22,40 @@ export interface AgentRuntimeConfig {
   execAllowlist?: string[];
 }
 
+function interpolateEnvInString(raw: string): string {
+  return raw.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, varName: string) => {
+    const resolved = process.env[varName];
+    if (resolved === undefined) {
+      throw new Error(`Missing environment variable: ${varName}`);
+    }
+    return resolved;
+  });
+}
+
+function interpolateEnvVars<T>(value: T): T {
+  if (typeof value === "string") {
+    return interpolateEnvInString(value) as T;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => interpolateEnvVars(item)) as T;
+  }
+
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = interpolateEnvVars(v);
+    }
+    return out as T;
+  }
+
+  return value;
+}
+
 export function loadAgentConfig(path: string): AgentConfig {
   const raw = readFileSync(path, "utf-8");
-  const parsed = (yaml.load(raw) ?? {}) as Record<string, any>;
+  const parsedRaw = (yaml.load(raw) ?? {}) as Record<string, any>;
+  const parsed = interpolateEnvVars(parsedRaw);
 
   const workspace = String(parsed.workspace || parsed.repo || process.cwd());
   const memoryPath = parsed.memoryPath || `${workspace}/.openclaw/agent.memory.jsonl`;
