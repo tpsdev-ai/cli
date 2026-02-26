@@ -23,13 +23,19 @@ jobs:
 
       - name: Determine version
         id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            echo "tps_version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_VERSION" ]; then
+            # Validate: must be semver-like (digits and dots only)
+            if ! echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+              echo "❌ Invalid version: $INPUT_VERSION" && exit 1
+            fi
+            echo "tps_version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
           else
-            V="${{ github.ref_name }}"
-            V="${V#v}"
+            V="${REF_NAME#v}"
             echo "tps_version=$V" >> "$GITHUB_OUTPUT"
             echo "tag=$V" >> "$GITHUB_OUTPUT"
           fi
