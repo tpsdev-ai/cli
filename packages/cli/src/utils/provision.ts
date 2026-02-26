@@ -126,7 +126,12 @@ description: ${report.description?.trim().split('\n')[0] || "Generated agent"}
 `;
     writeFileSync(join(agentRoot, "tps.yaml"), tpsYamlContent, "utf-8");
 
-    agentConfigs.push(generated.config);
+    // Strip keys that older OpenClaw versions don't recognize
+    // Fix paths to be container-relative (Docker mounts team root at /workspace)
+    const { thinking, ...cleanConfig } = generated.config as any;
+    cleanConfig.workspace = `/workspace/workspace`;
+    cleanConfig.agentDir = `/workspace/.openclaw/agents/${agentId}/agent`;
+    agentConfigs.push(cleanConfig);
   }
 
   // Write shared openclaw.json
@@ -142,6 +147,11 @@ description: ${report.description?.trim().split('\n')[0] || "Generated agent"}
         },
       },
       list: agentConfigs,
+    },
+    gateway: {
+      port: 18800,
+      mode: "local",
+      bind: "loopback",
     },
   };
   writeFileSync(join(dotOpenClaw, "openclaw.json"), JSON.stringify(sandboxConfig, null, 2), "utf-8");

@@ -1,0 +1,18 @@
+name: dev-team
+purpose: development
+image: tps-office:latest
+
+manager:
+  name: Lead
+  persona: ops
+  role: office-manager
+
+agents:
+  - name: Coder
+    persona: developer
+    role: developer
+    runtime: claude-code
+
+resources:
+  memory: 4g
+  cpus: 2
