@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, join as pathJoin } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { MailClient } from "../src/io/mail.js";
@@ -39,7 +39,6 @@ describe("MailClient", () => {
     expect(msgs.length).toBe(1);
     expect(msgs[0]!.body).toBe("hello world");
 
-    // File should now be in cur
     const { existsSync } = await import("node:fs");
     expect(existsSync(join(tmpDir, "inbox", "new", "test-1.json"))).toBe(false);
     expect(existsSync(join(tmpDir, "inbox", "cur", "test-1.json"))).toBe(true);
@@ -74,7 +73,16 @@ describe("MemoryStore", () => {
     expect(all[0]!.data).toBe("hello");
   });
 
-  test("readAll returns empty array for missing file", () => {
+  test("redacts leaked secrets in stored JSON", () => {
+    process.env.OPENAI_API_KEY = "secret-token";
+    const store = new MemoryStore(join(tmpDir, "memory.jsonl"));
+    store.append({ type: "provider", ts: "2025-01-01T00:00:00Z", data: { raw: "Authorization: secret-token" } });
+    const all = store.readAll();
+    expect(String(all[0]!.data)).not.toContain("secret-token");
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  test("readAll returns empty for missing file", () => {
     const store = new MemoryStore(join(tmpDir, "missing.jsonl"));
     expect(store.readAll()).toEqual([]);
   });
@@ -91,15 +99,15 @@ describe("ContextManager", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("getWindow returns empty for empty memory", () => {
+  test("getWindow returns empty for empty memory", async () => {
     const store = new MemoryStore(join(tmpDir, "mem.jsonl"));
     const ctx = new ContextManager(store, 1000);
-    expect(ctx.getWindow()).toEqual([]);
+    expect(await ctx.getWindow()).toEqual([]);
   });
 
-  test("needsCompaction is false for empty memory", () => {
+  test("needsCompaction is false for empty memory", async () => {
     const store = new MemoryStore(join(tmpDir, "mem.jsonl"));
     const ctx = new ContextManager(store, 1000);
-    expect(ctx.needsCompaction()).toBe(false);
+    expect(await ctx.needsCompaction()).toBe(false);
   });
 });

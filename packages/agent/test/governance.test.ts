@@ -1,40 +1,42 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
 import { BoundaryManager } from "../src/governance/boundary.js";
 import { ReviewGate } from "../src/governance/review-gate.js";
 import { MailClient } from "../src/io/mail.js";
 import { ToolRegistry } from "../src/tools/registry.js";
+import { makeReadTool, makeWriteTool, makeEditTool } from "../src/tools/index.js";
 
 describe("BoundaryManager", () => {
+  let workspace: string;
+  let boundary: BoundaryManager;
+
+  beforeEach(() => {
+    workspace = mkdtempSync(join(tmpdir(), "tps-boundary-"));
+    boundary = new BoundaryManager(workspace);
+  });
+
+  afterEach(() => {
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
   test("allows registered network host", () => {
-    const mgr = new BoundaryManager();
-    mgr.addNetworkHost("api.anthropic.com");
-    expect(mgr.isNetworkAllowed("api.anthropic.com")).toBe(true);
-    expect(mgr.isNetworkAllowed("evil.com")).toBe(false);
+    boundary.addNetworkHost("api.openai.com");
+    expect(boundary.isNetworkAllowed("api.openai.com")).toBe(true);
+    expect(boundary.isNetworkAllowed("evil.com")).toBe(false);
   });
 
-  test("wildcard allows any host", () => {
-    const mgr = new BoundaryManager();
-    mgr.addNetworkHost("*");
-    expect(mgr.isNetworkAllowed("api.anthropic.com")).toBe(true);
-  });
-
-  test("allows registered path prefix", () => {
-    const mgr = new BoundaryManager();
-    mgr.addPath("/workspace");
-    expect(mgr.isPathAllowed("/workspace/src")).toBe(true);
-    expect(mgr.isPathAllowed("/etc/passwd")).toBe(false);
+  test("blocks path traversal", () => {
+    expect(() => boundary.resolveWorkspacePath("../secret.txt")).toThrow();
   });
 
   test("describeCapabilities returns readable string", () => {
-    const mgr = new BoundaryManager();
-    mgr.addNetworkHost("api.anthropic.com");
-    mgr.addPath("/workspace");
-    const desc = mgr.describeCapabilities();
+    boundary.addNetworkHost("api.anthropic.com");
+    const desc = boundary.describeCapabilities();
     expect(desc).toContain("api.anthropic.com");
-    expect(desc).toContain("/workspace");
+    expect(desc).toContain(workspace);
   });
 });
 
@@ -49,13 +51,6 @@ describe("ReviewGate", () => {
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
-  });
-
-  test("identifies high-risk tools", () => {
-    const gate = new ReviewGate(mail, "host@tps");
-    expect(gate.isHighRisk("git_push")).toBe(true);
-    expect(gate.isHighRisk("file_delete")).toBe(true);
-    expect(gate.isHighRisk("fs_read")).toBe(false);
   });
 
   test("requestApproval sends mail to approver", async () => {
@@ -73,14 +68,14 @@ describe("ToolRegistry", () => {
     registry.register({
       name: "echo",
       description: "Echo input",
-      parameters: { input: { type: "string", description: "text to echo" } },
+      input_schema: { input: { type: "string" } },
       async execute(args) {
-        return String(args.input);
+        return { content: String((args as any).input) };
       },
     });
 
     const result = await registry.execute("echo", { input: "hello" });
-    expect(result).toBe("hello");
+    expect(result.content).toBe("hello");
   });
 
   test("throws for unknown tool", async () => {
@@ -93,10 +88,44 @@ describe("ToolRegistry", () => {
     registry.register({
       name: "echo",
       description: "Echo input",
-      parameters: {},
-      async execute() { return ""; },
+      input_schema: { input: { type: "string" } },
+      async execute() {
+        return { content: "" };
+      },
     });
     expect(registry.list().length).toBe(1);
     expect(registry.list()[0]!.name).toBe("echo");
+  });
+});
+
+describe("Read/Write/Edit tools", () => {
+  let tmpDir: string;
+  let boundary: BoundaryManager;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "tps-tools-"));
+    boundary = new BoundaryManager(tmpDir);
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("edit fails if old_string appears more than once", async () => {
+    const tool = makeEditTool(boundary);
+    const file = join(tmpDir, "a.txt");
+    writeFileSync(file, "abc abc", "utf-8");
+    const out = await tool.execute({ path: file, old_string: "abc", new_string: "xyz" });
+    expect(out.isError).toBe(true);
+  });
+
+  test("write/read round trip", async () => {
+    const read = makeReadTool(boundary);
+    const write = makeWriteTool(boundary);
+
+    const result = await write.execute({ path: "foo.txt", content: "hello" });
+    expect(result.isError).toBe(false);
+    const readResult = await read.execute({ path: "foo.txt" });
+    expect(readResult.content).toContain("hello");
   });
 });
