@@ -1,0 +1,16 @@
+[meta]
+name = "tps-agent"
+version = "1.0.0"
+description = "TPS branch office — sandboxed OpenClaw agent instance. Filesystem scoped to agent workspace + shared repos."
+
+# CWD = the agent's workspace directory (passed via --workdir)
+[workdir]
+access = "readwrite"
+
+[filesystem]
+# Agent needs read access to nono profiles (for nested nono calls)
+# Additional paths (shared repos, credential files) added via CLI flags
+# at invocation time by tps office start
+
+[network]
+block = false  # Agent needs API provider + Discord access
