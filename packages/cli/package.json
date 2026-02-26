@@ -61,6 +61,7 @@
   },
   "files": [
     "bin",
+    "scripts",
     "nono-profiles",
     "personas",
     "reports",
