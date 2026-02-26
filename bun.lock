@@ -26,7 +26,7 @@
     },
     "packages/cli": {
       "name": "@tpsdev-ai/cli",
-      "version": "0.3.3",
+      "version": "0.3.5",
       "bin": {
         "tps": "./bin/tps.cjs",
       },
@@ -55,36 +55,36 @@
         "typescript": "^5.7.0",
       },
       "optionalDependencies": {
-        "@tpsdev-ai/cli-darwin-arm64": "0.3.2",
-        "@tpsdev-ai/cli-darwin-x64": "0.3.2",
-        "@tpsdev-ai/cli-linux-arm64": "0.3.2",
-        "@tpsdev-ai/cli-linux-x64": "0.3.2",
+        "@tpsdev-ai/cli-darwin-arm64": "0.3.5",
+        "@tpsdev-ai/cli-darwin-x64": "0.3.5",
+        "@tpsdev-ai/cli-linux-arm64": "0.3.5",
+        "@tpsdev-ai/cli-linux-x64": "0.3.5",
       },
     },
     "packages/cli-darwin-arm64": {
       "name": "@tpsdev-ai/cli-darwin-arm64",
-      "version": "0.3.3",
+      "version": "0.3.5",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-darwin-x64": {
       "name": "@tpsdev-ai/cli-darwin-x64",
-      "version": "0.3.3",
+      "version": "0.3.5",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-linux-arm64": {
       "name": "@tpsdev-ai/cli-linux-arm64",
-      "version": "0.3.3",
+      "version": "0.3.5",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-linux-x64": {
       "name": "@tpsdev-ai/cli-linux-x64",
-      "version": "0.3.3",
+      "version": "0.3.5",
       "bin": {
         "tps": "./tps",
       },
@@ -330,14 +330,6 @@
     "yoga-layout": ["yoga-layout@3.2.1", "", {}, "sha512-0LPOt3AxKqMdFBZA3HBAt/t/8vIKq7VaQYbuA8WxCgung+p9TVyKRYdpvCb80HcdTN2NkbIKbhNwKUfm3tQywQ=="],
 
     "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-darwin-arm64": ["@tpsdev-ai/cli-darwin-arm64@0.3.2", "", { "os": "darwin", "cpu": "arm64", "bin": { "tps": "tps" } }, "sha512-0bwHn39FypDdiOWCHTCb3/A7E7r3rFfkrNmVvtb+S2x43GIGeVIh3qr61y+J4rkKNSsiOlaT4eOhOzQW4EjPzw=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-darwin-x64": ["@tpsdev-ai/cli-darwin-x64@0.3.2", "", { "os": "darwin", "cpu": "x64", "bin": { "tps": "tps" } }, "sha512-ytHqlfQ9JHXMNtTkR26Xf/FdRtZbd3KGsuNXRgdWfX6ydT44TxSPpokpUsgLgQUjB3ZvJDVvOMsKZBWLh18uqQ=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-linux-arm64": ["@tpsdev-ai/cli-linux-arm64@0.3.2", "", { "os": "linux", "cpu": "arm64", "bin": { "tps": "tps" } }, "sha512-sj22Rp81GDjVBhaW9qjDJkzdjFoGQDtmS4lnkg9BSq6UF3P5lMv63VtrBEgZ/nl5m7mXLhU8JBk7WUyfCrkg+A=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-linux-x64": ["@tpsdev-ai/cli-linux-x64@0.3.2", "", { "os": "linux", "cpu": "x64", "bin": { "tps": "tps" } }, "sha512-cUm5S+DGpFFvI7mtBO7dpDS7etHfAOfIjTHCqiwUPrVnv1hI4fpkqYZ7X0SwCV/RFZ2IYYH1xEJCSy/7THf3FA=="],
 
     "cli-truncate/slice-ansi": ["slice-ansi@5.0.0", "", { "dependencies": { "ansi-styles": "^6.0.0", "is-fullwidth-code-point": "^4.0.0" } }, "sha512-FC+lgizVPfie0kkhqUScwRu1O/lF6NOgJmlCgK+/LYxDCTk8sGelYaHDhFcDN+Sn3Cv+3VSa4Byeo+IMCzpMgQ=="],
 
