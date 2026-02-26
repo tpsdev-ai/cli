@@ -27,47 +27,6 @@ export interface OfficeArgs {
   dryRun?: boolean;
 }
 
-const BOOTSTRAP_TEMPLATE = `#!/bin/bash
-set -e
-
-# Install dependencies (skip if already available, e.g., soundstage image)
-if ! command -v openclaw >/dev/null 2>&1; then
-  npm install -g openclaw || { echo "ERROR: openclaw install failed"; exit 1; }
-  npm install -g @tpsdev-ai/cli || echo "TPS not on npm yet, skipping"
-fi
-
-openclaw --version
-
-# Detect config location
-# Standard branch office: workspace/.openclaw/openclaw.json
-# Multi-agent office: team-root/.openclaw/openclaw.json (workspace is a subdir)
-if [ -f "__WORKSPACE__/.openclaw/openclaw.json" ]; then
-  CONFIG="__WORKSPACE__/.openclaw/openclaw.json"
-elif [ -f "__WORKSPACE__/../.openclaw/openclaw.json" ]; then
-  CONFIG="__WORKSPACE__/../.openclaw/openclaw.json"
-else
-  echo "No openclaw.json found"
-  exit 1
-fi
-
-echo "Starting gateway with config: $CONFIG"
-
-# If mock LLM script exists, start it (soundstage mode)
-# mock-llm.js lives in team root (outside workspace) so agents can't modify it
-if [ -f "__TEAM_ROOT__/mock-llm.js" ]; then
-  echo "Starting mock LLM (soundstage mode)..."
-  nohup node __TEAM_ROOT__/mock-llm.js > __TEAM_ROOT__/mock-llm.log 2>&1 &
-  sleep 1
-fi
-
-# Symlink openclaw config to default location so gateway finds it
-mkdir -p ~/.openclaw
-ln -sf "$CONFIG" ~/.openclaw/openclaw.json
-
-# Run gateway in foreground (keeps container alive)
-echo "Branch office agent ready"
-exec openclaw gateway
-`;
 
 function branchRoot(): string {
   return sharedBranchRoot();
@@ -243,37 +202,22 @@ function setupWorkspace(agent: string): string {
   mkdirSync(join(ws, "mail", "outbox", "failed"), { recursive: true });
   mkdirSync(join(ws, "mail", "outbox", "paused"), { recursive: true });
 
-  // Scaffold minimal openclaw.json if missing (skip for team agents — provisionTeam handles it)
-  const teamId = resolveTeamId(agent);
-  const isTeamAgent = teamId !== agent;
-  if (!isTeamAgent) {
-    const ocDir = join(ws, ".openclaw");
-    const ocConfig = join(ocDir, "openclaw.json");
-    if (!existsSync(ocConfig)) {
-      mkdirSync(ocDir, { recursive: true });
-      const minimalConfig = {
-        agents: {
-          list: [{ id: agent.toLowerCase(), name: agent }],
-        },
-        gateway: {
-          port: 18800,
-          mode: "local",
-          bind: "loopback",
-        },
-      };
-      writeFileSync(ocConfig, JSON.stringify(minimalConfig, null, 2));
-    }
-  }
-
-  const bootstrap = join(ws, "bootstrap.sh");
-  if (!existsSync(bootstrap)) {
-    // Use container-relative paths — host paths don't exist inside Docker
-    const template = BOOTSTRAP_TEMPLATE
-      .replaceAll("__WORKSPACE__", "/workspace")
-      .replaceAll("__TEAM_ROOT__", "/workspace");
-    writeFileSync(bootstrap, template, { mode: 0o755 });
-  } else {
-    console.log("Using existing bootstrap.sh");
+  const tpsDir = join(ws, ".tps");
+  const agentConfig = join(tpsDir, "agent.yaml");
+  if (!existsSync(agentConfig)) {
+    mkdirSync(tpsDir, { recursive: true });
+    const yaml = [
+      `agentId: ${agent.toLowerCase()}`,
+      `name: ${agent}`,
+      `workspace: /workspace/${agent}`,
+      `mailDir: /workspace/${agent}/mail`,
+      "llm:",
+      "  provider: anthropic",
+      "  model: claude-sonnet-4-6",
+      "  apiKey: ${ANTHROPIC_API_KEY}",
+      "",
+    ].join("\n");
+    writeFileSync(agentConfig, yaml, "utf-8");
   }
 
   return ws;
@@ -305,28 +249,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         mkdirSync(teamRoot, { recursive: true });
         writeFileSync(join(teamRoot, "soundstage.json"), JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
 
-        const teamBootstrap = join(teamRoot, "bootstrap.sh");
-        const teamWs = join(teamRoot, "workspace");
-        let bs = BOOTSTRAP_TEMPLATE
-          .replaceAll("__WORKSPACE__", teamWs)
-          .replaceAll("__TEAM_ROOT__", teamRoot);
-        const workspaceBootstrap = join(teamWs, "bootstrap.sh");
-        if (existsSync(workspaceBootstrap)) {
-          bs = readFileSync(workspaceBootstrap, "utf-8")
-            .replaceAll("__WORKSPACE__", teamWs)
-            .replaceAll("__TEAM_ROOT__", teamRoot);
-
-          if (!bs.includes(teamRoot)) {
-            bs = bs.replaceAll("/workspace/mock-llm.js", teamRoot + "/mock-llm.js");
-          }
-        }
-
-        // Keep an explicit team-root marker for sanity checks and soundstage behavior.
-        if (!bs.includes(teamRoot)) {
-          bs = bs + "\n\n# TEAM_ROOT=" + teamRoot + "\n";
-        }
-
-        writeFileSync(teamBootstrap, bs, { mode: 0o755 });
       }
 
       if (manifestData && manifestData.name !== teamId && manifestData.name !== agent) {
