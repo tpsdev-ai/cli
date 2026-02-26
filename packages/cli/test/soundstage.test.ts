@@ -66,7 +66,7 @@ agents:
     expect(markerPath.startsWith(workspace)).toBe(false);
   });
 
-  test("soundstage replaces __TEAM_ROOT__ in bootstrap.sh", () => {
+  test("soundstage start does not require bootstrap.sh and keeps agent config", () => {
     const manifestPath = join(tempDir, "office.yaml");
     writeFileSync(manifestPath, `
 name: stage-team2
@@ -105,10 +105,13 @@ agents:
 
     const teamRoot = join(tempDir, ".tps", "branch-office", "stage-team2");
     const bootstrapPath = join(teamRoot, "bootstrap.sh");
-    expect(existsSync(bootstrapPath)).toBe(true);
+    expect(existsSync(bootstrapPath)).toBe(false);
 
-    const bootstrap = readFileSync(bootstrapPath, "utf-8");
-    expect(bootstrap).not.toContain("__TEAM_ROOT__");
-    expect(bootstrap).toContain(teamRoot);
+    const cfgPathA = join(teamRoot, ".tps", "agent.yaml");
+    const cfgPathB = join(teamRoot, "workspace", ".tps", "agent.yaml");
+    const cfgPath = existsSync(cfgPathA) ? cfgPathA : cfgPathB;
+    expect(existsSync(cfgPath)).toBe(true);
+    const cfg = readFileSync(cfgPath, "utf-8");
+    expect(cfg).toContain("agentId: stage-team2");
   });
 });
