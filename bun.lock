@@ -59,10 +59,10 @@
         "typescript": "^5.7.0",
       },
       "optionalDependencies": {
-        "@tpsdev-ai/cli-darwin-arm64": "0.4.2",
-        "@tpsdev-ai/cli-darwin-x64": "0.4.2",
-        "@tpsdev-ai/cli-linux-arm64": "0.4.2",
-        "@tpsdev-ai/cli-linux-x64": "0.4.2",
+        "@tpsdev-ai/cli-darwin-arm64": "0.5.0",
+        "@tpsdev-ai/cli-darwin-x64": "0.5.0",
+        "@tpsdev-ai/cli-linux-arm64": "0.5.0",
+        "@tpsdev-ai/cli-linux-x64": "0.5.0",
       },
     },
     "packages/cli-darwin-arm64": {
@@ -296,14 +296,6 @@
     "yoga-layout": ["yoga-layout@3.2.1", "", {}, "sha512-0LPOt3AxKqMdFBZA3HBAt/t/8vIKq7VaQYbuA8WxCgung+p9TVyKRYdpvCb80HcdTN2NkbIKbhNwKUfm3tQywQ=="],
 
     "zod": ["zod@3.25.76", "", {}, "sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-darwin-arm64": ["@tpsdev-ai/cli-darwin-arm64@0.4.2", "", { "os": "darwin", "cpu": "arm64", "bin": { "tps": "tps" } }, "sha512-lw5jU3CFi4YjfjfwVWF66ZTy0jA/BSpJpRZ23QMldTV3cHjKH7edZ+4LQXyV6GHFuFthQUA/gAdgqyGpCXCvjw=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-darwin-x64": ["@tpsdev-ai/cli-darwin-x64@0.4.2", "", { "os": "darwin", "cpu": "x64", "bin": { "tps": "tps" } }, "sha512-8lAeZvdV4km1DV/ct6guJ4ahHMabpWqQ7rSdg36Q01hi7NE4fzX9Ztq2Um/k3bi2Gs76NDvBYtrMOmxYikO3zQ=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-linux-arm64": ["@tpsdev-ai/cli-linux-arm64@0.4.2", "", { "os": "linux", "cpu": "arm64", "bin": { "tps": "tps" } }, "sha512-aO3WLGNwdMjQjGit9Gd9mik6s2d69YIAeVKYorakZPV7klUmbBmXkc8Dp94ty37qnVis/iX3VX7eUXcRDLqwNw=="],
-
-    "@tpsdev-ai/cli/@tpsdev-ai/cli-linux-x64": ["@tpsdev-ai/cli-linux-x64@0.4.2", "", { "os": "linux", "cpu": "x64", "bin": { "tps": "tps" } }, "sha512-E8BxqXqC+kfyYvoIeDeDfTtShkSbkprnDUDxAQcayolh2SGkncuawgKExjGidbBYB8aGGc152HZkDh4fCybzEQ=="],
 
     "cli-truncate/slice-ansi": ["slice-ansi@5.0.0", "", { "dependencies": { "ansi-styles": "^6.0.0", "is-fullwidth-code-point": "^4.0.0" } }, "sha512-FC+lgizVPfie0kkhqUScwRu1O/lF6NOgJmlCgK+/LYxDCTk8sGelYaHDhFcDN+Sn3Cv+3VSa4Byeo+IMCzpMgQ=="],
 
