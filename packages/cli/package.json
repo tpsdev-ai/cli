@@ -26,7 +26,7 @@
     "lint:ci": "biome lint ./src ./bin --max-diagnostics=200",
     "pretest": "tsc",
     "test": "bun test",
-    "postinstall": "node scripts/postinstall.js"
+    "postinstall": "node scripts/postinstall.cjs"
   },
   "keywords": [
     "cli",
