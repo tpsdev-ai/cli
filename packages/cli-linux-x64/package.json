@@ -1,6 +1,6 @@
 {
   "name": "@tpsdev-ai/cli-linux-x64",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "TPS CLI native binary for linux-x64",
   "os": [
     "linux"
