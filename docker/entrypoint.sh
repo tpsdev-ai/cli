@@ -3,14 +3,18 @@ set -euo pipefail
 
 if [ -f /workspace/bootstrap.sh ]; then
   cd /workspace
-  /workspace/bootstrap.sh
+  exec /workspace/bootstrap.sh
 elif [ -f /workspace/workspace/bootstrap.sh ]; then
   cd /workspace/workspace
-  /workspace/workspace/bootstrap.sh
+  exec /workspace/workspace/bootstrap.sh
 elif [ -f /workspace/.openclaw/openclaw.json ]; then
-  openclaw gateway run --config /workspace/.openclaw/openclaw.json --port 18800 --bind lan
+  mkdir -p "$HOME/.openclaw"
+  ln -sfn /workspace/.openclaw "$HOME/.openclaw"
+  exec openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1
 elif [ -f /workspace/../.openclaw/openclaw.json ]; then
-  openclaw gateway run --config /workspace/../.openclaw/openclaw.json --port 18800 --bind lan
+  mkdir -p "$HOME/.openclaw"
+  ln -sfn /workspace/../.openclaw "$HOME/.openclaw"
+  exec openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1
 else
   echo "No openclaw config found"
   exit 1

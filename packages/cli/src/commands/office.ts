@@ -348,10 +348,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       const runtime = resolveDockerAgent(agent);
-      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace && ./workspace/bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & elif [ -f /workspace/../.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/../.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & else exit 1; fi`;
+      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace/workspace && ./bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; elif [ -f /workspace/../.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/../.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; else exit 1; fi`;
       const createResult = spawnSync("docker", [
         "run", "-d", "--name", sName,
-        "--user", "node",
+        "--user", "tps",
         ...mountArgs,
         "-p", "18800:18800",
         image,
