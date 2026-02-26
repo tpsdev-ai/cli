@@ -18,7 +18,7 @@ const cli = meow(
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
-    agent run          Run tps-agent one-shot run (from config)
+    agent run|start|health  Manage tps-agent runtime from config
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
     git <action>      Git utilities (worktree)
@@ -202,27 +202,34 @@ async function main() {
     }
 
     case "agent": {
-      if (rest[0] !== "run") {
-        console.error("Usage: tps agent run --config <path> --message <text>");
+      const action = rest[0] as "run" | "start" | "health" | undefined;
+      if (!action || !["run", "start", "health"].includes(action)) {
+        console.error("Usage:\n  tps agent run --config <path> --message <text>\n  tps agent start --config <path>\n  tps agent health --config <path>");
         process.exit(1);
       }
 
       const cfgIdx = process.argv.indexOf("--config");
-      const msgIdx = process.argv.indexOf("--message");
-      if (cfgIdx < 0 || msgIdx < 0) {
-        console.error("Usage: tps agent run --config <path> --message <text>");
+      if (cfgIdx < 0) {
+        console.error("Usage: tps agent <run|start|health> --config <path> [--message <text>]");
         process.exit(1);
       }
 
       const configPath = process.argv[cfgIdx + 1];
-      const message = process.argv.slice(msgIdx + 1).join(" ");
-      if (!configPath || !message) {
-        console.error("Usage: tps agent run --config <path> --message <text>");
+      if (!configPath) {
+        console.error("Usage: tps agent <run|start|health> --config <path> [--message <text>]");
         process.exit(1);
       }
 
       const { runAgent } = await import("../src/commands/agent.js");
-      await runAgent({ action: "run", config: configPath, message });
+      if (action === "run") {
+        const msgIdx = process.argv.indexOf("--message");
+        const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
+        await runAgent({ action: "run", config: configPath, message });
+      } else if (action === "start") {
+        await runAgent({ action: "start", config: configPath });
+      } else {
+        await runAgent({ action: "health", config: configPath });
+      }
       break;
     }
 
