@@ -8,6 +8,8 @@ RUN npm install -g @tpsdev-ai/cli@${TPS_VERSION}
 COPY --from=nono-builder /tmp/nono/target/release/nono /usr/local/bin/nono
 RUN apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
-USER tps
+COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace
-ENTRYPOINT ["tps-agent", "start", "--config", "/workspace/.tps/agent.yaml"]
+# Supervisor starts as root only for setup, then drops to tps-supervisor.
+# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
+ENTRYPOINT ["tps-office-supervisor"]
