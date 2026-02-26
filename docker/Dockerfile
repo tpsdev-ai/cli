@@ -10,4 +10,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl jq ca-
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace
+# Supervisor starts as root only for setup, then drops to tps-supervisor.
 ENTRYPOINT ["tps-office-supervisor"]
