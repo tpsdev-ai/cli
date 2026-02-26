@@ -1,6 +1,6 @@
 {
   "name": "@tpsdev-ai/agent",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Native TPS Agent Runtime — headless, mail-driven, nono-sandboxed",
   "type": "module",
   "main": "./dist/index.js",
