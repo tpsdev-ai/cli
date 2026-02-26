@@ -60,9 +60,13 @@ if [ -f "__TEAM_ROOT__/mock-llm.js" ]; then
   sleep 1
 fi
 
-# Run gateway in background (nohup to survive shell exit)
-nohup openclaw gateway run --config "$CONFIG" > __WORKSPACE__/gateway.log 2>&1 &
-echo "Branch office agent ready (gateway pid $!)"
+# Symlink openclaw config to default location so gateway finds it
+mkdir -p ~/.openclaw
+ln -sf "$CONFIG" ~/.openclaw/openclaw.json
+
+# Run gateway in foreground (keeps container alive)
+echo "Branch office agent ready"
+exec openclaw gateway
 `;
 
 function branchRoot(): string {
@@ -239,12 +243,30 @@ function setupWorkspace(agent: string): string {
   mkdirSync(join(ws, "mail", "outbox", "failed"), { recursive: true });
   mkdirSync(join(ws, "mail", "outbox", "paused"), { recursive: true });
 
+  // Scaffold minimal openclaw.json if missing
+  const ocDir = join(ws, ".openclaw");
+  const ocConfig = join(ocDir, "openclaw.json");
+  if (!existsSync(ocConfig)) {
+    mkdirSync(ocDir, { recursive: true });
+    const minimalConfig = {
+      agents: {
+        list: [{ id: agent.toLowerCase(), name: agent }],
+      },
+      gateway: {
+        port: 18800,
+        mode: "local",
+        bind: "loopback",
+      },
+    };
+    writeFileSync(ocConfig, JSON.stringify(minimalConfig, null, 2));
+  }
+
   const bootstrap = join(ws, "bootstrap.sh");
   if (!existsSync(bootstrap)) {
-    const teamRoot = join(branchRoot(), agent);
+    // Use container-relative paths — host paths don't exist inside Docker
     const template = BOOTSTRAP_TEMPLATE
-      .replaceAll("__WORKSPACE__", ws)
-      .replaceAll("__TEAM_ROOT__", teamRoot);
+      .replaceAll("__WORKSPACE__", "/workspace")
+      .replaceAll("__TEAM_ROOT__", "/workspace");
     writeFileSync(bootstrap, template, { mode: 0o755 });
   } else {
     console.log("Using existing bootstrap.sh");
@@ -286,8 +308,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           .replaceAll("__TEAM_ROOT__", teamRoot);
         const workspaceBootstrap = join(teamWs, "bootstrap.sh");
         if (existsSync(workspaceBootstrap)) {
-          bs = readFileSync(workspaceBootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
+          bs = readFileSync(workspaceBootstrap, "utf-8")
+            .replaceAll("__WORKSPACE__", teamWs)
+            .replaceAll("__TEAM_ROOT__", teamRoot);
+
+          if (!bs.includes(teamRoot)) {
+            bs = bs.replaceAll("/workspace/mock-llm.js", teamRoot + "/mock-llm.js");
+          }
         }
+
+        // Keep an explicit team-root marker for sanity checks and soundstage behavior.
+        if (!bs.includes(teamRoot)) {
+          bs = bs + "\n\n# TEAM_ROOT=" + teamRoot + "\n";
+        }
+
         writeFileSync(teamBootstrap, bs, { mode: 0o755 });
       }
 
@@ -326,10 +360,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       const runtime = resolveDockerAgent(agent);
-      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace && ./workspace/bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & elif [ -f /workspace/../.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/../.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & else exit 1; fi`;
+      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace/workspace && ./bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; elif [ -f /workspace/../.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/../.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; else exit 1; fi`;
       const createResult = spawnSync("docker", [
         "run", "-d", "--name", sName,
-        "--user", "node",
+        "--user", "tps",
         ...mountArgs,
         "-p", "18800:18800",
         image,

@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/* /tmp/* /root/.npm
 
 # Install CLI agent runtimes
-RUN npm i -g @anthropic-ai/claude-code codex gemini-cli || true \
+RUN npm i -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli || true \
   && npm cache clean --force \
   && rm -rf /root/.npm
 
