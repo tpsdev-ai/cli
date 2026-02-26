@@ -61,6 +61,8 @@ jobs:
         with:
           bun-version: latest
       - run: bun install --frozen-lockfile
+      - name: Build workspace packages
+        run: bun run build
       - name: Build ${TARGET}
         env:
           TARGET: ${{ matrix.target }}
