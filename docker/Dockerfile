@@ -11,4 +11,5 @@ RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
+# nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["tps-office-supervisor"]
