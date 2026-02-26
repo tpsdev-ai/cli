@@ -18,5 +18,8 @@ COPY nono-profiles /opt/openclaw/nono-profiles
 COPY docker/entrypoint.sh /opt/openclaw/entrypoint.sh
 RUN chmod +x /opt/openclaw/entrypoint.sh
 
+RUN useradd -m -s /bin/bash agent
 WORKDIR /workspace
+RUN chown agent:agent /workspace
+USER agent
 ENTRYPOINT ["/opt/openclaw/entrypoint.sh"]
