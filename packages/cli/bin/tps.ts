@@ -122,6 +122,16 @@ async function checkNono() {
 }
 
 async function main() {
+  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+    const { readFileSync } = await import("node:fs");
+    const { dirname, join } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const here = dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8"));
+    console.log(pkg.version);
+    return;
+  }
+
   await checkNono();
   switch (command) {
     case "hire": {
