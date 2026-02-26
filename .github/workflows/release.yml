@@ -113,6 +113,25 @@ jobs:
           cp -R /tmp/release/cli-darwin-x64/. packages/cli-darwin-x64/
           cp -R /tmp/release/cli-linux-arm64/. packages/cli-linux-arm64/
           cp -R /tmp/release/cli-linux-x64/. packages/cli-linux-x64/
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Build agent package
+        run: bun run --filter @tpsdev-ai/agent build
+      - name: Publish agent package
+        run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          npm publish --access public --workspace @tpsdev-ai/agent || {
+            if npm view "@tpsdev-ai/agent@$VERSION" version 2>/dev/null; then
+              echo "⏭️ @tpsdev-ai/agent@$VERSION already published, skipping"
+            else
+              echo "❌ Failed to publish @tpsdev-ai/agent" && exit 1
+            fi
+          }
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish platform packages
         run: |
           VERSION="${{ github.ref_name }}"
