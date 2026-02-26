@@ -9,7 +9,14 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./bin": {
+      "import": "./dist/bin.js",
+      "types": "./dist/bin.d.ts"
     }
+  },
+  "bin": {
+    "tps-agent": "./dist/bin.js"
   },
   "scripts": {
     "build": "tsc",
@@ -22,6 +29,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "js-yaml": "^4.1.0",
+    "js-tiktoken": "^1.0.13",
     "zod": "^3.24.0"
   },
   "devDependencies": {

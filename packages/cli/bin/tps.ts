@@ -18,6 +18,7 @@ const cli = meow(
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
+    agent run          Run tps-agent one-shot run (from config)
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
     git <action>      Git utilities (worktree)
@@ -197,6 +198,31 @@ async function main() {
         configPath: cli.flags.config,
         channel: cli.flags.channel,
       });
+      break;
+    }
+
+    case "agent": {
+      if (rest[0] !== "run") {
+        console.error("Usage: tps agent run --config <path> --message <text>");
+        process.exit(1);
+      }
+
+      const cfgIdx = process.argv.indexOf("--config");
+      const msgIdx = process.argv.indexOf("--message");
+      if (cfgIdx < 0 || msgIdx < 0) {
+        console.error("Usage: tps agent run --config <path> --message <text>");
+        process.exit(1);
+      }
+
+      const configPath = process.argv[cfgIdx + 1];
+      const message = process.argv.slice(msgIdx + 1).join(" ");
+      if (!configPath || !message) {
+        console.error("Usage: tps agent run --config <path> --message <text>");
+        process.exit(1);
+      }
+
+      const { runAgent } = await import("../src/commands/agent.js");
+      await runAgent({ action: "run", config: configPath, message });
       break;
     }
 
