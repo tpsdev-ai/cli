@@ -43,6 +43,8 @@ export type TpsYaml = z.infer<typeof TpsYamlSchema>;
 export const OfficeManifestSchema = z.object({
   name: z.string().min(1),
   purpose: z.enum(["ops", "research", "development", "adversarial"]).default("ops"),
+  image: z.string().optional(),
+  runtime: z.string().optional(),
   manager: z.object({
     name: z.string(),
     persona: z.string(),
@@ -52,7 +54,17 @@ export const OfficeManifestSchema = z.object({
     name: z.string(),
     persona: z.string(),
     role: z.string().optional(),
+    runtime: z.string().optional(),
   })).default([]),
+  mounts: z.array(z.object({
+    host: z.string(),
+    target: z.string(),
+    readonly: z.boolean().default(true),
+  })).optional(),
+  resources: z.object({
+    memory: z.string().optional(),
+    cpus: z.union([z.number(), z.string()]).optional(),
+  }).optional(),
   wall: z.boolean().default(false),
   context: z.object({
     briefs: z.array(z.string()).optional(),

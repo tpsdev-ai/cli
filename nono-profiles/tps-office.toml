@@ -1,0 +1,18 @@
+[meta]
+name = "tps-office"
+version = "1.0.0"
+description = "TPS Branch Office: container runtime wrapper for OpenClaw + agents."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+read = ["/workspace"]
+readwrite = ["/workspace", "/tmp"]
+
+[network]
+block = false
+
+[process]
+# Prevent child processes from inspecting process env / secrets.
+blacklist = ["env", "cat /proc/1/environ", "cat /proc/self/environ"]
