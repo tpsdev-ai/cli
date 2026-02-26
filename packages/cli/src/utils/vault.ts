@@ -1,5 +1,4 @@
-import { randomBytes, createCipheriv, createDecipheriv } from "node:crypto";
-import { hashRaw, Algorithm } from "@node-rs/argon2";
+import { randomBytes, createCipheriv, createDecipheriv, scryptSync } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -10,30 +9,28 @@ export interface VaultData {
   authTag: string;    // base64
   ciphertext: string; // base64
   kdf?: {
-    m: number;
-    t: number;
-    p: number;
+    n: number;  // CPU/memory cost (scrypt N)
+    r: number;  // block size
+    p: number;  // parallelism
   };
 }
 
-// Default KDF parameters
-const DEFAULT_KDF = { m: 65536, t: 3, p: 4 };
+// Default KDF parameters (scrypt)
+// N=2^17 (~128MB), r=8, p=1 — comparable security to argon2id defaults
+const DEFAULT_KDF = { n: 131072, r: 8, p: 1 };
 
-// Derive a 32-byte key using Argon2id
+// Derive a 32-byte key using scrypt (built-in, no native deps)
 export async function deriveKey(
   passphrase: string, 
   salt: Buffer, 
   params = DEFAULT_KDF
 ): Promise<Buffer> {
-  const key = await hashRaw(passphrase, {
-    algorithm: Algorithm.Argon2id,
-    memoryCost: params.m,
-    timeCost: params.t,
-    parallelism: params.p,
-    outputLen: 32,
-    salt,
+  return scryptSync(passphrase, salt, 32, {
+    N: params.n,
+    r: params.r,
+    p: params.p,
+    maxmem: params.n * params.r * 256,
   });
-  return Buffer.from(key);
 }
 
 export async function encryptVault(data: any, passphrase: string): Promise<VaultData> {
@@ -64,8 +61,8 @@ export async function decryptVault(vault: VaultData, passphrase: string): Promis
   const authTag = Buffer.from(vault.authTag, "base64");
   
   const params = {
-    m: vault.kdf?.m ?? DEFAULT_KDF.m,
-    t: vault.kdf?.t ?? DEFAULT_KDF.t,
+    n: vault.kdf?.n ?? DEFAULT_KDF.n,
+    r: vault.kdf?.r ?? DEFAULT_KDF.r,
     p: vault.kdf?.p ?? DEFAULT_KDF.p,
   };
 
