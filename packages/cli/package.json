@@ -48,7 +48,8 @@
     "noise-handshake": "^4.2.0",
     "react": "^18.3.1",
     "ws": "^8.19.0",
-    "zod": "^3.24.0"
+    "zod": "^3.24.0",
+    "@tpsdev-ai/agent": "workspace:*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.4",
