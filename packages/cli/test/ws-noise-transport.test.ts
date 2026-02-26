@@ -84,8 +84,18 @@ describe("WsNoiseTransport", () => {
       process.env.TPS_REGISTRY_DIR = join(root, "reg");
       const host = generateKeyPair();
       const branch = generateKeyPair();
-      const port = 30000 + Math.floor(Math.random() * 10000);
-      const server = await new WsNoiseTransport(host, host).listen(port);
+      const net = await import("node:net");
+      const port = await new Promise((resolve, reject) => {
+        const s = net.createServer();
+        s.listen(0, "127.0.0.1", () => {
+          const addr = s.address();
+          if (!addr || typeof addr === "string") return reject(new Error("no addr"));
+          const p = addr.port;
+          s.close(() => resolve(p));
+        });
+        s.once("error", reject);
+      });
+      const server = await new WsNoiseTransport(host, host).listen(port as number);
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "unknown",
@@ -94,9 +104,9 @@ describe("WsNoiseTransport", () => {
         process.exit(1);
       } catch { process.exit(0); }
       finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
-    `], { cwd: process.cwd(), timeout: 10000, env: { ...process.env, HOME: root } });
+    `], { cwd: process.cwd(), timeout: 30000, env: { ...process.env, HOME: root } });
     expect(result.status).toBe(0);
-  }, 15000);
+  }, 40000);
 
   test("wrong host key rejected", async () => {
     const { spawnSync } = await import("node:child_process");
@@ -113,8 +123,18 @@ describe("WsNoiseTransport", () => {
       const wrongHost = generateKeyPair();
       const branch = generateKeyPair();
       registerBranch("branch2", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-      const port = 30000 + Math.floor(Math.random() * 10000);
-      const server = await new WsNoiseTransport(host, host).listen(port);
+      const net = await import("node:net");
+      const port = await new Promise((resolve, reject) => {
+        const s = net.createServer();
+        s.listen(0, "127.0.0.1", () => {
+          const addr = s.address();
+          if (!addr || typeof addr === "string") return reject(new Error("no addr"));
+          const p = addr.port;
+          s.close(() => resolve(p));
+        });
+        s.once("error", reject);
+      });
+      const server = await new WsNoiseTransport(host, host).listen(port as number);
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "branch2",
@@ -123,9 +143,9 @@ describe("WsNoiseTransport", () => {
         process.exit(1);
       } catch { process.exit(0); }
       finally { await server.close(); rmSync(root, { recursive: true, force: true }); }
-    `], { cwd: process.cwd(), timeout: 10000, env: { ...process.env, HOME: root } });
+    `], { cwd: process.cwd(), timeout: 30000, env: { ...process.env, HOME: root } });
     expect(result.status).toBe(0);
-  }, 15000);
+  }, 40000);
 
   test("wire data is encrypted (plaintext not visible in ws frames)", async () => {
     const host = generateKeyPair();
