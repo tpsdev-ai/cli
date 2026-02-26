@@ -82,19 +82,19 @@ describe("office command", () => {
   test("stop handles missing sandbox gracefully", () => {
     const r = run(["office", "stop", "brancha"]);
     expect(r.status).not.toBe(0);
-    expect((r.stdout || "") + (r.stderr || "")).toContain("No sandbox found");
+    expect((r.stdout || "") + (r.stderr || "")).toContain("No office found");
   });
 
   test("list handles no workspaces gracefully", () => {
     const r = run(["office", "list"]);
     expect(r.status).toBe(0);
-    expect((r.stdout || "") + (r.stderr || "")).toContain("No branch-office workspaces found");
+    expect((r.stdout || "") + (r.stderr || "")).toContain("No branch offices found");
   });
 
   test("status handles missing sandbox gracefully", () => {
     const r = run(["office", "status", "brancha"]);
     expect(r.status).toBe(0);
-    expect(r.stdout).toContain("Sandbox: not running");
+    expect(r.stdout).toContain("Office: not running");
   });
 
   test("status shows paused message count when loop-detected messages exist", () => {
