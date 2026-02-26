@@ -243,22 +243,26 @@ function setupWorkspace(agent: string): string {
   mkdirSync(join(ws, "mail", "outbox", "failed"), { recursive: true });
   mkdirSync(join(ws, "mail", "outbox", "paused"), { recursive: true });
 
-  // Scaffold minimal openclaw.json if missing
-  const ocDir = join(ws, ".openclaw");
-  const ocConfig = join(ocDir, "openclaw.json");
-  if (!existsSync(ocConfig)) {
-    mkdirSync(ocDir, { recursive: true });
-    const minimalConfig = {
-      agents: {
-        list: [{ id: agent.toLowerCase(), name: agent }],
-      },
-      gateway: {
-        port: 18800,
-        mode: "local",
-        bind: "loopback",
-      },
-    };
-    writeFileSync(ocConfig, JSON.stringify(minimalConfig, null, 2));
+  // Scaffold minimal openclaw.json if missing (skip for team agents — provisionTeam handles it)
+  const teamId = resolveTeamId(agent);
+  const isTeamAgent = teamId !== agent;
+  if (!isTeamAgent) {
+    const ocDir = join(ws, ".openclaw");
+    const ocConfig = join(ocDir, "openclaw.json");
+    if (!existsSync(ocConfig)) {
+      mkdirSync(ocDir, { recursive: true });
+      const minimalConfig = {
+        agents: {
+          list: [{ id: agent.toLowerCase(), name: agent }],
+        },
+        gateway: {
+          port: 18800,
+          mode: "local",
+          bind: "loopback",
+        },
+      };
+      writeFileSync(ocConfig, JSON.stringify(minimalConfig, null, 2));
+    }
   }
 
   const bootstrap = join(ws, "bootstrap.sh");
