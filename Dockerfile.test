@@ -24,6 +24,7 @@ COPY package.json bun.lock* tsconfig*.json ./
 
 # Copy package manifests first for layer caching
 COPY packages/cli/package.json packages/cli/tsconfig.json ./packages/cli/
+COPY packages/cli/scripts/ ./packages/cli/scripts/
 COPY packages/agent/package.json packages/agent/tsconfig.json ./packages/agent/
 
 RUN bun install --frozen-lockfile 2>/dev/null || bun install
