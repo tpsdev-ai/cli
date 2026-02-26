@@ -47,7 +47,7 @@ describe("office command", () => {
     });
   }
 
-  test("start creates branch-office dir structure and bootstrap script", () => {
+  test("start creates branch-office dir structure and agent config", () => {
     const r = run(["office", "start", "brancha"]);
     if (r.status !== 0) {
       console.error("Test failed stdout:", r.stdout);
@@ -60,17 +60,16 @@ describe("office command", () => {
     expect(existsSync(join(ws, "mail", "inbox", "cur"))).toBe(true);
     expect(existsSync(join(ws, "mail", "outbox", "new"))).toBe(true);
     expect(existsSync(join(ws, "mail", "outbox", "cur"))).toBe(true);
-    expect(existsSync(join(ws, "bootstrap.sh"))).toBe(true);
-    const bootstrap = readFileSync(join(ws, "bootstrap.sh"), "utf-8");
-    expect(bootstrap).toContain("npm install -g openclaw");
+    expect(existsSync(join(ws, ".tps", "agent.yaml"))).toBe(true);
+    const cfg = readFileSync(join(ws, ".tps", "agent.yaml"), "utf-8");
+    expect(cfg).toContain("agentId: brancha");
+    expect(cfg).toContain("apiKey: ${ANTHROPIC_API_KEY}");
 
-    // ops-15.5: Check overwrite protection
-    writeFileSync(join(ws, "bootstrap.sh"), "echo custom", { mode: 0o755 });
+    // config should remain stable on repeated start
     const r2 = run(["office", "start", "brancha"]);
     expect(r2.status).toBe(0);
-    const bootstrap2 = readFileSync(join(ws, "bootstrap.sh"), "utf-8");
-    expect(bootstrap2).toBe("echo custom");
-    expect(r2.stdout).toContain("Using existing bootstrap.sh");
+    const cfg2 = readFileSync(join(ws, ".tps", "agent.yaml"), "utf-8");
+    expect(cfg2).toBe(cfg);
   });
 
   test("start rejects invalid agent id", () => {
