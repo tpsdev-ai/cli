@@ -13,6 +13,7 @@ readwrite = ["/workspace", "/tmp"]
 [network]
 block = false
 
-[process]
-# Prevent child processes from inspecting process env / secrets.
-blacklist = ["env", "cat /proc/1/environ", "cat /proc/self/environ"]
+# Note: nono v0.5.0 does not support per-process command blocking.
+# Credential protection relies on tmpfs-backed /run/secrets and
+# the entrypoint sourcing secrets into the gateway process only.
+# Future: nono --block-command can restrict specific binaries.
