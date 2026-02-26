@@ -285,20 +285,29 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         return;
       }
 
-      const runtime = resolveDockerAgent(agent);
-      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace/workspace && ./bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; elif [ -f /workspace/../.openclaw/openclaw.json ]; then mkdir -p "$HOME/.openclaw" && ln -sfn /workspace/../.openclaw "$HOME/.openclaw" && openclaw gateway run --port 18800 --bind loopback > /workspace/gateway.log 2>&1; else exit 1; fi`;
+      const teamJsonPath = join(workspaceMount, ".tps", "team.json");
+      mkdirSync(dirname(teamJsonPath), { recursive: true });
+      writeFileSync(
+        teamJsonPath,
+        JSON.stringify(
+          {
+            agents: [
+              {
+                id: agent,
+                workspace: `/workspace/${agent}`,
+                configPath: `/workspace/${agent}/.tps/agent.yaml`,
+              },
+            ],
+          },
+          null,
+          2
+        )
+      );
+
       const createResult = spawnSync("docker", [
         "run", "-d", "--name", sName,
-        "--user", "tps",
         ...mountArgs,
-        "-p", "18800:18800",
         image,
-        "nono",
-        "run",
-        "--profile",
-        runtime === "openclaw" ? "tps-office" : runtime,
-        "--",
-        "bash", "-lc", command,
       ], { stdio: "inherit", encoding: "utf-8", timeout: 120_000 });
 
       if (createResult.status !== 0) {
@@ -367,12 +376,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         process.exit(stopResult.status ?? 1);
       }
 
-      const filesToClean = [join(ws, "gateway.log"), join(ws, "gateway.pid")];
+      const filesToClean = [join(ws, ".tps", "pids.json"), join(ws, ".tps", "team.json")];
       for (const file of filesToClean) {
         try { rmSync(file, { force: true }); } catch {}
       }
-      const tmpSecret = join(ws, "mock-llm.log");
-      try { rmSync(tmpSecret, { force: true }); } catch {}
 
       console.log(`✓ Office removed for ${agent} (container ${sName}).`);
       return;
