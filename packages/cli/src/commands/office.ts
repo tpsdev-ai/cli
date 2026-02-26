@@ -308,8 +308,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           .replaceAll("__TEAM_ROOT__", teamRoot);
         const workspaceBootstrap = join(teamWs, "bootstrap.sh");
         if (existsSync(workspaceBootstrap)) {
-          bs = readFileSync(workspaceBootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
+          bs = readFileSync(workspaceBootstrap, "utf-8")
+            .replaceAll("__WORKSPACE__", teamWs)
+            .replaceAll("__TEAM_ROOT__", teamRoot);
+
+          if (!bs.includes(teamRoot)) {
+            bs = bs.replaceAll("/workspace/mock-llm.js", teamRoot + "/mock-llm.js");
+          }
         }
+
+        // Keep an explicit team-root marker for sanity checks and soundstage behavior.
+        if (!bs.includes(teamRoot)) {
+          bs = bs + "\n\n# TEAM_ROOT=" + teamRoot + "\n";
+        }
+
         writeFileSync(teamBootstrap, bs, { mode: 0o755 });
       }
 
