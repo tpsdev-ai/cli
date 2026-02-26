@@ -67,11 +67,10 @@ jobs:
           PKG: ${{ matrix.pkg }}
           ART: ${{ matrix.artifact }}
         run: |
-          cd packages/cli
-          bun build --compile ./bin/tps.ts \
+          bun build --compile ./packages/cli/bin/tps.ts \
             --target=${TARGET} \
-            --outfile=dist/${ART}
-          sha256sum dist/${ART} > dist/${ART}.sha256
+            --outfile=packages/cli/dist/${ART}
+          sha256sum packages/cli/dist/${ART} > packages/cli/dist/${ART}.sha256
       - name: Stage binary
         env:
           PKG: ${{ matrix.pkg }}
