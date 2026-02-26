@@ -8,8 +8,8 @@ import { connectionAlive, listHostStates } from "../utils/connection-state.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
+import { parseOfficeManifest } from "../schema/manifest.js";
 import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/relay.js";
-import { isSandboxReady, loadImageIntoSandbox, sandboxExec, sandboxSocketPath, waitForSandbox } from "../utils/sandbox.js";
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
 import { branchRoot as sharedBranchRoot, resolveTeamId, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
@@ -18,7 +18,7 @@ import { runOfficeManager, OFFICE_READY_MARKER, loadWorkspaceManifest } from "./
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export interface OfficeArgs {
-  action: "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup";
+  action: "start" | "stop" | "rm" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup";
   agent?: string;
   command?: string[];
   manifest?: string;
@@ -106,21 +106,8 @@ function validateAgent(agent?: string): string {
   return agent;
 }
 
-/** Map TPS runtime names to Docker Sandbox agent names */
-const RUNTIME_TO_DOCKER_AGENT: Record<string, string> = {
-  "claude-code": "claude",
-  "codex": "codex",
-  "gemini": "gemini",
-  "openclaw": "claude", // default to claude for openclaw runtime
-};
-
-/**
- * Resolve the Docker Sandbox agent name for a TPS agent.
- * Checks the TPS report in the workspace for runtime config.
- */
 function resolveDockerAgent(agentId: string): string {
   const ws = workspacePath(agentId);
-  // Check for runtime hint in workspace
   const runtimeFile = join(ws, ".tps-runtime");
   if (existsSync(runtimeFile)) {
     const runtime = readFileSync(runtimeFile, "utf-8").trim();
@@ -129,44 +116,92 @@ function resolveDockerAgent(agentId: string): string {
   return "claude"; // default
 }
 
-interface SandboxState {
-  name: string;
-  agent: string;
-  status: string;
-  workspace: string;
-}
-
 /**
- * List Docker Sandbox instances, optionally filtered by name.
+ * Map TPS runtime names to Docker image/runtime labels.
  */
-function listDockerSandboxes(): SandboxState[] {
-  const result = spawnSync("docker", ["sandbox", "ls", "--json"], { encoding: "utf-8", timeout: 10000 });
-  if (result.status !== 0) return [];
-  try {
-    const parsed = JSON.parse(result.stdout);
-    // Docker sandbox ls --json returns { vms: [...] }
-    if (parsed && Array.isArray(parsed.vms)) {
-      return parsed.vms;
-    }
-    // Fallback: direct array
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-    return [];
-  } catch {
-    return [];
-  }
+const RUNTIME_TO_DOCKER_AGENT: Record<string, string> = {
+  "claude-code": "claude",
+  "codex": "codex",
+  "gemini": "gemini",
+  "openclaw": "claude", // default to claude for openclaw runtime
+};
+
+interface ContainerState {
+  name: string;
+  status: string;
+  state: string;
 }
 
-function findSandbox(agentId: string): SandboxState | null {
+function listDockerContainers(filterName?: string): ContainerState[] {
+  if (process.env.TPS_OFFICE_SKIP_VM === "1") return [];
+
+  const args = ["ps", "-a", "--format", "{{json .}}"]; 
+  if (filterName) args.push("--filter", `name=${filterName}`);
+
+  const result = spawnSync("docker", args, { encoding: "utf-8", timeout: 10_000 });
+  if (result.status !== 0 || !result.stdout.trim()) return [];
+
+  return result.stdout
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        const parsed = JSON.parse(line);
+        return {
+          name: (parsed.Names || "").split(",")[0],
+          status: String(parsed.Status || "unknown"),
+          state: String(parsed.State || "unknown"),
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter((row): row is ContainerState => Boolean(row));
+}
+
+function findContainer(agentId: string): ContainerState | null {
   const sName = sandboxName(agentId);
-  const sandboxes = listDockerSandboxes();
-  return sandboxes.find((s) => s.name === sName) || null;
+  const containers = listDockerContainers(sName);
+  return containers.find((s) => s.name === sName) || null;
 }
 
-function resolveSandboxId(agentId: string): string | null {
-  const sb = findSandbox(agentId);
-  return sb ? sb.name : null;
+function parseManifestMountArgs(manifestPath?: string): string[] {
+  if (!manifestPath) return [];
+  const manifest = parseOfficeManifest(manifestPath);
+  const mounts = manifest.mounts || [];
+  const result: string[] = [];
+  const pathMod = require("node:path");
+  const fs = require("node:fs");
+
+  const home = pathMod.resolve(process.env.HOME || "");
+
+  for (const m of mounts) {
+    if (!m.target.startsWith("/workspace")) {
+      throw new Error(`Invalid manifest mount target: ${m.target}`);
+    }
+    if (m.target.includes("..")) {
+      throw new Error(`Manifest mount target traversal not allowed: ${m.target}`);
+    }
+
+    const rawHost = m.host.startsWith("~/") ? pathMod.join(home, m.host.slice(2)) : m.host;
+    const host = pathMod.resolve(rawHost);
+    const hostReal = fs.realpathSync(host);
+    if (!hostReal.startsWith(home + pathMod.sep)) {
+      throw new Error(`Manifest mount host outside HOME: ${m.host}`);
+    }
+
+    const roFlag = m.readonly ? ":ro" : "";
+    result.push("-v", `${hostReal}:${m.target}${roFlag}`);
+  }
+
+  return result;
+}
+
+function dockerImageFromManifest(manifestPath?: string): string {
+  if (!manifestPath) return "tps-office:latest";
+  const manifest = parseOfficeManifest(manifestPath);
+  return (manifest as any).image || "tps-office:latest";
 }
 
 export function parseJoinToken(tokenUrl: string): any {
@@ -221,49 +256,45 @@ function setupWorkspace(agent: string): string {
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
-      if (args.manifest) {
+      const manifest = args.manifest;
+      if (manifest) {
         try {
-          provisionTeam(args.manifest, branchRoot());
-          if (args.soundstage && args.agent) {
-            const team = validateAgent(args.agent);
-            const teamRoot = join(branchRoot(), team);
-            const ws = join(teamRoot, "workspace");
-            const marker = join(teamRoot, "soundstage.json");
-            mkdirSync(teamRoot, { recursive: true });
-            writeFileSync(marker, JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
-
-            const teamBootstrap = join(teamRoot, "bootstrap.sh");
-            let bs = BOOTSTRAP_TEMPLATE
-              .replaceAll("__WORKSPACE__", ws)
-              .replaceAll("__TEAM_ROOT__", teamRoot);
-            const workspaceBootstrap = join(ws, "bootstrap.sh");
-            if (existsSync(workspaceBootstrap)) {
-              bs = readFileSync(workspaceBootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
-            }
-            writeFileSync(teamBootstrap, bs, { mode: 0o755 });
-          }
-          console.log(`Team provisioned from manifest.`);
+          provisionTeam(manifest, branchRoot());
         } catch (e: any) {
           console.error(`Failed to provision team: ${e.message}`);
           process.exit(1);
         }
-        return;
       }
-
+      const manifestData = manifest ? parseOfficeManifest(manifest) : null;
       const agent = validateAgent(args.agent);
       const ws = setupWorkspace(agent);
+      const teamId = resolveTeamId(agent);
+      const isTeam = teamId !== agent;
       const sName = sandboxName(agent);
+      const image = dockerImageFromManifest(manifest);
 
       if (args.soundstage) {
         console.log("🎬 Soundstage mode enabled (Mock LLM, local isolation)");
-        const agentDir = join(branchRoot(), agent);
-        mkdirSync(agentDir, { recursive: true });
-        const marker = join(agentDir, "soundstage.json");
-        writeFileSync(marker, JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
+        const teamRoot = join(branchRoot(), teamId);
+        mkdirSync(teamRoot, { recursive: true });
+        writeFileSync(join(teamRoot, "soundstage.json"), JSON.stringify({ enabled: true, startedAt: new Date().toISOString() }));
+
+        const teamBootstrap = join(teamRoot, "bootstrap.sh");
+        const teamWs = join(teamRoot, "workspace");
+        let bs = BOOTSTRAP_TEMPLATE
+          .replaceAll("__WORKSPACE__", teamWs)
+          .replaceAll("__TEAM_ROOT__", teamRoot);
+        const workspaceBootstrap = join(teamWs, "bootstrap.sh");
+        if (existsSync(workspaceBootstrap)) {
+          bs = readFileSync(workspaceBootstrap, "utf-8").replaceAll("__TEAM_ROOT__", teamRoot);
+        }
+        writeFileSync(teamBootstrap, bs, { mode: 0o755 });
       }
 
-      const teamId = resolveTeamId(agent);
-      const isTeam = teamId !== agent;
+      if (manifestData && manifestData.name !== teamId && manifestData.name !== agent) {
+        console.warn(`Manifest name mismatch: ${manifestData.name}`);
+      }
+
       if (isTeam) {
         console.log(`(Shared team sandbox: ${teamId})`);
       }
@@ -273,50 +304,57 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         return;
       }
 
-      // Check if sandbox already exists
-      const existing = findSandbox(agent);
+      const mountArgs = parseManifestMountArgs(manifest);
+      const workspaceMount = isTeam ? join(branchRoot(), teamId) : ws;
+      mountArgs.push("-v", `${workspaceMount}:/workspace`);
+      mountArgs.push("-v", `${join(ws, "mail")}:/mail`);
+      mountArgs.push("--mount", "type=tmpfs,destination=/run/secrets");
+
+      const existing = findContainer(agent);
       if (existing) {
-        if (existing.status === "running") {
-          console.log(`Office already running for ${agent} (sandbox: ${sName})`);
+        if (existing.state === "running") {
+          console.log(`Office already running for ${agent} (container: ${sName})`);
           return;
         }
-        // Sandbox exists but stopped — run it
-        console.log(`Resuming sandbox for ${agent}...`);
-        const runResult = spawnSync("docker", ["sandbox", "run", sName], { stdio: "inherit", encoding: "utf-8" });
+        const runResult = spawnSync("docker", ["start", sName], { stdio: "inherit", encoding: "utf-8" });
         if (runResult.status !== 0) {
-          console.error(`Failed to resume sandbox for ${agent}`);
+          console.error(`Failed to resume office for ${agent}`);
           process.exit(runResult.status ?? 1);
         }
         console.log(`✓ Office resumed for ${agent}`);
         return;
       }
 
-      // Create and run new sandbox
-      const dockerAgent = resolveDockerAgent(agent);
-      console.log(`Starting Docker Sandbox for ${agent} (runtime: ${dockerAgent})...`);
-
+      const runtime = resolveDockerAgent(agent);
+      const command = `if [ -f /workspace/bootstrap.sh ]; then cd /workspace && ./bootstrap.sh; elif [ -f /workspace/workspace/bootstrap.sh ]; then cd /workspace && ./workspace/bootstrap.sh; elif [ -f /workspace/.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & elif [ -f /workspace/../.openclaw/openclaw.json ]; then openclaw gateway run --config /workspace/../.openclaw/openclaw.json --port 18800 --bind lan > /workspace/gateway.log 2>&1 & else exit 1; fi`;
       const createResult = spawnSync("docker", [
-        "sandbox", "run",
-        "--name", sName,
-        dockerAgent,
-        ws,
-      ], { stdio: "inherit", encoding: "utf-8" });
+        "run", "-d", "--name", sName,
+        "--user", "node",
+        ...mountArgs,
+        "-p", "18800:18800",
+        image,
+        "nono",
+        "run",
+        "--profile",
+        runtime === "openclaw" ? "tps-office" : runtime,
+        "--",
+        "bash", "-lc", command,
+      ], { stdio: "inherit", encoding: "utf-8", timeout: 120_000 });
 
       if (createResult.status !== 0) {
-        console.error(`Failed to create sandbox for ${agent}`);
+        console.error(`Failed to start office container for ${agent}`);
         process.exit(createResult.status ?? 1);
       }
 
-      console.log(`✓ Office started for ${agent} (sandbox: ${sName})`);
-      console.log(`  Exec: tps office exec ${agent} -- <command>`);
-      console.log(`  Stop: tps office stop ${agent}`);
-
-      // Auto-run Office Manager if a workspace manifest exists
-      if (loadWorkspaceManifest(ws)) {
+      if (manifest && loadWorkspaceManifest(ws)) {
         console.log("Workspace manifest found — running Office Manager...");
-        await runOfficeManager(ws, { dryRun: false });
+        const ok = await runOfficeManager(ws, { dryRun: false });
+        if (!ok) process.exit(1);
       }
 
+      console.log(`✓ Office started for ${agent} (container: ${sName})`);
+      console.log(`  Exec: tps office exec ${agent} -- <command>`);
+      console.log(`  Stop: tps office stop ${agent}`);
       return;
     }
 
@@ -336,19 +374,19 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         try { unlinkSync(soundstageMarker); } catch {}
       }
 
-      const sb = findSandbox(agent);
+      const sb = findContainer(agent);
       if (!sb) {
         console.error(`No office found for ${agent}`);
         process.exit(1);
       }
 
-      if (sb.status === "stopped") {
+      if (sb.state === "exited") {
         console.log(`Office for ${agent} is already stopped.`);
         return;
       }
 
       console.log(`Stopping office for ${agent}...`);
-      const stopResult = spawnSync("docker", ["sandbox", "stop", sName], { stdio: "inherit", encoding: "utf-8" });
+      const stopResult = spawnSync("docker", ["stop", sName], { stdio: "inherit", encoding: "utf-8" });
       if (stopResult.status !== 0) {
         console.error(`Failed to stop sandbox for ${agent}`);
         process.exit(stopResult.status ?? 1);
@@ -358,8 +396,30 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       return;
     }
 
+    case "rm": {
+      const agent = validateAgent(args.agent);
+      const ws = workspacePath(agent);
+      const sName = sandboxName(agent);
+
+      const stopResult = spawnSync("docker", ["rm", "-f", sName], { stdio: "inherit", encoding: "utf-8" });
+      if (stopResult.status !== 0 && stopResult.status !== 1) {
+        console.error(`Failed to remove office ${agent}`);
+        process.exit(stopResult.status ?? 1);
+      }
+
+      const filesToClean = [join(ws, "gateway.log"), join(ws, "gateway.pid")];
+      for (const file of filesToClean) {
+        try { rmSync(file, { force: true }); } catch {}
+      }
+      const tmpSecret = join(ws, "mock-llm.log");
+      try { rmSync(tmpSecret, { force: true }); } catch {}
+
+      console.log(`✓ Office removed for ${agent} (container ${sName}).`);
+      return;
+    }
+
     case "list": {
-      const sandboxes = process.env.TPS_OFFICE_SKIP_VM === "1" ? [] : listDockerSandboxes().filter((s) => s.name.startsWith("tps-"));
+      const sandboxes = process.env.TPS_OFFICE_SKIP_VM === "1" ? [] : listDockerContainers().filter((s) => s.name.startsWith("tps-"));
       const root = branchRoot();
       const localAgents = existsSync(root) ? readdirSync(root).filter((d) => existsSync(join(root, d))) : [];
 
@@ -371,7 +431,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       // Show Docker sandboxes
       for (const sb of sandboxes) {
         const agentName = sb.name.replace(/^tps-/, "");
-        console.log(`- ${agentName}  ${sb.status}  agent=${sb.agent}  sandbox=${sb.name}`);
+        console.log(`- ${agentName}  ${sb.state}  ${sb.status}  sandbox=${sb.name}`);
       }
 
       // Show local-only workspaces (no sandbox yet)
@@ -406,7 +466,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const ws = workspacePath(agent);
       const relayRunning = existsSync(relayPidFile(agent));
       const counts = outboxCounts(agent);
-      const sb = findSandbox(agent);
+      const sb = findContainer(agent);
       
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
@@ -419,7 +479,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       if (sb) {
-        console.log(`Office: ${sb.status} (sandbox: ${sb.name}, agent: ${sb.agent})`);
+        console.log(`Office: ${sb.state} (sandbox: ${sb.name})`);
       } else {
         console.log(`Office: not running`);
       }
@@ -458,8 +518,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const sName = sandboxName(agent);
       const ws = workspacePath(agent);
 
-      const sb = findSandbox(agent);
-      if (!sb || sb.status !== "running") {
+      const sb = findContainer(agent);
+      if (!sb || sb.state !== "running") {
         console.error(`Office for ${agent} is not running. Start it with: tps office start ${agent}`);
         process.exit(1);
       }
@@ -470,14 +530,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         process.exit(1);
       }
 
-      // Use direct socket access — docker sandbox exec is broken in v0.11.0
-      // (can't find running sandboxes). sandboxExec() talks to the VM's
-      // Docker daemon socket directly.
-      const result = sandboxExec(sName, cmd, { workspace: ws });
-
-      if (result.stdout) process.stdout.write(result.stdout);
-      if (result.stderr) process.stderr.write(result.stderr);
-      process.exit(result.status ?? 1);
+      const result = spawnSync("docker", ["exec", "-i", sName, ...cmd], { encoding: "utf-8", cwd: ws, stdio: "inherit" });
+      process.exit(result.status ?? 0);
       return;
     }
 

@@ -1,0 +1,19 @@
+[meta]
+name = "tps-office"
+version = "1.0.0"
+description = "TPS Branch Office: container runtime wrapper for OpenClaw + agents."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+read = ["/workspace"]
+readwrite = ["/workspace", "/tmp"]
+
+[network]
+block = false
+
+# Note: nono v0.5.0 does not support per-process command blocking.
+# Credential protection relies on tmpfs-backed /run/secrets and
+# the entrypoint sourcing secrets into the gateway process only.
+# Future: nono --block-command can restrict specific binaries.
