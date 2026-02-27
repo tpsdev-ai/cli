@@ -103,20 +103,20 @@ llm:
 Each office is a single Docker container running multiple agents with layered isolation:
 
 ```
-┌─────────────────────────────────────────┐
-│  Docker Container                       │
-│  ┌───────────────┐ ┌─────────────────┐  │
-│  │ agent-lead    │ │ agent-coder     │  │
-│  │ (UID 1001)    │ │ (UID 1002)      │  │
-│  │ nono Landlock  │ │ nono Landlock    │  │
-│  │ /workspace/lead│ │ /workspace/coder│  │
-│  └───────────────┘ └─────────────────┘  │
-│                                         │
-│  tps-office-supervisor (PID 1)          │
-│  - Creates per-agent Linux users        │
-│  - Starts each under nono sandbox       │
-│  - Drops privileges after setup         │
-└─────────────────────────────────────────┘
+┌─────────────────────────────────────────────┐
+│  Docker Container                           │
+│  ┌──────────────────┐ ┌──────────────────┐  │
+│  │ agent-lead       │ │ agent-coder      │  │
+│  │ UID 1001         │ │ UID 1002         │  │
+│  │ nono Landlock    │ │ nono Landlock    │  │
+│  │ /workspace/lead  │ │ /workspace/coder │  │
+│  └──────────────────┘ └──────────────────┘  │
+│                                             │
+│  tps-office-supervisor (PID 1)              │
+│  · Creates per-agent Linux users            │
+│  · Starts each agent under nono sandbox     │
+│  · Drops privileges after setup             │
+└─────────────────────────────────────────────┘
 ```
 
 - **Docker**: Container boundary
