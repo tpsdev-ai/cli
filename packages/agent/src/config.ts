@@ -13,6 +13,7 @@ export interface AgentRuntimeConfig {
   llm: {
     provider: "anthropic" | "google" | "openai" | "ollama";
     model: string;
+    auth?: "oauth" | "api-key";
     apiKey?: string;
     baseUrl?: string;
   };
@@ -74,6 +75,7 @@ export function loadAgentConfig(path: string): AgentConfig {
     llm: {
       provider: parsed.llm?.provider || parsed.provider || "openai",
       model: parsed.llm?.model || parsed.model || "gpt-4o-mini",
+      auth: parsed.llm?.auth || parsed.auth || "api-key",
       apiKey: parsed.llm?.apiKey || parsed.apiKey,
       baseUrl: parsed.llm?.baseUrl || parsed.baseUrl,
     },

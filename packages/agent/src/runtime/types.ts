@@ -3,6 +3,7 @@ export type ProviderName = "anthropic" | "google" | "openai" | "ollama";
 export interface LLMConfig {
   provider: ProviderName;
   model: string;
+  auth?: "oauth" | "api-key";
   apiKey?: string;
   baseUrl?: string;
 }

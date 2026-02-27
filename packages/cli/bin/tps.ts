@@ -18,6 +18,7 @@ const cli = meow(
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
+    auth <action>     OAuth provider authentication (login/status/revoke/refresh)
     agent run|start|health  Manage tps-agent runtime from config
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
@@ -240,6 +241,17 @@ async function main() {
       } else {
         await runAgent({ action: "health", config: configPath });
       }
+      break;
+    }
+
+    case "auth": {
+      const action = rest[0] as "login" | "status" | "revoke" | "refresh" | undefined;
+      if (!action || !["login", "status", "revoke", "refresh"].includes(action)) {
+        console.error("Usage:\n  tps auth login <provider>\n  tps auth status\n  tps auth revoke <provider>\n  tps auth refresh <provider>");
+        process.exit(1);
+      }
+      const { runAuth } = await import("../src/commands/auth.js");
+      await runAuth({ action, provider: rest[1] });
       break;
     }
 
