@@ -214,7 +214,7 @@ function injectSecrets(containerName: string, secrets: Array<{ key: string; valu
       `cat > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
     ], { input: value, stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8", timeout: 10_000 });
     if (result.status !== 0) {
-      console.error(`Failed to inject secret ${key}`);
+      console.error("Failed to inject a secret into container");
     }
   }
   spawnSync("docker", [
