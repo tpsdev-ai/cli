@@ -83,6 +83,10 @@ export class ProviderManager {
       toolCalls: toolCalls.length ? toolCalls : undefined,
       inputTokens: raw?.usage?.input_tokens ?? 0,
       outputTokens: raw?.usage?.output_tokens ?? 0,
+      cacheReadTokens: raw?.usage?.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: raw?.usage?.cache_creation_input_tokens ?? 0,
+      // Raw assistant message preserves tool_use blocks for history
+      rawAssistantMessage: { role: "assistant", content: raw?.content },
     };
   }
 
@@ -99,6 +103,8 @@ export class ProviderManager {
       toolCalls: toolCalls.length ? toolCalls : undefined,
       inputTokens: raw?.usage?.prompt_tokens ?? 0,
       outputTokens: raw?.usage?.completion_tokens ?? 0,
+      cacheReadTokens: raw?.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+      rawAssistantMessage: message,
     };
   }
 
@@ -121,6 +127,7 @@ export class ProviderManager {
       toolCalls: toolCalls && toolCalls.length ? toolCalls : undefined,
       inputTokens: raw?.prompt_eval_count ?? 0,
       outputTokens: raw?.eval_count ?? 0,
+      rawAssistantMessage: message,
     };
   }
 
@@ -137,17 +144,66 @@ export class ProviderManager {
     return {};
   }
 
+  /** Build messages array, using raw assistant messages when available */
+  private buildMessages(messages: LLMMessage[]): any[] {
+    return messages.map((m) => {
+      if (m.role === "assistant" && m._raw) {
+        return m._raw;
+      }
+      if (m.role === "tool") {
+        return {
+          role: "tool",
+          tool_call_id: m.tool_call_id,
+          content: m.content ?? "",
+        };
+      }
+      return { role: m.role, content: m.content ?? "" };
+    });
+  }
+
   private async completeAnthropic(request: CompletionRequest): Promise<CompletionResponse> {
     const apiKey = this.config.apiKey ?? process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
 
+    // Cache-aware system prompt (multi-block with breakpoint)
+    const system = request.systemPrompt
+      ? [{ type: "text", text: request.systemPrompt, cache_control: { type: "ephemeral" } }]
+      : undefined;
+
+    // Cache breakpoint on last tool only
+    const tools = this.toolSetForAnthropic(request.tools) as any[];
+    if (tools.length > 0) {
+      tools[tools.length - 1] = {
+        ...tools[tools.length - 1],
+        cache_control: { type: "ephemeral" },
+      };
+    }
+
+    // Use raw assistant messages for Anthropic format compliance
+    const messages = request.messages.map((m) => {
+      if (m.role === "assistant" && m._raw) return m._raw;
+      if (m.role === "tool") {
+        return {
+          role: "user",
+          content: [{
+            type: "tool_result",
+            tool_use_id: m.tool_call_id,
+            content: m.content ?? "",
+          }],
+        };
+      }
+      return { role: m.role, content: m.content ?? "" };
+    });
+
     const body = {
       model: this.config.model,
-      max_tokens: request.maxTokens ?? 2048,
-      system: request.systemPrompt,
-      messages: request.messages,
-      tools: this.toolSetForAnthropic(request.tools),
-      tool_choice: request.toolChoice ?? "auto",
+      max_tokens: request.maxTokens ?? 4096,
+      system,
+      messages,
+      tools,
+      tool_choice: request.toolChoice === "required"
+        ? { type: "any" }
+        : { type: "auto" },
     };
 
     const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -217,6 +273,8 @@ export class ProviderManager {
       toolCalls: toolCalls.length ? toolCalls : undefined,
       inputTokens: data?.usageMetadata?.promptTokenCount ?? 0,
       outputTokens: data?.usageMetadata?.candidatesTokenCount ?? 0,
+      cacheReadTokens: data?.usageMetadata?.cachedContentTokenCount ?? 0,
+      rawAssistantMessage: candidate?.content,
     };
   }
 
