@@ -109,8 +109,10 @@ export class ProviderManager {
     if (message?.tool_calls) {
       toolCalls = message.tool_calls.map((toolCall: any) => ({
         id: toolCall?.id,
-        name: toolCall?.name,
-        input: this.safeJson(toolCall?.arguments),
+        name: toolCall?.function?.name,
+        input: typeof toolCall?.function?.arguments === "string"
+          ? this.safeJson(toolCall.function.arguments)
+          : toolCall?.function?.arguments ?? {},
       }));
     }
 
