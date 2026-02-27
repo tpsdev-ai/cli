@@ -203,6 +203,25 @@ function setupWorkspace(agent: string): string {
   return ws;
 }
 
+/**
+ * S33B-E: Inject secrets into container tmpfs via stdin pipe.
+ * Secrets never appear in process args, logs, or docker inspect.
+ */
+function injectSecrets(containerName: string, secrets: Array<{ key: string; value: string }>): void {
+  for (const { key, value } of secrets) {
+    const result = spawnSync("docker", [
+      "exec", "-i", containerName, "sh", "-c",
+      `cat > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
+    ], { input: value, stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8", timeout: 10_000 });
+    if (result.status !== 0) {
+      console.error(`Failed to inject secret ${key}`);
+    }
+  }
+  spawnSync("docker", [
+    "exec", containerName, "touch", "/run/secrets/.ready",
+  ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
+}
+
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
@@ -317,18 +336,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       // Supervisor waits for /run/secrets/.ready before booting agents.
       // Secrets piped via stdin — never appear in process args or logs.
       if (secretsToInject.length > 0) {
-        for (const { key, value } of secretsToInject) {
-          const writeResult = spawnSync("docker", [
-            "exec", "-i", sName, "sh", "-c",
-            `cat > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
-          ], { input: value, stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8", timeout: 10_000 });
-          if (writeResult.status !== 0) {
-            console.error(`Failed to inject secret ${key}`);
-          }
-        }
-        spawnSync("docker", [
-          "exec", sName, "touch", "/run/secrets/.ready",
-        ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
+        injectSecrets(sName, secretsToInject);
       }
 
       if (manifest && loadWorkspaceManifest(ws)) {
