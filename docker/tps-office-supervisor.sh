@@ -70,7 +70,7 @@ for ((i=0; i<count; i++)); do
   chown -R "$user":tps "$tmpdir"
   chmod 700 "$tmpdir"
 
-  su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
+  su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- tps-agent start --config '$config_path'" &
 
   pid=$!
   AGENT_IDS+=("$id")
