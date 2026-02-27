@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y libdbus-1-dev pkg-config
 RUN git clone --depth 1 https://github.com/lukehinds/nono.git /tmp/nono && cd /tmp/nono && cargo build --release
 
 FROM node:24-bookworm-slim AS base
-ARG TPS_VERSION=0.5.3
+ARG TPS_VERSION=0.5.4
 RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
 COPY --from=nono-builder /tmp/nono/target/release/nono /usr/local/bin/nono
 RUN apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
