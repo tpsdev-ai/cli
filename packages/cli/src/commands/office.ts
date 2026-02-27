@@ -162,9 +162,9 @@ function parseManifestMountArgs(manifestPath?: string): string[] {
 }
 
 function dockerImageFromManifest(manifestPath?: string): string {
-  if (!manifestPath) return "tps-office:latest";
+  if (!manifestPath) return "ghcr.io/tpsdev-ai/tps-office:latest";
   const manifest = parseOfficeManifest(manifestPath);
-  return (manifest as any).image || "tps-office:latest";
+  return (manifest as any).image || "ghcr.io/tpsdev-ai/tps-office:latest";
 }
 
 export function parseJoinToken(tokenUrl: string): any {
@@ -267,7 +267,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const mountArgs = parseManifestMountArgs(manifest);
       const workspaceMount = isTeam ? join(branchRoot(), teamId) : ws;
       mountArgs.push("-v", `${workspaceMount}:/workspace`);
-      mountArgs.push("-v", `${join(ws, "mail")}:/mail`);
+      // Mail dirs are inside each agent workspace — no separate /mail mount needed
       mountArgs.push("--mount", "type=tmpfs,destination=/run/secrets");
 
       const existing = findContainer(agent);
@@ -304,8 +304,21 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         )
       );
 
+      // Pass through known API key env vars to the container
+      const envPassthrough: string[] = [];
+      const API_KEY_VARS = [
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY",
+        "GEMINI_API_KEY", "OLLAMA_HOST",
+      ];
+      for (const key of API_KEY_VARS) {
+        if (process.env[key]) {
+          envPassthrough.push("-e", `${key}=${process.env[key]}`);
+        }
+      }
+
       const createResult = spawnSync("docker", [
         "run", "-d", "--name", sName,
+        ...envPassthrough,
         ...mountArgs,
         image,
       ], { stdio: "inherit", encoding: "utf-8", timeout: 120_000 });
