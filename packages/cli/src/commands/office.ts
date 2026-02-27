@@ -284,15 +284,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         )
       );
 
-      // Pass through known API key env vars to the container
-      const envPassthrough: string[] = [];
+      // S33B-E: Pass secrets via tmpfs files, not env vars.
+      // Env vars leak via `docker inspect`. Instead, we start the container,
+      // write secrets to /run/secrets (tmpfs), then the supervisor reads + unlinks
+      // before starting agents. Secrets exist only in memory.
       const API_KEY_VARS = [
         "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY",
         "GEMINI_API_KEY", "OLLAMA_HOST",
       ];
+      const envPassthrough: string[] = [];
+      const secretsToInject: Array<{ key: string; value: string }> = [];
       for (const key of API_KEY_VARS) {
-        if (process.env[key]) {
-          envPassthrough.push("-e", `${key}=${process.env[key]}`);
+        const val = process.env[key];
+        if (val) {
+          secretsToInject.push({ key, value: val });
         }
       }
 
@@ -306,6 +311,26 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       if (createResult.status !== 0) {
         console.error(`Failed to start office container for ${agent}`);
         process.exit(createResult.status ?? 1);
+      }
+
+      // S33B-E: Inject secrets into tmpfs after container start.
+      // Supervisor waits for /run/secrets/.ready before booting agents.
+      if (secretsToInject.length > 0) {
+        for (const { key, value } of secretsToInject) {
+          // Write each secret as a file in /run/secrets/ (tmpfs)
+          const writeResult = spawnSync("docker", [
+            "exec", sName, "sh", "-c",
+            `printf '%s' "$1" > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
+            "sh", value,
+          ], { stdio: "pipe", encoding: "utf-8", timeout: 10_000 });
+          if (writeResult.status !== 0) {
+            console.error(`Failed to inject secret ${key}: ${writeResult.stderr}`);
+          }
+        }
+        // Signal supervisor that secrets are ready
+        spawnSync("docker", [
+          "exec", sName, "touch", "/run/secrets/.ready",
+        ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
       }
 
       if (manifest && loadWorkspaceManifest(ws)) {
