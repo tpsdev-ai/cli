@@ -73,8 +73,7 @@ for ((i=0; i<count; i++)); do
   nono run \
     --allow "$workdir" \
     --allow "$tmpdir" \
-    --allow /var/run/tps-proxy.sock \
-    --allow /run/secrets \
+    --allow-command su \
     -- su -s /bin/bash "$user" -c "tps-agent start --config '$config_path'" &
 
   pid=$!
