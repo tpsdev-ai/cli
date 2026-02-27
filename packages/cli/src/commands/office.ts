@@ -203,6 +203,25 @@ function setupWorkspace(agent: string): string {
   return ws;
 }
 
+/**
+ * S33B-E: Inject secrets into container tmpfs via stdin pipe.
+ * Secrets never appear in process args, logs, or docker inspect.
+ */
+function injectSecrets(containerName: string, secrets: Array<{ key: string; value: string }>): void {
+  for (const { key, value } of secrets) {
+    const result = spawnSync("docker", [
+      "exec", "-i", containerName, "sh", "-c",
+      `cat > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
+    ], { input: value, stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8", timeout: 10_000 });
+    if (result.status !== 0) {
+      console.error("Failed to inject a secret into container");
+    }
+  }
+  spawnSync("docker", [
+    "exec", containerName, "touch", "/run/secrets/.ready",
+  ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
+}
+
 export async function runOffice(args: OfficeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
@@ -284,15 +303,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         )
       );
 
-      // Pass through known API key env vars to the container
-      const envPassthrough: string[] = [];
+      // S33B-E: Pass secrets via tmpfs files, not env vars.
+      // Env vars leak via `docker inspect`. Instead, we start the container,
+      // write secrets to /run/secrets (tmpfs), then the supervisor reads + unlinks
+      // before starting agents. Secrets exist only in memory.
       const API_KEY_VARS = [
         "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY",
         "GEMINI_API_KEY", "OLLAMA_HOST",
       ];
+      const envPassthrough: string[] = [];
+      const secretsToInject: Array<{ key: string; value: string }> = [];
       for (const key of API_KEY_VARS) {
-        if (process.env[key]) {
-          envPassthrough.push("-e", `${key}=${process.env[key]}`);
+        const val = process.env[key];
+        if (val) {
+          secretsToInject.push({ key, value: val });
         }
       }
 
@@ -306,6 +330,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       if (createResult.status !== 0) {
         console.error(`Failed to start office container for ${agent}`);
         process.exit(createResult.status ?? 1);
+      }
+
+      // S33B-E: Inject secrets into tmpfs after container start.
+      // Supervisor waits for /run/secrets/.ready before booting agents.
+      // Secrets piped via stdin — never appear in process args or logs.
+      if (secretsToInject.length > 0) {
+        injectSecrets(sName, secretsToInject);
       }
 
       if (manifest && loadWorkspaceManifest(ws)) {
