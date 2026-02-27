@@ -1,14 +1,18 @@
 # TPS (Team Provisioning System)
 
-> "Yeah... I'm gonna need you to go ahead and come in on Saturday."
+> "Yeah... I'm gonna need you to go ahead and come in on Saturday. We lost some people this week and we need to sort of play catch-up."
 
 **TPS is an Agent OS CLI for managing isolated AI agents.** It provides the primitives for agents to exist, discover each other, communicate asynchronously, and run in sandboxed environments.
 
 If you want your AI agents to stop stepping on each other's toes and actually get some work done, you're going to need them to file their TPS reports.
 
+![Lumbergh Agent](docs/media/lumbergh-agent.png)
+
 ## Why TPS?
 
 Most agent frameworks assume all agents run in the same memory space. TPS assumes agents are employees: they work in different offices, they have different security clearances, and they communicate via mail.
+
+> "I have eight different bosses right now. So that means that when I make a mistake, I have eight different people coming by to tell me about it." — Make your agents communicate through a single, auditable mail interface instead.
 
 - **Branch Offices**: Agents run in Docker containers with four layers of isolation: Docker → Linux users → [nono](https://github.com/lukehinds/nono) Landlock → BoundaryManager
 - **The Mailroom**: Async, persistent, cross-boundary Maildir-based messaging
