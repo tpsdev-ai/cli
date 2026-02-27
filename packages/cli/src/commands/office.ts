@@ -315,19 +315,17 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       // S33B-E: Inject secrets into tmpfs after container start.
       // Supervisor waits for /run/secrets/.ready before booting agents.
+      // Secrets piped via stdin — never appear in process args or logs.
       if (secretsToInject.length > 0) {
         for (const { key, value } of secretsToInject) {
-          // Write each secret as a file in /run/secrets/ (tmpfs)
           const writeResult = spawnSync("docker", [
-            "exec", sName, "sh", "-c",
-            `printf '%s' "$1" > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
-            "sh", value,
-          ], { stdio: "pipe", encoding: "utf-8", timeout: 10_000 });
+            "exec", "-i", sName, "sh", "-c",
+            `cat > "/run/secrets/${key}" && chmod 600 "/run/secrets/${key}"`,
+          ], { input: value, stdio: ["pipe", "pipe", "pipe"], encoding: "utf-8", timeout: 10_000 });
           if (writeResult.status !== 0) {
-            console.error(`Failed to inject secret ${key}: ${writeResult.stderr}`);
+            console.error(`Failed to inject secret ${key}`);
           }
         }
-        // Signal supervisor that secrets are ready
         spawnSync("docker", [
           "exec", sName, "touch", "/run/secrets/.ready",
         ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
