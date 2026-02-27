@@ -7,6 +7,8 @@ export interface LLMConfig {
   baseUrl?: string;
 }
 
+export type TrustLevel = "user" | "internal" | "external";
+
 export interface AgentConfig {
   /** Agent identifier from tps.yaml */
   agentId: string;
@@ -26,6 +28,8 @@ export interface AgentConfig {
   contextWindowTokens?: number;
   /** Max model output tokens */
   maxTokens?: number;
+  /** Max tool turns per message (default 12) */
+  maxToolTurns?: number;
   /** Tools the runtime should load */
   tools?: Array<"read" | "write" | "edit" | "exec" | "mail">;
   /** Allow-list for exec command binary names */
@@ -48,6 +52,8 @@ export interface LLMMessage {
   content?: string;
   name?: string;
   tool_call_id?: string;
+  /** Raw provider-specific message (for assistant messages with tool_use blocks) */
+  _raw?: unknown;
 }
 
 export interface CompletionRequest {
@@ -69,6 +75,12 @@ export interface CompletionResponse {
   toolCalls?: ToolCall[];
   inputTokens: number;
   outputTokens: number;
+  /** Anthropic/Google/OpenAI cache read tokens */
+  cacheReadTokens?: number;
+  /** Anthropic cache creation tokens */
+  cacheWriteTokens?: number;
+  /** Raw assistant message for history accumulation (provider-specific shape) */
+  rawAssistantMessage?: unknown;
 }
 
 export type AgentState =
