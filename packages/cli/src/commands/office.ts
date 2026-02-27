@@ -69,26 +69,6 @@ function validateAgent(agent?: string): string {
   return agent;
 }
 
-function resolveDockerAgent(agentId: string): string {
-  const ws = workspacePath(agentId);
-  const runtimeFile = join(ws, ".tps-runtime");
-  if (existsSync(runtimeFile)) {
-    const runtime = readFileSync(runtimeFile, "utf-8").trim();
-    return RUNTIME_TO_DOCKER_AGENT[runtime] || "claude";
-  }
-  return "claude"; // default
-}
-
-/**
- * Map TPS runtime names to Docker image/runtime labels.
- */
-const RUNTIME_TO_DOCKER_AGENT: Record<string, string> = {
-  "claude-code": "claude",
-  "codex": "codex",
-  "gemini": "gemini",
-  "openclaw": "claude", // default to claude for openclaw runtime
-};
-
 interface ContainerState {
   name: string;
   status: string;
