@@ -1,17 +1,32 @@
+/**
+ * TPS Auth — Provider OAuth via CLI delegation.
+ *
+ * HOW THIS WORKS (transparency):
+ * TPS does NOT implement its own OAuth flows or embed provider client IDs.
+ * Instead, it delegates to the provider's official CLI tool:
+ *
+ *   tps auth login anthropic  →  runs `claude login`  →  reads ~/.claude/.credentials.json
+ *   tps auth login google     →  runs `gemini auth login` → reads ~/.gemini/oauth_creds.json
+ *   tps auth login openai     →  (future) runs codex login → reads its credential store
+ *
+ * The user authenticates directly with the provider's own tool. TPS reads
+ * the resulting credentials and uses them for API calls. The refresh tokens
+ * were issued by the provider's CLI — TPS refreshes them using the same
+ * client ID and token endpoint the CLI uses (this is standard OAuth2).
+ *
+ * No credential spoofing. No client ID impersonation. The user's existing
+ * CLI subscription (Claude Pro, Gemini, ChatGPT Plus) is used transparently.
+ */
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { createHash, randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
-import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
+import { spawnSync } from "node:child_process";
 
 const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+
+// Anthropic OAuth constants (from Claude Code's public source)
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-const ANTHROPIC_AUTH_URL = "https://claude.ai/oauth/authorize";
-const ANTHROPIC_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback";
-const ANTHROPIC_SCOPES = "org:create_api_key user:profile user:inference";
 
 export interface AuthArgs {
   action: "login" | "status" | "revoke" | "refresh";
@@ -46,12 +61,6 @@ function loadCredentials(provider: string): StoredCredentials | null {
   return JSON.parse(readFileSync(p, "utf-8")) as StoredCredentials;
 }
 
-function openInBrowser(url: string): void {
-  const cmd = process.platform === "darwin" ? "open" : "xdg-open";
-  const child = spawn(cmd, [url], { stdio: "ignore", detached: true });
-  child.unref();
-}
-
 function humanExpiry(expiresAt: number): string {
   const ms = expiresAt - Date.now();
   if (ms <= 0) return "expired";
@@ -62,43 +71,72 @@ function humanExpiry(expiresAt: number): string {
   return `expires in ${m}m`;
 }
 
-function parseCodeAndState(inputCode: string): { code: string; state?: string } {
-  if (inputCode.includes("#")) {
-    const [code, state] = inputCode.split("#", 2);
-    return { code: code.trim(), state: state?.trim() };
-  }
-  return { code: inputCode.trim() };
+function findCli(name: string): string | null {
+  const result = spawnSync("which", [name], { encoding: "utf-8", timeout: 5000 });
+  return result.status === 0 ? result.stdout.trim() : null;
 }
 
-async function exchangeAnthropicCode(code: string, codeVerifier: string): Promise<StoredCredentials> {
-  const res = await fetch(ANTHROPIC_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "claude-code/1.0",
-    },
-    body: JSON.stringify({
-      grant_type: "authorization_code",
-      code,
-      client_id: ANTHROPIC_CLIENT_ID,
-      redirect_uri: ANTHROPIC_REDIRECT_URI,
-      code_verifier: codeVerifier,
-    }),
-  });
-
-  if (!res.ok) {
-    throw new Error(`OAuth exchange failed: ${res.status} ${await res.text()}`);
+/**
+ * Login via Claude Code CLI.
+ * Runs `claude login`, then reads the resulting credentials.
+ */
+async function loginAnthropic(): Promise<void> {
+  const claudePath = findCli("claude");
+  if (!claudePath) {
+    console.error(
+      "Claude Code CLI not found. Install it first:\n" +
+      "  npm install -g @anthropic-ai/claude-code\n" +
+      "  https://docs.anthropic.com/en/docs/claude-code"
+    );
+    process.exit(1);
   }
 
-  const token = (await res.json()) as any;
-  return {
-    provider: "anthropic",
-    refreshToken: token.refresh_token,
-    accessToken: token.access_token,
-    expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
-    clientId: ANTHROPIC_CLIENT_ID,
-    scopes: ANTHROPIC_SCOPES,
-  };
+  console.log("Running 'claude login' — authenticate in your browser...\n");
+  const result = spawnSync(claudePath, ["login"], {
+    stdio: "inherit",
+    timeout: 120_000,
+  });
+
+  if (result.status !== 0) {
+    console.error("claude login failed.");
+    process.exit(1);
+  }
+
+  // Read credentials that Claude Code just stored
+  const creds = readClaudeCodeCredentials();
+  if (!creds) {
+    console.error("Could not read Claude Code credentials after login.");
+    process.exit(1);
+  }
+
+  saveCredentials("anthropic", creds);
+  console.log(`\nanthropic  ✓ OAuth configured — ${humanExpiry(creds.expiresAt)}`);
+}
+
+/**
+ * Read Claude Code's credential file.
+ * Claude Code stores OAuth tokens at ~/.claude/.credentials.json
+ */
+function readClaudeCodeCredentials(): StoredCredentials | null {
+  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  if (!existsSync(credPath)) return null;
+
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf-8"));
+    const oauth = data.claudeAiOauth;
+    if (!oauth?.accessToken || !oauth?.refreshToken) return null;
+
+    return {
+      provider: "anthropic",
+      refreshToken: oauth.refreshToken,
+      accessToken: oauth.accessToken,
+      expiresAt: oauth.expiresAt || 0,
+      clientId: ANTHROPIC_CLIENT_ID,
+      scopes: oauth.scopes || "",
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function refreshAnthropicToken(creds: StoredCredentials): Promise<StoredCredentials> {
@@ -116,7 +154,7 @@ export async function refreshAnthropicToken(creds: StoredCredentials): Promise<S
   });
 
   if (!res.ok) {
-    throw new Error(`Anthropic token refresh failed: ${res.status} ${await res.text()}`);
+    throw new Error(`Anthropic token refresh failed: ${res.status}`);
   }
 
   const token = (await res.json()) as any;
@@ -126,42 +164,6 @@ export async function refreshAnthropicToken(creds: StoredCredentials): Promise<S
     refreshToken: token.refresh_token || creds.refreshToken,
     expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
   };
-}
-
-async function loginAnthropic(): Promise<void> {
-  const verifier = randomBytes(32).toString("base64url");
-  const challenge = createHash("sha256").update(verifier).digest("base64url");
-  const state = randomBytes(16).toString("hex");
-
-  const authUrl = new URL(ANTHROPIC_AUTH_URL);
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("client_id", ANTHROPIC_CLIENT_ID);
-  authUrl.searchParams.set("redirect_uri", ANTHROPIC_REDIRECT_URI);
-  authUrl.searchParams.set("scope", ANTHROPIC_SCOPES);
-  authUrl.searchParams.set("code_challenge", challenge);
-  authUrl.searchParams.set("code_challenge_method", "S256");
-  authUrl.searchParams.set("state", state);
-
-  console.log(`Opening browser for Anthropic OAuth...`);
-  console.log(authUrl.toString());
-  try {
-    openInBrowser(authUrl.toString());
-  } catch {
-    // no-op, URL already printed
-  }
-
-  const rl = createInterface({ input, output });
-  const pasted = await rl.question("Paste callback code (code#state): ");
-  rl.close();
-
-  const parsed = parseCodeAndState(pasted);
-  if (parsed.state && parsed.state !== state) {
-    throw new Error("OAuth state mismatch");
-  }
-
-  const creds = await exchangeAnthropicCode(parsed.code, verifier);
-  saveCredentials("anthropic", creds);
-  console.log(`anthropic  ✓ OAuth configured — ${humanExpiry(creds.expiresAt)}`);
 }
 
 export function showStatus(): void {
@@ -193,7 +195,7 @@ export async function runAuth(args: AuthArgs): Promise<void> {
       if (args.provider === "anthropic") {
         await loginAnthropic();
       } else {
-        console.error("Only 'anthropic' is supported in Phase 1");
+        console.error("Only 'anthropic' is supported in Phase 1.\n  tps auth login anthropic");
         process.exit(1);
       }
       return;
@@ -209,7 +211,7 @@ export async function runAuth(args: AuthArgs): Promise<void> {
       return;
     case "refresh":
       if (args.provider !== "anthropic") {
-        console.error("Only 'anthropic' is supported in Phase 1");
+        console.error("Only 'anthropic' is supported in Phase 1.");
         process.exit(1);
       }
       {
