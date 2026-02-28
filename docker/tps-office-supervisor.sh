@@ -12,29 +12,6 @@ fi
 
 mkdir -p /workspace/.tps
 
-# S33B-E: Wait for secrets to be injected into tmpfs.
-# Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
-SECRETS_DIR="/run/secrets"
-SECRETS_TIMEOUT=30
-elapsed=0
-while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $SECRETS_TIMEOUT ]]; do
-  sleep 0.5
-  elapsed=$((elapsed + 1))
-done
-
-# Load secrets into environment, then unlink all files.
-# After this, secrets exist only in this process's memory.
-if [[ -d "$SECRETS_DIR" ]]; then
-  for secret_file in "$SECRETS_DIR"/*; do
-    [[ -f "$secret_file" ]] || continue
-    fname=$(basename "$secret_file")
-    [[ "$fname" == ".ready" ]] && continue
-    export "$fname"="$(cat "$secret_file")"
-    rm -f "$secret_file"
-  done
-  rm -f "$SECRETS_DIR/.ready"
-fi
-
 declare -a AGENT_IDS=()
 declare -a AGENT_PIDS=()
 
@@ -52,6 +29,27 @@ fi
 if ! id tps-supervisor >/dev/null 2>&1; then
   useradd -r -g tps -M -s /usr/sbin/nologin tps-supervisor
 fi
+
+supports_landlock_for_agent() {
+  local user="$1"
+  local workdir="$2"
+  local tmpdir="$3"
+
+  local probe_file="$workdir/.landlock-probe"
+  set +e
+  su -s /bin/bash "$user" -c "echo probe > '$probe_file'" >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    set -e
+    return 1
+  fi
+
+  su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
+  local rc=$?
+  su -s /bin/bash "$user" -c "rm -f '$probe_file'" >/dev/null 2>&1 || true
+  set -e
+
+  [[ $rc -eq 0 ]]
+}
 
 uid=1001
 for ((i=0; i<count; i++)); do
@@ -93,10 +91,12 @@ for ((i=0; i<count; i++)); do
   chown -R "$user":tps "$tmpdir"
   chmod 700 "$tmpdir"
 
-  # S33B-E: Secrets are already in supervisor's env (loaded from tmpfs above).
-  # Use su -m to preserve environment when switching to agent user.
-  # Agent process inherits env vars; original tmpfs files are already deleted.
-  su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- tps-agent start --config '$config_path'" &
+  if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
+    su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
+  else
+    echo "⚠ Landlock incompatible with mount type for agent '$id' — falling back to UID isolation only" >&2
+    su -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
+  fi
 
   pid=$!
   AGENT_IDS+=("$id")
@@ -121,7 +121,7 @@ done
 
 chmod 644 "$PIDS_FILE"
 
-cat > "$MONITOR_SCRIPT" <<'EOF'
+cat > "$MONITOR_SCRIPT" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -144,7 +144,7 @@ trap shutdown SIGTERM SIGINT
 
 wait -n || true
 shutdown
-EOF
+EOS
 
 chown tps-supervisor:tps "$MONITOR_SCRIPT"
 chmod 700 "$MONITOR_SCRIPT"
