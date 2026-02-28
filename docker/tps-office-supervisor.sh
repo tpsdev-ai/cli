@@ -17,10 +17,15 @@ mkdir -p /workspace/.tps
 SECRETS_DIR="/run/secrets"
 SECRETS_TIMEOUT=30
 elapsed=0
-while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $SECRETS_TIMEOUT ]]; do
+while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $((SECRETS_TIMEOUT * 2)) ]]; do
   sleep 0.5
   elapsed=$((elapsed + 1))
 done
+
+if [[ ! -f "$SECRETS_DIR/.ready" ]]; then
+  echo "Timed out waiting for $SECRETS_DIR/.ready" >&2
+  exit 1
+fi
 
 # Load secrets into environment, then unlink all files.
 # After this, secrets exist only in this process's memory.
