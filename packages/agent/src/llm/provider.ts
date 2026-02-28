@@ -1,3 +1,6 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type {
   LLMConfig,
   CompletionRequest,
@@ -8,6 +11,83 @@ import type {
 } from "../runtime/types.js";
 
 type ProviderKind = LLMConfig["provider"];
+
+interface OAuthCredentials {
+  provider: string;
+  refreshToken: string;
+  accessToken: string;
+  expiresAt: number;
+  clientId: string;
+  scopes: string;
+}
+
+const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+
+function oauthPath(provider: string): string {
+  return join(AUTH_DIR, `${provider}.json`);
+}
+
+function loadOAuth(provider: string): OAuthCredentials | null {
+  const p = oauthPath(provider);
+  if (!existsSync(p)) return null;
+  return JSON.parse(readFileSync(p, "utf-8")) as OAuthCredentials;
+}
+
+function saveOAuth(provider: string, creds: OAuthCredentials): void {
+  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+  writeFileSync(oauthPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
+}
+
+export async function refreshAnthropicOAuthToken(creds: OAuthCredentials): Promise<OAuthCredentials> {
+  const res = await fetch(ANTHROPIC_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "claude-code/1.0",
+    },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      client_id: creds.clientId,
+      refresh_token: creds.refreshToken,
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Anthropic token refresh failed: ${res.status} ${await res.text()}`);
+  }
+
+  const token = (await res.json()) as any;
+  const refreshed: OAuthCredentials = {
+    ...creds,
+    accessToken: token.access_token,
+    refreshToken: token.refresh_token || creds.refreshToken,
+    expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
+  };
+
+  // Sync back to Claude Code's credential file to prevent split-brain (S46-C)
+  syncToClaudeCode(refreshed);
+
+  return refreshed;
+}
+
+/**
+ * Keep Claude Code's credentials in sync after TPS refreshes the token.
+ */
+function syncToClaudeCode(creds: OAuthCredentials): void {
+  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  if (!existsSync(credPath)) return;
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf-8"));
+    if (!data.claudeAiOauth) return;
+    data.claudeAiOauth.accessToken = creds.accessToken;
+    data.claudeAiOauth.refreshToken = creds.refreshToken;
+    data.claudeAiOauth.expiresAt = creds.expiresAt;
+    writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch {
+    // Best-effort sync
+  }
+}
 
 /**
  * Routes completion requests to the configured provider and normalizes
@@ -162,7 +242,21 @@ export class ProviderManager {
   }
 
   private async completeAnthropic(request: CompletionRequest): Promise<CompletionResponse> {
-    const apiKey = this.config.apiKey ?? process.env.ANTHROPIC_API_KEY;
+    let apiKey = this.config.apiKey ?? process.env.ANTHROPIC_API_KEY;
+
+    if (this.config.auth === "oauth") {
+      const oauth = loadOAuth("anthropic");
+      if (!oauth) {
+        throw new Error("Anthropic OAuth not configured. Run: tps auth login anthropic");
+      }
+      let current = oauth;
+      if (Date.now() > oauth.expiresAt - 5 * 60_000) {
+        current = await refreshAnthropicOAuthToken(oauth);
+        saveOAuth("anthropic", current);
+      }
+      apiKey = current.accessToken;
+    }
+
     if (!apiKey) throw new Error("ANTHROPIC_API_KEY not set");
 
     // Cache-aware system prompt (multi-block with breakpoint)
