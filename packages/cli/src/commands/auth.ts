@@ -10,9 +10,11 @@
  *   tps auth login openai     →  (future) runs codex login → reads its credential store
  *
  * The user authenticates directly with the provider's own tool. TPS reads
- * the resulting credentials and uses them for API calls. The refresh tokens
- * were issued by the provider's CLI — TPS refreshes them using the same
- * client ID and token endpoint the CLI uses (this is standard OAuth2).
+ * the resulting credentials and uses them for API calls. When TPS refreshes
+ * tokens, it writes updated credentials back to both its own store AND the
+ * original CLI's credential file to prevent split-brain token invalidation.
+ * Refresh tokens were issued by the provider's CLI — TPS refreshes them
+ * using the same client ID and token endpoint (standard OAuth2).
  *
  * No credential spoofing. No client ID impersonation. The user's existing
  * CLI subscription (Claude Pro, Gemini, ChatGPT Plus) is used transparently.
@@ -47,7 +49,7 @@ function authPath(provider: string): string {
 }
 
 function ensureAuthDir(): void {
-  mkdirSync(AUTH_DIR, { recursive: true });
+  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
 }
 
 function saveCredentials(provider: string, creds: StoredCredentials): void {
@@ -71,9 +73,25 @@ function humanExpiry(expiresAt: number): string {
   return `expires in ${m}m`;
 }
 
+/**
+ * Find a CLI binary, rejecting paths in CWD or relative directories
+ * to prevent PATH hijacking (S46-B).
+ */
 function findCli(name: string): string | null {
   const result = spawnSync("which", [name], { encoding: "utf-8", timeout: 5000 });
-  return result.status === 0 ? result.stdout.trim() : null;
+  if (result.status !== 0) return null;
+  const resolved = result.stdout.trim();
+  // Reject relative paths and CWD-local binaries
+  if (!resolved.startsWith("/")) return null;
+  const cwd = process.cwd();
+  if (resolved.startsWith(cwd + "/") || resolved.startsWith(cwd + "\\")) {
+    console.error(
+      `Security: refusing to run '${name}' from current directory (${resolved}).\n` +
+      `Install it globally or use an absolute path.`
+    );
+    return null;
+  }
+  return resolved;
 }
 
 /**
@@ -139,6 +157,28 @@ function readClaudeCodeCredentials(): StoredCredentials | null {
   }
 }
 
+/**
+ * Sync refreshed tokens back to Claude Code's credential file so both
+ * TPS and Claude Code stay in sync (fixes S46-C split-brain).
+ */
+function syncToClaudeCode(creds: StoredCredentials): void {
+  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  if (!existsSync(credPath)) return;
+
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf-8"));
+    if (!data.claudeAiOauth) return;
+
+    data.claudeAiOauth.accessToken = creds.accessToken;
+    data.claudeAiOauth.refreshToken = creds.refreshToken;
+    data.claudeAiOauth.expiresAt = creds.expiresAt;
+
+    writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch {
+    // Best-effort — don't fail the refresh if Claude Code's file is unwritable
+  }
+}
+
 export async function refreshAnthropicToken(creds: StoredCredentials): Promise<StoredCredentials> {
   const res = await fetch(ANTHROPIC_TOKEN_URL, {
     method: "POST",
@@ -158,12 +198,17 @@ export async function refreshAnthropicToken(creds: StoredCredentials): Promise<S
   }
 
   const token = (await res.json()) as any;
-  return {
+  const refreshed: StoredCredentials = {
     ...creds,
     accessToken: token.access_token,
     refreshToken: token.refresh_token || creds.refreshToken,
     expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
   };
+
+  // Keep Claude Code in sync — no split-brain (S46-C)
+  syncToClaudeCode(refreshed);
+
+  return refreshed;
 }
 
 export function showStatus(): void {

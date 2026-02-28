@@ -35,7 +35,7 @@ function loadOAuth(provider: string): OAuthCredentials | null {
 }
 
 function saveOAuth(provider: string, creds: OAuthCredentials): void {
-  mkdirSync(AUTH_DIR, { recursive: true });
+  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
   writeFileSync(oauthPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
@@ -58,12 +58,35 @@ export async function refreshAnthropicOAuthToken(creds: OAuthCredentials): Promi
   }
 
   const token = (await res.json()) as any;
-  return {
+  const refreshed: OAuthCredentials = {
     ...creds,
     accessToken: token.access_token,
     refreshToken: token.refresh_token || creds.refreshToken,
     expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
   };
+
+  // Sync back to Claude Code's credential file to prevent split-brain (S46-C)
+  syncToClaudeCode(refreshed);
+
+  return refreshed;
+}
+
+/**
+ * Keep Claude Code's credentials in sync after TPS refreshes the token.
+ */
+function syncToClaudeCode(creds: OAuthCredentials): void {
+  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  if (!existsSync(credPath)) return;
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf-8"));
+    if (!data.claudeAiOauth) return;
+    data.claudeAiOauth.accessToken = creds.accessToken;
+    data.claudeAiOauth.refreshToken = creds.refreshToken;
+    data.claudeAiOauth.expiresAt = creds.expiresAt;
+    writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+  } catch {
+    // Best-effort sync
+  }
 }
 
 /**
