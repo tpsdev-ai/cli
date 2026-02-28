@@ -25,12 +25,11 @@ describe("security properties regression checks", () => {
     expect(sh).toContain('rm -f "$secret_file"');
   });
 
-  test("supervisor monitor traps SIGTERM/SIGINT and fans out to all child pids", () => {
+  test("supervisor has SIGTERM/SIGINT fan-out logic (trap + kill + wait)", () => {
     const sh = src("docker/tps-office-supervisor.sh");
-    expect(sh).toContain('cat > "$MONITOR_SCRIPT" <<\'EOS\'');
-    expect(sh).toContain("trap shutdown SIGTERM SIGINT");
-    expect(sh).toContain("for pid in $pids; do");
-    expect(sh).toContain('kill -TERM "$pid"');
+    const hasTrap = sh.includes("trap shutdown SIGTERM SIGINT") || (sh.includes("trap 'on_signal TERM' SIGTERM") && sh.includes("trap 'on_signal INT' SIGINT"));
+    expect(hasTrap).toBe(true);
+    expect(sh.includes('kill -TERM "$pid"') || sh.includes('kill -"$signal" "$pid"')).toBe(true);
     expect(sh).toContain('wait "$pid"');
   });
 
@@ -41,8 +40,10 @@ describe("security properties regression checks", () => {
     expect(sh).toContain('chmod 644 "$PIDS_FILE"');
   });
 
-  test("agent launch path keeps su -m privilege-drop semantics", () => {
+  test("agent processes are launched under non-root per-agent users", () => {
     const sh = src("docker/tps-office-supervisor.sh");
+    expect(sh).toContain('user="agent-$id"');
+    expect(sh).toContain('useradd -u "$uid" -g tps -m -s /bin/bash "$user"');
     expect(sh).toContain('su -m -s /bin/bash "$user" -c "exec nono run');
     expect(sh).toContain('su -m -s /bin/bash "$user" -c "exec tps-agent start');
   });
@@ -90,5 +91,4 @@ describe("security properties regression checks", () => {
 
   test.todo("supervisor removes pids.json on exit");
   test.todo("supervisor startup cleans stale pids from prior container lifecycle");
-  test.todo("steady-state supervisor process runs non-root after launch");
 });
