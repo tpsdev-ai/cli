@@ -14,6 +14,8 @@ import type { ProviderManager } from "../llm/provider.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { ReviewGate } from "../governance/review-gate.js";
 import { resolve, relative, isAbsolute, sep } from "node:path";
+import type { EventLogger } from "../telemetry/events.js";
+import { sanitizeError } from "../telemetry/events.js";
 
 /** Absolute safety net — independent of config */
 const PANIC_MAX_TURNS = 20;
@@ -40,6 +42,7 @@ interface EventLoopDeps {
   provider: ProviderManager;
   tools: ToolRegistry;
   reviewGate?: ReviewGate;
+  events?: EventLogger;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -59,8 +62,14 @@ export class EventLoop {
   async run(checkInbox: () => Promise<MailMessage[]>): Promise<void> {
     this.running = true;
     this.state = "idle";
+    this.deps.events?.emit({
+      type: "session.start",
+      model: this.deps.config.llm.model,
+      contextTokens: this.deps.config.contextWindowTokens ?? 0,
+    });
 
-    while (this.running) {
+    try {
+      while (this.running) {
       const messages = await checkInbox();
       for (const msg of messages) {
         if (!this.running) break;
@@ -79,6 +88,12 @@ export class EventLoop {
 
       if (!this.running) break;
       if (messages.length === 0) await sleep(this.pollMs);
+      }
+    } finally {
+      this.deps.events?.emit({
+        type: "session.end",
+        model: this.deps.config.llm.model,
+      });
     }
   }
 
@@ -318,13 +333,27 @@ export class EventLoop {
         }
 
         let result;
+        const toolStart = Date.now();
         try {
           result = await this.deps.tools.execute(call.name, call.input);
+          this.deps.events?.emit({
+            type: "tool.call",
+            tool: call.name,
+            durationMs: Date.now() - toolStart,
+            status: "ok",
+          });
         } catch (err: any) {
           result = {
             content: `Tool execution error: ${err?.message ?? String(err)}`,
             isError: true,
           };
+          this.deps.events?.emit({
+            type: "tool.call",
+            tool: call.name,
+            durationMs: Date.now() - toolStart,
+            status: "error",
+            error: sanitizeError(err),
+          });
         }
 
         await this.deps.memory.append({
@@ -383,6 +412,14 @@ export class EventLoop {
         inputTokens: summary.inputTokens,
         cacheReadTokens: summary.cacheReadTokens,
       },
+    });
+
+    this.deps.events?.emit({
+      type: "compaction",
+      tokensBefore: summary.inputTokens ?? 0,
+      tokensAfter: (summary.content ?? "").length,
+      messagesDropped: 0,
+      memoryFlushed: true,
     });
 
     this.compactionSummary = summary.content ?? undefined;

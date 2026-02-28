@@ -24,6 +24,7 @@ const cli = meow(
     secrets <action>  Secret management (set/list/remove)
     git <action>      Git utilities (worktree)
     branch <action>   Branch office node (init/start/stop/status/log)
+    stats            Aggregate structured JSONL telemetry events
 
   Options
     --help            Show this help text
@@ -101,6 +102,9 @@ const cli = meow(
       offlineHours: { type: "number" },
       shared: { type: "boolean", default: false },
       cost: { type: "boolean", default: false },
+      costs: { type: "boolean", default: false },
+      today: { type: "boolean", default: false },
+      agent: { type: "string" },
       statusOverride: { type: "string" },
     },
   }
@@ -424,6 +428,15 @@ async function main() {
         status: (cli.flags.statusOverride as any) || undefined,
         nonono: !!cli.flags.nonono,
         profile: "tps-status",
+      });
+      break;
+    }
+    case "stats": {
+      const { runStats } = await import("../src/commands/stats.js");
+      runStats({
+        today: !!cli.flags.today,
+        agent: (cli.flags.agent as string) || undefined,
+        costs: !!cli.flags.costs,
       });
       break;
     }

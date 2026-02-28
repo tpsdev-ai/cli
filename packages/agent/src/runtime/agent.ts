@@ -8,6 +8,7 @@ import { ContextManager } from "../io/context.js";
 import { ProviderManager } from "../llm/provider.js";
 import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
+import { EventLogger } from "../telemetry/events.js";
 
 export class AgentRuntime {
   private loop: EventLoop;
@@ -15,10 +16,14 @@ export class AgentRuntime {
   private readonly boundary: BoundaryManager;
 
   constructor(public readonly config: AgentConfig) {
-    const mail = new MailClient(config.mailDir);
+    const events = new EventLogger(
+      config.agentId,
+      join(config.workspace, ".tps", "events"),
+    );
+    const mail = new MailClient(config.mailDir, events, config.agentId);
     const memory = new MemoryStore(config.memoryPath);
     const context = new ContextManager(memory, config.contextWindowTokens ?? 8000);
-    const provider = new ProviderManager(config.llm);
+    const provider = new ProviderManager(config.llm, events, config.agentId);
 
     this.mail = mail;
     this.boundary = new BoundaryManager(config.workspace);
@@ -29,7 +34,7 @@ export class AgentRuntime {
       execAllowlist: config.execAllowlist,
     });
 
-    this.loop = new EventLoop({ config, memory, context, provider, tools });
+    this.loop = new EventLoop({ config, memory, context, provider, tools, events });
   }
 
   async start(): Promise<void> {

@@ -9,6 +9,8 @@ import type {
   ToolSpec,
   LLMMessage,
 } from "../runtime/types.js";
+import type { EventLogger } from "../telemetry/events.js";
+import { sanitizeError } from "../telemetry/events.js";
 
 type ProviderKind = LLMConfig["provider"];
 
@@ -155,20 +157,61 @@ function syncToGeminiCli(creds: OAuthCredentials): void {
  * tool-call responses into a common shape.
  */
 export class ProviderManager {
-  constructor(private readonly config: LLMConfig) {}
+  constructor(
+    private readonly config: LLMConfig,
+    private readonly events?: EventLogger,
+    private readonly agentId = "unknown",
+  ) {}
 
   async complete(request: CompletionRequest): Promise<CompletionResponse> {
-    switch (this.config.provider) {
-      case "anthropic":
-        return this.completeAnthropic(request);
-      case "google":
-        return this.completeGoogle(request);
-      case "openai":
-        return this.completeOpenAI(request);
-      case "ollama":
-        return this.completeOllama(request);
-      default:
-        throw new Error(`Unsupported provider: ${this.config.provider}`);
+    const started = Date.now();
+    const provider = this.config.provider;
+    const model = this.config.model;
+    try {
+      let out: CompletionResponse;
+      switch (provider) {
+        case "anthropic":
+          out = await this.completeAnthropic(request);
+          break;
+        case "google":
+          out = await this.completeGoogle(request);
+          break;
+        case "openai":
+          out = await this.completeOpenAI(request);
+          break;
+        case "ollama":
+          out = await this.completeOllama(request);
+          break;
+        default:
+          throw new Error(`Unsupported provider: ${provider}`);
+      }
+
+      this.events?.emit({
+        type: "llm.request",
+        agent: this.agentId,
+        provider,
+        model,
+        inputTokens: out.inputTokens ?? 0,
+        outputTokens: out.outputTokens ?? 0,
+        cacheReadTokens: out.cacheReadTokens,
+        cacheWriteTokens: out.cacheWriteTokens,
+        durationMs: Date.now() - started,
+        status: "ok",
+      });
+      return out;
+    } catch (err) {
+      this.events?.emit({
+        type: "llm.request",
+        agent: this.agentId,
+        provider,
+        model,
+        inputTokens: 0,
+        outputTokens: 0,
+        durationMs: Date.now() - started,
+        status: "error",
+        error: sanitizeError(err),
+      });
+      throw err;
     }
   }
 
