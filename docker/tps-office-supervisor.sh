@@ -115,7 +115,7 @@ for ((i=0; i<count; i++)); do
   chmod 700 "$tmpdir"
 
   if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
-    su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
+    su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock -- tps-agent start --config '$config_path'" &
   else
     echo "⚠ Landlock incompatible with mount type for agent '$id' — falling back to UID isolation only" >&2
     su -m -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
