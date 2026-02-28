@@ -23,6 +23,7 @@ interface OAuthCredentials {
 
 const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 function oauthPath(provider: string): string {
   return join(AUTH_DIR, `${provider}.json`);
@@ -86,6 +87,66 @@ function syncToClaudeCode(creds: OAuthCredentials): void {
     writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
   } catch {
     // Best-effort sync
+  }
+}
+
+
+export async function refreshGoogleOAuthToken(creds: OAuthCredentials): Promise<OAuthCredentials> {
+  if (!creds.clientId) {
+    throw new Error("Google OAuth refresh requires clientId. Run: tps auth login google");
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: creds.clientId,
+    refresh_token: creds.refreshToken,
+  });
+
+  const res = await fetch(GOOGLE_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) {
+    throw new Error(`Google token refresh failed: ${res.status} ${await res.text()}`);
+  }
+
+  const token = (await res.json()) as any;
+  const refreshed: OAuthCredentials = {
+    ...creds,
+    accessToken: token.access_token,
+    refreshToken: token.refresh_token || creds.refreshToken,
+    expiresAt: Date.now() + Number(token.expires_in || 0) * 1000,
+    scopes: token.scope || creds.scopes,
+  };
+
+  syncToGeminiCli(refreshed);
+  return refreshed;
+}
+
+function syncToGeminiCli(creds: OAuthCredentials): void {
+  const home = process.env.HOME || homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const candidates = [
+    join(home, ".gemini", "oauth_creds.json"),
+    join(xdg, "gemini", "oauth_creds.json"),
+  ];
+
+  for (const credPath of candidates) {
+    if (!existsSync(credPath)) continue;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      data.access_token = creds.accessToken;
+      data.refresh_token = creds.refreshToken;
+      data.expiry_date = creds.expiresAt;
+      if (creds.scopes) data.scope = creds.scopes;
+      if (creds.clientId) data.client_id = creds.clientId;
+      writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      return;
+    } catch {
+      // Best-effort sync
+    }
   }
 }
 
@@ -319,15 +380,34 @@ export class ProviderManager {
   }
 
   private async completeGoogle(request: CompletionRequest): Promise<CompletionResponse> {
-    const apiKey = this.config.apiKey ?? process.env.GOOGLE_API_KEY;
-    if (!apiKey) throw new Error("GOOGLE_API_KEY not set");
+    let authHeader: string | undefined;
+    let url = `https://generativelanguage.googleapis.com/v1beta/models/${this.config.model}:generateContent`;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.config.model}:generateContent?key=${apiKey}`;
+    if (this.config.auth === "oauth") {
+      const oauth = loadOAuth("google");
+      if (!oauth) {
+        throw new Error("Google OAuth not configured. Run: tps auth login google");
+      }
+      let current = oauth;
+      if (Date.now() > oauth.expiresAt - 5 * 60_000) {
+        current = await refreshGoogleOAuthToken(oauth);
+        saveOAuth("google", current);
+      }
+      authHeader = `Bearer ${current.accessToken}`;
+    } else {
+      const apiKey = this.config.apiKey ?? process.env.GOOGLE_API_KEY;
+      if (!apiKey) throw new Error("GOOGLE_API_KEY not set");
+      url = `${url}?key=${apiKey}`;
+    }
+
     const toolPayload = this.toolSetForGoogle(request.tools);
 
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
       body: JSON.stringify({
         systemInstruction: request.systemPrompt
           ? { parts: [{ text: request.systemPrompt }] }

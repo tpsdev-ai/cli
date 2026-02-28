@@ -426,3 +426,42 @@ describe("Edge cases", () => {
     expect(res.toolCalls).toBeUndefined();
   });
 });
+
+
+describe("Google OAuth mode", () => {
+  test("uses bearer token when auth=oauth", async () => {
+    const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+
+    const authDir = join(process.env.HOME || homedir(), ".tps", "auth");
+    const authFile = join(authDir, "google.json");
+    mkdirSync(authDir, { recursive: true });
+
+    const hadOriginal = existsSync(authFile);
+    const original = hadOriginal ? readFileSync(authFile, "utf-8") : undefined;
+
+    writeFileSync(authFile, JSON.stringify({
+      provider: "google",
+      refreshToken: "r",
+      accessToken: "bearer-1",
+      expiresAt: Date.now() + 3600_000,
+      clientId: "cid",
+      scopes: "s",
+    }));
+
+    const pm = new ProviderManager({ provider: "google", model: "test-model", auth: "oauth" });
+    let authHeader = "";
+    globalThis.fetch = (async (_url: string, init: any) => {
+      authHeader = init?.headers?.Authorization || "";
+      return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: "ok" }] } }], usageMetadata: {} }), { status: 200 });
+    }) as any;
+
+    const res = await pm.complete({ messages: [{ role: "user", content: "hi" }], tools: [] });
+    expect(res.content).toBe("ok");
+    expect(authHeader).toBe("Bearer bearer-1");
+
+    if (hadOriginal && original !== undefined) writeFileSync(authFile, original);
+    else rmSync(authFile, { force: true });
+  });
+});
