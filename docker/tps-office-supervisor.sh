@@ -3,7 +3,6 @@ set -euo pipefail
 
 TEAM_FILE="/workspace/.tps/team.json"
 PIDS_FILE="/workspace/.tps/pids.json"
-MONITOR_SCRIPT="/workspace/.tps/supervisor-monitor.sh"
 
 if [[ ! -f "$TEAM_FILE" ]]; then
   echo "Missing team file: $TEAM_FILE" >&2
@@ -19,7 +18,6 @@ if [[ -e "$PROXY_SOCK" ]] && [[ ! -S "$PROXY_SOCK" ]]; then
   echo "Invalid proxy socket at $PROXY_SOCK (not a UNIX socket)" >&2
   exit 1
 fi
-
 
 # S33B-E: Wait for secrets to be injected into tmpfs.
 # Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
@@ -51,6 +49,94 @@ fi
 
 declare -a AGENT_IDS=()
 declare -a AGENT_PIDS=()
+
+cleanup_pids_file() {
+  rm -f "$PIDS_FILE"
+}
+
+kill_stale_pids() {
+  [[ -f "$PIDS_FILE" ]] || return 0
+
+  if ! jq -e type "$PIDS_FILE" >/dev/null 2>&1; then
+    echo "Invalid stale pids file at $PIDS_FILE; removing" >&2
+    rm -f "$PIDS_FILE"
+    return 0
+  fi
+
+  mapfile -t stale_pids < <(jq -r 'to_entries[].value' "$PIDS_FILE" 2>/dev/null || true)
+  if [[ ${#stale_pids[@]} -eq 0 ]]; then
+    rm -f "$PIDS_FILE"
+    return 0
+  fi
+
+  echo "Found stale pids file; cleaning up old child processes" >&2
+  for pid in "${stale_pids[@]}"; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+
+  sleep 1
+
+  for pid in "${stale_pids[@]}"; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$PIDS_FILE"
+}
+
+write_pids_file() {
+  {
+    echo "{";
+    for ((i=0; i<${#AGENT_IDS[@]}; i++)); do
+      id="${AGENT_IDS[$i]}"
+      pid="${AGENT_PIDS[$i]}"
+      comma=",";
+      if [[ $i -eq $((${#AGENT_IDS[@]} - 1)) ]]; then
+        comma=""
+      fi
+      echo "  \"$id\": $pid$comma"
+    done
+    echo "}"
+  } > "$PIDS_FILE"
+
+  chmod 644 "$PIDS_FILE"
+}
+
+shutdown_children() {
+  local signal="${1:-TERM}"
+
+  if [[ ${#AGENT_PIDS[@]} -gt 0 ]]; then
+    for pid in "${AGENT_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -"$signal" "$pid" 2>/dev/null || true
+      fi
+    done
+
+    for pid in "${AGENT_PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
+  fi
+
+  cleanup_pids_file
+}
+
+on_signal() {
+  local signal="$1"
+  trap - SIGTERM SIGINT
+  shutdown_children "$signal"
+  exit 0
+}
+
+trap 'on_signal TERM' SIGTERM
+trap 'on_signal INT' SIGINT
+trap cleanup_pids_file EXIT
+
+kill_stale_pids
 
 # Accept either:
 # 1) [ { id, workspace, configPath }, ... ]
@@ -142,49 +228,8 @@ for ((i=0; i<count; i++)); do
   uid=$((uid + 1))
 done
 
-{
-  echo "{";
-  for ((i=0; i<${#AGENT_IDS[@]}; i++)); do
-    id="${AGENT_IDS[$i]}"
-    pid="${AGENT_PIDS[$i]}"
-    comma=","
-    if [[ $i -eq $((${#AGENT_IDS[@]} - 1)) ]]; then
-      comma=""
-    fi
-    echo "  \"$id\": $pid$comma"
-  done
-  echo "}"
-} > "$PIDS_FILE"
-
-chmod 644 "$PIDS_FILE"
-
-cat > "$MONITOR_SCRIPT" <<'EOS'
-#!/usr/bin/env bash
-set -euo pipefail
-
-PIDS_FILE="${1:?missing pids file}"
-
-shutdown() {
-  pids=$(jq -r 'to_entries[].value' "$PIDS_FILE")
-  for pid in $pids; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
-
-  for pid in $pids; do
-    wait "$pid" 2>/dev/null || true
-  done
-}
-
-trap shutdown SIGTERM SIGINT
+write_pids_file
 
 wait -n || true
-shutdown
-EOS
-
-chown tps-supervisor:tps "$MONITOR_SCRIPT"
-chmod 700 "$MONITOR_SCRIPT"
-
-# Drop privileges for steady-state supervision.
-exec su -s /bin/bash tps-supervisor -c "$MONITOR_SCRIPT '$PIDS_FILE'"
+shutdown_children TERM
+exit 0
