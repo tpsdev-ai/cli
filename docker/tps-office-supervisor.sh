@@ -12,6 +12,15 @@ fi
 
 mkdir -p /workspace/.tps
 
+# S33B-I: Proxy socket integrity check (if mounted).
+# If path exists, it must be a UNIX domain socket (not regular file/symlink).
+PROXY_SOCK="/var/run/tps-proxy.sock"
+if [[ -e "$PROXY_SOCK" ]] && [[ ! -S "$PROXY_SOCK" ]]; then
+  echo "Invalid proxy socket at $PROXY_SOCK (not a UNIX socket)" >&2
+  exit 1
+fi
+
+
 # S33B-E: Wait for secrets to be injected into tmpfs.
 # Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
 SECRETS_DIR="/run/secrets"
