@@ -105,4 +105,24 @@ describe("tps auth", () => {
     expect(out).not.toContain(token);
     expect(out).not.toContain("refresh-secret");
   });
+
+  test("refresh google updates access token", async () => {
+    const mod = await import(`../src/commands/auth.js?x=${Date.now()}`);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "g-new", expires_in: 3600 }), { status: 200 })) as any;
+
+    const refreshed = await mod.refreshGoogleToken({
+      provider: "google",
+      refreshToken: "gr1",
+      accessToken: "gold",
+      expiresAt: Date.now() - 1000,
+      clientId: "gid",
+      scopes: "scope",
+    });
+
+    expect(refreshed.accessToken).toBe("g-new");
+    expect(refreshed.expiresAt).toBeGreaterThan(Date.now());
+    globalThis.fetch = originalFetch;
+  });
+
 });
