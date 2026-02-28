@@ -12,6 +12,29 @@ fi
 
 mkdir -p /workspace/.tps
 
+# S33B-E: Wait for secrets to be injected into tmpfs.
+# Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
+SECRETS_DIR="/run/secrets"
+SECRETS_TIMEOUT=30
+elapsed=0
+while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $SECRETS_TIMEOUT ]]; do
+  sleep 0.5
+  elapsed=$((elapsed + 1))
+done
+
+# Load secrets into environment, then unlink all files.
+# After this, secrets exist only in this process's memory.
+if [[ -d "$SECRETS_DIR" ]]; then
+  for secret_file in "$SECRETS_DIR"/*; do
+    [[ -f "$secret_file" ]] || continue
+    fname=$(basename "$secret_file")
+    [[ "$fname" == ".ready" ]] && continue
+    export "$fname"="$(cat "$secret_file")"
+    rm -f "$secret_file"
+  done
+  rm -f "$SECRETS_DIR/.ready"
+fi
+
 declare -a AGENT_IDS=()
 declare -a AGENT_PIDS=()
 
@@ -92,10 +115,10 @@ for ((i=0; i<count; i++)); do
   chmod 700 "$tmpdir"
 
   if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
-    su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
+    su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
   else
     echo "⚠ Landlock incompatible with mount type for agent '$id' — falling back to UID isolation only" >&2
-    su -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
+    su -m -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
   fi
 
   pid=$!
