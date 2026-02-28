@@ -53,6 +53,27 @@ if ! id tps-supervisor >/dev/null 2>&1; then
   useradd -r -g tps -M -s /usr/sbin/nologin tps-supervisor
 fi
 
+supports_landlock_for_agent() {
+  local user="$1"
+  local workdir="$2"
+  local tmpdir="$3"
+
+  local probe_file="$workdir/.landlock-probe"
+  set +e
+  su -s /bin/bash "$user" -c "echo probe > '$probe_file'" >/dev/null 2>&1
+  if [[ $? -ne 0 ]]; then
+    set -e
+    return 1
+  fi
+
+  su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
+  local rc=$?
+  su -s /bin/bash "$user" -c "rm -f '$probe_file'" >/dev/null 2>&1 || true
+  set -e
+
+  [[ $rc -eq 0 ]]
+}
+
 uid=1001
 for ((i=0; i<count; i++)); do
   id=$(echo "$agents_json" | jq -r ".[$i].id")
@@ -93,10 +114,12 @@ for ((i=0; i<count; i++)); do
   chown -R "$user":tps "$tmpdir"
   chmod 700 "$tmpdir"
 
-  # S33B-E: Secrets are already in supervisor's env (loaded from tmpfs above).
-  # Use su -m to preserve environment when switching to agent user.
-  # Agent process inherits env vars; original tmpfs files are already deleted.
-  su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- tps-agent start --config '$config_path'" &
+  if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
+    su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock --allow /run/secrets -- tps-agent start --config '$config_path'" &
+  else
+    echo "⚠ Landlock incompatible with mount type for agent '$id' — falling back to UID isolation only" >&2
+    su -m -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
+  fi
 
   pid=$!
   AGENT_IDS+=("$id")
@@ -121,7 +144,7 @@ done
 
 chmod 644 "$PIDS_FILE"
 
-cat > "$MONITOR_SCRIPT" <<'EOF'
+cat > "$MONITOR_SCRIPT" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -144,7 +167,7 @@ trap shutdown SIGTERM SIGINT
 
 wait -n || true
 shutdown
-EOF
+EOS
 
 chown tps-supervisor:tps "$MONITOR_SCRIPT"
 chmod 700 "$MONITOR_SCRIPT"
