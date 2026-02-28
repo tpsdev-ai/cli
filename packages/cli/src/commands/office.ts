@@ -337,15 +337,14 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       // S33B-E: Inject secrets into tmpfs after container start.
       // Supervisor waits for /run/secrets/.ready before booting agents.
+      // Always mark .ready (even with zero secrets) so startup is deterministic.
       // Secrets piped via stdin — never appear in process args or logs.
-      if (secretsToInject.length > 0) {
-        try {
-          injectSecrets(sName, secretsToInject);
-        } catch (e: any) {
-          console.error(`Secret injection failed: ${e?.message || e}`);
-          try { spawnSync("docker", ["rm", "-f", sName], { stdio: "pipe", encoding: "utf-8" }); } catch {}
-          process.exit(1);
-        }
+      try {
+        injectSecrets(sName, secretsToInject);
+      } catch (e: any) {
+        console.error(`Secret injection failed: ${e?.message || e}`);
+        try { spawnSync("docker", ["rm", "-f", sName], { stdio: "pipe", encoding: "utf-8" }); } catch {}
+        process.exit(1);
       }
 
       if (manifest && loadWorkspaceManifest(ws)) {
