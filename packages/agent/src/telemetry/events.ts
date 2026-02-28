@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 export interface BaseEvent {
@@ -45,6 +45,7 @@ export interface MailEvent extends BaseEvent {
   subject?: string;
   durationMs?: number;
   status: "ok" | "error";
+  error?: string;
 }
 
 export interface SessionEvent extends BaseEvent {
@@ -68,6 +69,7 @@ export function sanitizeError(err: unknown): string {
   const raw = String((err as any)?.message ?? err ?? "unknown_error");
   return raw
     .replace(/(sk-[a-zA-Z0-9_-]+)/g, "[REDACTED_KEY]")
+    .replace(/AIza[0-9A-Za-z\-_]{35}/g, "[REDACTED_KEY]")
     .replace(/(api[_-]?key\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
     .slice(0, 300);
 }
@@ -94,8 +96,6 @@ export class EventLogger {
 
     const path = this.pathFor(ts);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    appendFileSync(path, `${JSON.stringify(out)}\n`, "utf-8");
-    if (!existsSync(path)) return;
-    chmodSync(path, 0o600);
+    appendFileSync(path, `${JSON.stringify(out)}\n`, { mode: 0o600, encoding: "utf-8" });
   }
 }

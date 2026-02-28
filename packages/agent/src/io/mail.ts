@@ -61,7 +61,7 @@ export class MailClient {
           status: "error",
           from: "unknown",
           durationMs: Date.now() - started,
-          subject: sanitizeError(err),
+          error: sanitizeError(err),
         });
       }
     }
@@ -94,7 +94,7 @@ export class MailClient {
         to,
         status: "error",
         durationMs: Date.now() - started,
-        subject: sanitizeError(err),
+        error: sanitizeError(err),
       });
       throw err;
     }
