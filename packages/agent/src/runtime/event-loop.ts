@@ -369,13 +369,27 @@ export class EventLoop {
           content: JSON.stringify(result),
         });
       }
-      // Loop continues — next completion sees FULL history
+      // Auto-compact if context is getting large
+      const estimatedTokens = this.estimateTokens(messages, systemPrompt, tools);
+      const threshold = this.deps.config.contextWindowTokens
+        ? Math.floor(this.deps.config.contextWindowTokens * 0.75)
+        : 100_000;
+      if (estimatedTokens > threshold) {
+        await this.compact(messages);
+        messages.length = 0;
+        if (this.compactionSummary) {
+          messages.push({ role: "user", content: `[Previous conversation summary]\n${this.compactionSummary}` });
+          messages.push({ role: "assistant", content: "Understood, I have the context from the previous conversation." });
+        }
+        messages.push({ role: "user", content: prompt });
+      }
+      // Loop continues — next completion sees FULL history (or reset history after compaction)
     }
   }
 
   // --- Compaction ---
 
-  async compact(): Promise<void> {
+  async compact(conversationMessages?: LLMMessage[]): Promise<void> {
     const systemPrompt = await this.buildSystemPrompt("user");
     const tools = this.buildToolSpecs("user");
 
@@ -389,10 +403,21 @@ export class EventLoop {
       ? `<previous_summary>\n${this.compactionSummary}\n</previous_summary>\n\n`
       : "";
 
+    // Build real history text from passed-in messages
+    const historyText = conversationMessages?.length
+      ? conversationMessages
+          .map((m) => {
+            const contentStr =
+              typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            return `[${m.role}]: ${contentStr}`;
+          })
+          .join('\n')
+      : '(See prior messages in this conversation)';
+
     const messages: LLMMessage[] = [
       {
         role: "user",
-        content: `${COMPACTION_INSTRUCTION}\n\n${historyBlock}<conversation_history>\n(See prior messages in this conversation)\n</conversation_history>`,
+        content: `${COMPACTION_INSTRUCTION}\n\n${historyBlock}<conversation_history>\n${historyText}\n</conversation_history>`,
       },
     ];
 
@@ -459,6 +484,15 @@ export class EventLoop {
    * S43-C: Validate raw assistant message structure.
    * Only allow known block types (text, tool_use for Anthropic; standard OpenAI format).
    */
+  private estimateTokens(messages: LLMMessage[], system: string, tools: ToolSpec[]): number {
+    let chars = system.length;
+    for (const t of tools) chars += JSON.stringify(t).length;
+    for (const m of messages) {
+      chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+    }
+    return Math.ceil(chars / 4); // ~4 chars per token
+  }
+
   private validateRawAssistant(raw: unknown): boolean {
     if (raw == null || typeof raw !== "object") return false;
 
