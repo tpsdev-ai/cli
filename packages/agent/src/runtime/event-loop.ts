@@ -13,6 +13,7 @@ import type { ContextManager } from "../io/context.js";
 import type { ProviderManager } from "../llm/provider.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { ReviewGate } from "../governance/review-gate.js";
+import { getEncoding } from "js-tiktoken";
 import { resolve, relative, isAbsolute, sep } from "node:path";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
@@ -407,8 +408,10 @@ export class EventLoop {
     const historyText = conversationMessages?.length
       ? conversationMessages
           .map((m) => {
-            const contentStr =
+            const raw =
               typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            // Sanitize closing XML tags to prevent fence-breaking (Kern/Sherlock S43-B)
+            const contentStr = raw.replace(/<\//g, '<\\/');
             return `[${m.role}]: ${contentStr}`;
           })
           .join('\n')
@@ -485,12 +488,25 @@ export class EventLoop {
    * Only allow known block types (text, tool_use for Anthropic; standard OpenAI format).
    */
   private estimateTokens(messages: LLMMessage[], system: string, tools: ToolSpec[]): number {
-    let chars = system.length;
-    for (const t of tools) chars += JSON.stringify(t).length;
-    for (const m of messages) {
-      chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+    try {
+      const enc = getEncoding("cl100k_base");
+      let tokens = enc.encode(system).length;
+      for (const t of tools) tokens += enc.encode(JSON.stringify(t)).length;
+      for (const m of messages) {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        tokens += enc.encode(text).length;
+      }
+
+      return tokens;
+    } catch {
+      // Fallback to char estimate if tiktoken unavailable
+      let chars = system.length;
+      for (const t of tools) chars += JSON.stringify(t).length;
+      for (const m of messages) {
+        chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+      }
+      return Math.ceil(chars / 4);
     }
-    return Math.ceil(chars / 4); // ~4 chars per token
   }
 
   private validateRawAssistant(raw: unknown): boolean {
