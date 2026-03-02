@@ -72,6 +72,10 @@ export function loadAgentConfig(path: string): AgentConfig {
     maxTokens: parsed.maxTokens ? Number(parsed.maxTokens) : 1024,
     tools: parsed.tools ?? ["read", "write", "edit", "exec", "mail"],
     execAllowlist: parsed.execAllowlist,
+    flair: parsed.flair ? {
+      url: parsed.flair.url ? String(parsed.flair.url) : undefined,
+      keyPath: parsed.flair.keyPath ? String(parsed.flair.keyPath) : undefined,
+    } : undefined,
     llm: {
       provider: parsed.llm?.provider || parsed.provider || "openai",
       model: parsed.llm?.model || parsed.model || "gpt-4o-mini",

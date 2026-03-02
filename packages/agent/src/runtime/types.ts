@@ -35,6 +35,8 @@ export interface AgentConfig {
   tools?: Array<"read" | "write" | "edit" | "exec" | "mail">;
   /** Allow-list for exec command binary names */
   execAllowlist?: string[];
+  /** Optional Flair memory/identity integration */
+  flair?: FlairConfig;
 }
 
 export interface ToolResult {
@@ -89,3 +91,13 @@ export type AgentState =
   | "processing"
   | "awaiting_approval"
   | "stopped";
+
+
+// ─── Flair Integration ───────────────────────────────────────────────────────
+
+export interface FlairConfig {
+  /** Base URL for the Flair/Harper API. Default: http://127.0.0.1:9926 */
+  url?: string;
+  /** Path to Ed25519 private key PEM. Default: ~/.tps/identity/<agentId>.key */
+  keyPath?: string;
+}
