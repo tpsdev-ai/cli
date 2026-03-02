@@ -8,11 +8,9 @@
  */
 
 import { bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
-const BRIDGE_PID_PATH = join(homedir(), ".tps", "run", "mail-bridge.pid");
 
 export interface BridgeArgs {
   action: "start" | "stop" | "status";
@@ -45,17 +43,19 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
     }
 
     case "stop": {
-      if (!existsSync(BRIDGE_PID_PATH)) {
+      const st = bridgeStatus();
+      if (!st.running) {
         console.log("Bridge is not running.");
         break;
       }
       try {
-        const raw = JSON.parse(readFileSync(BRIDGE_PID_PATH, "utf-8"));
-        process.kill(raw.pid, "SIGTERM");
-        rmSync(BRIDGE_PID_PATH, { force: true });
-        console.log(`Bridge (pid ${raw.pid}) stopped.`);
+        process.kill(st.pid!, "SIGTERM");
+        // Clean up PID file (try both old and new paths)
+        const pidDir = join(homedir(), ".tps", "run");
+        rmSync(join(pidDir, "bridge-openclaw.pid"), { force: true });
+        rmSync(join(pidDir, "mail-bridge.pid"), { force: true });
+        console.log(`Bridge (pid ${st.pid}) stopped.`);
       } catch {
-        rmSync(BRIDGE_PID_PATH, { force: true });
         console.log("Bridge was not running (stale pid cleaned up).");
       }
       break;
