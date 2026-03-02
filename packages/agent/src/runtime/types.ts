@@ -6,6 +6,8 @@ export interface LLMConfig {
   auth?: "oauth" | "api-key";
   apiKey?: string;
   baseUrl?: string;
+  /** Localhost LLM proxy URL. When set, all provider calls route through the proxy. */
+  proxyUrl?: string;
 }
 
 export type TrustLevel = "user" | "internal" | "external";
