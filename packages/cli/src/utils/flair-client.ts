@@ -41,6 +41,24 @@ export interface SearchResult {
   type?: string;
 }
 
+export interface ReflectResult {
+  memories: Memory[];
+  prompt: string;
+  suggestedTags: string[];
+  count: number;
+}
+
+export interface ConsolidateCandidate {
+  memory: Memory;
+  suggestion: "promote" | "archive" | "keep";
+  reason: string;
+}
+
+export interface ConsolidateResult {
+  candidates: ConsolidateCandidate[];
+  prompt: string;
+}
+
 export interface FlairAgent {
   id: string;
   name: string;
@@ -258,6 +276,40 @@ export class FlairClient {
     return sections.join("") || "(No Flair context available)";
   }
 
+  // ─── Learning pipeline (ops-31.2) ───────────────────────────────────────────
+
+  async reflectMemory(opts: {
+    agentId?: string;
+    scope?: "recent" | "tagged" | "all";
+    since?: string;
+    maxMemories?: number;
+    focus?: "lessons_learned" | "patterns" | "decisions" | "errors";
+    tag?: string;
+  } = {}): Promise<ReflectResult> {
+    return this.request<ReflectResult>("POST", "/MemoryReflect/", {
+      agentId: opts.agentId ?? this.agentId,
+      scope: opts.scope ?? "recent",
+      since: opts.since,
+      maxMemories: opts.maxMemories ?? 50,
+      focus: opts.focus ?? "lessons_learned",
+      tag: opts.tag,
+    });
+  }
+
+  async consolidateMemory(opts: {
+    agentId?: string;
+    scope?: "persistent" | "standard" | "all";
+    olderThan?: string;
+    limit?: number;
+  } = {}): Promise<ConsolidateResult> {
+    return this.request<ConsolidateResult>("POST", "/MemoryConsolidate/", {
+      agentId: opts.agentId ?? this.agentId,
+      scope: opts.scope ?? "persistent",
+      olderThan: opts.olderThan ?? "30d",
+      limit: opts.limit ?? 20,
+    });
+  }
+
   async ping(): Promise<boolean> {
     try {
       const res = await fetch(`${this.baseUrl}/Health`);
@@ -271,9 +323,11 @@ export class FlairClient {
 export function createFlairClient(
   agentId: string,
   baseUrl?: string,
+  keyPath?: string,
 ): FlairClient {
   return new FlairClient({
     agentId,
     baseUrl: baseUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+    keyPath,
   });
 }

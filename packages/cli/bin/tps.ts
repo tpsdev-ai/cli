@@ -513,6 +513,43 @@ async function main() {
       }
       break;
     }
+    case "memory": {
+      // ops-31.2: reflect + consolidate (ops-31.1 governance commands come with PR #67)
+      const action = rest[0] as "reflect" | "consolidate" | undefined;
+      if (!action || !["reflect", "consolidate"].includes(action)) {
+        console.error(
+          "Usage:\n" +
+          "  tps memory reflect <agentId> [--scope recent|tagged|all] [--since ISO] [--focus lessons_learned|patterns|decisions|errors] [--limit N]\n" +
+          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]"
+        );
+        process.exit(1);
+      }
+
+      const agentId = rest[1];
+      if (!agentId) { console.error(`Usage: tps memory ${action} <agentId>`); process.exit(1); }
+
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
+
+      const { runMemoryLearn } = await import("../src/commands/memory-learn.js");
+      await runMemoryLearn({
+        action,
+        agentId,
+        scope: getFlag("scope"),
+        since: getFlag("since"),
+        focus: getFlag("focus"),
+        tag: getFlag("tag"),
+        olderThan: getFlag("older-than"),
+        durabilityScope: getFlag("scope"),
+        limit: getFlag("limit") ? parseInt(getFlag("limit")!, 10) : undefined,
+        flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
+        json: cli.flags.json,
+      });
+      break;
+    }
+
     case "proxy": {
       const subAction = rest[0] as "start" | "stop" | "status" | undefined;
       if (!subAction || !["start", "stop", "status"].includes(subAction)) {
