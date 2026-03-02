@@ -13,6 +13,7 @@ import type { ContextManager } from "../io/context.js";
 import type { ProviderManager } from "../llm/provider.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { ReviewGate } from "../governance/review-gate.js";
+import { getEncoding } from "js-tiktoken";
 import { resolve, relative, isAbsolute, sep } from "node:path";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
@@ -369,13 +370,27 @@ export class EventLoop {
           content: JSON.stringify(result),
         });
       }
-      // Loop continues — next completion sees FULL history
+      // Auto-compact if context is getting large
+      const estimatedTokens = this.estimateTokens(messages, systemPrompt, tools);
+      const threshold = this.deps.config.contextWindowTokens
+        ? Math.floor(this.deps.config.contextWindowTokens * 0.75)
+        : 100_000;
+      if (estimatedTokens > threshold) {
+        await this.compact(messages);
+        messages.length = 0;
+        if (this.compactionSummary) {
+          messages.push({ role: "user", content: `[Previous conversation summary]\n${this.compactionSummary}` });
+          messages.push({ role: "assistant", content: "Understood, I have the context from the previous conversation." });
+        }
+        messages.push({ role: "user", content: prompt });
+      }
+      // Loop continues — next completion sees FULL history (or reset history after compaction)
     }
   }
 
   // --- Compaction ---
 
-  async compact(): Promise<void> {
+  async compact(conversationMessages?: LLMMessage[]): Promise<void> {
     const systemPrompt = await this.buildSystemPrompt("user");
     const tools = this.buildToolSpecs("user");
 
@@ -389,10 +404,23 @@ export class EventLoop {
       ? `<previous_summary>\n${this.compactionSummary}\n</previous_summary>\n\n`
       : "";
 
+    // Build real history text from passed-in messages
+    const historyText = conversationMessages?.length
+      ? conversationMessages
+          .map((m) => {
+            const raw =
+              typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+            // Sanitize closing XML tags to prevent fence-breaking (Kern/Sherlock S43-B)
+            const contentStr = raw.replace(/<\//g, '<\\/');
+            return `[${m.role}]: ${contentStr}`;
+          })
+          .join('\n')
+      : '(See prior messages in this conversation)';
+
     const messages: LLMMessage[] = [
       {
         role: "user",
-        content: `${COMPACTION_INSTRUCTION}\n\n${historyBlock}<conversation_history>\n(See prior messages in this conversation)\n</conversation_history>`,
+        content: `${COMPACTION_INSTRUCTION}\n\n${historyBlock}<conversation_history>\n${historyText}\n</conversation_history>`,
       },
     ];
 
@@ -459,6 +487,28 @@ export class EventLoop {
    * S43-C: Validate raw assistant message structure.
    * Only allow known block types (text, tool_use for Anthropic; standard OpenAI format).
    */
+  private estimateTokens(messages: LLMMessage[], system: string, tools: ToolSpec[]): number {
+    try {
+      const enc = getEncoding("cl100k_base");
+      let tokens = enc.encode(system).length;
+      for (const t of tools) tokens += enc.encode(JSON.stringify(t)).length;
+      for (const m of messages) {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        tokens += enc.encode(text).length;
+      }
+
+      return tokens;
+    } catch {
+      // Fallback to char estimate if tiktoken unavailable
+      let chars = system.length;
+      for (const t of tools) chars += JSON.stringify(t).length;
+      for (const m of messages) {
+        chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
+      }
+      return Math.ceil(chars / 4);
+    }
+  }
+
   private validateRawAssistant(raw: unknown): boolean {
     if (raw == null || typeof raw !== "object") return false;
 
