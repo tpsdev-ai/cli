@@ -1,7 +1,10 @@
 /**
  * Flair TypeScript client — Ed25519-authenticated requests to the Flair API.
+ *
+ * Auth protocol: TPS-Ed25519 <agentId>:<timestamp>:<nonce>:<signatureBase64>
+ * Signature payload: agentId:timestamp:nonce:METHOD:/path?query
  */
-import { createSign } from "node:crypto";
+import { sign as ed25519Sign, createPrivateKey, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -17,7 +20,7 @@ export interface Memory {
   agentId: string;
   content: string;
   type?: string;
-  durability?: "permanent" | "standard";
+  durability?: "permanent" | "persistent" | "standard" | "ephemeral";
   tags?: string[];
   createdAt?: string;
   updatedAt?: string;
@@ -34,7 +37,7 @@ export interface SearchResult {
   id: string;
   agentId: string;
   content: string;
-  score: number;
+  _score: number;
   type?: string;
 }
 
@@ -49,6 +52,7 @@ export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
   private readonly keyPath: string;
+  private _privateKey: ReturnType<typeof createPrivateKey> | null = null;
 
   constructor(config: FlairConfig) {
     this.baseUrl = (config.baseUrl ?? "http://127.0.0.1:9926").replace(/\/$/, "");
@@ -58,31 +62,47 @@ export class FlairClient {
       join(homedir(), ".tps", "identity", `${config.agentId}.key`);
   }
 
-  private sign(method: string, path: string): string {
-    const ts = Date.now().toString();
-    const payload = `${this.agentId}:${ts}:${method}:${path}`;
-    let privKeyPem: string;
+  private loadKey(): ReturnType<typeof createPrivateKey> {
+    if (this._privateKey) return this._privateKey;
+    let raw: string;
     try {
-      privKeyPem = readFileSync(this.keyPath, "utf-8");
+      raw = readFileSync(this.keyPath, "utf-8").trim();
     } catch {
       throw new Error(
         `Cannot read Flair private key at ${this.keyPath}. ` +
           `Run 'tps agent create --id ${this.agentId}' first.`,
       );
     }
-    const sign = createSign("SHA256");
-    sign.update(payload);
-    sign.end();
-    const sig = sign.sign({ key: privKeyPem, dsaEncoding: "der" }, "base64url");
-    return `TPS-Ed25519 agentId=${this.agentId},ts=${ts},sig=${sig}`;
+    // Support both PEM and raw base64 (PKCS8) formats
+    if (raw.startsWith("-----")) {
+      this._privateKey = createPrivateKey(raw);
+    } else {
+      this._privateKey = createPrivateKey({
+        key: Buffer.from(raw, "base64"),
+        format: "der",
+        type: "pkcs8",
+      });
+    }
+    return this._privateKey;
+  }
+
+  private sign(method: string, path: string): string {
+    const ts = Date.now().toString();
+    const nonce = randomUUID();
+    const payload = `${this.agentId}:${ts}:${nonce}:${method}:${path}`;
+    const key = this.loadKey();
+    const sig = ed25519Sign(null, Buffer.from(payload), key);
+    return `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
   }
 
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const authHeader = this.sign(method, path);
+    const headers: Record<string, string> = { Authorization: authHeader };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
     const res = await fetch(url, {
       method,
-      headers: { "Content-Type": "application/json", Authorization: authHeader },
+      headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) {
@@ -94,23 +114,47 @@ export class FlairClient {
   }
 
   async registerAgent(name: string, publicKey: string): Promise<FlairAgent> {
-    return this.request<FlairAgent>("POST", "/Agent", { id: this.agentId, name, publicKey });
+    return this.request<FlairAgent>("PUT", `/Agent/${this.agentId}`, {
+      id: this.agentId,
+      name,
+      publicKey,
+      createdAt: new Date().toISOString(),
+    });
   }
 
   async getAgent(id?: string): Promise<FlairAgent | null> {
-    try { return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`); }
-    catch { return null; }
+    try {
+      return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`);
+    } catch {
+      return null;
+    }
   }
 
-  async listMemories(limit = 10): Promise<Memory[]> {
-    return this.request<Memory[]>("GET", `/Memory?agentId=${encodeURIComponent(this.agentId)}&limit=${limit}`);
+  async listMemories(limit = 50): Promise<Memory[]> {
+    return this.request<Memory[]>(
+      "GET",
+      `/Memory/?agentId=${encodeURIComponent(this.agentId)}&limit=${limit}`,
+    );
   }
 
-  async writeMemory(id: string, content: string, opts: { durability?: "permanent" | "standard"; type?: string; tags?: string[] } = {}): Promise<void> {
-    const existing = await this.request("GET", `/Memory/${id}`).catch(() => null);
-    const payload = { id, agentId: this.agentId, content, durability: opts.durability ?? "standard", type: opts.type ?? "daily", tags: opts.tags, updatedAt: new Date().toISOString() };
-    if (existing) { await this.request("PUT", `/Memory/${id}`, payload); }
-    else { await this.request("POST", "/Memory", { ...payload, createdAt: new Date().toISOString() }); }
+  async writeMemory(
+    id: string,
+    content: string,
+    opts: {
+      durability?: "permanent" | "persistent" | "standard" | "ephemeral";
+      type?: string;
+      tags?: string[];
+    } = {},
+  ): Promise<void> {
+    await this.request("PUT", `/Memory/${id}`, {
+      id,
+      agentId: this.agentId,
+      content,
+      durability: opts.durability ?? "standard",
+      type: opts.type ?? "daily",
+      tags: opts.tags,
+      createdAt: new Date().toISOString(),
+    });
   }
 
   async getMemory(id: string): Promise<Memory> {
@@ -118,19 +162,31 @@ export class FlairClient {
   }
 
   async getSoul(): Promise<SoulEntry[]> {
-    return this.request<SoulEntry[]>("GET", `/Soul?agentId=${encodeURIComponent(this.agentId)}`);
+    return this.request<SoulEntry[]>(
+      "GET",
+      `/Soul/?agentId=${encodeURIComponent(this.agentId)}`,
+    );
   }
 
   async setSoul(key: string, value: string): Promise<void> {
     const id = `${this.agentId}-${key}`;
-    const existing = await this.request("GET", `/Soul/${id}`).catch(() => null);
-    const payload = { id, agentId: this.agentId, key, value, updatedAt: new Date().toISOString() };
-    if (existing) { await this.request("PUT", `/Soul/${id}`, payload); }
-    else { await this.request("POST", "/Soul", { ...payload, createdAt: new Date().toISOString() }); }
+    await this.request("PUT", `/Soul/${id}`, {
+      id,
+      agentId: this.agentId,
+      key,
+      value,
+      durability: "permanent",
+      createdAt: new Date().toISOString(),
+    });
   }
 
   async search(query: string, limit = 5): Promise<SearchResult[]> {
-    return this.request<SearchResult[]>("GET", `/MemorySearch?agentId=${encodeURIComponent(this.agentId)}&q=${encodeURIComponent(query)}&limit=${limit}`);
+    const result = await this.request<{ results: SearchResult[] }>(
+      "POST",
+      "/MemorySearch/",
+      { agentId: this.agentId, q: query, limit },
+    );
+    return result.results ?? [];
   }
 
   async bootstrap(opts: { days?: number; query?: string } = {}): Promise<string> {
@@ -140,22 +196,38 @@ export class FlairClient {
       const soul = await this.getSoul();
       if (soul.length > 0) {
         sections.push("## Identity\n");
-        for (const entry of soul) sections.push(`**${entry.key}:** ${entry.value}\n`);
+        for (const entry of soul)
+          sections.push(`**${entry.key}:** ${entry.value}\n`);
       }
     } catch {}
     try {
-      const memories = await this.listMemories(days * 3);
+      const memories = await this.listMemories(50);
       if (memories.length > 0) {
-        sections.push("\n## Recent Memory\n");
-        for (const m of memories.slice(0, days)) sections.push(`### ${m.id}\n${m.content.slice(0, 2000)}\n`);
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - days);
+        const recent = memories
+          .filter((m) => new Date(m.createdAt ?? "") >= cutoff)
+          .sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
+        if (recent.length > 0) {
+          sections.push(`\n## Recent Memory (last ${days} days)\n`);
+          for (const m of recent)
+            sections.push(
+              `### ${m.createdAt?.slice(0, 10)} — ${m.id}\n${m.content.slice(0, 2000)}\n`,
+            );
+        }
       }
     } catch {}
     if (opts.query) {
       try {
         const results = await this.search(opts.query, 5);
         if (results.length > 0) {
-          sections.push(`\n## Relevant Context (query: "${opts.query}")\n`);
-          for (const r of results) sections.push(`[${r.score.toFixed(3)}] ${r.id}: ${r.content.slice(0, 500)}\n`);
+          sections.push(
+            `\n## Relevant Context (query: "${opts.query}")\n`,
+          );
+          for (const r of results)
+            sections.push(
+              `[${r._score.toFixed(3)}] ${r.id}: ${r.content.slice(0, 500)}\n`,
+            );
         }
       } catch {}
     }
@@ -163,11 +235,21 @@ export class FlairClient {
   }
 
   async ping(): Promise<boolean> {
-    try { const res = await fetch(`${this.baseUrl}/Health`); return res.ok; }
-    catch { return false; }
+    try {
+      const res = await fetch(`${this.baseUrl}/Health`);
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 }
 
-export function createFlairClient(agentId: string, baseUrl?: string): FlairClient {
-  return new FlairClient({ agentId, baseUrl: baseUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926" });
+export function createFlairClient(
+  agentId: string,
+  baseUrl?: string,
+): FlairClient {
+  return new FlairClient({
+    agentId,
+    baseUrl: baseUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+  });
 }
