@@ -5,7 +5,7 @@
  * Uses the same TPS-Ed25519 signing scheme as the CLI FlairClient.
  */
 
-import { createSign } from "node:crypto";
+import crypto from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -41,18 +41,22 @@ export class FlairContextProvider {
 
   private sign(method: string, path: string): string {
     const ts = Date.now().toString();
-    const payload = `${this.agentId}:${ts}:${method}:${path}`;
+    const nonce = crypto.randomUUID();
+    const payload = `${this.agentId}:${ts}:${nonce}:${method}:${path}`;
 
     if (!existsSync(this.keyPath)) {
       throw new Error(`Flair key not found at ${this.keyPath}. Run: tps agent create --id ${this.agentId}`);
     }
 
-    const privKeyPem = readFileSync(this.keyPath, "utf-8");
-    const sign = createSign("SHA256");
-    sign.update(payload);
-    sign.end();
-    const sig = sign.sign({ key: privKeyPem, dsaEncoding: "der" }, "base64url");
-    return `TPS-Ed25519 agentId=${this.agentId},ts=${ts},sig=${sig}`;
+    const raw = readFileSync(this.keyPath, "utf-8").trim();
+    let key;
+    if (raw.startsWith("-----")) {
+      key = crypto.createPrivateKey(raw);
+    } else {
+      key = crypto.createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+    }
+    const sig = crypto.sign(null, Buffer.from(payload), key);
+    return `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
   }
 
   private async req<T>(method: string, path: string, body?: unknown): Promise<T> {

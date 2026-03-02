@@ -18,7 +18,7 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createVerify } from "node:crypto";
+import crypto from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -29,15 +29,15 @@ const WINDOW_MS = 30_000; // 30-second replay window
 // ─── Auth ─────────────────────────────────────────────────────────────────────
 
 function verifyRequest(authHeader: string, method: string, path: string): string | null {
-  // Parse TPS-Ed25519 agentId=<id>,ts=<ms>,sig=<base64url>
-  const m = authHeader.match(/^TPS-Ed25519\s+agentId=([^,]+),ts=(\d+),sig=(.+)$/);
+  // Parse TPS-Ed25519 <agentId>:<ts>:<nonce>:<sigBase64>
+  const m = authHeader.match(/^TPS-Ed25519\s+([^:]+):(\d+):([^:]+):(.+)$/);
   if (!m) return null;
 
-  const [, agentId, tsStr, sig] = m;
+  const [, agentId, tsStr, nonce, sigB64] = m;
   const ts = parseInt(tsStr, 10);
   const now = Date.now();
 
-  if (Math.abs(now - ts) > WINDOW_MS) return null; // replay attack
+  if (Math.abs(now - ts) > WINDOW_MS) return null; // replay window
 
   const pubPath = join(homedir(), ".tps", "identity", `${agentId}.pub`);
   if (!existsSync(pubPath)) return null;
@@ -47,20 +47,23 @@ function verifyRequest(authHeader: string, method: string, path: string): string
     const pubKeyHex: string = pubMeta.signing?.publicKey ?? pubMeta.publicKey;
     const pubKeyBuf = Buffer.from(pubKeyHex, "hex");
 
-    // Reconstruct signed payload
-    const payload = `${agentId}:${tsStr}:${method}:${path}`;
+    // Reconstruct signed payload (matches FlairClient format)
+    const payload = `${agentId}:${tsStr}:${nonce}:${method}:${path}`;
 
-    const verify = createVerify("SHA256");
-    verify.update(payload);
-    verify.end();
+    // Ed25519 verify — import raw 32-byte public key
+    const pubKey = crypto.createPublicKey({
+      key: Buffer.concat([
+        // Ed25519 SPKI header (12 bytes)
+        Buffer.from("302a300506032b6570032100", "hex"),
+        pubKeyBuf,
+      ]),
+      format: "der",
+      type: "spki",
+    });
 
-    const valid = verify.verify(
-      { key: pubKeyBuf, format: "der", type: "spki" },
-      sig,
-      "base64url",
-    );
-
-    return valid ? agentId : null;
+    return crypto.verify(null, Buffer.from(payload), pubKey, Buffer.from(sigB64, "base64"))
+      ? agentId
+      : null;
   } catch {
     return null;
   }

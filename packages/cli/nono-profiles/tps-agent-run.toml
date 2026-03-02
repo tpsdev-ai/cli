@@ -1,34 +1,26 @@
-# nono sandbox profile for tps agent run
-# Agent processes run with restricted syscall/filesystem access.
-[profile]
+[meta]
 name = "tps-agent-run"
-description = "TPS agent runtime — restricted to local filesystem and localhost networking"
+description = "TPS agent runtime — restricted to local filesystem and localhost networking only. Agents never hold API keys; all outbound LLM calls go through the localhost proxy."
 
 [filesystem]
-# Read-only by default
 readonly = true
-# Agent workspace and TPS dirs are writable
 writable = [
-  "~/.tps/",
-  "~/ops/",
+  "{home}/.tps/",
+  "{home}/ops/",
 ]
-# Deny sensitive paths
 deny = [
-  "/etc/passwd",
   "/etc/shadow",
-  "~/.ssh/",
-  "~/.tps/secrets/",
+  "{home}/.ssh/",
+  "{home}/.tps/secrets/",
 ]
 
 [network]
-# Agents may only reach localhost — proxy holds outbound API keys
 localhost_only = true
 allow = [
   "127.0.0.1",
 ]
 
 [process]
-# No spawning arbitrary processes
 exec_allowlist = [
   "git",
   "bun",
