@@ -7,6 +7,10 @@ export interface MailMessage {
   filename: string;
   body: string;
   receivedAt: Date;
+  /** Trust/routing headers from bridge envelope */
+  headers: Record<string, string>;
+  /** Sender agent ID */
+  from: string;
 }
 
 /**
@@ -46,7 +50,14 @@ export class MailClient {
       try {
         const body = readFileSync(srcPath, "utf-8");
         renameSync(srcPath, dstPath);
-        messages.push({ filename: file, body, receivedAt: new Date() });
+        let headers: Record<string, string> = {};
+        let from = "unknown";
+        try {
+          const parsed = JSON.parse(body);
+          headers = parsed.headers ?? {};
+          from = parsed.from ?? "unknown";
+        } catch {}
+        messages.push({ filename: file, body, receivedAt: new Date(), headers, from });
         this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,

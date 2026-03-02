@@ -25,6 +25,7 @@ const cli = meow(
     git <action>      Git utilities (worktree)
     branch <action>   Branch office node (init/start/stop/status/log)
     stats            Aggregate structured JSONL telemetry events
+    bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
 
   Options
     --help            Show this help text
@@ -551,6 +552,35 @@ async function main() {
           console.log("Proxy is not running.");
         }
       }
+      break;
+    }
+
+    case "bridge": {
+      const action = rest[0] as "start" | "stop" | "status" | undefined;
+      if (!action || !["start", "stop", "status"].includes(action)) {
+        console.error(
+          "Usage:\n" +
+          "  tps bridge start [--port 7891] [--openclaw-url <url>] [--bridge-agent-id openclaw-bridge] [--default-agent <id>]\n" +
+          "  tps bridge stop\n" +
+          "  tps bridge status [--json]"
+        );
+        process.exit(1);
+      }
+
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
+
+      const { runBridge } = await import("../src/commands/bridge.js");
+      await runBridge({
+        action,
+        port: getFlag("port") ? parseInt(getFlag("port")!, 10) : undefined,
+        openClawUrl: getFlag("openclaw-url") ?? process.env.OPENCLAW_MESSAGE_URL,
+        bridgeAgentId: getFlag("bridge-agent-id"),
+        defaultAgentId: getFlag("default-agent"),
+        json: cli.flags.json,
+      });
       break;
     }
 
