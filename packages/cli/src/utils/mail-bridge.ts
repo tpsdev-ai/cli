@@ -27,15 +27,21 @@ export function bridgeStatus(): { running: boolean; pid?: number; port?: number 
   const { existsSync, readFileSync } = require("node:fs");
   const { homedir } = require("node:os");
   const { join } = require("node:path");
-  const pidPath = join(homedir(), ".tps", "run", "bridge-openclaw.pid");
-  if (!existsSync(pidPath)) return { running: false };
-  try {
-    const raw = JSON.parse(readFileSync(pidPath, "utf-8"));
-    process.kill(raw.pid, 0);
-    return { running: true, pid: raw.pid, port: raw.port };
-  } catch {
-    return { running: false };
+  const home = process.env.HOME ?? homedir();
+  const pidDir = join(home, ".tps", "run");
+  // Check both new and legacy PID paths
+  for (const name of ["bridge-openclaw.pid", "mail-bridge.pid"]) {
+    const pidPath = join(pidDir, name);
+    if (!existsSync(pidPath)) continue;
+    try {
+      const raw = JSON.parse(readFileSync(pidPath, "utf-8"));
+      process.kill(raw.pid, 0);
+      return { running: true, pid: raw.pid, port: raw.port };
+    } catch {
+      continue;
+    }
   }
+  return { running: false };
 }
 
 export function startBridgeDaemon(config: BridgeConfig = {}): void {
