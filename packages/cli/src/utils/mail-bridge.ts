@@ -4,23 +4,19 @@
  * Standalone bridge process connecting OpenClaw channels (Discord, etc.)
  * to TPS mail. Runs as a long-lived daemon.
  *
- * Architecture:
- *   Inbound  (OpenClaw → Agent):  HTTP server receives webhook POSTs from
- *                                  OpenClaw, writes envelope to agent mailbox.
- *   Outbound (Agent → OpenClaw):  Watches openclaw-bridge TPS mailbox,
- *                                  POSTs replies to OpenClaw message API.
+ * Security:
+ *   - Inbound POST /inbound requires a bearer token (BRIDGE_TOKEN env var or
+ *     config.inboundToken). Requests without a valid token are rejected 401.
+ *   - agentId from envelope is validated against /^[a-zA-Z0-9_-]{1,64}$/ before
+ *     being used as a mailbox directory name (prevents path traversal).
+ *   - Bridge writes X-TPS-Trust and X-TPS-Sender headers into mail so EventLoop
+ *     can determine trust level for tool access.
+ *   - Outbound delivery errors are logged but non-fatal.
+ *   - Binds to 127.0.0.1 only — never 0.0.0.0.
  *
- * Envelope format (shared inbound/outbound):
- * {
- *   "channel":   "discord",
- *   "channelId": "1477302504369688721",
- *   "senderId":  "284437008405757953",
- *   "senderName": "Nathan",
- *   "content":   "What's next?",
- *   "replyTo":   "1477835831971418243",   // optional
- *   "agentId":   "anvil",                 // inbound: routing target
- *   "timestamp": "2026-03-01T17:11:00Z"
- * }
+ * Flows:
+ *   Inbound  (OpenClaw → Agent):  POST /inbound → validate → write mailbox
+ *   Outbound (Agent → OpenClaw):  watch bridge mailbox → POST OpenClaw API
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -36,7 +32,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -47,7 +43,10 @@ export interface BridgeEnvelope {
   senderName: string;
   content: string;
   replyTo?: string;
-  /** Inbound: target agent. Outbound: set by agent, used for routing. */
+  /**
+   * Inbound: target agent to route to.
+   * Must match /^[a-zA-Z0-9_-]{1,64}$/ — validated before use.
+   */
   agentId?: string;
   timestamp: string;
 }
@@ -63,6 +62,36 @@ export interface BridgeConfig {
   mailDir?: string;
   /** Default target agent when envelope lacks agentId. Default: anvil */
   defaultAgentId?: string;
+  /**
+   * Bearer token required on POST /inbound.
+   * Falls back to BRIDGE_TOKEN env var. If neither set, inbound is DISABLED
+   * for safety — requests return 503 with a clear error message.
+   */
+  inboundToken?: string;
+}
+
+// ─── Validation ───────────────────────────────────────────────────────────────
+
+const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+
+export function validateAgentId(id: string): boolean {
+  return AGENT_ID_RE.test(id);
+}
+
+/**
+ * Constant-time bearer token comparison.
+ * Returns false if either side is empty or lengths differ.
+ */
+function checkToken(provided: string, expected: string): boolean {
+  if (!provided || !expected) return false;
+  try {
+    const a = Buffer.from(provided, "utf-8");
+    const b = Buffer.from(expected, "utf-8");
+    if (a.length !== b.length) return false;
+    return timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
 
 // ─── Mail helpers ─────────────────────────────────────────────────────────────
@@ -75,7 +104,19 @@ function mailboxDir(mailDir: string, agentId: string): { fresh: string; cur: str
   };
 }
 
-function sendMail(mailDir: string, to: string, from: string, body: string): void {
+interface MailHeaders {
+  "X-TPS-Trust": "user" | "internal" | "external";
+  "X-TPS-Sender": string;
+  "X-TPS-Channel"?: string;
+}
+
+function sendMail(
+  mailDir: string,
+  to: string,
+  from: string,
+  body: string,
+  headers?: MailHeaders,
+): void {
   const { fresh } = mailboxDir(mailDir, to);
   mkdirSync(fresh, { recursive: true });
 
@@ -85,6 +126,7 @@ function sendMail(mailDir: string, to: string, from: string, body: string): void
     from,
     to,
     timestamp: new Date().toISOString(),
+    headers: headers ?? {},
     body,
   };
   writeFileSync(join(fresh, `${id}.json`), JSON.stringify(msg, null, 2), "utf-8");
@@ -141,6 +183,7 @@ function watchOutbox(
     try {
       const raw = readFileSync(fullPath, "utf-8");
       const msg = JSON.parse(raw);
+      // Body may be a JSON string (from tps mail send) or a plain string
       envelope = typeof msg.body === "string" ? JSON.parse(msg.body) : msg.body;
     } catch (e) {
       log(`[bridge:outbound] Failed to parse mail ${file}: ${e}`);
@@ -157,7 +200,6 @@ function watchOutbox(
     });
   };
 
-  // Drain existing
   try {
     readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach(process_);
   } catch {}
@@ -169,24 +211,42 @@ function watchOutbox(
   return () => { try { watcher.close(); } catch {} };
 }
 
-// ─── Inbound: HTTP server, receive from OpenClaw, write to agent mailbox ──────
+// ─── Inbound: HTTP server ────────────────────────────────────────────────────
 
 function startInboundServer(
   port: number,
   mailDir: string,
   bridgeAgentId: string,
   defaultAgentId: string,
+  inboundToken: string | undefined,
   log: (msg: string) => void,
 ): { stop: () => void } {
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-    // Health
+    // Health — no auth required
     if (req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ status: "ok", bridge: bridgeAgentId }));
       return;
     }
 
-    // Inbound envelope from OpenClaw
+    // All other routes require auth
+    if (!inboundToken) {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "Bridge inbound is disabled: no BRIDGE_TOKEN configured. Set BRIDGE_TOKEN env var or pass --inbound-token.",
+      }));
+      return;
+    }
+
+    const authHeader = req.headers["authorization"] ?? "";
+    const provided = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+    if (!checkToken(provided, inboundToken)) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid or missing Bearer token" }));
+      return;
+    }
+
+    // Inbound envelope
     if (req.method === "POST" && req.url === "/inbound") {
       let envelope: BridgeEnvelope;
       try {
@@ -204,11 +264,30 @@ function startInboundServer(
         return;
       }
 
-      const targetAgent = envelope.agentId ?? defaultAgentId;
-      const body = JSON.stringify(envelope);
+      // Validate agentId — prevent path traversal / mailbox forgery
+      const rawAgentId = envelope.agentId;
+      if (rawAgentId !== undefined && !validateAgentId(rawAgentId)) {
+        res.writeHead(422, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: `Invalid agentId '${rawAgentId}': must match /^[a-zA-Z0-9_-]{1,64}$/`,
+        }));
+        return;
+      }
+
+      const targetAgent = rawAgentId ?? defaultAgentId;
+      const bodyJson = JSON.stringify(envelope);
+
+      // Trust level: messages via bridge are "external" by default.
+      // Only elevate to "internal" if the envelope explicitly says so AND
+      // the bearer token was verified (already done above).
+      const headers: MailHeaders = {
+        "X-TPS-Trust": "external",
+        "X-TPS-Sender": envelope.senderId,
+        "X-TPS-Channel": `${envelope.channel}:${envelope.channelId}`,
+      };
 
       try {
-        sendMail(mailDir, targetAgent, bridgeAgentId, body);
+        sendMail(mailDir, targetAgent, bridgeAgentId, bodyJson, headers);
         log(`[bridge:inbound] ${envelope.channel}/${envelope.senderId} → ${targetAgent}`);
         res.writeHead(202, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true, deliveredTo: targetAgent }));
@@ -226,6 +305,9 @@ function startInboundServer(
 
   server.listen(port, "127.0.0.1", () => {
     log(`[bridge:inbound] Listening on http://127.0.0.1:${port}/inbound`);
+    if (!inboundToken) {
+      log(`[bridge:inbound] ⚠️  No BRIDGE_TOKEN set — inbound POST /inbound is DISABLED`);
+    }
   });
 
   return { stop: () => server.close() };
@@ -252,21 +334,21 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
   const bridgeAgentId = config.bridgeAgentId ?? "openclaw-bridge";
   const mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
   const defaultAgentId = config.defaultAgentId ?? "anvil";
+  const inboundToken = config.inboundToken ?? process.env.BRIDGE_TOKEN;
 
   const log = (msg: string) => console.log(`${new Date().toISOString()} ${msg}`);
 
-  // Write PID
   mkdirSync(join(homedir(), ".tps", "run"), { recursive: true });
   writeFileSync(BRIDGE_PID_PATH, JSON.stringify({ pid: process.pid, port }), "utf-8");
 
-  // Start outbound watcher
   const stopOutbound = watchOutbox(mailDir, bridgeAgentId, openClawUrl, log);
-
-  // Start inbound server
-  const inbound = startInboundServer(port, mailDir, bridgeAgentId, defaultAgentId, log);
+  const inbound = startInboundServer(port, mailDir, bridgeAgentId, defaultAgentId, inboundToken, log);
 
   log(`[bridge] TPS OpenClaw Mail Bridge started (bridgeAgentId=${bridgeAgentId}, defaultAgent=${defaultAgentId})`);
   log(`[bridge] OpenClaw URL: ${openClawUrl}`);
+  if (!inboundToken) {
+    log(`[bridge] ⚠️  BRIDGE_TOKEN not set — POST /inbound is disabled until token is configured`);
+  }
 
   const shutdown = () => {
     log("[bridge] Shutting down...");
@@ -279,7 +361,5 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
 }
-
-// ─── Export for use in commands ───────────────────────────────────────────────
 
 export { sendMail, mailboxDir };
