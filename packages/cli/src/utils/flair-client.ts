@@ -113,13 +113,37 @@ export class FlairClient {
     return res.json() as Promise<T>;
   }
 
-  async registerAgent(name: string, publicKey: string): Promise<FlairAgent> {
-    return this.request<FlairAgent>("PUT", `/Agent/${this.agentId}`, {
-      id: this.agentId,
-      name,
-      publicKey,
-      createdAt: new Date().toISOString(),
+  /**
+   * Register agent in Flair. Uses admin Basic auth because the agent's
+   * public key isn't in the DB yet (chicken-and-egg: can't verify a
+   * signature for an agent that doesn't exist).
+   */
+  async registerAgent(
+    name: string,
+    publicKey: string,
+    adminAuth?: string,
+  ): Promise<FlairAgent> {
+    const url = `${this.baseUrl}/Agent/${this.agentId}`;
+    const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
+    const res = await fetch(url, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
+      },
+      body: JSON.stringify({
+        id: this.agentId,
+        name,
+        publicKey,
+        createdAt: new Date().toISOString(),
+      }),
     });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Flair agent registration failed: ${res.status}: ${text}`);
+    }
+    if (res.status === 204) return { id: this.agentId, name, publicKey } as FlairAgent;
+    return res.json() as Promise<FlairAgent>;
   }
 
   async getAgent(id?: string): Promise<FlairAgent | null> {
