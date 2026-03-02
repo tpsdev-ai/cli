@@ -1,0 +1,30 @@
+[meta]
+name = "tps-agent-run"
+version = "1.0.0"
+description = "TPS agent runtime sandbox. Agents get localhost networking only — LLM calls route through the TPS proxy, Flair is on localhost:9926. No outbound internet."
+
+[workdir]
+access = "readwrite"
+
+[filesystem]
+paths = [
+  # Agent workspace (read-write for file tools)
+  { path = "/workspace", access = "readwrite" },
+  # Temporary files
+  { path = "/tmp", access = "readwrite" },
+  # TPS identity (read-only — agent reads its own keys)
+  { path = "~/.tps/identity", access = "readonly" },
+  # TPS mail (read-write — agent checks and sends mail)
+  { path = "~/.tps/mail", access = "readwrite" },
+  # Agent config and memory (read-write)
+  { path = "~/.tps/agents", access = "readwrite" },
+]
+
+# Localhost only — no outbound internet.
+# Agent authenticates to:
+#   - LLM proxy at localhost:6459
+#   - Flair at localhost:9926
+# Network policy enforced by nono; the agent process has no ANTHROPIC_API_KEY.
+[network]
+block = false
+allow = ["127.0.0.1", "::1"]
