@@ -217,33 +217,53 @@ async function main() {
     }
 
     case "agent": {
-      const action = rest[0] as "run" | "start" | "health" | undefined;
-      if (!action || !["run", "start", "health"].includes(action)) {
-        console.error("Usage:\n  tps agent run --config <path> --message <text>\n  tps agent start --config <path>\n  tps agent health --config <path>");
+      const validActions = ["run", "start", "health", "create", "list", "status"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | undefined;
+      if (!action || !validActions.includes(action)) {
+        console.error(
+          "Usage:\n" +
+          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>]\n" +
+          "  tps agent list [--json]\n" +
+          "  tps agent status --id <agent-id> [--json]\n" +
+          "  tps agent run --id <agent-id> --message <text>\n" +
+          "  tps agent start --id <agent-id>\n" +
+          "  tps agent health --id <agent-id>",
+        );
         process.exit(1);
       }
 
-      const cfgIdx = process.argv.indexOf("--config");
-      if (cfgIdx < 0) {
-        console.error("Usage: tps agent <run|start|health> --config <path> [--message <text>]");
-        process.exit(1);
-      }
-
-      const configPath = process.argv[cfgIdx + 1];
-      if (!configPath) {
-        console.error("Usage: tps agent <run|start|health> --config <path> [--message <text>]");
-        process.exit(1);
-      }
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
 
       const { runAgent } = await import("../src/commands/agent.js");
-      if (action === "run") {
-        const msgIdx = process.argv.indexOf("--message");
-        const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
-        await runAgent({ action: "run", config: configPath, message });
-      } else if (action === "start") {
-        await runAgent({ action: "start", config: configPath });
+
+      if (action === "create") {
+        await runAgent({
+          action: "create",
+          id: getFlag("id") ?? rest[1],
+          name: getFlag("name"),
+          model: getFlag("model"),
+          flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
+        });
+      } else if (action === "list") {
+        await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });
+      } else if (action === "status") {
+        await runAgent({ action: "status", id: getFlag("id") ?? rest[1], json: cli.flags.json, flairUrl: getFlag("flair-url") });
       } else {
-        await runAgent({ action: "health", config: configPath });
+        // run / start / health — support both --id and --config
+        const configPath = getFlag("config");
+        const agentId = getFlag("id") ?? rest[1];
+        if (action === "run") {
+          const msgIdx = process.argv.indexOf("--message");
+          const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
+          await runAgent({ action: "run", config: configPath, id: agentId, message });
+        } else if (action === "start") {
+          await runAgent({ action: "start", config: configPath, id: agentId });
+        } else {
+          await runAgent({ action: "health", config: configPath, id: agentId });
+        }
       }
       break;
     }
