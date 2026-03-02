@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -169,6 +170,11 @@ export class ProviderManager {
     const model = this.config.model;
     try {
       let out: CompletionResponse;
+
+      // Route through proxy when configured (sandbox mode)
+      if (this.config.proxyUrl) {
+        out = await this.completeViaProxy(request);
+      } else
       switch (provider) {
         case "anthropic":
           out = await this.completeAnthropic(request);
@@ -343,6 +349,131 @@ export class ProviderManager {
       }
       return { role: m.role, content: m.content ?? "" };
     });
+  }
+
+
+  /**
+   * Route LLM request through the TPS localhost proxy.
+   * The proxy holds API keys; agent authenticates with Ed25519.
+   */
+  private async completeViaProxy(request: CompletionRequest): Promise<CompletionResponse> {
+    const proxyUrl = this.config.proxyUrl!;
+    const provider = this.config.provider;
+    const model = this.config.model;
+
+    // Build provider-specific request body
+    let body: Record<string, unknown>;
+    let providerPath: string;
+
+    switch (provider) {
+      case "anthropic":
+        providerPath = "/proxy/anthropic/v1/messages";
+        body = {
+          model,
+          max_tokens: request.maxTokens ?? 4096,
+          system: request.systemPrompt,
+          messages: request.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+        };
+        if (request.tools?.length) {
+          body.tools = request.tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            input_schema: t.input_schema,
+          }));
+        }
+        break;
+      case "openai":
+        providerPath = "/proxy/openai/v1/chat/completions";
+        body = {
+          model,
+          max_tokens: request.maxTokens ?? 4096,
+          messages: [
+            ...(request.systemPrompt ? [{ role: "system", content: request.systemPrompt }] : []),
+            ...request.messages.map((m) => ({ role: m.role, content: m.content })),
+          ],
+        };
+        if (request.tools?.length) {
+          body.tools = request.tools.map((t) => ({
+            type: "function",
+            function: { name: t.name, description: t.description, parameters: t.input_schema },
+          }));
+        }
+        break;
+      default:
+        throw new Error(`Proxy not supported for provider: ${provider}. Use direct mode.`);
+    }
+
+    // Sign with Ed25519
+    const ts = Date.now().toString();
+    const nonce = crypto.randomUUID();
+    const signPayload = `${this.agentId}:${ts}:${nonce}:POST:${providerPath}`;
+
+    const keyPath = join(homedir(), ".tps", "identity", `${this.agentId}.key`);
+    let authHeader = "";
+    try {
+      const raw = readFileSync(keyPath, "utf-8").trim();
+      let key;
+      if (raw.startsWith("-----")) {
+        key = crypto.createPrivateKey(raw);
+      } else {
+        key = crypto.createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+      }
+      const sig = crypto.sign(null, Buffer.from(signPayload), key);
+      authHeader = `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
+    } catch {
+      throw new Error(`Cannot sign proxy request. Key not found at ${keyPath}`);
+    }
+
+    const res = await fetch(`${proxyUrl}${providerPath}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: authHeader,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`LLM proxy error: ${res.status} ${text}`);
+    }
+
+    const data = await res.json() as Record<string, unknown>;
+
+    // Normalize response (proxy returns provider-native format)
+    if (provider === "anthropic") {
+      const content = (data as any).content ?? [];
+      const text = content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+      const toolCalls: ToolCall[] = content
+        .filter((b: any) => b.type === "tool_use")
+        .map((b: any) => ({ id: b.id, name: b.name, input: b.input }));
+      return {
+        content: text,
+        toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        inputTokens: (data as any).usage?.input_tokens ?? 0,
+        outputTokens: (data as any).usage?.output_tokens ?? 0,
+        cacheReadTokens: (data as any).usage?.cache_read_input_tokens,
+        cacheWriteTokens: (data as any).usage?.cache_creation_input_tokens,
+      };
+    }
+
+    // OpenAI format
+    const choice = ((data as any).choices ?? [])[0];
+    const msg = choice?.message ?? {};
+    const toolCalls: ToolCall[] = (msg.tool_calls ?? []).map((tc: any) => ({
+      id: tc.id,
+      name: tc.function.name,
+      input: JSON.parse(tc.function.arguments ?? "{}"),
+    }));
+    return {
+      content: msg.content ?? "",
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      inputTokens: (data as any).usage?.prompt_tokens ?? 0,
+      outputTokens: (data as any).usage?.completion_tokens ?? 0,
+    };
   }
 
   private async completeAnthropic(request: CompletionRequest): Promise<CompletionResponse> {

@@ -512,6 +512,48 @@ async function main() {
       }
       break;
     }
+    case "proxy": {
+      const subAction = rest[0] as "start" | "stop" | "status" | undefined;
+      if (!subAction || !["start", "stop", "status"].includes(subAction)) {
+        console.error("Usage:\n  tps proxy start [--port 6459]\n  tps proxy stop\n  tps proxy status");
+        process.exit(1);
+      }
+
+      const { startProxyDaemon, proxyStatus } = await import("../src/utils/llm-proxy.js");
+      const portIdx = process.argv.indexOf("--port");
+      const port = portIdx >= 0 ? parseInt(process.argv[portIdx + 1], 10) : undefined;
+
+      if (subAction === "start") {
+        startProxyDaemon(port);
+      } else if (subAction === "stop") {
+        const { readFileSync, rmSync, existsSync } = await import("node:fs");
+        const { homedir } = await import("node:os");
+        const { join } = await import("node:path");
+        const pidPath = join(homedir(), ".tps", "run", "llm-proxy.pid");
+        if (!existsSync(pidPath)) {
+          console.log("Proxy is not running.");
+          break;
+        }
+        const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+        try {
+          process.kill(pid, "SIGTERM");
+          rmSync(pidPath, { force: true });
+          console.log(`Proxy (pid ${pid}) stopped.`);
+        } catch {
+          rmSync(pidPath, { force: true });
+          console.log("Proxy was not running (stale pid cleaned up).");
+        }
+      } else if (subAction === "status") {
+        const st = proxyStatus();
+        if (st.running) {
+          console.log(`Proxy running: pid=${st.pid}, port=${st.port}`);
+        } else {
+          console.log("Proxy is not running.");
+        }
+      }
+      break;
+    }
+
     default:
       cli.showHelp();
   }

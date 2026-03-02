@@ -36,3 +36,7 @@ export { ReviewGate } from "./governance/review-gate.js";
 
 // Config
 export { loadAgentConfig } from "./config.js";
+
+// Flair integration
+export { FlairContextProvider } from "./io/flair.js";
+export type { FlairConfig } from "./runtime/types.js";

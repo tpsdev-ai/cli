@@ -9,11 +9,13 @@ import { ProviderManager } from "../llm/provider.js";
 import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
+import { FlairContextProvider } from "../io/flair.js";
 
 export class AgentRuntime {
   private loop: EventLoop;
   private readonly mail: MailClient;
   private readonly boundary: BoundaryManager;
+  private readonly flair: FlairContextProvider | null;
 
   constructor(public readonly config: AgentConfig) {
     const events = new EventLogger(
@@ -27,6 +29,7 @@ export class AgentRuntime {
 
     this.mail = mail;
     this.boundary = new BoundaryManager(config.workspace);
+    this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
     const tools = createDefaultToolset({
       boundary: this.boundary,
       mail,
@@ -64,7 +67,31 @@ export class AgentRuntime {
   }
 
   async runOnce(message: string): Promise<void> {
+    if (this.flair) {
+      // Inject Flair context as a system prompt supplement
+      try {
+        const ctx = await this.flair.buildContextBlock(message.slice(0, 200));
+        if (ctx) {
+          await this.loop.runOnce(`${message}
+
+[Flair Context]
+${ctx}`);
+          return;
+        }
+      } catch {
+        // Fall through to normal path
+      }
+    }
     await this.loop.runOnce(message);
+  }
+
+  async writeConversationMemory(id: string, content: string): Promise<void> {
+    if (!this.flair) return;
+    try {
+      await this.flair.writeMemory(id, content, "conversation");
+    } catch {
+      // Non-fatal — local memory still works
+    }
   }
 
   getState(): string {

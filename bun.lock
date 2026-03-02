@@ -12,7 +12,7 @@
     },
     "packages/agent": {
       "name": "@tpsdev-ai/agent",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps-agent": "./dist/bin.js",
       },
@@ -30,7 +30,7 @@
     },
     "packages/cli": {
       "name": "@tpsdev-ai/cli",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps": "./bin/tps.cjs",
       },
@@ -59,36 +59,36 @@
         "typescript": "^5.7.0",
       },
       "optionalDependencies": {
-        "@tpsdev-ai/cli-darwin-arm64": "0.5.0",
-        "@tpsdev-ai/cli-darwin-x64": "0.5.0",
-        "@tpsdev-ai/cli-linux-arm64": "0.5.0",
-        "@tpsdev-ai/cli-linux-x64": "0.5.0",
+        "@tpsdev-ai/cli-darwin-arm64": "0.5.4",
+        "@tpsdev-ai/cli-darwin-x64": "0.5.4",
+        "@tpsdev-ai/cli-linux-arm64": "0.5.4",
+        "@tpsdev-ai/cli-linux-x64": "0.5.4",
       },
     },
     "packages/cli-darwin-arm64": {
       "name": "@tpsdev-ai/cli-darwin-arm64",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-darwin-x64": {
       "name": "@tpsdev-ai/cli-darwin-x64",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-linux-arm64": {
       "name": "@tpsdev-ai/cli-linux-arm64",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps": "./tps",
       },
     },
     "packages/cli-linux-x64": {
       "name": "@tpsdev-ai/cli-linux-x64",
-      "version": "0.5.0",
+      "version": "0.5.4",
       "bin": {
         "tps": "./tps",
       },

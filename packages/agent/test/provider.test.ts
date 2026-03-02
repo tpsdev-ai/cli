@@ -1,3 +1,7 @@
+import { beforeEach, afterEach } from "bun:test";
+let _savedFetch: typeof globalThis.fetch;
+beforeEach(() => { _savedFetch = globalThis.fetch; });
+afterEach(() => { globalThis.fetch = _savedFetch; });
 import { describe, expect, test } from "bun:test";
 import { ProviderManager } from "../src/llm/provider.js";
 

@@ -10,6 +10,7 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
+import { createLLMProxy, startProxyDaemon, proxyStatus } from "../utils/llm-proxy.js";
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
