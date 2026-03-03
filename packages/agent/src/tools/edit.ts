@@ -25,30 +25,43 @@ function normalizeIndent(s: string): string {
 
 /**
  * Find `needle` in `haystack`, falling back to indent-normalized matching.
- * Returns the index in the original haystack, or -1 if not found.
+ * Returns { index, matchedText } where matchedText is the actual substring
+ * in haystack that corresponds to needle (needed for correct replacement).
+ * Returns null if not found.
  */
-function findOccurrence(haystack: string, needle: string): number {
+function findOccurrence(
+  haystack: string,
+  needle: string,
+): { index: number; matchedText: string } | null {
+  // Exact match — fast path
   const exact = haystack.indexOf(needle);
-  if (exact !== -1) return exact;
+  if (exact !== -1) return { index: exact, matchedText: needle };
 
-  // Fuzzy: normalize both sides and find in normalized haystack
+  // Fuzzy: normalize indentation on both sides
   const normHaystack = normalizeIndent(haystack);
   const normNeedle = normalizeIndent(needle);
   const normIdx = normHaystack.indexOf(normNeedle);
-  if (normIdx === -1) return -1;
+  if (normIdx === -1) return null;
 
-  // Map normalized index back to original by counting newlines
+  // Map the normalized index back to an original-string line number
   const normLines = normHaystack.slice(0, normIdx).split("\n").length - 1;
+  const needleLineCount = needle.split("\n").length;
   const origLines = haystack.split("\n");
-  let origIdx = 0;
+
+  // Reconstruct the actual text block from the original lines
+  const origBlock = origLines
+    .slice(normLines, normLines + needleLineCount)
+    .join("\n");
+
+  // Find (and verify) the block in the original haystack
+  let charOffset = 0;
   for (let i = 0; i < normLines && i < origLines.length; i++) {
-    origIdx += origLines[i]!.length + 1; // +1 for \n
+    charOffset += origLines[i]!.length + 1; // +1 for \n
   }
-  // Find the actual start of the matching block
-  const blockLen = needle.split("\n").length;
-  const origBlock = origLines.slice(normLines, normLines + blockLen).join("\n");
-  const blockIdx = haystack.indexOf(origBlock, Math.max(0, origIdx - 50));
-  return blockIdx !== -1 ? blockIdx : origIdx;
+  const blockIdx = haystack.indexOf(origBlock, Math.max(0, charOffset - 50));
+  if (blockIdx === -1) return null;
+
+  return { index: blockIdx, matchedText: origBlock };
 }
 
 export function makeEditTool(boundary: BoundaryManager): Tool {
@@ -101,36 +114,29 @@ export function makeEditTool(boundary: BoundaryManager): Tool {
       try {
         const current = readFileSync(workspacePath, "utf-8");
 
-        const first = findOccurrence(current, payload.old_string);
-        if (first === -1) {
+        const match = findOccurrence(current, payload.old_string);
+        if (match === null) {
           return {
             content: `No occurrence of old_string found in ${payload.path}. Tip: use the read tool to verify exact text, or use the write tool to rewrite the full file.`,
             isError: true,
           };
         }
+        const { index: first, matchedText } = match;
 
-        // Check for multiple occurrences (exact only)
-        const last = current.lastIndexOf(payload.old_string);
-        if (
-          current.indexOf(payload.old_string) !== -1 &&
-          current.indexOf(payload.old_string) !== last
-        ) {
+        // Check for multiple occurrences (exact only, to keep fuzzy safe)
+        const exactOccurrences = current.split(payload.old_string).length - 1;
+        const normOccurrences = normalizeIndent(current).split(normalizeIndent(payload.old_string)).length - 1;
+        if (exactOccurrences > 1 || normOccurrences > 1) {
           return {
             content: `old_string matches multiple locations in ${payload.path} — provide narrower context`,
             isError: true,
           };
         }
 
-        // Replace: use the actual found substring (handles fuzzy match)
-        const foundText =
-          current.indexOf(payload.old_string) !== -1
-            ? payload.old_string
-            : current.slice(
-                first,
-                first + payload.old_string.split("\n").length,
-              );
-
-        const next = current.slice(0, first) + payload.new_string + current.slice(first + foundText.length);
+        const next =
+          current.slice(0, first) +
+          payload.new_string +
+          current.slice(first + matchedText.length);
         writeFileSync(workspacePath, next, "utf-8");
         return { content: `Edited ${payload.path}`, isError: false };
       } catch (err: any) {
