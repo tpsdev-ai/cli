@@ -71,7 +71,10 @@ function getNodePath(): string {
 
 function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): string {
   const nodePath = getNodePath();
-  const harperBin = join(flairDir, "node_modules/harperdb/bin/harper.js");
+  // Support both new (harper package) and old (harperdb package) binary paths
+  const harperBinNew = join(flairDir, "node_modules/harper/dist/bin/harper.js");
+  const harperBinOld = join(flairDir, "node_modules/harperdb/bin/harper.js");
+  const harperBin = existsSync(harperBinNew) ? harperBinNew : harperBinOld;
   const mode = "dev";  // Harper "run" requires pre-installed instance; dev works for all setups
 
   if (!existsSync(harperBin)) {
