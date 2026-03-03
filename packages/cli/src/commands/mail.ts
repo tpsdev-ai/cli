@@ -9,7 +9,7 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 
 interface MailArgs {
-  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search";
+  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay";
   agent?: string;
   message?: string;
   messageId?: string;
@@ -229,6 +229,70 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
       }
       return;
+    }
+
+    case "relay": {
+      const relayAction = args.agent ?? "status"; // relay start|stop|status
+      const { getRelayPid, runRelayDaemon } = await import("../utils/mail-relay.js");
+      const { spawnSync } = await import("node:child_process");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+      const mailDir = join(homedir(), ".tps", "mail");
+
+      if (relayAction === "status") {
+        const pid = getRelayPid();
+        if (pid) {
+          console.log(`Mail relay running: pid=${pid}`);
+        } else {
+          console.log("Mail relay is not running.");
+        }
+        break;
+      }
+
+      if (relayAction === "stop") {
+        const pid = getRelayPid();
+        if (!pid) {
+          console.log("Mail relay is not running.");
+        } else {
+          process.kill(pid, "SIGTERM");
+          console.log(`Mail relay stopped (pid=${pid}).`);
+        }
+        break;
+      }
+
+      if (relayAction === "start") {
+        const existingPid = getRelayPid();
+        if (existingPid) {
+          console.log(`Mail relay already running (pid=${existingPid}).`);
+          break;
+        }
+        // Spawn relay as detached background process
+        const { spawn } = await import("node:child_process");
+        const daemon = spawn(
+          process.execPath,
+          [...process.execArgv, process.argv[1]!, "mail", "relay", "_run", mailDir],
+          {
+            detached: true,
+            stdio: ["ignore", "ignore", "ignore"],
+            env: process.env as NodeJS.ProcessEnv,
+          },
+        );
+        daemon.unref();
+        await new Promise((r) => setTimeout(r, 500));
+        const newPid = getRelayPid();
+        console.log(newPid ? `Mail relay started: pid=${newPid}` : "Mail relay started (pid pending).");
+        break;
+      }
+
+      if (relayAction === "_run") {
+        // Internal: actual daemon loop
+        const dir = args.message ?? mailDir;
+        await runRelayDaemon(dir);
+        break;
+      }
+
+      console.error(`Usage: tps mail relay [start|stop|status]`);
+      process.exit(1);
     }
 
     case "search": {

@@ -35,7 +35,8 @@ export type NonoProfile =
   | "tps-bootstrap"
   | "tps-backup"
   | "tps-restore"
-  | "tps-status";
+  | "tps-status"
+  | "tps-agent-run";
 
 export interface NonoOptions {
   /** Override workdir for the nono sandbox (--workdir flag) */

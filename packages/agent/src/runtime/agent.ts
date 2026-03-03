@@ -62,7 +62,7 @@ export class AgentRuntime {
     });
 
     try {
-      await Promise.race([this.loop.run(checkInbox, deliverOutbox), shutdown]);
+      await Promise.race([this.loop.run(checkInbox), shutdown]);
     } finally {
       rmSync(pidPath, { force: true });
     }

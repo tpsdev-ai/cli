@@ -62,7 +62,7 @@ export class EventLoop {
     private readonly pollMs = 500,
   ) {}
 
-  async run(checkInbox: () => Promise<MailMessage[]>, deliverOutbox?: () => void): Promise<void> {
+  async run(checkInbox: () => Promise<MailMessage[]>): Promise<void> {
     this.running = true;
     this.state = "idle";
     this.deps.events?.emit({
@@ -79,7 +79,6 @@ export class EventLoop {
         this.state = "processing";
         try {
           await this.processMail(msg);
-          deliverOutbox?.();
         } catch (err: any) {
           await this.deps.memory.append({
             type: "error",
