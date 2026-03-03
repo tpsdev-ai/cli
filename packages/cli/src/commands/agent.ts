@@ -386,7 +386,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         try {
           await runtime.start();
         } catch (_err) {
-          console.error("❌ Agent runtime crashed:", err);
+          console.error("❌ Agent runtime crashed:", _err);
           process.exit(1);
         }
         return;
