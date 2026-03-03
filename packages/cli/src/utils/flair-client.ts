@@ -24,6 +24,12 @@ export interface Memory {
   tags?: string[];
   createdAt?: string;
   updatedAt?: string;
+  promotionStatus?: "pending" | "approved" | "rejected" | null;
+  promotedAt?: string;
+  promotedBy?: string;
+  archived?: boolean;
+  archivedAt?: string;
+  archivedBy?: string;
 }
 
 export interface SoulEntry {
@@ -40,6 +46,7 @@ export interface SearchResult {
   _score: number;
   type?: string;
 }
+
 
 export interface ReflectResult {
   memories: Memory[];
@@ -276,7 +283,117 @@ export class FlairClient {
     return sections.join("") || "(No Flair context available)";
   }
 
-  // ─── Learning pipeline (ops-31.2) ───────────────────────────────────────────
+  // ─── Memory governance (admin-only on Flair server) ──────────────────────────
+
+  async listMemoriesFull(opts: {
+    agentId?: string;
+    durability?: string;
+    promotionStatus?: string;
+    archived?: boolean;
+    limit?: number;
+  } = {}): Promise<Memory[]> {
+    const agentId = opts.agentId ?? this.agentId;
+    const params = new URLSearchParams({ agentId, limit: String(opts.limit ?? 50) });
+    if (opts.durability) params.set("durability", opts.durability);
+    return this.request<Memory[]>("GET", `/Memory/?${params.toString()}`);
+  }
+
+
+  /** Read-modify-write: GET existing record, merge patch, PUT back. Prevents field loss on partial updates. */
+  private async patchRecord(table: string, id: string, patch: Record<string, unknown>): Promise<void> {
+    const existing = await this.request<Record<string, unknown>>("GET", `/${table}/${encodeURIComponent(id)}`).catch(() => null);
+    const merged = { ...(existing ?? {}), ...patch, id };  // id always present
+    await this.request("PUT", `/${table}/${encodeURIComponent(id)}`, merged);
+  }
+
+  async approveMemory(id: string): Promise<void> {
+    await this.patchRecord("Memory", id, {
+      promotionStatus: "approved",
+      promotedBy: this.agentId,
+      promotedAt: new Date().toISOString(),
+      durability: "permanent",
+    });
+  }
+
+  async rejectMemory(id: string): Promise<void> {
+    await this.patchRecord("Memory", id, {
+      promotionStatus: "rejected",
+    });
+  }
+
+  async archiveMemory(id: string): Promise<void> {
+    await this.patchRecord("Memory", id, {
+      archived: true,
+      archivedBy: this.agentId,
+      archivedAt: new Date().toISOString(),
+    });
+  }
+
+  async unarchiveMemory(id: string): Promise<void> {
+    await this.patchRecord("Memory", id, {
+      archived: false,
+      archivedBy: null,
+      archivedAt: null,
+    });
+  }
+
+  async purgeMemory(id: string): Promise<void> {
+    await this.request("DELETE", `/Memory/${id}`);
+  }
+
+  async proposeMemory(id: string, content: string, tags?: string[]): Promise<void> {
+    await this.request("PUT", `/Memory/${id}`, {
+      id,
+      agentId: this.agentId,
+      content,
+      durability: "standard",
+      promotionStatus: "pending",
+      promotedBy: this.agentId,
+      tags,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  // ─── Soul governance ───────────────────────────────────────────────────────
+
+  async getSoulFor(agentId: string): Promise<SoulEntry[]> {
+    return this.request<SoulEntry[]>("GET", `/Soul/?agentId=${encodeURIComponent(agentId)}`);
+  }
+
+  async setSoulEntry(agentId: string, key: string, value: string): Promise<void> {
+    const id = `${agentId}-${key}`;
+    await this.request("PUT", `/Soul/${id}`, {
+      id,
+      agentId,
+      key,
+      value,
+      durability: "permanent",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  async deleteSoulEntry(agentId: string, key: string): Promise<void> {
+    const id = `${agentId}-${key}`;
+    await this.request("DELETE", `/Soul/${id}`);
+  }
+
+
+
+  async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
+    const existing = await this.getAgent(agentId);
+    if (!existing) throw new Error(`Agent ${agentId} not found`);
+    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
+  }
+
+  async seedAgent(opts: {
+    agentId: string;
+    displayName?: string;
+    role?: "admin" | "agent";
+    soulTemplate?: Record<string, string>;
+    starterMemories?: Array<{ content: string; tags?: string[]; durability?: string }>;
+  }): Promise<{ agent: FlairAgent; soulEntries: any[]; memories: any[] }> {
+    return this.request("POST", "/AgentSeed/", opts);
+  }
 
   async reflectMemory(opts: {
     agentId?: string;
@@ -308,24 +425,6 @@ export class FlairClient {
       olderThan: opts.olderThan ?? "30d",
       limit: opts.limit ?? 20,
     });
-  }
-
-  // ─── Onboarding seed (ops-31.3) ──────────────────────────────────────────────
-
-  async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
-    const existing = await this.getAgent(agentId);
-    if (!existing) throw new Error(`Agent ${agentId} not found`);
-    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
-  }
-
-  async seedAgent(opts: {
-    agentId: string;
-    displayName?: string;
-    role?: "admin" | "agent";
-    soulTemplate?: Record<string, string>;
-    starterMemories?: Array<{ content: string; tags?: string[]; durability?: string }>;
-  }): Promise<{ agent: FlairAgent; soulEntries: any[]; memories: any[] }> {
-    return this.request("POST", "/AgentSeed/", opts);
   }
 
   async ping(): Promise<boolean> {
