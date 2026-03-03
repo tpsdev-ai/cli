@@ -57,7 +57,7 @@ function getNodePath(): string {
 function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): string {
   const nodePath = getNodePath();
   const harperBin = join(flairDir, "node_modules/harperdb/bin/harper.js");
-  const mode = dev ? "dev" : "dev";  // Harper "run" requires pre-installed instance; dev works for all setups
+  const mode = "dev";  // Harper "run" requires pre-installed instance; dev works for all setups
 
   if (!existsSync(harperBin)) {
     throw new Error(
