@@ -15,8 +15,10 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { randomBytes } from "node:crypto";
 
 const PLIST_LABEL = "ai.tpsdev.flair";
+const HARPER_OPS_URL = "http://127.0.0.1:9925";  // local only, not a security risk
 const PLIST_PATH = join(
   homedir(),
   "Library/LaunchAgents",
@@ -44,6 +46,19 @@ function getFlairDir(opts: HarperOpts): string {
     );
   }
   return resolved;
+}
+
+const SECRETS_DIR = join(homedir(), ".tps/secrets/flair");
+const ADMIN_TOKEN_PATH = join(SECRETS_DIR, "harper-admin-token");
+
+function ensureAdminToken(): string {
+  mkdirSync(SECRETS_DIR, { recursive: true });
+  if (existsSync(ADMIN_TOKEN_PATH)) {
+    return readFileSync(ADMIN_TOKEN_PATH, "utf8").trim();
+  }
+  const token = randomBytes(32).toString("base64url");
+  writeFileSync(ADMIN_TOKEN_PATH, token, { encoding: "utf8", mode: 0o600 });
+  return token;
 }
 
 function getNodePath(): string {
@@ -110,7 +125,7 @@ function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): stri
     <key>HOME</key>
     <string>${homedir()}</string>
     <key>HARPER_SET_CONFIG</key>
-    <string>{"rootPath":"${harperDataDir}","http":{"port":9926},"operationsApi":{"network":{"port":9925}}}</string>
+    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"],"domainSocket":"${harperDataDir}/operations-server"}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
   </dict>
 </dict>
 </plist>
@@ -143,7 +158,7 @@ function getPid(): number | null {
 
 function isHarperResponding(): boolean {
   try {
-    execSync("curl -sf -o /dev/null http://127.0.0.1:9925/health", {
+    execSync(`curl -sf -o /dev/null ${HARPER_OPS_URL}/health`, {
       timeout: 3000,
     });
     return true;
@@ -162,6 +177,7 @@ export async function flairCommand(
       mkdirSync(LOG_DIR, { recursive: true });
       const harperDataDir = join(homedir(), ".harper/flair");
       mkdirSync(harperDataDir, { recursive: true });
+      const adminToken = ensureAdminToken();
       const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir);
       writeFileSync(PLIST_PATH, plist, "utf8");
       chmodSync(PLIST_PATH, 0o644);
@@ -175,7 +191,32 @@ export async function flairCommand(
       console.log(`   Plist: ${PLIST_PATH}`);
       console.log(`   Logs:  ${STDOUT_LOG}`);
       console.log(`   Flair: ${flairDir}`);
+      console.log(`   Token: ${ADMIN_TOKEN_PATH}`);
       console.log(`   Mode:  dev`);
+      // Update Harper's internal admin password (stored in DB, HARPER_SET_CONFIG only sets on first install).
+      // Poll until Harper is up (up to 30s), then rotate.
+      await new Promise<void>((resolve) => setTimeout(resolve, 12000));
+      try {
+        // Use Harper's Unix domain socket to avoid HTTP-over-loopback for admin ops.
+        const harperSocket = join(harperDataDir, "operations-server");
+        for (const oldPw of ["admin123", adminToken]) {
+          const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
+          const body = JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken });
+          try {
+            execSync(
+              `curl -sf --unix-socket "${harperSocket}" http://localhost` +
+              ` -X POST -H 'Content-Type: application/json'` +
+              ` -H 'Authorization: ${cred}'` +
+              ` -d '${body}'`,
+              { stdio: "pipe" }
+            );
+            console.log("   ✅ Admin password rotated (via Unix socket)");
+            break;
+          } catch { continue; }
+        }
+      } catch (err: any) {
+        console.warn(`   ⚠️  Could not rotate password yet. Run 'tps flair install' again once Flair is up.`);
+      }
       break;
     }
     case "uninstall": {
