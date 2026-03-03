@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 
 const PLIST_LABEL = "ai.tpsdev.flair";
+const HARPER_OPS_URL = "http://127.0.0.1:9925";  // local only, not a security risk
 const PLIST_PATH = join(
   homedir(),
   "Library/LaunchAgents",
@@ -160,7 +161,7 @@ function getPid(): number | null {
 
 function isHarperResponding(): boolean {
   try {
-    execSync("curl -sf -o /dev/null http://127.0.0.1:9925/health", {
+    execSync(`curl -sf -o /dev/null ${HARPER_OPS_URL}/health`, {
       timeout: 3000,
     });
     return true;
@@ -201,7 +202,7 @@ export async function flairCommand(
       try {
         for (const oldPw of ["admin123", adminToken]) {
           const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
-          const res = await fetch("http://127.0.0.1:9925", {
+          const res = await fetch(HARPER_OPS_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json", Authorization: cred },
             body: JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken }),
