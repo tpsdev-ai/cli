@@ -83,12 +83,93 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 
 // ─── Provider forwarding ──────────────────────────────────────────────────────
 
-type Provider = "anthropic" | "openai";
+type Provider = "anthropic" | "openai" | "claude-oauth";
 
 function readSecretFile(name: string): string | null {
   const p = join(homedir(), ".tps", "secrets", name);
   return existsSync(p) ? readFileSync(p, "utf-8").trim() : null;
 }
+
+// ─── Claude OAuth token management ────────────────────────────────────────────
+
+interface ClaudeOAuthCredentials {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number; // milliseconds epoch
+  scopes: string[];
+  subscriptionType: string;
+  rateLimitTier: string;
+}
+
+const CLAUDE_CREDENTIALS_PATH = join(homedir(), ".claude", ".credentials.json");
+const OAUTH_REFRESH_URL = "https://console.anthropic.com/v1/oauth/token";
+// Refresh 5 minutes before actual expiry
+const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+function readClaudeOAuthCredentials(): ClaudeOAuthCredentials | null {
+  try {
+    if (!existsSync(CLAUDE_CREDENTIALS_PATH)) return null;
+    const raw = readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8");
+    const data = JSON.parse(raw);
+    return data?.claudeAiOauth ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeClaudeOAuthCredentials(creds: ClaudeOAuthCredentials): void {
+  try {
+    const raw = readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8");
+    const data = JSON.parse(raw);
+    data.claudeAiOauth = creds;
+    writeFileSync(CLAUDE_CREDENTIALS_PATH, JSON.stringify(data, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[llm-proxy] Failed to write OAuth credentials:", err);
+  }
+}
+
+async function refreshOAuthToken(creds: ClaudeOAuthCredentials): Promise<ClaudeOAuthCredentials> {
+  const res = await fetch(OAUTH_REFRESH_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: creds.refreshToken,
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`OAuth token refresh failed (${res.status}): ${body}`);
+  }
+
+  const data = await res.json() as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
+
+  const updated: ClaudeOAuthCredentials = {
+    ...creds,
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token ?? creds.refreshToken,
+    expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000,
+  };
+
+  writeClaudeOAuthCredentials(updated);
+  return updated;
+}
+
+async function getValidOAuthToken(): Promise<string> {
+  const creds = readClaudeOAuthCredentials();
+  if (!creds) throw new Error("Claude OAuth credentials not found at ~/.claude/.credentials.json");
+
+  const needsRefresh = Date.now() >= creds.expiresAt - OAUTH_EXPIRY_BUFFER_MS;
+  const validCreds = needsRefresh ? await refreshOAuthToken(creds) : creds;
+  return validCreds.accessToken;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: string } | null {
   if (provider === "anthropic") {
@@ -107,6 +188,10 @@ function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: s
       authHeader: `Bearer ${key}`,
     };
   }
+  // claude-oauth: dynamic, fetched per-request in forwardRequest
+  if (provider === "claude-oauth") {
+    return { baseUrl: "https://api.anthropic.com", authHeader: "" };
+  }
   return null;
 }
 
@@ -122,13 +207,17 @@ async function forwardRequest(
 
   const headers: Record<string, string> = {
     "Content-Type": contentType,
-    "Authorization": provider === "openai" ? providerCfg.authHeader : "",
   };
 
   if (provider === "anthropic") {
     headers["x-api-key"] = providerCfg.authHeader.replace("x-api-key: ", "");
     headers["anthropic-version"] = "2023-06-01";
-    delete headers.Authorization;
+  } else if (provider === "claude-oauth") {
+    const token = await getValidOAuthToken();
+    headers["Authorization"] = `Bearer ${token}`;
+    headers["anthropic-version"] = "2023-06-01";
+  } else if (provider === "openai") {
+    headers["Authorization"] = providerCfg.authHeader;
   }
 
   // Force uncompressed response — proxy passes raw bytes to agent, no decompression
@@ -188,10 +277,10 @@ export function createLLMProxy(port = DEFAULT_PORT): { start: () => Promise<void
     }
 
     // Route: /proxy/<provider>/<path>
-    const match = (req.url ?? "").match(/^\/proxy\/(anthropic|openai)(\/.*)?$/);
+    const match = (req.url ?? "").match(/^\/proxy\/(anthropic|openai|claude-oauth)(\/.*)?$/);
     if (!match) {
       res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unknown proxy path. Use /proxy/anthropic/... or /proxy/openai/..." }));
+      res.end(JSON.stringify({ error: "Unknown proxy path. Use /proxy/anthropic/..., /proxy/openai/..., or /proxy/claude-oauth/..." }));
       return;
     }
 
