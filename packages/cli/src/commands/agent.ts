@@ -33,6 +33,8 @@ export interface AgentArgs {
   flairUrl?: string;
   json?: boolean;
   sandbox?: boolean;
+  /** Internal: set by re-exec under nono, skips re-wrapping */
+  sandboxed?: boolean;
 }
 
 // ─── create ──────────────────────────────────────────────────────────────────
@@ -354,9 +356,12 @@ export async function runAgent(args: AgentArgs): Promise<void> {
 
       if (args.action === "start") {
         const sandbox = (args as any).sandbox ?? false;
+        const sandboxed = (args as any).sandboxed ?? false;
         const nonoAvailable = findNono();
 
-        if (sandbox || isNonoStrict()) {
+        if (sandboxed) {
+          // Already running inside nono — skip re-exec, proceed to runtime
+        } else if (sandbox || isNonoStrict()) {
           if (!nonoAvailable) {
             if (isNonoStrict()) {
               console.error("❌ --sandbox requires nono (TPS_NONO_STRICT=1). Install from https://nono.sh");
@@ -368,18 +373,21 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             const identityDir = join(homedir(), ".tps", "identity");
             const mailDir = join(homedir(), ".tps", "mail");
             const agentDir = join(homedir(), ".tps", "agents", config.agentId);
+            const bunDir = join(homedir(), ".bun");
+            const tmpDir = process.env.TMPDIR ?? "/tmp";
             const exitCode = runCommandUnderNono(
               "tps-agent-run",
               {
                 workdir: config.workspace,
-                read: [identityDir, agentDir],
-                allow: [mailDir],
+                // System-wide read: bun needs macOS dylibs/frameworks, read-only is safe
+                read: [identityDir, agentDir, bunDir, "/"],
+                allow: [mailDir, tmpDir, config.workspace],
               },
-              [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId],
+              [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId, "--sandboxed"],
             );
             process.exit(exitCode);
           }
-        } else if (nonoAvailable) {
+        } else if (!sandboxed && nonoAvailable) {
           console.log(`ℹ️  nono available — pass --sandbox to run with isolation`);
         }
 

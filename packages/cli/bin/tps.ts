@@ -267,7 +267,7 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox") });
+          await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });
         }
