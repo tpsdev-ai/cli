@@ -35,6 +35,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
   const parts = payload.split(":");
   if (parts.length < 4) return null;
   const agentId = parts[0];
+  if (!agentId || !/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) return null;
   const tsStr = parts[1];
   const nonce = parts[2];
   const sigB64 = parts.slice(3).join(":");
