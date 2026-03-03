@@ -54,10 +54,10 @@ function getNodePath(): string {
   }
 }
 
-function buildPlist(flairDir: string, dev: boolean): string {
+function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): string {
   const nodePath = getNodePath();
   const harperBin = join(flairDir, "node_modules/harperdb/bin/harper.js");
-  const mode = dev ? "dev" : "run";
+  const mode = dev ? "dev" : "dev";  // Harper "run" requires pre-installed instance; dev works for all setups
 
   if (!existsSync(harperBin)) {
     throw new Error(
@@ -109,6 +109,8 @@ function buildPlist(flairDir: string, dev: boolean): string {
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
     <string>${homedir()}</string>
+    <key>HARPER_SET_CONFIG</key>
+    <string>{"rootPath":"${harperDataDir}","http":{"port":9926},"operationsApi":{"network":{"port":9925}}}</string>
   </dict>
 </dict>
 </plist>
@@ -158,7 +160,9 @@ export async function harperCommand(
     case "install": {
       const flairDir = getFlairDir(opts);
       mkdirSync(LOG_DIR, { recursive: true });
-      const plist = buildPlist(flairDir, opts.dev ?? false);
+      const harperDataDir = join(homedir(), ".harper/flair");
+      mkdirSync(harperDataDir, { recursive: true });
+      const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir);
       writeFileSync(PLIST_PATH, plist, "utf8");
       chmodSync(PLIST_PATH, 0o644);
       if (isLoaded()) {
@@ -171,7 +175,7 @@ export async function harperCommand(
       console.log(`   Plist: ${PLIST_PATH}`);
       console.log(`   Logs:  ${STDOUT_LOG}`);
       console.log(`   Flair: ${flairDir}`);
-      console.log(`   Mode:  ${opts.dev ? "dev" : "run"}`);
+      console.log(`   Mode:  dev`);
       break;
     }
     case "uninstall": {
@@ -194,9 +198,7 @@ export async function harperCommand(
         process.exit(1);
       }
       if (isLoaded()) {
-        execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, {
-          stdio: "pipe", shell: true,
-        });
+        execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, { shell: "/bin/sh", stdio: "pipe" } as any);
       } else {
         execSync(`launchctl load "${PLIST_PATH}"`);
       }
@@ -220,9 +222,7 @@ export async function harperCommand(
         process.exit(1);
       }
       if (isLoaded()) {
-        execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, {
-          stdio: "pipe", shell: true,
-        });
+        execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, { shell: "/bin/sh", stdio: "pipe" } as any);
       } else {
         execSync(`launchctl load "${PLIST_PATH}"`);
       }
