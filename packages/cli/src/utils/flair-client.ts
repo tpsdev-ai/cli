@@ -47,6 +47,25 @@ export interface SearchResult {
   type?: string;
 }
 
+
+export interface ReflectResult {
+  memories: Memory[];
+  prompt: string;
+  suggestedTags: string[];
+  count: number;
+}
+
+export interface ConsolidateCandidate {
+  memory: Memory;
+  suggestion: "promote" | "archive" | "keep";
+  reason: string;
+}
+
+export interface ConsolidateResult {
+  candidates: ConsolidateCandidate[];
+  prompt: string;
+}
+
 export interface FlairAgent {
   id: string;
   name: string;
@@ -356,6 +375,56 @@ export class FlairClient {
   async deleteSoulEntry(agentId: string, key: string): Promise<void> {
     const id = `${agentId}-${key}`;
     await this.request("DELETE", `/Soul/${id}`);
+  }
+
+
+
+  async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
+    const existing = await this.getAgent(agentId);
+    if (!existing) throw new Error(`Agent ${agentId} not found`);
+    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
+  }
+
+  async seedAgent(opts: {
+    agentId: string;
+    displayName?: string;
+    role?: "admin" | "agent";
+    soulTemplate?: Record<string, string>;
+    starterMemories?: Array<{ content: string; tags?: string[]; durability?: string }>;
+  }): Promise<{ agent: FlairAgent; soulEntries: any[]; memories: any[] }> {
+    return this.request("POST", "/AgentSeed/", opts);
+  }
+
+  async reflectMemory(opts: {
+    agentId?: string;
+    scope?: "recent" | "tagged" | "all";
+    since?: string;
+    maxMemories?: number;
+    focus?: "lessons_learned" | "patterns" | "decisions" | "errors";
+    tag?: string;
+  } = {}): Promise<ReflectResult> {
+    return this.request<ReflectResult>("POST", "/ReflectMemories/", {
+      agentId: opts.agentId ?? this.agentId,
+      scope: opts.scope ?? "recent",
+      since: opts.since,
+      maxMemories: opts.maxMemories ?? 50,
+      focus: opts.focus ?? "lessons_learned",
+      tag: opts.tag,
+    });
+  }
+
+  async consolidateMemory(opts: {
+    agentId?: string;
+    scope?: "persistent" | "standard" | "all";
+    olderThan?: string;
+    limit?: number;
+  } = {}): Promise<ConsolidateResult> {
+    return this.request<ConsolidateResult>("POST", "/ConsolidateMemories/", {
+      agentId: opts.agentId ?? this.agentId,
+      scope: opts.scope ?? "persistent",
+      olderThan: opts.olderThan ?? "30d",
+      limit: opts.limit ?? 20,
+    });
   }
 
   async ping(): Promise<boolean> {
