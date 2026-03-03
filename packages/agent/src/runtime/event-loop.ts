@@ -284,6 +284,14 @@ export class EventLoop {
         });
       }
 
+      // Post-response context trim: after recording the assistant turn, check
+      // whether accumulated history now exceeds 75% of the context window.
+      // If so, drop oldest messages (keeping at least 10) before appending
+      // tool results or looping.  This is a cheap O(n) guard; the heavier
+      // LLM-based compaction that resets the conversation runs later only
+      // when trimming alone is insufficient.
+      this.trimHistory(messages, systemPrompt, tools);
+
       // No tool calls = done
       if (!completion.toolCalls?.length) return;
 
