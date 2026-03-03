@@ -19,7 +19,7 @@
  *   });
  */
 
-import { spawnSync, type SpawnSyncOptions } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -114,7 +114,7 @@ export function buildNonoArgs(
  */
 export async function withNono(
   profile: NonoProfile,
-  options: NonoOptions,
+  _options: NonoOptions,
   fn: () => Promise<void>
 ): Promise<void> {
   const nono = findNono();

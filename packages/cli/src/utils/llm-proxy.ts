@@ -123,7 +123,7 @@ async function forwardRequest(
   if (provider === "anthropic") {
     headers["x-api-key"] = providerCfg.authHeader.replace("x-api-key: ", "");
     headers["anthropic-version"] = "2023-06-01";
-    delete headers["Authorization"];
+    delete headers.Authorization;
   }
 
   // Force uncompressed response — proxy passes raw bytes to agent, no decompression
@@ -168,7 +168,7 @@ export function createLLMProxy(port = DEFAULT_PORT): { start: () => Promise<void
     }
 
     // Auth
-    const auth = req.headers["authorization"] as string | undefined;
+    const auth = req.headers.authorization as string | undefined;
     if (!auth) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Missing Authorization header" }));

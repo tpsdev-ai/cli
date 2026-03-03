@@ -10,7 +10,6 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
-import { createLLMProxy, startProxyDaemon, proxyStatus } from "../utils/llm-proxy.js";
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
@@ -116,7 +115,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
         // Update the public key on the agent record that AgentSeed created
         await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
         console.log(`  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`);
-      } catch (e: any) {
+      } catch (_e: any) {
         // AgentSeed requires admin auth — fall back to direct registration
         await flair.registerAgent(name, pubKeyHex).catch(() => {});
         console.log(`  Agent '${id}' registered in Flair (no seed — not admin).`);
@@ -386,7 +385,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
 
         try {
           await runtime.start();
-        } catch (err) {
+        } catch (_err) {
           console.error("❌ Agent runtime crashed:", err);
           process.exit(1);
         }

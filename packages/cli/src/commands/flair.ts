@@ -69,7 +69,7 @@ function getNodePath(): string {
   }
 }
 
-function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): string {
+function buildPlist(flairDir: string, _dev: boolean, harperDataDir: string): string {
   const nodePath = getNodePath();
   // Support both new (harper package) and old (harperdb package) binary paths
   const harperBinNew = join(flairDir, "node_modules/harper/dist/bin/harper.js");
@@ -153,7 +153,7 @@ function getPid(): number | null {
       { encoding: "utf8" },
     );
     const match = out.match(/"PID"\s*=\s*(\d+)/);
-    return match ? parseInt(match[1]) : null;
+    return match ? parseInt(match[1], 10) : null;
   } catch {
     return null;
   }
@@ -203,7 +203,7 @@ export async function flairCommand(
         // Use Harper's Unix domain socket to avoid HTTP-over-loopback for admin ops.
         const harperSocket = join(harperDataDir, "operations-server");
         for (const oldPw of ["admin123", adminToken]) {
-          const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
+          const cred = `Basic ${Buffer.from(`admin:${oldPw}`).toString("base64")}`;
           const body = JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken });
           try {
             execSync(
@@ -215,9 +215,9 @@ export async function flairCommand(
             );
             console.log("   ✅ Admin password rotated (via Unix socket)");
             break;
-          } catch { continue; }
+          } catch { }
         }
-      } catch (err: any) {
+      } catch (_err: any) {
         console.warn(`   ⚠️  Could not rotate password yet. Run 'tps flair install' again once Flair is up.`);
       }
       break;

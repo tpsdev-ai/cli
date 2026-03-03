@@ -234,7 +234,6 @@ export async function runMail(args: MailArgs): Promise<void> {
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
       const { getRelayPid, runRelayDaemon } = await import("../utils/mail-relay.js");
-      const { spawnSync } = await import("node:child_process");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
       const mailDir = join(homedir(), ".tps", "mail");
@@ -293,6 +292,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
       console.error(`Usage: tps mail relay [start|stop|status]`);
       process.exit(1);
+      break;
     }
 
     case "search": {

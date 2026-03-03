@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-const { execFileSync } = require('child_process');
-const path = require('path');
+const { execFileSync } = require('node:child_process');
+const path = require('node:path');
 
 const platform = process.platform;
 const arch = process.arch;
@@ -25,7 +25,7 @@ function runBinary() {
     const binPath = path.join(path.dirname(pkgJson), 'tps');
     execFileSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
     return;
-  } catch (err) {
+  } catch (_err) {
     // Fall through to error message
   }
 
