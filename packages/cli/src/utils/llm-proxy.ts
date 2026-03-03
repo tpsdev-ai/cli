@@ -43,9 +43,16 @@ function verifyRequest(authHeader: string, method: string, path: string): string
   if (!existsSync(pubPath)) return null;
 
   try {
-    const pubMeta = JSON.parse(readFileSync(pubPath, "utf-8"));
-    const pubKeyHex: string = pubMeta.signing?.publicKey ?? pubMeta.publicKey;
-    const pubKeyBuf = Buffer.from(pubKeyHex, "hex");
+    const pubRaw = readFileSync(pubPath);
+    // Support both raw 32-byte binary and JSON with hex publicKey
+    let pubKeyBuf: Buffer;
+    if (pubRaw.length === 32) {
+      pubKeyBuf = pubRaw;
+    } else {
+      const pubMeta = JSON.parse(pubRaw.toString("utf-8"));
+      const pubKeyHex: string = pubMeta.signing?.publicKey ?? pubMeta.publicKey;
+      pubKeyBuf = Buffer.from(pubKeyHex, "hex");
+    }
 
     // Reconstruct signed payload (matches FlairClient format)
     const payload = `${agentId}:${tsStr}:${nonce}:${method}:${path}`;
@@ -73,9 +80,14 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 
 type Provider = "anthropic" | "openai";
 
+function readSecretFile(name: string): string | null {
+  const p = join(homedir(), ".tps", "secrets", name);
+  return existsSync(p) ? readFileSync(p, "utf-8").trim() : null;
+}
+
 function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: string } | null {
   if (provider === "anthropic") {
-    const key = process.env.ANTHROPIC_API_KEY;
+    const key = process.env.ANTHROPIC_API_KEY ?? readSecretFile("anthropic-api-key");
     if (!key) return null;
     return {
       baseUrl: "https://api.anthropic.com",
@@ -83,7 +95,7 @@ function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: s
     };
   }
   if (provider === "openai") {
-    const key = process.env.OPENAI_API_KEY;
+    const key = process.env.OPENAI_API_KEY ?? readSecretFile("openai-api-key");
     if (!key) return null;
     return {
       baseUrl: "https://api.openai.com",
@@ -114,6 +126,9 @@ async function forwardRequest(
     delete headers["Authorization"];
   }
 
+  // Force uncompressed response — proxy passes raw bytes to agent, no decompression
+  headers["accept-encoding"] = "identity";
+
   const res = await fetch(url, {
     method,
     headers,
@@ -123,7 +138,10 @@ async function forwardRequest(
   const responseBody = Buffer.from(await res.arrayBuffer());
   const responseHeaders: Record<string, string> = {};
   res.headers.forEach((value, key) => {
-    responseHeaders[key] = value;
+    // Strip content-encoding so downstream doesn't attempt decompression
+    if (key.toLowerCase() !== "content-encoding") {
+      responseHeaders[key] = value;
+    }
   });
 
   return { status: res.status, headers: responseHeaders, body: responseBody };

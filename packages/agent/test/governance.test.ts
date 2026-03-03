@@ -46,7 +46,7 @@ describe("ReviewGate", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-gate-test-"));
-    mail = new MailClient(tmpDir);
+    mail = new MailClient(tmpDir, undefined, "testagent");
   });
 
   afterEach(() => {
@@ -57,7 +57,7 @@ describe("ReviewGate", () => {
     const gate = new ReviewGate(mail, "host@tps");
     await gate.requestApproval("git_push", { branch: "main" });
     const { readdirSync } = await import("node:fs");
-    const outbox = join(tmpDir, "outbox", "new");
+    const outbox = join(tmpDir, "testagent", "outbox");
     expect(readdirSync(outbox).length).toBe(1);
   });
 });

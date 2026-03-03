@@ -12,7 +12,7 @@ describe("MailClient", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-mail-test-"));
-    client = new MailClient(tmpDir);
+    client = new MailClient(tmpDir, undefined, "testagent");
   });
 
   afterEach(() => {
@@ -21,9 +21,9 @@ describe("MailClient", () => {
 
   test("creates required maildir directories on construction", () => {
     const { existsSync } = require("node:fs");
-    expect(existsSync(join(tmpDir, "inbox", "new"))).toBe(true);
-    expect(existsSync(join(tmpDir, "inbox", "cur"))).toBe(true);
-    expect(existsSync(join(tmpDir, "outbox", "new"))).toBe(true);
+    expect(existsSync(join(tmpDir, "testagent", "new"))).toBe(true);
+    expect(existsSync(join(tmpDir, "testagent", "cur"))).toBe(true);
+    expect(existsSync(join(tmpDir, "testagent", "outbox"))).toBe(true);
   });
 
   test("checkNewMail returns empty when inbox is empty", async () => {
@@ -33,22 +33,22 @@ describe("MailClient", () => {
 
   test("checkNewMail returns and moves messages from new to cur", async () => {
     const { writeFileSync } = await import("node:fs");
-    writeFileSync(join(tmpDir, "inbox", "new", "test-1.json"), "hello world", "utf-8");
+    writeFileSync(join(tmpDir, "testagent", "new", "test-1.json"), "hello world", "utf-8");
 
     const msgs = await client.checkNewMail();
     expect(msgs.length).toBe(1);
     expect(msgs[0]!.body).toBe("hello world");
 
     const { existsSync } = await import("node:fs");
-    expect(existsSync(join(tmpDir, "inbox", "new", "test-1.json"))).toBe(false);
-    expect(existsSync(join(tmpDir, "inbox", "cur", "test-1.json"))).toBe(true);
+    expect(existsSync(join(tmpDir, "testagent", "new", "test-1.json"))).toBe(false);
+    expect(existsSync(join(tmpDir, "testagent", "cur", "test-1.json"))).toBe(true);
   });
 
   test("sendMail writes a file to outbox/new", async () => {
     await client.sendMail("host@tps", "hello from agent");
 
     const { readdirSync } = await import("node:fs");
-    const files = readdirSync(join(tmpDir, "outbox", "new"));
+    const files = readdirSync(join(tmpDir, "testagent", "outbox"));
     expect(files.length).toBe(1);
   });
 });

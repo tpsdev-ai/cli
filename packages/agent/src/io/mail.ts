@@ -28,9 +28,9 @@ export class MailClient {
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
   ) {
-    this.inboxNew = join(mailDir, "inbox", "new");
-    this.inboxCur = join(mailDir, "inbox", "cur");
-    this.outboxNew = join(mailDir, "outbox", "new");
+    this.inboxNew = join(mailDir, agentId, "new");
+    this.inboxCur = join(mailDir, agentId, "cur");
+    this.outboxNew = join(mailDir, agentId, "outbox");
     for (const dir of [this.inboxNew, this.inboxCur, this.outboxNew]) {
       mkdirSync(dir, { recursive: true });
     }

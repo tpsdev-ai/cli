@@ -12,6 +12,7 @@ export interface MailMessage {
   body: string;
   timestamp: string;
   read: boolean;
+  headers?: Record<string, string>;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -92,6 +93,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
     body,
     timestamp,
     read: false,
+    headers: { "X-TPS-Trust": "user", "X-TPS-Sender": sender },
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
