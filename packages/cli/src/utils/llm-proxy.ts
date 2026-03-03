@@ -27,13 +27,18 @@ const DEFAULT_PORT = 6459;
 const WINDOW_MS = 30_000; // 30-second replay window
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
-
 function verifyRequest(authHeader: string, method: string, path: string): string | null {
   // Parse TPS-Ed25519 <agentId>:<ts>:<nonce>:<sigBase64>
-  const m = authHeader.match(/^TPS-Ed25519\s+([^:]+):(\d+):([^:]+):(.+)$/);
-  if (!m) return null;
-
-  const [, agentId, tsStr, nonce, sigB64] = m;
+  // Uses split() instead of regex to avoid ReDoS (js/polynomial-redos)
+  if (!authHeader.startsWith("TPS-Ed25519 ")) return null;
+  const payload = authHeader.slice("TPS-Ed25519 ".length);
+  const parts = payload.split(":");
+  if (parts.length < 4) return null;
+  const agentId = parts[0];
+  if (!agentId || !/^[a-zA-Z0-9_-]{1,64}$/.test(agentId)) return null;
+  const tsStr = parts[1];
+  const nonce = parts[2];
+  const sigB64 = parts.slice(3).join(":");
   const ts = parseInt(tsStr, 10);
   const now = Date.now();
 
