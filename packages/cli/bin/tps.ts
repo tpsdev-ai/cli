@@ -224,7 +224,7 @@ async function main() {
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
-          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>]\n" +
+          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
           "  tps agent list [--json]\n" +
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
@@ -248,6 +248,9 @@ async function main() {
           name: getFlag("name"),
           model: getFlag("model"),
           flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
+          displayName: getFlag("display-name"),
+          soulFile: getFlag("soul-file"),
+          noSeed: process.argv.includes("--no-seed"),
         });
       } else if (action === "list") {
         await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });

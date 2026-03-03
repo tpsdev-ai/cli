@@ -310,6 +310,24 @@ export class FlairClient {
     });
   }
 
+  // ─── Onboarding seed (ops-31.3) ──────────────────────────────────────────────
+
+  async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
+    const existing = await this.getAgent(agentId);
+    if (!existing) throw new Error(`Agent ${agentId} not found`);
+    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
+  }
+
+  async seedAgent(opts: {
+    agentId: string;
+    displayName?: string;
+    role?: "admin" | "agent";
+    soulTemplate?: Record<string, string>;
+    starterMemories?: Array<{ content: string; tags?: string[]; durability?: string }>;
+  }): Promise<{ agent: FlairAgent; soulEntries: any[]; memories: any[] }> {
+    return this.request("POST", "/AgentSeed/", opts);
+  }
+
   async ping(): Promise<boolean> {
     try {
       const res = await fetch(`${this.baseUrl}/Health`);

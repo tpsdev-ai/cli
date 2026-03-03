@@ -23,6 +23,10 @@ export interface AgentArgs {
   config?: string;
   message?: string;
   /** For create/list/status */
+  displayName?: string;
+  soulFile?: string;
+  noSeed?: boolean;
+  starterMemories?: Array<{ content: string; tags?: string[]; durability?: string }>;
   id?: string;
   name?: string;
   model?: string;
@@ -31,6 +35,19 @@ export interface AgentArgs {
 }
 
 // ─── create ──────────────────────────────────────────────────────────────────
+
+async function loadSoulFile(filePath: string): Promise<Record<string, string>> {
+  const { readFileSync } = await import("node:fs");
+  const raw = readFileSync(filePath, "utf8");
+  // Support simple KEY: value YAML or JSON
+  if (filePath.endsWith(".json")) return JSON.parse(raw);
+  const result: Record<string, string> = {};
+  for (const line of raw.split("\n")) {
+    const m = line.match(/^([\w-]+):\s*(.+)$/);
+    if (m) result[m[1]] = m[2].trim();
+  }
+  return result;
+}
 
 async function createAgent(args: AgentArgs): Promise<void> {
   const id = args.id;
@@ -76,17 +93,37 @@ async function createAgent(args: AgentArgs): Promise<void> {
     const existing = await flair.getAgent(id);
     if (existing) {
       console.log(`  Agent '${id}' already registered in Flair.`);
+      // Still register real public key if record has placeholder
+      if (existing.publicKey === "pending") {
+        await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
+      }
+    } else if (!args.noSeed) {
+      // Seed agent with soul + starter memories
+      const soulTemplate = args.soulFile
+        ? await loadSoulFile(args.soulFile)
+        : undefined;
+      const starterMemories = args.starterMemories;
+      try {
+        const seeded = await flair.seedAgent({
+          agentId: id,
+          displayName: name,
+          role: "agent",
+          soulTemplate,
+          starterMemories,
+        });
+        // Update the public key on the agent record that AgentSeed created
+        await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
+        console.log(`  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`);
+      } catch (e: any) {
+        // AgentSeed requires admin auth — fall back to direct registration
+        await flair.registerAgent(name, pubKeyHex).catch(() => {});
+        console.log(`  Agent '${id}' registered in Flair (no seed — not admin).`);
+      }
     } else {
+      // --no-seed: just register
       await flair.registerAgent(name, pubKeyHex);
-      console.log(`  Agent '${id}' registered in Flair.`);
+      console.log(`  Agent '${id}' registered in Flair (seeding skipped).`);
     }
-
-    // Initialize soul
-    const soulKeys = { role: name, identity: `I am ${name}, a TPS agent.` };
-    for (const [k, v] of Object.entries(soulKeys)) {
-      await flair.setSoul(k, v).catch(() => {});
-    }
-    console.log(`  Soul initialized.`);
   }
 
   // 3. Write agent config
