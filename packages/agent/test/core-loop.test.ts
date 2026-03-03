@@ -183,3 +183,58 @@ describe("ops-32: tiktoken estimation", () => {
     expect(Number.isInteger(count)).toBe(true);
   });
 });
+
+describe("trimHistory", () => {
+  function makeMessages(count: number): LLMMessage[] {
+    return Array.from({ length: count }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: "x".repeat(500), // ~125 tokens each at 4 chars/token
+    })) as LLMMessage[];
+  }
+
+  test("does nothing when contextWindowTokens is not set", () => {
+    const { loop } = makeLoop([], { contextWindowTokens: undefined });
+    const msgs = makeMessages(20);
+    const before = msgs.length;
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs.length).toBe(before);
+  });
+
+  test("does nothing when under threshold", () => {
+    const { loop } = makeLoop([], { contextWindowTokens: 200_000 });
+    const msgs = makeMessages(4);
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs.length).toBe(4);
+  });
+
+  test("trims when over 75% threshold", () => {
+    // contextWindowTokens = 100, threshold = 75. Each message ~125 tokens.
+    const { loop } = makeLoop([], { contextWindowTokens: 100 });
+    const msgs = makeMessages(20);
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs.length).toBeGreaterThanOrEqual(10);
+    expect(msgs.length).toBeLessThan(20);
+  });
+
+  test("never drops below MIN_MESSAGES floor (10)", () => {
+    const { loop } = makeLoop([], { contextWindowTokens: 1 }); // tiny budget
+    const msgs = makeMessages(20);
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs.length).toBeGreaterThanOrEqual(10);
+  });
+
+  test("after trimming, oldest message is always a user turn", () => {
+    const { loop } = makeLoop([], { contextWindowTokens: 100 });
+    const msgs = makeMessages(20);
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs[0]?.role).toBe("user");
+  });
+
+  test("does not trim when exactly at MIN_MESSAGES", () => {
+    const { loop } = makeLoop([], { contextWindowTokens: 1 });
+    const msgs = makeMessages(10);
+    const before = msgs.length;
+    (loop as any).trimHistory(msgs, "", []);
+    expect(msgs.length).toBe(before);
+  });
+});
