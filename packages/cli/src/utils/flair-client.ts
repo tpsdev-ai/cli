@@ -91,15 +91,27 @@ export class FlairClient {
           `Run 'tps agent create --id ${this.agentId}' first.`,
       );
     }
-    // Support both PEM and raw base64 (PKCS8) formats
+    // Support PEM, base64 PKCS8, or raw 32-byte seed (TPS native format)
     if (raw.startsWith("-----")) {
       this._privateKey = createPrivateKey(raw);
+    } else if (raw.length === 64 && /^[0-9a-f]+$/i.test(raw)) {
+      // Raw 32-byte seed as hex — TPS identity format
+      // Build PKCS8 wrapper: 16-byte header + 2-byte inner octet string tag/len + 32-byte seed
+      const seed = Buffer.from(raw, "hex");
+      const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+      const pkcs8Der = Buffer.concat([pkcs8Header, seed]);
+      this._privateKey = createPrivateKey({ key: pkcs8Der, format: "der", type: "pkcs8" });
     } else {
-      this._privateKey = createPrivateKey({
-        key: Buffer.from(raw, "base64"),
-        format: "der",
-        type: "pkcs8",
-      });
+      // Try reading the raw binary file (TPS saves keys as raw bytes, not text)
+      const rawBuf = readFileSync(this.keyPath);
+      if (rawBuf.length === 32) {
+        // Raw 32-byte seed
+        const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+        const pkcs8Der = Buffer.concat([pkcs8Header, rawBuf]);
+        this._privateKey = createPrivateKey({ key: pkcs8Der, format: "der", type: "pkcs8" });
+      } else {
+        this._privateKey = createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+      }
     }
     return this._privateKey;
   }
