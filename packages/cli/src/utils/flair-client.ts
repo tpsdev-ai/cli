@@ -91,9 +91,18 @@ export class FlairClient {
           `Run 'tps agent create --id ${this.agentId}' first.`,
       );
     }
-    // Support both PEM and raw base64 (PKCS8) formats
+    // Support PEM, raw 32-byte binary seed, and base64 DER/PKCS8
+    const rawBuf = readFileSync(this.keyPath);
     if (raw.startsWith("-----")) {
       this._privateKey = createPrivateKey(raw);
+    } else if (rawBuf.length === 32) {
+      // Raw Ed25519 seed — wrap in PKCS8 envelope
+      const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+      this._privateKey = createPrivateKey({
+        key: Buffer.concat([pkcs8Header, rawBuf]),
+        format: "der",
+        type: "pkcs8",
+      });
     } else {
       this._privateKey = createPrivateKey({
         key: Buffer.from(raw, "base64"),
