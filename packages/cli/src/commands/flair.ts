@@ -69,7 +69,7 @@ function getNodePath(): string {
   }
 }
 
-function buildPlist(flairDir: string, dev: boolean, harperDataDir: string, adminToken: string): string {
+function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): string {
   const nodePath = getNodePath();
   const harperBin = join(flairDir, "node_modules/harperdb/bin/harper.js");
   const mode = "dev";  // Harper "run" requires pre-installed instance; dev works for all setups
@@ -125,10 +125,7 @@ function buildPlist(flairDir: string, dev: boolean, harperDataDir: string, admin
     <key>HOME</key>
     <string>${homedir()}</string>
     <key>HARPER_SET_CONFIG</key>
-    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"]}},"authentication":{"operationsAdminPassword":"${adminToken}"},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
-
-  <key>FLAIR_ADMIN_TOKEN</key>
-  <string>${adminToken}</string>
+    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"]}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
   </dict>
 </dict>
 </plist>
@@ -181,7 +178,7 @@ export async function flairCommand(
       const harperDataDir = join(homedir(), ".harper/flair");
       mkdirSync(harperDataDir, { recursive: true });
       const adminToken = ensureAdminToken();
-      const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir, adminToken);
+      const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir);
       writeFileSync(PLIST_PATH, plist, "utf8");
       chmodSync(PLIST_PATH, 0o644);
       if (isLoaded()) {
