@@ -125,7 +125,7 @@ function buildPlist(flairDir: string, dev: boolean, harperDataDir: string, admin
     <key>HOME</key>
     <string>${homedir()}</string>
     <key>HARPER_SET_CONFIG</key>
-    <string>{"rootPath":"${harperDataDir}","http":{"port":9926},"operationsApi":{"network":{"port":9925}},"authentication":{"operationsAdminPassword":"${adminToken}"}}</string>
+    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"]}},"authentication":{"operationsAdminPassword":"${adminToken}"},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
 
   <key>FLAIR_ADMIN_TOKEN</key>
   <string>${adminToken}</string>
@@ -200,14 +200,23 @@ export async function flairCommand(
       // Poll until Harper is up (up to 30s), then rotate.
       await new Promise<void>((resolve) => setTimeout(resolve, 12000));
       try {
+        // Use Harper's Unix domain socket to avoid HTTP-over-loopback for admin ops.
+        const DOMAIN_SOCKET = join(homedir(), "../../../tmp/harper-flair/operations-server").replace(/[^/]+\/\.\.\//g, "");
+        const harperSocket = "/tmp/harper-flair/operations-server";
         for (const oldPw of ["admin123", adminToken]) {
           const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
-          const res = await fetch(HARPER_OPS_URL, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", Authorization: cred },
-            body: JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken }),
-          });
-          if (res.ok) { console.log("   ✅ Admin password rotated"); break; }
+          const body = JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken });
+          try {
+            execSync(
+              `curl -sf --unix-socket "${harperSocket}" http://localhost` +
+              ` -X POST -H 'Content-Type: application/json'` +
+              ` -H 'Authorization: ${cred}'` +
+              ` -d '${body}'`,
+              { stdio: "pipe" }
+            );
+            console.log("   ✅ Admin password rotated (via Unix socket)");
+            break;
+          } catch { continue; }
         }
       } catch (err: any) {
         console.warn(`   ⚠️  Could not rotate password yet. Run 'tps flair install' again once Flair is up.`);
