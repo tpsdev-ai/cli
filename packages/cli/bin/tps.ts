@@ -26,6 +26,7 @@ const cli = meow(
     branch <action>   Branch office node (init/start/stop/status/log)
     stats            Aggregate structured JSONL telemetry events
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
+    harper install|start|stop|restart|status|logs  Harper (Flair) launchd service
 
   Options
     --help            Show this help text
@@ -617,6 +618,29 @@ async function main() {
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
         json: cli.flags.json,
+      });
+      break;
+    }
+
+    case "harper": {
+      const action = rest[0];
+      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs"].includes(action)) {
+        console.error(
+          "Usage:\n" +
+          "  tps harper install [--flair-dir ~/ops/flair] [--dev]\n" +
+          "  tps harper uninstall\n" +
+          "  tps harper start|stop|restart\n" +
+          "  tps harper status\n" +
+          "  tps harper logs"
+        );
+        process.exit(1);
+      }
+      const { harperCommand } = await import("../src/commands/harper.js");
+      await harperCommand(action, {
+        flairDir: process.argv.includes("--flair-dir")
+          ? process.argv[process.argv.indexOf("--flair-dir") + 1]
+          : undefined,
+        dev: process.argv.includes("--dev"),
       });
       break;
     }
