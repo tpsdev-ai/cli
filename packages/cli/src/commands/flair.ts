@@ -16,15 +16,15 @@ import {
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
-const PLIST_LABEL = "ai.tpsdev.harper";
+const PLIST_LABEL = "ai.tpsdev.flair";
 const PLIST_PATH = join(
   homedir(),
   "Library/LaunchAgents",
   `${PLIST_LABEL}.plist`,
 );
 const LOG_DIR = join(homedir(), ".tps/logs");
-const STDOUT_LOG = join(LOG_DIR, "harper.log");
-const STDERR_LOG = join(LOG_DIR, "harper.error.log");
+const STDOUT_LOG = join(LOG_DIR, "flair.log");
+const STDERR_LOG = join(LOG_DIR, "flair.error.log");
 
 interface HarperOpts {
   flairDir?: string;
@@ -152,7 +152,7 @@ function isHarperResponding(): boolean {
   }
 }
 
-export async function harperCommand(
+export async function flairCommand(
   action: string,
   opts: HarperOpts,
 ): Promise<void> {
@@ -171,7 +171,7 @@ export async function harperCommand(
         });
       }
       execSync(`launchctl load "${PLIST_PATH}"`);
-      console.log(`✅ Harper launchd agent installed and started`);
+      console.log(`✅ Flair launchd agent installed and started`);
       console.log(`   Plist: ${PLIST_PATH}`);
       console.log(`   Logs:  ${STDOUT_LOG}`);
       console.log(`   Flair: ${flairDir}`);
@@ -194,7 +194,7 @@ export async function harperCommand(
     }
     case "start": {
       if (!existsSync(PLIST_PATH)) {
-        console.error(`❌ Not installed. Run: tps harper install --flair-dir <path>`);
+        console.error(`❌ Not installed. Run: tps flair install --flair-dir <path>`);
         process.exit(1);
       }
       if (isLoaded()) {
@@ -218,7 +218,7 @@ export async function harperCommand(
     }
     case "restart": {
       if (!existsSync(PLIST_PATH)) {
-        console.error(`❌ Not installed. Run: tps harper install`);
+        console.error(`❌ Not installed. Run: tps flair install`);
         process.exit(1);
       }
       if (isLoaded()) {
@@ -234,14 +234,14 @@ export async function harperCommand(
       const pid = getPid();
       const responding = loaded ? isHarperResponding() : false;
       if (!existsSync(PLIST_PATH)) {
-        console.log(`Harper launchd agent: NOT INSTALLED`);
-        console.log(`  Run: tps harper install --flair-dir ~/ops/flair`);
+        console.log(`Flair launchd agent: NOT INSTALLED`);
+        console.log(`  Run: tps flair install --flair-dir ~/ops/flair`);
       } else if (!loaded) {
-        console.log(`Harper launchd agent: INSTALLED but NOT RUNNING`);
-        console.log(`  Run: tps harper start`);
+        console.log(`Flair launchd agent: INSTALLED but NOT RUNNING`);
+        console.log(`  Run: tps flair start`);
       } else {
         console.log(
-          `Harper launchd agent: ${responding ? "✅ RUNNING" : "⚠️  LOADED (not responding)"}`,
+          `Flair launchd agent: ${responding ? "✅ RUNNING" : "⚠️  LOADED (not responding)"}`,
         );
         if (pid) console.log(`  PID: ${pid}`);
         console.log(`  API:   http://127.0.0.1:9925`);

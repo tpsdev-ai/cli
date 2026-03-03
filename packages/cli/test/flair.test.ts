@@ -33,7 +33,7 @@ describe("harper plist generation", () => {
     const nodePath = "/usr/local/bin/node";
     const flairDir = FAKE_FLAIR_DIR;
     const mode = "run";
-    const stdoutLog = join(homedir(), ".tps/logs/harper.log");
+    const stdoutLog = join(homedir(), ".tps/logs/flair.log");
     const stderrLog = join(homedir(), ".tps/logs/harper.error.log");
 
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -42,7 +42,7 @@ describe("harper plist generation", () => {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>ai.tpsdev.harper</string>
+  <string>ai.tpsdev.flair</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -84,12 +84,12 @@ describe("harper plist generation", () => {
 </plist>
 `;
 
-    expect(plist).toContain("ai.tpsdev.harper");
+    expect(plist).toContain("ai.tpsdev.flair");
     expect(plist).toContain(FAKE_HARPER_BIN);
     expect(plist).toContain("<string>run</string>");
     expect(plist).toContain("<true/>"); // RunAtLoad
     expect(plist).toContain("Crashed"); // KeepAlive on crash
-    expect(plist).toContain("harper.log");
+    expect(plist).toContain("flair.log");
     expect(plist).toContain("ThrottleInterval");
   });
 
@@ -128,14 +128,14 @@ describe("harper plist generation", () => {
 
 describe("harper status helpers (no launchctl)", () => {
   test("plist label is deterministic", () => {
-    expect("ai.tpsdev.harper").toMatch(/^ai\.tpsdev\.harper$/);
+    expect("ai.tpsdev.flair").toMatch(/^ai\.tpsdev\.flair$/);
   });
 
   test("plist path is under ~/Library/LaunchAgents", () => {
     const plistPath = join(
       homedir(),
       "Library/LaunchAgents",
-      "ai.tpsdev.harper.plist",
+      "ai.tpsdev.flair.plist",
     );
     expect(plistPath).toContain("LaunchAgents");
     expect(plistPath).toEndWith(".plist");
