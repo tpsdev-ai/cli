@@ -500,19 +500,25 @@ export class EventLoop {
   }
 
   /**
-   * S43-C: Validate raw assistant message structure.
-   * Only allow known block types (text, tool_use for Anthropic; standard OpenAI format).
+   * Estimate the token cost of a single LLMMessage.
+   * Accepts an optional pre-created tiktoken encoder to avoid repeated
+   * getEncoding() calls in tight loops.
    */
+  private estimateMessageTokens(m: LLMMessage, enc?: ReturnType<typeof getEncoding>): number {
+    const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+    if (enc) {
+      return enc.encode(text).length;
+    }
+    // Char-based fallback (4 chars ≈ 1 token)
+    return Math.ceil(text.length / 4);
+  }
+
   private estimateTokens(messages: LLMMessage[], system: string, tools: ToolSpec[]): number {
     try {
       const enc = getEncoding("cl100k_base");
       let tokens = enc.encode(system).length;
       for (const t of tools) tokens += enc.encode(JSON.stringify(t)).length;
-      for (const m of messages) {
-        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        tokens += enc.encode(text).length;
-      }
-
+      for (const m of messages) tokens += this.estimateMessageTokens(m, enc);
       return tokens;
     } catch {
       // Fallback to char estimate if tiktoken unavailable
@@ -552,23 +558,35 @@ export class EventLoop {
     const threshold = Math.floor(contextWindowTokens * 0.75);
     const MIN_MESSAGES = 10;
 
-    while (
-      messages.length > MIN_MESSAGES &&
-      this.estimateTokens(messages, systemPrompt, tools) > threshold
-    ) {
-      // Find the end of the oldest turn: the first user message plus all
-      // immediately following non-user messages (assistant + tool_result).
-      // This preserves tool_use/tool_result pairing required by the API.
+    // O(n) approach: compute the total once, then subtract the token cost of
+    // each dropped turn as we go — no full re-scan on every loop iteration.
+    let totalTokens = this.estimateTokens(messages, systemPrompt, tools);
+    if (totalTokens <= threshold) return; // Fast-path: nothing to do
+
+    // Obtain a single encoder instance to reuse across per-message estimates.
+    // Falls back to undefined (char-based estimate) if tiktoken is unavailable.
+    let enc: ReturnType<typeof getEncoding> | undefined;
+    try { enc = getEncoding("cl100k_base"); } catch { enc = undefined; }
+
+    while (messages.length > MIN_MESSAGES && totalTokens > threshold) {
+      // Find the end of the oldest complete turn: the first user message plus
+      // all immediately following non-user messages (assistant + tool_result).
+      // Dropping whole turns preserves tool_use/tool_result pairing required
+      // by the Anthropic API and prevents 400 Bad Request errors.
       let turnEnd = 1; // at minimum drop the first message
-      while (
-        turnEnd < messages.length &&
-        messages[turnEnd]?.role !== "user"
-      ) {
+      while (turnEnd < messages.length && messages[turnEnd]?.role !== "user") {
         turnEnd++;
       }
 
       // Safety: don't drop so many that we fall below MIN_MESSAGES floor
       if (messages.length - turnEnd < MIN_MESSAGES) break;
+
+      // Subtract the token cost of the messages we are about to drop so that
+      // the next iteration re-checks the updated total without re-scanning the
+      // remaining array (this is the key O(n²) → O(n) improvement).
+      for (let i = 0; i < turnEnd; i++) {
+        totalTokens -= this.estimateMessageTokens(messages[i], enc);
+      }
 
       messages.splice(0, turnEnd);
     }
