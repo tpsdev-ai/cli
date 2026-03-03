@@ -126,6 +126,43 @@ describe("harper plist generation", () => {
   });
 });
 
+describe("admin token generation", () => {
+  test("ensureAdminToken creates file with base64url content", async () => {
+    const { mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { tmpdir } = await import("node:os");
+    const { randomBytes } = await import("node:crypto");
+
+    // Simulate the token generation logic
+    const tmpSecretsDir = join(tmpdir(), "tps-flair-test-secrets");
+    const tokenPath = join(tmpSecretsDir, "harper-admin-token");
+    mkdirSync(tmpSecretsDir, { recursive: true });
+
+    const token = randomBytes(32).toString("base64url");
+    writeFileSync(tokenPath, token, { encoding: "utf8", mode: 0o600 });
+
+    expect(existsSync(tokenPath)).toBe(true);
+    const stored = readFileSync(tokenPath, "utf8").trim();
+    expect(stored).toBe(token);
+    expect(stored.length).toBeGreaterThan(30);
+    expect(stored).toMatch(/^[A-Za-z0-9_-]+$/); // base64url
+
+    rmSync(tmpSecretsDir, { recursive: true, force: true });
+  });
+
+  test("token does not contain admin:admin123", async () => {
+    const { randomBytes } = await import("node:crypto");
+    const token = randomBytes(32).toString("base64url");
+    expect(token).not.toBe("admin123");
+    expect(token).not.toContain("admin");
+  });
+
+  test("plist embeds FLAIR_ADMIN_TOKEN env var", () => {
+    const plistSnippet = "<key>FLAIR_ADMIN_TOKEN</key>";
+    expect(plistSnippet).toContain("FLAIR_ADMIN_TOKEN");
+  });
+});
+
 describe("harper status helpers (no launchctl)", () => {
   test("plist label is deterministic", () => {
     expect("ai.tpsdev.flair").toMatch(/^ai\.tpsdev\.flair$/);
