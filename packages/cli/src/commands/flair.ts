@@ -198,8 +198,9 @@ export async function flairCommand(
       await new Promise<void>((resolve) => setTimeout(resolve, 12000));
       try {
         // Use Harper's Unix domain socket to avoid HTTP-over-loopback for admin ops.
-        const DOMAIN_SOCKET = join(homedir(), "../../../tmp/harper-flair/operations-server").replace(/[^/]+\/\.\.\//g, "");
-        const harperSocket = "/tmp/harper-flair/operations-server";
+        // Harper places its runtime files in /tmp/harper-<appname>/; socket is there, not in rootPath.
+        const { basename } = await import("node:path");
+        const harperSocket = join("/tmp", `harper-${basename(flairDir)}`, "operations-server");
         for (const oldPw of ["admin123", adminToken]) {
           const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
           const body = JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken });
