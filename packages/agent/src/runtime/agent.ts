@@ -37,11 +37,17 @@ export class AgentRuntime {
       execAllowlist: config.execAllowlist,
     });
 
-    this.loop = new EventLoop({ config, memory, context, provider, tools, events });
+    const flairContext = this.flair
+      ? (query: string) => this.flair!.buildContextBlock(query)
+      : undefined;
+    this.loop = new EventLoop({ config, memory, context, provider, tools, events, flairContext });
   }
 
   async start(): Promise<void> {
     const checkInbox = async () => this.mail.checkNewMail();
+    const deliverOutbox = () => this.mail.deliverOutbox();
+
+
     const pidPath = join(this.config.workspace, ".tps-agent.pid");
     mkdirSync(dirname(pidPath), { recursive: true });
     writeFileSync(pidPath, `${process.pid}\n`, "utf-8");

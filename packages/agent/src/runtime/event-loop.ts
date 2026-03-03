@@ -44,6 +44,8 @@ interface EventLoopDeps {
   tools: ToolRegistry;
   reviewGate?: ReviewGate;
   events?: EventLogger;
+  /** Optional Flair context injector — returns extra context for system prompt */
+  flairContext?: (query: string) => Promise<string>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -207,7 +209,7 @@ export class EventLoop {
   private async processMessage(promptRaw: string, trust: TrustLevel): Promise<void> {
     const prompt = String(promptRaw).trim();
     const tools = this.buildToolSpecs(trust);
-    const systemPrompt = await this.buildSystemPrompt(trust);
+    const systemPrompt = await this.buildSystemPrompt(trust, prompt.slice(0, 200));
     const maxTurns = Math.min(
       this.deps.config.maxToolTurns ?? 12,
       PANIC_MAX_TURNS,
@@ -455,15 +457,16 @@ export class EventLoop {
 
   // --- System prompt ---
 
-  private async buildSystemPrompt(trust: TrustLevel = "user"): Promise<string> {
-    const docs = await Promise.all([
+  private async buildSystemPrompt(trust: TrustLevel = "user", query?: string): Promise<string> {
+    const [flair, ...docs] = await Promise.all([
+      this.deps.flairContext ? this.deps.flairContext(query ?? "").catch(() => "") : Promise.resolve(""),
       this.fileOrEmpty(`${this.deps.config.workspace}/SOUL.md`),
       this.fileOrEmpty(`${this.deps.config.workspace}/AGENTS.md`),
       this.fileOrEmpty(`${this.deps.config.workspace}/IDENTITY.md`),
       Promise.resolve(this.deps.config.systemPrompt || ""),
     ]);
 
-    const docBlock = docs.filter(Boolean).join("\n\n");
+    const docBlock = [...docs, flair ? `\n## Flair Context\n${flair}` : ""].filter(Boolean).join("\n\n");
     const parts = [
       docBlock,
       `Role: ${this.deps.config.name}`,

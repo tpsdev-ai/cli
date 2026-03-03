@@ -119,7 +119,9 @@ async function checkNono() {
   if (cli.flags.nonono) return;
   if (command === "office" && rest[0] === "relay") return; // relay runs in background
   const { findNono } = await import("../src/utils/nono.js");
-  if (!findNono()) {
+  // Suppress warning if already running inside nono sandbox
+  const alreadySandboxed = process.env.NONO_ACTIVE === "1" || process.env.SANDBOX_ACTIVE === "1";
+  if (!findNono() && !alreadySandboxed) {
     console.warn(
       "⚠️  nono not found. Host agents will run without process isolation.\n" +
       "   Install nono for syscall filtering + filesystem boundaries.\n" +
@@ -265,7 +267,7 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          await runAgent({ action: "start", config: configPath, id: agentId });
+          await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox") });
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });
         }
@@ -348,10 +350,10 @@ async function main() {
       break;
     }
     case "mail": {
-      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | undefined;
-      if (cli.flags.help || !action || !["send", "check", "list", "log", "read", "watch", "search"].includes(action)) {
+      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | undefined;
+      if (cli.flags.help || !action || !["send", "check", "list", "log", "read", "watch", "search", "relay"].includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
@@ -359,7 +361,7 @@ async function main() {
       await runMail({
         action,
         agent: rest[1],
-        message: action === "send" ? rest.slice(2).join(" ") : undefined,
+        message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : undefined),
         messageId: action === "read" ? rest[2] : undefined,
         json: cli.flags.json,
         since: cli.flags.since,

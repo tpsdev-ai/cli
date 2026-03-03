@@ -10,13 +10,13 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
-import { createLLMProxy, startProxyDaemon, proxyStatus } from "../utils/llm-proxy.js";
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status";
@@ -32,6 +32,7 @@ export interface AgentArgs {
   model?: string;
   flairUrl?: string;
   json?: boolean;
+  sandbox?: boolean;
 }
 
 // ─── create ──────────────────────────────────────────────────────────────────
@@ -114,7 +115,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
         // Update the public key on the agent record that AgentSeed created
         await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
         console.log(`  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`);
-      } catch (e: any) {
+      } catch (_e: any) {
         // AgentSeed requires admin auth — fall back to direct registration
         await flair.registerAgent(name, pubKeyHex).catch(() => {});
         console.log(`  Agent '${id}' registered in Flair (no seed — not admin).`);
@@ -352,7 +353,42 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       if (args.action === "start") {
-        await runtime.start();
+        const sandbox = (args as any).sandbox ?? false;
+        const nonoAvailable = findNono();
+
+        if (sandbox || isNonoStrict()) {
+          if (!nonoAvailable) {
+            if (isNonoStrict()) {
+              console.error("❌ --sandbox requires nono (TPS_NONO_STRICT=1). Install from https://nono.sh");
+              process.exit(1);
+            }
+            console.warn("⚠️  nono not found — starting WITHOUT sandbox isolation. Pass --sandbox after installing nono.");
+          } else {
+            // Re-exec this process under nono with tps-agent-run profile
+            const identityDir = join(homedir(), ".tps", "identity");
+            const mailDir = join(homedir(), ".tps", "mail");
+            const agentDir = join(homedir(), ".tps", "agents", config.agentId);
+            const exitCode = runCommandUnderNono(
+              "tps-agent-run",
+              {
+                workdir: config.workspace,
+                read: [identityDir, agentDir],
+                allow: [mailDir],
+              },
+              [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId],
+            );
+            process.exit(exitCode);
+          }
+        } else if (nonoAvailable) {
+          console.log(`ℹ️  nono available — pass --sandbox to run with isolation`);
+        }
+
+        try {
+          await runtime.start();
+        } catch (_err) {
+          console.error("❌ Agent runtime crashed:", _err);
+          process.exit(1);
+        }
         return;
       }
 

@@ -28,9 +28,9 @@ export class MailClient {
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
   ) {
-    this.inboxNew = join(mailDir, "inbox", "new");
-    this.inboxCur = join(mailDir, "inbox", "cur");
-    this.outboxNew = join(mailDir, "outbox", "new");
+    this.inboxNew = join(mailDir, agentId, "new");
+    this.inboxCur = join(mailDir, agentId, "cur");
+    this.outboxNew = join(mailDir, agentId, "outbox");
     for (const dir of [this.inboxNew, this.inboxCur, this.outboxNew]) {
       mkdirSync(dir, { recursive: true });
     }
@@ -108,6 +108,28 @@ export class MailClient {
         error: sanitizeError(err),
       });
       throw err;
+    }
+  }
+
+  /** Deliver all messages in outbox to recipient inboxes (local relay). */
+  deliverOutbox(): void {
+    if (!existsSync(this.outboxNew)) return;
+    const files = readdirSync(this.outboxNew).filter(f => !f.startsWith("."));
+    for (const file of files) {
+      const srcPath = join(this.outboxNew, file);
+      try {
+        const raw = readFileSync(srcPath, "utf-8");
+        const msg = JSON.parse(raw) as { to: string; body: string; sentAt: string };
+        if (!msg.to || !/^[a-zA-Z0-9_-]{1,64}$/.test(msg.to)) {
+          continue; // skip invalid recipients
+        }
+        const recipientInbox = join(this.mailDir, msg.to, "new");
+        mkdirSync(recipientInbox, { recursive: true });
+        const destFile = `${msg.sentAt.replace(/[:.]/g, "-")}-${file}`;
+        renameSync(srcPath, join(recipientInbox, destFile));
+      } catch {
+        // Leave in outbox on error
+      }
     }
   }
 }

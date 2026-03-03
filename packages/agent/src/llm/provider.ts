@@ -366,16 +366,27 @@ export class ProviderManager {
     let providerPath: string;
 
     switch (provider) {
-      case "anthropic":
+      case "anthropic": {
         providerPath = "/proxy/anthropic/v1/messages";
+        const anthropicMessages = request.messages.map((m) => {
+          if (m._raw) return m._raw;
+          if (m.role === "tool") {
+            return {
+              role: "user",
+              content: [{
+                type: "tool_result",
+                tool_use_id: m.tool_call_id,
+                content: m.content ?? "",
+              }],
+            };
+          }
+          return { role: m.role, content: m.content ?? "" };
+        });
         body = {
           model,
           max_tokens: request.maxTokens ?? 4096,
           system: request.systemPrompt,
-          messages: request.messages.map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
+          messages: anthropicMessages,
         };
         if (request.tools?.length) {
           body.tools = request.tools.map((t) => ({
@@ -383,8 +394,10 @@ export class ProviderManager {
             description: t.description,
             input_schema: t.input_schema,
           }));
+          body.tool_choice = { type: "auto" };
         }
         break;
+      }
       case "openai":
         providerPath = "/proxy/openai/v1/chat/completions";
         body = {
@@ -414,12 +427,19 @@ export class ProviderManager {
     const keyPath = join(homedir(), ".tps", "identity", `${this.agentId}.key`);
     let authHeader = "";
     try {
-      const raw = readFileSync(keyPath, "utf-8").trim();
+      const rawBuf = readFileSync(keyPath);
       let key;
-      if (raw.startsWith("-----")) {
-        key = crypto.createPrivateKey(raw);
+      const rawStr = rawBuf.toString("utf-8").trim();
+      if (rawStr.startsWith("-----")) {
+        // PEM format
+        key = crypto.createPrivateKey(rawStr);
+      } else if (rawBuf.length === 32) {
+        // Raw 32-byte Ed25519 seed — wrap in PKCS8 envelope
+        const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+        key = crypto.createPrivateKey({ key: Buffer.concat([pkcs8Header, rawBuf]), format: "der", type: "pkcs8" });
       } else {
-        key = crypto.createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
+        // Assume base64-encoded DER/PKCS8
+        key = crypto.createPrivateKey({ key: Buffer.from(rawStr, "base64"), format: "der", type: "pkcs8" });
       }
       const sig = crypto.sign(null, Buffer.from(signPayload), key);
       authHeader = `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
@@ -457,6 +477,8 @@ export class ProviderManager {
         outputTokens: (data as any).usage?.output_tokens ?? 0,
         cacheReadTokens: (data as any).usage?.cache_read_input_tokens,
         cacheWriteTokens: (data as any).usage?.cache_creation_input_tokens,
+        // Preserve raw for history — tool_use blocks must survive into next turn
+        rawAssistantMessage: { role: "assistant", content },
       };
     }
 

@@ -82,6 +82,7 @@ export function loadAgentConfig(path: string): AgentConfig {
       auth: parsed.llm?.auth || parsed.auth || "api-key",
       apiKey: parsed.llm?.apiKey || parsed.apiKey,
       baseUrl: parsed.llm?.baseUrl || parsed.baseUrl,
+      proxyUrl: parsed.llm?.proxyUrl || parsed.llm?.baseUrl || parsed.baseUrl,
     },
   };
 
