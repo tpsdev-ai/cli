@@ -125,7 +125,7 @@ function buildPlist(flairDir: string, dev: boolean, harperDataDir: string): stri
     <key>HOME</key>
     <string>${homedir()}</string>
     <key>HARPER_SET_CONFIG</key>
-    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"]}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
+    <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"],"domainSocket":"${harperDataDir}/operations-server"}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
   </dict>
 </dict>
 </plist>
@@ -198,9 +198,7 @@ export async function flairCommand(
       await new Promise<void>((resolve) => setTimeout(resolve, 12000));
       try {
         // Use Harper's Unix domain socket to avoid HTTP-over-loopback for admin ops.
-        // Harper places its runtime files in /tmp/harper-<appname>/; socket is there, not in rootPath.
-        const { basename } = await import("node:path");
-        const harperSocket = join("/tmp", `harper-${basename(flairDir)}`, "operations-server");
+        const harperSocket = join(harperDataDir, "operations-server");
         for (const oldPw of ["admin123", adminToken]) {
           const cred = "Basic " + Buffer.from(`admin:${oldPw}`).toString("base64");
           const body = JSON.stringify({ operation: "alter_user", role: "super_user", username: "admin", password: adminToken });
