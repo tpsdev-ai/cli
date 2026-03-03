@@ -45,7 +45,7 @@ describe("ops-31.2: tps memory reflect", () => {
   test("calls MemoryReflect and prints prompt + memories", async () => {
     let capturedBody: any;
     globalThis.fetch = (async (url: string, opts?: RequestInit) => {
-      if (String(url).includes("/MemoryReflect")) {
+      if (String(url).includes("/ReflectMemories")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify(REFLECT_RESPONSE), { status: 200 });
       }
@@ -71,7 +71,7 @@ describe("ops-31.2: tps memory reflect", () => {
   test("--focus flag is forwarded", async () => {
     let capturedBody: any;
     globalThis.fetch = (async (url: string, opts?: RequestInit) => {
-      if (String(url).includes("/MemoryReflect")) {
+      if (String(url).includes("/ReflectMemories")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify({ ...REFLECT_RESPONSE, count: 0, memories: [] }), { status: 200 });
       }
@@ -86,7 +86,7 @@ describe("ops-31.2: tps memory reflect", () => {
 
   test("--json outputs valid JSON", async () => {
     globalThis.fetch = (async (url: string) => {
-      if (String(url).includes("/MemoryReflect")) return new Response(JSON.stringify(REFLECT_RESPONSE), { status: 200 });
+      if (String(url).includes("/ReflectMemories")) return new Response(JSON.stringify(REFLECT_RESPONSE), { status: 200 });
       return new Response("{}", { status: 200 });
     }) as any;
 
@@ -108,7 +108,7 @@ describe("ops-31.2: tps memory consolidate", () => {
   test("calls MemoryConsolidate and prints candidates", async () => {
     let capturedBody: any;
     globalThis.fetch = (async (url: string, opts?: RequestInit) => {
-      if (String(url).includes("/MemoryConsolidate")) {
+      if (String(url).includes("/ConsolidateMemories")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify(CONSOLIDATE_RESPONSE), { status: 200 });
       }
@@ -135,7 +135,7 @@ describe("ops-31.2: tps memory consolidate", () => {
   test("--older-than forwarded to API", async () => {
     let capturedBody: any;
     globalThis.fetch = (async (url: string, opts?: RequestInit) => {
-      if (String(url).includes("/MemoryConsolidate")) {
+      if (String(url).includes("/ConsolidateMemories")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify({ candidates: [], prompt: "" }), { status: 200 });
       }
@@ -150,7 +150,7 @@ describe("ops-31.2: tps memory consolidate", () => {
 
   test("--json outputs valid JSON", async () => {
     globalThis.fetch = (async (url: string) => {
-      if (String(url).includes("/MemoryConsolidate")) return new Response(JSON.stringify(CONSOLIDATE_RESPONSE), { status: 200 });
+      if (String(url).includes("/ConsolidateMemories")) return new Response(JSON.stringify(CONSOLIDATE_RESPONSE), { status: 200 });
       return new Response("{}", { status: 200 });
     }) as any;
 

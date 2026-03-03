@@ -225,7 +225,7 @@ export class FlairClient {
   async search(query: string, limit = 5): Promise<SearchResult[]> {
     const result = await this.request<{ results: SearchResult[] }>(
       "POST",
-      "/MemorySearch/",
+      "/SearchMemories/",
       { agentId: this.agentId, q: query, limit },
     );
     return result.results ?? [];
@@ -286,7 +286,7 @@ export class FlairClient {
     focus?: "lessons_learned" | "patterns" | "decisions" | "errors";
     tag?: string;
   } = {}): Promise<ReflectResult> {
-    return this.request<ReflectResult>("POST", "/MemoryReflect/", {
+    return this.request<ReflectResult>("POST", "/ReflectMemories/", {
       agentId: opts.agentId ?? this.agentId,
       scope: opts.scope ?? "recent",
       since: opts.since,
@@ -302,7 +302,7 @@ export class FlairClient {
     olderThan?: string;
     limit?: number;
   } = {}): Promise<ConsolidateResult> {
-    return this.request<ConsolidateResult>("POST", "/MemoryConsolidate/", {
+    return this.request<ConsolidateResult>("POST", "/ConsolidateMemories/", {
       agentId: opts.agentId ?? this.agentId,
       scope: opts.scope ?? "persistent",
       olderThan: opts.olderThan ?? "30d",
