@@ -533,8 +533,11 @@ export class EventLoop {
    *  - Only acts when `contextWindowTokens` is configured (skips otherwise).
    *  - Never drops below the last 10 messages so the model always has
    *    immediate conversational context.
-   *  - Drops the *oldest* message on each iteration until we are under budget
-   *    or cannot drop any more without violating the 10-message floor.
+   *  - Drops the *oldest complete turn* on each iteration. A turn is defined
+   *    as one user message plus any immediately following assistant messages
+   *    up to (but not including) the next user message. This ensures we never
+   *    orphan a tool_use/tool_result pair, which would cause a 400 Bad Request
+   *    from the Anthropic API.
    *  - Uses the same `estimateTokens` helper used elsewhere (tiktoken with a
    *    4 chars/token fallback) so the estimate is consistent.
    */
@@ -553,7 +556,21 @@ export class EventLoop {
       messages.length > MIN_MESSAGES &&
       this.estimateTokens(messages, systemPrompt, tools) > threshold
     ) {
-      messages.shift(); // Drop oldest message
+      // Find the end of the oldest turn: the first user message plus all
+      // immediately following non-user messages (assistant + tool_result).
+      // This preserves tool_use/tool_result pairing required by the API.
+      let turnEnd = 1; // at minimum drop the first message
+      while (
+        turnEnd < messages.length &&
+        messages[turnEnd]?.role !== "user"
+      ) {
+        turnEnd++;
+      }
+
+      // Safety: don't drop so many that we fall below MIN_MESSAGES floor
+      if (messages.length - turnEnd < MIN_MESSAGES) break;
+
+      messages.splice(0, turnEnd);
     }
   }
 
