@@ -128,7 +128,7 @@ function writeClaudeOAuthCredentials(creds: ClaudeOAuthCredentials): void {
   }
 }
 
-async function refreshOAuthToken(creds: ClaudeOAuthCredentials): Promise<ClaudeOAuthCredentials> {
+async function _doRefreshOAuthToken(creds: ClaudeOAuthCredentials): Promise<ClaudeOAuthCredentials> {
   const res = await fetch(OAUTH_REFRESH_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -160,12 +160,29 @@ async function refreshOAuthToken(creds: ClaudeOAuthCredentials): Promise<ClaudeO
   return updated;
 }
 
+/**
+ * Singleton refresh promise — ensures only one refresh call is in-flight at a
+ * time. This prevents refresh-token rotation revocation: if two concurrent
+ * requests both see an expired token, only one actually calls the endpoint;
+ * the second awaits the same promise.
+ */
+let _refreshPromise: Promise<ClaudeOAuthCredentials> | null = null;
+
 async function getValidOAuthToken(): Promise<string> {
   const creds = readClaudeOAuthCredentials();
   if (!creds) throw new Error("Claude OAuth credentials not found at ~/.claude/.credentials.json");
 
   const needsRefresh = Date.now() >= creds.expiresAt - OAUTH_EXPIRY_BUFFER_MS;
-  const validCreds = needsRefresh ? await refreshOAuthToken(creds) : creds;
+  if (!needsRefresh) return creds.accessToken;
+
+  // Coalesce concurrent refresh attempts into a single in-flight promise
+  if (!_refreshPromise) {
+    _refreshPromise = _doRefreshOAuthToken(creds).finally(() => {
+      _refreshPromise = null;
+    });
+  }
+
+  const validCreds = await _refreshPromise;
   return validCreds.accessToken;
 }
 
