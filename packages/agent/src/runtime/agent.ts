@@ -40,7 +40,7 @@ export class AgentRuntime {
     const flairContext = this.flair
       ? (query: string) => this.flair!.buildContextBlock(query)
       : undefined;
-    this.loop = new EventLoop({ config, memory, context, provider, tools, events, flairContext });
+    this.loop = new EventLoop({ config, memory, context, provider, tools, events, flairContext, mailClient: mail });
   }
 
   async start(): Promise<void> {
