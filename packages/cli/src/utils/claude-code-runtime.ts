@@ -401,7 +401,8 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         try {
           const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
           const memId = randomUUID();
-          await taskFlair.writeMemory(memId, "Completed: " + msg.body.slice(0, 80) + "\n" + summary);
+          const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
+          await Promise.race([taskFlair.writeMemory(memId, "Completed: " + msg.body.slice(0, 80) + "\n" + summary), timeout]);
         } catch (memErr: any) {
           console.warn(`[${agentId}] Flair memory write failed (non-fatal):`, memErr.message);
         }
