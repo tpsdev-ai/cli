@@ -19,7 +19,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import crypto from "node:crypto";
-import { readFileSync, existsSync, writeFileSync, renameSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
