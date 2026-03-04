@@ -366,8 +366,9 @@ export class ProviderManager {
     let providerPath: string;
 
     switch (provider) {
+      case "claude-oauth":
       case "anthropic": {
-        providerPath = "/proxy/anthropic/v1/messages";
+        providerPath = provider === "claude-oauth" ? "/proxy/claude-oauth/v1/messages" : "/proxy/anthropic/v1/messages";
         const anthropicMessages = request.messages.map((m) => {
           if (m._raw) return m._raw;
           if (m.role === "tool") {
@@ -464,7 +465,7 @@ export class ProviderManager {
     const data = await res.json() as Record<string, unknown>;
 
     // Normalize response (proxy returns provider-native format)
-    if (provider === "anthropic") {
+    if (provider === "anthropic" || provider === "claude-oauth") {
       const content = (data as any).content ?? [];
       const text = content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
       const toolCalls: ToolCall[] = content

@@ -1,4 +1,4 @@
-export type ProviderName = "anthropic" | "google" | "openai" | "ollama";
+export type ProviderName = "anthropic" | "claude-oauth" | "google" | "openai" | "ollama";
 
 export interface LLMConfig {
   provider: ProviderName;
