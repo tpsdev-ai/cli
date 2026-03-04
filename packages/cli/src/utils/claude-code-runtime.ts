@@ -38,6 +38,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "./flair-client.js";
+import { catchUpTopics } from "./mail-topics.js";
 
 /** How often to snapshot Flair soul to disk (ms) */
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -370,6 +371,16 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
   } else {
     const fallback = getFallbackSoulPath(agentId);
     console.warn(`[${agentId}] ⚠️  Flair offline at startup. Fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
+  }
+
+  // Boot: catch up on any topic messages missed while offline
+  try {
+    const caught = catchUpTopics(agentId);
+    if (caught > 0) {
+      console.log(`[${agentId}] Caught up ${caught} missed topic message(s) on boot`);
+    }
+  } catch (err: any) {
+    console.warn(`[${agentId}] Topic catch-up failed at boot: ${err.message}`);
   }
 
   let lastSnapshot = Date.now();
