@@ -254,22 +254,23 @@ async function runClaudeCode(
 
   const args = [
     "--print",
-    "--output-format", "json",
+    "--output-format", "stream-json",
+    "--verbose",
     "--model", model,
     "--system-prompt", systemPrompt,
     "--allowedTools", allowedTools,
     "--add-dir", config.workspace,
     "--no-session-persistence",
-    prompt,
   ];
 
   for (const dir of config.extraDirs ?? []) {
     args.push("--add-dir", dir);
   }
 
-  // Session log — append with task header, pipe stdout+stderr
+  // Session log — append with task header
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
-  const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} | prompt_src: ${systemPrompt.includes("Flair (live)") ? "flair" : "disk-fallback"}\n${"=".repeat(60)}\n`;
+  const promptSrc = systemPrompt.includes("Flair (live)") ? "flair" : "disk-fallback";
+  const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} | prompt_src: ${promptSrc}\n${"=".repeat(60)}\n`;
   appendFileSync(logPath, logHeader, "utf-8");
   const logStream = createWriteStream(logPath, { flags: "a" });
 
@@ -279,10 +280,52 @@ async function runClaudeCode(
       env: { ...process.env },
     });
 
-    let stdout = "";
+    // Send prompt via stdin (required for stream-json)
+    proc.stdin.write(prompt);
+    proc.stdin.end();
+
+    let resultText = "";
+    let turnCount = 0;
     let stderr = "";
-    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); logStream.write(d); });
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); logStream.write(d); });
+
+    // Parse NDJSON stream line-by-line — real-time visibility
+    let buf = "";
+    proc.stdout.on("data", (d: Buffer) => {
+      const chunk = d.toString();
+      logStream.write(d); // raw to session.log for tail -f
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as Record<string, any>;
+          if (event.type === "assistant") {
+            // Log tool calls for visibility
+            const toolUses = (event.message?.content ?? []).filter((c: any) => c.type === "tool_use");
+            for (const tu of toolUses) {
+              turnCount++;
+              const args = typeof tu.input === "object" ? JSON.stringify(tu.input).slice(0, 80) : String(tu.input ?? "");
+              console.log(`[${config.agentId}] turn ${turnCount}: ${tu.name}(${args})`);
+            }
+          } else if (event.type === "result") {
+            // Final event — extract result
+            if (event.is_error || event.subtype === "error") {
+              reject(new Error(`claude error: ${event.result ?? "unknown"}`));
+            } else {
+              resultText = event.result ?? "(no output)";
+            }
+          }
+        } catch {
+          // non-JSON line — ignore
+        }
+      }
+    });
+
+    proc.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+      logStream.write(d);
+    });
 
     const _timeout = setTimeout(() => {
       proc.kill("SIGTERM");
@@ -291,19 +334,14 @@ async function runClaudeCode(
     proc.on("close", (code) => {
       clearTimeout(_timeout);
       logStream.end();
-      if (code !== 0) {
+      if (code !== 0 && !resultText) {
         reject(new Error(`claude exited ${code}: ${stderr.slice(0, 500)}`));
         return;
       }
-      try {
-        const result = JSON.parse(stdout) as { result?: string; is_error?: boolean };
-        if (result.is_error) {
-          reject(new Error(`claude error: ${result.result}`));
-        } else {
-          resolve(result.result ?? "(no output)");
-        }
-      } catch {
-        resolve(stdout.trim() || "(no output)");
+      if (resultText) {
+        resolve(resultText);
+      } else {
+        reject(new Error(`claude exited ${code} with no result`));
       }
     });
 
