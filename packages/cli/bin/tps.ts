@@ -108,6 +108,9 @@ const cli = meow(
       today: { type: "boolean", default: false },
       agent: { type: "string" },
       statusOverride: { type: "string" },
+      desc: { type: "string" },
+      id: { type: "string" },
+      fromBeginning: { type: "boolean", default: false },
     },
   }
 );
@@ -372,23 +375,64 @@ async function main() {
       break;
     }
     case "mail": {
-      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | undefined;
-      if (cli.flags.help || !action || !["send", "check", "list", "log", "read", "watch", "search", "relay"].includes(action)) {
+      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | undefined;
+      const validMailActions = ["send", "check", "list", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish"];
+      if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
+
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
+
       const { runMail } = await import("../src/commands/mail.js");
-      await runMail({
-        action,
-        agent: rest[1],
-        message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : undefined),
-        messageId: action === "read" ? rest[2] : undefined,
-        json: cli.flags.json,
-        since: cli.flags.since,
-        limit: cli.flags.limit ? Number(cli.flags.limit) : undefined,
-      });
+
+      if (action === "topic") {
+        await runMail({
+          action: "topic",
+          topicAction: rest[1], // create | list
+          agent: rest[2],       // topic name for create
+          desc: getFlag("desc"),
+          json: cli.flags.json,
+        });
+      } else if (action === "subscribe") {
+        await runMail({
+          action: "subscribe",
+          agent: rest[1], // topic name
+          from: getFlag("id"),
+          fromBeginning: process.argv.includes("--from-beginning"),
+          json: cli.flags.json,
+        });
+      } else if (action === "unsubscribe") {
+        await runMail({
+          action: "unsubscribe",
+          agent: rest[1], // topic name
+          from: getFlag("id"),
+          json: cli.flags.json,
+        });
+      } else if (action === "publish") {
+        await runMail({
+          action: "publish",
+          agent: rest[1], // topic name
+          message: rest.slice(2).join(" "),
+          from: getFlag("from"),
+          json: cli.flags.json,
+        });
+      } else {
+        await runMail({
+          action,
+          agent: rest[1],
+          message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : undefined),
+          messageId: action === "read" ? rest[2] : undefined,
+          json: cli.flags.json,
+          since: cli.flags.since,
+          limit: cli.flags.limit ? Number(cli.flags.limit) : undefined,
+        });
+      }
       break;
     }
     case "identity": {

@@ -9,13 +9,17 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 
 interface MailArgs {
-  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay";
+  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish";
   agent?: string;
   message?: string;
   messageId?: string;
   json?: boolean;
   since?: string;
   limit?: number;
+  desc?: string;
+  from?: string;
+  fromBeginning?: boolean;
+  topicAction?: string;
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
@@ -318,6 +322,97 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
       }
       break;
+    }
+
+    case "topic": {
+      const { createTopic, listTopics } = await import("../utils/mail-topics.js");
+      const subAction = args.topicAction;
+
+      if (subAction === "create") {
+        const name = args.agent;
+        if (!name) {
+          console.error("Usage: tps mail topic create <name> [--desc \"...\"]");
+          process.exit(1);
+        }
+        const meta = createTopic(name, args.desc);
+        if (args.json) {
+          console.log(JSON.stringify(meta, null, 2));
+        } else {
+          console.log(`Topic created: ${meta.name}`);
+        }
+        return;
+      }
+
+      if (subAction === "list") {
+        const topics = listTopics();
+        if (args.json) {
+          console.log(JSON.stringify(topics, null, 2));
+        } else if (topics.length === 0) {
+          console.log("No topics.");
+        } else {
+          for (const t of topics) {
+            const last = t.lastMessage ? ` last=${t.lastMessage}` : "";
+            console.log(`  ${t.name}  subs=${t.subscribers.length}  msgs=${t.messageCount}${last}`);
+            if (t.description) console.log(`    ${t.description}`);
+          }
+        }
+        return;
+      }
+
+      console.error("Usage:\n  tps mail topic create <name> [--desc \"...\"]\n  tps mail topic list");
+      process.exit(1);
+      break;
+    }
+
+    case "subscribe": {
+      const { subscribe } = await import("../utils/mail-topics.js");
+      const topic = args.agent;
+      if (!topic) {
+        console.error("Usage: tps mail subscribe <topic> [--id <agentId>] [--from-beginning]");
+        process.exit(1);
+      }
+      const agentId = await resolveAgentId(args.from);
+      subscribe(topic, agentId, args.fromBeginning);
+      if (args.json) {
+        console.log(JSON.stringify({ status: "subscribed", topic, agentId }));
+      } else {
+        console.log(`${agentId} subscribed to ${topic}`);
+      }
+      return;
+    }
+
+    case "unsubscribe": {
+      const { unsubscribe } = await import("../utils/mail-topics.js");
+      const topic = args.agent;
+      if (!topic) {
+        console.error("Usage: tps mail unsubscribe <topic> [--id <agentId>]");
+        process.exit(1);
+      }
+      const agentId = await resolveAgentId(args.from);
+      unsubscribe(topic, agentId);
+      if (args.json) {
+        console.log(JSON.stringify({ status: "unsubscribed", topic, agentId }));
+      } else {
+        console.log(`${agentId} unsubscribed from ${topic}`);
+      }
+      return;
+    }
+
+    case "publish": {
+      const { publishToTopic } = await import("../utils/mail-topics.js");
+      const topic = args.agent;
+      if (!topic || !args.message) {
+        console.error("Usage: tps mail publish <topic> <message> [--from <agentId>]");
+        process.exit(1);
+      }
+      const from = await resolveAgentId(args.from);
+      const entry = publishToTopic(topic, from, args.message);
+      if (args.json) {
+        console.log(JSON.stringify(entry, null, 2));
+      } else {
+        console.log(`Published to ${topic} (${entry.id.slice(0, 8)})`);
+      }
+      return;
     }
   }
 }
