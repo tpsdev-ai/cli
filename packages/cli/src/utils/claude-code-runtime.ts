@@ -23,7 +23,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync, appendFileSync, createWriteStream } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -41,6 +41,8 @@ export interface ClaudeCodeConfig {
   supervisorId?: string;
   /** Max ms to wait for claude to finish a task (default: 30 minutes) */
   taskTimeoutMs?: number;
+  /** Path to session log file (default: ~/.tps/agents/<id>/session.log) */
+  sessionLogPath?: string;
 }
 
 interface MailMessage {
@@ -150,6 +152,12 @@ async function runClaudeCode(
     args.push("--add-dir", dir);
   }
 
+  // Session log — append with task header, pipe stdout+stderr
+  const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
+  const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from}\n${"=".repeat(60)}\n`;
+  appendFileSync(logPath, logHeader, "utf-8");
+  const logStream = createWriteStream(logPath, { flags: "a" });
+
   return new Promise((resolve, reject) => {
     const proc = spawn("claude", args, {
       cwd: config.workspace,
@@ -158,8 +166,8 @@ async function runClaudeCode(
 
     let stdout = "";
     let stderr = "";
-    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); logStream.write(d); });
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); logStream.write(d); });
 
     const _timeout = setTimeout(() => {
       proc.kill("SIGTERM");
@@ -167,6 +175,7 @@ async function runClaudeCode(
 
     proc.on("close", (code) => {
       clearTimeout(_timeout);
+      logStream.end();
       if (code !== 0) {
         reject(new Error(`claude exited ${code}: ${stderr.slice(0, 500)}`));
         return;
