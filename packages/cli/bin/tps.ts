@@ -267,7 +267,26 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
+          if (process.argv.includes("--runtime") && process.argv[process.argv.indexOf("--runtime") + 1] === "claude-code") {
+            // Claude Code CLI runtime — OAuth, no TPS proxy needed
+            const { join } = await import("node:path");
+            const { homedir } = await import("node:os");
+            const { readFileSync, existsSync } = await import("node:fs");
+            const { load: parseYaml } = await import("js-yaml");
+            const cfgPath = configPath ?? join(homedir(), ".tps", "agents", agentId!, "agent.yaml");
+            const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
+            const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
+            await runClaudeCodeRuntime({
+              agentId: agentId!,
+              workspace: agentCfg.workspace ?? join(homedir(), "ops", "tps"),
+              mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
+              model: agentCfg.llm?.model,
+              allowedTools: ["Bash", "Read", "Write", "Edit"],
+              extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
+            });
+          } else {
+            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
+          }
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });
         }

@@ -11,7 +11,7 @@ export interface AgentRuntimeConfig {
   workspace: string;
   systemPrompt?: string;
   llm: {
-    provider: "anthropic" | "google" | "openai" | "ollama";
+    provider: "anthropic" | "claude-oauth" | "google" | "openai" | "ollama";
     model: string;
     auth?: "oauth" | "api-key";
     apiKey?: string;
