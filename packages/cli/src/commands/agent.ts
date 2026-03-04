@@ -380,8 +380,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               {
                 workdir: config.workspace,
                 // System-wide read: bun needs macOS dylibs/frameworks, read-only is safe
-                read: [identityDir, agentDir, bunDir, "/"],
-                allow: [mailDir, tmpDir, config.workspace],
+                read: [identityDir, bunDir, "/"],
+                allow: [mailDir, tmpDir, config.workspace, agentDir],
               },
               [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId, "--sandboxed"],
             );
