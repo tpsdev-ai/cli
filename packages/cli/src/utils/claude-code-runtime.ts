@@ -396,6 +396,15 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
+
+        // Non-blocking: write task completion memory to Flair
+        try {
+          const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
+          const memId = randomUUID();
+          await taskFlair.writeMemory(memId, "Completed: " + msg.body.slice(0, 80) + "\n" + summary);
+        } catch (memErr: any) {
+          console.warn(`[${agentId}] Flair memory write failed (non-fatal):`, memErr.message);
+        }
       } catch (err: any) {
         // Hard fail: no system prompt available → notify supervisor
         if (err.message.startsWith("No system prompt available")) {
