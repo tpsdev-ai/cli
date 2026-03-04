@@ -72,7 +72,7 @@ export function countInboxMessages(agent: string): number {
     readdirSync(inbox.cur).filter((f) => f.endsWith(".json")).length;
 }
 
-export function sendMessage(to: string, body: string, from?: string): MailMessage {
+export function sendMessage(to: string, body: string, from?: string): MailMessage & { filePath: string } {
   assertValidAgentId(to);
   const sender = from || "unknown";
   assertValidAgentId(sender);
@@ -105,7 +105,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
 
   logEvent({ event: "sent", from: sender, to, messageId: id }, body);
 
-  return message;
+  return { ...message, filePath: newPath };
 }
 
 export function checkMessages(agent: string): MailMessage[] {

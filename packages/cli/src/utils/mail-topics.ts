@@ -12,6 +12,7 @@ export interface TopicMeta {
   description: string;
   createdAt: string;
   subscribers: string[];
+  allowedPublishers?: string[];  // undefined = open to all
 }
 
 export interface TopicLogEntry {
@@ -81,6 +82,7 @@ export function readMeta(topic: string): TopicMeta {
   return JSON.parse(readFileSync(p, "utf-8")) as TopicMeta;
 }
 
+// TODO(ops-42): Add file locking (e.g., proper-lockfile) to prevent data loss on concurrent subscribe/unsubscribe/updateCursor calls. Low-risk for single-process agents but needed for multi-process scenarios.
 export function writeMeta(topic: string, meta: TopicMeta): void {
   writeFileSync(metaPath(topic), JSON.stringify(meta, null, 2) + "\n", "utf-8");
 }
@@ -137,7 +139,7 @@ function readLogSince(topic: string, cursor: string): TopicLogEntry[] {
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-export function createTopic(name: string, description?: string): TopicMeta {
+export function createTopic(name: string, description?: string, allowedPublishers?: string[]): TopicMeta {
   assertValidTopicName(name);
   const dir = topicDir(name);
   if (existsSync(metaPath(name))) {
@@ -150,6 +152,7 @@ export function createTopic(name: string, description?: string): TopicMeta {
     description: description || "",
     createdAt: new Date().toISOString(),
     subscribers: [],
+    ...(allowedPublishers ? { allowedPublishers } : {}),
   };
   writeMeta(name, meta);
   writeFileSync(logPath(name), "", "utf-8");
@@ -209,6 +212,10 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
   assertValidBody(body);
   const meta = readMeta(topic);
 
+  if (meta.allowedPublishers && meta.allowedPublishers.length > 0 && !meta.allowedPublishers.includes(from)) {
+    throw new Error(`Agent '${from}' is not authorized to publish to topic '${topic}'`);
+  }
+
   // 1. Append to topic log
   const entry: TopicLogEntry = {
     id: randomUUID(),
@@ -226,18 +233,11 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
     try {
       const msg = sendMessage(subscriberId, body, from);
       // Patch topic fields into the written file
-      const inbox = join(
-        process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail"),
-        subscriberId,
-      );
-      const safeTs = msg.timestamp.replace(/[:.]/g, "-");
-      const filename = `${safeTs}-${msg.id}.json`;
-      const filePath = join(inbox, "new", filename);
-      if (existsSync(filePath)) {
-        const existing = JSON.parse(readFileSync(filePath, "utf-8"));
+      if (existsSync(msg.filePath)) {
+        const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
         existing.topic = topic;
         existing.topicMessageId = entry.id;
-        writeFileSync(filePath, JSON.stringify(existing, null, 2), "utf-8");
+        writeFileSync(msg.filePath, JSON.stringify(existing, null, 2), "utf-8");
       }
       markDelivered(subscriberId, entry.id);
     } catch (err: any) {
@@ -264,18 +264,11 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
       if (!alreadyDelivered(agentId, entry.id)) {
         try {
           const msg = sendMessage(agentId, entry.body, entry.from);
-          const inbox = join(
-            process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail"),
-            agentId,
-          );
-          const safeTs = msg.timestamp.replace(/[:.]/g, "-");
-          const filename = `${safeTs}-${msg.id}.json`;
-          const filePath = join(inbox, "new", filename);
-          if (existsSync(filePath)) {
-            const existing = JSON.parse(readFileSync(filePath, "utf-8"));
+          if (existsSync(msg.filePath)) {
+            const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
             existing.topic = topic;
             existing.topicMessageId = entry.id;
-            writeFileSync(filePath, JSON.stringify(existing, null, 2), "utf-8");
+            writeFileSync(msg.filePath, JSON.stringify(existing, null, 2), "utf-8");
           }
           markDelivered(agentId, entry.id);
           delivered++;
