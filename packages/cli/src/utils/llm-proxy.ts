@@ -19,7 +19,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import crypto from "node:crypto";
-import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -122,7 +122,10 @@ function writeClaudeOAuthCredentials(creds: ClaudeOAuthCredentials): void {
     const raw = readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8");
     const data = JSON.parse(raw);
     data.claudeAiOauth = creds;
-    writeFileSync(CLAUDE_CREDENTIALS_PATH, JSON.stringify(data, null, 2), "utf-8");
+    // Atomic write: write to tmp then rename to avoid corruption on crash
+    const tmp = `${CLAUDE_CREDENTIALS_PATH}.tmp`;
+    writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
+    renameSync(tmp, CLAUDE_CREDENTIALS_PATH);
   } catch (err) {
     console.error("[llm-proxy] Failed to write OAuth credentials:", err);
   }
@@ -135,6 +138,8 @@ async function _doRefreshOAuthToken(creds: ClaudeOAuthCredentials): Promise<Clau
     body: JSON.stringify({
       grant_type: "refresh_token",
       refresh_token: creds.refreshToken,
+      // client_id is required by Anthropic's OAuth token endpoint
+      client_id: "claude-code",
     }),
   });
 
