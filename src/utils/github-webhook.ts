@@ -7,7 +7,7 @@ function webhookSecret(): string {
 }
 
 function webhookTarget(): string {
-  return process.env.GITHUB_WEBHOOK_TARGET ?? "rockit";
+  return process.env.GITHUB_WEBHOOK_TARGET ?? "host";
 }
 
 function validateSignature(body: Buffer, sigHeader: string | undefined): boolean {

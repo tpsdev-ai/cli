@@ -14,7 +14,7 @@ Mail-driven command dispatcher (no LLM):
 ```bash
 export DEPLOY_BOT_AGENT=austin
 export DEPLOY_BOT_TPS_DIR=~/tps
-export DEPLOY_BOT_HOST_AGENT=rockit
+export DEPLOY_BOT_HOST_AGENT=your-host-id
 
 tmux new-session -d -s deploy-bot 'cd ~/tps && bun scripts/deploy-bot.ts'
 ```

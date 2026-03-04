@@ -20,7 +20,8 @@ function resolveAgentId(): string {
 
 const AGENT_ID = resolveAgentId();
 const TPS_DIR = process.env.DEPLOY_BOT_TPS_DIR ?? join(HOME, "tps");
-const HOST_AGENT = process.env.DEPLOY_BOT_HOST_AGENT ?? "rockit";
+const HOST_AGENT = process.env.DEPLOY_BOT_HOST_AGENT;
+if (!HOST_AGENT) { console.error("DEPLOY_BOT_HOST_AGENT env var is required"); process.exit(1); }
 const RUN_ALLOWLIST = (process.env.DEPLOY_BOT_RUN_CMDS ?? "df -h,uptime,bun --version,git log --oneline -5")
   .split(",")
   .map((s) => s.trim())

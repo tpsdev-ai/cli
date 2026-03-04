@@ -113,8 +113,8 @@ describe("matchesFilter", () => {
   });
 
   test("filters by from allowlist", () => {
-    const m: any = { capabilities: { mail_handler: { match: { from: ["rockit"] } } } };
-    expect(matchesFilter(m, { from: "rockit", body: "b" })).toBe(true);
+    const m: any = { capabilities: { mail_handler: { match: { from: ["test-host"] } } } };
+    expect(matchesFilter(m, { from: "test-host", body: "b" })).toBe(true);
     expect(matchesFilter(m, { from: "other", body: "b" })).toBe(false);
   });
 
@@ -130,9 +130,9 @@ describe("matchesFilter", () => {
   });
 
   test("requires both from and bodyPattern to match", () => {
-    const m: any = { capabilities: { mail_handler: { match: { from: ["rockit"], bodyPattern: "^deploy" } } } };
-    expect(matchesFilter(m, { from: "rockit", body: "deploy" })).toBe(true);
+    const m: any = { capabilities: { mail_handler: { match: { from: ["test-host"], bodyPattern: "^deploy" } } } };
+    expect(matchesFilter(m, { from: "test-host", body: "deploy" })).toBe(true);
     expect(matchesFilter(m, { from: "other", body: "deploy" })).toBe(false);
-    expect(matchesFilter(m, { from: "rockit", body: "other" })).toBe(false);
+    expect(matchesFilter(m, { from: "test-host", body: "other" })).toBe(false);
   });
 });

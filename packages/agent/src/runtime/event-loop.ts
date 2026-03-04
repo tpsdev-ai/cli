@@ -561,8 +561,8 @@ export class EventLoop {
       // Best-effort — don't let commit failure crash the notification
     }
 
-    // Mail the sender (or rockit as fallback) with a progress report
-    const recipient = sender && sender !== "unknown" ? sender : "rockit";
+    // Mail the sender (or operator as fallback) with a progress report
+    const recipient = sender && sender !== "unknown" ? sender : "operator";
     const mailBody = [
       `Hit turn limit (${turns}/${this.deps.config.maxToolTurns ?? 50}) on the current task.`,
       `Any staged changes have been auto-committed to the workspace.`,
