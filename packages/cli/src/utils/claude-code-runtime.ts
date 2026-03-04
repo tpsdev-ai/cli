@@ -37,6 +37,8 @@ export interface ClaudeCodeConfig {
   allowedTools?: string[];
   /** Additional directories Claude Code can access */
   extraDirs?: string[];
+  /** Agent to notify when done (defaults to "host") */
+  supervisorId?: string;
 }
 
 interface MailMessage {
@@ -107,10 +109,10 @@ Your workspace: ${workspace}
 Tools available: ${(config.allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(", ")}
 
 When you finish a task, use Bash to send mail:
-  cd ${workspace} && bun run /Users/squeued/ops/tps/packages/cli/bin/tps.ts mail send rockit "done: <summary>"
+  cd ${workspace} && tps mail send ${config.supervisorId ?? "host"} "done: <summary>"
 
-Always commit your work before mailing rockit:
-  git add -A && git commit --author="Ember <ember@tps.dev>" -m "feat: ..."
+Always commit your work before mailing ${config.supervisorId ?? "host"}:
+  git add -A && git commit --author="${config.agentId} <${config.agentId}@tps.dev>" -m "feat: ..."
 `.trim());
 
   return parts.join("\n\n");

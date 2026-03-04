@@ -1,4 +1,4 @@
-import type { MailMessage } from "../io/mail.js";
+import type { MailMessage, MailClient } from "../io/mail.js";
 import type {
   AgentConfig,
   CompletionRequest,
@@ -46,6 +46,8 @@ interface EventLoopDeps {
   events?: EventLogger;
   /** Optional Flair context injector — returns extra context for system prompt */
   flairContext?: (query: string) => Promise<string>;
+  /** Mail client for sending graceful turn-limit notifications */
+  mailClient?: MailClient;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -203,10 +205,10 @@ export class EventLoop {
     const sender = this.parseSender(message);
     const prompt = this.formatMailPrompt(body, trust, sender);
 
-    await this.processMessage(prompt, trust);
+    await this.processMessage(prompt, trust, sender);
   }
 
-  private async processMessage(promptRaw: string, trust: TrustLevel): Promise<void> {
+  private async processMessage(promptRaw: string, trust: TrustLevel, sender?: string): Promise<void> {
     const prompt = String(promptRaw).trim();
     const tools = this.buildToolSpecs(trust);
     const systemPrompt = await this.buildSystemPrompt(trust, prompt.slice(0, 200));
@@ -301,6 +303,8 @@ export class EventLoop {
           ts: new Date().toISOString(),
           data: { message: `tool loop max depth reached (${maxTurns})` },
         });
+        // Graceful notification: auto-commit any staged changes and mail the sender
+        await this.notifyTurnLimitReached(sender, turns);
         return;
       }
 
@@ -528,6 +532,50 @@ export class EventLoop {
         chars += typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length;
       }
       return Math.ceil(chars / 4);
+    }
+  }
+
+  /**
+   * Gracefully handle turn limit reached: auto-commit staged changes and notify
+   * the original sender so work isn't silently lost.
+   */
+  private async notifyTurnLimitReached(sender: string | undefined, turns: number): Promise<void> {
+    const agentId = this.deps.config.agentId;
+
+    // Auto-commit any staged git changes so work isn't lost
+    try {
+      const { spawnSync } = await import("node:child_process");
+      const workspace = this.deps.config.workspace;
+      const status = spawnSync("git", ["status", "--porcelain"], { cwd: workspace, encoding: "utf-8" });
+      const hasChanges = (status.stdout ?? "").trim();
+      if (hasChanges) {
+        spawnSync("git", ["add", "-A"], { cwd: workspace });
+        const agentId = this.deps.config.agentId ?? "agent";
+        spawnSync("git", [
+          "commit",
+          `--author=${agentId} <${agentId}@tps.dev>`,
+          "-m", `wip: auto-commit at turn limit (${turns} turns)`,
+        ], { cwd: workspace });
+      }
+    } catch {
+      // Best-effort — don't let commit failure crash the notification
+    }
+
+    // Mail the sender (or operator as fallback) with a progress report
+    const recipient = sender && sender !== "unknown" ? sender : "operator";
+    const mailBody = [
+      `Hit turn limit (${turns}/${this.deps.config.maxToolTurns ?? 50}) on the current task.`,
+      `Any staged changes have been auto-committed to the workspace.`,
+      `Please restart me with the task or break it into smaller steps.`,
+    ].join("\n");
+
+
+    try {
+      if (this.deps.mailClient) {
+        await this.deps.mailClient.sendMail(recipient, mailBody);
+      }
+    } catch {
+      // Best-effort — mail failure is not fatal
     }
   }
 
