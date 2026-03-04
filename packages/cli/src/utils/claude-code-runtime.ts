@@ -415,6 +415,15 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         } else {
           console.error(`[${agentId}] Task failed:`, err.message);
           sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+
+          // Non-blocking: write task failure memory to Flair
+          try {
+            const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
+            const memId = randomUUID();
+            await taskFlair.writeMemory(memId, "Failed: " + msg.body.slice(0, 80) + "\n" + err.message);
+          } catch (memErr: any) {
+            console.warn(`[${agentId}] Flair failure memory write failed (non-fatal):`, memErr.message);
+          }
         }
       }
     }
