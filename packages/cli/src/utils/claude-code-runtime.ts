@@ -39,6 +39,8 @@ export interface ClaudeCodeConfig {
   extraDirs?: string[];
   /** Agent to notify when done (defaults to "host") */
   supervisorId?: string;
+  /** Max ms to wait for claude to finish a task (default: 30 minutes) */
+  taskTimeoutMs?: number;
 }
 
 interface MailMessage {
@@ -121,6 +123,7 @@ Always commit your work before mailing ${config.supervisorId ?? "host"}:
 async function runClaudeCode(
   message: MailMessage,
   config: ClaudeCodeConfig,
+  taskTimeoutMs: number,
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(config.workspace, config);
   const model = config.model ?? "claude-sonnet-4-6";
@@ -160,7 +163,7 @@ async function runClaudeCode(
 
     const _timeout = setTimeout(() => {
       proc.kill("SIGTERM");
-    }, 10 * 60 * 1000);
+    }, taskTimeoutMs);
 
     proc.on("close", (code) => {
       clearTimeout(_timeout);
@@ -203,7 +206,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
       try {
-        const result = await runClaudeCode(msg, config);
+        const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         // Send summary back to sender
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
