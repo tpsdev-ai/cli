@@ -544,14 +544,18 @@ export class EventLoop {
 
     // Auto-commit any staged git changes so work isn't lost
     try {
-      const { execSync } = await import("node:child_process");
+      const { spawnSync } = await import("node:child_process");
       const workspace = this.deps.config.workspace;
-      const hasChanges = execSync("git status --porcelain", { cwd: workspace, encoding: "utf-8" }).trim();
+      const status = spawnSync("git", ["status", "--porcelain"], { cwd: workspace, encoding: "utf-8" });
+      const hasChanges = (status.stdout ?? "").trim();
       if (hasChanges) {
-        execSync(
-          `git add -A && git commit --author="ember <ember@tps.dev>" -m "wip: auto-commit at turn limit (${turns} turns)"`,
-          { cwd: workspace },
-        );
+        spawnSync("git", ["add", "-A"], { cwd: workspace });
+        const agentId = this.deps.config.agentId ?? "agent";
+        spawnSync("git", [
+          "commit",
+          `--author=${agentId} <${agentId}@tps.dev>`,
+          "-m", `wip: auto-commit at turn limit (${turns} turns)`,
+        ], { cwd: workspace });
       }
     } catch {
       // Best-effort — don't let commit failure crash the notification
