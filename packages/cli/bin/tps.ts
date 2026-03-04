@@ -283,6 +283,7 @@ async function main() {
               model: agentCfg.llm?.model,
               allowedTools: ["Bash", "Read", "Write", "Edit"],
               extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
+              taskTimeoutMs: agentCfg.taskTimeoutMs,
             });
           } else {
             await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
