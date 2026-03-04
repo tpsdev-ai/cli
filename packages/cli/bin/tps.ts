@@ -284,6 +284,8 @@ async function main() {
               allowedTools: ["Bash", "Read", "Write", "Edit"],
               extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
               taskTimeoutMs: agentCfg.taskTimeoutMs,
+              flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
+              flairKeyPath: agentCfg.flair?.keyPath,
             });
           } else {
             await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });

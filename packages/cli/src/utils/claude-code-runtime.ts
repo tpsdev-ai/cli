@@ -7,10 +7,16 @@
  *
  * Architecture:
  *   1. Check TPS mail inbox for new messages
- *   2. For each message, spawn `claude --print` with the message as prompt
- *   3. Claude Code runs its own tool loop (Bash, Read, Write, Edit)
- *   4. On completion, send reply via TPS mail
- *   5. Repeat
+ *   2. For each message, build system prompt from Flair (with disk fallback)
+ *   3. Spawn `claude --print` with the message as prompt
+ *   4. Claude Code runs its own tool loop (Bash, Read, Write, Edit)
+ *   5. On completion, send reply via TPS mail
+ *   6. Repeat (background: snapshot Flair soul to disk daily)
+ *
+ * System prompt source priority:
+ *   1. Flair (primary) — soul + task-relevant memories
+ *   2. Disk fallback (~/.tps/agents/<id>/fallback/SOUL.md) with ⚠️ warning
+ *   3. Hard fail — mails supervisor if neither is available
  *
  * This runtime does NOT use:
  *   - TPS LLM proxy
@@ -19,14 +25,22 @@
  *
  * It DOES use:
  *   - TPS mail (inbox/outbox)
- *   - Workspace files (SOUL.md, AGENTS.md loaded as --system-prompt)
+ *   - Flair (soul + memories)
+ *   - Disk fallback (daily snapshot from Flair)
  */
 
 import { spawn } from "node:child_process";
-import { readFileSync, existsSync, mkdirSync, readdirSync, renameSync, writeFileSync, appendFileSync, createWriteStream } from "node:fs";
+import {
+  readFileSync, existsSync, mkdirSync, readdirSync,
+  renameSync, writeFileSync, appendFileSync, createWriteStream, statSync,
+} from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { FlairClient } from "./flair-client.js";
+
+/** How often to snapshot Flair soul to disk (ms) */
+const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 
 export interface ClaudeCodeConfig {
   agentId: string;
@@ -43,6 +57,10 @@ export interface ClaudeCodeConfig {
   taskTimeoutMs?: number;
   /** Path to session log file (default: ~/.tps/agents/<id>/session.log) */
   sessionLogPath?: string;
+  /** Flair base URL (default: http://127.0.0.1:9926) */
+  flairUrl?: string;
+  /** Path to Ed25519 private key for Flair auth (default: ~/.tps/identity/<agentId>.key) */
+  flairKeyPath?: string;
 }
 
 interface MailMessage {
@@ -52,6 +70,8 @@ interface MailMessage {
   body: string;
   timestamp: string;
 }
+
+// ─── Mail helpers ───────────────────────────────────────────────────────────
 
 function getMailPaths(mailDir: string, agentId: string) {
   const root = join(mailDir, agentId);
@@ -80,7 +100,6 @@ function checkNewMail(mailDir: string, agentId: string): MailMessage[] {
 }
 
 function sendMail(mailDir: string, from: string, to: string, body: string): void {
-  // Write to recipient's new/ inbox
   const { fresh: recipientFresh, tmp: recipientTmp } = getMailPaths(mailDir, to);
   const id = randomUUID();
   const ts = new Date().toISOString();
@@ -93,41 +112,138 @@ function sendMail(mailDir: string, from: string, to: string, body: string): void
   renameSync(tmpPath, newPath);
 }
 
-function buildSystemPrompt(workspace: string, config: ClaudeCodeConfig): string {
+// ─── Flair + fallback ───────────────────────────────────────────────────────
+
+function getFallbackDir(agentId: string): string {
+  return join(homedir(), ".tps", "agents", agentId, "fallback");
+}
+
+function getFallbackSoulPath(agentId: string): string {
+  return join(getFallbackDir(agentId), "SOUL.md");
+}
+
+/**
+ * Snapshot the agent's soul from Flair to disk.
+ * Called on a schedule so the fallback file stays fresh.
+ */
+async function snapshotSoulToDisk(flair: FlairClient, agentId: string): Promise<void> {
+  try {
+    const soul = await flair.getSoul();
+    if (soul.length === 0) return;
+
+    const fallbackDir = getFallbackDir(agentId);
+    mkdirSync(fallbackDir, { recursive: true });
+
+    const content = [
+      `# Soul snapshot for ${agentId}`,
+      `# Captured: ${new Date().toISOString()}`,
+      "",
+      ...soul.map(e => `**${e.key}:** ${e.value}`),
+    ].join("\n");
+
+    writeFileSync(getFallbackSoulPath(agentId), content, "utf-8");
+  } catch {
+    // non-fatal — snapshot failure doesn't block the task
+  }
+}
+
+/**
+ * Build system prompt from Flair (primary) or disk fallback.
+ * Throws if neither is available.
+ */
+async function buildSystemPrompt(
+  message: MailMessage,
+  config: ClaudeCodeConfig,
+): Promise<string> {
+  const { agentId, workspace, allowedTools, supervisorId, flairUrl, flairKeyPath } = config;
   const parts: string[] = [];
 
-  // Load workspace orientation files (limit SOUL.md to keep prompt short)
-  const soul = join(workspace, "SOUL.md");
-  if (existsSync(soul)) {
-    // Truncate to first 2000 chars to avoid huge prompts
-    const content = readFileSync(soul, "utf-8").trim();
-    parts.push(content.slice(0, 2000));
+  // ── 1. Identity block ──────────────────────────────────────────────────────
+  let identitySource: "flair" | "disk" | null = null;
+
+  const flair = new FlairClient({
+    baseUrl: flairUrl,
+    agentId,
+    keyPath: flairKeyPath,
+  });
+
+  const flairOnline = await flair.ping();
+
+  if (flairOnline) {
+    try {
+      const taskQuery = message.body.slice(0, 100);
+      const context = await flair.bootstrap({ query: taskQuery });
+      if (context.trim()) {
+        parts.push(context);
+        identitySource = "flair";
+      }
+    } catch {
+      // fall through to disk
+    }
   }
 
-  // Runtime-specific instructions
+  if (identitySource !== "flair") {
+    // Flair offline or returned empty — try disk fallback
+    const fallbackPath = getFallbackSoulPath(agentId);
+    if (existsSync(fallbackPath)) {
+      const content = readFileSync(fallbackPath, "utf-8").trim();
+      if (content) {
+        parts.push(content.slice(0, 2000));
+        identitySource = "disk";
+        console.warn(`[${agentId}] ⚠️  Flair offline — using stale disk fallback (${fallbackPath})`);
+      }
+    }
+
+    // Also try workspace SOUL.md as last resort
+    if (identitySource !== "disk") {
+      const workspaceSoul = join(workspace, "SOUL.md");
+      if (existsSync(workspaceSoul)) {
+        const content = readFileSync(workspaceSoul, "utf-8").trim();
+        if (content) {
+          parts.push(content.slice(0, 2000));
+          identitySource = "disk";
+          console.warn(`[${agentId}] ⚠️  Flair offline — using workspace SOUL.md fallback`);
+        }
+      }
+    }
+  }
+
+  if (identitySource === null) {
+    throw new Error(
+      `No system prompt available: Flair offline and no disk fallback found. ` +
+      `Run: tps agent soul --id ${agentId} to seed Flair, or create a fallback at ${getFallbackSoulPath(agentId)}`
+    );
+  }
+
+  // ── 2. Runtime context ─────────────────────────────────────────────────────
+  const tools = (allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(", ");
+  const supervisor = supervisorId ?? "host";
   parts.push(`
 ## Runtime Context
 
-You are running as agent \`${config.agentId}\` via Claude Code CLI.
+You are running as agent \`${agentId}\` via Claude Code CLI.
 Your workspace: ${workspace}
-Tools available: ${(config.allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(", ")}
+Tools available: ${tools}
+System prompt sourced from: ${identitySource === "flair" ? "Flair (live)" : "⚠️ disk fallback"}
 
 When you finish a task, use Bash to send mail:
-  cd ${workspace} && tps mail send ${config.supervisorId ?? "host"} "done: <summary>"
+  cd ${workspace} && tps mail send ${supervisor} "done: <summary>"
 
-Always commit your work before mailing ${config.supervisorId ?? "host"}:
-  git add -A && git commit --author="${config.agentId} <${config.agentId}@tps.dev>" -m "feat: ..."
+Always commit your work before mailing ${supervisor}:
+  git add -A && git commit --author="${agentId} <${agentId}@tps.dev>" -m "feat: ..."
 `.trim());
 
   return parts.join("\n\n");
 }
+
+// ─── Claude invocation ───────────────────────────────────────────────────────
 
 async function runClaudeCode(
   message: MailMessage,
   config: ClaudeCodeConfig,
   taskTimeoutMs: number,
 ): Promise<string> {
-  const systemPrompt = buildSystemPrompt(config.workspace, config);
+  const systemPrompt = await buildSystemPrompt(message, config);
   const model = config.model ?? "claude-sonnet-4-6";
   const allowedTools = (config.allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(",");
 
@@ -147,14 +263,13 @@ async function runClaudeCode(
     prompt,
   ];
 
-  // Add extra dirs
   for (const dir of config.extraDirs ?? []) {
     args.push("--add-dir", dir);
   }
 
   // Session log — append with task header, pipe stdout+stderr
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
-  const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from}\n${"=".repeat(60)}\n`;
+  const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} | prompt_src: ${systemPrompt.includes("Flair (live)") ? "flair" : "disk-fallback"}\n${"=".repeat(60)}\n`;
   appendFileSync(logPath, logHeader, "utf-8");
   const logStream = createWriteStream(logPath, { flags: "a" });
 
@@ -196,8 +311,10 @@ async function runClaudeCode(
   });
 }
 
+// ─── Main loop ───────────────────────────────────────────────────────────────
+
 export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<void> {
-  const { agentId, mailDir, workspace } = config;
+  const { agentId, mailDir, workspace, flairUrl, flairKeyPath } = config;
 
   // Write PID file
   const pidPath = join(workspace, ".tps-agent.pid");
@@ -205,10 +322,32 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
   console.log(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
 
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+
+  // Initial Flair health check + snapshot
+  const flairOnline = await flair.ping();
+  if (flairOnline) {
+    console.log(`[${agentId}] Flair online — snapshotting soul to disk`);
+    await snapshotSoulToDisk(flair, agentId);
+  } else {
+    const fallback = getFallbackSoulPath(agentId);
+    console.warn(`[${agentId}] ⚠️  Flair offline at startup. Fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
+  }
+
+  let lastSnapshot = Date.now();
   const POLL_MS = 5000;
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    // Background: periodic Flair → disk snapshot
+    if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS) {
+      if (await flair.ping()) {
+        await snapshotSoulToDisk(flair, agentId);
+        lastSnapshot = Date.now();
+        console.log(`[${agentId}] Flair soul snapshot refreshed`);
+      }
+    }
+
     const messages = checkNewMail(mailDir, agentId);
 
     for (const msg of messages) {
@@ -217,12 +356,18 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       try {
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
-        // Send summary back to sender
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
       } catch (err: any) {
-        console.error(`[${agentId}] Task failed:`, err.message);
-        sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+        // Hard fail: no system prompt available → notify supervisor
+        if (err.message.startsWith("No system prompt available")) {
+          console.error(`[${agentId}] FATAL: ${err.message}`);
+          sendMail(mailDir, agentId, config.supervisorId ?? msg.from,
+            `Agent ${agentId} cannot start task: ${err.message}`);
+        } else {
+          console.error(`[${agentId}] Task failed:`, err.message);
+          sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+        }
       }
     }
 
