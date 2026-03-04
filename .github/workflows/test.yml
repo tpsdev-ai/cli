@@ -67,7 +67,6 @@ jobs:
 
   binary-smoke:
     name: Binary Smoke Test
-    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -75,6 +74,8 @@ jobs:
         with:
           bun-version: 1.3.10
       - run: bun install --frozen-lockfile
+      - name: Build agent package (required by CLI compile)
+        run: cd packages/agent && bun run build
       - name: Build compiled binary
         run: cd packages/cli && bun build --compile bin/tps.ts --target=bun-linux-x64 --outfile=dist/tps-smoke
       - name: Smoke test
