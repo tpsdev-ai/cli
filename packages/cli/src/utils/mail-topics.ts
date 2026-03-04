@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -82,9 +82,12 @@ export function readMeta(topic: string): TopicMeta {
   return JSON.parse(readFileSync(p, "utf-8")) as TopicMeta;
 }
 
-// TODO(ops-42): Add file locking (e.g., proper-lockfile) to prevent data loss on concurrent subscribe/unsubscribe/updateCursor calls. Low-risk for single-process agents but needed for multi-process scenarios.
+// Atomic write: write to .tmp then renameSync — safe for concurrent readers/writers on same filesystem.
 export function writeMeta(topic: string, meta: TopicMeta): void {
-  writeFileSync(metaPath(topic), JSON.stringify(meta, null, 2) + "\n", "utf-8");
+  const p = metaPath(topic);
+  const tmp = p + ".tmp";
+  writeFileSync(tmp, JSON.stringify(meta, null, 2) + "\n", "utf-8");
+  renameSync(tmp, p);
 }
 
 // ── Cursors ────────────────────────────────────────────────────────────────
