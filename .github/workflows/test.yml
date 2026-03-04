@@ -65,6 +65,23 @@ jobs:
       - name: Run tests in Docker
         run: docker compose run --rm test
 
+  binary-smoke:
+    name: Binary Smoke Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.10"
+      - run: bun install --frozen-lockfile
+      - name: Build compiled binary (linux-x64)
+        run: cd packages/cli && bun build --compile bin/tps.ts --target=bun-linux-x64 --outfile=dist/tps-smoke
+      - name: Smoke test — binary starts and prints version
+        run: |
+          ./packages/cli/dist/tps-smoke --version
+          echo "Exit code: $?"
+
   # SAST (Static Application Security Testing) using Semgrep.
   # Semgrep scans the codebase for security vulnerabilities, hardcoded secrets, and bad practices
   # using pattern matching. It is fast and catches common mistakes.
