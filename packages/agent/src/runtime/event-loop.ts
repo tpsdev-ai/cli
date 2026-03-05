@@ -562,7 +562,7 @@ export class EventLoop {
     }
 
     // Mail the sender (or operator as fallback) with a progress report
-    const recipient = sender && sender !== "unknown" ? sender : "operator";
+    const recipient = sender && sender !== "unknown" ? sender : "host";
     const mailBody = [
       `Hit turn limit (${turns}/${this.deps.config.maxToolTurns ?? 50}) on the current task.`,
       `Any staged changes have been auto-committed to the workspace.`,
