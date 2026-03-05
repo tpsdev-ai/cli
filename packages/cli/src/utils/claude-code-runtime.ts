@@ -27,18 +27,26 @@
  *   - TPS mail (inbox/outbox)
  *   - Flair (soul + memories)
  *   - Disk fallback (daily snapshot from Flair)
+ *   - WorkspaceProvider (OPS-47) for workspace lifecycle
  */
 
 import { spawn } from "node:child_process";
 import {
   readFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, writeFileSync, appendFileSync, createWriteStream, statSync,
+  renameSync, writeFileSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "./flair-client.js";
-import { catchUpTopics } from "./mail-topics.js";
+import {
+  snapshotSoulToDisk,
+  bootContext,
+  searchPastExperience,
+  writeTaskMemory,
+  catchUpTopics,
+} from "./agent-lifecycle.js";
+import type { WorkspaceProvider } from "./workspace-provider.js";
 
 /** How often to snapshot Flair soul to disk (ms) */
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -62,6 +70,8 @@ export interface ClaudeCodeConfig {
   flairUrl?: string;
   /** Path to Ed25519 private key for Flair auth (default: ~/.tps/identity/<agentId>.key) */
   flairKeyPath?: string;
+  /** Optional workspace provider for lifecycle management (OPS-47) */
+  workspaceProvider?: WorkspaceProvider;
 }
 
 interface MailMessage {
@@ -113,143 +123,32 @@ function sendMail(mailDir: string, from: string, to: string, body: string): void
   renameSync(tmpPath, newPath);
 }
 
-// ─── Flair + fallback ───────────────────────────────────────────────────────
-
-function getFallbackDir(agentId: string): string {
-  return join(homedir(), ".tps", "agents", agentId, "fallback");
-}
+// ─── System prompt (delegates to agent-lifecycle) ────────────────────────────
 
 function getFallbackSoulPath(agentId: string): string {
-  return join(getFallbackDir(agentId), "SOUL.md");
+  return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
 }
 
-/**
- * Snapshot the agent's soul from Flair to disk.
- * Called on a schedule so the fallback file stays fresh.
- */
-async function snapshotSoulToDisk(flair: FlairClient, agentId: string): Promise<void> {
-  try {
-    const soul = await flair.getSoul();
-    if (soul.length === 0) return;
-
-    const fallbackDir = getFallbackDir(agentId);
-    mkdirSync(fallbackDir, { recursive: true });
-
-    const content = [
-      `# Soul snapshot for ${agentId}`,
-      `# Captured: ${new Date().toISOString()}`,
-      "",
-      ...soul.map(e => `**${e.key}:** ${e.value}`),
-    ].join("\n");
-
-    writeFileSync(getFallbackSoulPath(agentId), content, "utf-8");
-  } catch {
-    // non-fatal — snapshot failure doesn't block the task
-  }
-}
-
-/**
- * Build system prompt from Flair (primary) or disk fallback.
- * Throws if neither is available.
- */
 async function buildSystemPrompt(
   message: MailMessage,
   config: ClaudeCodeConfig,
 ): Promise<string> {
   const { agentId, workspace, allowedTools, supervisorId, flairUrl, flairKeyPath } = config;
-  const parts: string[] = [];
 
-  // ── 1. Identity block ──────────────────────────────────────────────────────
-  let identitySource: "flair" | "disk" | null = null;
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
 
-  const flair = new FlairClient({
-    baseUrl: flairUrl,
-    agentId,
-    keyPath: flairKeyPath,
-  });
+  const { systemPrompt, identitySource } = await bootContext(
+    flair, agentId, message.body.slice(0, 100), workspace,
+    { allowedTools, supervisorId },
+  );
 
-  const flairOnline = await flair.ping();
-
-  if (flairOnline) {
-    try {
-      const taskQuery = message.body.slice(0, 100);
-      const context = await flair.bootstrap({ query: taskQuery });
-      if (context.trim()) {
-        parts.push(context);
-        identitySource = "flair";
-      }
-    } catch {
-      // fall through to disk
-    }
+  // Append past experience search
+  const experience = await searchPastExperience(flair, message.body);
+  if (experience) {
+    return systemPrompt + "\n\n" + experience;
   }
 
-  if (identitySource !== "flair") {
-    // Flair offline or returned empty — try disk fallback
-    const fallbackPath = getFallbackSoulPath(agentId);
-    if (existsSync(fallbackPath)) {
-      const content = readFileSync(fallbackPath, "utf-8").trim();
-      if (content) {
-        parts.push(content.slice(0, 2000));
-        identitySource = "disk";
-        console.warn(`[${agentId}] ⚠️  Flair offline — using stale disk fallback (${fallbackPath})`);
-      }
-    }
-
-    // Also try workspace SOUL.md as last resort
-    if (identitySource !== "disk") {
-      const workspaceSoul = join(workspace, "SOUL.md");
-      if (existsSync(workspaceSoul)) {
-        const content = readFileSync(workspaceSoul, "utf-8").trim();
-        if (content) {
-          parts.push(content.slice(0, 2000));
-          identitySource = "disk";
-          console.warn(`[${agentId}] ⚠️  Flair offline — using workspace SOUL.md fallback`);
-        }
-      }
-    }
-  }
-
-  if (identitySource === null) {
-    throw new Error(
-      `No system prompt available: Flair offline and no disk fallback found. ` +
-      `Run: tps agent soul --id ${agentId} to seed Flair, or create a fallback at ${getFallbackSoulPath(agentId)}`
-    );
-  }
-
-  // ── 1b. Relevant past experience (non-blocking search) ──────────────────────
-  if (flairOnline) {
-    try {
-      const searchResults = await flair.search(message.body.slice(0, 200), 5);
-      if (searchResults.length > 0) {
-        const experienceBlock = searchResults
-          .map(r => `- ${r.content?.slice(0, 200) ?? r.id}`)
-          .join("\n");
-        parts.push(`## Relevant Past Experience\n${experienceBlock}`);
-      }
-    } catch {
-      // Non-blocking: skip if search fails
-    }
-  }
-
-  // ── 2. Runtime context ─────────────────────────────────────────────────────
-  const tools = (allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(", ");
-  const supervisor = supervisorId ?? "host";
-  parts.push(`
-## Runtime Context
-
-You are running as agent \`${agentId}\` via Claude Code CLI.
-Your workspace: ${workspace}
-Tools available: ${tools}
-System prompt sourced from: ${identitySource === "flair" ? "Flair (live)" : "⚠️ disk fallback"}
-
-When you finish a task, use Bash to send mail:
-  cd ${workspace} && tps mail send ${supervisor} "done: <summary>"
-
-Always commit your work before mailing ${supervisor}:
-  git add -A && git commit --author="${agentId} <${agentId}@tps.dev>" -m "feat: ..."
-`.trim());
-
-  return parts.join("\n\n");
+  return systemPrompt;
 }
 
 // ─── Claude invocation ───────────────────────────────────────────────────────
@@ -368,7 +267,7 @@ async function runClaudeCode(
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
 export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<void> {
-  const { agentId, mailDir, workspace, flairUrl, flairKeyPath } = config;
+  const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
 
   // Write PID file
   const pidPath = join(workspace, ".tps-agent.pid");
@@ -398,6 +297,26 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     console.warn(`[${agentId}] Topic catch-up failed at boot: ${err.message}`);
   }
 
+  // Boot: workspace lifecycle — stash leftover state, reset to baseline (OPS-47)
+  if (workspaceProvider) {
+    try {
+      await workspaceProvider.checkpoint("pre-boot-stash");
+      console.log(`[${agentId}] Workspace pre-boot checkpoint saved`);
+    } catch (err: any) {
+      console.warn(`[${agentId}] Workspace pre-boot checkpoint failed (non-fatal): ${err.message}`);
+    }
+
+    try {
+      const base = await workspaceProvider.baseline();
+      await workspaceProvider.reset(base);
+      console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
+    } catch (err: any) {
+      console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
+      // reset() failure → fail hard per Kern's review
+      throw err;
+    }
+  }
+
   let lastSnapshot = Date.now();
   const POLL_MS = 5000;
 
@@ -417,6 +336,16 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     for (const msg of messages) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
+      // Task start: workspace snapshot (OPS-47)
+      let preTaskSnapshot;
+      if (workspaceProvider) {
+        try {
+          preTaskSnapshot = await workspaceProvider.snapshot(`pre-task`);
+        } catch (err: any) {
+          console.warn(`[${agentId}] Pre-task workspace snapshot failed: ${err.message}`);
+        }
+      }
+
       const taskStartMs = Date.now();
       try {
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
@@ -424,22 +353,27 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
 
-        // Non-blocking: write task completion memory to Flair
-        try {
-          const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-          const memId = `${agentId}-${Date.now()}`;
-          const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-          const completionMemory = JSON.stringify({
-            type: "task_completion",
-            task: msg.body.slice(0, 80),
-            summary: summary.slice(0, 500),
-            timestamp: new Date().toISOString(),
-            durationMs: Date.now() - taskStartMs,
-          });
-          await Promise.race([taskFlair.writeMemory(memId, completionMemory), timeout]);
-        } catch (memErr: any) {
-          console.warn(`[${agentId}] Flair memory write failed (non-fatal):`, memErr.message);
+        // Task complete: workspace checkpoint (OPS-47)
+        let checkpointState;
+        if (workspaceProvider) {
+          try {
+            checkpointState = await workspaceProvider.checkpoint(
+              "task-done",
+              `task complete: ${msg.body.slice(0, 60)}`,
+            );
+          } catch (err: any) {
+            console.warn(`[${agentId}] Post-task workspace checkpoint failed: ${err.message}`);
+          }
         }
+
+        // Write task completion memory to Flair (via agent-lifecycle)
+        const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
+        await writeTaskMemory(taskFlair, agentId, "completion", {
+          task: msg.body,
+          summary,
+          durationMs: Date.now() - taskStartMs,
+          workspaceRef: checkpointState?.ref,
+        });
       } catch (err: any) {
         // Hard fail: no system prompt available → notify supervisor
         if (err.message.startsWith("No system prompt available")) {
@@ -450,21 +384,24 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           console.error(`[${agentId}] Task failed:`, err.message);
           sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
 
-          // Non-blocking: write task failure memory to Flair
-          try {
-            const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-            const memId = `${agentId}-${Date.now()}`;
-            const failTimeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-            const failureMemory = JSON.stringify({
-              type: "task_failure",
-              task: msg.body.slice(0, 80),
-              error: err.message.slice(0, 200),
-              timestamp: new Date().toISOString(),
-            });
-            await Promise.race([taskFlair.writeMemory(memId, failureMemory), failTimeout]);
-          } catch (memErr: any) {
-            console.warn(`[${agentId}] Flair failure memory write failed (non-fatal):`, memErr.message);
+          // Task failure: workspace checkpoint (OPS-47)
+          if (workspaceProvider) {
+            try {
+              await workspaceProvider.checkpoint(
+                "task-failed",
+                `WIP: failed — ${err.message.slice(0, 60)}`,
+              );
+            } catch (cpErr: any) {
+              console.warn(`[${agentId}] Failure checkpoint failed: ${cpErr.message}`);
+            }
           }
+
+          // Write task failure memory to Flair (via agent-lifecycle)
+          const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
+          await writeTaskMemory(taskFlair, agentId, "failure", {
+            task: msg.body,
+            error: err.message,
+          });
         }
       }
     }
