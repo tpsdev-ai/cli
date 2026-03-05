@@ -240,6 +240,14 @@ function syncToGeminiCli(creds: StoredCredentials): void {
 
 
 async function loginOpenAI(): Promise<void> {
+  // If Codex already has valid credentials, just import them without re-running codex.
+  const existing = readCodexCredentials();
+  if (existing) {
+    saveCredentials("openai", existing);
+    console.log(`openai     ✓ imported from Codex — ${humanExpiry(existing.expiresAt)}`);
+    return;
+  }
+
   const codexPath = findCli("codex");
   if (!codexPath) {
     console.error(
@@ -250,20 +258,25 @@ async function loginOpenAI(): Promise<void> {
     process.exit(1);
   }
 
-  console.log("Running 'codex' login — authenticate in your browser...\n");
-  // Codex CLI opens browser interactively when no valid session exists.
-  // Spawning with stdio=inherit so the user can complete the flow.
-  const result = spawnSync(codexPath, [], {
+  // Detect headless/remote environment and use device auth flow
+  const isHeadless = !process.env.DISPLAY && (!process.stdout.isTTY || !!process.env.SSH_TTY || !!process.env.SSH_CLIENT);
+  const codexArgs = isHeadless ? ["login", "--device-auth"] : [];
+  if (isHeadless) {
+    console.log("Detected remote/headless environment. Using device auth flow...\n");
+  } else {
+    console.log("Running 'codex' login — authenticate in your browser...\n");
+  }
+
+  const result = spawnSync(codexPath, codexArgs, {
     stdio: "inherit",
     timeout: 120_000,
-    env: { ...process.env, CODEX_QUIET_MODE: "1" },
   });
 
-  // codex may exit non-zero even on success (first-run flow quirks) — still try to read creds
   const creds = readCodexCredentials();
   if (!creds) {
     if (result.status !== 0) {
       console.error("Codex login failed and no credentials found.");
+      console.error("On a remote machine, try: codex login --device-auth");
       process.exit(1);
     }
     console.error("Codex exited OK but no credentials found at ~/.codex/auth.json.");
@@ -292,17 +305,30 @@ function readCodexCredentials(): StoredCredentials | null {
     if (!existsSync(credPath)) continue;
     try {
       const data = JSON.parse(readFileSync(credPath, "utf-8"));
-      // Codex auth.json format: { accessToken, refreshToken, expiresAt, ... }
-      const accessToken = data.accessToken ?? data.access_token;
-      const refreshToken = data.refreshToken ?? data.refresh_token;
+      // Codex auth.json actual format (ChatGPT auth mode):
+      //   { auth_mode: "chatgpt", tokens: { access_token, refresh_token, id_token, account_id } }
+      // Also support flat format as fallback.
+      const tokens = data.tokens ?? {};
+      const accessToken = tokens.access_token ?? data.accessToken ?? data.access_token;
+      const refreshToken = tokens.refresh_token ?? data.refreshToken ?? data.refresh_token;
       if (!accessToken || !refreshToken) continue;
 
       return {
         provider: "openai",
         refreshToken: String(refreshToken),
         accessToken: String(accessToken),
-        expiresAt: Number(data.expiresAt ?? data.expires_at ?? 0),
-        clientId: String(data.clientId ?? data.client_id ?? ""),
+        expiresAt: (() => {
+          const raw = Number(data.expiresAt ?? data.expires_at ?? 0);
+          if (raw > 0) return raw;
+          // Decode JWT exp claim from access_token as fallback
+          try {
+            const at = String(accessToken);
+            const payload = JSON.parse(Buffer.from(at.split(".")[1], "base64url").toString());
+            if (payload.exp) return Number(payload.exp) * 1000;
+          } catch { /* ignore */ }
+          return 0;
+        })(),
+        clientId: String(tokens.account_id ?? data.clientId ?? data.client_id ?? ""),
         scopes: String(data.scopes ?? data.scope ?? ""),
       };
     } catch {
