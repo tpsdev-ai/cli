@@ -143,7 +143,7 @@ async function buildSystemPrompt(
   );
 
   // Append past experience search
-  const experience = await searchPastExperience(flair, message.body);
+  const experience = await searchPastExperience(flair, message.body, workspace);
   if (experience) {
     return systemPrompt + "\n\n" + experience;
   }
