@@ -400,7 +400,10 @@ export class ProviderManager {
         break;
       }
       case "openai":
-        providerPath = "/proxy/openai/v1/chat/completions";
+      case "openai-oauth":
+        providerPath = provider === "openai-oauth"
+          ? "/proxy/openai-oauth/v1/chat/completions"
+          : "/proxy/openai/v1/chat/completions";
         body = {
           model,
           max_tokens: request.maxTokens ?? 4096,
