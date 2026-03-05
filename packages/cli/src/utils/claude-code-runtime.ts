@@ -216,6 +216,21 @@ async function buildSystemPrompt(
     );
   }
 
+  // ── 1b. Relevant past experience (non-blocking search) ──────────────────────
+  if (flairOnline) {
+    try {
+      const searchResults = await flair.search(message.body.slice(0, 200), 5);
+      if (searchResults.length > 0) {
+        const experienceBlock = searchResults
+          .map(r => `- ${r.content?.slice(0, 200) ?? r.id}`)
+          .join("\n");
+        parts.push(`## Relevant Past Experience\n${experienceBlock}`);
+      }
+    } catch {
+      // Non-blocking: skip if search fails
+    }
+  }
+
   // ── 2. Runtime context ─────────────────────────────────────────────────────
   const tools = (allowedTools ?? ["Bash", "Read", "Write", "Edit"]).join(", ");
   const supervisor = supervisorId ?? "host";
@@ -413,7 +428,14 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
           const memId = `${agentId}-${Date.now()}`;
           const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-          await Promise.race([taskFlair.writeMemory(memId, "Completed: " + msg.body.slice(0, 80) + "\n" + summary), timeout]);
+          const taskStartMs = Date.now();
+          const completionMemory = JSON.stringify({
+            type: "task_completion",
+            task: msg.body.slice(0, 80),
+            summary: summary.slice(0, 500),
+            timestamp: new Date().toISOString(),
+          });
+          await Promise.race([taskFlair.writeMemory(memId, completionMemory), timeout]);
         } catch (memErr: any) {
           console.warn(`[${agentId}] Flair memory write failed (non-fatal):`, memErr.message);
         }
@@ -432,7 +454,13 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
             const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
             const memId = `${agentId}-${Date.now()}`;
             const failTimeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-            await Promise.race([taskFlair.writeMemory(memId, "Failed: " + msg.body.slice(0, 80) + "\n" + err.message), failTimeout]);
+            const failureMemory = JSON.stringify({
+              type: "task_failure",
+              task: msg.body.slice(0, 80),
+              error: err.message.slice(0, 200),
+              timestamp: new Date().toISOString(),
+            });
+            await Promise.race([taskFlair.writeMemory(memId, failureMemory), failTimeout]);
           } catch (memErr: any) {
             console.warn(`[${agentId}] Flair failure memory write failed (non-fatal):`, memErr.message);
           }
