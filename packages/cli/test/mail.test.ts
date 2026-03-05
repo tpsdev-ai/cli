@@ -107,10 +107,10 @@ describe("mail command", () => {
     const home = join(tempRoot, "home");
     const fs = require("node:fs");
     fs.mkdirSync(join(home, ".tps", "identity"), { recursive: true });
-    fs.writeFileSync(join(home, ".tps", "identity", "host.json"), JSON.stringify({ hostId: "rockit" }));
+    fs.writeFileSync(join(home, ".tps", "identity", "host.json"), JSON.stringify({ hostId: "host" }));
 
     const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), HOME: home, TPS_AGENT_ID: "austin" };
-    const sent = run(["mail", "send", "rockit", "reply from branch"], env);
+    const sent = run(["mail", "send", "host", "reply from branch"], env);
     expect(sent.status).toBe(0);
     expect(sent.stdout).toContain("Queued for delivery to host");
 

@@ -20,7 +20,7 @@ describe("handleGithubWebhook", () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-gh-webhook-"));
     process.env.HOME = root;
-    process.env.GITHUB_WEBHOOK_TARGET = "rockit";
+    process.env.GITHUB_WEBHOOK_TARGET = "host";
     process.env.GITHUB_WEBHOOK_SECRET = "testsecret";
   });
 
@@ -103,7 +103,7 @@ describe("handleGithubWebhook", () => {
     const files = readdirSync(outDir).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(1);
     const row = JSON.parse(readFileSync(join(outDir, files[0]!), "utf-8"));
-    expect(row.to).toBe("rockit");
+    expect(row.to).toBe("host");
     expect(String(row.body)).toContain("push");
 
     await new Promise<void>((resolve) => server.close(() => resolve()));
