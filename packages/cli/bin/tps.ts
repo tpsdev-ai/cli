@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import meow from "meow";
 
+// Injected at compile time via --define flag; falls back to "dev" in dev mode.
+declare const INJECTED_VERSION: string;
+
 const cli = meow(
   `
   Usage
@@ -138,12 +141,12 @@ async function checkNono() {
 
 async function main() {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
-    const { readFileSync } = await import("node:fs");
-    const { dirname, join } = await import("node:path");
-    const { fileURLToPath } = await import("node:url");
-    const here = dirname(fileURLToPath(import.meta.url));
-    const pkg = JSON.parse(readFileSync(join(here, "..", "package.json"), "utf-8"));
-    console.log(pkg.version);
+    // Version is injected at build time to avoid runtime package.json reads,
+    // which fail in compiled Bun binaries (the $bunfs path is inaccessible).
+    // See: https://bun.sh/docs/bundler/executables#embed-a-file
+    // INJECTED_VERSION is replaced by the build script with the actual semver.
+    const version = typeof INJECTED_VERSION !== "undefined" ? INJECTED_VERSION : "dev";
+    console.log(version);
     return;
   }
 
