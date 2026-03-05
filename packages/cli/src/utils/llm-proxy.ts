@@ -83,7 +83,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 
 // ─── Provider forwarding ──────────────────────────────────────────────────────
 
-type Provider = "anthropic" | "openai" | "claude-oauth";
+type Provider = "anthropic" | "openai" | "openai-oauth" | "claude-oauth";
 
 function readSecretFile(name: string): string | null {
   const p = join(homedir(), ".tps", "secrets", name);
@@ -193,6 +193,142 @@ async function getValidOAuthToken(): Promise<string> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+
+// ─── OpenAI OAuth token management ───────────────────────────────────────────
+
+const OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token";
+
+interface OpenAIOAuthCredentials {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  clientId: string;
+}
+
+function readOpenAIOAuthCredentials(): OpenAIOAuthCredentials | null {
+  const home = process.env.HOME || homedir();
+  const authPath = join(home, ".tps", "auth", "openai.json");
+  if (!existsSync(authPath)) return null;
+  try {
+    const data = JSON.parse(readFileSync(authPath, "utf-8")) as any;
+    if (!data.accessToken || !data.refreshToken) return null;
+    return {
+      accessToken: data.accessToken,
+      refreshToken: data.refreshToken,
+      expiresAt: Number(data.expiresAt || 0),
+      clientId: String(data.clientId || ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeOpenAIOAuthCredentials(creds: OpenAIOAuthCredentials): void {
+  const home = process.env.HOME || homedir();
+  const authPath = join(home, ".tps", "auth", "openai.json");
+  try {
+    // Read existing file to preserve all fields (StoredCredentials format)
+    let data: Record<string, unknown> = {};
+    if (existsSync(authPath)) {
+      data = JSON.parse(readFileSync(authPath, "utf-8"));
+    }
+    data.accessToken = creds.accessToken;
+    data.refreshToken = creds.refreshToken;
+    data.expiresAt = creds.expiresAt;
+    data.clientId = creds.clientId;
+
+    // Atomic write: tmp → rename
+    const tmpPath = authPath + ".tmp";
+    writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+    renameSync(tmpPath, authPath);
+  } catch (err) {
+    console.error("[llm-proxy] Failed to write OpenAI OAuth credentials:", err);
+  }
+}
+
+async function refreshOpenAIOAuthToken(creds: OpenAIOAuthCredentials): Promise<OpenAIOAuthCredentials> {
+  if (!creds.clientId) {
+    throw new Error("OpenAI OAuth refresh requires clientId. Re-login with: tps auth login openai");
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: creds.clientId,
+    refresh_token: creds.refreshToken,
+  });
+
+  const res = await fetch(OPENAI_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  if (!res.ok) {
+    // Do NOT log response body — may contain token details
+    throw new Error(`OpenAI OAuth token refresh failed (${res.status})`);
+  }
+
+  const token = (await res.json()) as any;
+  const updated: OpenAIOAuthCredentials = {
+    accessToken: token.access_token,
+    refreshToken: token.refresh_token ?? creds.refreshToken,
+    expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000,
+    clientId: creds.clientId,
+  };
+
+  writeOpenAIOAuthCredentials(updated);
+
+  // Also sync back to Codex CLI auth.json if present
+  syncOpenAIToCodexCli(updated);
+
+  return updated;
+}
+
+function syncOpenAIToCodexCli(creds: OpenAIOAuthCredentials): void {
+  const home = process.env.HOME || homedir();
+  const codexHome = process.env.CODEX_HOME || join(home, ".codex");
+  const candidates = [
+    join(codexHome, "auth.json"),
+    join(home, ".config", "codex", "auth.json"),
+  ];
+  for (const credPath of candidates) {
+    if (!existsSync(credPath)) continue;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      if ("accessToken" in data) data.accessToken = creds.accessToken;
+      if ("access_token" in data) data.access_token = creds.accessToken;
+      if ("refreshToken" in data) data.refreshToken = creds.refreshToken;
+      if ("refresh_token" in data) data.refresh_token = creds.refreshToken;
+      if ("expiresAt" in data) data.expiresAt = creds.expiresAt;
+      if ("expires_at" in data) data.expires_at = creds.expiresAt;
+      const tmpPath = credPath + ".tmp";
+      writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      renameSync(tmpPath, credPath);
+      return;
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+let _openaiRefreshPromise: Promise<OpenAIOAuthCredentials> | null = null;
+
+async function getValidOpenAIOAuthToken(): Promise<string> {
+  const creds = readOpenAIOAuthCredentials();
+  if (!creds) throw new Error("OpenAI OAuth credentials not found. Run: tps auth login openai");
+
+  const needsRefresh = creds.expiresAt - Date.now() < 5 * 60 * 1000;
+  if (!needsRefresh) return creds.accessToken;
+
+  if (!_openaiRefreshPromise) {
+    _openaiRefreshPromise = refreshOpenAIOAuthToken(creds).finally(() => {
+      _openaiRefreshPromise = null;
+    });
+  }
+  const validCreds = await _openaiRefreshPromise;
+  return validCreds.accessToken;
+}
+
 function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: string } | null {
   if (provider === "anthropic") {
     const key = process.env.ANTHROPIC_API_KEY ?? readSecretFile("anthropic-api-key");
@@ -213,6 +349,10 @@ function getProviderConfig(provider: Provider): { baseUrl: string; authHeader: s
   // claude-oauth: dynamic, fetched per-request in forwardRequest
   if (provider === "claude-oauth") {
     return { baseUrl: "https://api.anthropic.com", authHeader: "" };
+  }
+  // openai-oauth: dynamic, fetched per-request via getValidOpenAIOAuthToken
+  if (provider === "openai-oauth") {
+    return { baseUrl: "https://api.openai.com", authHeader: "" };
   }
   return null;
 }
@@ -240,6 +380,9 @@ async function forwardRequest(
     headers["anthropic-version"] = "2023-06-01";
   } else if (provider === "openai") {
     headers["Authorization"] = providerCfg.authHeader;
+  } else if (provider === "openai-oauth") {
+    const token = await getValidOpenAIOAuthToken();
+    headers["Authorization"] = `Bearer ${token}`;
   }
 
   // Force uncompressed response — proxy passes raw bytes to agent, no decompression
@@ -299,10 +442,10 @@ export function createLLMProxy(port = DEFAULT_PORT): { start: () => Promise<void
     }
 
     // Route: /proxy/<provider>/<path>
-    const match = (req.url ?? "").match(/^\/proxy\/(anthropic|openai|claude-oauth)(\/.*)?$/);
+    const match = (req.url ?? "").match(/^\/proxy\/(anthropic|openai|openai-oauth|claude-oauth)(\/.*)?$/);
     if (!match) {
       res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unknown proxy path. Use /proxy/anthropic/..., /proxy/openai/..., or /proxy/claude-oauth/..." }));
+      res.end(JSON.stringify({ error: "Unknown proxy path. Use /proxy/anthropic/..., /proxy/openai/..., /proxy/openai-oauth/..., or /proxy/claude-oauth/..." }));
       return;
     }
 
