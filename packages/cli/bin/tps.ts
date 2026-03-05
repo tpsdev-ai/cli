@@ -278,10 +278,40 @@ async function main() {
             const { load: parseYaml } = await import("js-yaml");
             const cfgPath = configPath ?? join(homedir(), ".tps", "agents", agentId!, "agent.yaml");
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
+            const agentWorkspace = agentCfg.workspace ?? join(homedir(), "ops", "tps");
+
+            // OPS-47: Build workspace provider from agent.yaml config
+            const { GitWorkspaceProvider } = await import("../src/utils/workspace-provider.js");
+            let workspaceProvider;
+            const wpCfg = agentCfg.workspaceProvider;
+            if (wpCfg?.type === "git") {
+              workspaceProvider = new GitWorkspaceProvider(agentWorkspace, {
+                remote: wpCfg.remote,
+                baseBranch: wpCfg.baseBranch,
+                author: wpCfg.author,
+                failureMode: wpCfg.failureMode,
+              });
+            } else if (!wpCfg) {
+              // Default: use git provider if workspace is a git repo
+              try {
+                const { spawnSync } = await import("node:child_process");
+                const check = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+                  cwd: agentWorkspace, encoding: "utf-8",
+                });
+                if (check.status === 0 && check.stdout.trim() === "true") {
+                  workspaceProvider = new GitWorkspaceProvider(agentWorkspace, {
+                    author: `${agentId} <${agentId}@tps.dev>`,
+                  });
+                }
+              } catch {
+                // Not a git repo — no workspace provider
+              }
+            }
+
             const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
             await runClaudeCodeRuntime({
               agentId: agentId!,
-              workspace: agentCfg.workspace ?? join(homedir(), "ops", "tps"),
+              workspace: agentWorkspace,
               mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
               model: agentCfg.llm?.model,
               allowedTools: ["Bash", "Read", "Write", "Edit"],
@@ -289,6 +319,7 @@ async function main() {
               taskTimeoutMs: agentCfg.taskTimeoutMs,
               flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
               flairKeyPath: agentCfg.flair?.keyPath,
+              workspaceProvider,
             });
           } else {
             await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
