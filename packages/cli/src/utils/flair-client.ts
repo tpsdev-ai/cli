@@ -191,7 +191,7 @@ export class FlairClient {
   async listMemories(limit = 50): Promise<Memory[]> {
     return this.request<Memory[]>(
       "GET",
-      `/Memory/?agentId=${encodeURIComponent(this.agentId)}&limit=${limit}`,
+      `/Memory/?agentId=${encodeURIComponent(this.agentId)}`,
     );
   }
 
