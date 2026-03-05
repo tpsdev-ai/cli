@@ -18,7 +18,7 @@ afterEach(() => {
 
 const msg: MailMessage = {
   id: "123",
-  from: "rockit",
+  from: "host",
   to: "tester",
   body: "hello world",
   timestamp: "2024-01-01T00:00:00Z"
@@ -64,7 +64,7 @@ describe("runHandlerPipeline", () => {
       }
     };
     const res = await runHandlerPipeline(msg, [manifest], []);
-    expect(res).toEqual({ type: "reply", body: "got it", to: "rockit" });
+    expect(res).toEqual({ type: "reply", body: "got it", to: "host" });
   });
 
   test("executes handler and parses JSON reply envelope", async () => {
@@ -97,7 +97,7 @@ describe("runHandlerPipeline", () => {
       capabilities: { mail_handler: { enabled: true, exec: script2 } }
     };
     const res = await runHandlerPipeline(msg, [m1, m2], []);
-    expect(res).toEqual({ type: "reply", body: "handled", to: "rockit" });
+    expect(res).toEqual({ type: "reply", body: "handled", to: "host" });
   });
 
   test("handles exit 2 (error) — falls through to next", async () => {
@@ -114,7 +114,7 @@ describe("runHandlerPipeline", () => {
       capabilities: { mail_handler: { enabled: true, exec: script2 } }
     };
     const res = await runHandlerPipeline(msg, [m1, m2], []);
-    expect(res).toEqual({ type: "reply", body: "handled", to: "rockit" });
+    expect(res).toEqual({ type: "reply", body: "handled", to: "host" });
   });
 
   test("follows routing rules before exec", async () => {
@@ -210,7 +210,7 @@ describe("runHandlerPipeline", () => {
         mail_handler: {
           enabled: true,
           exec: script,
-          match: { from: ["not-rockit"] }
+          match: { from: ["not-host"] }
         }
       }
     };

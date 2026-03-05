@@ -67,12 +67,12 @@ describe("branch join handshake", () => {
       body: {
         hostPubkey: hostPubB64,
         hostFingerprint: fingerprint(hostKp.encryption.publicKey),
-        hostId: "rockit",
+        hostId: "host",
       },
     });
 
     const joined = await joinP;
-    expect(joined.hostId).toBe("rockit");
+    expect(joined.hostId).toBe("host");
     expect(joined.hostFingerprint).toBe(fingerprint(hostKp.encryption.publicKey));
 
     await ch.close();
@@ -118,7 +118,7 @@ describe("branch join handshake", () => {
       body: {
         hostPubkey: Buffer.from(hostKp.encryption.publicKey).toString("base64url"),
         hostFingerprint: fingerprint(hostKp.encryption.publicKey),
-        hostId: "rockit",
+        hostId: "host",
       },
     });
 
@@ -127,7 +127,7 @@ describe("branch join handshake", () => {
     const hostFile = join(branchIdentityDir, "host.json");
     expect(existsSync(hostFile)).toBe(true);
     const saved = JSON.parse(readFileSync(hostFile, "utf-8"));
-    expect(saved.hostId).toBe("rockit");
+    expect(saved.hostId).toBe("host");
     expect(saved.fingerprint).toBe(fingerprint(hostKp.encryption.publicKey));
 
     await ch.close();

@@ -65,7 +65,7 @@ describe("MSG_JOIN_COMPLETE", () => {
     const valid = {
       hostPubkey: "dGVzdA",
       hostFingerprint: "sha256:abc123",
-      hostId: "rockit",
+      hostId: "host",
     };
     expect(JoinCompleteBodySchema.safeParse(valid).success).toBe(true);
   });

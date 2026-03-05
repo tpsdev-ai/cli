@@ -18,14 +18,14 @@ function dispatch(body: string): string {
 
 describe("deploy bot dispatch", () => {
   test("rejects commands from unauthorized senders", () => {
-    const allowed = ["rockit"];
+    const allowed = ["host"];
     const msg = { id: "abc", from: "evil-agent", body: "deploy" };
     expect(allowed.includes(msg.from)).toBe(false);
   });
 
   test("accepts commands from allowed senders", () => {
-    const allowed = ["rockit"];
-    const msg = { id: "abc", from: "rockit", body: "status" };
+    const allowed = ["host"];
+    const msg = { id: "abc", from: "host", body: "status" };
     expect(allowed.includes(msg.from)).toBe(true);
   });
   test("returns error for unknown command", () => {
