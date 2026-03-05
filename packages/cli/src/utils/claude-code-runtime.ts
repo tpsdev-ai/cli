@@ -45,6 +45,10 @@ import {
   searchPastExperience,
   writeTaskMemory,
   catchUpTopics,
+  onBoot,
+  onTaskStart,
+  onTaskComplete,
+  onTaskFailure,
 } from "./agent-lifecycle.js";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 
@@ -297,13 +301,15 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     console.warn(`[${agentId}] Topic catch-up failed at boot: ${err.message}`);
   }
 
-  // Boot: workspace lifecycle — stash leftover state, reset to baseline (OPS-47)
+  // Boot: workspace lifecycle — query Flair for last state, checkpoint (OPS-47 Phase 2)
   if (workspaceProvider) {
     try {
-      await workspaceProvider.checkpoint("pre-boot-stash");
-      console.log(`[${agentId}] Workspace pre-boot checkpoint saved`);
+      const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
+      if (lastCheckpoint) {
+        console.log(`[${agentId}] Resumed from last checkpoint: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      }
     } catch (err: any) {
-      console.warn(`[${agentId}] Workspace pre-boot checkpoint failed (non-fatal): ${err.message}`);
+      console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
     }
 
     try {
@@ -312,7 +318,6 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
     } catch (err: any) {
       console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
-      // reset() failure → fail hard per Kern's review
       throw err;
     }
   }
@@ -336,44 +341,37 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     for (const msg of messages) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
-      // Task start: workspace snapshot (OPS-47)
-      let preTaskSnapshot;
+      // Task start: snapshot workspace via lifecycle hook (OPS-47 Phase 2)
+      const taskId = msg.id;
+      let preTaskState;
       if (workspaceProvider) {
         try {
-          preTaskSnapshot = await workspaceProvider.snapshot(`pre-task`);
+          preTaskState = await onTaskStart(workspaceProvider, flair, taskId);
         } catch (err: any) {
-          console.warn(`[${agentId}] Pre-task workspace snapshot failed: ${err.message}`);
+          console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
         }
       }
 
-      const taskStartMs = Date.now();
       try {
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
 
-        // Task complete: workspace checkpoint (OPS-47)
-        let checkpointState;
-        if (workspaceProvider) {
+        // Task complete: checkpoint + structured memory via lifecycle hook (OPS-47 Phase 2)
+        if (workspaceProvider && preTaskState) {
           try {
-            checkpointState = await workspaceProvider.checkpoint(
-              "task-done",
-              `task complete: ${msg.body.slice(0, 60)}`,
-            );
+            await onTaskComplete(workspaceProvider, flair, taskId, preTaskState);
           } catch (err: any) {
-            console.warn(`[${agentId}] Post-task workspace checkpoint failed: ${err.message}`);
+            console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
           }
+        } else {
+          // Fallback: write task memory directly if no workspace provider
+          await writeTaskMemory(flair, agentId, "completion", {
+            task: msg.body,
+            summary,
+          });
         }
-
-        // Write task completion memory to Flair (via agent-lifecycle)
-        const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-        await writeTaskMemory(taskFlair, agentId, "completion", {
-          task: msg.body,
-          summary,
-          durationMs: Date.now() - taskStartMs,
-          workspaceRef: checkpointState?.ref,
-        });
       } catch (err: any) {
         // Hard fail: no system prompt available → notify supervisor
         if (err.message.startsWith("No system prompt available")) {
@@ -384,24 +382,19 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           console.error(`[${agentId}] Task failed:`, err.message);
           sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
 
-          // Task failure: workspace checkpoint (OPS-47)
-          if (workspaceProvider) {
+          // Task failure: checkpoint + failure record via lifecycle hook (OPS-47 Phase 2)
+          if (workspaceProvider && preTaskState) {
             try {
-              await workspaceProvider.checkpoint(
-                "task-failed",
-                `WIP: failed — ${err.message.slice(0, 60)}`,
-              );
+              await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message);
             } catch (cpErr: any) {
-              console.warn(`[${agentId}] Failure checkpoint failed: ${cpErr.message}`);
+              console.warn(`[${agentId}] Failure lifecycle failed: ${cpErr.message}`);
             }
+          } else {
+            await writeTaskMemory(flair, agentId, "failure", {
+              task: msg.body,
+              error: err.message,
+            });
           }
-
-          // Write task failure memory to Flair (via agent-lifecycle)
-          const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-          await writeTaskMemory(taskFlair, agentId, "failure", {
-            task: msg.body,
-            error: err.message,
-          });
         }
       }
     }

@@ -11,6 +11,11 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { join, resolve, relative, isAbsolute } from "node:path";
+import { tmpdir } from "node:os";
+import type { FlairClient } from "./flair-client.js";
+import type { WorkspaceStateRecord } from "./flair-client.js";
 
 // ── Interfaces ─────────────────────────────────────────────────────────────
 
@@ -276,5 +281,252 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       provider: "git",
       metadata: { remote: this.remote, baseBranch: this.baseBranch },
     };
+  }
+}
+
+// ── FilesystemWorkspaceProvider ─────────────────────────────────────────────
+
+/** Always excluded from snapshots — security-sensitive files (S47-D) */
+const ALWAYS_EXCLUDE = [".env", "*.key", "*.pem", "secrets/", ".tps/snapshots/"];
+
+export interface FilesystemWorkspaceConfig {
+  snapshotDir?: string;       // default: .tps/snapshots
+  maxSnapshots?: number;      // rotation limit, default 10
+  excludePatterns?: string[]; // additional glob patterns to skip
+  flair?: FlairClient;        // optional — for checkpoint() to write to Flair
+  agentId?: string;           // required if flair is provided
+}
+
+export class FilesystemWorkspaceProvider implements WorkspaceProvider {
+  readonly type = "filesystem";
+
+  private readonly cwd: string;
+  private readonly snapshotDir: string;
+  private readonly maxSnapshots: number;
+  private readonly excludePatterns: string[];
+  private readonly flair?: FlairClient;
+  private readonly agentId?: string;
+
+  constructor(cwd: string, config: FilesystemWorkspaceConfig = {}) {
+    this.cwd = resolve(cwd);
+    this.snapshotDir = resolve(cwd, config.snapshotDir ?? ".tps/snapshots");
+    this.maxSnapshots = config.maxSnapshots ?? 10;
+    this.excludePatterns = [
+      ...ALWAYS_EXCLUDE,
+      ...(config.excludePatterns ?? []),
+    ];
+    this.flair = config.flair;
+    this.agentId = config.agentId;
+
+    // S47-D: snapshotDir must be inside workspace
+    this.assertInsideWorkspace(this.snapshotDir);
+    mkdirSync(this.snapshotDir, { recursive: true });
+  }
+
+  // ── Security (S47-D) ─────────────────────────────────────────────────────
+
+  private assertInsideWorkspace(p: string): void {
+    const resolved = resolve(p);
+    if (!resolved.startsWith(this.cwd + "/") && resolved !== this.cwd) {
+      throw new Error(`Path traversal blocked: "${p}" is outside workspace "${this.cwd}"`);
+    }
+  }
+
+  private validateSnapshotRef(ref: string): string {
+    // Ref must be a simple filename — no slashes, no .., no absolute paths
+    if (ref.includes("/") || ref.includes("\\") || ref.includes("..") || isAbsolute(ref)) {
+      throw new Error(`Invalid snapshot ref: "${ref}" — must be a simple filename`);
+    }
+    const fullPath = join(this.snapshotDir, ref);
+    this.assertInsideWorkspace(fullPath);
+    return fullPath;
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  private tarExcludeArgs(): string[] {
+    const args: string[] = [];
+    // Exclude the snapshot dir relative to cwd
+    const relSnapshotDir = relative(this.cwd, this.snapshotDir);
+    args.push(`--exclude=${relSnapshotDir}`);
+    for (const pattern of this.excludePatterns) {
+      args.push(`--exclude=${pattern}`);
+    }
+    return args;
+  }
+
+  private listSnapshots(): string[] {
+    if (!existsSync(this.snapshotDir)) return [];
+    return readdirSync(this.snapshotDir)
+      .filter(f => f.endsWith(".tar.gz"))
+      .sort(); // lexicographic = chronological since filenames start with timestamp
+  }
+
+  private rotateSnapshots(): void {
+    const snapshots = this.listSnapshots();
+    const excess = snapshots.length - this.maxSnapshots;
+    if (excess <= 0) return;
+    for (let i = 0; i < excess; i++) {
+      const fullPath = join(this.snapshotDir, snapshots[i]);
+      try { unlinkSync(fullPath); } catch {}
+    }
+  }
+
+  // ── WorkspaceProvider ─────────────────────────────────────────────────────
+
+  async snapshot(label?: string): Promise<WorkspaceState> {
+    const ts = new Date().toISOString();
+    const safeTs = ts.replace(/[:.]/g, "-");
+    const safeLabel = (label ?? "snapshot").replace(/[^a-zA-Z0-9_-]/g, "_");
+    const filename = `${safeTs}-${safeLabel}.tar.gz`;
+    const fullPath = join(this.snapshotDir, filename);
+
+    const args = [
+      "czf", fullPath,
+      ...this.tarExcludeArgs(),
+      "-C", this.cwd,
+      ".",
+    ];
+
+    // S47-A: shell: false (spawnSync default)
+    const result = spawnSync("tar", args, { encoding: "utf-8" });
+    if (result.status !== 0) {
+      throw new Error(`tar snapshot failed: ${result.stderr ?? result.stdout ?? "unknown error"}`);
+    }
+
+    this.rotateSnapshots();
+
+    return {
+      ref: filename,
+      label: label ?? `snapshot-${safeTs}`,
+      timestamp: ts,
+      provider: "filesystem",
+      metadata: { snapshotDir: this.snapshotDir },
+    };
+  }
+
+  async reset(to: StateRef): Promise<void> {
+    const ref = typeof to === "string" ? to : to.ref;
+    const fullPath = this.validateSnapshotRef(ref);
+
+    if (!existsSync(fullPath)) {
+      throw new Error(`Snapshot not found: ${ref}`);
+    }
+
+    // Backup current state before reset
+    try {
+      await this.snapshot("pre-reset-backup");
+    } catch {
+      // non-fatal — proceed with reset
+    }
+
+    // Extract snapshot over cwd
+    const args = [
+      "xzf", fullPath,
+      "-C", this.cwd,
+    ];
+
+    const result = spawnSync("tar", args, { encoding: "utf-8" });
+    if (result.status !== 0) {
+      throw new Error(`tar reset failed: ${result.stderr ?? result.stdout ?? "unknown error"}`);
+    }
+  }
+
+  async checkpoint(label: string, message?: string): Promise<WorkspaceState> {
+    const state = await this.snapshot(label);
+
+    // Write to Flair if configured
+    if (this.flair && this.agentId) {
+      try {
+        const record: WorkspaceStateRecord = {
+          id: `${this.agentId}-${Date.now()}`,
+          agentId: this.agentId,
+          ref: state.ref,
+          label: state.label ?? label,
+          provider: "filesystem",
+          timestamp: state.timestamp,
+          metadata: message ? JSON.stringify({ message }) : undefined,
+          summary: message,
+          createdAt: state.timestamp,
+        };
+        await this.flair.writeWorkspaceState(record);
+      } catch (err: any) {
+        console.warn(`[workspace] Flair checkpoint write failed (non-fatal): ${err.message}`);
+      }
+    }
+
+    return state;
+  }
+
+  async diff(from: StateRef): Promise<WorkspaceChanges> {
+    const ref = typeof from === "string" ? from : from.ref;
+    const fullPath = this.validateSnapshotRef(ref);
+
+    if (!existsSync(fullPath)) {
+      return { summary: `Snapshot ${ref} not found`, files: [] };
+    }
+
+    // Extract old snapshot to temp dir
+    const tempDir = join(tmpdir(), `tps-diff-${Date.now()}`);
+    mkdirSync(tempDir, { recursive: true });
+
+    const extractResult = spawnSync("tar", ["xzf", fullPath, "-C", tempDir], { encoding: "utf-8" });
+    if (extractResult.status !== 0) {
+      return { summary: `Failed to extract snapshot: ${extractResult.stderr}`, files: [] };
+    }
+
+    // Diff file trees
+    const diffResult = spawnSync("diff", ["-rq", tempDir, this.cwd], {
+      encoding: "utf-8",
+      timeout: 30_000,
+    });
+
+    // Clean up temp dir
+    spawnSync("rm", ["-rf", tempDir]);
+
+    const stdout = (diffResult.stdout ?? "").trim();
+    const lines = stdout ? stdout.split("\n") : [];
+
+    // Parse diff output: "Files X and Y differ" or "Only in X: file"
+    const files: string[] = [];
+    for (const line of lines) {
+      // Skip snapshot dir entries
+      if (line.includes(".tps/snapshots")) continue;
+      const onlyIn = line.match(/^Only in (.+): (.+)$/);
+      if (onlyIn) {
+        const dir = onlyIn[1];
+        const name = onlyIn[2];
+        const fullFile = join(dir, name);
+        const rel = fullFile.startsWith(this.cwd) ? relative(this.cwd, fullFile) : relative(tempDir, fullFile);
+        files.push(rel);
+      }
+      const differ = line.match(/^Files .+ and (.+) differ$/);
+      if (differ) {
+        const rel = relative(this.cwd, differ[1]);
+        files.push(rel);
+      }
+    }
+
+    return {
+      summary: `${files.length} file(s) changed since ${ref}`,
+      files,
+      details: stdout.slice(0, 10_000) || undefined,
+    };
+  }
+
+  async baseline(): Promise<WorkspaceState> {
+    const snapshots = this.listSnapshots();
+    if (snapshots.length > 0) {
+      const oldest = snapshots[0];
+      return {
+        ref: oldest,
+        label: `baseline-${oldest}`,
+        timestamp: oldest.split("-").slice(0, 3).join("-"), // approximate from filename
+        provider: "filesystem",
+      };
+    }
+
+    // No snapshots yet — snapshot current state as baseline
+    return this.snapshot("baseline");
   }
 }
