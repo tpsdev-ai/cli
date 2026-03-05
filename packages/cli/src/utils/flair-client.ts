@@ -101,6 +101,30 @@ export interface FlairAgent {
   createdAt?: string;
 }
 
+export interface SkillAssignment {
+  id: string;
+  agentId: string;
+  key: "skill-assignment";
+  value: string;
+  priority?: "critical" | "high" | "standard" | "low";
+  metadata?: string; // JSON: { source, version, hash, reviewedAt, reviewedBy, status }
+  durability: "permanent";
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface SkillScanViolation {
+  type: string;
+  line: number;
+  content: string;
+}
+
+export interface SkillScanResult {
+  safe: boolean;
+  violations: SkillScanViolation[];
+  riskLevel: "low" | "medium" | "high" | "critical";
+}
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -507,6 +531,56 @@ export class FlairClient {
     } catch {
       return null;
     }
+  }
+
+  // ─── Skill governance (ops-31.4) ─────────────────────────────────────────
+
+  async scanSkill(content: string): Promise<SkillScanResult> {
+    return this.request<SkillScanResult>("POST", "/SkillScan/", { content });
+  }
+
+  async listSkills(agentId: string): Promise<SkillAssignment[]> {
+    const allSoul = await this.request<SkillAssignment[]>(
+      "GET",
+      `/Soul/?agentId=${encodeURIComponent(agentId)}`,
+    );
+    return allSoul.filter((s) => s.key === "skill-assignment");
+  }
+
+  async registerSkill(
+    agentId: string,
+    skill: {
+      name: string;
+      priority?: "critical" | "high" | "standard" | "low";
+      source: string;
+      version: string;
+      content: string;
+    },
+  ): Promise<void> {
+    const id = `${agentId}-skill-assignment-${skill.name}`;
+    const metadata = JSON.stringify({
+      source: skill.source,
+      version: skill.version,
+      hash: skill.version,
+      reviewedAt: new Date().toISOString(),
+      reviewedBy: this.agentId,
+      status: "active",
+    });
+    await this.request("PUT", `/Soul/${encodeURIComponent(id)}`, {
+      id,
+      agentId,
+      key: "skill-assignment",
+      value: skill.name,
+      priority: skill.priority ?? "standard",
+      metadata,
+      durability: "permanent",
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  async revokeSkill(agentId: string, skillName: string): Promise<void> {
+    const id = `${agentId}-skill-assignment-${skillName}`;
+    await this.request("DELETE", `/Soul/${encodeURIComponent(id)}`);
   }
 
   async ping(): Promise<boolean> {

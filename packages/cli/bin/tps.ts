@@ -26,6 +26,7 @@ const cli = meow(
     branch <action>   Branch office node (init/start/stop/status/log)
     stats            Aggregate structured JSONL telemetry events
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
+    skill <action>    Skill governance (list/register/scan/revoke/show)
     flair install|start|stop|restart|status|logs  Flair (Harper backend) launchd service
 
   Options
@@ -111,6 +112,8 @@ const cli = meow(
       desc: { type: "string" },
       id: { type: "string" },
       fromBeginning: { type: "boolean", default: false },
+      priority: { type: "string" },
+      version: { type: "string" },
     },
   }
 );
@@ -720,6 +723,41 @@ async function main() {
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
         json: cli.flags.json,
+      });
+      break;
+    }
+
+    case "skill": {
+      const action = rest[0] as "list" | "register" | "scan" | "revoke" | "show" | undefined;
+      const validSkillActions = ["list", "register", "scan", "revoke", "show"];
+      if (!action || !validSkillActions.includes(action)) {
+        console.error(
+          "Usage:\n" +
+          "  tps skill list --agent <id>                                    List skills assigned to an agent\n" +
+          "  tps skill register <source> --name <n> --version <hash> --agent <id> [--priority standard]\n" +
+          "  tps skill scan <file>                                          Static analysis of skill content\n" +
+          "  tps skill revoke <name> --agent <id>                           Remove skill assignment\n" +
+          "  tps skill show <name> --agent <id>                             Show skill details"
+        );
+        process.exit(1);
+      }
+
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
+
+      const { runSkill } = await import("../src/commands/skill.js");
+      await runSkill({
+        action,
+        agent: getFlag("agent") ?? cli.flags.agent,
+        name: getFlag("name") ?? cli.flags.name,
+        version: getFlag("version"),
+        source: action === "register" ? rest[1] : undefined,
+        file: action === "scan" ? rest[1] : (action === "register" ? rest[1] : undefined),
+        priority: getFlag("priority"),
+        json: cli.flags.json,
+        flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
       });
       break;
     }
