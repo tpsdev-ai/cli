@@ -66,6 +66,21 @@ export interface ConsolidateResult {
   prompt: string;
 }
 
+export interface WorkspaceStateRecord {
+  id: string;
+  agentId: string;
+  ref: string;
+  label?: string;
+  provider: string;
+  timestamp: string;
+  metadata?: string;       // JSON blob
+  taskId?: string;
+  phase?: string;          // "pre-task" | "post-task" | "failure" | "boot"
+  summary?: string;
+  filesChanged?: string[];
+  createdAt: string;
+}
+
 export interface FlairAgent {
   id: string;
   name: string;
@@ -434,6 +449,20 @@ export class FlairClient {
       olderThan: opts.olderThan ?? "30d",
       limit: opts.limit ?? 20,
     });
+  }
+
+  // ─── Workspace state (OPS-47 Phase 2) ────────────────────────────────────
+
+  async writeWorkspaceState(state: WorkspaceStateRecord): Promise<void> {
+    await this.request("PUT", `/WorkspaceState/${encodeURIComponent(state.id)}`, state);
+  }
+
+  async getLatestWorkspaceState(agentId: string): Promise<WorkspaceStateRecord | null> {
+    try {
+      return await this.request<WorkspaceStateRecord>("GET", `/WorkspaceLatest/${encodeURIComponent(agentId)}`);
+    } catch {
+      return null;
+    }
   }
 
   async ping(): Promise<boolean> {
