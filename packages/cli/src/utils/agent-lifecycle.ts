@@ -143,24 +143,41 @@ Always commit your work before mailing ${supervisor}:
 export async function searchPastExperience(
   flair: FlairClient,
   taskDescription: string,
+  workspacePath?: string,
 ): Promise<string> {
   try {
     const flairOnline = await flair.ping();
-    if (!flairOnline) return "";
-
-    const searchResults = await flair.search(taskDescription.slice(0, 200), 5);
-    if (searchResults.length === 0) return "";
-
-    const experienceBlock = searchResults
-      .map(r => `- ${r.content?.slice(0, 200) ?? r.id}`)
-      .join("\n");
-    return `## Relevant Past Experience\n${experienceBlock}`;
+    if (flairOnline) {
+      const searchResults = await flair.search(taskDescription.slice(0, 200), 5);
+      if (searchResults.length > 0) {
+        const experienceBlock = searchResults
+          .map(r => `- ${r.content?.slice(0, 200) ?? r.id}`)
+          .join("\n");
+        return `## Relevant Past Experience\n${experienceBlock}`;
+      }
+    }
   } catch (err: any) {
-    console.warn("[flair] SearchMemories failed (non-fatal):", err.message);
-    return "";
+    console.warn("[flair] FindMemories failed (non-fatal):", err.message);
   }
-}
 
+  // Belt and suspenders: fall back to local MEMORY.md if Flair unavailable or empty
+  if (workspacePath) {
+    try {
+      const memoryPath = join(workspacePath, "MEMORY.md");
+      if (existsSync(memoryPath)) {
+        const content = readFileSync(memoryPath, "utf-8").slice(0, 3000);
+        if (content.trim()) {
+          console.warn("[flair] Using MEMORY.md fallback for past experience");
+          return `## Past Experience (local fallback)\n${content}`;
+        }
+      }
+    } catch {
+      // Silent — best effort fallback
+    }
+  }
+
+  return "";
+}
 // ── Task memory writes ─────────────────────────────────────────────────────
 
 /**
