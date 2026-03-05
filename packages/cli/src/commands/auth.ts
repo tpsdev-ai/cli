@@ -16,7 +16,7 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 
 const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
@@ -24,6 +24,8 @@ const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+// OpenAI OAuth: Codex CLI uses ChatGPT OAuth. Refresh endpoint follows standard OAuth2.
+const OPENAI_TOKEN_URL = "https://auth.openai.com/oauth/token";
 
 export interface AuthArgs {
   action: "login" | "status" | "revoke" | "refresh";
@@ -236,6 +238,117 @@ function syncToGeminiCli(creds: StoredCredentials): void {
   }
 }
 
+
+async function loginOpenAI(): Promise<void> {
+  const codexPath = findCli("codex");
+  if (!codexPath) {
+    console.error(
+      "Codex CLI not found. Install it first:\n" +
+      "  npm install -g @openai/codex\n" +
+      "  https://github.com/openai/codex"
+    );
+    process.exit(1);
+  }
+
+  console.log("Running 'codex' login — authenticate in your browser...\n");
+  // Codex CLI opens browser interactively when no valid session exists.
+  // Spawning with stdio=inherit so the user can complete the flow.
+  const result = spawnSync(codexPath, [], {
+    stdio: "inherit",
+    timeout: 120_000,
+    env: { ...process.env, CODEX_QUIET_MODE: "1" },
+  });
+
+  // codex may exit non-zero even on success (first-run flow quirks) — still try to read creds
+  const creds = readCodexCredentials();
+  if (!creds) {
+    if (result.status !== 0) {
+      console.error("Codex login failed and no credentials found.");
+      process.exit(1);
+    }
+    console.error("Codex exited OK but no credentials found at ~/.codex/auth.json.");
+    process.exit(1);
+  }
+
+  saveCredentials("openai", creds);
+  console.log(`\nopenai     ✓ OAuth configured — ${humanExpiry(creds.expiresAt)}`);
+}
+
+/**
+ * Discover Codex CLI credential store.
+ * Codex stores credentials at ~/.codex/auth.json (file mode) or OS keyring.
+ * We only support file mode — keyring is not scriptable cross-platform.
+ * Format: { accessToken, refreshToken, expiresAt, clientId, scopes, ... }
+ */
+function readCodexCredentials(): StoredCredentials | null {
+  const home = process.env.HOME || homedir();
+  const codexHome = process.env.CODEX_HOME || join(home, ".codex");
+  const candidates = [
+    join(codexHome, "auth.json"),
+    join(home, ".config", "codex", "auth.json"),
+  ];
+
+  for (const credPath of candidates) {
+    if (!existsSync(credPath)) continue;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      // Codex auth.json format: { accessToken, refreshToken, expiresAt, ... }
+      const accessToken = data.accessToken ?? data.access_token;
+      const refreshToken = data.refreshToken ?? data.refresh_token;
+      if (!accessToken || !refreshToken) continue;
+
+      return {
+        provider: "openai",
+        refreshToken: String(refreshToken),
+        accessToken: String(accessToken),
+        expiresAt: Number(data.expiresAt ?? data.expires_at ?? 0),
+        clientId: String(data.clientId ?? data.client_id ?? ""),
+        scopes: String(data.scopes ?? data.scope ?? ""),
+      };
+    } catch {
+      // try next
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Sync refreshed token back to Codex CLI's auth.json.
+ * Atomic write: write to .tmp then rename to prevent partial reads.
+ */
+function syncToCodexCli(creds: StoredCredentials): void {
+  const home = process.env.HOME || homedir();
+  const codexHome = process.env.CODEX_HOME || join(home, ".codex");
+  const candidates = [
+    join(codexHome, "auth.json"),
+    join(home, ".config", "codex", "auth.json"),
+  ];
+
+  for (const credPath of candidates) {
+    if (!existsSync(credPath)) continue;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+
+      // Update token fields — preserve all other Codex metadata
+      if ("accessToken" in data) data.accessToken = creds.accessToken;
+      if ("access_token" in data) data.access_token = creds.accessToken;
+      if ("refreshToken" in data) data.refreshToken = creds.refreshToken;
+      if ("refresh_token" in data) data.refresh_token = creds.refreshToken;
+      if ("expiresAt" in data) data.expiresAt = creds.expiresAt;
+      if ("expires_at" in data) data.expires_at = creds.expiresAt;
+
+      // Atomic write: tmp → rename
+      const tmpPath = credPath + ".tmp";
+      writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      renameSync(tmpPath, credPath);
+      return;
+    } catch {
+      // Best-effort — don't crash the proxy if sync fails
+    }
+  }
+}
+
 export async function refreshAnthropicToken(creds: StoredCredentials): Promise<StoredCredentials> {
   const res = await fetch(ANTHROPIC_TOKEN_URL, {
     method: "POST",
@@ -302,6 +415,46 @@ export async function refreshGoogleToken(creds: StoredCredentials): Promise<Stor
   return refreshed;
 }
 
+
+export async function refreshOpenAIToken(creds: StoredCredentials): Promise<StoredCredentials> {
+  if (!creds.clientId) {
+    throw new Error("OpenAI OAuth refresh requires clientId. Re-login with: tps auth login openai");
+  }
+
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: creds.clientId,
+    refresh_token: creds.refreshToken,
+  });
+
+  const res = await fetch(OPENAI_TOKEN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      // No Authorization header for public client token refresh
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    // Do NOT log response body — it may contain token details
+    throw new Error(`OpenAI token refresh failed (${res.status})`);
+  }
+
+  const token = (await res.json()) as any;
+  const refreshed: StoredCredentials = {
+    ...creds,
+    accessToken: token.access_token,
+    refreshToken: token.refresh_token || creds.refreshToken,
+    expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000,
+    scopes: token.scope || creds.scopes,
+  };
+
+  // Sync back to Codex CLI (atomic write)
+  await syncToCodexCli(refreshed);
+  return refreshed;
+}
+
 export function showStatus(): void {
   const providers = ["anthropic", "google", "openai"];
 
@@ -332,8 +485,10 @@ export async function runAuth(args: AuthArgs): Promise<void> {
         await loginAnthropic();
       } else if (args.provider === "google") {
         await loginGoogle();
+      } else if (args.provider === "openai") {
+        await loginOpenAI();
       } else {
-        console.error("Supported providers: anthropic, google\n  tps auth login anthropic\n  tps auth login google");
+        console.error("Supported providers: anthropic, google, openai\n  tps auth login anthropic\n  tps auth login google\n  tps auth login openai");
         process.exit(1);
       }
       return;
@@ -348,8 +503,8 @@ export async function runAuth(args: AuthArgs): Promise<void> {
       await revokeProvider(args.provider);
       return;
     case "refresh":
-      if (args.provider !== "anthropic" && args.provider !== "google") {
-        console.error("Supported refresh providers: anthropic, google.");
+      if (args.provider !== "anthropic" && args.provider !== "google" && args.provider !== "openai") {
+        console.error("Supported refresh providers: anthropic, google, openai.");
         process.exit(1);
       }
       {
@@ -361,6 +516,8 @@ export async function runAuth(args: AuthArgs): Promise<void> {
         }
         const refreshed = provider === "anthropic"
           ? await refreshAnthropicToken(creds)
+          : provider === "openai"
+          ? await refreshOpenAIToken(creds)
           : await refreshGoogleToken(creds);
         saveCredentials(provider, refreshed);
         console.log(`${provider.padEnd(10)} ✓ refreshed — ${humanExpiry(refreshed.expiresAt)}`);
