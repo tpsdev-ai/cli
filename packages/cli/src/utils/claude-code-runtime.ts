@@ -411,7 +411,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         // Non-blocking: write task completion memory to Flair
         try {
           const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-          const memId = randomUUID();
+          const memId = `${agentId}-${Date.now()}`;
           const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
           await Promise.race([taskFlair.writeMemory(memId, "Completed: " + msg.body.slice(0, 80) + "\n" + summary), timeout]);
         } catch (memErr: any) {
@@ -430,7 +430,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           // Non-blocking: write task failure memory to Flair
           try {
             const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
-            const memId = randomUUID();
+            const memId = `${agentId}-${Date.now()}`;
             const failTimeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
             await Promise.race([taskFlair.writeMemory(memId, "Failed: " + msg.body.slice(0, 80) + "\n" + err.message), failTimeout]);
           } catch (memErr: any) {
