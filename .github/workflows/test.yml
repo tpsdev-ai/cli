@@ -77,7 +77,9 @@ jobs:
       - name: Build agent package (required by CLI compile)
         run: cd packages/agent && bun run build
       - name: Build compiled binary
-        run: cd packages/cli && bun build --compile bin/tps.ts --target=bun-linux-x64 --outfile=dist/tps-smoke
+        run: |
+          PKG_VERSION=$(node -p "require('./packages/cli/package.json').version")
+          cd packages/cli && bun build --compile bin/tps.ts --target=bun-linux-x64 --define "INJECTED_VERSION=\"$PKG_VERSION\"" --outfile=dist/tps-smoke
       - name: Smoke test
         run: ./packages/cli/dist/tps-smoke --version
 
