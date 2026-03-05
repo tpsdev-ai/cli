@@ -512,7 +512,8 @@ export class FlairClient {
     try {
       return await this.request<OrgEvent[]>(
         "GET",
-        `/OrgEventCatchup/${encodeURIComponent(participantId)}?since=${encodeURIComponent(since.toISOString())}`,
+        // Harper requires full ISO with milliseconds (.000Z) and no encoding of colons.
+        `/OrgEventCatchup/${encodeURIComponent(participantId)}?since=${since.toISOString()}`,
       );
     } catch {
       return [];
