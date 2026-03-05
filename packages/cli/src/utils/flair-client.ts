@@ -81,6 +81,19 @@ export interface WorkspaceStateRecord {
   createdAt: string;
 }
 
+export interface OrgEvent {
+  id: string;
+  authorId: string;
+  kind: string;
+  scope?: string;
+  summary: string;
+  detail?: string;
+  targetIds?: string[];
+  refId?: string;
+  createdAt: string;
+  expiresAt?: string;
+}
+
 export interface FlairAgent {
   id: string;
   name: string;
@@ -449,6 +462,37 @@ export class FlairClient {
       olderThan: opts.olderThan ?? "30d",
       limit: opts.limit ?? 20,
     });
+  }
+
+  // ─── Org events ─────────────────────────────────────────────────────────
+
+  async publishEvent(event: {
+    kind: string;
+    scope?: string;
+    summary: string;
+    detail?: string;
+    targetIds?: string[];
+    refId?: string;
+    expiresAt?: string;
+  }): Promise<void> {
+    const id = `${this.agentId}-${Date.now()}`;
+    await this.request("POST", "/OrgEvent/", {
+      id,
+      authorId: this.agentId,
+      ...event,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  async getEventsSince(participantId: string, since: Date): Promise<OrgEvent[]> {
+    try {
+      return await this.request<OrgEvent[]>(
+        "GET",
+        `/OrgEventCatchup/${encodeURIComponent(participantId)}?since=${encodeURIComponent(since.toISOString())}`,
+      );
+    } catch {
+      return [];
+    }
   }
 
   // ─── Workspace state (OPS-47 Phase 2) ────────────────────────────────────

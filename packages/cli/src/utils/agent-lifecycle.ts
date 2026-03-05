@@ -13,7 +13,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
-import type { WorkspaceStateRecord } from "./flair-client.js";
+import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
 import { catchUpTopics as _catchUpTopics } from "./mail-topics.js";
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 
@@ -224,8 +224,9 @@ export async function onBoot(
   workspace: WorkspaceProvider,
   flair: FlairClient,
   agentId: string,
-): Promise<{ lastCheckpoint?: WorkspaceState }> {
+): Promise<{ lastCheckpoint?: WorkspaceState; recentEvents?: OrgEvent[] }> {
   let lastCheckpoint: WorkspaceState | undefined;
+  let lastBootAt: string | undefined;
 
   try {
     const latest = await flair.getLatestWorkspaceState(agentId);
@@ -238,12 +239,34 @@ export async function onBoot(
         provider: latest.provider,
         metadata: latest.metadata ? JSON.parse(latest.metadata) : undefined,
       };
+      // Extract lastBootAt from metadata if stored
+      if (latest.metadata) {
+        try {
+          const meta = JSON.parse(latest.metadata);
+          if (meta.lastBootAt) lastBootAt = meta.lastBootAt;
+        } catch {}
+      }
+      // Fall back to latest checkpoint timestamp
+      if (!lastBootAt) lastBootAt = latest.timestamp;
     }
   } catch (err: any) {
     console.warn(`[${agentId}] Flair workspace state query failed (non-fatal): ${err.message}`);
   }
 
-  // Checkpoint current state as boot marker
+  // Fetch recent OrgEvents since last boot
+  let recentEvents: OrgEvent[] = [];
+  try {
+    const since = lastBootAt ? new Date(lastBootAt) : new Date(Date.now() - 24 * 3600_000);
+    recentEvents = await flair.getEventsSince(agentId, since);
+    if (recentEvents.length > 0) {
+      console.log(`[${agentId}] ${recentEvents.length} org events since last boot`);
+    }
+  } catch (err: any) {
+    console.warn(`[${agentId}] OrgEvent catchup failed (non-fatal): ${err.message}`);
+  }
+
+  // Checkpoint current state as boot marker, store lastBootAt
+  const bootTimestamp = new Date().toISOString();
   try {
     const bootState = await workspace.checkpoint("boot");
     if (flair && agentId) {
@@ -254,6 +277,7 @@ export async function onBoot(
         label: bootState.label ?? "boot",
         provider: workspace.type,
         timestamp: bootState.timestamp,
+        metadata: JSON.stringify({ lastBootAt: bootTimestamp }),
         phase: "boot",
         createdAt: bootState.timestamp,
       };
@@ -263,7 +287,7 @@ export async function onBoot(
     console.warn(`[${agentId}] Boot checkpoint failed (non-fatal): ${err.message}`);
   }
 
-  return { lastCheckpoint };
+  return { lastCheckpoint, recentEvents };
 }
 
 /**
@@ -343,6 +367,18 @@ export async function onTaskComplete(
     console.warn(`[${agentId}] Post-task Flair write failed (non-fatal): ${err.message}`);
   }
 
+  // Publish task_done OrgEvent
+  try {
+    await flair.publishEvent({
+      kind: "task_done",
+      summary: `${agentId} completed task ${taskId}`,
+      detail: learned ?? undefined,
+      refId: taskId,
+    });
+  } catch (err: any) {
+    console.warn(`[${agentId}] OrgEvent task_done publish failed (non-fatal): ${err.message}`);
+  }
+
   // Write structured task memory
   const memId = `${agentId}-task-${taskId}-${Date.now()}`;
   const memory = JSON.stringify({
@@ -417,6 +453,18 @@ export async function onTaskFailure(
     await flair.writeWorkspaceState(record);
   } catch (err: any) {
     console.warn(`[${agentId}] Failure Flair write failed (non-fatal): ${err.message}`);
+  }
+
+  // Publish blocker OrgEvent
+  try {
+    await flair.publishEvent({
+      kind: "blocker",
+      summary: `${agentId} hit blocker on task ${taskId}: ${error.slice(0, 100)}`,
+      detail: error.slice(0, 500),
+      refId: taskId,
+    });
+  } catch (err2: any) {
+    console.warn(`[${agentId}] OrgEvent blocker publish failed (non-fatal): ${err2.message}`);
   }
 
   // Write failure memory
