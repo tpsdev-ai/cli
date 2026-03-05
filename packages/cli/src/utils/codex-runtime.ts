@@ -111,14 +111,13 @@ async function runCodex(
   taskTimeoutMs: number,
 ): Promise<string> {
   const systemPrompt = await buildSystemPrompt(message, config);
-  const model = config.model ?? "gpt-4.1";
   const sandboxMode = config.sandboxMode ?? "workspace-write";
 
   const prompt = [systemPrompt, "", `[Mail from: ${message.from}]`, message.body].join("\n");
 
   const args = [
     "exec", "--json", "--ephemeral",
-    "--model", model,
+    ...(config.model ? ["--model", config.model] : []),
     "--sandbox", sandboxMode,
     "--cd", config.workspace,
     "-",
