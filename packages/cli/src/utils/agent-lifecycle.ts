@@ -154,7 +154,8 @@ export async function searchPastExperience(
       .map(r => `- ${r.content?.slice(0, 200) ?? r.id}`)
       .join("\n");
     return `## Relevant Past Experience\n${experienceBlock}`;
-  } catch {
+  } catch (err: any) {
+    console.warn("[flair] SearchMemories failed (non-fatal):", err.message);
     return "";
   }
 }
