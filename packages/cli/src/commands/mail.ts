@@ -23,7 +23,28 @@ interface MailArgs {
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
-  const id = override || process.env.TPS_AGENT_ID || await loadHostIdentityId() || "unknown";
+  // Fast path: explicit override or env var — no vault I/O needed
+  if (override) {
+    const safe = sanitizeIdentifier(override);
+    if (safe !== override) {
+      console.error(`Invalid agent id: ${override}`);
+      process.exit(1);
+    }
+    return override;
+  }
+  if (process.env.TPS_AGENT_ID) return process.env.TPS_AGENT_ID;
+
+  // Check host.json on disk before touching the vault (vault decrypt is expensive)
+  const hostJsonPath = join(process.env.HOME || homedir(), ".tps", "identity", "host.json");
+  if (existsSync(hostJsonPath)) {
+    try {
+      const parsed = JSON.parse(readFileSync(hostJsonPath, "utf-8"));
+      if (parsed?.hostId) return String(parsed.hostId);
+    } catch { /* fall through */ }
+  }
+
+  // Fallback: full vault resolution (may be slow if vault file present + TPS_VAULT_KEY unset)
+  const id = await loadHostIdentityId() || "unknown";
   const safe = sanitizeIdentifier(id);
   if (safe !== id) {
     console.error(`Invalid agent id: ${id}`);
