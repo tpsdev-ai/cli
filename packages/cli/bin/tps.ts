@@ -276,7 +276,8 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          if (process.argv.includes("--runtime") && process.argv[process.argv.indexOf("--runtime") + 1] === "claude-code") {
+          const runtimeArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : undefined;
+          if (runtimeArg === "claude-code" || runtimeArg === "codex") {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
             const { join } = await import("node:path");
             const { homedir } = await import("node:os");
@@ -314,19 +315,34 @@ async function main() {
               }
             }
 
-            const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
-            await runClaudeCodeRuntime({
-              agentId: agentId!,
-              workspace: agentWorkspace,
-              mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
-              model: agentCfg.llm?.model,
-              allowedTools: ["Bash", "Read", "Write", "Edit"],
-              extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
-              taskTimeoutMs: agentCfg.taskTimeoutMs,
-              flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
-              flairKeyPath: agentCfg.flair?.keyPath,
-              workspaceProvider,
-            });
+            if (runtimeArg === "codex") {
+              const { runCodexRuntime } = await import("../src/utils/codex-runtime.js");
+              await runCodexRuntime({
+                agentId: agentId!,
+                workspace: agentWorkspace,
+                mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
+                model: agentCfg.llm?.model ?? "gpt-4.1",
+                extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
+                taskTimeoutMs: agentCfg.taskTimeoutMs,
+                flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
+                flairKeyPath: agentCfg.flair?.keyPath,
+                workspaceProvider,
+              });
+            } else {
+              const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
+              await runClaudeCodeRuntime({
+                agentId: agentId!,
+                workspace: agentWorkspace,
+                mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
+                model: agentCfg.llm?.model,
+                allowedTools: ["Bash", "Read", "Write", "Edit"],
+                extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
+                taskTimeoutMs: agentCfg.taskTimeoutMs,
+                flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
+                flairKeyPath: agentCfg.flair?.keyPath,
+                workspaceProvider,
+              });
+            }
           } else {
             await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
           }
