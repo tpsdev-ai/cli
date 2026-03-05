@@ -417,6 +417,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     for (const msg of messages) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
+      const taskStartMs = Date.now();
       try {
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
@@ -428,12 +429,12 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           const taskFlair = new FlairClient({ baseUrl: config.flairUrl, agentId, keyPath: config.flairKeyPath });
           const memId = `${agentId}-${Date.now()}`;
           const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-          const taskStartMs = Date.now();
           const completionMemory = JSON.stringify({
             type: "task_completion",
             task: msg.body.slice(0, 80),
             summary: summary.slice(0, 500),
             timestamp: new Date().toISOString(),
+            durationMs: Date.now() - taskStartMs,
           });
           await Promise.race([taskFlair.writeMemory(memId, completionMemory), timeout]);
         } catch (memErr: any) {
