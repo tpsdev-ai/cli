@@ -28,7 +28,8 @@ import {
   refreshOpenAIToken,
   type StoredCredentials,
 } from "../commands/auth.js";
-import type { WorkspaceProvider } from "./workspace-provider.js";
+import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
+import { startTaskLoop } from "./flair-task-loop.js";
 
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
@@ -261,6 +262,48 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       throw err;
     }
   }
+
+
+  // Start Flair task loop (runs in parallel with mail loop)
+  startTaskLoop(flair, agentId, async (event) => {
+    const taskBody = event.detail ?? event.summary;
+    const taskId = event.refId ?? event.id;
+    let preTaskState: WorkspaceState | undefined;
+    if (workspaceProvider) {
+      try { preTaskState = await onTaskStart(workspaceProvider, flair, taskId); } catch (e) {
+        console.warn(`[${agentId}] Pre-task lifecycle failed: ${(e as Error).message}`);
+      }
+    }
+    try {
+      const msg: MailMessage = { id: taskId, from: event.authorId, to: agentId, body: taskBody, timestamp: new Date().toISOString() };
+      const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
+      const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
+      console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
+      sendMail(mailDir, agentId, event.authorId, `Task complete (via Flair):\n\n${summary}`);
+      try {
+        await (flair as any).request("POST", "/OrgEvent", {
+          kind: "task.completed", authorId: agentId, targetIds: [event.authorId],
+          summary: `Completed: ${event.summary}`, refId: taskId, scope: event.scope,
+        });
+      } catch { /* non-fatal */ }
+      if (workspaceProvider && preTaskState) {
+        try { await onTaskComplete(workspaceProvider, flair, taskId, preTaskState); } catch (e) {
+          console.warn(`[${agentId}] Post-task lifecycle failed: ${(e as Error).message}`);
+        }
+      } else {
+        await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
+      }
+    } catch (e) {
+      const err = e as Error;
+      console.error(`[${agentId}] Flair task failed:`, err.message);
+      sendMail(mailDir, agentId, event.authorId, `Task failed (via Flair): ${err.message}`);
+      if (workspaceProvider && preTaskState) {
+        try { await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message); } catch { /* */ }
+      } else {
+        await writeTaskMemory(flair, agentId, "failure", { task: taskBody, error: err.message });
+      }
+    }
+  });
 
   let lastSnapshot = Date.now();
   let lastTokenRefresh = Date.now();
