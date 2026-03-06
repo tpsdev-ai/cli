@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -34,6 +34,14 @@ export interface AgentArgs {
   flairUrl?: string;
   json?: boolean;
   force?: boolean;
+  repo?: string;
+  branchName?: string;
+  commitMessage?: string;
+  authorName?: string;
+  authorEmail?: string;
+  paths?: string[];
+  push?: boolean;
+  prTitle?: string;
   sandbox?: boolean;
   /** Internal: set by re-exec under nono, skips re-wrapping */
   sandboxed?: boolean;
@@ -431,6 +439,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
     case "decommission":
       return decommissionAgent(args);
 
+    case "commit":
+      return commitAgentChanges(args);
+
     case "run":
     case "start":
     case "health": {
@@ -522,5 +533,92 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       console.error(`Unknown agent action: ${_}`);
       process.exit(1);
     }
+  }
+}
+
+// ─── agent commit ─────────────────────────────────────────────────────────────
+
+const SAFE_GIT_REF_RE = /^[a-zA-Z0-9._/-]+$/;
+const SIMPLE_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function failWith(message: string, exitCode = 1): never {
+  console.error(message);
+  process.exit(exitCode);
+}
+
+function isWithinDir(root: string, target: string): boolean {
+  const rel = require("node:path").relative(root, target);
+  return rel === "" || (!rel.startsWith("..") && !rel.startsWith("/"));
+}
+
+function runGit(args: string[], cwd: string): { ok: boolean; stdout: string; stderr: string; status: number } {
+  const { spawnSync } = require("node:child_process");
+  const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  return { ok: r.status === 0, stdout: (r.stdout ?? "").trim(), stderr: (r.stderr ?? "").trim(), status: r.status ?? 1 };
+}
+
+function runGitOrFail(args: string[], cwd: string, label: string): string {
+  const r = runGit(args, cwd);
+  if (!r.ok) failWith(`${label} failed: ${r.stderr || r.stdout || `exit ${r.status}`}`);
+  return r.stdout;
+}
+
+async function commitAgentChanges(args: AgentArgs): Promise<void> {
+  const { repo, branchName, commitMessage, authorName, authorEmail, paths, push: doPush, prTitle } = args;
+
+  if (!repo || !branchName || !commitMessage || !authorName || !authorEmail) {
+    failWith("Usage: tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <file>] [--push] [--pr-title <title>]");
+  }
+  if (!SIMPLE_EMAIL_RE.test(authorEmail!)) failWith(`Invalid author email: ${authorEmail}`);
+  if (branchName!.startsWith("-") || !SAFE_GIT_REF_RE.test(branchName!)) failWith(`Invalid branch name: ${branchName}`);
+
+  const { resolve: resolvePath, relative: relativePath } = require("node:path");
+  const { existsSync: exists } = require("node:fs");
+  const repoPath = resolvePath(repo!);
+  if (!exists(repoPath)) failWith(`Repository path not found: ${repoPath}`);
+  if (!repoPath.startsWith("/")) failWith("Repository path must be absolute.");
+  const gitCheck = runGit(["rev-parse", "--is-inside-work-tree"], repoPath);
+  if (!gitCheck.ok || gitCheck.stdout !== "true") failWith(`Not a git repository: ${repoPath}`);
+
+  // Create or checkout branch
+  const branchExists = runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], repoPath).ok;
+  if (branchExists) {
+    runGitOrFail(["checkout", branchName!], repoPath, `checkout ${branchName}`);
+  } else {
+    runGitOrFail(["checkout", "-b", branchName!], repoPath, `create branch ${branchName}`);
+  }
+
+  // Stage changes
+  if (paths && paths.length > 0) {
+    const safePaths = paths.map((p) => {
+      const abs = resolvePath(repoPath, p);
+      if (!isWithinDir(repoPath, abs)) failWith(`Path escapes repo: ${p}`);
+      return relativePath(repoPath, abs) || ".";
+    });
+    runGitOrFail(["add", "--", ...safePaths], repoPath, "git add");
+  } else {
+    runGitOrFail(["add", "-A"], repoPath, "git add -A");
+  }
+
+  const diff = runGit(["diff", "--cached", "--quiet"], repoPath);
+  if (diff.status === 0) failWith("No changes staged for commit.");
+
+  runGitOrFail(["commit", "--author", `${authorName} <${authorEmail}>`, "-m", commitMessage!], repoPath, "git commit");
+  console.log(`Committed changes in ${repoPath} on branch ${branchName}.`);
+
+  if (!doPush) return;
+
+  runGitOrFail(["push", "-u", "origin", branchName!], repoPath, "git push");
+  console.log(`Pushed ${branchName} to origin.`);
+
+  // Open PR via gh-as
+  const agentHandle = authorEmail!.split("@")[0] ?? "";
+  const title = prTitle ?? commitMessage!;
+  const { spawnSync } = require("node:child_process");
+  const pr = spawnSync("gh-as", [agentHandle, "pr", "create", "--title", title, "--body", commitMessage!, "--head", branchName!], { cwd: repoPath, encoding: "utf-8" });
+  if (pr.status !== 0) {
+    console.warn(`PR creation failed: ${pr.stderr?.trim() ?? pr.stdout?.trim()}`);
+  } else {
+    console.log(`PR opened: ${pr.stdout?.trim()}`);
   }
 }
