@@ -21,7 +21,8 @@ afterEach(() => {
 describe("tps init", () => {
   test("scaffolds identity, config, and workspace", () => {
     const result = spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], {
-      encoding: "utf-8", env: { ...process.env },
+      encoding: "utf-8",
+      env: { ...process.env, HOME },  // ensure subprocess uses same HOME
     });
     expect(result.status).toBe(0);
     expect(existsSync(join(HOME, ".tps", "identity", `${TEST_ID}.key`))).toBe(true);
