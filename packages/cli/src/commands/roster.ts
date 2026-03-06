@@ -154,3 +154,119 @@ export function runRoster(args: RosterArgs): void {
     }
   }
 }
+
+// ─── roster dashboard ─────────────────────────────────────────────────────────
+
+interface FlairIdentity {
+  id: string;
+  agentId?: string;
+  name?: string;
+  role?: string;
+  status?: string;
+}
+
+interface OrgEventRecord {
+  id: string;
+  kind: string;
+  authorId: string;
+  summary: string;
+  createdAt: string;
+  refId?: string;
+}
+
+export async function runDashboard(opts: { flairUrl?: string; json?: boolean; keyPath?: string; agentId?: string }): Promise<void> {
+  const flairUrl = opts.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
+  const { join } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const { readFileSync, existsSync } = await import("node:fs");
+  const { createPrivateKey, sign } = await import("node:crypto");
+
+  const viewerId = opts.agentId ?? process.env.TPS_AGENT_ID ?? "anvil";
+  const keyPath = opts.keyPath ?? join(homedir(), ".tps", "identity", `${viewerId}.key`);
+
+  function makeAuth(method: string, urlPath: string): string | undefined {
+    if (!existsSync(keyPath)) return undefined;
+    try {
+      const raw = readFileSync(keyPath);
+      let privKey;
+      try { privKey = createPrivateKey(raw); } catch {
+        const h = Buffer.from("302e020100300506032b657004220420", "hex");
+        privKey = createPrivateKey({ key: Buffer.concat([h, raw]), format: "der", type: "pkcs8" });
+      }
+      const ts = Date.now().toString();
+      const nonce = Math.random().toString(36).slice(2, 10);
+      const sig = sign(null, Buffer.from(`${viewerId}:${ts}:${nonce}:${method}:${urlPath}`), privKey).toString("base64");
+      return `TPS-Ed25519 ${viewerId}:${ts}:${nonce}:${sig}`;
+    } catch { return undefined; }
+  }
+
+  // Fetch agents from Flair
+  let agents: FlairIdentity[] = [];
+  try {
+    const auth = makeAuth("GET", "/Agent/");
+    const res = await fetch(`${flairUrl}/Agent/`, auth ? { headers: { Authorization: auth } } : {});
+    if (res.ok) agents = await res.json() as FlairIdentity[];
+    else { console.error(`Cannot reach Flair at ${flairUrl} (HTTP ${res.status}). Is it running?`); process.exit(1); }
+  } catch {
+    console.error(`Cannot reach Flair at ${flairUrl}. Is it running?`);
+    process.exit(1);
+  }
+
+  if (agents.length === 0) {
+    console.log("No agents registered in Flair.");
+    return;
+  }
+
+  // Fetch recent OrgEvents for activity
+  const recentEvents: OrgEventRecord[] = [];
+  try {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace(/Z$/, ".000Z");
+    const auth = makeAuth("GET", `/OrgEventCatchup/${viewerId}?since=${since}`);
+    const res = await fetch(`${flairUrl}/OrgEventCatchup/${viewerId}?since=${since}`, auth ? { headers: { Authorization: auth } } : {});
+    if (res.ok) recentEvents.push(...(await res.json() as OrgEventRecord[]));
+  } catch { /* non-fatal */ }
+
+  // Build per-agent last event map
+  const lastEvent = new Map<string, OrgEventRecord>();
+  const lastTask = new Map<string, OrgEventRecord>();
+  for (const ev of recentEvents) {
+    if (!lastEvent.has(ev.authorId)) lastEvent.set(ev.authorId, ev);
+    if ((ev.kind === "task.assigned" || ev.kind === "task.completed") && !lastTask.has(ev.authorId)) {
+      lastTask.set(ev.authorId, ev);
+    }
+  }
+
+  if (opts.json) {
+    console.log(JSON.stringify(agents.map(a => ({
+      ...a,
+      lastEvent: lastEvent.get(a.id ?? a.agentId ?? ""),
+      lastTask: lastTask.get(a.id ?? a.agentId ?? ""),
+    })), null, 2));
+    return;
+  }
+
+  // Pretty print
+  const now = Date.now();
+  console.log(`\n⚒️  TPS Office Dashboard — ${agents.length} agents\n`);
+  console.log(`${"Agent".padEnd(16)} ${"Role".padEnd(12)} ${"Status".padEnd(10)} ${"Last Activity"}`);
+  console.log("─".repeat(72));
+
+  for (const agent of agents) {
+    const agId = agent.id ?? agent.agentId ?? "?"; const last = lastEvent.get(agId);
+    const task = lastTask.get(agId);
+    const ago = last
+      ? (() => {
+          const ms = now - new Date(last.createdAt).getTime();
+          if (ms < 60000) return `${Math.round(ms / 1000)}s ago`;
+          if (ms < 3600000) return `${Math.round(ms / 60000)}m ago`;
+          return `${Math.round(ms / 3600000)}h ago`;
+        })()
+      : "no activity";
+    const taskInfo = task ? ` [${task.kind}: ${(task.refId ?? task.summary).slice(0, 30)}]` : "";
+    const status = agent.status ?? "unknown";
+    console.log(
+      `${agId.padEnd(16)} ${(agent.role ?? "agent").padEnd(12)} ${status.padEnd(10)} ${ago}${taskInfo}`
+    );
+  }
+  console.log();
+}
