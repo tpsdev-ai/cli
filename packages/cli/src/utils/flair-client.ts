@@ -98,6 +98,7 @@ export interface FlairAgent {
   id: string;
   name: string;
   publicKey: string;
+  status?: string;
   createdAt?: string;
 }
 

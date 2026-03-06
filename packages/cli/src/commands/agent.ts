@@ -13,13 +13,14 @@
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -32,11 +33,42 @@ export interface AgentArgs {
   model?: string;
   flairUrl?: string;
   json?: boolean;
+  force?: boolean;
   sandbox?: boolean;
   /** Internal: set by re-exec under nono, skips re-wrapping */
   sandboxed?: boolean;
 }
 
+function archivePath(path: string, timestamp: string): string {
+  return `${path}.archived-${timestamp}`;
+}
+
+function archiveIfExists(path: string, timestamp: string): string | null {
+  if (!existsSync(path)) return null;
+  const archived = archivePath(path, timestamp);
+  renameSync(path, archived);
+  return archived;
+}
+
+async function confirmDecommission(agentId: string): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error("Refusing to prompt without a TTY. Re-run with --force to skip confirmation.");
+    process.exit(1);
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(
+      `Decommission agent '${agentId}'? This archives local state and marks the Flair agent decommissioned. Type '${agentId}' to continue: `,
+    );
+    if (answer.trim() !== agentId) {
+      console.error("Decommission cancelled.");
+      process.exit(1);
+    }
+  } finally {
+    rl.close();
+  }
+}
 // ─── create ──────────────────────────────────────────────────────────────────
 
 async function loadSoulFile(filePath: string): Promise<Record<string, string>> {
@@ -309,6 +341,80 @@ async function agentStatus(args: AgentArgs): Promise<void> {
   }
 }
 
+async function decommissionAgent(args: AgentArgs): Promise<void> {
+  const id = args.id;
+  if (!id) {
+    console.error("Usage: tps agent decommission --id <agent-id> [--force]");
+    process.exit(1);
+  }
+
+  if (!args.force) {
+    await confirmDecommission(id);
+  }
+
+  const timestamp = Date.now().toString();
+  const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
+  const identityDir = join(homedir(), ".tps", "identity");
+  const mailDir = join(homedir(), ".tps", "mail");
+  const agentsDir = join(homedir(), ".tps", "agents");
+
+  const keyPath = join(identityDir, `${id}.key`);
+  const pubPath = join(identityDir, `${id}.pub`);
+  const mailPath = join(mailDir, id);
+  const agentConfigPath = join(agentsDir, id);
+
+  const summary: Array<{ label: string; result: string }> = [];
+
+  const flair = createFlairClient(id, flairUrl);
+  if (existsSync(keyPath)) {
+    try {
+      (flair as unknown as { loadKey: () => unknown }).loadKey();
+    } catch (error) {
+      throw new Error(`Failed to load Flair signing key for ${id}: ${String(error)}`);
+    }
+  }
+
+  const archivedKey = archiveIfExists(keyPath, timestamp);
+  summary.push({
+    label: "Identity key",
+    result: archivedKey ?? "not found",
+  });
+
+  const archivedPub = archiveIfExists(pubPath, timestamp);
+  summary.push({
+    label: "Identity public key",
+    result: archivedPub ?? "not found",
+  });
+
+  try {
+    const agent = await flair.getAgent(id);
+    if (agent) {
+      await flair.updateAgent(id, { status: "decommissioned" });
+      summary.push({ label: "Flair agent", result: `status=decommissioned (${flairUrl})` });
+    } else {
+      summary.push({ label: "Flair agent", result: "not found" });
+    }
+  } catch (error) {
+    throw new Error(`Failed to archive Flair identity for ${id}: ${String(error)}`);
+  }
+
+  const archivedMail = archiveIfExists(mailPath, timestamp);
+  summary.push({
+    label: "Mail dir",
+    result: archivedMail ?? "not found",
+  });
+
+  const archivedConfig = archiveIfExists(agentConfigPath, timestamp);
+  summary.push({
+    label: "Agent config",
+    result: archivedConfig ?? "not found",
+  });
+
+  console.log(`Decommissioned agent '${id}'.`);
+  for (const item of summary) {
+    console.log(`  ${item.label}: ${item.result}`);
+  }
+}
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
 export async function runAgent(args: AgentArgs): Promise<void> {
@@ -321,6 +427,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
 
     case "status":
       return agentStatus(args);
+
+    case "decommission":
+      return decommissionAgent(args);
 
     case "run":
     case "start":
