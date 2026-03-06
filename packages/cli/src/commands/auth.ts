@@ -258,9 +258,11 @@ async function loginOpenAI(): Promise<void> {
     process.exit(1);
   }
 
-  // Detect headless/remote environment and use device auth flow
-  const isHeadless = !process.env.DISPLAY && (!process.stdout.isTTY || !!process.env.SSH_TTY || !!process.env.SSH_CLIENT);
-  const codexArgs = isHeadless ? ["login", "--device-auth"] : [];
+  // Detect headless environment: no DISPLAY and either no TTY or SSH session.
+  const hasTty = Boolean(process.stdin.isTTY || process.stdout.isTTY);
+  const isSshSession = Boolean(process.env.SSH_TTY || process.env.SSH_CLIENT);
+  const isHeadless = !process.env.DISPLAY && (!hasTty || isSshSession);
+  const codexArgs = ["login", ...(isHeadless ? ["--device-auth"] : [])];
   if (isHeadless) {
     console.log("Detected remote/headless environment. Using device auth flow...\n");
   } else {
