@@ -362,6 +362,7 @@ async function main() {
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
                 workspaceProvider,
+                autoCommit: agentCfg.autoCommit,
               });
             } else {
               const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");

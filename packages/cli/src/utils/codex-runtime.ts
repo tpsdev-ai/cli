@@ -4,7 +4,7 @@
  * Same interface as claude-code-runtime.ts.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   readFileSync, existsSync, mkdirSync, readdirSync,
   renameSync, writeFileSync, appendFileSync, createWriteStream,
@@ -68,6 +68,19 @@ async function ensureFreshOpenAIToken(agentId: string): Promise<void> {
 
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+export interface AutoCommitConfig {
+  /** Repository path to commit changes in (defaults to workspace) */
+  repo?: string;
+  /** Branch name prefix; task refId appended: e.g. "task/" -> "task/ops-68" */
+  branchPrefix?: string;
+  /** Commit author name (defaults to agentId) */
+  authorName?: string;
+  /** Commit author email (defaults to agentId@tps.dev) */
+  authorEmail?: string;
+  /** Push branch to origin and open PR after commit */
+  push?: boolean;
+}
+
 export interface CodexRuntimeConfig {
   agentId: string;
   workspace: string;
@@ -81,6 +94,8 @@ export interface CodexRuntimeConfig {
   flairUrl?: string;
   flairKeyPath?: string;
   workspaceProvider?: WorkspaceProvider;
+  /** If set, auto-commit workspace changes after each task completes */
+  autoCommit?: AutoCommitConfig;
 }
 
 interface MailMessage {
@@ -222,6 +237,47 @@ async function runCodex(
   });
 }
 
+/** Run tps agent commit for the given config + task. Non-fatal — logs on failure. */
+function runAutoCommit(
+  agentId: string,
+  workspace: string,
+  taskId: string,
+  cfg: AutoCommitConfig,
+): string | null {
+  const repo = cfg.repo ?? workspace;
+  const branchPrefix = cfg.branchPrefix ?? "task/";
+  const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
+  const authorName = cfg.authorName ?? agentId;
+  const authorEmail = cfg.authorEmail ?? `${agentId}@tps.dev`;
+  const tpsBin = join(homedir(), ".tps", "bin", "tps");
+  const [cmd, baseArgs] = existsSync(tpsBin)
+    ? [tpsBin, [] as string[]]
+    : ["bun", [join(import.meta.dirname, "../../bin/tps.ts")]];
+
+  const args = [
+    ...baseArgs,
+    "agent", "commit",
+    "--repo", repo,
+    "--branch", safeBranch,
+    "--message", `task complete: ${taskId}`,
+    "--author", authorName, authorEmail,
+    ...(cfg.push ? ["--push"] : []),
+  ];
+
+  console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${repo}`);
+  const result = spawnSync(cmd, args, { encoding: "utf-8" });
+  if (result.status === 0) {
+    const out = result.stdout?.trim() ?? "";
+    console.log(`[${agentId}] Auto-commit succeeded: ${out}`);
+    // Extract PR URL if push was enabled (gh pr create outputs the URL)
+    const prMatch = out.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+    return prMatch ? prMatch[0] : safeBranch;
+  } else {
+    console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${result.stderr?.trim() || result.stdout?.trim()}`);
+    return null;
+  }
+}
+
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
@@ -292,6 +348,19 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         }
       } else {
         await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
+      }
+      // Auto-commit if configured
+      if (config.autoCommit) {
+        const prRef = runAutoCommit(agentId, config.workspace, taskId, config.autoCommit);
+        if (prRef && config.autoCommit.push) {
+          try {
+            await (flair as any).request("POST", "/OrgEvent", {
+              kind: "pr.opened", authorId: agentId,
+              summary: `PR opened for ${taskId}`, refId: taskId,
+              detail: prRef,
+            });
+          } catch { /* non-fatal */ }
+        }
       }
     } catch (e) {
       const err = e as Error;
