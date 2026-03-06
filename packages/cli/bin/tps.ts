@@ -321,7 +321,7 @@ async function main() {
                 agentId: agentId!,
                 workspace: agentWorkspace,
                 mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
-                model: agentCfg.llm?.model ?? "gpt-4.1",
+                model: agentCfg.llm?.model,
                 extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
