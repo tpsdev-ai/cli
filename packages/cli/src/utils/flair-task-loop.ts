@@ -10,6 +10,9 @@
  */
 
 import type { FlairClient } from "./flair-client.js";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { join } from "path";
+import { homedir } from "os";
 
 export interface OrgEvent {
   id: string;
@@ -27,6 +30,29 @@ export interface OrgEvent {
 export type TaskHandler = (event: OrgEvent) => Promise<void>;
 
 const DEFAULT_POLL_MS = 10_000;
+const MAX_BACKOFF_MS = 60_000;
+const CURSOR_DIR = join(homedir(), ".tps", "cursors");
+
+function cursorPath(agentId: string): string {
+  return join(CURSOR_DIR, `${agentId}-task-loop.json`);
+}
+
+function loadCursor(agentId: string): string {
+  try {
+    const data = JSON.parse(readFileSync(cursorPath(agentId), "utf-8"));
+    if (data.since) return data.since;
+  } catch {}
+  return new Date().toISOString();
+}
+
+function saveCursor(agentId: string, since: string): void {
+  try {
+    mkdirSync(CURSOR_DIR, { recursive: true });
+    writeFileSync(cursorPath(agentId), JSON.stringify({ since, updatedAt: new Date().toISOString() }));
+  } catch (err: any) {
+    console.warn(`[${agentId}] Failed to persist cursor: ${err.message}`);
+  }
+}
 
 export function startTaskLoop(
   flair: FlairClient,
@@ -34,10 +60,11 @@ export function startTaskLoop(
   handler: TaskHandler,
   opts: { pollIntervalMs?: number; kinds?: string[] } = {},
 ): { stop: () => void } {
-  const pollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
+  const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  let since = new Date().toISOString();
+  let since = loadCursor(agentId);
   let running = true;
+  let consecutiveErrors = 0;
   const seen = new Set<string>();
 
   async function poll() {
@@ -47,6 +74,8 @@ export function startTaskLoop(
           "GET",
           `/OrgEventCatchup/${agentId}?since=${since}`,
         );
+
+        consecutiveErrors = 0; // reset backoff on success
 
         for (const event of events ?? []) {
           if (seen.has(event.id)) continue;
@@ -67,6 +96,7 @@ export function startTaskLoop(
 
         if (events && events.length > 0) {
           since = events[events.length - 1].createdAt;
+          saveCursor(agentId, since);
         }
 
         // Cap seen set
@@ -77,14 +107,19 @@ export function startTaskLoop(
           arr.forEach((id) => seen.add(id));
         }
       } catch (err: any) {
+        consecutiveErrors++;
         console.warn(`[${agentId}] Task loop poll error: ${err.message}`);
       }
 
-      await new Promise((r) => setTimeout(r, pollMs));
+      // Exponential backoff on errors, capped at MAX_BACKOFF_MS
+      const delay = consecutiveErrors > 0
+        ? Math.min(basePollMs * Math.pow(2, consecutiveErrors - 1), MAX_BACKOFF_MS)
+        : basePollMs;
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
 
   poll();
-  console.log(`[${agentId}] Task loop started (polling every ${pollMs / 1000}s)`);
+  console.log(`[${agentId}] Task loop started (polling every ${basePollMs / 1000}s, cursor: ${since})`);
   return { stop: () => { running = false; } };
 }
