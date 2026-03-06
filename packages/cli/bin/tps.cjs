@@ -6,12 +6,20 @@ const path = require('node:path');
 const platform = process.platform;
 const arch = process.arch;
 const pkg = `@tpsdev-ai/cli-${platform}-${arch}`;
+const FALLBACK_VERSION = process.env.TPS_CLI_VERSION || process.env.npm_package_version || 'dev';
+
+function getCliVersion() {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return require('../package.json').version || FALLBACK_VERSION;
+  } catch {
+    return FALLBACK_VERSION;
+  }
+}
 
 if (process.argv.includes('--version') || process.argv.includes('-v')) {
   // Fast-path version output even when native binary package is missing.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const version = require('../package.json').version;
-  console.log(version);
+  console.log(getCliVersion());
   process.exit(0);
 }
 
@@ -40,8 +48,9 @@ function runBinary() {
 
   console.error(`Failed to load native binding`);
   console.error(`TPS: no binary package available for ${platform}-${arch}.`);
-  console.error(`Try reinstalling main package: npm install -g @tpsdev-ai/cli@${require('../package.json').version}`);
-  console.error(`Or install platform binary directly: npm install -g ${pkg}@${require('../package.json').version}`);
+  const version = getCliVersion();
+  console.error(`Try reinstalling main package: npm install -g @tpsdev-ai/cli@${version}`);
+  console.error(`Or install platform binary directly: npm install -g ${pkg}@${version}`);
   process.exitCode = 1;
 }
 
