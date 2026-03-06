@@ -108,12 +108,18 @@ export class DiscordAdapter implements BridgeAdapter {
           continue;
         }
 
+        // Parse @agentname routing (e.g. "@ember do this task")
+        const mentionMatch = msg.content.match(/^@([a-zA-Z0-9_-]+)\s*/);
+        const agentId = mentionMatch ? mentionMatch[1] : undefined;
+        const content = mentionMatch ? msg.content.slice(mentionMatch[0].length).trim() : msg.content;
+
         const envelope: BridgeEnvelope = {
           channel: "discord",
           channelId: this.channelId,
           senderId: msg.author.id,
           senderName: msg.author.username,
-          content: msg.content,
+          content,
+          agentId,
           timestamp: msg.timestamp,
           replyTo: msg.id,
           metadata: { discordMessageId: msg.id, guildId: msg.guild_id },
