@@ -230,8 +230,8 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status", "decommission"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
@@ -241,7 +241,9 @@ async function main() {
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
           "  tps agent start --id <agent-id>\n" +
-          "  tps agent health --id <agent-id>",
+          "  tps agent health --id <agent-id>\n" +
+          "  tps agent decommission --id <agent-id> [--force]\n" +
+          "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>]",
         );
         process.exit(1);
       }
@@ -274,6 +276,26 @@ async function main() {
           id: getFlag("id") ?? rest[1],
           flairUrl: getFlag("flair-url"),
           force: cli.flags.force,
+        });
+      } else if (action === "commit") {
+        // Inline helpers (getAuthor/getRepeatedFlags defined in else block below)
+        const authorIdx = process.argv.indexOf("--author");
+        const repoAuthorName = authorIdx >= 0 ? process.argv[authorIdx + 1] : undefined;
+        const repoAuthorEmail = authorIdx >= 0 ? process.argv[authorIdx + 2] : undefined;
+        const pathValues: string[] = [];
+        for (let i = 0; i < process.argv.length; i++) {
+          if (process.argv[i] === "--path" && process.argv[i + 1]) pathValues.push(process.argv[i + 1]!);
+        }
+        await runAgent({
+          action: "commit",
+          repo: getFlag("repo"),
+          branchName: getFlag("branch"),
+          commitMessage: getFlag("message"),
+          authorName: repoAuthorName,
+          authorEmail: repoAuthorEmail,
+          paths: pathValues,
+          push: process.argv.includes("--push"),
+          prTitle: getFlag("pr-title"),
         });
       } else {
         // run / start / health — support both --id and --config
