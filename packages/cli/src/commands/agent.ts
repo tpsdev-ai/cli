@@ -20,7 +20,7 @@ import { join } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -34,6 +34,7 @@ export interface AgentArgs {
   flairUrl?: string;
   json?: boolean;
   force?: boolean;
+  port?: number;
   repo?: string;
   branchName?: string;
   commitMessage?: string;
@@ -442,6 +443,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
     case "commit":
       return commitAgentChanges(args);
 
+    case "isolate":
+      return isolateAgent(args);
+
     case "run":
     case "start":
     case "health": {
@@ -621,4 +625,66 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   } else {
     console.log(`PR opened: ${pr.stdout?.trim()}`);
   }
+}
+
+// ─── agent isolate ────────────────────────────────────────────────────────────
+
+async function isolateAgent(args: AgentArgs): Promise<void> {
+  const id = args.id;
+  if (!id) {
+    console.error("Usage: tps agent isolate --id <agent-id> [--port <gateway-port>]");
+    process.exit(1);
+  }
+
+  const ocHome = join(homedir(), `.openclaw-${id}`);
+  const srcJson = join(homedir(), ".openclaw", "openclaw.json");
+  const dstJson = join(ocHome, "openclaw.json");
+
+  if (!existsSync(srcJson)) {
+    console.error(`OpenClaw config not found at ${srcJson}`);
+    process.exit(1);
+  }
+
+  mkdirSync(ocHome, { recursive: true });
+
+  // Read source config
+  const src = JSON.parse(readFileSync(srcJson, "utf-8"));
+
+  // Extract just this agent's entry
+  const agentList: any[] = src.agents?.list ?? [];
+  const agentEntry = agentList.find((a: any) => a.id === id);
+  if (!agentEntry) {
+    console.error(`Agent '${id}' not found in OpenClaw config.`);
+    process.exit(1);
+  }
+
+  // Build isolated config — minimal subset, single agent
+  const port = args.port ?? 18800 + Math.floor(Math.random() * 100);
+  const isolated = {
+    meta: src.meta ?? {},
+    wizard: { completed: true },
+    secrets: {},
+    auth: {},
+    models: src.models ?? {},
+    agents: {
+      defaults: src.agents?.defaults ?? {},
+      list: [agentEntry],
+    },
+    bindings: {},
+    messages: {},
+    commands: {},
+    channels: src.channels ?? {},
+    gateway: { port },
+    plugins: src.plugins ?? {},
+  };
+
+  writeFileSync(dstJson, JSON.stringify(isolated, null, 2), "utf-8");
+
+  console.log(`\nAgent '${id}' isolated at: ${ocHome}`);
+  console.log(`Gateway port: ${port}`);
+  console.log(`\nTo start the isolated gateway:`);
+  console.log(`  OPENCLAW_HOME=${ocHome} openclaw gateway start`);
+  console.log(`\nAdd to ~/.tps/agents/${id}/agent.yaml:`);
+  console.log(`  openclawHome: ${ocHome}`);
+  console.log(`  openclawPort: ${port}`);
 }
