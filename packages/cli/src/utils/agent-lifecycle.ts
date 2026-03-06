@@ -10,7 +10,8 @@
  */
 
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
@@ -215,6 +216,111 @@ export async function writeTaskMemory(
   }
 }
 
+
+// ── Agent start/stop lifecycle (OPS-54) ────────────────────────────────────
+
+export interface AgentLifecycleResult {
+  changed: boolean;
+  reason: string;
+}
+
+function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
+  const out = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  return {
+    ok: out.status === 0,
+    stdout: (out.stdout ?? "").trim(),
+    stderr: (out.stderr ?? "").trim(),
+  };
+}
+
+function isGitRepo(path: string): boolean {
+  const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
+  return out.ok && out.stdout === "true";
+}
+
+function parseWorktreePaths(baseRepo: string): Set<string> {
+  const out = git(baseRepo, ["worktree", "list", "--porcelain"]);
+  if (!out.ok) {
+    throw new Error(out.stderr || out.stdout || "git worktree list failed");
+  }
+  const paths = new Set<string>();
+  for (const line of out.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      paths.add(resolve(line.slice("worktree ".length).trim()));
+    }
+  }
+  return paths;
+}
+
+function resolveBaseRepo(workspacePath: string): string | null {
+  const defaultBase = resolve(join(homedir(), "ops", "tps"));
+  if (isGitRepo(defaultBase)) return defaultBase;
+
+  const derivedBase = resolve(join(dirname(workspacePath), "tps"));
+  if (isGitRepo(derivedBase)) return derivedBase;
+
+  return null;
+}
+
+export function onStart(agentId: string, workspacePath?: string): AgentLifecycleResult {
+  if (!workspacePath) {
+    return { changed: false, reason: "no workspace path configured" };
+  }
+
+  const workspace = resolve(workspacePath);
+  const baseRepo = resolveBaseRepo(workspace);
+  if (!baseRepo) {
+    return { changed: false, reason: "base repo not found or not a git repo" };
+  }
+
+  if (workspace === baseRepo) {
+    return { changed: false, reason: "workspace is base repo; skipping worktree add" };
+  }
+
+  const worktrees = parseWorktreePaths(baseRepo);
+  if (worktrees.has(workspace)) {
+    return { changed: false, reason: "worktree already exists" };
+  }
+
+  if (existsSync(workspace)) {
+    return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
+  }
+
+  const add = git(baseRepo, ["worktree", "add", workspace, "--detach"]);
+  if (!add.ok) {
+    throw new Error(`failed to create worktree for ${agentId}: ${add.stderr || add.stdout}`);
+  }
+
+  return { changed: true, reason: "worktree created" };
+}
+
+export function onStop(_agentId: string, workspacePath?: string): AgentLifecycleResult {
+  if (!workspacePath) {
+    return { changed: false, reason: "no workspace path configured" };
+  }
+
+  const workspace = resolve(workspacePath);
+  const baseRepo = resolveBaseRepo(workspace);
+  if (!baseRepo) {
+    return { changed: false, reason: "base repo not found or not a git repo" };
+  }
+
+  if (!existsSync(workspace)) {
+    return { changed: false, reason: "workspace does not exist" };
+  }
+
+  const worktrees = parseWorktreePaths(baseRepo);
+  if (!worktrees.has(workspace)) {
+    return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
+  }
+
+  const remove = git(baseRepo, ["worktree", "remove", workspace, "--force"]);
+  if (!remove.ok) {
+    throw new Error(`failed to remove worktree: ${remove.stderr || remove.stdout}`);
+  }
+
+  return { changed: true, reason: "worktree removed" };
+}
 // ── Workspace lifecycle hooks (OPS-47 Phase 2) ─────────────────────────────
 
 /**

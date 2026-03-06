@@ -315,7 +315,12 @@ async function main() {
               }
             }
 
-            if (runtimeArg === "codex") {
+            const { onStart, onStop } = await import("../src/utils/agent-lifecycle.js");
+            const startResult = onStart(agentId!, agentWorkspace);
+            if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
+
+            try {
+              if (runtimeArg === "codex") {
               const { runCodexRuntime } = await import("../src/utils/codex-runtime.js");
               await runCodexRuntime({
                 agentId: agentId!,
@@ -342,6 +347,10 @@ async function main() {
                 flairKeyPath: agentCfg.flair?.keyPath,
                 workspaceProvider,
               });
+            }
+            } finally {
+              const stopResult = onStop(agentId!, agentWorkspace);
+              if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
             }
           } else {
             await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
