@@ -263,7 +263,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   }
 
   let lastSnapshot = Date.now();
+  let lastTokenRefresh = Date.now();
+  const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
   while (true) {
+    if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
+      await ensureFreshOpenAIToken(agentId);
+      lastTokenRefresh = Date.now();
+    }
     if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS && await flair.ping()) {
       await snapshotSoulToDisk(flair, agentId);
       lastSnapshot = Date.now();
