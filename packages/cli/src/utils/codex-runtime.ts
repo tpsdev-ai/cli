@@ -286,6 +286,14 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   await ensureFreshOpenAIToken(agentId);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+
+  // Mark offline on clean shutdown
+  const markOffline = () => {
+    try { (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "offline" }).catch(() => {}); } catch {}
+  };
+  process.once("SIGINT", () => { markOffline(); process.exit(0); });
+  process.once("SIGTERM", () => { markOffline(); process.exit(0); });
+
   const flairOnline = await flair.ping();
   if (flairOnline) {
     console.log(`[${agentId}] Flair online — snapshotting soul to disk`);
@@ -376,7 +384,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   let lastSnapshot = Date.now();
   let lastTokenRefresh = Date.now();
+  let lastHeartbeat = 0; // publish on first tick
   const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
+  const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // publish heartbeat every 5min
   while (true) {
     if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
       await ensureFreshOpenAIToken(agentId);
@@ -385,6 +395,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS && await flair.ping()) {
       await snapshotSoulToDisk(flair, agentId);
       lastSnapshot = Date.now();
+    }
+    // Publish heartbeat to Flair (update agent status + OrgEvent)
+    if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
+      try {
+        await (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "online", lastSeen: new Date().toISOString() });
+      } catch { /* non-fatal */ }
+      lastHeartbeat = Date.now();
     }
 
     for (const msg of checkNewMail(mailDir, agentId)) {
