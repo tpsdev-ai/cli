@@ -1,21 +1,31 @@
 /**
- * tps bridge — OpenClaw Mail Bridge lifecycle
+ * tps bridge — Mail Bridge lifecycle
  *
  * Subcommands:
- *   start   Start the bridge daemon
+ *   start   Start the bridge daemon (--adapter openclaw|discord|stdio)
  *   stop    Stop the bridge daemon
  *   status  Show bridge status
  */
 
 import { bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
+import { BridgeCore } from "../bridge/core.js";
+import { DiscordAdapter } from "../bridge/discord-adapter.js";
+import { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 export interface BridgeArgs {
   action: "start" | "stop" | "status";
+  adapter?: "openclaw" | "discord" | "stdio";
+  // OpenClaw adapter options
   port?: number;
   openClawUrl?: string;
+  // Discord adapter options
+  discordToken?: string;
+  discordChannel?: string;
+  discordPollMs?: number;
+  // Shared
   bridgeAgentId?: string;
   defaultAgentId?: string;
   mailDir?: string;
@@ -25,13 +35,54 @@ export interface BridgeArgs {
 export async function runBridge(args: BridgeArgs): Promise<void> {
   switch (args.action) {
     case "start": {
+      const adapter = args.adapter ?? "openclaw";
+
+      // Discord adapter path — does not use the legacy daemon
+      if (adapter === "discord") {
+        const token = args.discordToken ?? process.env.DISCORD_BOT_TOKEN;
+        const channelId = args.discordChannel ?? process.env.DISCORD_CHANNEL_ID;
+        if (!token || !channelId) {
+          console.error("Discord bridge requires --discord-token and --discord-channel (or env DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID)");
+          process.exit(1);
+        }
+        const discordAdapter = new DiscordAdapter({
+          token,
+          channelId,
+          pollIntervalMs: args.discordPollMs,
+        });
+        const core = new BridgeCore(discordAdapter, {
+          bridgeAgentId: args.bridgeAgentId ?? "discord-bridge",
+          mailDir: args.mailDir,
+          defaultAgentId: args.defaultAgentId ?? "ember",
+        });
+        await core.start();
+
+        const shutdown = () => { void core.stop().then(() => process.exit(0)); };
+        process.once("SIGTERM", shutdown);
+        process.once("SIGINT", shutdown);
+        return;
+      }
+
+      if (adapter === "stdio") {
+        const stdioAdapter = new StdioAdapter();
+        const core = new BridgeCore(stdioAdapter, {
+          bridgeAgentId: args.bridgeAgentId ?? "stdio-bridge",
+          mailDir: args.mailDir,
+          defaultAgentId: args.defaultAgentId,
+        });
+        await core.start();
+        const shutdown = () => { void core.stop().then(() => process.exit(0)); };
+        process.once("SIGTERM", shutdown);
+        process.once("SIGINT", shutdown);
+        return;
+      }
+
+      // Default: OpenClaw adapter (legacy path)
       const st = bridgeStatus();
       if (st.running) {
         console.log(`Bridge already running (pid ${st.pid}, port ${st.port})`);
         process.exit(0);
       }
-
-      // Start in-process (caller should run as a daemon / background process)
       startBridgeDaemon({
         port: args.port,
         openClawUrl: args.openClawUrl,
@@ -50,7 +101,6 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
       }
       try {
         process.kill(st.pid!, "SIGTERM");
-        // Clean up PID file (try both old and new paths)
         const pidDir = join(homedir(), ".tps", "run");
         rmSync(join(pidDir, "bridge-openclaw.pid"), { force: true });
         rmSync(join(pidDir, "mail-bridge.pid"), { force: true });
