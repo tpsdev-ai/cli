@@ -78,6 +78,7 @@ describe("tps roster invite", () => {
       agent: "flint",
       message: "Welcome to TPS",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath: join(tempHome, ".tps", "identity", "anvil.key"),
       mailDir: join(tempHome, ".tps", "mail"),
       json: true,
       configPath,
@@ -130,6 +131,7 @@ describe("tps roster invite", () => {
       action: "invite",
       agent: "flint",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath: join(tempHome, ".tps", "identity", "anvil.key"),
       mailDir: join(tempHome, ".tps", "mail"),
       configPath,
     });
@@ -161,6 +163,7 @@ describe("tps roster invite", () => {
         action: "invite",
         agent: "ghost",
         flairUrl: "http://127.0.0.1:9926",
+        keyPath: join(tempHome, ".tps", "identity", "anvil.key"),
         configPath,
       }),
     ).rejects.toThrow("exit:1");

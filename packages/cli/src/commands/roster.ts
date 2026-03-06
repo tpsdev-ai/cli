@@ -13,6 +13,7 @@ interface RosterArgs {
   channel?: string;
   message?: string;
   flairUrl?: string;
+  keyPath?: string;
   mailDir?: string;
   json?: boolean;
   configPath?: string;
@@ -171,7 +172,7 @@ export async function runRoster(args: RosterArgs): Promise<void> {
         process.exit(1);
       }
       const invitedBy = await resolveInviterId();
-      const flair = createFlairClient(invitedBy, args.flairUrl);
+      const flair = createFlairClient(invitedBy, args.flairUrl, args.keyPath);
       try {
         await flair.request("GET", `/Identity/${encodeURIComponent(args.agent)}`);
       } catch (error) {
