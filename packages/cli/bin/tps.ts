@@ -197,16 +197,21 @@ async function main() {
         break;
       }
 
-      const action = rest[0] as "list" | "show" | "find";
+      const action = rest[0] as "list" | "show" | "find" | "dashboard" | "dash";
+      if (action === "dashboard" || action === "dash") {
+        const { runDashboard } = await import("../src/commands/roster.js");
+        await runDashboard({ flairUrl: process.env.FLAIR_URL, json: cli.flags.json });
+        break;
+      }
       if (!["list", "show", "find"].includes(action)) {
         console.error(
-          "Usage:\n  tps roster\n  tps roster list\n  tps roster show <agent> [--json]\n  tps roster find --channel <channel> [--json]"
+          "Usage:\n  tps roster\n  tps roster list\n  tps roster show <agent> [--json]\n  tps roster find --channel <channel> [--json]\n  tps roster dashboard [--json]"
         );
         process.exit(1);
       }
       const { runRoster } = await import("../src/commands/roster.js");
       runRoster({
-        action,
+        action: action as "list" | "show" | "find",
         agent: rest[1],
         channel: cli.flags.channel || undefined,
         json: cli.flags.json,
