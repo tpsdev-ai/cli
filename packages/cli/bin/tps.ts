@@ -230,8 +230,8 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
@@ -296,6 +296,13 @@ async function main() {
           paths: pathValues,
           push: process.argv.includes("--push"),
           prTitle: getFlag("pr-title"),
+        });
+      } else if (action === "isolate") {
+        const portArg = getFlag("port");
+        await runAgent({
+          action: "isolate",
+          id: getFlag("id") ?? rest[1],
+          port: portArg ? parseInt(portArg, 10) : undefined,
         });
       } else {
         // run / start / health — support both --id and --config
