@@ -10,6 +10,7 @@ const cli = meow(
     $ tps <command> [options]
 
   Commands
+    init              Scaffold a new TPS agent workspace (identity, config, Flair registration)
     hire <report>     Onboard a new agent from a .tps report or persona
     roster <action>   Agent directory (list/show/find)
     review <name>     Performance review for a specific agent
@@ -152,6 +153,18 @@ async function main() {
 
   await checkNono();
   switch (command) {
+    case "init": {
+      const { runInit } = await import("../src/commands/init.js");
+      await runInit({
+        agentId: (cli.flags.id as string | undefined) ?? rest[0],
+        name: cli.flags.name as string | undefined,
+        flairUrl: (cli.flags.flairUrl as string | undefined) ?? process.env.FLAIR_URL,
+        model: cli.flags.model as string | undefined,
+        force: cli.flags.force as boolean | undefined,
+      });
+      break;
+    }
+
     case "hire": {
       const reportPath = rest[0];
       if (!reportPath) {
