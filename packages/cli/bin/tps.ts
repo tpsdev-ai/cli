@@ -230,14 +230,15 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
           "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
           "  tps agent list [--json]\n" +
           "  tps agent status --id <agent-id> [--json]\n" +
+          "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
           "  tps agent start --id <agent-id>\n" +
           "  tps agent health --id <agent-id>",
@@ -267,6 +268,13 @@ async function main() {
         await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });
       } else if (action === "status") {
         await runAgent({ action: "status", id: getFlag("id") ?? rest[1], json: cli.flags.json, flairUrl: getFlag("flair-url") });
+      } else if (action === "decommission") {
+        await runAgent({
+          action: "decommission",
+          id: getFlag("id") ?? rest[1],
+          flairUrl: getFlag("flair-url"),
+          force: cli.flags.force,
+        });
       } else {
         // run / start / health — support both --id and --config
         const configPath = getFlag("config");
