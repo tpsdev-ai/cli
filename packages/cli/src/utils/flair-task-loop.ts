@@ -10,9 +10,9 @@
  */
 
 import type { FlairClient } from "./flair-client.js";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 export interface OrgEvent {
   id: string;
@@ -49,7 +49,8 @@ function saveCursor(agentId: string, since: string): void {
   try {
     mkdirSync(CURSOR_DIR, { recursive: true });
     writeFileSync(cursorPath(agentId), JSON.stringify({ since, updatedAt: new Date().toISOString() }));
-  } catch (err: any) {
+  } catch (e) {
+    const err = e as Error;
     console.warn(`[${agentId}] Failed to persist cursor: ${err.message}`);
   }
 }
@@ -89,7 +90,8 @@ export function startTaskLoop(
           console.log(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
           try {
             await handler(event);
-          } catch (err: any) {
+          } catch (e) {
+            const err = e as Error;
             console.error(`[${agentId}] Task handler error for ${event.id}: ${err.message}`);
           }
         }
@@ -104,16 +106,17 @@ export function startTaskLoop(
           const arr = [...seen];
           arr.splice(0, arr.length - 500);
           seen.clear();
-          arr.forEach((id) => seen.add(id));
+          for (const id of arr) seen.add(id);
         }
-      } catch (err: any) {
+      } catch (e) {
+        const err = e as Error;
         consecutiveErrors++;
         console.warn(`[${agentId}] Task loop poll error: ${err.message}`);
       }
 
       // Exponential backoff on errors, capped at MAX_BACKOFF_MS
       const delay = consecutiveErrors > 0
-        ? Math.min(basePollMs * Math.pow(2, consecutiveErrors - 1), MAX_BACKOFF_MS)
+        ? Math.min(basePollMs * 2 ** (consecutiveErrors - 1), MAX_BACKOFF_MS)
         : basePollMs;
       await new Promise((r) => setTimeout(r, delay));
     }
