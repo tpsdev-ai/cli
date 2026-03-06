@@ -24,7 +24,46 @@ import {
   onTaskComplete,
   onTaskFailure,
 } from "./agent-lifecycle.js";
+import {
+  refreshOpenAIToken,
+  type StoredCredentials,
+} from "../commands/auth.js";
 import type { WorkspaceProvider } from "./workspace-provider.js";
+
+/** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
+function readStoredOpenAICreds(): StoredCredentials | null {
+  const credPath = join(homedir(), ".tps", "auth", "openai.json");
+  if (!existsSync(credPath)) return null;
+  try {
+    const data = JSON.parse(readFileSync(credPath, "utf-8"));
+    if (!data.accessToken || !data.refreshToken) return null;
+    return data as StoredCredentials;
+  } catch {
+    return null;
+  }
+}
+
+/** Refresh OpenAI OAuth token if expiring within 1 hour. No-op if not stored or already fresh. */
+async function ensureFreshOpenAIToken(agentId: string): Promise<void> {
+  const creds = readStoredOpenAICreds();
+  if (!creds) return;
+
+  const oneHourMs = 60 * 60 * 1000;
+  const isExpiringSoon = creds.expiresAt > 0 && creds.expiresAt - Date.now() < oneHourMs;
+  if (!isExpiringSoon) return;
+
+  if (!creds.clientId) {
+    console.warn(`[${agentId}] ⚠️  OpenAI token expiring soon but no clientId — re-run: tps auth login openai`);
+    return;
+  }
+
+  try {
+    const refreshed = await refreshOpenAIToken(creds);
+    console.log(`[${agentId}] OpenAI token refreshed — expires ${new Date(refreshed.expiresAt).toISOString()}`);
+  } catch (err: any) {
+    console.warn(`[${agentId}] ⚠️  OpenAI token refresh failed (non-fatal): ${err.message}`);
+  }
+}
 
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
@@ -186,6 +225,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
   console.log(`[${agentId}] Codex runtime started. Polling ${mailDir}/${agentId}/new`);
+
+  await ensureFreshOpenAIToken(agentId);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
   const flairOnline = await flair.ping();
