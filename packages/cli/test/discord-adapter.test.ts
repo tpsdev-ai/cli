@@ -1,8 +1,13 @@
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import { DiscordAdapter } from "../src/bridge/discord-adapter.js";
 
 describe("DiscordAdapter", () => {
   let fetchMock: ReturnType<typeof mock>;
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
 
   beforeEach(() => {
     fetchMock = mock(async (url: string, opts?: RequestInit) => {
