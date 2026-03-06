@@ -42,7 +42,8 @@ function loadCursor(agentId: string): string {
     const data = JSON.parse(readFileSync(cursorPath(agentId), "utf-8"));
     if (data.since) return data.since;
   } catch {}
-  return new Date().toISOString();
+  // First boot: look back 1 hour to catch recently-assigned tasks
+  return new Date(Date.now() - 3_600_000).toISOString();
 }
 
 function saveCursor(agentId: string, since: string): void {
