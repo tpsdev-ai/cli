@@ -243,7 +243,7 @@ function runAutoCommit(
   workspace: string,
   taskId: string,
   cfg: AutoCommitConfig,
-): void {
+): string | null {
   const repo = cfg.repo ?? workspace;
   const branchPrefix = cfg.branchPrefix ?? "task/";
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
@@ -267,9 +267,14 @@ function runAutoCommit(
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${repo}`);
   const result = spawnSync(cmd, args, { encoding: "utf-8" });
   if (result.status === 0) {
-    console.log(`[${agentId}] Auto-commit succeeded: ${result.stdout?.trim()}`);
+    const out = result.stdout?.trim() ?? "";
+    console.log(`[${agentId}] Auto-commit succeeded: ${out}`);
+    // Extract PR URL if push was enabled (gh pr create outputs the URL)
+    const prMatch = out.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
+    return prMatch ? prMatch[0] : safeBranch;
   } else {
     console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${result.stderr?.trim() || result.stdout?.trim()}`);
+    return null;
   }
 }
 
@@ -346,7 +351,16 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       }
       // Auto-commit if configured
       if (config.autoCommit) {
-        runAutoCommit(agentId, config.workspace, taskId, config.autoCommit);
+        const prRef = runAutoCommit(agentId, config.workspace, taskId, config.autoCommit);
+        if (prRef && config.autoCommit.push) {
+          try {
+            await (flair as any).request("POST", "/OrgEvent", {
+              kind: "pr.opened", authorId: agentId,
+              summary: `PR opened for ${taskId}`, refId: taskId,
+              detail: prRef,
+            });
+          } catch { /* non-fatal */ }
+        }
       }
     } catch (e) {
       const err = e as Error;
