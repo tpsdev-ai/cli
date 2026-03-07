@@ -353,7 +353,7 @@ async function main() {
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
           const runtimeArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : undefined;
-          if (runtimeArg === "claude-code" || runtimeArg === "codex") {
+          if (runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini") {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
             const { join } = await import("node:path");
             const { homedir } = await import("node:os");
@@ -409,6 +409,19 @@ async function main() {
                 flairKeyPath: agentCfg.flair?.keyPath,
                 workspaceProvider,
                 autoCommit: agentCfg.autoCommit,
+              });
+            } else if (runtimeArg === "gemini") {
+              const { runGeminiRuntime } = await import("../src/utils/gemini-runtime.js");
+              await runGeminiRuntime({
+                agentId: agentId!,
+                workspace: agentWorkspace,
+                mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
+                model: agentCfg.llm?.model,
+                extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps")],
+                taskTimeoutMs: agentCfg.taskTimeoutMs,
+                flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
+                flairKeyPath: agentCfg.flair?.keyPath,
+                workspaceProvider,
               });
             } else {
               const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
