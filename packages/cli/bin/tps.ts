@@ -248,8 +248,8 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate", "logs"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate", "logs", "healthcheck"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
@@ -294,6 +294,16 @@ async function main() {
           id: getFlag("id") ?? rest[1],
           flairUrl: getFlag("flair-url"),
           force: cli.flags.force,
+        });
+      } else if (action === "healthcheck") {
+        const { runAgentHealthcheck } = await import("../src/commands/agent-healthcheck.js");
+        await runAgentHealthcheck({
+          agentId: rest[1] ?? getFlag("id"),
+          flairUrl: getFlag("flair-url"),
+          mailDir: getFlag("mail-dir"),
+          workspace: getFlag("workspace"),
+          json: cli.flags.json as boolean | undefined,
+          noColor: Boolean(cli.flags["no-color"]),
         });
       } else if (action === "logs") {
         const { runAgentLogs } = await import("../src/commands/agent-logs.js");
