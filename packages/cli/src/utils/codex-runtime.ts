@@ -168,6 +168,7 @@ async function runCodex(
   config: CodexRuntimeConfig,
   taskTimeoutMs: number,
 ): Promise<string> {
+  await syncWorkspaceBeforeTask(config);
   const systemPrompt = await buildSystemPrompt(message, config);
   const sandboxMode = config.sandboxMode ?? "workspace-write";
 
@@ -255,8 +256,46 @@ export interface AutoCommitDeps {
   tpsCommand?: string;
 }
 
+export interface WorkspaceSyncDeps {
+  spawnSyncImpl?: typeof spawnSync;
+  warn?: (message?: any, ...optionalParams: any[]) => void;
+}
+
 interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
+}
+
+function resolveDefaultBranch(repo: string, runSync: typeof spawnSync): string {
+  const headRef = runSync("git", ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], {
+    cwd: repo,
+    encoding: "utf-8",
+  });
+  if ((headRef.status ?? 1) === 0) {
+    const ref = typeof headRef.stdout === "string" ? headRef.stdout.trim() : "";
+    const branch = ref.replace(/^origin\//, "");
+    if (branch) return branch;
+  }
+  return "main";
+}
+
+export async function syncWorkspaceBeforeTask(
+  config: CodexRuntimeConfig,
+  deps: WorkspaceSyncDeps = {},
+): Promise<void> {
+  const runSync = deps.spawnSyncImpl ?? spawnSync;
+  const warn = deps.warn ?? console.warn;
+  const branch = resolveDefaultBranch(config.workspace, runSync);
+  const result = runSync("git", ["pull", "--rebase", "origin", branch], {
+    cwd: config.workspace,
+    encoding: "utf-8",
+  });
+
+  if ((result.status ?? 1) === 0) return;
+
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const detail = stderr || stdout || `exit ${result.status ?? "unknown"}`;
+  warn(`[${config.agentId}] Workspace sync failed before task (non-fatal): git pull --rebase origin ${branch}: ${detail}`);
 }
 
 export async function runAutoCommit(
