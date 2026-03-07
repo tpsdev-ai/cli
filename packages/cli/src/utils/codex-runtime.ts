@@ -31,6 +31,7 @@ import {
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 import { startTaskLoop } from "./flair-task-loop.js";
 import { handlePrOpened } from "./pr-review-trigger.js";
+import { formatTaskCompleteMailBody } from "./task-result-mail.js";
 
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
@@ -448,7 +449,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
       const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
       console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
-      sendMail(mailDir, agentId, event.authorId, `Task complete (via Flair):\n\n${summary}`);
+      sendMail(mailDir, agentId, event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
       try {
         await (flair as any).request("POST", "/OrgEvent", {
           kind: "task.completed", authorId: agentId, targetIds: [event.authorId],
@@ -537,7 +538,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
-        sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
+        sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
         if (workspaceProvider && preTaskState) {
           try { await onTaskComplete(workspaceProvider, flair, msg.id, preTaskState); } catch (err: any) {
             console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
