@@ -424,6 +424,7 @@ async function main() {
                   join(homedir(), "ops", "tps"),
                   join(homedir(), "ops", "flair"),
                   ...((worktreeGitDir) => worktreeGitDir ? [worktreeGitDir] : [])(resolveWorktreeGitDir(agentWorkspace)),
+                  ...(agentCfg.codex?.extraDirs ?? []),
                 ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
