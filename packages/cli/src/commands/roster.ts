@@ -1,11 +1,20 @@
 import { findOpenClawConfig, getAgentList, readOpenClawConfig, resolveConfigPath, resolveWorkspace, type OpenClawAgent } from "../utils/config.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { getAgentInfo } from "../utils/agent-info.js";
+import { createFlairClient } from "../utils/flair-client.js";
+import { sendMail } from "../utils/mail-bridge.js";
+import { loadHostIdentityId } from "../utils/identity.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 interface RosterArgs {
-  action: "list" | "show" | "find";
+  action: "list" | "show" | "find" | "invite";
   agent?: string;
   channel?: string;
+  message?: string;
+  flairUrl?: string;
+  keyPath?: string;
+  mailDir?: string;
   json?: boolean;
   configPath?: string;
 }
@@ -29,7 +38,7 @@ function resolveConfig(args: RosterArgs) {
   return readOpenClawConfig(configPath);
 }
 
-export function runRoster(args: RosterArgs): void {
+export async function runRoster(args: RosterArgs): Promise<void> {
   const config = resolveConfig(args);
   const agents = getAgentList(config);
 
@@ -152,6 +161,45 @@ export function runRoster(args: RosterArgs): void {
       }
       return;
     }
+    case "invite": {
+      if (!args.agent) {
+        console.error("Usage: tps roster invite <agent> [--message <text>]");
+        process.exit(1);
+      }
+      const safeAgent = sanitizeIdentifier(args.agent);
+      if (safeAgent !== args.agent) {
+        console.error(`Invalid agent id: ${args.agent}`);
+        process.exit(1);
+      }
+      const invitedBy = await resolveInviterId();
+      const flair = createFlairClient(invitedBy, args.flairUrl, args.keyPath);
+      try {
+        await flair.request("GET", `/Identity/${encodeURIComponent(args.agent)}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Agent "${args.agent}" not found in Flair identity registry: ${message}`);
+        process.exit(1);
+      }
+      const inviteMessage = buildInviteMessage(args.agent, invitedBy);
+      sendMail(args.mailDir ?? join(homedir(), ".tps", "mail"), args.agent, invitedBy, inviteMessage, {
+        "X-TPS-Trust": "internal",
+        "X-TPS-Sender": invitedBy,
+        "X-TPS-Message-Type": "org.invite",
+      });
+      await flair.publishEvent({
+        kind: "org.invited",
+        scope: "org",
+        summary: `Invited ${args.agent} to TPS`,
+        detail: args.message ?? inviteMessage,
+        targetIds: [args.agent],
+      });
+      if (args.json) {
+        console.log(JSON.stringify({ status: "invited", agentId: args.agent, invitedBy }, null, 2));
+      } else {
+        console.log(`Invited ${args.agent} to TPS.`);
+      }
+      return;
+    }
   }
 }
 
@@ -269,4 +317,36 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
     );
   }
   console.log();
+}
+
+
+function buildInviteMessage(agentId: string, invitedBy: string): string {
+  return [
+    "You have been invited to join TPS.",
+    "",
+    `Agent: ${agentId}`,
+    `Invited by: ${invitedBy}`,
+    "",
+    "Check your TPS mail and reply when you are online.",
+  ].join("\n");
+}
+
+async function resolveInviterId(): Promise<string> {
+  const explicit = process.env.TPS_AGENT_ID;
+  if (explicit) {
+    const safe = sanitizeIdentifier(explicit);
+    if (safe !== explicit) {
+      console.error(`Invalid inviter id: ${explicit}`);
+      process.exit(1);
+    }
+    return explicit;
+  }
+
+  const hostId = await loadHostIdentityId();
+  const safe = sanitizeIdentifier(hostId);
+  if (safe !== hostId) {
+    console.error(`Invalid inviter id: ${hostId}`);
+    process.exit(1);
+  }
+  return hostId;
 }

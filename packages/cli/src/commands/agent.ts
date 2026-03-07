@@ -621,7 +621,11 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   const { spawnSync } = require("node:child_process");
   const pr = spawnSync("gh-as", [agentHandle, "pr", "create", "--title", title, "--body", commitMessage!, "--head", branchName!], { cwd: repoPath, encoding: "utf-8" });
   if (pr.status !== 0) {
-    console.warn(`PR creation failed: ${pr.stderr?.trim() ?? pr.stdout?.trim()}`);
+    const prErr = pr.stderr?.trim() ?? pr.stdout?.trim() ?? "unknown error";
+    console.warn(`[tps agent commit] PR creation failed: ${prErr}`);
+    console.warn(`[tps agent commit] Branch ${branchName} was pushed — open PR manually with: gh pr create --head ${branchName}`);
+    // Exit non-zero so callers (auto-commit) can detect and log the failure
+    process.exit(2);
   } else {
     console.log(`PR opened: ${pr.stdout?.trim()}`);
   }
