@@ -32,6 +32,8 @@ export interface BridgeCoreConfig {
   mailDir?: string;
   defaultAgentId?: string;
   defaultChannelId?: string;
+  /** System prompt injected when routing Discord messages. Set to empty string to disable. */
+  discordContextPrompt?: string;
 }
 
 export class BridgeCore {
@@ -39,6 +41,7 @@ export class BridgeCore {
   private readonly mailDir: string;
   private readonly defaultAgentId: string;
   private readonly defaultChannelId: string;
+  private readonly discordContextPrompt: string;
   private readonly log: (msg: string) => void;
   private stopOutbound: (() => void) | null = null;
 
@@ -51,6 +54,7 @@ export class BridgeCore {
     this.mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
+    this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
     this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
   }
 
@@ -115,10 +119,8 @@ export class BridgeCore {
       return JSON.stringify(envelope);
     }
 
-    return `[Discord message from ${envelope.senderName}]
-Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
-
-Message: ${envelope.content}`;
+    if (!this.discordContextPrompt) return envelope.content;
+    return `[Discord message from ${envelope.senderName}]\n${this.discordContextPrompt}\n\nMessage: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {

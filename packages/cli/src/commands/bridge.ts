@@ -26,6 +26,7 @@ export interface BridgeArgs {
   discordTokenFile?: string;
   discordChannel?: string;
   discordPollMs?: number;
+  discordContextPrompt?: string;
   // Shared
   bridgeAgentId?: string;
   defaultAgentId?: string;
@@ -60,6 +61,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId ?? "ember",
           defaultChannelId: channelId,
+          discordContextPrompt: args.discordContextPrompt,
         });
         await core.start();
 
