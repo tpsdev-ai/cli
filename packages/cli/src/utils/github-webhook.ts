@@ -1,6 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { queueOutboxMessage } from "./outbox.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
+
 
 function webhookSecret(): string {
   return process.env.GITHUB_WEBHOOK_SECRET ?? "";
@@ -78,7 +81,7 @@ function formatEvent(event: string, payload: Record<string, unknown>): string {
 
 export async function handleGithubWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!webhookSecret()) {
-    console.warn("[webhook] GITHUB_WEBHOOK_SECRET not set — all webhook requests will be rejected");
+    swarn("[webhook] GITHUB_WEBHOOK_SECRET not set — all webhook requests will be rejected");
     res.statusCode = 503;
     res.end("Webhook not configured");
     return;

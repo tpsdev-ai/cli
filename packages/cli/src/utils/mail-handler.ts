@@ -1,6 +1,9 @@
 import { spawnSync } from "node:child_process";
 import type { AgentManifest } from "./manifest.js";
 import { matchesFilter } from "./manifest.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
+
 
 export interface HandlerAction {
   type: "reply" | "forward" | "drop" | "inbox";
@@ -79,7 +82,7 @@ export async function runHandlerPipeline(
         });
 
         if (result.error) {
-          console.error("[HANDLER] spawnSync error:", result.error);
+          serror("[HANDLER] spawnSync error:", result.error);
           continue;
         }
 
@@ -108,11 +111,11 @@ export async function runHandlerPipeline(
           continue;
         } else {
           // Exit 2+: error, log and continue
-          console.error(`[HANDLER] error: ${manifest.name} exited with ${result.status}`);
+          serror(`[HANDLER] error: ${manifest.name} exited with ${result.status}`);
           continue;
         }
       } catch (err) {
-        console.error("[HANDLER] exception running %s:", manifest.name, err); // nosemgrep: unsafe-formatstring
+        serror("[HANDLER] exception running %s:", manifest.name, err); // nosemgrep: unsafe-formatstring
         continue;
       }
     }

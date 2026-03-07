@@ -4,6 +4,9 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { sendMessage, assertValidBody } from "./mail.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
+
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -245,7 +248,7 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
       markDelivered(subscriberId, entry.id);
     } catch (err: any) {
       // Log but don't fail the publish if one subscriber's inbox is full
-      console.error(`Warning: failed to deliver to ${subscriberId}: ${err.message}`);
+      serror(`Warning: failed to deliver to ${subscriberId}: ${err.message}`);
     }
   }
 
@@ -276,7 +279,7 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
           markDelivered(agentId, entry.id);
           delivered++;
         } catch (err: any) {
-          console.error(`Warning: catch-up delivery failed for ${topic}/${entry.id}: ${err.message}`);
+          serror(`Warning: catch-up delivery failed for ${topic}/${entry.id}: ${err.message}`);
         }
       }
     }

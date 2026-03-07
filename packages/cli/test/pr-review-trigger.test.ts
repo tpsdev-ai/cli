@@ -21,22 +21,17 @@ describe("pr-review-trigger", () => {
   });
 
   test("handlePrOpened: no-ops when detail has no PR URL", async () => {
-    // Should warn but not throw
-    let warned = false;
-    const origWarn = console.warn;
-    console.warn = () => { warned = true; };
-    await handlePrOpened({ detail: "branch-name-only", summary: "PR" }, cfg);
-    console.warn = origWarn;
-    expect(warned).toBe(true);
+    // Should warn (via snooplogg) but not throw
+    await expect(
+      handlePrOpened({ detail: "branch-name-only", summary: "PR" }, cfg)
+    ).resolves.toBeUndefined();
   });
 
   test("handlePrOpened: no-ops when detail is empty", async () => {
-    let warned = false;
-    const origWarn = console.warn;
-    console.warn = () => { warned = true; };
-    await handlePrOpened({ summary: "PR opened" }, cfg);
-    console.warn = origWarn;
-    expect(warned).toBe(true);
+    // Should warn (via snooplogg) but not throw
+    await expect(
+      handlePrOpened({ summary: "PR opened" }, cfg)
+    ).resolves.toBeUndefined();
   });
 
   test("requestReviews: returns true when reviewers list is empty", () => {

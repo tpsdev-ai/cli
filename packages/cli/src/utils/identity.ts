@@ -43,7 +43,7 @@ function vaultPath(): string {
 function getVaultPassphrase(): string {
   const key = process.env.TPS_VAULT_KEY;
   if (!key) {
-    console.error("❌ TPS_VAULT_KEY environment variable is required to unlock the identity vault.");
+    serror("❌ TPS_VAULT_KEY environment variable is required to unlock the identity vault.");
     process.exit(1);
   }
   return key;
@@ -102,6 +102,9 @@ async function migrateToVault(): Promise<void> {
 
 // noble/ed25519 v3 needs hashes.sha512 set for sync operations.
 import { hashes } from "@noble/ed25519";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:identity");
+
 hashes.sha512 = (message: Uint8Array) => {
   return new Uint8Array(createHash("sha512").update(message).digest());
 };

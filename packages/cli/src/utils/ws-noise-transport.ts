@@ -14,6 +14,9 @@ import { decodeWireMessage, encodeWireMessage } from "./wire-frame.js";
 import { fingerprint, loadHostIdentity, lookupBranch, type TpsKeyPair } from "./identity.js";
 import { JoinCompleteBodySchema, MSG_JOIN_COMPLETE } from "./wire-mail.js";
 import { handleGithubWebhook } from "./github-webhook.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:ws");
+
 
 const PROLOGUE = Buffer.from("tps-v1");
 const HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -386,7 +389,7 @@ export async function listenForHostWs(
       handleGithubWebhook(req, res).catch((e: Error) => {
         res.statusCode = 500;
         res.end("Internal error");
-        console.error("[webhook] error:", e.message);
+        serror("[webhook] error:", e.message);
       });
       return;
     }

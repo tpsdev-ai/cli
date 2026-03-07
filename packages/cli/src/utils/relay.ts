@@ -12,6 +12,9 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema } from "./wire-mail.js";
 import { clearHostState, writeHostState, type HostConnectionState } from "./connection-state.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
+
 
 export interface RelayMessage {
   id?: string;
@@ -231,17 +234,17 @@ export async function connectRemoteBranches(
       const remoteHost = String(remote.host || "");
       const remotePort = Number(remote.port);
       if (!remoteHost || /[^a-zA-Z0-9._\-:]/.test(remoteHost)) {
-        console.error(`Remote branch '${name}': invalid host in remote.json`);
+        serror(`Remote branch '${name}': invalid host in remote.json`);
         continue;
       }
       if (!Number.isFinite(remotePort) || remotePort <= 0 || remotePort > 65535) {
-        console.error(`Remote branch '${name}': invalid port in remote.json`);
+        serror(`Remote branch '${name}': invalid port in remote.json`);
         continue;
       }
 
       const branch = lookupBranch(name);
       if (!branch || !branch.encryptionKey) {
-        console.error(`Remote branch '${name}': not registered or missing encryption key`);
+        serror(`Remote branch '${name}': not registered or missing encryption key`);
         continue;
       }
 
@@ -264,9 +267,9 @@ export async function connectRemoteBranches(
         }
       });
 
-      console.log(`Connected to remote branch '${name}' at ${remote.host}:${remote.port}`);
+      slog(`Connected to remote branch '${name}' at ${remote.host}:${remote.port}`);
     } catch (e: any) {
-      console.error(`Failed to connect to remote branch '${name}': ${e.message}`);
+      serror(`Failed to connect to remote branch '${name}': ${e.message}`);
     }
   }
 
@@ -286,14 +289,14 @@ export async function connectRemoteBranches(
 export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   const parsed = MailDeliverBodySchema.safeParse(msg.body);
   if (!parsed.success) {
-    console.error(`Invalid MAIL_DELIVER from ${branchId}`);
+    serror(`Invalid MAIL_DELIVER from ${branchId}`);
     return;
   }
 
   const { to, content, id, from, timestamp } = parsed.data;
   const safe = sanitizeIdentifier(to);
   if (safe !== to) {
-    console.error(`Invalid recipient in mail from ${branchId}: ${to}`);
+    serror(`Invalid recipient in mail from ${branchId}: ${to}`);
     return;
   }
 
@@ -317,11 +320,11 @@ export function startRelay(agentId: string): () => void {
     .then(({ connected, cleanup }) => {
       remoteCleanup = cleanup;
       if (connected.length > 0) {
-        console.log(`Connected to ${connected.length} remote branch(es): ${connected.join(", ")}`);
+        slog(`Connected to ${connected.length} remote branch(es): ${connected.join(", ")}`);
       }
     })
     .catch((e: any) => {
-      console.error(`Remote branch connection error: ${e.message}`);
+      serror(`Remote branch connection error: ${e.message}`);
     });
 
   const intervalMs = Number(process.env.TPS_RELAY_POLL_MS || 1000);

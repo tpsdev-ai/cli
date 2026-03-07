@@ -17,6 +17,9 @@ import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
 import { catchUpTopics as _catchUpTopics } from "./mail-topics.js";
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:agent:lifecycle");
+
 
 // ── Boot context ───────────────────────────────────────────────────────────
 
@@ -90,7 +93,7 @@ export async function bootContext(
       if (content) {
         parts.push(content.slice(0, 2000));
         identitySource = "disk";
-        console.warn(`[${agentId}] ⚠️  Flair offline — using stale disk fallback (${fallbackPath})`);
+        swarn(`[${agentId}] ⚠️  Flair offline — using stale disk fallback (${fallbackPath})`);
       }
     }
 
@@ -101,7 +104,7 @@ export async function bootContext(
         if (content) {
           parts.push(content.slice(0, 2000));
           identitySource = "disk";
-          console.warn(`[${agentId}] ⚠️  Flair offline — using workspace SOUL.md fallback`);
+          swarn(`[${agentId}] ⚠️  Flair offline — using workspace SOUL.md fallback`);
         }
       }
     }
@@ -159,7 +162,7 @@ export async function searchPastExperience(
       }
     }
   } catch (err: any) {
-    console.warn("[flair] search failed (non-fatal):", err.message);
+    swarn("[flair] search failed (non-fatal):", err.message);
   }
 
   // Fallback: read MEMORY.md from workspace
@@ -168,7 +171,7 @@ export async function searchPastExperience(
     if (existsSync(memPath)) {
       const content = readFileSync(memPath, "utf-8").trim();
       if (content) {
-        console.warn("[flair] Using MEMORY.md fallback for past experience");
+        swarn("[flair] Using MEMORY.md fallback for past experience");
         return `## Past Experience (from MEMORY.md)\n${content.slice(0, 3000)}`;
       }
     }
@@ -212,7 +215,7 @@ export async function writeTaskMemory(
 
     await Promise.race([flair.writeMemory(memId, memory), timeout]);
   } catch (err: any) {
-    console.warn(`[${agentId}] Flair ${type} memory write failed (non-fatal):`, err.message);
+    swarn(`[${agentId}] Flair ${type} memory write failed (non-fatal):`, err.message);
   }
 }
 
@@ -337,7 +340,7 @@ export async function onBoot(
   try {
     const latest = await flair.getLatestWorkspaceState(agentId);
     if (latest) {
-      console.log(`[${agentId}] Last Flair checkpoint: ${latest.label ?? latest.ref} (${latest.phase ?? "unknown"} @ ${latest.timestamp})`);
+      slog(`[${agentId}] Last Flair checkpoint: ${latest.label ?? latest.ref} (${latest.phase ?? "unknown"} @ ${latest.timestamp})`);
       lastCheckpoint = {
         ref: latest.ref,
         label: latest.label,
@@ -356,7 +359,7 @@ export async function onBoot(
       if (!lastBootAt) lastBootAt = latest.timestamp;
     }
   } catch (err: any) {
-    console.warn(`[${agentId}] Flair workspace state query failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Flair workspace state query failed (non-fatal): ${err.message}`);
   }
 
   // Fetch recent OrgEvents since last boot
@@ -365,10 +368,10 @@ export async function onBoot(
     const since = lastBootAt ? new Date(lastBootAt) : new Date(Date.now() - 24 * 3600_000);
     recentEvents = await flair.getEventsSince(agentId, since);
     if (recentEvents.length > 0) {
-      console.log(`[${agentId}] ${recentEvents.length} org events since last boot`);
+      slog(`[${agentId}] ${recentEvents.length} org events since last boot`);
     }
   } catch (err: any) {
-    console.warn(`[${agentId}] OrgEvent catchup failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] OrgEvent catchup failed (non-fatal): ${err.message}`);
   }
 
   // Checkpoint current state as boot marker, store lastBootAt
@@ -390,7 +393,7 @@ export async function onBoot(
       await flair.writeWorkspaceState(record).catch(() => {});
     }
   } catch (err: any) {
-    console.warn(`[${agentId}] Boot checkpoint failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Boot checkpoint failed (non-fatal): ${err.message}`);
   }
 
   return { lastCheckpoint, recentEvents };
@@ -421,7 +424,7 @@ export async function onTaskStart(
     };
     await flair.writeWorkspaceState(record);
   } catch (err: any) {
-    console.warn(`[${agentId}] Pre-task Flair write failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Pre-task Flair write failed (non-fatal): ${err.message}`);
   }
 
   return state;
@@ -470,7 +473,7 @@ export async function onTaskComplete(
     };
     await flair.writeWorkspaceState(record);
   } catch (err: any) {
-    console.warn(`[${agentId}] Post-task Flair write failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Post-task Flair write failed (non-fatal): ${err.message}`);
   }
 
   // Publish task_done OrgEvent
@@ -482,7 +485,7 @@ export async function onTaskComplete(
       refId: taskId,
     });
   } catch (err: any) {
-    console.warn(`[${agentId}] OrgEvent task_done publish failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] OrgEvent task_done publish failed (non-fatal): ${err.message}`);
   }
 
   // Write structured task memory
@@ -506,7 +509,7 @@ export async function onTaskComplete(
     const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
     await Promise.race([flair.writeMemory(memId, memory, { tags: ["task", taskId] }), timeout]);
   } catch (err: any) {
-    console.warn(`[${agentId}] Task completion memory write failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Task completion memory write failed (non-fatal): ${err.message}`);
   }
 }
 
@@ -558,7 +561,7 @@ export async function onTaskFailure(
     };
     await flair.writeWorkspaceState(record);
   } catch (err: any) {
-    console.warn(`[${agentId}] Failure Flair write failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Failure Flair write failed (non-fatal): ${err.message}`);
   }
 
   // Publish blocker OrgEvent
@@ -570,7 +573,7 @@ export async function onTaskFailure(
       refId: taskId,
     });
   } catch (err2: any) {
-    console.warn(`[${agentId}] OrgEvent blocker publish failed (non-fatal): ${err2.message}`);
+    swarn(`[${agentId}] OrgEvent blocker publish failed (non-fatal): ${err2.message}`);
   }
 
   // Write failure memory
@@ -592,7 +595,7 @@ export async function onTaskFailure(
     const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
     await Promise.race([flair.writeMemory(memId, memory, { tags: ["task", taskId, "failure"] }), timeout]);
   } catch (err: any) {
-    console.warn(`[${agentId}] Task failure memory write failed (non-fatal): ${err.message}`);
+    swarn(`[${agentId}] Task failure memory write failed (non-fatal): ${err.message}`);
   }
 }
 
