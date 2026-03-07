@@ -11,8 +11,10 @@ import {
 } from "node:fs";
 import { join, basename } from "node:path";
 import { spawnSync } from "node:child_process";
+import yaml from "js-yaml";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { workspacePath as resolveWorkspacePath } from "../utils/workspace.js";
+import { createFlairClient, type OrgEvent } from "../utils/flair-client.js";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
 
 const STATUS_DIR = join(process.env.HOME || homedir(), ".tps", "status");
@@ -265,19 +267,90 @@ function safeAgentId(agentId: string): string {
   return id || "unknown";
 }
 
-function resolveModel(agentId: string): string {
+function resolveConfigModel(agentId: string): string | null {
   const cfgPath = resolveConfigPath();
-  if (!cfgPath) return "unknown-model";
+  if (!cfgPath) return null;
   try {
     const cfg: OpenClawConfig = readOpenClawConfig(cfgPath);
     const list = getAgentList(cfg);
     const match = list.find((agent: OpenClawAgent) => agent.id === agentId);
     const direct = match?.model;
     if (typeof direct === "string") return direct;
-    return "unknown-model";
+    return null;
   } catch {
-    return "unknown-model";
+    return null;
   }
+}
+
+function extractModelFromUnknown(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  if ("model" in value && typeof (value as Record<string, unknown>).model === "string") {
+    return (value as Record<string, unknown>).model as string;
+  }
+  if ("llm" in value && typeof (value as Record<string, unknown>).llm === "object") {
+    const llm = (value as Record<string, unknown>).llm as Record<string, unknown>;
+    if (typeof llm.model === "string") return llm.model;
+  }
+  return null;
+}
+
+export function extractModelFromHeartbeatEvent(event: OrgEvent): string | null {
+  const sources = [event.detail, event.summary];
+  for (const source of sources) {
+    if (!source) continue;
+    try {
+      const parsed = JSON.parse(source);
+      const model = extractModelFromUnknown(parsed);
+      if (model) return model;
+    } catch {
+      const match = source.match(/"model"\s*:\s*"([^"]+)"/) || source.match(/\bmodel[:=]\s*([A-Za-z0-9./:_-]+)/i);
+      if (match?.[1]) return match[1];
+    }
+  }
+  return null;
+}
+
+async function resolveModelFromHeartbeat(agentId: string): Promise<string | null> {
+  try {
+    const flair = createFlairClient(agentId, undefined, join(homedir(), ".tps", "identity", `${agentId}.key`));
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const events = await flair.getEventsSince(agentId, since);
+    const heartbeat = events
+      .filter((event) => event.kind === "agent.heartbeat")
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    return heartbeat ? extractModelFromHeartbeatEvent(heartbeat) : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveWorkspaceModel(agentId: string, workspace?: string): string | null {
+  const candidates = [
+    workspace,
+    resolveWorkspacePath(agentId),
+  ].filter((value): value is string => Boolean(value));
+
+  for (const base of candidates) {
+    const configPath = join(base, ".tps", "agent.yaml");
+    if (!existsSync(configPath)) continue;
+    try {
+      const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+      const model = extractModelFromUnknown(parsed);
+      if (model) return model;
+    } catch {
+      // ignore malformed workspace config and continue with the next source
+    }
+  }
+  return null;
+}
+
+async function resolveModel(agentId: string, workspace?: string): Promise<string> {
+  return (
+    await resolveModelFromHeartbeat(agentId) ??
+    resolveWorkspaceModel(agentId, workspace) ??
+    resolveConfigModel(agentId) ??
+    "unknown-model"
+  );
 }
 
 function detectDangerState(profile?: string, nonono?: boolean, status?: string): string {
@@ -365,7 +438,7 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
   const status: NodeStatus = {
     agentId,
     host: hostFingerprint(),
-    model: resolveModel(agentId),
+    model: await resolveModel(agentId, workspace),
     status: resolvedState,
     lastHeartbeat: lastHeartbeat,
     lastActivity: now,

@@ -247,8 +247,7 @@ async function listAgents(args: AgentArgs): Promise<void> {
     // Check Flair registration
     let flairStatus = "unknown";
     try {
-      const kpPath = join(homedir(), ".tps", "identity", `${id}.key`);
-      const flair = createFlairClient(id, flairUrl, kpPath);
+      const flair = createFlairClient(id, flairUrl, join(homedir(), ".tps", "identity", `${id}.key`));
       const online = await flair.ping();
       if (!online) {
         flairStatus = "offline";
@@ -323,8 +322,7 @@ async function agentStatus(args: AgentArgs): Promise<void> {
 
   // Flair status
   try {
-    const kpPath2 = join(homedir(), ".tps", "identity", `${id}.key`);
-    const flair = createFlairClient(id, flairUrl, kpPath2);
+    const flair = createFlairClient(id, flairUrl, join(homedir(), ".tps", "identity", `${id}.key`));
     const online = await flair.ping();
     if (!online) {
       out.flair = { online: false };
