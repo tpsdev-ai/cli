@@ -30,6 +30,7 @@ import {
 } from "../commands/auth.js";
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 import { startTaskLoop } from "./flair-task-loop.js";
+import { handlePrOpened } from "./pr-review-trigger.js";
 
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
@@ -96,6 +97,8 @@ export interface CodexRuntimeConfig {
   workspaceProvider?: WorkspaceProvider;
   /** If set, auto-commit workspace changes after each task completes */
   autoCommit?: AutoCommitConfig;
+  /** If set, listen for pr.opened events and auto-request reviews */
+  reviewTrigger?: { reviewers: string[]; repo: string };
 }
 
 interface MailMessage {
@@ -381,6 +384,19 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       }
     }
   });
+
+  // Review trigger — listens for pr.opened and auto-requests K&S review
+  if (config.reviewTrigger) {
+    const triggerConfig = {
+      reviewers: config.reviewTrigger.reviewers,
+      agentId,
+      repo: config.reviewTrigger.repo,
+    };
+    startTaskLoop(flair, `${agentId}-review-trigger`, async (event) => {
+      await handlePrOpened(event, triggerConfig);
+    }, { kinds: ["pr.opened"] });
+    console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
+  }
 
   let lastSnapshot = Date.now();
   let lastTokenRefresh = Date.now();
