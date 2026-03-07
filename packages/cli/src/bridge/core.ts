@@ -31,12 +31,14 @@ export interface BridgeCoreConfig {
   bridgeAgentId?: string;
   mailDir?: string;
   defaultAgentId?: string;
+  defaultChannelId?: string;
 }
 
 export class BridgeCore {
   private readonly bridgeAgentId: string;
   private readonly mailDir: string;
   private readonly defaultAgentId: string;
+  private readonly defaultChannelId: string;
   private readonly log: (msg: string) => void;
   private stopOutbound: (() => void) | null = null;
 
@@ -48,6 +50,7 @@ export class BridgeCore {
     this.bridgeAgentId = config.bridgeAgentId ?? "bridge-" + adapter.name;
     this.mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
+    this.defaultChannelId = config.defaultChannelId ?? "";
     this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
   }
 
@@ -121,7 +124,25 @@ export class BridgeCore {
       try {
         const raw = readFileSync(fullPath, "utf-8");
         const msg = JSON.parse(raw);
-        envelope = typeof msg.body === "string" ? JSON.parse(msg.body) : msg.body;
+        // If body is a JSON-serialized BridgeEnvelope, use it directly.
+        // Otherwise treat as plain text and route to the default channel.
+        let parsedBody: unknown = null;
+        if (typeof msg.body === "string") {
+          try { parsedBody = JSON.parse(msg.body); } catch { /* plain text */ }
+        }
+        if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
+          envelope = parsedBody as BridgeEnvelope;
+        } else {
+          // Plain text reply — route back to the channel this agent is bridging
+          envelope = {
+            channel: this.adapter.name,
+            channelId: this.defaultChannelId ?? "",
+            content: typeof msg.body === "string" ? msg.body : String(msg.body ?? ""),
+            senderId: "agent",
+            senderName: "agent",
+            timestamp: new Date().toISOString(),
+          };
+        }
       } catch (e) {
         this.log(`[bridge:outbound] Failed to parse ${file}: ${e}`);
         renameSync(fullPath, join(cur, file));
