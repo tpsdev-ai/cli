@@ -8,6 +8,7 @@ export interface AgentLogsArgs {
   agentId?: string;
   asAgent?: string;
   flairUrl?: string;
+  keyPath?: string;
   mailDir?: string;
   limit?: number;
   json?: boolean;
@@ -125,7 +126,8 @@ export async function runAgentLogs(args: AgentLogsArgs): Promise<void> {
   const mailDir = args.mailDir ?? process.env.TPS_MAIL_DIR ?? join(homedir(), ".tps", "mail");
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-  const flair = createFlairClient(viewerId, flairUrl);
+  const keyPath = args.keyPath ?? join(homedir(), ".tps", "identity", `${viewerId}.key`);
+  const flair = createFlairClient(viewerId, flairUrl, keyPath);
   const [events, mail] = await Promise.all([
     flair.getEventsSince(agentId, since),
     Promise.resolve(readMailTimeline(mailDir, agentId)),

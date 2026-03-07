@@ -63,7 +63,7 @@ describe("tps agent logs", () => {
     }));
 
     const { runAgentLogs } = await import("../src/commands/agent-logs.js");
-    await runAgentLogs({ agentId: "ember", mailDir, limit: 4, flairUrl: "http://127.0.0.1:19926" });
+    await runAgentLogs({ agentId: "ember", mailDir, limit: 4, flairUrl: "http://127.0.0.1:19926", keyPath: join(tempHome, ".tps", "identity", "anvil.key") });
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.url).toContain("/OrgEventCatchup/ember?since=");
@@ -92,7 +92,7 @@ describe("tps agent logs", () => {
     }));
 
     const { runAgentLogs } = await import("../src/commands/agent-logs.js");
-    await runAgentLogs({ agentId: "ember", mailDir, json: true, limit: 2, flairUrl: "http://127.0.0.1:19926" });
+    await runAgentLogs({ agentId: "ember", mailDir, json: true, limit: 2, keyPath: join(tempHome, ".tps", "identity", "anvil.key"), flairUrl: "http://127.0.0.1:19926" });
     expect(JSON.parse(out[0]!)).toEqual([
       { source: "mail", kind: "mail", summary: "Direct subject", timestamp: "2026-03-07T10:05:00.000Z" },
       { source: "flair", kind: "task.completed", summary: "Completed ops-72", timestamp: "2026-03-07T10:02:00.000Z" },
