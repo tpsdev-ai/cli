@@ -360,6 +360,22 @@ async function main() {
             const { readFileSync, existsSync } = await import("node:fs");
             const { load: parseYaml } = await import("js-yaml");
             const cfgPath = configPath ?? join(homedir(), ".tps", "agents", agentId!, "agent.yaml");
+
+            /** Resolve the git worktree metadata dir for a workspace.
+             *  A worktree's .git is a file containing "gitdir: /path/to/.git/worktrees/<name>".
+             *  Codex workspace-write sandbox restricts writes to the workspace dir; the worktree
+             *  metadata dir (index, HEAD, etc.) is outside that boundary and must be added to
+             *  extraDirs so git commit/push can write index.lock. */
+            function resolveWorktreeGitDir(workspace: string): string | null {
+              try {
+                const dotGit = join(workspace, ".git");
+                const content = readFileSync(dotGit, "utf-8").trim();
+                // If it's a worktree, .git is a file with "gitdir: /path"
+                const match = content.match(/^gitdir:\s*(.+)$/);
+                if (match) return match[1].trim();
+              } catch { /* not a worktree — .git is a directory, readFileSync throws */ }
+              return null;
+            }
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
             const agentWorkspace = agentCfg.workspace ?? join(homedir(), "ops", "tps");
 
@@ -403,7 +419,12 @@ async function main() {
                 workspace: agentWorkspace,
                 mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
                 model: agentCfg.llm?.model,
-                extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps"), join(homedir(), "ops", "flair")],
+                extraDirs: [
+                  join(homedir(), ".tps", "mail", agentId!),
+                  join(homedir(), "ops", "tps"),
+                  join(homedir(), "ops", "flair"),
+                  ...((worktreeGitDir) => worktreeGitDir ? [worktreeGitDir] : [])(resolveWorktreeGitDir(agentWorkspace)),
+                ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
@@ -431,7 +452,12 @@ async function main() {
                 mailDir: agentCfg.mailDir ?? join(homedir(), ".tps", "mail"),
                 model: agentCfg.llm?.model,
                 allowedTools: ["Bash", "Read", "Write", "Edit"],
-                extraDirs: [join(homedir(), ".tps", "mail", agentId!), join(homedir(), "ops", "tps"), join(homedir(), "ops", "flair")],
+                extraDirs: [
+                  join(homedir(), ".tps", "mail", agentId!),
+                  join(homedir(), "ops", "tps"),
+                  join(homedir(), "ops", "flair"),
+                  ...((worktreeGitDir) => worktreeGitDir ? [worktreeGitDir] : [])(resolveWorktreeGitDir(agentWorkspace)),
+                ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
