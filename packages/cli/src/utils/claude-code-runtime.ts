@@ -38,7 +38,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
+import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
   bootContext,
@@ -87,6 +87,10 @@ interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
+}
+
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
 }
 
 // ─── Mail helpers ───────────────────────────────────────────────────────────
@@ -142,7 +146,7 @@ async function buildSystemPrompt(
 ): Promise<string> {
   const { agentId, workspace, allowedTools, supervisorId, flairUrl, flairKeyPath } = config;
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? resolveFlairKeyPath(agentId) });
 
   const { systemPrompt, identitySource } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -282,7 +286,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
   slog(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? resolveFlairKeyPath(agentId) });
 
   // Initial Flair health check + snapshot
   const flairOnline = await flair.ping();

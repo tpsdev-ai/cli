@@ -6,8 +6,6 @@
  */
 import { sign as ed25519Sign, createPrivateKey, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 
 export interface FlairConfig {
   baseUrl?: string;
@@ -600,10 +598,6 @@ export class FlairClient {
       return false;
     }
   }
-}
-
-export function defaultFlairKeyPath(agentId: string): string {
-  return join(homedir(), ".tps", "identity", `${agentId}.key`);
 }
 
 export function createFlairClient(

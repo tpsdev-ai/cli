@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { createFlairClient, defaultFlairKeyPath, type FlairAgent } from "../utils/flair-client.js";
+import { createFlairClient, type FlairAgent } from "../utils/flair-client.js";
 
 const DEFAULT_INTERVAL_SECONDS = 60;
 const STALE_MS = 5 * 60 * 1000;
@@ -114,6 +114,10 @@ function cursorPath(agentId: string): string {
   return join(CURSOR_DIR, `${agentId}-task-loop.json`);
 }
 
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
+}
+
 function buildIssues(agent: FlairAgent, nowMs: number): Omit<AgentHealthRecord, "eventPublished"> {
   const heartbeatAgeMs = ageMsFromIso(agent.lastHeartbeat, nowMs);
   const taskCursorAgeMs = ageMsFromPath(cursorPath(agent.id), nowMs);
@@ -167,7 +171,7 @@ export async function runOfficeHealthTick(args: {
 }): Promise<{ result: OfficeHealthTickResult; state: HealthState }> {
   const nowMs = args.nowMs ?? Date.now();
   const timestamp = new Date(nowMs).toISOString();
-  const flair = createFlairClient(args.viewerId, args.flairUrl, args.keyPath ?? defaultFlairKeyPath(args.viewerId));
+  const flair = createFlairClient(args.viewerId, args.flairUrl, args.keyPath ?? resolveFlairKeyPath(args.viewerId));
   const agents = await flair.listAgents();
   const nextState: HealthState = args.state ?? readState();
   let publishedEvents = 0;
@@ -243,7 +247,7 @@ export async function runOfficeHealth(args: OfficeHealthArgs): Promise<void> {
       const tick = await runOfficeHealthTick({
         viewerId,
         flairUrl: args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
-        keyPath: args.keyPath ?? defaultFlairKeyPath(viewerId),
+        keyPath: args.keyPath ?? resolveFlairKeyPath(viewerId),
         state,
       });
       state = tick.state;

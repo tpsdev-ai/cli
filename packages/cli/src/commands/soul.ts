@@ -8,7 +8,7 @@
  *   diff <agentId> --file <f>  Diff current soul against a file
  */
 
-import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
+import { createFlairClient } from "../utils/flair-client.js";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,10 @@ export interface SoulArgs {
   json?: boolean;
   asAgent?: string;
   keyPath?: string;
+}
+
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
 }
 
 function soulToText(entries: Array<{ key: string; value: string }>): string {
@@ -49,7 +53,7 @@ function textToEntries(text: string): Array<{ key: string; value: string }> {
 export async function runSoul(args: SoulArgs): Promise<void> {
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
   const actorId = args.asAgent ?? args.agentId;
-  const flair = createFlairClient(actorId, flairUrl, args.keyPath ?? defaultFlairKeyPath(actorId));
+  const flair = createFlairClient(actorId, flairUrl, args.keyPath ?? resolveFlairKeyPath(actorId));
 
   switch (args.action) {
     case "show": {

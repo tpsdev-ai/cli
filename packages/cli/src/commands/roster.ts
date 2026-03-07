@@ -1,7 +1,7 @@
 import { findOpenClawConfig, getAgentList, readOpenClawConfig, resolveConfigPath, resolveWorkspace, type OpenClawAgent } from "../utils/config.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { getAgentInfo } from "../utils/agent-info.js";
-import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
+import { createFlairClient } from "../utils/flair-client.js";
 import { sendMail } from "../utils/mail-bridge.js";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { homedir } from "node:os";
@@ -17,6 +17,10 @@ interface RosterArgs {
   mailDir?: string;
   json?: boolean;
   configPath?: string;
+}
+
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
 }
 
 function getPrimaryModel(agent: OpenClawAgent): string {
@@ -172,7 +176,7 @@ export async function runRoster(args: RosterArgs): Promise<void> {
         process.exit(1);
       }
       const invitedBy = await resolveInviterId();
-      const flair = createFlairClient(invitedBy, args.flairUrl, args.keyPath ?? defaultFlairKeyPath(invitedBy));
+      const flair = createFlairClient(invitedBy, args.flairUrl, args.keyPath ?? resolveFlairKeyPath(invitedBy));
       try {
         await flair.request("GET", `/Identity/${encodeURIComponent(args.agent)}`);
       } catch (error) {

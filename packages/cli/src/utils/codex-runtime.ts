@@ -12,7 +12,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
+import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
   bootContext,
@@ -110,6 +110,10 @@ interface MailMessage {
   timestamp: string;
 }
 
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
+}
+
 function getMailPaths(mailDir: string, agentId: string) {
   const root = join(mailDir, agentId);
   const fresh = join(root, "new");
@@ -154,7 +158,7 @@ async function buildSystemPrompt(
   config: CodexRuntimeConfig,
 ): Promise<string> {
   const { agentId, workspace, extraDirs, supervisorId, flairUrl, flairKeyPath } = config;
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? resolveFlairKeyPath(agentId) });
   const allowedTools = ["Bash", "Read", "Write", "Edit"];
   const { systemPrompt } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -391,7 +395,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   await ensureFreshOpenAIToken(agentId);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? resolveFlairKeyPath(agentId) });
 
   // Mark offline on clean shutdown
   const markOffline = () => {

@@ -8,7 +8,9 @@
  * consolidate <agentId> — review persistent memories for promote/archive/keep
  */
 
-import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createFlairClient } from "../utils/flair-client.js";
 
 export interface MemoryLearnArgs {
   action: "reflect" | "consolidate";
@@ -28,9 +30,13 @@ export interface MemoryLearnArgs {
   keyPath?: string;
 }
 
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
+}
+
 export async function runMemoryLearn(args: MemoryLearnArgs): Promise<void> {
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
-  const flair = createFlairClient(args.agentId, flairUrl, args.keyPath ?? defaultFlairKeyPath(args.agentId));
+  const flair = createFlairClient(args.agentId, flairUrl, args.keyPath ?? resolveFlairKeyPath(args.agentId));
 
   switch (args.action) {
     case "reflect": {

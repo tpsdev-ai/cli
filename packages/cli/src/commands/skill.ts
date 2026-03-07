@@ -5,7 +5,9 @@
  * Skills are knowledge packages — not executable code.
  */
 import { readFileSync } from "node:fs";
-import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createFlairClient } from "../utils/flair-client.js";
 
 export interface SkillArgs {
   action: "list" | "register" | "scan" | "revoke" | "show";
@@ -17,6 +19,10 @@ export interface SkillArgs {
   priority?: string;
   json?: boolean;
   flairUrl?: string;
+}
+
+function resolveFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
 }
 
 export async function runSkill(args: SkillArgs): Promise<void> {
@@ -41,7 +47,7 @@ async function listSkills(args: SkillArgs): Promise<void> {
     process.exit(1);
   }
 
-  const flair = createFlairClient(agentId, args.flairUrl, defaultFlairKeyPath(agentId));
+  const flair = createFlairClient(agentId, args.flairUrl, resolveFlairKeyPath(agentId));
   const skills = await flair.listSkills(agentId);
 
   if (args.json) {
@@ -90,7 +96,7 @@ async function registerSkill(args: SkillArgs): Promise<void> {
     process.exit(1);
   }
 
-  const flair = createFlairClient(agent, args.flairUrl, defaultFlairKeyPath(agent));
+  const flair = createFlairClient(agent, args.flairUrl, resolveFlairKeyPath(agent));
 
   // Auto-scan before registration
   console.log("Scanning skill content...");
@@ -150,7 +156,7 @@ async function scanSkill(args: SkillArgs): Promise<void> {
 
   // Use a default agent ID for scan-only (read-only operation)
   const agentId = args.agent ?? process.env.TPS_AGENT_ID ?? "nathan";
-  const flair = createFlairClient(agentId, args.flairUrl, defaultFlairKeyPath(agentId));
+  const flair = createFlairClient(agentId, args.flairUrl, resolveFlairKeyPath(agentId));
   const result = await flair.scanSkill(content);
 
   if (args.json) {
@@ -177,7 +183,7 @@ async function revokeSkill(args: SkillArgs): Promise<void> {
     process.exit(1);
   }
 
-  const flair = createFlairClient(agent, args.flairUrl, defaultFlairKeyPath(agent));
+  const flair = createFlairClient(agent, args.flairUrl, resolveFlairKeyPath(agent));
   await flair.revokeSkill(agent, name);
   console.log(`Skill '${name}' revoked from ${agent}. Takes effect on next bootstrap.`);
 }
@@ -189,7 +195,7 @@ async function showSkill(args: SkillArgs): Promise<void> {
     process.exit(1);
   }
 
-  const flair = createFlairClient(agent, args.flairUrl, defaultFlairKeyPath(agent));
+  const flair = createFlairClient(agent, args.flairUrl, resolveFlairKeyPath(agent));
   const skills = await flair.listSkills(agent);
   const skill = skills.find((s) => s.value === name);
 
