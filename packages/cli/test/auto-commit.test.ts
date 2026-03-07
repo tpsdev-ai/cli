@@ -37,6 +37,7 @@ describe("runAutoCommit", () => {
         commitMessage: "feat: ship task 123",
         authorName: "ember",
         authorEmail: "ember@tps.dev",
+        push: true,
         prTitle: "feat: ship task 123",
       },
       { spawnSyncImpl },
@@ -59,6 +60,7 @@ describe("runAutoCommit", () => {
           "--author",
           "ember",
           "ember@tps.dev",
+          "--push",
           "--pr-title",
           "feat: ship task 123",
         ],
@@ -66,14 +68,100 @@ describe("runAutoCommit", () => {
     ]);
   });
 
-  test("publishes a blocker OrgEvent when PR creation fails with exit code 2", async () => {
+  test("opens a PR via gh-as when push, openPr, and prRepo are configured", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
+      }
+      if (cmd === "tps") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh-as") {
+        return { status: 0, stdout: "https://github.com/tpsdev-ai/cli/pull/123\n", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    await runAutoCommit(
+      config,
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-456",
+        branchName: "feat/task-456",
+        commitMessage: "feat: ship task 456",
+        authorName: "Ember",
+        authorEmail: "ember@tps.dev",
+        push: true,
+        openPr: true,
+        prRepo: "tpsdev-ai/cli",
+        ghAgent: "ember",
+        prTitle: "feat: ship task 456",
+      },
+      { spawnSyncImpl },
+    );
+
+    expect(calls).toEqual([
+      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      {
+        cmd: "tps",
+        args: [
+          "agent",
+          "commit",
+          "--repo",
+          "/tmp/repo",
+          "--branch",
+          "feat/task-456",
+          "--message",
+          "feat: ship task 456",
+          "--author",
+          "Ember",
+          "ember@tps.dev",
+          "--push",
+        ],
+      },
+      {
+        cmd: "gh-as",
+        args: [
+          "ember",
+          "pr",
+          "create",
+          "--repo",
+          "tpsdev-ai/cli",
+          "--head",
+          "feat/task-456",
+          "--title",
+          "feat: ship task 456",
+          "--body",
+          "feat: ship task 456",
+        ],
+      },
+    ]);
+  });
+
+  test("publishes a blocker OrgEvent when runtime PR creation fails", async () => {
     const publishEvent = mock(async () => {});
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
       }
       if (cmd === "tps") {
-        return { status: 2, stdout: "", stderr: "gh-as pr create failed" };
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "gh-as") {
+        expect(args).toEqual([
+          "ember",
+          "pr",
+          "create",
+          "--repo",
+          "tpsdev-ai/cli",
+          "--head",
+          "feat/task-456",
+          "--body",
+          "feat: ship task 456",
+        ]);
+        return { status: 1, stdout: "", stderr: "gh-as pr create failed" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
     });
@@ -87,9 +175,13 @@ describe("runAutoCommit", () => {
         commitMessage: "feat: ship task 456",
         authorName: "ember",
         authorEmail: "ember@tps.dev",
+        push: true,
+        openPr: true,
+        prRepo: "tpsdev-ai/cli",
+        ghAgent: "ember",
       },
       { spawnSyncImpl },
-    )).rejects.toThrow("tps agent commit failed: gh-as pr create failed");
+    )).rejects.toThrow("gh-as pr create failed: gh-as pr create failed");
 
     expect(publishEvent).toHaveBeenCalledTimes(1);
     expect(publishEvent).toHaveBeenCalledWith({
