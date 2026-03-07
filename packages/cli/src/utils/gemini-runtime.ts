@@ -122,7 +122,7 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
   const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"] });
+    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, TPS_AGENT_ID: config.agentId } });
     proc.stdin.write(systemPrompt);
     proc.stdin.end();
     const chunks: Buffer[] = [];
