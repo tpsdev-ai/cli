@@ -853,6 +853,7 @@ async function main() {
         port: getFlag("port") ? parseInt(getFlag("port")!, 10) : undefined,
         openClawUrl: getFlag("openclaw-url") ?? process.env.OPENCLAW_MESSAGE_URL,
         discordToken: getFlag("discord-token") ?? process.env.DISCORD_BOT_TOKEN,
+        discordTokenFile: getFlag("discord-token-file"),
         discordChannel: getFlag("discord-channel") ?? process.env.DISCORD_CHANNEL_ID,
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
