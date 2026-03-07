@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -121,22 +121,49 @@ describe("mail command", () => {
 
   test("check/list accept agent positional arg (overrides TPS_AGENT_ID)", () => {
     const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "anvil" };
-    // send a message to sherlock
     const sent = run(["mail", "send", "sherlock", "positional test"], env);
     expect(sent.status).toBe(0);
 
-    // check as sherlock via positional arg, NOT env var (env says "anvil")
     const checked = run(["mail", "check", "sherlock", "--json"], env);
     expect(checked.status).toBe(0);
     const msgs = JSON.parse(checked.stdout);
     expect(msgs.length).toBe(1);
     expect(msgs[0].body).toBe("positional test");
 
-    // list as sherlock via positional arg
     const listed = run(["mail", "list", "sherlock", "--json"], env);
     expect(listed.status).toBe(0);
     const all = JSON.parse(listed.stdout);
     expect(all.length).toBe(1);
     expect(all[0].read).toBe(true);
+  });
+
+  test("stats reports inbox count and latest received/sent timestamps", () => {
+    const mailDir = join(tempRoot, "mail");
+    const env = { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil" };
+    const sent = run(["mail", "send", "sherlock", "stats test"], env);
+    expect(sent.status).toBe(0);
+
+    const sentDir = join(mailDir, "sherlock", "sent");
+    mkdirSync(sentDir, { recursive: true });
+    writeFileSync(join(sentDir, "sent-message.json"), JSON.stringify({ id: "1" }), "utf-8");
+
+    const stats = run(["mail", "stats", "sherlock", "--json"], env);
+    expect(stats.status).toBe(0);
+    const payload = JSON.parse(stats.stdout);
+    expect(payload.agent).toBe("sherlock");
+    expect(payload.inboxCount).toBe(1);
+    expect(payload.lastReceived).toBeTruthy();
+    expect(payload.lastSent).toBeTruthy();
+  });
+
+  test("stats defaults agent from TPS_AGENT_ID", () => {
+    const mailDir = join(tempRoot, "mail");
+    run(["mail", "send", "kern", "default agent"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil" });
+
+    const stats = run(["mail", "stats", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    expect(stats.status).toBe(0);
+    const payload = JSON.parse(stats.stdout);
+    expect(payload.agent).toBe("kern");
+    expect(payload.inboxCount).toBe(1);
   });
 });
