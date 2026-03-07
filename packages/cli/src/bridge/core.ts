@@ -102,12 +102,23 @@ export class BridgeCore {
         "X-TPS-Sender": envelope.senderId,
         "X-TPS-Channel": `${envelope.channel}:${envelope.channelId}`,
       },
-      body: JSON.stringify(envelope),
+      body: this.buildInboundBody(envelope),
     };
 
     writeFileSync(join(fresh, `${id}.json`), JSON.stringify(msg, null, 2), "utf-8");
     this.log(`[bridge:inbound] ${envelope.channel}/${envelope.senderId} → ${targetAgent}`);
     return targetAgent;
+  }
+
+  private buildInboundBody(envelope: BridgeEnvelope): string {
+    if (envelope.metadata?.channel !== "discord") {
+      return JSON.stringify(envelope);
+    }
+
+    return `[Discord message from ${envelope.senderName}]
+Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
+
+Message: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {
@@ -124,25 +135,7 @@ export class BridgeCore {
       try {
         const raw = readFileSync(fullPath, "utf-8");
         const msg = JSON.parse(raw);
-        // If body is a JSON-serialized BridgeEnvelope, use it directly.
-        // Otherwise treat as plain text and route to the default channel.
-        let parsedBody: unknown = null;
-        if (typeof msg.body === "string") {
-          try { parsedBody = JSON.parse(msg.body); } catch { /* plain text */ }
-        }
-        if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
-          envelope = parsedBody as BridgeEnvelope;
-        } else {
-          // Plain text reply — route back to the channel this agent is bridging
-          envelope = {
-            channel: this.adapter.name,
-            channelId: this.defaultChannelId ?? "",
-            content: typeof msg.body === "string" ? msg.body : String(msg.body ?? ""),
-            senderId: "agent",
-            senderName: "agent",
-            timestamp: new Date().toISOString(),
-          };
-        }
+        envelope = typeof msg.body === "string" ? JSON.parse(msg.body) : msg.body;
       } catch (e) {
         this.log(`[bridge:outbound] Failed to parse ${file}: ${e}`);
         renameSync(fullPath, join(cur, file));
