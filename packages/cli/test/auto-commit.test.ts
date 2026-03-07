@@ -1,67 +1,98 @@
-import { describe, test, expect } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
-import * as os from "node:os";
+import { describe, expect, mock, test } from "bun:test";
+import { runAutoCommit, type CodexRuntimeConfig } from "../src/utils/codex-runtime.ts";
 
-const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
-const TMP_ROOT = resolve(import.meta.dir, "../.tmp-tests");
+const config: CodexRuntimeConfig = {
+  agentId: "ember",
+  workspace: "/tmp/repo",
+  mailDir: "/tmp/mail",
+};
 
-function git(args: string[], cwd: string): string {
-  const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
-  if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
-  return (r.stdout ?? "").trim();
-}
+describe("runAutoCommit", () => {
+  test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      if (cmd === "git" && args.join(" ") === "checkout -b feat/task-123") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "tps") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
 
-function initRepo(root: string): string {
-  const repo = join(root, "repo");
-  mkdirSync(repo, { recursive: true });
-  git(["init"], repo);
-  git(["checkout", "-b", "main"], repo);
-  git(["config", "user.name", "Test"], repo);
-  git(["config", "user.email", "test@tps.dev"], repo);
-  writeFileSync(join(repo, "README.md"), "init\n");
-  git(["add", "-A"], repo);
-  git(["commit", "-m", "init"], repo);
-  return repo;
-}
+    await runAutoCommit(
+      config,
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-123",
+        branchName: "feat/task-123",
+        commitMessage: "feat: ship task 123",
+        authorName: "ember",
+        authorEmail: "ember@tps.dev",
+        prTitle: "feat: ship task 123",
+      },
+      { spawnSyncImpl },
+    );
 
-mkdirSync(TMP_ROOT, { recursive: true });
-
-describe("ops-68: auto-commit lifecycle", () => {
-  test("commits on a task branch with correct author", () => {
-    const tmp = mkdtempSync(join(TMP_ROOT, "auto-commit-"));
-    try {
-      const repo = initRepo(tmp);
-      writeFileSync(join(repo, "output.ts"), "export const x = 1;\n");
-      const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
-      const result = spawnSync("bun", [TPS_BIN, "agent", "commit",
-        "--repo", repo, "--branch", "task/ops-68",
-        "--message", "task complete: ops-68",
-        "--author", "Ember", "ember@tps.dev",
-      ], { encoding: "utf-8", env: cleanEnv });
-      expect(result.status).toBe(0);
-      expect(git(["rev-parse", "--abbrev-ref", "HEAD"], repo)).toBe("task/ops-68");
-      expect(git(["log", "-1", "--format=%an <%ae>|%s"], repo)).toBe("Ember <ember@tps.dev>|task complete: ops-68");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
+    expect(calls).toEqual([
+      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "git", args: ["checkout", "-b", "feat/task-123"] },
+      {
+        cmd: "tps",
+        args: [
+          "agent",
+          "commit",
+          "--repo",
+          "/tmp/repo",
+          "--branch",
+          "feat/task-123",
+          "--message",
+          "feat: ship task 123",
+          "--author",
+          "ember",
+          "ember@tps.dev",
+          "--pr-title",
+          "feat: ship task 123",
+        ],
+      },
+    ]);
   });
 
-  test("noops gracefully when no changes staged", () => {
-    const tmp = mkdtempSync(join(TMP_ROOT, "auto-commit-"));
-    try {
-      const repo = initRepo(tmp);
-      const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
-      const result = spawnSync("bun", [TPS_BIN, "agent", "commit",
-        "--repo", repo, "--branch", "task/no-changes",
-        "--message", "task complete: empty",
-        "--author", "Ember", "ember@tps.dev",
-      ], { encoding: "utf-8", env: cleanEnv });
-      expect(result.status).not.toBe(0); // should fail with "No changes staged"
-      expect((result.stderr ?? "") + (result.stdout ?? "")).toContain("No changes staged");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
+  test("publishes a blocker OrgEvent when PR creation fails with exit code 2", async () => {
+    const publishEvent = mock(async () => {});
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
+      }
+      if (cmd === "tps") {
+        return { status: 2, stdout: "", stderr: "gh-as pr create failed" };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    await expect(runAutoCommit(
+      config,
+      { publishEvent },
+      {
+        taskId: "task-456",
+        branchName: "feat/task-456",
+        commitMessage: "feat: ship task 456",
+        authorName: "ember",
+        authorEmail: "ember@tps.dev",
+      },
+      { spawnSyncImpl },
+    )).rejects.toThrow("tps agent commit failed: gh-as pr create failed");
+
+    expect(publishEvent).toHaveBeenCalledTimes(1);
+    expect(publishEvent).toHaveBeenCalledWith({
+      kind: "blocker",
+      summary: "PR creation failed for task-456",
+      detail: "gh-as pr create failed",
+      refId: "task-456",
+    });
   });
 });

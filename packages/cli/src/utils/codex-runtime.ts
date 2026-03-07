@@ -241,45 +241,108 @@ async function runCodex(
 }
 
 /** Run tps agent commit for the given config + task. Non-fatal — logs on failure. */
-function runAutoCommit(
+export interface AutoCommitOptions {
+  taskId: string;
+  branchName: string;
+  commitMessage: string;
+  authorName: string;
+  authorEmail: string;
+  prTitle?: string;
+}
+
+export interface AutoCommitDeps {
+  spawnSyncImpl?: typeof spawnSync;
+  tpsCommand?: string;
+}
+
+interface AutoCommitFlair {
+  publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
+}
+
+export async function runAutoCommit(
+  config: CodexRuntimeConfig,
+  flair: AutoCommitFlair,
+  options: AutoCommitOptions,
+  deps: AutoCommitDeps = {},
+): Promise<void> {
+  const runSync = deps.spawnSyncImpl ?? spawnSync;
+  const tpsCmd = deps.tpsCommand ?? "tps";
+  const repo = config.workspace;
+  const { taskId, branchName, commitMessage, authorName, authorEmail, prTitle } = options;
+
+  // Ensure we're on a named branch (not detached HEAD) before committing
+  const headCheck = runSync("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  if ((headCheck.status ?? 1) !== 0) {
+    const checkout = runSync("git", ["checkout", "-b", branchName], { cwd: repo, encoding: "utf-8" });
+    if ((checkout.status ?? 1) !== 0) {
+      const stderr = typeof checkout.stderr === "string" ? checkout.stderr.trim() : "";
+      throw new Error(`create branch ${branchName} failed: ${stderr || `exit ${checkout.status}`}`);
+    }
+  }
+
+  const args = [
+    "agent", "commit",
+    "--repo", repo,
+    "--branch", branchName,
+    "--message", commitMessage,
+    "--author", authorName, authorEmail,
+    ...(prTitle ? ["--pr-title", prTitle] : []),
+  ];
+
+  const result = runSync(tpsCmd, args, { cwd: repo, encoding: "utf-8" });
+  if (result.status === 0) return;
+
+  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const errMsg = stderr || stdout || `exit ${result.status ?? "unknown"}`;
+
+  if (result.status === 2) {
+    // Push succeeded but PR creation failed
+    try {
+      await flair.publishEvent({
+        kind: "blocker",
+        summary: `PR creation failed for ${taskId}`,
+        detail: errMsg,
+        refId: taskId,
+      });
+    } catch { /* non-fatal */ }
+  }
+
+  throw new Error(`tps agent commit failed: ${errMsg}`);
+}
+
+/** @internal Legacy inline auto-commit for the mail loop. Wraps runAutoCommit. */
+async function _runAutoCommitLegacy(
   agentId: string,
   workspace: string,
   taskId: string,
   cfg: AutoCommitConfig,
-): string | null {
-  const repo = cfg.repo ?? workspace;
+  flair: AutoCommitFlair,
+): Promise<string | null> {
   const branchPrefix = cfg.branchPrefix ?? "task/";
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
   const authorName = cfg.authorName ?? agentId;
   const authorEmail = cfg.authorEmail ?? `${agentId}@tps.dev`;
   const tpsBin = join(homedir(), ".tps", "bin", "tps");
-  const [cmd, baseArgs] = existsSync(tpsBin)
-    ? [tpsBin, [] as string[]]
-    : ["bun", [join(import.meta.dirname, "../../bin/tps.ts")]];
+  const tpsCommand = existsSync(tpsBin) ? tpsBin : undefined;
 
-  const args = [
-    ...baseArgs,
-    "agent", "commit",
-    "--repo", repo,
-    "--branch", safeBranch,
-    "--message", `task complete: ${taskId}`,
-    "--author", authorName, authorEmail,
-    ...(cfg.push ? ["--push"] : []),
-  ];
-
-  console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${repo}`);
-  const result = spawnSync(cmd, args, { encoding: "utf-8" });
-  if (result.status === 0) {
-    const out = result.stdout?.trim() ?? "";
-    console.log(`[${agentId}] Auto-commit succeeded: ${out}`);
-    // Extract PR URL if push was enabled (gh pr create outputs the URL)
-    const prMatch = out.match(/https:\/\/github\.com\/[^\s]+\/pull\/\d+/);
-    return prMatch ? prMatch[0] : safeBranch;
-  } else {
-    console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${result.stderr?.trim() || result.stdout?.trim()}`);
+  console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
+  try {
+    await runAutoCommit(
+      { agentId, workspace, mailDir: "" },
+      flair,
+      { taskId, branchName: safeBranch, commitMessage: `task complete: ${taskId}`, authorName, authorEmail },
+      { tpsCommand },
+    );
+    console.log(`[${agentId}] Auto-commit succeeded: ${safeBranch}`);
+    return safeBranch;
+  } catch (e) {
+    const err = e as Error;
+    console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${err.message}`);
     return null;
   }
 }
+
 
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
@@ -360,15 +423,18 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       } else {
         await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
       }
-      // Auto-commit if configured
+      // Auto-commit if configured — _runAutoCommitLegacy handles detached HEAD + blocker on exit 2
       if (config.autoCommit) {
-        const prRef = runAutoCommit(agentId, config.workspace, taskId, config.autoCommit);
-        if (prRef && config.autoCommit.push) {
+        const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
+          try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+        }};
+        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher);
+        if (branchRef && config.autoCommit.push) {
           try {
             await (flair as any).request("POST", "/OrgEvent", {
               kind: "pr.opened", authorId: agentId,
               summary: `PR opened for ${taskId}`, refId: taskId,
-              detail: prRef,
+              detail: branchRef,
             });
           } catch { /* non-fatal */ }
         }
