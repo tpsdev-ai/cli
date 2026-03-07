@@ -49,11 +49,11 @@ export class DiscordAdapter implements BridgeAdapter {
   async start(onInbound: (envelope: BridgeEnvelope) => string): Promise<void> {
     this.onInbound = onInbound;
 
-    // Seed lastMessageId so we don't replay history on boot
-    const recent = await this.fetchMessages(1);
-    if (recent.length > 0) {
-      this.lastMessageId = recent[0].id;
-    }
+    // Seed: set cursor to 30 seconds ago so we catch messages sent during bridge startup
+    // without replaying full history. Uses Discord snowflake format.
+    const lookbackMs = 30_000;
+    const epoch = BigInt(Date.now() - lookbackMs - 1420070400000) * BigInt(2 ** 22);
+    this.lastMessageId = epoch.toString();
 
     this.pollTimer = setInterval(() => { void this.poll(); }, this.pollIntervalMs);
     console.log(`[discord-bridge] Listening on channel ${this.channelId}`);

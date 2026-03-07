@@ -10,17 +10,16 @@ describe("DiscordAdapter", () => {
   });
 
   beforeEach(() => {
+    let pollCount = 0;
     fetchMock = mock(async (url: string, opts?: RequestInit) => {
       const u = String(url);
-      // Seed call (limit=1, no after)
-      if (u.includes("limit=1") && !u.includes("after=")) {
-        return { ok: true, json: async () => [{ id: "1000", author: { bot: false, id: "u1", username: "Alice" }, content: "hi", timestamp: "2026-01-01T00:00:00Z", guild_id: "g1" }] };
+      // Poll call (after=<snowflake>) — first poll returns new message, rest empty
+      if (u.includes("after=")) {
+        pollCount++;
+        if (pollCount === 1) {
+          return { ok: true, json: async () => [{ id: "1001", author: { bot: false, id: "u2", username: "Bob" }, content: "hello", timestamp: "2026-01-01T00:01:00Z", guild_id: "g1", mentions: [] }] };
+        }
       }
-      // Poll call (after=1000) — one new message
-      if (u.includes("after=1000")) {
-        return { ok: true, json: async () => [{ id: "1001", author: { bot: false, id: "u2", username: "Bob" }, content: "hello", timestamp: "2026-01-01T00:01:00Z", guild_id: "g1" }] };
-      }
-      // Subsequent polls — empty
       return { ok: true, json: async () => [] };
     });
     globalThis.fetch = fetchMock as any;
