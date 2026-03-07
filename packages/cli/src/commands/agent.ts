@@ -479,7 +479,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       if (args.action === "start") {
-        const sandbox = (args as any).sandbox ?? false;
+        const sandbox = (args as any).sandbox ?? true; // default ON — nono is the required isolation layer
         const sandboxed = (args as any).sandboxed ?? false;
         const nonoAvailable = findNono();
 
