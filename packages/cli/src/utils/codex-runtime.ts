@@ -9,7 +9,7 @@ import {
   readFileSync, existsSync, mkdirSync, readdirSync,
   renameSync, writeFileSync, appendFileSync, createWriteStream,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
@@ -81,6 +81,14 @@ export interface AutoCommitConfig {
   authorEmail?: string;
   /** Push branch to origin and open PR after commit */
   push?: boolean;
+  /** Open a PR after pushing the branch */
+  openPr?: boolean;
+  /** Repo slug to target when opening a PR, e.g. "org/repo" */
+  prRepo?: string;
+  /** PR title to use when opening a PR */
+  prTitle?: string;
+  /** Path to the GitHub PAT file; basename maps to gh-as agent handle */
+  githubPat?: string;
 }
 
 export interface CodexRuntimeConfig {
@@ -249,6 +257,10 @@ export interface AutoCommitOptions {
   commitMessage: string;
   authorName: string;
   authorEmail: string;
+  push?: boolean;
+  openPr?: boolean;
+  prRepo?: string;
+  ghAgent?: string;
   prTitle?: string;
 }
 
@@ -308,7 +320,18 @@ export async function runAutoCommit(
   const runSync = deps.spawnSyncImpl ?? spawnSync;
   const tpsCmd = deps.tpsCommand ?? "tps";
   const repo = config.workspace;
-  const { taskId, branchName, commitMessage, authorName, authorEmail, prTitle } = options;
+  const {
+    taskId,
+    branchName,
+    commitMessage,
+    authorName,
+    authorEmail,
+    push,
+    openPr,
+    prRepo,
+    ghAgent,
+    prTitle,
+  } = options;
 
   // Ensure we're on a named branch (not detached HEAD) before committing
   const headCheck = runSync("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: repo, encoding: "utf-8" });
@@ -326,11 +349,43 @@ export async function runAutoCommit(
     "--branch", branchName,
     "--message", commitMessage,
     "--author", authorName, authorEmail,
-    ...(prTitle ? ["--pr-title", prTitle] : []),
+    ...(push ? ["--push"] : []),
+    ...(prTitle && !(openPr && prRepo) ? ["--pr-title", prTitle] : []),
   ];
 
   const result = runSync(tpsCmd, args, { cwd: repo, encoding: "utf-8" });
-  if (result.status === 0) return;
+  if (result.status === 0) {
+    if (push && openPr && prRepo) {
+      const prArgs = [
+        ghAgent ?? authorEmail.split("@")[0] ?? "",
+        "pr",
+        "create",
+        "--repo",
+        prRepo,
+        "--head",
+        branchName,
+        ...(prTitle ? ["--title", prTitle] : []),
+        "--body",
+        commitMessage,
+      ];
+      const prResult = runSync("gh-as", prArgs, { cwd: repo, encoding: "utf-8" });
+      if ((prResult.status ?? 1) === 0) return;
+
+      const prStderr = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
+      const prStdout = typeof prResult.stdout === "string" ? prResult.stdout.trim() : "";
+      const prErrMsg = prStderr || prStdout || `exit ${prResult.status ?? "unknown"}`;
+      try {
+        await flair.publishEvent({
+          kind: "blocker",
+          summary: `PR creation failed for ${taskId}`,
+          detail: prErrMsg,
+          refId: taskId,
+        });
+      } catch { /* non-fatal */ }
+      throw new Error(`gh-as pr create failed: ${prErrMsg}`);
+    }
+    return;
+  }
 
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
   const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
@@ -365,13 +420,27 @@ async function _runAutoCommitLegacy(
   const authorEmail = cfg.authorEmail ?? `${agentId}@tps.dev`;
   const tpsBin = join(homedir(), ".tps", "bin", "tps");
   const tpsCommand = existsSync(tpsBin) ? tpsBin : undefined;
+  const ghAgent = cfg.githubPat
+    ? basename(cfg.githubPat).replace(/-github-pat(?:\.[^.]+)?$/, "").replace(/\.[^.]+$/, "")
+    : undefined;
 
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
     await runAutoCommit(
-      { agentId, workspace, mailDir: "" },
+      { agentId, workspace: cfg.repo ?? workspace, mailDir: "" },
       flair,
-      { taskId, branchName: safeBranch, commitMessage: `task complete: ${taskId}`, authorName, authorEmail },
+      {
+        taskId,
+        branchName: safeBranch,
+        commitMessage: `task complete: ${taskId}`,
+        authorName,
+        authorEmail,
+        push: cfg.push,
+        openPr: cfg.openPr,
+        prRepo: cfg.prRepo,
+        ghAgent,
+        prTitle: cfg.prTitle,
+      },
       { tpsCommand },
     );
     console.log(`[${agentId}] Auto-commit succeeded: ${safeBranch}`);
