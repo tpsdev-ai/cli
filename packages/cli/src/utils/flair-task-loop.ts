@@ -5,7 +5,7 @@
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
  *   startTaskLoop(flairClient, "anvil", async (event) => {
- *     console.log("Got task:", event.summary, event.refId);
+ *     slog("Got task:", event.summary, event.refId);
  *   });
  */
 
@@ -13,6 +13,9 @@ import type { FlairClient } from "./flair-client.js";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:flair");
+
 
 export interface OrgEvent {
   id: string;
@@ -52,7 +55,7 @@ function saveCursor(agentId: string, since: string): void {
     writeFileSync(cursorPath(agentId), JSON.stringify({ since, updatedAt: new Date().toISOString() }));
   } catch (e) {
     const err = e as Error;
-    console.warn(`[${agentId}] Failed to persist cursor: ${err.message}`);
+    swarn(`[${agentId}] Failed to persist cursor: ${err.message}`);
   }
 }
 
@@ -88,12 +91,12 @@ export function startTaskLoop(
           const targets = event.targetIds ?? [];
           if (targets.length > 0 && !targets.includes(agentId)) continue;
 
-          console.log(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
+          slog(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
           try {
             await handler(event);
           } catch (e) {
             const err = e as Error;
-            console.error(`[${agentId}] Task handler error for ${event.id}: ${err.message}`);
+            serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}`);
           }
         }
 
@@ -112,7 +115,7 @@ export function startTaskLoop(
       } catch (e) {
         const err = e as Error;
         consecutiveErrors++;
-        console.warn(`[${agentId}] Task loop poll error: ${err.message}`);
+        swarn(`[${agentId}] Task loop poll error: ${err.message}`);
       }
 
       // Exponential backoff on errors, capped at MAX_BACKOFF_MS
@@ -124,6 +127,6 @@ export function startTaskLoop(
   }
 
   poll();
-  console.log(`[${agentId}] Task loop started (polling every ${basePollMs / 1000}s, cursor: ${since})`);
+  slog(`[${agentId}] Task loop started (polling every ${basePollMs / 1000}s, cursor: ${since})`);
   return { stop: () => { running = false; } };
 }

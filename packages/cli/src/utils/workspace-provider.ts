@@ -16,6 +16,9 @@ import { join, resolve, relative, isAbsolute } from "node:path";
 import { tmpdir } from "node:os";
 import type { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord } from "./flair-client.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:workspace");
+
 
 // ── Interfaces ─────────────────────────────────────────────────────────────
 
@@ -178,7 +181,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       const stashMsg = `auto-stash: pre-reset ${new Date().toISOString()}`;
       const stash = this.git("stash", "push", "-m", stashMsg);
       if (stash.ok) {
-        console.log(`[workspace] Stashed uncommitted changes: ${stashMsg}`);
+        slog(`[workspace] Stashed uncommitted changes: ${stashMsg}`);
       } else {
         // Stash failed — checkpoint to recovery branch instead
         const recoveryBranch = `recovery/${Date.now()}`;
@@ -186,7 +189,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
         this.gitOrThrow("checkout", "-b", recoveryBranch);
         this.gitOrThrow("add", "-A");
         this.git("commit", "--author", this.author, "-m", `WIP: recovery before reset`);
-        console.warn(`[workspace] Stash failed — saved to branch ${recoveryBranch}`);
+        swarn(`[workspace] Stash failed — saved to branch ${recoveryBranch}`);
       }
     }
 
@@ -258,7 +261,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
         throw new Error(msg);
       }
       // warn mode: proceed with last known state
-      console.warn(`[workspace] ⚠️ ${msg} — proceeding with current state`);
+      swarn(`[workspace] ⚠️ ${msg} — proceeding with current state`);
       const sha = this.headSha();
       this.registerRef(sha);
       return {
@@ -451,7 +454,7 @@ export class FilesystemWorkspaceProvider implements WorkspaceProvider {
         };
         await this.flair.writeWorkspaceState(record);
       } catch (err: any) {
-        console.warn(`[workspace] Flair checkpoint write failed (non-fatal): ${err.message}`);
+        swarn(`[workspace] Flair checkpoint write failed (non-fatal): ${err.message}`);
       }
     }
 

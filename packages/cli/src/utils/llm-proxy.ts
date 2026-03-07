@@ -22,6 +22,9 @@ import crypto from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:llm");
+
 
 const DEFAULT_PORT = 6459;
 const WINDOW_MS = 30_000; // 30-second replay window
@@ -127,7 +130,7 @@ function writeClaudeOAuthCredentials(creds: ClaudeOAuthCredentials): void {
     writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
     renameSync(tmp, CLAUDE_CREDENTIALS_PATH);
   } catch (err) {
-    console.error("[llm-proxy] Failed to write OAuth credentials:", err);
+    serror("[llm-proxy] Failed to write OAuth credentials:", err);
   }
 }
 
@@ -242,7 +245,7 @@ function writeOpenAIOAuthCredentials(creds: OpenAIOAuthCredentials): void {
     writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
     renameSync(tmpPath, authPath);
   } catch (err) {
-    console.error("[llm-proxy] Failed to write OpenAI OAuth credentials:", err);
+    serror("[llm-proxy] Failed to write OpenAI OAuth credentials:", err);
   }
 }
 
@@ -486,7 +489,7 @@ export function createLLMProxy(port = DEFAULT_PORT): { start: () => Promise<void
     start: () =>
       new Promise((resolve, reject) => {
         server.listen(port, "127.0.0.1", () => {
-          console.log(`TPS LLM proxy listening on http://127.0.0.1:${port}`);
+          slog(`TPS LLM proxy listening on http://127.0.0.1:${port}`);
           resolve();
         });
         server.on("error", reject);
@@ -504,7 +507,7 @@ const PROXY_PID_PATH = join(homedir(), ".tps", "run", "llm-proxy.pid");
 export function startProxyDaemon(port = DEFAULT_PORT): void {
   const proxy = createLLMProxy(port);
   proxy.start().catch((e) => {
-    console.error(`Failed to start LLM proxy: ${e}`);
+    serror(`Failed to start LLM proxy: ${e}`);
     process.exit(1);
   });
 

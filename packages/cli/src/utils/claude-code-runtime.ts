@@ -51,6 +51,9 @@ import {
   onTaskFailure,
 } from "./agent-lifecycle.js";
 import type { WorkspaceProvider } from "./workspace-provider.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:agent");
+
 
 /** How often to snapshot Flair soul to disk (ms) */
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
@@ -225,7 +228,7 @@ async function runClaudeCode(
             for (const tu of toolUses) {
               turnCount++;
               const args = typeof tu.input === "object" ? JSON.stringify(tu.input).slice(0, 80) : String(tu.input ?? "");
-              console.log(`[${config.agentId}] turn ${turnCount}: ${tu.name}(${args})`);
+              slog(`[${config.agentId}] turn ${turnCount}: ${tu.name}(${args})`);
             }
           } else if (event.type === "result") {
             // Final event — extract result
@@ -277,28 +280,28 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
   const pidPath = join(workspace, ".tps-agent.pid");
   writeFileSync(pidPath, `${process.pid}\n`, "utf-8");
 
-  console.log(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
+  slog(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
 
   // Initial Flair health check + snapshot
   const flairOnline = await flair.ping();
   if (flairOnline) {
-    console.log(`[${agentId}] Flair online — snapshotting soul to disk`);
+    slog(`[${agentId}] Flair online — snapshotting soul to disk`);
     await snapshotSoulToDisk(flair, agentId);
   } else {
     const fallback = getFallbackSoulPath(agentId);
-    console.warn(`[${agentId}] ⚠️  Flair offline at startup. Fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
+    swarn(`[${agentId}] ⚠️  Flair offline at startup. Fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
   }
 
   // Boot: catch up on any topic messages missed while offline
   try {
     const caught = catchUpTopics(agentId);
     if (caught > 0) {
-      console.log(`[${agentId}] Caught up ${caught} missed topic message(s) on boot`);
+      slog(`[${agentId}] Caught up ${caught} missed topic message(s) on boot`);
     }
   } catch (err: any) {
-    console.warn(`[${agentId}] Topic catch-up failed at boot: ${err.message}`);
+    swarn(`[${agentId}] Topic catch-up failed at boot: ${err.message}`);
   }
 
   // Boot: workspace lifecycle — query Flair for last state, checkpoint (OPS-47 Phase 2)
@@ -306,18 +309,18 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     try {
       const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
       if (lastCheckpoint) {
-        console.log(`[${agentId}] Resumed from last checkpoint: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+        slog(`[${agentId}] Resumed from last checkpoint: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
       }
     } catch (err: any) {
-      console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      swarn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
     }
 
     try {
       const base = await workspaceProvider.baseline();
       await workspaceProvider.reset(base);
-      console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
+      slog(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
     } catch (err: any) {
-      console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
+      serror(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
       throw err;
     }
   }
@@ -332,14 +335,14 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       if (await flair.ping()) {
         await snapshotSoulToDisk(flair, agentId);
         lastSnapshot = Date.now();
-        console.log(`[${agentId}] Flair soul snapshot refreshed`);
+        slog(`[${agentId}] Flair soul snapshot refreshed`);
       }
     }
 
     const messages = checkNewMail(mailDir, agentId);
 
     for (const msg of messages) {
-      console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+      slog(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
       // Task start: snapshot workspace via lifecycle hook (OPS-47 Phase 2)
       const taskId = msg.id;
@@ -348,13 +351,13 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         try {
           preTaskState = await onTaskStart(workspaceProvider, flair, taskId);
         } catch (err: any) {
-          console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
+          swarn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
         }
       }
 
       try {
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
-        console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
+        slog(`[${agentId}] Task complete. Result length: ${result.length}`);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
 
@@ -363,7 +366,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           try {
             await onTaskComplete(workspaceProvider, flair, taskId, preTaskState);
           } catch (err: any) {
-            console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
+            swarn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
           }
         } else {
           // Fallback: write task memory directly if no workspace provider
@@ -375,11 +378,11 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       } catch (err: any) {
         // Hard fail: no system prompt available → notify supervisor
         if (err.message.startsWith("No system prompt available")) {
-          console.error(`[${agentId}] FATAL: ${err.message}`);
+          serror(`[${agentId}] FATAL: ${err.message}`);
           sendMail(mailDir, agentId, config.supervisorId ?? msg.from,
             `Agent ${agentId} cannot start task: ${err.message}`);
         } else {
-          console.error(`[${agentId}] Task failed:`, err.message);
+          serror(`[${agentId}] Task failed:`, err.message);
           sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
 
           // Task failure: checkpoint + failure record via lifecycle hook (OPS-47 Phase 2)
@@ -387,7 +390,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
             try {
               await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message);
             } catch (cpErr: any) {
-              console.warn(`[${agentId}] Failure lifecycle failed: ${cpErr.message}`);
+              swarn(`[${agentId}] Failure lifecycle failed: ${cpErr.message}`);
             }
           } else {
             await writeTaskMemory(flair, agentId, "failure", {

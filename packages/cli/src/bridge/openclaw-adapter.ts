@@ -13,6 +13,9 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:bridge:openclaw");
+
 
 // ─── Ed25519 verification ─────────────────────────────────────────────────────
 
@@ -83,7 +86,7 @@ export class OpenClawAdapter implements BridgeAdapter {
   constructor(config: OpenClawAdapterConfig = {}, log?: (msg: string) => void) {
     this.port = config.port ?? 7891;
     this.openClawUrl = config.openClawUrl ?? process.env.OPENCLAW_MESSAGE_URL ?? "http://127.0.0.1:3000/api/message";
-    this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
+    this.log = log ?? ((msg) => slog(`${new Date().toISOString()} ${msg}`));
   }
 
   async start(onInbound: (envelope: BridgeEnvelope) => string): Promise<void> {

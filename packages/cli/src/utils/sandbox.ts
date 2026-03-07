@@ -12,6 +12,9 @@ import { existsSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:sandbox");
+
 
 export interface SandboxInfo {
   name: string;
@@ -145,7 +148,7 @@ export function waitForSandbox(name: string, timeoutMs = 30000): boolean {
     // If socket parent dir doesn't exist, Docker's internal layout may have changed
     const parentDir = join(sock, "..");
     if (Date.now() - start > 15000 && !existsSync(parentDir)) {
-      console.error(
+      serror(
         `Docker Sandbox socket path not found: ${parentDir}\n` +
         `Docker may have changed its internal layout. Expected socket at:\n  ${sock}`
       );

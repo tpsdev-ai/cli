@@ -19,6 +19,9 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
+
 
 const RELAY_PID_PATH = join(homedir(), ".tps", "relay.pid");
 const RELAY_POLL_MS = 500;
@@ -103,16 +106,16 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
     process.exit(0);
   });
 
-  console.log(
+  slog(
     `[relay] TPS mail relay started (pid=${process.pid}, mailDir=${mailDir})`,
   );
 
   while (true) {
     try {
       const n = deliverPendingMail(mailDir);
-      if (n > 0) console.log(`[relay] Delivered ${n} message(s)`);
+      if (n > 0) slog(`[relay] Delivered ${n} message(s)`);
     } catch (err: any) {
-      console.error(`[relay] Error:`, err?.message ?? err);
+      serror(`[relay] Error:`, err?.message ?? err);
     }
     await new Promise((r) => setTimeout(r, RELAY_POLL_MS));
   }

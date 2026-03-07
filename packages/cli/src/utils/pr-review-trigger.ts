@@ -9,6 +9,9 @@
  */
 
 import { spawnSync } from "node:child_process";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
+
 
 export interface ReviewTriggerConfig {
   reviewers: string[];   // GitHub usernames to request review from
@@ -44,10 +47,10 @@ export function requestReviews(
   );
 
   if (result.status !== 0) {
-    console.warn(`[pr-review-trigger] Failed to request reviews for PR #${prNumber}: ${result.stderr?.trim()}`);
+    swarn(`[pr-review-trigger] Failed to request reviews for PR #${prNumber}: ${result.stderr?.trim()}`);
     return false;
   }
-  console.log(`[pr-review-trigger] Requested review on PR #${prNumber} from: ${reviewers.join(", ")}`);
+  slog(`[pr-review-trigger] Requested review on PR #${prNumber} from: ${reviewers.join(", ")}`);
   return true;
 }
 
@@ -62,7 +65,7 @@ export async function handlePrOpened(
   const prNumber = extractPrNumber(detail);
 
   if (!prNumber) {
-    console.warn(`[pr-review-trigger] No PR number in event detail: ${detail}`);
+    swarn(`[pr-review-trigger] No PR number in event detail: ${detail}`);
     return;
   }
 

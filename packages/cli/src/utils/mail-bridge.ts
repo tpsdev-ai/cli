@@ -13,6 +13,9 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
+import snooplogg from "snooplogg";
+const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
+
 
 // Legacy BridgeConfig (maps to new structure)
 export interface BridgeConfig {
@@ -58,7 +61,7 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
   });
 
   core.start().catch((e) => {
-    console.error(`Bridge start failed: ${e}`);
+    serror(`Bridge start failed: ${e}`);
     process.exit(1);
   });
 
