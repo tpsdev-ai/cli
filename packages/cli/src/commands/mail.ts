@@ -4,12 +4,12 @@ import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, readdirSync, readFileSync, renameSync, watch } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 
 interface MailArgs {
-  action: "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish";
+  action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish";
   agent?: string;
   message?: string;
   messageId?: string;
@@ -64,6 +64,16 @@ function validateAgent(agent?: string): string {
     process.exit(1);
   }
   return agent;
+}
+
+function newestJsonMtime(dir: string): string | null {
+  if (!existsSync(dir)) return null;
+  const newest = readdirSync(dir)
+    .filter((file) => file.endsWith(".json"))
+    .map((file) => join(dir, file))
+    .filter((file) => existsSync(file))
+    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
+  return newest ? statSync(newest).mtime.toISOString() : null;
 }
 
 export async function runMail(args: MailArgs): Promise<void> {
@@ -163,6 +173,27 @@ export async function runMail(args: MailArgs): Promise<void> {
           const marker = m.read ? "📖" : "📬";
           console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}`);
         }
+      }
+      return;
+    }
+
+    case "stats": {
+      const agent = await resolveAgentId(args.agent);
+      const inbox = getInbox(agent);
+      const sentDir = join(inbox.root, "sent");
+      const payload = {
+        agent,
+        inboxCount: readdirSync(inbox.fresh).filter((file) => file.endsWith(".json")).length,
+        lastReceived: newestJsonMtime(inbox.fresh),
+        lastSent: newestJsonMtime(sentDir),
+      };
+      if (args.json) {
+        console.log(JSON.stringify(payload, null, 2));
+      } else {
+        console.log(`Agent: ${payload.agent}`);
+        console.log(`Inbox count: ${payload.inboxCount}`);
+        console.log(`Last received: ${payload.lastReceived ?? "never"}`);
+        console.log(`Last sent: ${payload.lastSent ?? "never"}`);
       }
       return;
     }

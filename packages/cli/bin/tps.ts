@@ -248,8 +248,8 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate", "logs"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
@@ -294,6 +294,17 @@ async function main() {
           id: getFlag("id") ?? rest[1],
           flairUrl: getFlag("flair-url"),
           force: cli.flags.force,
+        });
+      } else if (action === "logs") {
+        const { runAgentLogs } = await import("../src/commands/agent-logs.js");
+        const rawLimit = getFlag("limit");
+        await runAgentLogs({
+          agentId: rest[1] ?? getFlag("id"),
+          asAgent: getFlag("as"),
+          json: cli.flags.json as boolean | undefined,
+          flairUrl: getFlag("flair-url"),
+          mailDir: getFlag("mail-dir"),
+          limit: rawLimit ? Number.parseInt(rawLimit, 10) : undefined,
         });
       } else if (action === "commit") {
         // Inline helpers (getAuthor/getRepeatedFlags defined in else block below)
@@ -505,8 +516,8 @@ async function main() {
       break;
     }
     case "mail": {
-      const action = rest[0] as "send" | "check" | "list" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | undefined;
-      const validMailActions = ["send", "check", "list", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish"];
+      const action = rest[0] as "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | undefined;
+      const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish"];
       if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
           "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
