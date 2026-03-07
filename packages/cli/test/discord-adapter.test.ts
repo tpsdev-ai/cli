@@ -27,7 +27,7 @@ describe("DiscordAdapter", () => {
   });
 
   test("seeds lastMessageId on start and delivers new messages", async () => {
-    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan1", pollIntervalMs: 999999 });
+    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan1", pollIntervalMs: 999999, requireMention: false });
     const received: any[] = [];
     await adapter.start((env) => { received.push(env); return "ok"; });
 
@@ -48,7 +48,7 @@ describe("DiscordAdapter", () => {
     }));
     globalThis.fetch = fetchMock as any;
 
-    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan2", pollIntervalMs: 999999 });
+    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan2", pollIntervalMs: 999999, requireMention: false });
     const received: any[] = [];
     await adapter.start((env) => { received.push(env); return "ok"; });
     await (adapter as any).poll();
@@ -65,7 +65,7 @@ describe("DiscordAdapter", () => {
     });
     globalThis.fetch = fetchMock as any;
 
-    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan3", pollIntervalMs: 999999 });
+    const adapter = new DiscordAdapter({ token: "tok", channelId: "chan3", pollIntervalMs: 999999, requireMention: false });
     await adapter.start(() => "ok");
     await adapter.send({ channel: "discord", channelId: "chan3", senderId: "s1", senderName: "Ember", content: "Done!", timestamp: new Date().toISOString() });
 

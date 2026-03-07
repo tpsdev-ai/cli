@@ -42,6 +42,8 @@ export class DiscordAdapter implements BridgeAdapter {
     this.token = config.token;
     this.channelId = config.channelId;
     this.pollIntervalMs = config.pollIntervalMs ?? 5_000;
+    this.botUserId = config.botUserId;
+    this.requireMention = config.requireMention !== false;
   }
 
   async start(onInbound: (envelope: BridgeEnvelope) => string): Promise<void> {
