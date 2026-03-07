@@ -102,12 +102,23 @@ export class BridgeCore {
         "X-TPS-Sender": envelope.senderId,
         "X-TPS-Channel": `${envelope.channel}:${envelope.channelId}`,
       },
-      body: JSON.stringify(envelope),
+      body: this.buildInboundBody(envelope),
     };
 
     writeFileSync(join(fresh, `${id}.json`), JSON.stringify(msg, null, 2), "utf-8");
     this.log(`[bridge:inbound] ${envelope.channel}/${envelope.senderId} → ${targetAgent}`);
     return targetAgent;
+  }
+
+  private buildInboundBody(envelope: BridgeEnvelope): string {
+    if (envelope.metadata?.channel !== "discord") {
+      return JSON.stringify(envelope);
+    }
+
+    return `[Discord message from ${envelope.senderName}]
+Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
+
+Message: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {
