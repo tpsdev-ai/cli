@@ -23,6 +23,7 @@ export interface BridgeArgs {
   openClawUrl?: string;
   // Discord adapter options
   discordToken?: string;
+  discordTokenFile?: string;
   discordChannel?: string;
   discordPollMs?: number;
   // Shared
@@ -39,7 +40,11 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
 
       // Discord adapter path — does not use the legacy daemon
       if (adapter === "discord") {
-        const token = args.discordToken ?? process.env.DISCORD_BOT_TOKEN;
+        let token = args.discordToken ?? process.env.DISCORD_BOT_TOKEN;
+        if (!token && args.discordTokenFile) {
+          const { readFileSync } = await import("node:fs");
+          token = readFileSync(args.discordTokenFile, "utf-8").trim();
+        }
         const channelId = args.discordChannel ?? process.env.DISCORD_CHANNEL_ID;
         if (!token || !channelId) {
           console.error("Discord bridge requires --discord-token and --discord-channel (or env DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID)");
