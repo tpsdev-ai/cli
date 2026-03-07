@@ -849,10 +849,14 @@ async function main() {
       const { runBridge } = await import("../src/commands/bridge.js");
       await runBridge({
         action,
+        adapter: getFlag("adapter") as "openclaw" | "discord" | "stdio" | undefined,
         port: getFlag("port") ? parseInt(getFlag("port")!, 10) : undefined,
         openClawUrl: getFlag("openclaw-url") ?? process.env.OPENCLAW_MESSAGE_URL,
+        discordToken: getFlag("discord-token") ?? process.env.DISCORD_BOT_TOKEN,
+        discordChannel: getFlag("discord-channel") ?? process.env.DISCORD_CHANNEL_ID,
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
+        mailDir: getFlag("mail-dir"),
         json: cli.flags.json,
       });
       break;
