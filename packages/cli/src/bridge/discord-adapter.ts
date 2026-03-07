@@ -18,6 +18,10 @@ export interface DiscordAdapterConfig {
   channelId: string;
   /** Poll interval for incoming messages (ms, default 5000) */
   pollIntervalMs?: number;
+  /** Bot's own Discord user ID — used for mention detection */
+  botUserId?: string;
+  /** If true (default), only forward messages that @mention the bot. Set false to forward all messages. */
+  requireMention?: boolean;
 }
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -28,6 +32,8 @@ export class DiscordAdapter implements BridgeAdapter {
   private token: string;
   private channelId: string;
   private pollIntervalMs: number;
+  private botUserId?: string;
+  private requireMention = true;
   private lastMessageId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private onInbound: ((envelope: BridgeEnvelope) => string) | null = null;
@@ -36,6 +42,8 @@ export class DiscordAdapter implements BridgeAdapter {
     this.token = config.token;
     this.channelId = config.channelId;
     this.pollIntervalMs = config.pollIntervalMs ?? 5_000;
+    this.botUserId = config.botUserId;
+    this.requireMention = config.requireMention !== false;
   }
 
   async start(onInbound: (envelope: BridgeEnvelope) => string): Promise<void> {
@@ -106,6 +114,15 @@ export class DiscordAdapter implements BridgeAdapter {
         if (msg.author?.bot) {
           this.lastMessageId = msg.id;
           continue;
+        }
+
+        // Mention filtering: skip messages that don't @mention the bot (default: on)
+        if (this.requireMention) {
+          const mentioned = msg.mentions?.some((u: { id: string }) => u.id === this.botUserId);
+          if (!mentioned) {
+            this.lastMessageId = msg.id;
+            continue;
+          }
         }
 
         // Parse @agentname routing (e.g. "@ember do this task")

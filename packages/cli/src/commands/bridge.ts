@@ -27,6 +27,8 @@ export interface BridgeArgs {
   discordChannel?: string;
   discordPollMs?: number;
   discordContextPrompt?: string;
+  botUserId?: string;
+  requireMention?: boolean;
   // Shared
   bridgeAgentId?: string;
   defaultAgentId?: string;
@@ -55,6 +57,8 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           token,
           channelId,
           pollIntervalMs: args.discordPollMs,
+        botUserId: args.botUserId,
+        requireMention: args.requireMention,
         });
         const core = new BridgeCore(discordAdapter, {
           bridgeAgentId: args.bridgeAgentId ?? "discord-bridge",
