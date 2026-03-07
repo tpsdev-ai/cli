@@ -117,7 +117,7 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
   const logStream = createWriteStream(logPath, { flags: "a" });
 
   // Gemini: pass prompt via stdin (avoids arg length limits with long system prompts)
-  const args = ["-y", "--model", model, "--prompt", ""];
+  const args = ["-y", "--model", model, "--prompt", "", "-e", ""];
 
   return new Promise((resolve, reject) => {
     const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"] });
