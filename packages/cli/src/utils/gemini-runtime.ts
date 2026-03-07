@@ -78,7 +78,9 @@ function getFallbackSoulPath(agentId: string): string {
   return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
 }
 
-async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<string> {
+/** Returns { systemPrompt, userTask } — kept separate so gemini gets
+ *  system context via stdin and the task body via -p (avoids prompt echo). */
+async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<{ systemPrompt: string; userTask: string }> {
   let systemPrompt = "";
   try {
     const flair = new FlairClient({
@@ -98,7 +100,6 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
     if (experience) systemPrompt += "\n\n" + experience;
   } catch (err: unknown) {
     swarn(`Flair boot failed, using disk fallback: ${(err as Error).message}`);
-    // Disk fallback
     const soulPath = getFallbackSoulPath(config.agentId);
     if (existsSync(soulPath)) {
       systemPrompt = readFileSync(soulPath, "utf-8");
@@ -106,22 +107,23 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
       systemPrompt = `You are ${config.agentId}. Respond helpfully.`;
     }
   }
-  return [systemPrompt, "", `[Mail from: ${message.from}]`, message.body].join("\n");
+  const userTask = `[Mail from: ${message.from}]\n${message.body}`;
+  return { systemPrompt, userTask };
 }
 
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
-  const prompt = await buildPrompt(message, config);
+  const { systemPrompt, userTask } = await buildPrompt(message, config);
   const model = config.model ?? "gemini-2.5-pro";
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (gemini)\n${"=".repeat(60)}\n`);
   const logStream = createWriteStream(logPath, { flags: "a" });
 
   // Gemini: pass prompt via stdin (avoids arg length limits with long system prompts)
-  const args = ["-y", "--model", model, "--prompt", "", "-e", ""];
+  const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
     const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"] });
-    proc.stdin.write(prompt);
+    proc.stdin.write(systemPrompt);
     proc.stdin.end();
     const chunks: Buffer[] = [];
     proc.stdout.on("data", (c: Buffer) => { chunks.push(c); logStream.write(c); });
