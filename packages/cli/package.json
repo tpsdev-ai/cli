@@ -22,8 +22,8 @@
     "dev": "tsc --watch",
     "start": "node dist/bin/tps.js",
     "tps": "node dist/bin/tps.js",
-    "lint": "biome lint ./src ./bin",
-    "lint:ci": "biome lint ./src ./bin --max-diagnostics=200",
+    "lint": "biome lint ./src ./bin && node ../../scripts/lint-flair-keypath.mjs src",
+    "lint:ci": "biome lint ./src ./bin --max-diagnostics=200 && node ../../scripts/lint-flair-keypath.mjs src",
     "pretest": "tsc",
     "test": "bun test",
     "postinstall": "node scripts/postinstall.cjs"
