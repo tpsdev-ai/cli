@@ -59,6 +59,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           bridgeAgentId: args.bridgeAgentId ?? "discord-bridge",
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId ?? "ember",
+          defaultChannelId: channelId,
         });
         await core.start();
 
