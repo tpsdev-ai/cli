@@ -46,6 +46,7 @@
         "msgpackr": "^1.11.8",
         "noise-handshake": "^4.2.0",
         "react": "^18.3.1",
+        "snooplogg": "^6.1.1",
         "ws": "^8.19.0",
         "zod": "^3.24.0",
       },
@@ -262,6 +263,8 @@
     "signal-exit": ["signal-exit@3.0.7", "", {}, "sha512-wnD2ZE+l+SPC/uoS0vXeE9L1+0wuaMqKlfz9AMUo38JsyLSBWSFcHR1Rri62LZc12vLr1gb3jl7iwQhgwpAbGQ=="],
 
     "slice-ansi": ["slice-ansi@7.1.2", "", { "dependencies": { "ansi-styles": "^6.2.1", "is-fullwidth-code-point": "^5.0.0" } }, "sha512-iOBWFgUX7caIZiuutICxVgX1SdxwAVFFKwt1EvMYYec/NWO5meOJ6K5uQxhrYBdQJne4KxiqZc+KptFOWFSI9w=="],
+
+    "snooplogg": ["snooplogg@6.1.1", "", {}, "sha512-ERUf0zDe+4/wdzoTlz9aj45PCXRO/jckRY6BwlGLl4dZVr8hanHEW13MSYLSqOz9aDbRR8PGnb4arak+Nh4VqQ=="],
 
     "sodium-native": ["sodium-native@5.0.10", "", { "dependencies": { "require-addon": "^1.1.0", "which-runtime": "^1.2.1" } }, "sha512-UIw+0AbpCQRuTJF88JWrZomP4O+PXhlWvdopiAJOsUivTyHTf3korMyStxkZuPngSbBEtEfDdc4ewEd8/T4/lA=="],
 

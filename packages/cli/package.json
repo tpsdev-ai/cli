@@ -47,6 +47,7 @@
     "msgpackr": "^1.11.8",
     "noise-handshake": "^4.2.0",
     "react": "^18.3.1",
+    "snooplogg": "^6.1.1",
     "ws": "^8.19.0",
     "zod": "^3.24.0"
   },

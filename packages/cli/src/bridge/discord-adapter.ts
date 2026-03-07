@@ -9,7 +9,10 @@
  */
 
 import { randomUUID as _randomUUID } from "node:crypto";
+import snooplogg from "snooplogg";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+
+const { log: slog, warn: swarn } = snooplogg("bridge:discord");
 
 export interface DiscordAdapterConfig {
   /** Discord bot token */
@@ -111,9 +114,11 @@ export class DiscordAdapter implements BridgeAdapter {
   private async poll(): Promise<void> {
     try {
       const messages = await this.fetchMessages();
+      if (messages.length > 0) slog(`poll: ${messages.length} message(s)`);
       for (const msg of messages) {
         // Skip bot messages to avoid loops
         if (msg.author?.bot) {
+          slog(`skip bot: ${msg.id}`);
           this.lastMessageId = msg.id;
           continue;
         }
@@ -123,6 +128,7 @@ export class DiscordAdapter implements BridgeAdapter {
           const mentions = msg.mentions ?? [];
           const mentioned = mentions.some((u: { id: string } | string) => typeof u === "string" ? u === this.botUserId : u.id === this.botUserId);
           if (!mentioned) {
+            slog(`skip (no mention): ${msg.id} by ${msg.author?.username}`);
             this.lastMessageId = msg.id;
             continue;
           }
@@ -153,7 +159,8 @@ export class DiscordAdapter implements BridgeAdapter {
       }
     } catch (e) {
       const err = e as Error;
-      console.warn(`[discord-bridge] Poll error: ${err.message}`);
+      swarn(`poll error: ${err.message}`);
+      swarn(err.stack ?? err.message);
     }
   }
 }
