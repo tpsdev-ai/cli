@@ -13,7 +13,7 @@
  *   search <agentId> <q>    Semantic search (excludes archived)
  */
 
-import { createFlairClient, type Memory } from "../utils/flair-client.js";
+import { createFlairClient, defaultFlairKeyPath, type Memory } from "../utils/flair-client.js";
 
 export interface MemoryArgs {
   action: "review" | "approve" | "reject" | "archive" | "unarchive" | "purge" | "list" | "show" | "search";
@@ -46,7 +46,7 @@ export async function runMemory(args: MemoryArgs): Promise<void> {
   // For governance ops (approve/reject/archive/purge) the admin authenticates as themselves
   // The agentId used for signing is the CLI operator's configured agent (default: from env)
   const operatorId = process.env.TPS_AGENT_ID ?? args.agentId ?? "admin";
-  const flair = createFlairClient(operatorId, flairUrl, args.keyPath);
+  const flair = createFlairClient(operatorId, flairUrl, args.keyPath ?? defaultFlairKeyPath(operatorId));
 
   switch (args.action) {
     case "review": {
@@ -143,7 +143,7 @@ export async function runMemory(args: MemoryArgs): Promise<void> {
         console.error("Usage: tps memory search <agentId> <query>");
         process.exit(1);
       }
-      const agentFlair = createFlairClient(args.agentId, flairUrl, args.keyPath);
+      const agentFlair = createFlairClient(args.agentId, flairUrl, args.keyPath ?? defaultFlairKeyPath(args.agentId));
       const results = await agentFlair.search(args.query, args.limit ?? 10);
       if (args.json) { console.log(JSON.stringify(results, null, 2)); break; }
       if (results.length === 0) { console.log("No results."); break; }

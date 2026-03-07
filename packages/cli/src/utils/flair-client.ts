@@ -12,7 +12,7 @@ import { join } from "node:path";
 export interface FlairConfig {
   baseUrl?: string;
   agentId: string;
-  keyPath?: string;
+  keyPath: string;
 }
 
 export interface Memory {
@@ -99,6 +99,7 @@ export interface FlairAgent {
   name: string;
   publicKey: string;
   status?: string;
+  lastHeartbeat?: string;
   createdAt?: string;
 }
 
@@ -135,9 +136,7 @@ export class FlairClient {
   constructor(config: FlairConfig) {
     this.baseUrl = (config.baseUrl ?? "http://127.0.0.1:9926").replace(/\/$/, "");
     this.agentId = config.agentId;
-    this.keyPath =
-      config.keyPath ??
-      join(homedir(), ".tps", "identity", `${config.agentId}.key`);
+    this.keyPath = config.keyPath;
   }
 
   private loadKey(): ReturnType<typeof createPrivateKey> {
@@ -238,6 +237,14 @@ export class FlairClient {
       return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`);
     } catch {
       return null;
+    }
+  }
+
+  async listAgents(): Promise<FlairAgent[]> {
+    try {
+      return await this.request<FlairAgent[]>("GET", "/Agent/");
+    } catch {
+      return [];
     }
   }
 
@@ -595,10 +602,14 @@ export class FlairClient {
   }
 }
 
+export function defaultFlairKeyPath(agentId: string): string {
+  return join(homedir(), ".tps", "identity", `${agentId}.key`);
+}
+
 export function createFlairClient(
   agentId: string,
-  baseUrl?: string,
-  keyPath?: string,
+  baseUrl: string | undefined,
+  keyPath: string,
 ): FlairClient {
   return new FlairClient({
     agentId,

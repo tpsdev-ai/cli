@@ -38,7 +38,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient } from "./flair-client.js";
+import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
   bootContext,
@@ -139,7 +139,7 @@ async function buildSystemPrompt(
 ): Promise<string> {
   const { agentId, workspace, allowedTools, supervisorId, flairUrl, flairKeyPath } = config;
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
 
   const { systemPrompt, identitySource } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -279,7 +279,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
   console.log(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
 
   // Initial Flair health check + snapshot
   const flairOnline = await flair.ping();
