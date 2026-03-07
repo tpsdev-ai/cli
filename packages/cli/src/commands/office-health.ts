@@ -15,6 +15,7 @@ export interface OfficeHealthArgs {
   json?: boolean;
   viewerId?: string;
   flairUrl?: string;
+  keyPath?: string;
   once?: boolean;
 }
 
@@ -160,12 +161,13 @@ function renderText(result: OfficeHealthTickResult): string {
 export async function runOfficeHealthTick(args: {
   viewerId: string;
   flairUrl?: string;
+  keyPath?: string;
   nowMs?: number;
   state?: HealthState;
 }): Promise<{ result: OfficeHealthTickResult; state: HealthState }> {
   const nowMs = args.nowMs ?? Date.now();
   const timestamp = new Date(nowMs).toISOString();
-  const flair = createFlairClient(args.viewerId, args.flairUrl, defaultFlairKeyPath(args.viewerId));
+  const flair = createFlairClient(args.viewerId, args.flairUrl, args.keyPath ?? defaultFlairKeyPath(args.viewerId));
   const agents = await flair.listAgents();
   const nextState: HealthState = args.state ?? readState();
   let publishedEvents = 0;
@@ -241,6 +243,7 @@ export async function runOfficeHealth(args: OfficeHealthArgs): Promise<void> {
       const tick = await runOfficeHealthTick({
         viewerId,
         flairUrl: args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+        keyPath: args.keyPath ?? defaultFlairKeyPath(viewerId),
         state,
       });
       state = tick.state;

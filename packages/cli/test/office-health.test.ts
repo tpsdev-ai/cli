@@ -65,10 +65,12 @@ describe("tps office health", () => {
     }) as typeof globalThis.fetch;
 
     const { runOfficeHealthTick } = await import("../src/commands/office-health.js");
+    const keyPath = join(tempHome, ".tps", "identity", "anvil.key");
 
     const first = await runOfficeHealthTick({
       viewerId: "anvil",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath,
       nowMs,
       state: { unhealthyAgents: {} },
     });
@@ -85,6 +87,7 @@ describe("tps office health", () => {
     const second = await runOfficeHealthTick({
       viewerId: "anvil",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath,
       nowMs,
       state: first.state,
     });
@@ -100,6 +103,7 @@ describe("tps office health", () => {
     const recovered = await runOfficeHealthTick({
       viewerId: "anvil",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath,
       nowMs,
       state: second.state,
     });
@@ -115,6 +119,7 @@ describe("tps office health", () => {
     const republished = await runOfficeHealthTick({
       viewerId: "anvil",
       flairUrl: "http://127.0.0.1:9926",
+      keyPath,
       nowMs,
       state: recovered.state,
     });
@@ -140,7 +145,7 @@ describe("tps office health", () => {
     }) as typeof globalThis.fetch;
 
     const { runOfficeHealth } = await import("../src/commands/office-health.js");
-    await runOfficeHealth({ once: true, json: true, flairUrl: "http://127.0.0.1:9926", viewerId: "anvil" });
+    await runOfficeHealth({ once: true, json: true, flairUrl: "http://127.0.0.1:9926", viewerId: "anvil", keyPath: join(tempHome, ".tps", "identity", "anvil.key") });
 
     expect(logs).toHaveLength(1);
     const parsed = JSON.parse(logs[0]!);
