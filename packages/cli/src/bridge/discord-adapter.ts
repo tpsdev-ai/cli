@@ -49,11 +49,13 @@ export class DiscordAdapter implements BridgeAdapter {
   async start(onInbound: (envelope: BridgeEnvelope) => string): Promise<void> {
     this.onInbound = onInbound;
 
-    // Seed: set cursor to 30 seconds ago so we catch messages sent during bridge startup
-    // without replaying full history. Uses Discord snowflake format.
-    const lookbackMs = 30_000;
+    // Seed: set cursor to 5 minutes ago and replay any messages in that window.
+    // This catches messages sent just before the bridge started without full history replay.
+    const lookbackMs = 5 * 60 * 1000;
     const epoch = BigInt(Date.now() - lookbackMs - 1420070400000) * BigInt(2 ** 22);
     this.lastMessageId = epoch.toString();
+    // Replay the lookback window immediately on start
+    await this.poll();
 
     this.pollTimer = setInterval(() => { void this.poll(); }, this.pollIntervalMs);
     console.log(`[discord-bridge] Listening on channel ${this.channelId}`);
@@ -118,7 +120,8 @@ export class DiscordAdapter implements BridgeAdapter {
 
         // Mention filtering: skip messages that don't @mention the bot (default: on)
         if (this.requireMention) {
-          const mentioned = msg.mentions?.some((u: { id: string }) => u.id === this.botUserId);
+          const mentions = msg.mentions ?? [];
+          const mentioned = mentions.some((u: { id: string } | string) => typeof u === "string" ? u === this.botUserId : u.id === this.botUserId);
           if (!mentioned) {
             this.lastMessageId = msg.id;
             continue;

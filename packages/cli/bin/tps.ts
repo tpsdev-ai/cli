@@ -858,6 +858,10 @@ async function main() {
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
         mailDir: getFlag("mail-dir"),
+        botUserId: getFlag("bot-user-id"),
+        requireMention: getFlag("require-mention") !== "false",
+        discordPollMs: getFlag("discord-poll-ms") ? parseInt(getFlag("discord-poll-ms")!, 10) : undefined,
+        discordContextPrompt: getFlag("discord-prompt"),
         json: cli.flags.json,
       });
       break;
