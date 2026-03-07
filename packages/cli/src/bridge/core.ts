@@ -19,7 +19,10 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import snooplogg from "snooplogg";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+
+const { log: slog, warn: swarn } = snooplogg("tps:bridge");
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -55,7 +58,7 @@ export class BridgeCore {
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
-    this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
+    this.log = log ?? ((msg) => slog(msg));
   }
 
   async start(): Promise<void> {

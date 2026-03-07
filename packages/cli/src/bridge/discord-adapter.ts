@@ -61,7 +61,7 @@ export class DiscordAdapter implements BridgeAdapter {
     await this.poll();
 
     this.pollTimer = setInterval(() => { void this.poll(); }, this.pollIntervalMs);
-    console.log(`[discord-bridge] Listening on channel ${this.channelId}`);
+    slog(`listening on channel ${this.channelId}`);
   }
 
   async send(envelope: BridgeEnvelope): Promise<void> {
@@ -82,7 +82,7 @@ export class DiscordAdapter implements BridgeAdapter {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    console.log("[discord-bridge] Stopped.");
+    slog("stopped");
   }
 
   // ─── Private ───────────────────────────────────────────────────────────────
@@ -103,7 +103,7 @@ export class DiscordAdapter implements BridgeAdapter {
       { headers: this.headers() },
     );
     if (!res.ok) {
-      console.warn(`[discord-bridge] Fetch failed (${res.status})`);
+      swarn(`fetch failed (${res.status})`);
       return [];
     }
     const msgs: any[] = await res.json();

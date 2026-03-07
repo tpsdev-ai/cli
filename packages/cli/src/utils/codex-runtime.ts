@@ -5,6 +5,13 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import snooplogg from "snooplogg";
+
+function agentLog(agentId: string) {
+  const { log, warn, error } = snooplogg(`tps:agent:${agentId}`);
+  return { log, warn, error };
+}
+
 import {
   readFileSync, existsSync, mkdirSync, readdirSync,
   renameSync, writeFileSync, appendFileSync, createWriteStream,
@@ -55,15 +62,15 @@ async function ensureFreshOpenAIToken(agentId: string): Promise<void> {
   if (!isExpiringSoon) return;
 
   if (!creds.clientId) {
-    console.warn(`[${agentId}] ⚠️  OpenAI token expiring soon but no clientId — re-run: tps auth login openai`);
+    agentLog(agentId).warn(`⚠️  OpenAI token expiring soon but no clientId — re-run: tps auth login openai`);
     return;
   }
 
   try {
     const refreshed = await refreshOpenAIToken(creds);
-    console.log(`[${agentId}] OpenAI token refreshed — expires ${new Date(refreshed.expiresAt).toISOString()}`);
+    agentLog(agentId).log(`OpenAI token refreshed — expires ${new Date(refreshed.expiresAt).toISOString()}`);
   } catch (err: any) {
-    console.warn(`[${agentId}] ⚠️  OpenAI token refresh failed (non-fatal): ${err.message}`);
+    agentLog(agentId).warn(`⚠️  OpenAI token refresh failed (non-fatal): ${err.message}`);
   }
 }
 
@@ -211,11 +218,11 @@ async function runCodex(
               resultMessages.push(item.text);
             } else if (item.type === "command_execution") {
               turnCount++;
-              console.log(`[${config.agentId}] turn ${turnCount}: exec(${String(item.command ?? "").slice(0, 80)}) → ${item.exit_code}`);
+              agentLog(config.agentId).log(`turn ${turnCount}: exec(${String(item.command ?? "").slice(0, 80)}) → ${item.exit_code}`);
             }
           } else if (event.type === "turn.completed") {
             const u = event.usage as Record<string, number> | undefined;
-            if (u) console.log(`[${config.agentId}] tokens: in=${u.input_tokens} out=${u.output_tokens}`);
+            if (u) agentLog(config.agentId).log(`tokens: in=${u.input_tokens} out=${u.output_tokens}`);
           }
         } catch {}
       }
@@ -326,7 +333,7 @@ async function _runAutoCommitLegacy(
   const tpsBin = join(homedir(), ".tps", "bin", "tps");
   const tpsCommand = existsSync(tpsBin) ? tpsBin : undefined;
 
-  console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
+  agentLog(agentId).log(`Auto-commit: ${safeBranch} in ${workspace}`);
   try {
     await runAutoCommit(
       { agentId, workspace, mailDir: "" },
@@ -334,11 +341,11 @@ async function _runAutoCommitLegacy(
       { taskId, branchName: safeBranch, commitMessage: `task complete: ${taskId}`, authorName, authorEmail },
       { tpsCommand },
     );
-    console.log(`[${agentId}] Auto-commit succeeded: ${safeBranch}`);
+    agentLog(agentId).log(`Auto-commit succeeded: ${safeBranch}`);
     return safeBranch;
   } catch (e) {
     const err = e as Error;
-    console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${err.message}`);
+    agentLog(agentId).warn(`Auto-commit failed (non-fatal): ${err.message}`);
     return null;
   }
 }
@@ -347,7 +354,7 @@ async function _runAutoCommitLegacy(
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
-  console.log(`[${agentId}] Codex runtime started. Polling ${mailDir}/${agentId}/new`);
+  agentLog(agentId).log(`Codex runtime started. Polling ${mailDir}/${agentId}/new`);
 
   await ensureFreshOpenAIToken(agentId);
 
@@ -362,33 +369,33 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   const flairOnline = await flair.ping();
   if (flairOnline) {
-    console.log(`[${agentId}] Flair online — snapshotting soul to disk`);
+    agentLog(agentId).log(`Flair online — snapshotting soul to disk`);
     await snapshotSoulToDisk(flair, agentId);
   } else {
     const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
-    console.warn(`[${agentId}] ⚠️  Flair offline. Fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
+    agentLog(agentId).warn(`⚠️  Flair offline. Fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
   }
 
   try {
     const caught = catchUpTopics(agentId);
-    if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
+    if (caught > 0) agentLog(agentId).log(`Caught up ${caught} missed topic message(s)`);
   } catch (err: any) {
-    console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
+    agentLog(agentId).warn(`Topic catch-up failed: ${err.message}`);
   }
 
   if (workspaceProvider) {
     try {
       const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
-      if (lastCheckpoint) console.log(`[${agentId}] Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      if (lastCheckpoint) agentLog(agentId).log(`Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
     } catch (err: any) {
-      console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      agentLog(agentId).warn(`Boot lifecycle failed (non-fatal): ${err.message}`);
     }
     try {
       const base = await workspaceProvider.baseline();
       await workspaceProvider.reset(base);
-      console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
+      agentLog(agentId).log(`Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
     } catch (err: any) {
-      console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
+      agentLog(agentId).error(`Workspace baseline reset failed: ${err.message}`);
       throw err;
     }
   }
@@ -401,14 +408,14 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     let preTaskState: WorkspaceState | undefined;
     if (workspaceProvider) {
       try { preTaskState = await onTaskStart(workspaceProvider, flair, taskId); } catch (e) {
-        console.warn(`[${agentId}] Pre-task lifecycle failed: ${(e as Error).message}`);
+        agentLog(agentId).warn(`Pre-task lifecycle failed: ${(e as Error).message}`);
       }
     }
     try {
       const msg: MailMessage = { id: taskId, from: event.authorId, to: agentId, body: taskBody, timestamp: new Date().toISOString() };
       const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
       const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
-      console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
+      agentLog(agentId).log(`Flair task complete. Result: ${result.length} chars`);
       sendMail(mailDir, agentId, event.authorId, `Task complete (via Flair):\n\n${summary}`);
       try {
         await (flair as any).request("POST", "/OrgEvent", {
@@ -418,7 +425,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       } catch { /* non-fatal */ }
       if (workspaceProvider && preTaskState) {
         try { await onTaskComplete(workspaceProvider, flair, taskId, preTaskState); } catch (e) {
-          console.warn(`[${agentId}] Post-task lifecycle failed: ${(e as Error).message}`);
+          agentLog(agentId).warn(`Post-task lifecycle failed: ${(e as Error).message}`);
         }
       } else {
         await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
@@ -441,7 +448,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       }
     } catch (e) {
       const err = e as Error;
-      console.error(`[${agentId}] Flair task failed:`, err.message);
+      agentLog(agentId).error(`Flair task failed: ${err.message}`);
       sendMail(mailDir, agentId, event.authorId, `Task failed (via Flair): ${err.message}`);
       if (workspaceProvider && preTaskState) {
         try { await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message); } catch { /* */ }
@@ -461,7 +468,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     startTaskLoop(flair, `${agentId}-review-trigger`, async (event) => {
       await handlePrOpened(event, triggerConfig);
     }, { kinds: ["pr.opened"] });
-    console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
+    agentLog(config.agentId).log(`Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
   }
 
   let lastSnapshot = Date.now();
@@ -487,27 +494,27 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
 
     for (const msg of checkNewMail(mailDir, agentId)) {
-      console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+      agentLog(agentId).log(`Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
       let preTaskState;
       if (workspaceProvider) {
         try { preTaskState = await onTaskStart(workspaceProvider, flair, msg.id); } catch (err: any) {
-          console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
+          agentLog(agentId).warn(`Pre-task lifecycle failed: ${err.message}`);
         }
       }
       try {
         const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
-        console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
+        agentLog(agentId).log(`Task complete. Result length: ${result.length}`);
         sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
         if (workspaceProvider && preTaskState) {
           try { await onTaskComplete(workspaceProvider, flair, msg.id, preTaskState); } catch (err: any) {
-            console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
+            agentLog(agentId).warn(`Post-task lifecycle failed: ${err.message}`);
           }
         } else {
           await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
         }
       } catch (err: any) {
-        console.error(`[${agentId}] Task failed:`, err.message);
+        agentLog(agentId).error(`Task failed: ${err.message}`);
         sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
         if (workspaceProvider && preTaskState) {
           try { await onTaskFailure(workspaceProvider, flair, msg.id, preTaskState, err.message); } catch {}
