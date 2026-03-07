@@ -18,6 +18,8 @@ export interface DiscordAdapterConfig {
   channelId: string;
   /** Poll interval for incoming messages (ms, default 5000) */
   pollIntervalMs?: number;
+  /** If set, only forward messages that mention this Discord user ID (bot ID). DMs always pass through. */
+  botUserId?: string;
 }
 
 const DISCORD_API = "https://discord.com/api/v10";
@@ -28,6 +30,7 @@ export class DiscordAdapter implements BridgeAdapter {
   private token: string;
   private channelId: string;
   private pollIntervalMs: number;
+  private botUserId?: string;
   private lastMessageId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private onInbound: ((envelope: BridgeEnvelope) => string) | null = null;
@@ -106,6 +109,15 @@ export class DiscordAdapter implements BridgeAdapter {
         if (msg.author?.bot) {
           this.lastMessageId = msg.id;
           continue;
+        }
+
+        // If botUserId is set, only route messages that mention the bot (or are DMs)
+        if (this.botUserId) {
+          const mentioned = msg.mentions?.some((u: { id: string }) => u.id === this.botUserId);
+          if (!mentioned) {
+            this.lastMessageId = msg.id;
+            continue;
+          }
         }
 
         // Parse @agentname routing (e.g. "@ember do this task")
