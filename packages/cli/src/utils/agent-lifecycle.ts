@@ -131,8 +131,7 @@ System prompt sourced from: ${identitySource === "flair" ? "Flair (live)" : "⚠
 When you finish a task, use Bash to send mail:
   cd ${workspace} && tps mail send ${supervisor} "done: <summary>"
 
-Always commit your work before mailing ${supervisor}:
-  git add -A && git commit --author="${agentId} <${agentId}@tps.dev>" -m "feat: ..."
+Do NOT run git add, git commit, or git push — the TPS runtime commits and opens a PR automatically after you reply. Just edit the files and send mail when done."
 `.trim());
 
   return { systemPrompt: parts.join("\n\n"), identitySource };
