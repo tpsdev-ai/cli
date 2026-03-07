@@ -127,7 +127,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
   }
 
   // 2. Register in Flair
-  const flair = createFlairClient(id, flairUrl);
+  const flair = createFlairClient(id, flairUrl, keyPath);
   const online = await flair.ping();
 
   if (!online) {
@@ -247,7 +247,8 @@ async function listAgents(args: AgentArgs): Promise<void> {
     // Check Flair registration
     let flairStatus = "unknown";
     try {
-      const flair = createFlairClient(id, flairUrl);
+      const kpPath = join(homedir(), ".tps", "identity", `${id}.key`);
+      const flair = createFlairClient(id, flairUrl, kpPath);
       const online = await flair.ping();
       if (!online) {
         flairStatus = "offline";
@@ -322,7 +323,8 @@ async function agentStatus(args: AgentArgs): Promise<void> {
 
   // Flair status
   try {
-    const flair = createFlairClient(id, flairUrl);
+    const kpPath2 = join(homedir(), ".tps", "identity", `${id}.key`);
+    const flair = createFlairClient(id, flairUrl, kpPath2);
     const online = await flair.ping();
     if (!online) {
       out.flair = { online: false };
@@ -374,7 +376,7 @@ async function decommissionAgent(args: AgentArgs): Promise<void> {
 
   const summary: Array<{ label: string; result: string }> = [];
 
-  const flair = createFlairClient(id, flairUrl);
+  const flair = createFlairClient(id, flairUrl, keyPath);
   if (existsSync(keyPath)) {
     try {
       (flair as unknown as { loadKey: () => unknown }).loadKey();
