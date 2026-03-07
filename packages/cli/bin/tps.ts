@@ -441,6 +441,18 @@ async function main() {
         process.exit(1);
       }
 
+      // `tps office status` with no agent = full Flair office view
+      if (action === "status" && !rest[1]) {
+        const { runOfficeStatus } = await import("../src/commands/office-status.js");
+        await runOfficeStatus({
+          flairUrl: process.env.FLAIR_URL,
+          repo: process.env.TPS_REPO,
+          json: cli.flags.json,
+          noColor: Boolean(cli.flags["no-color"]),
+        });
+        break;
+      }
+
       const { runOffice } = await import("../src/commands/office.js");
       if (isLegacy) {
         await runOffice({ action: "start", agent: rest[0] });
