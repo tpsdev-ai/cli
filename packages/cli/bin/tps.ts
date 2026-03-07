@@ -451,8 +451,8 @@ async function main() {
     }
 
     case "office": {
-      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup" | undefined;
-      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill", "setup"];
+      const action = rest[0] as "start" | "stop" | "list" | "status" | "relay" | "exec" | "join" | "revoke" | "sync" | "connect" | "kill" | "setup" | "health" | undefined;
+      const validActions = ["start", "stop", "list", "status", "relay", "exec", "join", "revoke", "sync", "connect", "kill", "setup", "health"];
       // Backward compatibility: `tps office <agent>` maps to `start <agent>`.
       const isLegacy = action && !validActions.includes(action);
       if ((!action && !isLegacy) || (!isLegacy && !validActions.includes(action!))) {
@@ -460,6 +460,20 @@ async function main() {
           "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill"
         );
         process.exit(1);
+      }
+
+      // `tps office health` — continuous monitor
+      if (action === "health") {
+        const { runOfficeHealth } = await import("../src/commands/office-health.js");
+        const healthInterval = process.argv.find((a: string) => a.startsWith("--interval="))?.split("=")[1];
+        await runOfficeHealth({
+          flairUrl: process.env.FLAIR_URL,
+          viewerId: process.env.TPS_AGENT_ID ?? "anvil",
+          interval: healthInterval ? Number(healthInterval) : 60,
+          json: cli.flags.json as boolean | undefined,
+          once: process.argv.includes("--once"),
+        });
+        break;
       }
 
       // `tps office status` with no agent = full Flair office view
