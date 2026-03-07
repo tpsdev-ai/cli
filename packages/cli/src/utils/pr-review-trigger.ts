@@ -18,6 +18,9 @@ export interface ReviewTriggerConfig {
   agentId: string;       // gh-as identity (e.g. "anvil")
   repo: string;          // owner/repo (e.g. "tpsdev-ai/cli")
 }
+export interface ReviewRequestDeps {
+  spawnSyncImpl?: typeof spawnSync;
+}
 
 /**
  * Extract PR number from a GitHub PR URL.
@@ -35,12 +38,14 @@ function extractPrNumber(detail: string): number | null {
 export function requestReviews(
   prNumber: number,
   config: ReviewTriggerConfig,
+  deps: ReviewRequestDeps = {},
 ): boolean {
   const { reviewers, agentId, repo } = config;
   if (reviewers.length === 0) return true;
+  const runSync = deps.spawnSyncImpl ?? spawnSync;
 
   const body = JSON.stringify({ reviewers });
-  const result = spawnSync(
+  const result = runSync(
     "gh-as",
     [agentId, "api", "--method", "POST", `repos/${repo}/pulls/${prNumber}/requested_reviewers`, "--input", "-"],
     { input: body, encoding: "utf-8" },
@@ -52,6 +57,15 @@ export function requestReviews(
   }
   slog(`[pr-review-trigger] Requested review on PR #${prNumber} from: ${reviewers.join(", ")}`);
   return true;
+}
+
+export function reRequestReviewer(
+  prNumber: number,
+  reviewer: string,
+  config: Omit<ReviewTriggerConfig, "reviewers">,
+  deps: ReviewRequestDeps = {},
+): boolean {
+  return requestReviews(prNumber, { ...config, reviewers: [reviewer] }, deps);
 }
 
 /**
