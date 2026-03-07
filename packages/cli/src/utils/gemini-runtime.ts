@@ -74,33 +74,57 @@ function sendMail(mailDir: string, from: string, to: string, body: string): void
   renameSync(join(tmp, filename), join(fresh, filename));
 }
 
-async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<string> {
-  const flair = new FlairClient({
-    baseUrl: config.flairUrl,
-    agentId: config.agentId,
-    keyPath: config.flairKeyPath ?? defaultFlairKeyPath(config.agentId),
-  });
-  const { systemPrompt } = await bootContext(
-    flair, config.agentId, message.body.slice(0, 100), config.workspace,
-    { supervisorId: config.supervisorId },
-  );
-  const experience = await searchPastExperience(flair, message.body, config.workspace);
-  const sys = experience ? systemPrompt + "\n\n" + experience : systemPrompt;
-  return [sys, "", `[Mail from: ${message.from}]`, message.body].join("\n");
+function getFallbackSoulPath(agentId: string): string {
+  return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
+}
+
+/** Returns { systemPrompt, userTask } — kept separate so gemini gets
+ *  system context via stdin and the task body via -p (avoids prompt echo). */
+async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<{ systemPrompt: string; userTask: string }> {
+  let systemPrompt = "";
+  try {
+    const flair = new FlairClient({
+      baseUrl: config.flairUrl,
+      agentId: config.agentId,
+      keyPath: config.flairKeyPath ?? defaultFlairKeyPath(config.agentId),
+    });
+    const bootResult = await Promise.race([
+      bootContext(flair, config.agentId, message.body.slice(0, 100), config.workspace, { supervisorId: config.supervisorId }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("boot timeout")), 10_000)),
+    ]);
+    systemPrompt = bootResult.systemPrompt;
+    const experience = await Promise.race([
+      searchPastExperience(flair, message.body, config.workspace),
+      new Promise<string | null>((resolve) => setTimeout(() => resolve(null), 5_000)),
+    ]);
+    if (experience) systemPrompt += "\n\n" + experience;
+  } catch (err: unknown) {
+    swarn(`Flair boot failed, using disk fallback: ${(err as Error).message}`);
+    const soulPath = getFallbackSoulPath(config.agentId);
+    if (existsSync(soulPath)) {
+      systemPrompt = readFileSync(soulPath, "utf-8");
+    } else {
+      systemPrompt = `You are ${config.agentId}. Respond helpfully.`;
+    }
+  }
+  const userTask = `[Mail from: ${message.from}]\n${message.body}`;
+  return { systemPrompt, userTask };
 }
 
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
-  const prompt = await buildPrompt(message, config);
+  const { systemPrompt, userTask } = await buildPrompt(message, config);
   const model = config.model ?? "gemini-2.5-pro";
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (gemini)\n${"=".repeat(60)}\n`);
   const logStream = createWriteStream(logPath, { flags: "a" });
 
-  const args = ["--model", model, "-p", prompt, "--yolo"];
-  for (const dir of config.extraDirs ?? []) args.push("--add-dir", dir);
+  // Gemini: pass prompt via stdin (avoids arg length limits with long system prompts)
+  const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["ignore", "pipe", "pipe"] });
+    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"] });
+    proc.stdin.write(systemPrompt);
+    proc.stdin.end();
     const chunks: Buffer[] = [];
     proc.stdout.on("data", (c: Buffer) => { chunks.push(c); logStream.write(c); });
     proc.stderr.on("data", (c: Buffer) => logStream.write(c));
@@ -120,22 +144,8 @@ export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
 
-  try {
-    slog("Snapshotting soul to disk");
-    await snapshotSoulToDisk(flair, agentId);
-  } catch (err: unknown) { swarn(`Soul snapshot failed: ${(err as Error).message}`); }
-
-  try {
-    const caught = catchUpTopics(agentId);
-    if (caught > 0) slog(`Caught up ${caught} topic messages`);
-  } catch (err: unknown) { swarn(`Topic catch-up failed: ${(err as Error).message}`); }
-
-  if (workspaceProvider) {
-    try {
-      const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
-      if (lastCheckpoint) slog(`Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
-    } catch (err: unknown) { swarn(`Boot lifecycle failed: ${(err as Error).message}`); }
-  }
+  // Boot lifecycle — skip Flair snapshot on first boot (agent may not be registered)
+  slog("Boot: skipping Flair snapshot (use disk fallback)");
 
   let lastSnapshot = Date.now();
 
