@@ -20,6 +20,8 @@ export interface DiscordAdapterConfig {
   pollIntervalMs?: number;
   /** Bot's own Discord user ID — used for mention detection */
   botUserId?: string;
+  /** Enable verbose debug logging (poll ticks, filter decisions) */
+  verbose?: boolean;
   /** If true (default), only forward messages that @mention the bot. Set false to forward all messages. */
   requireMention?: boolean;
 }
@@ -34,6 +36,7 @@ export class DiscordAdapter implements BridgeAdapter {
   private pollIntervalMs: number;
   private botUserId?: string;
   private requireMention = true;
+  private verbose = false;
   private lastMessageId: string | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private onInbound: ((envelope: BridgeEnvelope) => string) | null = null;
@@ -111,9 +114,11 @@ export class DiscordAdapter implements BridgeAdapter {
   private async poll(): Promise<void> {
     try {
       const messages = await this.fetchMessages();
+      if (this.verbose && messages.length > 0) console.log(`[discord-bridge] poll: ${messages.length} message(s)`);
       for (const msg of messages) {
         // Skip bot messages to avoid loops
         if (msg.author?.bot) {
+          if (this.verbose) console.log(`[discord-bridge] skip bot: ${msg.id}`);
           this.lastMessageId = msg.id;
           continue;
         }
@@ -123,6 +128,7 @@ export class DiscordAdapter implements BridgeAdapter {
           const mentions = msg.mentions ?? [];
           const mentioned = mentions.some((u: { id: string } | string) => typeof u === "string" ? u === this.botUserId : u.id === this.botUserId);
           if (!mentioned) {
+            if (this.verbose) console.log(`[discord-bridge] skip (no mention): ${msg.id} by ${msg.author?.username}`);
             this.lastMessageId = msg.id;
             continue;
           }
@@ -153,7 +159,8 @@ export class DiscordAdapter implements BridgeAdapter {
       }
     } catch (e) {
       const err = e as Error;
-      console.warn(`[discord-bridge] Poll error: ${err.message}`);
+      console.warn(`[discord-bridge] poll error: ${err.message}`);
+      if (this.verbose) console.warn(err.stack ?? err.message);
     }
   }
 }

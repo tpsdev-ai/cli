@@ -862,6 +862,7 @@ async function main() {
         requireMention: getFlag("require-mention") !== "false",
         discordPollMs: getFlag("discord-poll-ms") ? parseInt(getFlag("discord-poll-ms")!, 10) : undefined,
         discordContextPrompt: getFlag("discord-prompt"),
+        verbose: process.argv.includes("--verbose"),
         json: cli.flags.json,
       });
       break;
