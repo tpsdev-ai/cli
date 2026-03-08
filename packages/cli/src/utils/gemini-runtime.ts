@@ -36,6 +36,8 @@ export interface GeminiConfig {
   flairKeyPath: string;
   workspaceProvider?: WorkspaceProvider;
   pollIntervalMs?: number;
+  /** Appended to system prompt after soul/Flair context. Use for model-specific output instructions. */
+  systemPromptSuffix?: string;
 }
 
 interface MailMessage { id: string; from: string; to: string; body: string; timestamp: string; }
@@ -106,6 +108,9 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
     } else {
       systemPrompt = `You are ${config.agentId}. Respond helpfully.`;
     }
+  }
+  if (config.systemPromptSuffix) {
+    systemPrompt += "\n\n" + config.systemPromptSuffix;
   }
   const userTask = `[Mail from: ${message.from}]\n${message.body}`;
   return { systemPrompt, userTask };
