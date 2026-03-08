@@ -420,6 +420,11 @@ export async function runAutoCommit(
   ];
 
   const result = runSync(tpsCmd, args, { cwd: repo, encoding: "utf-8" });
+  const resultStdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
+  const resultStderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+  console.log(`[autoCommit] tps agent commit exit=${result.status} push=${push} branch=${branchName}`);
+  if (resultStdout) console.log(`[autoCommit] stdout: ${resultStdout.slice(0, 200)}`);
+  if (resultStderr) console.log(`[autoCommit] stderr: ${resultStderr.slice(0, 200)}`);
   if (result.status === 0) {
     if (push && openPr && prRepo) {
       const prArgs = [
@@ -434,11 +439,16 @@ export async function runAutoCommit(
         "--body",
         prBody ?? commitMessage,
       ];
+      console.log(`[autoCommit] opening PR: gh-as ${prArgs[0]} pr create --repo ${prRepo} --head ${branchName}`);
       const prResult = runSync("gh-as", prArgs, { cwd: repo, encoding: "utf-8" });
+      const prStdout2 = typeof prResult.stdout === "string" ? prResult.stdout.trim() : "";
+      const prStderr2 = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
+      console.log(`[autoCommit] gh-as pr create exit=${prResult.status} stdout=${prStdout2.slice(0, 200)}`);
+      if (prStderr2) console.log(`[autoCommit] gh-as stderr: ${prStderr2.slice(0, 200)}`);
       if ((prResult.status ?? 1) === 0) return;
 
-      const prStderr = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
-      const prStdout = typeof prResult.stdout === "string" ? prResult.stdout.trim() : "";
+      const prStderr = prStderr2;
+      const prStdout = prStdout2;
       const prErrMsg = prStderr || prStdout || `exit ${prResult.status ?? "unknown"}`;
       try {
         await flair.publishEvent({
@@ -517,6 +527,7 @@ async function _runAutoCommitLegacy(
   } catch (e) {
     const err = e as Error;
     console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${err.message}`);
+    if (err.stack) console.warn(`[${agentId}] Auto-commit stack: ${err.stack.slice(0, 400)}`);
     return null;
   }
 }
@@ -711,6 +722,30 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
+          // Detect stale rebase state before attempting autoCommit
+          const rebaseMergeDir = join(config.workspace, ".git", "rebase-merge");
+          const rebaseApplyDir = join(config.workspace, ".git", "rebase-apply");
+          // Also check worktree .git file reference
+          // Resolve worktree git dir (workspace may use a .git file pointer)
+          let wtGitDir: string | null = null;
+          try {
+            const gitFile = join(config.workspace, ".git");
+            if (existsSync(gitFile)) {
+              const stat = require("node:fs").statSync(gitFile);
+              if (!stat.isDirectory()) {
+                const content2 = readFileSync(gitFile, "utf-8").trim();
+                const match = content2.match(/^gitdir:\s*(.+)$/);
+                if (match?.[1]) wtGitDir = match[1].trim();
+              }
+            }
+          } catch { /* ignore */ }
+          const rebaseMergeDirWt = wtGitDir ? join(wtGitDir, "rebase-merge") : null;
+          const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
+            (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
+          if (hasStaleRebase) {
+            console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
+            spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
+          }
           const mailSubject = msg.body.split("\n")[0].slice(0, 72);
           await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body);
         }
