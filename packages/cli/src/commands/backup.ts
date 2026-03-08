@@ -4,6 +4,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  globSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -13,9 +14,9 @@ import {
   writeFileSync,
   statSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { workspacePath, resolveTeamId } from "../utils/workspace.js";
@@ -44,7 +45,7 @@ interface Manifest {
 }
 
 export interface BackupArgs {
-  agentId: string;
+  agentId?: string;
   keep?: number;
   schedule?: string;
   from?: string;
@@ -489,123 +490,41 @@ function backupFilesWithManifest(workspace: string, entry: OpenClawAgent | null,
 }
 
 export async function runBackup(args: BackupArgs): Promise<void> {
-  const safeId = sanitizeAgentId(args.agentId);
-  const workspace = workspacePath(safeId);
+  void args;
 
-  if (!existsSync(workspace)) {
-    throw new Error(`Workspace not found for ${safeId}`);
+  const home = homedir();
+  const backupDir = join(home, ".tps", "backups");
+  mkdirSync(backupDir, { recursive: true });
+
+  const archivePath = join(backupDir, `backup-${new Date().toISOString().slice(0, 10)}.tar.gz`);
+  const includedFiles = Array.from(new Set([
+    ...globSync(".tps/identity/*.key", { cwd: home }),
+    ...globSync(".tps/secrets/**/*", { cwd: home }),
+    ...globSync(".tps/agents/*/agent.yaml", { cwd: home }),
+    ...globSync(".codex/auth.json", { cwd: home }),
+  ])).filter((relativePath) => {
+    const absolutePath = join(home, relativePath);
+    return existsSync(absolutePath) && lstatSync(absolutePath).isFile();
+  }).sort();
+
+  if (includedFiles.length === 0) {
+    console.log("No TPS backup files found.");
+    return;
   }
 
-  const configPath = args.configPath ?? resolveConfigPath();
-  let config: OpenClawConfig | null = null;
-  let agentEntry: OpenClawAgent | null = null;
-  if (configPath) {
-    config = readOpenClawConfig(configPath);
-    agentEntry = findOpenClawAgentEntry(config, safeId) ?? null;
+  const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+  const tarArgs = includedFiles.map(shellQuote).join(" ");
+  execSync(`tar czf ${shellQuote(archivePath)} -C ${shellQuote(home)} ${tarArgs}`, {
+    stdio: "pipe",
+  });
+  chmodSync(archivePath, 0o600);
+
+  for (const relativePath of includedFiles) {
+    console.log(relativePath);
   }
 
-  if (!agentEntry) {
-    agentEntry = { id: safeId, name: safeId, workspace };
-  }
-
-  const backupBase = join(process.env.HOME || "/", ".tps", "backups", safeId);
-  mkdirSync(backupBase, { recursive: true });
-  const archivePath = buildArchivePath(safeId, backupBase);
-
-  const stagingDir = mkdtempSync(join(tmpdir(), "tps-backup-"));
-  const finalArchiveTmp = join(stagingDir, `${safeId}.tps-backup.tar.gz`);
-
-  try {
-    const toolsPath = join(workspace, "TOOLS.md");
-    const shouldSanitize = args.sanitize !== false;
-
-    if (shouldSanitize && existsSync(toolsPath)) {
-      const content = readFileSync(toolsPath, "utf-8");
-      const findings = parseSensitiveFindings(content);
-      if (findings.length) {
-        console.warn(`⚠️  Possible sensitive values in TOOLS.md: ${findings.join(", ")}`);
-      }
-    }
-
-    // Bootstrap state marker outside workspace.
-    const teamId = resolveTeamId(safeId);
-    const sourceMarker = join(process.env.HOME || "/", ".tps", "bootstrap-state", teamId, ".bootstrap-complete");
-    const markerData = existsSync(sourceMarker)
-      ? readFileSync(sourceMarker, "utf-8")
-      : null;
-
-    const staged = backupFilesWithManifest(workspace, agentEntry, markerData, shouldSanitize, stagingDir);
-
-    const manifest: Manifest = {
-      format: "tps-backup",
-      version: 1,
-      action: "backup",
-      agentId: safeId,
-      backupAt: new Date().toISOString(),
-      sourceHostFingerprint: await currentHostFingerprint(),
-      sourceHostId: await loadHostIdentityId(),
-      cliVersion: process.env.npm_package_version || "0.1.0",
-      files: staged,
-    };
-
-    if (manifest.files.some((entry) => isAbsoluteLike(entry.path) || entry.path.startsWith("../") || entry.path.includes("/../"))) {
-      throw new Error("Manifest contains absolute path entries");
-    }
-
-    const manifestPath = join(stagingDir, "manifest.json");
-    writeManifest(manifestPath, manifest);
-
-    const file = stageFromString(stagingDir, "manifest.json", JSON.stringify(manifest, null, 2));
-    // keep manifest in manifest list (checksum included as part of validation)
-    manifest.files.push(file);
-
-    runTarCreate(stagingDir, finalArchiveTmp);
-    chmodSync(finalArchiveTmp, 0o600);
-
-    // Validate archive by listing and reading checksum from manifest.
-    const listing = runTarList(finalArchiveTmp);
-    if (listing.length === 0) throw new Error("Tar archive is empty");
-
-    copyFileSync(finalArchiveTmp, archivePath);
-    chmodSync(archivePath, 0o600);
-
-    // rotate old backups
-    const keep = Number.isFinite(args.keep || 0) ? Math.max(1, Math.trunc(args.keep!)) : DEFAULT_KEEP;
-    const backups = readdirSync(backupBase)
-      .filter((file) => file.endsWith(".tps-backup.tar.gz"))
-      .filter((file) => file.startsWith(`${safeId}-`))
-      .map((file) => ({ file, path: join(backupBase, file) }))
-      .map((entry) => ({ ...entry, stats: statSync(entry.path) }))
-      .sort((a, b) => b.stats.mtimeMs - a.stats.mtimeMs);
-
-    if (backups.length > keep) {
-      for (const old of backups.slice(keep)) {
-        rmSync(old.path, { force: true });
-      }
-    }
-
-    if (args.schedule) {
-      if (args.schedule === "off") {
-        configureSchedule(safeId, "off", keep);
-        console.log(`Removed scheduled backup for ${safeId}`);
-      } else {
-        if (!SCHEDULE_ON.includes(args.schedule as never)) {
-          throw new Error(`Invalid schedule: ${args.schedule}`);
-        }
-        await ensureVaultForSchedule();
-        configureSchedule(safeId, "on", keep);
-        console.log(`Scheduled ${args.schedule} backup for ${safeId}`);
-      }
-    }
-
-    console.log(`✅ Backup complete: ${archivePath}`);
-    console.log(`📦 Files: ${manifest.files.length}`);
-    console.log(`🔐 Host: ${manifest.sourceHostFingerprint}`);
-  } finally {
-    rmSync(stagingDir, { recursive: true, force: true });
-  }
+  console.log(`Archive: ${archivePath} (${statSync(archivePath).size} bytes)`);
 }
-
 export async function runRestore(args: RestoreArgs): Promise<void> {
   const safeTarget = sanitizeAgentId(args.agentId);
   const archive = resolve(args.archivePath);
