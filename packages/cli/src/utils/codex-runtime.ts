@@ -356,10 +356,12 @@ export async function syncWorkspaceBeforeTask(
   const warn = deps.warn ?? console.warn;
   const branch = resolveDefaultBranch(config.workspace, runSync);
 
-  // Ensure we're on a named branch (worktrees start detached via git worktree add --detach)
-  const headCheck = runSync(GIT_BIN, ["symbolic-ref", "--quiet", "HEAD"], { cwd: config.workspace, encoding: "utf-8" });
-  if ((headCheck.status ?? 1) !== 0) {
-    runSync(GIT_BIN, ["checkout", branch], { cwd: config.workspace, encoding: "utf-8" });
+  // Always checkout default branch before rebase — task branches or detached HEAD both need this.
+  // Without explicit checkout, old task branches with conflict markers survive the rebase.
+  const checkoutResult = runSync(GIT_BIN, ["checkout", branch], { cwd: config.workspace, encoding: "utf-8" });
+  if ((checkoutResult.status ?? 1) !== 0) {
+    const stderr = typeof checkoutResult.stderr === "string" ? checkoutResult.stderr.trim() : "";
+    warn(`[${config.agentId}] git checkout ${branch} failed (non-fatal): ${stderr}`);
   }
   const result = runSync(GIT_BIN, ["pull", "--rebase", "origin", branch], {
     cwd: config.workspace,
