@@ -122,7 +122,8 @@ export function extractFinalAnswer(raw: string): string {
     "All tool calls will be automatically approved.",
     "missing pgrep output",
   ];
-  const stripped = raw.replace(/\x1b\[[0-9;]*m/g, "");
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape stripping requires ESC
+  const stripped = raw.replace(/\u001b\[[0-9;]*m/g, "");
   const lines = stripped.split("\n").filter(
     (l) => !STRIP_PREFIXES.some((p) => l.trim().startsWith(p)),
   );

@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 import snooplogg from "snooplogg";
-const { log: slog, warn: swarn, error: serror } = snooplogg("tps:bridge:openclaw");
+const { log: slog } = snooplogg("tps:bridge:openclaw");
 
 
 // ─── Ed25519 verification ─────────────────────────────────────────────────────
