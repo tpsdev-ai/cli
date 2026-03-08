@@ -4,6 +4,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  globSync,
   lstatSync,
   mkdirSync,
   readdirSync,
@@ -13,9 +14,9 @@ import {
   writeFileSync,
   statSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname, resolve, sep } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { workspacePath, resolveTeamId } from "../utils/workspace.js";
@@ -44,7 +45,7 @@ interface Manifest {
 }
 
 export interface BackupArgs {
-  agentId: string;
+  agentId?: string;
   keep?: number;
   schedule?: string;
   from?: string;
@@ -489,6 +490,7 @@ function backupFilesWithManifest(workspace: string, entry: OpenClawAgent | null,
 }
 
 export async function runBackup(args: BackupArgs): Promise<void> {
+  if (!args.agentId) throw new Error("Usage: tps backup <agent-id>");
   const safeId = sanitizeAgentId(args.agentId);
   const workspace = workspacePath(safeId);
 
@@ -598,12 +600,45 @@ export async function runBackup(args: BackupArgs): Promise<void> {
       }
     }
 
-    console.log(`✅ Backup complete: ${archivePath}`);
-    console.log(`📦 Files: ${manifest.files.length}`);
-    console.log(`🔐 Host: ${manifest.sourceHostFingerprint}`);
+    console.log(`Backup complete: ${archivePath}`);
   } finally {
     rmSync(stagingDir, { recursive: true, force: true });
   }
+}
+
+export async function runBackupSecrets(): Promise<void> {
+  const home = homedir();
+  const backupDir = join(home, ".tps", "backups");
+  mkdirSync(backupDir, { recursive: true });
+
+  const archivePath = join(backupDir, `backup-${new Date().toISOString().slice(0, 10)}.tar.gz`);
+  const includedFiles = Array.from(new Set([
+    ...globSync(".tps/identity/*.key", { cwd: home }),
+    ...globSync(".tps/secrets/**/*", { cwd: home }),
+    ...globSync(".tps/agents/*/agent.yaml", { cwd: home }),
+    ...globSync(".codex/auth.json", { cwd: home }),
+  ])).filter((relativePath) => {
+    const absolutePath = join(home, relativePath);
+    return existsSync(absolutePath) && lstatSync(absolutePath).isFile();
+  }).sort();
+
+  if (includedFiles.length === 0) {
+    console.log("No TPS backup files found.");
+    return;
+  }
+
+  const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+  const tarArgs = includedFiles.map(shellQuote).join(" ");
+  execSync(`tar czf ${shellQuote(archivePath)} -C ${shellQuote(home)} ${tarArgs}`, {
+    stdio: "pipe",
+  });
+  chmodSync(archivePath, 0o600);
+
+  for (const relativePath of includedFiles) {
+    console.log(relativePath);
+  }
+
+  console.log(`Archive: ${archivePath} (${statSync(archivePath).size} bytes)`);
 }
 
 export async function runRestore(args: RestoreArgs): Promise<void> {

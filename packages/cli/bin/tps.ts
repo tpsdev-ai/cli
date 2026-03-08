@@ -16,7 +16,7 @@ const cli = meow(
     review <name>     Performance review for a specific agent
     office <action>   Branch office sandbox lifecycle (start/stop/list/status/kill)
     bootstrap <agent-id>  Bring a hired agent to operational state
-    backup <agent-id> [--schedule daily|off] [--keep n] [--sanitize]  Backup agent workspace
+    backup            Archive critical TPS host files
     restore <agent-id> <archive> [--clone] [--overwrite] [--from <archive>] Restore agent workspace from a backup
     status [agent-id] [--auto-prune] [--prune] [--json] [--cost] [--shared]
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
@@ -55,7 +55,7 @@ const cli = meow(
     $ tps office start branch-a
     $ tps office status branch-a
     $ tps bootstrap flint
-    $ tps backup flint --schedule daily
+    $ tps backup
     $ tps restore flint ~/.tps/backups/flint/old.tps-backup.tar.gz
     $ tps status
     $ tps status flint --cost
@@ -680,19 +680,14 @@ async function main() {
       break;
     }
     case "backup": {
-      const agentId = rest[0];
-      if (!agentId) {
-        console.error("Usage: tps backup <agent-id> [--schedule daily|off] [--keep n]");
-        process.exit(1);
+      const subCmd = rest[0];
+      if (subCmd === "keys") {
+        const { runBackupSecrets } = await import("../src/commands/backup.js");
+        await runBackupSecrets();
+      } else {
+        const { runBackup } = await import("../src/commands/backup.js");
+        await runBackup({ agentId: subCmd });
       }
-      const { runBackup } = await import("../src/commands/backup.js");
-      await runBackup({
-        agentId,
-        keep: typeof cli.flags.keep === "number" ? Number(cli.flags.keep) : undefined,
-        schedule: cli.flags.schedule,
-        sanitize: cli.flags.sanitize,
-        configPath: cli.flags.config,
-      });
       break;
     }
     case "restore": {
