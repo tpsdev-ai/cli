@@ -677,8 +677,14 @@ async function main() {
       break;
     }
     case "backup": {
-      const { runBackup } = await import("../src/commands/backup.js");
-      await runBackup({});
+      const subCmd = rest[0];
+      if (subCmd === "keys") {
+        const { runBackupSecrets } = await import("../src/commands/backup.js");
+        await runBackupSecrets();
+      } else {
+        const { runBackup } = await import("../src/commands/backup.js");
+        await runBackup({ agentId: subCmd });
+      }
       break;
     }
     case "restore": {
