@@ -599,6 +599,12 @@ export async function runBackup(args: BackupArgs): Promise<void> {
       }
     }
 
+    console.log(`Backup complete: ${archivePath}`);
+  } finally {
+    rmSync(stagingDir, { recursive: true, force: true });
+  }
+}
+
 export async function runBackupSecrets(): Promise<void> {
   const home = homedir();
   const backupDir = join(home, ".tps", "backups");
