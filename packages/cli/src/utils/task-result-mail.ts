@@ -1,3 +1,4 @@
+// autonomous-loop-v4
 export function formatTaskCompleteMailBody(summary: string, prefix = "Task complete"): string {
   const trimmedSummary = summary.trimStart();
   const prefixPattern = new RegExp(`^${prefix}:?(?:\\r?\\n\\s*|\\s+)`, "i");
