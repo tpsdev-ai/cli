@@ -19,6 +19,8 @@ export interface DiscordAdapterConfig {
   token: string;
   /** Target channel ID to monitor and post to */
   channelId: string;
+  /** Optional pre-created webhook URL for outbound messages only */
+  webhookUrl?: string;
   /** Poll interval for incoming messages (ms, default 5000) */
   pollIntervalMs?: number;
   /** Bot's own Discord user ID — used for mention detection */
@@ -34,6 +36,7 @@ export class DiscordAdapter implements BridgeAdapter {
 
   private token: string;
   private channelId: string;
+  private webhookUrl?: string;
   private pollIntervalMs: number;
   private botUserId?: string;
   private requireMention = true;
@@ -44,6 +47,7 @@ export class DiscordAdapter implements BridgeAdapter {
   constructor(config: DiscordAdapterConfig) {
     this.token = config.token;
     this.channelId = config.channelId;
+    this.webhookUrl = config.webhookUrl;
     this.pollIntervalMs = config.pollIntervalMs ?? 5_000;
     this.botUserId = config.botUserId;
     this.requireMention = config.requireMention !== false;
@@ -65,15 +69,26 @@ export class DiscordAdapter implements BridgeAdapter {
   }
 
   async send(envelope: BridgeEnvelope): Promise<void> {
-    const body = JSON.stringify({ content: envelope.content });
-    const res = await fetch(`${DISCORD_API}/channels/${this.channelId}/messages`, {
-      method: "POST",
-      headers: this.headers(),
-      body,
-    });
+    const isWebhook = Boolean(this.webhookUrl);
+    const body = JSON.stringify(
+      this.webhookUrl
+        ? {
+            content: envelope.content,
+            username: envelope.senderName || undefined,
+          }
+        : { content: envelope.content },
+    );
+    const res = await fetch(
+      this.webhookUrl ?? `${DISCORD_API}/channels/${this.channelId}/messages`,
+      {
+        method: "POST",
+        headers: this.webhookUrl ? { "Content-Type": "application/json" } : this.headers(),
+        body,
+      },
+    );
     if (!res.ok) {
       const err = await res.text().catch(() => res.statusText);
-      throw new Error(`Discord send failed (${res.status}): ${err}`);
+      throw new Error(`${isWebhook ? "Discord webhook send" : "Discord send"} failed (${res.status}): ${err}`);
     }
   }
 
