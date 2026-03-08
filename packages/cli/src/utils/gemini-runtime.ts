@@ -111,6 +111,27 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
   return { systemPrompt, userTask };
 }
 
+/**
+ * Extract the final answer from Gemini output.
+ * Strips YOLO banners, preamble, ANSI codes, then returns last 3 paragraphs.
+ */
+export function extractFinalAnswer(raw: string): string {
+  const STRIP_PREFIXES = [
+    "YOLO mode is enabled.",
+    "Loaded cached credentials.",
+    "All tool calls will be automatically approved.",
+    "missing pgrep output",
+  ];
+  const stripped = raw.replace(/\x1b\[[0-9;]*m/g, "");
+  const lines = stripped.split("\n").filter(
+    (l) => !STRIP_PREFIXES.some((p) => l.trim().startsWith(p)),
+  );
+  const cleaned = lines.join("\n").trim();
+  const paragraphs = cleaned.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length === 0) return cleaned;
+  return paragraphs.slice(-3).join("\n\n");
+}
+
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
   const { systemPrompt, userTask } = await buildPrompt(message, config);
   const model = config.model ?? "gemini-2.5-pro";
@@ -131,8 +152,8 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
     const timer = setTimeout(() => { proc.kill(); reject(new Error(`timeout after ${taskTimeoutMs}ms`)); }, taskTimeoutMs);
     proc.on("close", (code) => {
       clearTimeout(timer); logStream.end();
-      const out = Buffer.concat(chunks).toString("utf-8").trim();
-      resolve(out || `(exit ${code})`);
+      const raw = Buffer.concat(chunks).toString("utf-8").trim();
+      resolve(extractFinalAnswer(raw) || raw || `(exit ${code})`);
     });
     proc.on("error", (err) => { clearTimeout(timer); logStream.end(); reject(err); });
   });
