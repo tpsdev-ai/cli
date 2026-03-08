@@ -197,7 +197,9 @@ async function runCodex(
   const logStream = createWriteStream(logPath, { flags: "a" });
 
   return new Promise((resolve, reject) => {
-    const proc = spawn("codex", args, { cwd: config.workspace, env: process.env });
+    const codexToolsDir = join(homedir(), ".tps", "bin", "codex-tools");
+    const codexEnv = { ...process.env, PATH: `${codexToolsDir}:${process.env.PATH ?? ""}` };
+    const proc = spawn("codex", args, { cwd: config.workspace, env: codexEnv });
     proc.stdin.write(prompt);
     proc.stdin.end();
 
