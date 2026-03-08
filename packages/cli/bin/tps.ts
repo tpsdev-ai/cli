@@ -552,7 +552,7 @@ async function main() {
         const isSoundstage = soundstageIdx >= 0 || cli.flags.soundstage;
         if (soundstageIdx >= 0) process.argv.splice(soundstageIdx, 1);
 
-        await runOffice({ action: action!, agent: rest[1], manifest: cli.flags.manifest, soundstage: isSoundstage });
+        await runOffice({ action: action!, agent: rest[1], manifest: cli.flags.manifest, soundstage: isSoundstage, json: cli.flags.json });
       }
       break;
     }
