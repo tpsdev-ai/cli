@@ -14,7 +14,7 @@ The PR looks good. Changes are secure.`;
     expect(result).toContain("The PR looks good");
   });
 
-  test("returns last paragraph(s) as final answer", () => {
+  test("short output — returns single final paragraph, skips narration", () => {
     const raw = `YOLO mode is enabled. All tool calls will be automatically approved.
 
 I'll analyze the code.
@@ -24,7 +24,24 @@ I've completed the analysis.
 **Summary:** The changes are correct and secure. No issues found.`;
     const result = extractFinalAnswer(raw);
     expect(result).toContain("Summary");
-    expect(result).not.toContain("YOLO");
+    expect(result).not.toContain("I'll analyze");
+    expect(result).not.toContain("I've completed");
+  });
+
+  test("long output (>5 paragraphs) — returns up to 3 concluding paragraphs", () => {
+    const paragraphs = [
+      "I'll start reviewing.",
+      "Checking imports.",
+      "Looking at the logic.",
+      "Verifying tests.",
+      "Reviewing security.",
+      "All changes look correct.",
+      "No vulnerabilities found.",
+    ];
+    const raw = paragraphs.join("\n\n");
+    const result = extractFinalAnswer(raw);
+    expect(result).toContain("No vulnerabilities found");
+    expect(result).not.toContain("I'll start");
   });
 
   test("handles empty input", () => {
@@ -32,9 +49,15 @@ I've completed the analysis.
   });
 
   test("strips ANSI color codes", () => {
-    const raw = "\x1b[32mGreen text\x1b[0m\n\nFinal answer.";
+    const raw = "\u001b[32mGreen text\u001b[0m\n\nFinal answer.";
     const result = extractFinalAnswer(raw);
-    expect(result).not.toContain("\x1b");
+    expect(result).not.toContain("\u001b");
     expect(result).toContain("Final answer");
+  });
+
+  test("single paragraph — returns it regardless of narration prefix", () => {
+    const raw = "I've completed the task successfully.";
+    const result = extractFinalAnswer(raw);
+    expect(result).toBe("I've completed the task successfully.");
   });
 });

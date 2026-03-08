@@ -113,7 +113,10 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
 
 /**
  * Extract the final answer from Gemini output.
- * Strips YOLO banners, preamble, ANSI codes, then returns last 3 paragraphs.
+ * Strips YOLO banners, preamble, ANSI codes, then returns the last paragraph
+ * for short outputs (≤5 paragraphs) or last 3 for longer ones.
+ * Narration paragraphs (starting with "I'll", "I've", "Okay", etc.) are
+ * skipped when walking backward to find the final substantive reply.
  */
 export function extractFinalAnswer(raw: string): string {
   const STRIP_PREFIXES = [
@@ -122,6 +125,7 @@ export function extractFinalAnswer(raw: string): string {
     "All tool calls will be automatically approved.",
     "missing pgrep output",
   ];
+  const NARRATION_RE = /^(I['\u2019]ll|I['\u2019]ve|Okay[,.]|Now I|Let me|I will|I need|I should|I am going|I can|I have to|First,|Next,|Then,|Now,|Finally,)/i;
   // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape stripping requires ESC
   const stripped = raw.replace(/\u001b\[[0-9;]*m/g, "");
   const lines = stripped.split("\n").filter(
@@ -130,7 +134,12 @@ export function extractFinalAnswer(raw: string): string {
   const cleaned = lines.join("\n").trim();
   const paragraphs = cleaned.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
   if (paragraphs.length === 0) return cleaned;
-  return paragraphs.slice(-3).join("\n\n");
+  // Walk backward to find last non-narration paragraph
+  let end = paragraphs.length - 1;
+  while (end > 0 && NARRATION_RE.test(paragraphs[end])) end--;
+  // For short outputs take just that paragraph; longer outputs take up to 3
+  const count = paragraphs.length > 5 ? 3 : 1;
+  return paragraphs.slice(Math.max(0, end - count + 1), end + 1).join("\n\n");
 }
 
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
