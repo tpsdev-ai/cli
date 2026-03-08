@@ -965,6 +965,20 @@ async function main() {
       break;
     }
 
+    case "tui":
+    case "ui": {
+      const { TuiApp } = await import("../src/commands/tui.js");
+      const { render } = await import("ink");
+      const React = (await import("react")).default;
+      const { join: tuiJoin } = await import("node:path");
+      const { homedir: tuiHomedir } = await import("node:os");
+      const tuiMailDir = (cli.flags["mail-dir"] as string | undefined) ?? tuiJoin(tuiHomedir(), ".tps", "mail");
+      const tuiAgentId = (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined) ?? rest[0] ?? "anvil";
+      const tuiRepo = (cli.flags.repo as string | undefined) ?? "tpsdev-ai/cli";
+      render(React.createElement(TuiApp, { mailDir: tuiMailDir, agentId: tuiAgentId, repo: tuiRepo }));
+      break;
+    }
+
     default:
       cli.showHelp();
   }
