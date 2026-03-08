@@ -16,10 +16,10 @@ describe("runAutoCommit", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       calls.push({ cmd, args });
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 1, stdout: "", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "checkout -b feat/task-123") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "checkout -b feat/task-123") {
         return { status: 0, stdout: "", stderr: "" };
       }
       if (cmd === "tps") {
@@ -44,8 +44,8 @@ describe("runAutoCommit", () => {
     );
 
     expect(calls).toEqual([
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
-      { cmd: "git", args: ["checkout", "-b", "feat/task-123"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["checkout", "-b", "feat/task-123"] },
       {
         cmd: "tps",
         args: [
@@ -72,7 +72,7 @@ describe("runAutoCommit", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       calls.push({ cmd, args });
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
       }
       if (cmd === "tps") {
@@ -103,7 +103,7 @@ describe("runAutoCommit", () => {
     );
 
     expect(calls).toEqual([
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
       {
         cmd: "tps",
         args: [
@@ -143,7 +143,7 @@ describe("runAutoCommit", () => {
   test("publishes a blocker OrgEvent when runtime PR creation fails", async () => {
     const publishEvent = mock(async () => {});
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
       }
       if (cmd === "tps") {
@@ -198,13 +198,13 @@ describe("syncWorkspaceBeforeTask", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       calls.push({ cmd, args });
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/trunk\n", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/trunk\n", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "pull --rebase origin trunk") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin trunk") {
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
@@ -213,9 +213,9 @@ describe("syncWorkspaceBeforeTask", () => {
     await syncWorkspaceBeforeTask(config, { spawnSyncImpl });
 
     expect(calls).toEqual([
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
-      { cmd: "git", args: ["pull", "--rebase", "origin", "trunk"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["pull", "--rebase", "origin", "trunk"] },
     ]);
   });
 
@@ -223,13 +223,13 @@ describe("syncWorkspaceBeforeTask", () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       calls.push({ cmd, args });
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 1, stdout: "", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/main\n", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "pull --rebase origin main") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin main") {
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
@@ -238,22 +238,22 @@ describe("syncWorkspaceBeforeTask", () => {
     await syncWorkspaceBeforeTask(config, { spawnSyncImpl });
 
     expect(calls).toEqual([
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
-      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
-      { cmd: "git", args: ["pull", "--rebase", "origin", "main"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["pull", "--rebase", "origin", "main"] },
     ]);
   });
 
   test("warns and continues when rebase fails", async () => {
     const warn = mock(() => {});
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/main\n", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/main\n", stderr: "" };
       }
-      if (cmd === "git" && args.join(" ") === "pull --rebase origin main") {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin main") {
         return { status: 1, stdout: "", stderr: "cannot rebase: unstaged changes" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
