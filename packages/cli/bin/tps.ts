@@ -422,6 +422,7 @@ async function main() {
                   ...(agentCfg.codex?.extraDirs ?? []),
                 ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
+                watchdogTimeoutMs: agentCfg.codex?.watchdogTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
                 workspaceProvider,

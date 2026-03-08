@@ -103,6 +103,7 @@ export interface CodexRuntimeConfig {
   extraDirs?: string[];
   supervisorId?: string;
   taskTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
   flairKeyPath: string;
@@ -175,10 +176,16 @@ async function buildSystemPrompt(
   return experience ? systemPrompt + "\n\n" + experience : systemPrompt;
 }
 
+interface RunCodexOptions {
+  flairPublisher?: { publishEvent: (ev: Record<string, unknown>) => Promise<void> };
+  onStall?: () => void;
+}
+
 async function runCodex(
   message: MailMessage,
   config: CodexRuntimeConfig,
   taskTimeoutMs: number,
+  opts: RunCodexOptions = {},
 ): Promise<string> {
   await syncWorkspaceBeforeTask(config);
   const systemPrompt = await buildSystemPrompt(message, config);
@@ -211,6 +218,28 @@ async function runCodex(
     let stderr = "";
     let buf = "";
 
+    // Watchdog: kill + stall event if no JSONL output for watchdogTimeoutMs
+    const watchdogMs = config.watchdogTimeoutMs ?? 5 * 60 * 1000;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const resetWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        console.warn(`[${config.agentId}] Watchdog: no output for ${watchdogMs / 1000}s — killing Codex`);
+        proc.kill("SIGTERM");
+        // Publish task.stalled OrgEvent (non-fatal)
+        opts.onStall?.();
+        if (opts.flairPublisher) {
+          opts.flairPublisher.publishEvent({
+            kind: "task.stalled",
+            authorId: config.agentId,
+            summary: `Task stalled (no output for ${Math.round(watchdogMs / 60000)}m)`,
+            refId: message.id,
+          }).catch(() => {});
+        }
+      }, watchdogMs);
+    };
+    resetWatchdog();
+
     proc.stdout.on("data", (d: Buffer) => {
       logStream.write(d);
       buf += d.toString();
@@ -218,6 +247,7 @@ async function runCodex(
       buf = lines.pop() ?? "";
       for (const line of lines) {
         if (!line.trim()) continue;
+        resetWatchdog(); // reset on each JSONL line
         try {
           const event = JSON.parse(line) as Record<string, unknown>;
           const item = event.item as Record<string, unknown> | undefined;
@@ -236,11 +266,16 @@ async function runCodex(
       }
     });
 
-    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); logStream.write(d); });
+    proc.stderr.on("data", (d: Buffer) => {
+      stderr += d.toString();
+      logStream.write(d);
+      resetWatchdog(); // stderr output also counts as activity
+    });
 
     const timeout = setTimeout(() => proc.kill("SIGTERM"), taskTimeoutMs);
     proc.on("close", (code) => {
       clearTimeout(timeout);
+      if (watchdog) clearTimeout(watchdog);
       logStream.end();
       const resultText = resultMessages.join("\n\n").trim();
       if (resultText) {
@@ -547,7 +582,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
     try {
       const msg: MailMessage = { id: taskId, from: event.authorId, to: agentId, body: taskBody, timestamp: new Date().toISOString() };
-      const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
+      const flairPub1 = { publishEvent: async (ev: Record<string, unknown>) => {
+        try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+      }};
+      const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+        flairPublisher: flairPub1,
+        onStall: () => { sendMail(mailDir, agentId, event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+      });
       const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
       console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
       sendMail(mailDir, agentId, event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
@@ -641,7 +682,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         }
       }
       try {
-        const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
+        const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
+          try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+        }};
+        const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+          flairPublisher: flairPub2,
+          onStall: () => { sendMail(mailDir, agentId, msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+        });
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
