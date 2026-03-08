@@ -283,6 +283,22 @@ interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
 }
 
+interface OrgEventClient {
+  request<T>(method: string, path: string, body?: unknown): Promise<T>;
+}
+
+export async function publishTaskOutcomeEvent(
+  flair: OrgEventClient,
+  agentId: string,
+  event: { kind: "task.completed" | "task.failed"; summary: string; refId: string },
+): Promise<void> {
+  try {
+    await flair.request("POST", "/OrgEvent", { ...event, authorId: agentId });
+  } catch {
+    /* non-fatal */
+  }
+}
+
 function resolveDefaultBranch(repo: string, runSync: typeof spawnSync): string {
   const headRef = runSync(GIT_BIN, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], {
     cwd: repo,
@@ -563,6 +579,11 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       const err = e as Error;
       console.error(`[${agentId}] Flair task failed:`, err.message);
       sendMail(mailDir, agentId, event.authorId, `Task failed (via Flair): ${err.message}`);
+      await publishTaskOutcomeEvent(flair, agentId, {
+        kind: "task.failed",
+        summary: `Task ${taskId} failed: ${err.message.slice(0, 200)}`,
+        refId: taskId,
+      });
       if (workspaceProvider && preTaskState) {
         try { await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message); } catch { /* */ }
       } else {
@@ -619,6 +640,11 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
+        await publishTaskOutcomeEvent(flair, agentId, {
+          kind: "task.completed",
+          summary: `Task ${msg.id} completed by ${agentId}`,
+          refId: msg.id,
+        });
         if (workspaceProvider && preTaskState) {
           try { await onTaskComplete(workspaceProvider, flair, msg.id, preTaskState); } catch (err: any) {
             console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
@@ -636,6 +662,11 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
         sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+        await publishTaskOutcomeEvent(flair, agentId, {
+          kind: "task.failed",
+          summary: `Task ${msg.id} failed: ${String(err.message ?? err).slice(0, 200)}`,
+          refId: msg.id,
+        });
         if (workspaceProvider && preTaskState) {
           try { await onTaskFailure(workspaceProvider, flair, msg.id, preTaskState, err.message); } catch {}
         } else {

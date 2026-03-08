@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
+  publishTaskOutcomeEvent,
   runAutoCommit,
   syncWorkspaceBeforeTask,
   type CodexRuntimeConfig,
@@ -192,6 +193,52 @@ describe("runAutoCommit", () => {
       summary: "PR creation failed for task-456",
       detail: "gh-as pr create failed",
       refId: "task-456",
+    });
+  });
+});
+
+describe("publishTaskOutcomeEvent", () => {
+  test("publishes task.completed OrgEvents with the runtime payload", async () => {
+    const request = mock(async () => ({}));
+
+    await publishTaskOutcomeEvent(
+      { request },
+      "ember",
+      {
+        kind: "task.completed",
+        summary: "Task task-123 completed by ember",
+        refId: "task-123",
+      },
+    );
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith("POST", "/OrgEvent", {
+      kind: "task.completed",
+      summary: "Task task-123 completed by ember",
+      refId: "task-123",
+      authorId: "ember",
+    });
+  });
+
+  test("publishes task.failed OrgEvents with the runtime payload", async () => {
+    const request = mock(async () => ({}));
+
+    await publishTaskOutcomeEvent(
+      { request },
+      "ember",
+      {
+        kind: "task.failed",
+        summary: "Task task-123 failed: boom",
+        refId: "task-123",
+      },
+    );
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith("POST", "/OrgEvent", {
+      kind: "task.failed",
+      summary: "Task task-123 failed: boom",
+      refId: "task-123",
+      authorId: "ember",
     });
   });
 });
