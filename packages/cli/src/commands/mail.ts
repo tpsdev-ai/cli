@@ -14,6 +14,7 @@ interface MailArgs {
   message?: string;
   messageId?: string;
   json?: boolean;
+  count?: boolean;
   since?: string;
   limit?: number;
   desc?: string;
@@ -163,18 +164,22 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "list": {
       const agent = await resolveAgentId(args.agent);
-      const limit = Math.max(0, Math.floor(args.limit ?? 20));
       const messages = listMessages(agent)
-        .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
-        .slice(0, limit);
-      if (args.json) {
+        .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+      if (args.count) {
+        console.log(messages.length);
+      } else if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
-      } else if (messages.length === 0) {
-        console.log("No messages.");
       } else {
-        for (const m of messages) {
-          const marker = m.read ? "📖" : "📬";
-          console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}`);
+        const limit = Math.max(0, Math.floor(args.limit ?? 20));
+        const visible = messages.slice(0, limit);
+        if (visible.length === 0) {
+          console.log("No messages.");
+        } else {
+          for (const m of visible) {
+            const marker = m.read ? "📖" : "📬";
+            console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}`);
+          }
         }
       }
       return;

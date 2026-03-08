@@ -116,6 +116,7 @@ const cli = meow(
       desc: { type: "string" },
       id: { type: "string" },
       fromBeginning: { type: "boolean", default: false },
+      count: { type: "boolean", default: false },
       priority: { type: "string" },
       version: { type: "string" },
     },
@@ -633,6 +634,7 @@ async function main() {
           message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : undefined),
           messageId: action === "read" ? rest[2] : undefined,
           json: cli.flags.json,
+          count: cli.flags.count,
           since: cli.flags.since,
           limit: cli.flags.limit ? Number(cli.flags.limit) : undefined,
         });

@@ -166,4 +166,15 @@ describe("mail command", () => {
     expect(payload.agent).toBe("kern");
     expect(payload.inboxCount).toBe(1);
   });
+
+  test("list --count prints only the total message count", () => {
+    const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "anvil" };
+    expect(run(["mail", "send", "kern", "first"], env).status).toBe(0);
+    expect(run(["mail", "send", "kern", "second"], env).status).toBe(0);
+
+    const counted = run(["mail", "list", "kern", "--count"], env);
+    expect(counted.status).toBe(0);
+    expect(counted.stdout.trim()).toBe("2");
+    expect(counted.stderr.trim()).toBe("");
+  });
 });
