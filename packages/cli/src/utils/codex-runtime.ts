@@ -12,7 +12,7 @@ import {
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
+import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
   bootContext,
@@ -105,7 +105,7 @@ export interface CodexRuntimeConfig {
   taskTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
-  flairKeyPath?: string;
+  flairKeyPath: string;
   workspaceProvider?: WorkspaceProvider;
   /** If set, auto-commit workspace changes after each task completes */
   autoCommit?: AutoCommitConfig;
@@ -165,7 +165,7 @@ async function buildSystemPrompt(
   config: CodexRuntimeConfig,
 ): Promise<string> {
   const { agentId, workspace, extraDirs, supervisorId, flairUrl, flairKeyPath } = config;
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
   const allowedTools = ["Bash", "Read", "Write", "Edit"];
   const { systemPrompt } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -323,7 +323,7 @@ export async function syncWorkspaceBeforeTask(
 }
 
 export async function runAutoCommit(
-  config: CodexRuntimeConfig,
+  config: Pick<CodexRuntimeConfig, "workspace">,
   flair: AutoCommitFlair,
   options: AutoCommitOptions,
   deps: AutoCommitDeps = {},
@@ -438,7 +438,7 @@ async function _runAutoCommitLegacy(
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
     await runAutoCommit(
-      { agentId, workspace: cfg.repo ?? workspace, mailDir: "" },
+      { workspace: cfg.repo ?? workspace },
       flair,
       {
         taskId,
@@ -471,7 +471,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   await ensureFreshOpenAIToken(agentId);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
 
   // Mark offline on clean shutdown
   const markOffline = () => {
