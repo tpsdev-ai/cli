@@ -309,7 +309,7 @@ async function main() {
           action: "logs",
           id: getFlag("id") ?? rest[1],
           lines: cli.flags.lines as number | undefined,
-          follow: cli.flags.follow as boolean | undefined,
+          follow: (cli.flags.follow as boolean | undefined) || process.argv.includes("-f"),
         });
       } else if (action === "commit") {
         // Inline helpers (getAuthor/getRepeatedFlags defined in else block below)
