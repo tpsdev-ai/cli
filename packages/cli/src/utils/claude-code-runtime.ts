@@ -38,7 +38,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
+import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
   bootContext,
@@ -75,8 +75,8 @@ export interface ClaudeCodeConfig {
   sessionLogPath?: string;
   /** Flair base URL (default: http://127.0.0.1:9926) */
   flairUrl?: string;
-  /** Path to Ed25519 private key for Flair auth (default: ~/.tps/identity/<agentId>.key) */
-  flairKeyPath?: string;
+  /** Path to Ed25519 private key for Flair auth */
+  flairKeyPath: string;
   /** Optional workspace provider for lifecycle management (OPS-47) */
   workspaceProvider?: WorkspaceProvider;
 }
@@ -142,7 +142,7 @@ async function buildSystemPrompt(
 ): Promise<string> {
   const { agentId, workspace, allowedTools, supervisorId, flairUrl, flairKeyPath } = config;
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
 
   const { systemPrompt, identitySource } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -282,7 +282,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
   slog(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
 
   // Initial Flair health check + snapshot
   const flairOnline = await flair.ping();

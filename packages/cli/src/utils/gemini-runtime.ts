@@ -11,7 +11,7 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
+import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk, bootContext, searchPastExperience,
   catchUpTopics, onBoot, onTaskStart, onTaskComplete, onTaskFailure,
@@ -33,7 +33,7 @@ export interface GeminiConfig {
   taskTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
-  flairKeyPath?: string;
+  flairKeyPath: string;
   workspaceProvider?: WorkspaceProvider;
   pollIntervalMs?: number;
 }
@@ -86,7 +86,7 @@ async function buildPrompt(message: MailMessage, config: GeminiConfig): Promise<
     const flair = new FlairClient({
       baseUrl: config.flairUrl,
       agentId: config.agentId,
-      keyPath: config.flairKeyPath ?? defaultFlairKeyPath(config.agentId),
+      keyPath: config.flairKeyPath,
     });
     const bootResult = await Promise.race([
       bootContext(flair, config.agentId, message.body.slice(0, 100), config.workspace, { supervisorId: config.supervisorId }),
@@ -142,7 +142,7 @@ export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
   const { agentId, mailDir, workspaceProvider, flairUrl, flairKeyPath, pollIntervalMs = 5000, taskTimeoutMs = 30 * 60 * 1000 } = config;
   slog(`Gemini runtime started. Polling ${mailDir}/${agentId}/new`);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath ?? defaultFlairKeyPath(agentId) });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
 
   // Boot lifecycle — skip Flair snapshot on first boot (agent may not be registered)
   slog("Boot: skipping Flair snapshot (use disk fallback)");
