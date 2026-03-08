@@ -208,7 +208,7 @@ describe("ops-31.1: tps memory show", () => {
 describe("ops-31.1: tps memory search", () => {
   test("calls MemorySearch and prints results", async () => {
     mockFetch(async (url, opts) => {
-      if (url.includes("/SearchMemories/")) {
+      if (url.includes("/FindMemories")) {
         return new Response(JSON.stringify({ results: [{ id: "m1", content: "gh commands lesson", _score: 0.91 }] }), { status: 200 });
       }
       return new Response("[]", { status: 200 });
