@@ -110,14 +110,22 @@ function tailLines(content: string, count: number): string[] {
 
 async function streamLogUpdates(logPath: string, offset: number): Promise<never> {
   let position = offset;
+  let reading = false;
+  let pending = false;
 
   const readFromPosition = (): void => {
+    if (reading) {
+      pending = true;
+      return;
+    }
+
     const size = statSync(logPath).size;
     if (size < position) {
       position = 0;
     }
     if (size === position) return;
 
+    reading = true;
     const stream = createReadStream(logPath, {
       encoding: "utf-8",
       start: position,
@@ -130,17 +138,33 @@ async function streamLogUpdates(logPath: string, offset: number): Promise<never>
 
     stream.on("end", () => {
       position = size;
+      reading = false;
+      if (pending) {
+        pending = false;
+        readFromPosition();
+      }
+    });
+
+    stream.on("error", () => {
+      reading = false;
     });
   };
 
-  readFromPosition();
-
-  await new Promise<never>((_resolve) => {
-    watch(logPath, { persistent: true }, (eventType) => {
+  await new Promise<never>(() => {
+    const watcher = watch(logPath, { persistent: true }, (eventType) => {
       if (eventType === "change" || eventType === "rename") {
         readFromPosition();
       }
     });
+
+    const handleSigint = (): void => {
+      watcher.close();
+      process.removeListener("SIGINT", handleSigint);
+      process.stdout.write("\n");
+      process.exit(0);
+    };
+
+    process.on("SIGINT", handleSigint);
   });
 
   process.exit(0);
@@ -149,12 +173,12 @@ async function streamLogUpdates(logPath: string, offset: number): Promise<never>
 async function logAgentRuntime(args: AgentArgs): Promise<void> {
   const agentId = args.id;
   if (!agentId) {
-    console.error("Usage: tps agent logs --id <agent-id> [--lines <N>] [--follow]");
+    console.error("Usage: tps agent logs --id <agent-id> [--lines <N>] [--follow|-f]");
     process.exit(1);
   }
 
   const lineCount = normalizeLogLineCount(args.lines);
-  const logPath = join(healthcheckHomeDir(), ".tps", "logs", `${agentId}.log`);
+  const logPath = join(healthcheckHomeDir(), ".tps", "agents", agentId, "session.log");
   if (!existsSync(logPath)) {
     console.error(`No log file found for ${agentId}`);
     process.exit(1);
