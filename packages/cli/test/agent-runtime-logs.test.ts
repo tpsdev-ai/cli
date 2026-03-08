@@ -11,6 +11,12 @@ describe("tps agent logs runtime tail", () => {
   let originalError: typeof console.error;
   let originalExit: typeof process.exit;
 
+  function writeSessionLog(agentId: string, content: string): void {
+    const logDir = join(tempHome, ".tps", "agents", agentId);
+    mkdirSync(logDir, { recursive: true });
+    writeFileSync(join(logDir, "session.log"), content, "utf-8");
+  }
+
   beforeEach(() => {
     tempHome = mkdtempSync(join(tmpdir(), "tps-agent-runtime-logs-"));
     originalHome = process.env.HOME;
@@ -35,11 +41,9 @@ describe("tps agent logs runtime tail", () => {
   test("shows the last 50 lines by default", async () => {
     const { runAgent } = await import("../src/commands/agent.js");
     const output: string[] = [];
-    mkdirSync(join(tempHome, ".tps", "logs"), { recursive: true });
-    writeFileSync(
-      join(tempHome, ".tps", "logs", "ember.log"),
+    writeSessionLog(
+      "ember",
       Array.from({ length: 60 }, (_, index) => `line-${index + 1}`).join("\n") + "\n",
-      "utf-8",
     );
     process.stdout.write = ((chunk: string | Uint8Array) => {
       output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
@@ -56,11 +60,9 @@ describe("tps agent logs runtime tail", () => {
   test("respects a custom line count", async () => {
     const { runAgent } = await import("../src/commands/agent.js");
     const output: string[] = [];
-    mkdirSync(join(tempHome, ".tps", "logs"), { recursive: true });
-    writeFileSync(
-      join(tempHome, ".tps", "logs", "ember.log"),
+    writeSessionLog(
+      "ember",
       ["alpha", "beta", "gamma", "delta"].join("\n"),
-      "utf-8",
     );
     process.stdout.write = ((chunk: string | Uint8Array) => {
       output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
