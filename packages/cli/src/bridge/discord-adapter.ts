@@ -14,6 +14,17 @@ import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 
 const { log: slog, warn: swarn } = snooplogg("bridge:discord");
 
+export function classifyMessage(content: string): "task" | "chat" {
+  const taskPatterns = [
+    /\b(implement|fix|add|create|build|test|update|remove|refactor|write|deploy|merge|revert|ship)\b/i,
+    /\b(packages\/|src\/|test\/|\.ts|\.js|\.md)\b/,
+    /\b(PR|pull request|branch|commit|push)\s*#?\d*/i,
+    /\bops-\d+/i,
+  ];
+
+  return taskPatterns.some((pattern) => pattern.test(content)) ? "task" : "chat";
+}
+
 export interface DiscordAdapterConfig {
   /** Discord bot token */
   token: string;
