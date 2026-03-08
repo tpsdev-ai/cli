@@ -298,6 +298,12 @@ export async function syncWorkspaceBeforeTask(
   const runSync = deps.spawnSyncImpl ?? spawnSync;
   const warn = deps.warn ?? console.warn;
   const branch = resolveDefaultBranch(config.workspace, runSync);
+
+  // Ensure we're on a named branch (worktrees start detached via git worktree add --detach)
+  const headCheck = runSync("git", ["symbolic-ref", "--quiet", "HEAD"], { cwd: config.workspace, encoding: "utf-8" });
+  if ((headCheck.status ?? 1) !== 0) {
+    runSync("git", ["checkout", branch], { cwd: config.workspace, encoding: "utf-8" });
+  }
   const result = runSync("git", ["pull", "--rebase", "origin", branch], {
     cwd: config.workspace,
     encoding: "utf-8",
@@ -614,6 +620,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           }
         } else {
           await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
+        }
+        // Auto-commit after mail task (same as Flair task path)
+        if (config.autoCommit) {
+          const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
+            try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+          }};
+          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher);
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
