@@ -14,13 +14,13 @@ import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
 import { createInterface } from "node:readline/promises";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "healthcheck";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -46,6 +46,16 @@ export interface AgentArgs {
   sandbox?: boolean;
   /** Internal: set by re-exec under nono, skips re-wrapping */
   sandboxed?: boolean;
+}
+
+interface AgentHealthcheckResult {
+  label: string;
+  pass: boolean;
+  detail: string;
+}
+
+function healthcheckHomeDir(): string {
+  return process.env.TPS_HOME ?? homedir();
 }
 
 function archivePath(path: string, timestamp: string): string {
@@ -424,6 +434,136 @@ async function decommissionAgent(args: AgentArgs): Promise<void> {
     console.log(`  ${item.label}: ${item.result}`);
   }
 }
+
+function checkAgentIdentity(agentId: string): AgentHealthcheckResult {
+  const configPath = join(healthcheckHomeDir(), ".tps", "agents", agentId, "agent.yaml");
+  try {
+    readFileSync(configPath, "utf-8");
+    return {
+      label: "Identity",
+      pass: true,
+      detail: `~/.tps/agents/${agentId}/agent.yaml`,
+    };
+  } catch {
+    return {
+      label: "Identity",
+      pass: false,
+      detail: `~/.tps/agents/${agentId}/agent.yaml unreadable or missing`,
+    };
+  }
+}
+
+async function checkAgentFlairAuth(agentId: string, flairUrl?: string): Promise<AgentHealthcheckResult> {
+  const baseUrl = flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
+  const keyPath = join(healthcheckHomeDir(), ".tps", "identity", `${agentId}.key`);
+
+  try {
+    const flair = createFlairClient(agentId, baseUrl, keyPath);
+    await flair.search("healthcheck", 1);
+    return {
+      label: "Flair auth",
+      pass: true,
+      detail: `authenticated as ${agentId}`,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      label: "Flair auth",
+      pass: false,
+      detail: message,
+    };
+  }
+}
+
+function checkAgentProcess(agentId: string): AgentHealthcheckResult {
+  const pidPath = join(healthcheckHomeDir(), "ops", `tps-${agentId}`, ".tps-agent.pid");
+
+  if (!existsSync(pidPath)) {
+    return {
+      label: "Process",
+      pass: false,
+      detail: "no PID file found",
+    };
+  }
+
+  try {
+    const pid = Number.parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+    if (Number.isNaN(pid)) {
+      return {
+        label: "Process",
+        pass: false,
+        detail: `invalid PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
+      };
+    }
+    process.kill(pid, 0);
+    return {
+      label: "Process",
+      pass: true,
+      detail: `PID ${pid} running`,
+    };
+  } catch {
+    return {
+      label: "Process",
+      pass: false,
+      detail: `stale PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
+    };
+  }
+}
+
+function checkAgentMailDir(agentId: string): AgentHealthcheckResult {
+  const mailPath = join(healthcheckHomeDir(), ".tps", "mail", agentId, "new");
+
+  if (!existsSync(mailPath)) {
+    return {
+      label: "Mail dir",
+      pass: false,
+      detail: `~/.tps/mail/${agentId}/new missing`,
+    };
+  }
+
+  try {
+    accessSync(mailPath, constants.W_OK);
+    return {
+      label: "Mail dir",
+      pass: true,
+      detail: `~/.tps/mail/${agentId}/new (writable)`,
+    };
+  } catch {
+    return {
+      label: "Mail dir",
+      pass: false,
+      detail: `~/.tps/mail/${agentId}/new not writable`,
+    };
+  }
+}
+
+export async function healthcheckAgent(args: AgentArgs): Promise<void> {
+  const agentId = args.id;
+  if (!agentId) {
+    console.error("Usage: tps agent healthcheck <agent-id>");
+    process.exit(1);
+  }
+
+  const checks: AgentHealthcheckResult[] = [
+    checkAgentIdentity(agentId),
+    await checkAgentFlairAuth(agentId, args.flairUrl),
+    checkAgentProcess(agentId),
+    checkAgentMailDir(agentId),
+  ];
+
+  if (args.json) {
+    console.log(JSON.stringify({ agentId, ok: checks.every((check) => check.pass), checks }, null, 2));
+  } else {
+    for (const check of checks) {
+      const prefix = check.pass ? "PASS " : "FAIL ";
+      console.log(`${prefix} ${check.label}: ${check.detail}`);
+    }
+  }
+
+  if (checks.some((check) => !check.pass)) {
+    process.exit(1);
+  }
+}
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
 export async function runAgent(args: AgentArgs): Promise<void> {
@@ -445,6 +585,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
 
     case "isolate":
       return isolateAgent(args);
+
+    case "healthcheck":
+      return healthcheckAgent(args);
 
     case "run":
     case "start":
