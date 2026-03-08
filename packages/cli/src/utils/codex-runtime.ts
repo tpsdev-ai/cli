@@ -375,7 +375,7 @@ export async function runAutoCommit(
         prRepo,
         "--head",
         branchName,
-        ...(prTitle ? ["--title", prTitle] : []),
+        "--title", prTitle ?? `task: ${taskId}`,
         "--body",
         commitMessage,
       ];
