@@ -25,6 +25,7 @@ export interface BridgeArgs {
   discordToken?: string;
   discordTokenFile?: string;
   discordChannel?: string;
+  discordWebhookUrl?: string;
   discordPollMs?: number;
   discordContextPrompt?: string;
   botUserId?: string;
@@ -56,6 +57,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         const discordAdapter = new DiscordAdapter({
           token,
           channelId,
+          webhookUrl: args.discordWebhookUrl,
           pollIntervalMs: args.discordPollMs,
         botUserId: args.botUserId,
         requireMention: args.requireMention,

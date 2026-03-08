@@ -69,7 +69,38 @@ describe("DiscordAdapter", () => {
     await adapter.send({ channel: "discord", channelId: "chan3", senderId: "s1", senderName: "Ember", content: "Done!", timestamp: new Date().toISOString() });
 
     expect(posts).toHaveLength(1);
+    expect(posts[0].url).toBe("https://discord.com/api/v10/channels/chan3/messages");
     expect(JSON.parse(posts[0].body as string).content).toBe("Done!");
+    await adapter.stop();
+  });
+
+  test("send posts to configured webhook URL for outbound replies", async () => {
+    const posts: any[] = [];
+    fetchMock = mock(async (url: string, opts?: RequestInit) => {
+      if (opts?.method === "POST") {
+        posts.push({ url, body: opts.body, headers: opts.headers });
+      }
+      return { ok: true, json: async () => [] };
+    });
+    globalThis.fetch = fetchMock as any;
+
+    const adapter = new DiscordAdapter({
+      token: "tok",
+      channelId: "chan4",
+      webhookUrl: "https://discord.com/api/webhooks/abc/def",
+      pollIntervalMs: 999999,
+      requireMention: false,
+    });
+    await adapter.start(() => "ok");
+    await adapter.send({ channel: "discord", channelId: "chan4", senderId: "s1", senderName: "Ember", content: "Done!", timestamp: new Date().toISOString() });
+
+    expect(posts).toHaveLength(1);
+    expect(posts[0].url).toBe("https://discord.com/api/webhooks/abc/def");
+    expect(posts[0].headers).toEqual({ "Content-Type": "application/json" });
+    expect(JSON.parse(posts[0].body as string)).toEqual({
+      content: "Done!",
+      username: "Ember",
+    });
     await adapter.stop();
   });
 });

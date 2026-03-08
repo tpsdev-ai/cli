@@ -873,6 +873,7 @@ async function main() {
         console.error(
           "Usage:\n" +
           "  tps bridge start [--port 7891] [--openclaw-url <url>] [--bridge-agent-id openclaw-bridge] [--default-agent <id>]\n" +
+          "  tps bridge start --adapter discord [--discord-token <token>] [--discord-token-file <path>] [--discord-channel <id>] [--webhook-url <url>]\n" +
           "  tps bridge stop\n" +
           "  tps bridge status [--json]"
         );
@@ -893,6 +894,7 @@ async function main() {
         discordToken: getFlag("discord-token") ?? process.env.DISCORD_BOT_TOKEN,
         discordTokenFile: getFlag("discord-token-file"),
         discordChannel: getFlag("discord-channel") ?? process.env.DISCORD_CHANNEL_ID,
+        discordWebhookUrl: getFlag("webhook-url"),
         bridgeAgentId: getFlag("bridge-agent-id"),
         defaultAgentId: getFlag("default-agent"),
         mailDir: getFlag("mail-dir"),
