@@ -260,6 +260,7 @@ async function main() {
           "  tps agent run --id <agent-id> --message <text>\n" +
           "  tps agent start --id <agent-id>\n" +
           "  tps agent health --id <agent-id>\n" +
+          "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>]",
@@ -304,15 +305,11 @@ async function main() {
           json: cli.flags.json as boolean | undefined,
         });
       } else if (action === "logs") {
-        const { runAgentLogs } = await import("../src/commands/agent-logs.js");
-        const rawLimit = getFlag("limit");
-        await runAgentLogs({
-          agentId: rest[1] ?? getFlag("id"),
-          asAgent: getFlag("as"),
-          json: cli.flags.json as boolean | undefined,
-          flairUrl: getFlag("flair-url"),
-          mailDir: getFlag("mail-dir"),
-          limit: rawLimit ? Number.parseInt(rawLimit, 10) : undefined,
+        await runAgent({
+          action: "logs",
+          id: getFlag("id") ?? rest[1],
+          lines: cli.flags.lines as number | undefined,
+          follow: cli.flags.follow as boolean | undefined,
         });
       } else if (action === "commit") {
         // Inline helpers (getAuthor/getRepeatedFlags defined in else block below)
