@@ -201,6 +201,9 @@ describe("syncWorkspaceBeforeTask", () => {
       if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/trunk\n", stderr: "" };
       }
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/trunk\n", stderr: "" };
+      }
       if (cmd === "git" && args.join(" ") === "pull --rebase origin trunk") {
         return { status: 0, stdout: "", stderr: "" };
       }
@@ -211,6 +214,7 @@ describe("syncWorkspaceBeforeTask", () => {
 
     expect(calls).toEqual([
       { cmd: "git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
+      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
       { cmd: "git", args: ["pull", "--rebase", "origin", "trunk"] },
     ]);
   });
@@ -222,6 +226,9 @@ describe("syncWorkspaceBeforeTask", () => {
       if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 1, stdout: "", stderr: "" };
       }
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/main\n", stderr: "" };
+      }
       if (cmd === "git" && args.join(" ") === "pull --rebase origin main") {
         return { status: 0, stdout: "", stderr: "" };
       }
@@ -232,6 +239,7 @@ describe("syncWorkspaceBeforeTask", () => {
 
     expect(calls).toEqual([
       { cmd: "git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
+      { cmd: "git", args: ["symbolic-ref", "--quiet", "HEAD"] },
       { cmd: "git", args: ["pull", "--rebase", "origin", "main"] },
     ]);
   });
@@ -241,6 +249,9 @@ describe("syncWorkspaceBeforeTask", () => {
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/main\n", stderr: "" };
+      }
+      if (cmd === "git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/main\n", stderr: "" };
       }
       if (cmd === "git" && args.join(" ") === "pull --rebase origin main") {
         return { status: 1, stdout: "", stderr: "cannot rebase: unstaged changes" };
