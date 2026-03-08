@@ -122,8 +122,7 @@ export function extractFinalAnswer(raw: string): string {
     "All tool calls will be automatically approved.",
     "missing pgrep output",
   ];
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape stripping requires ESC
-  const stripped = raw.replace(/\u001b\[[0-9;]*m/g, "");
+  const stripped = raw.replace(/\x1b\[[0-9;]*m/g, "");
   const lines = stripped.split("\n").filter(
     (l) => !STRIP_PREFIXES.some((p) => l.trim().startsWith(p)),
   );
@@ -144,9 +143,7 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
   const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
-    const tpsBin = join(homedir(), ".tps", "bin");
-    const geminiEnv = { ...process.env, TPS_AGENT_ID: config.agentId, PATH: `${tpsBin}:${process.env.PATH ?? ""}` };
-    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"], env: geminiEnv });
+    const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, TPS_AGENT_ID: config.agentId } });
     proc.stdin.write(systemPrompt);
     proc.stdin.end();
     const chunks: Buffer[] = [];
