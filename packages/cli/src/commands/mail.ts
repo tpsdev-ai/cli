@@ -2,6 +2,7 @@ import { assertValidBody, checkMessages, getInbox, listMessages, sendMessage, ty
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
+import { version } from "../../package.json" assert { type: "json" };
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
@@ -14,6 +15,7 @@ interface MailArgs {
   message?: string;
   messageId?: string;
   json?: boolean;
+  version?: boolean;
   since?: string;
   limit?: number;
   desc?: string;
@@ -170,8 +172,14 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
       } else if (messages.length === 0) {
+        if (args.version) {
+          console.log(version);
+        }
         console.log("No messages.");
       } else {
+        if (args.version) {
+          console.log(version);
+        }
         for (const m of messages) {
           const marker = m.read ? "📖" : "📬";
           console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}`);
