@@ -25,6 +25,7 @@ export interface OfficeArgs {
   soundstage?: boolean;
   joinToken?: string;
   dryRun?: boolean;
+  json?: boolean;
 }
 
 
@@ -447,7 +448,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       if (!args.agent) {
         const states = listHostStates();
         if (states.length === 0) {
+          if (args.json) {
+            console.log(JSON.stringify({ agents: [], timestamp: new Date().toISOString() }, null, 2));
+            return;
+          }
           console.log("No active branch connections.");
+          return;
+        }
+        if (args.json) {
+          const agents = states.map((s) => ({
+            id: s.branch,
+            status: connectionAlive(s.branch) ? "connected" : "stale",
+            lastSeen: s.lastHeartbeatAck ?? s.connectedAt,
+          }));
+          console.log(JSON.stringify({ agents, timestamp: new Date().toISOString() }, null, 2));
           return;
         }
         for (const s of states) {
@@ -469,6 +483,19 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
+
+      if (args.json) {
+        console.log(JSON.stringify({
+          agents: [
+            {
+              id: agent,
+              status: sb?.state ?? "not-running",
+            },
+          ],
+          timestamp: new Date().toISOString(),
+        }, null, 2));
+        return;
+      }
 
       console.log(`Agent: ${agent}`);
       console.log(`Workspace: ${ws}`);

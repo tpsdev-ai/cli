@@ -288,6 +288,12 @@ interface OrgEventClient {
   request<T>(method: string, path: string, body?: unknown): Promise<T>;
 }
 
+export function formatAutoCommitPrTitle(agentId: string, title?: string): string | undefined {
+  const firstLine = title?.split("\n")[0]?.trim().slice(0, 80);
+  if (!firstLine) return undefined;
+  return `${agentId}: ${firstLine}`;
+}
+
 export async function publishTaskOutcomeEvent(
   flair: OrgEventClient,
   agentId: string,
@@ -457,6 +463,7 @@ async function _runAutoCommitLegacy(
 
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
+    const prTitle = formatAutoCommitPrTitle(agentId, cfg.prTitle);
     await runAutoCommit(
       { workspace: cfg.repo ?? workspace },
       flair,
@@ -470,8 +477,12 @@ async function _runAutoCommitLegacy(
         openPr: cfg.openPr,
         prRepo: cfg.prRepo,
         ghAgent,
+<<<<<<< HEAD
         prTitle: cfg.prTitle ?? taskSubject ?? `task: ${taskId}`,
         prBody: taskBody,
+=======
+        prTitle,
+>>>>>>> 47c34cd (task complete: 1767db35-8fa1-4025-bebf-2020132edbe4)
       },
       { tpsCommand },
     );
@@ -662,8 +673,19 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
+<<<<<<< HEAD
           const mailSubject = msg.body.split("\n")[0].slice(0, 72);
           await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body);
+=======
+          const title = msg.body.split("\n")[0]?.slice(0, 80);
+          await _runAutoCommitLegacy(
+            agentId,
+            config.workspace,
+            msg.id,
+            { ...config.autoCommit, prTitle: title },
+            flairPublisher,
+          );
+>>>>>>> 47c34cd (task complete: 1767db35-8fa1-4025-bebf-2020132edbe4)
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);

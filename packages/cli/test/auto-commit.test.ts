@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
+  formatAutoCommitPrTitle,
   publishTaskOutcomeEvent,
   runAutoCommit,
   syncWorkspaceBeforeTask,
@@ -13,6 +14,13 @@ const config: CodexRuntimeConfig = {
 };
 
 describe("runAutoCommit", () => {
+  test("formats auto-commit PR titles from the first task line", () => {
+    expect(
+      formatAutoCommitPrTitle("ember", "ops-78 Remove defaultFlairKeyPath fallback from runtime files\nMore detail"),
+    ).toBe("ember: ops-78 Remove defaultFlairKeyPath fallback from runtime files");
+    expect(formatAutoCommitPrTitle("ember", "")).toBeUndefined();
+  });
+
   test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
