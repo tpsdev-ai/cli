@@ -2,7 +2,7 @@ import { assertValidBody, checkMessages, getInbox, listMessages, sendMessage, ty
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
-import { version } from "../../package.json" assert { type: "json" };
+import { version } from "../../package.json" with { type: "json" };
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
