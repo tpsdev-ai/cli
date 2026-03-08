@@ -356,24 +356,38 @@ export async function syncWorkspaceBeforeTask(
   const warn = deps.warn ?? console.warn;
   const branch = resolveDefaultBranch(config.workspace, runSync);
 
-  // Always checkout default branch before rebase — task branches or detached HEAD both need this.
-  // Without explicit checkout, old task branches with conflict markers survive the rebase.
+  // Abort any in-progress rebase or merge before touching the worktree.
+  const rebaseMergeCheck = runSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
+  if ((rebaseMergeCheck.status ?? 1) === 0) {
+    warn(`[${config.agentId}] Aborted stale in-progress rebase before sync.`);
+  }
+
+  // Checkout default branch — task branches or detached HEAD both need this.
   const checkoutResult = runSync(GIT_BIN, ["checkout", branch], { cwd: config.workspace, encoding: "utf-8" });
   if ((checkoutResult.status ?? 1) !== 0) {
     const stderr = typeof checkoutResult.stderr === "string" ? checkoutResult.stderr.trim() : "";
     warn(`[${config.agentId}] git checkout ${branch} failed (non-fatal): ${stderr}`);
   }
-  const result = runSync(GIT_BIN, ["pull", "--rebase", "origin", branch], {
+
+  // Fetch latest from origin.
+  runSync(GIT_BIN, ["fetch", "origin", branch], { cwd: config.workspace, encoding: "utf-8" });
+
+  // Hard reset to origin/<branch> — eliminates stale commits, conflict markers, and
+  // carried-over task-branch changes that survive rebases on dirty worktrees.
+  const resetResult = runSync(GIT_BIN, ["reset", "--hard", `origin/${branch}`], {
     cwd: config.workspace,
     encoding: "utf-8",
   });
+  if ((resetResult.status ?? 1) !== 0) {
+    const stderr = typeof resetResult.stderr === "string" ? resetResult.stderr.trim() : "";
+    warn(`[${config.agentId}] Workspace sync: git reset --hard failed (non-fatal): ${stderr}`);
+    return;
+  }
 
-  if ((result.status ?? 1) === 0) return;
+  // Remove untracked files and directories left by prior task branches.
+  runSync(GIT_BIN, ["clean", "-fd"], { cwd: config.workspace, encoding: "utf-8" });
 
-  const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-  const stdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
-  const detail = stderr || stdout || `exit ${result.status ?? "unknown"}`;
-  warn(`[${config.agentId}] Workspace sync failed before task (non-fatal): git pull --rebase origin ${branch}: ${detail}`);
+  console.log(`[${config.agentId}] Workspace synced to origin/${branch}.`);
 }
 
 export async function runAutoCommit(

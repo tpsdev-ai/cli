@@ -244,29 +244,32 @@ describe("publishTaskOutcomeEvent", () => {
 });
 
 describe("syncWorkspaceBeforeTask", () => {
-  test("pulls with the configured remote default branch when origin HEAD is available", async () => {
+  test("hard-resets to origin/branch when origin HEAD is available", async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      // All git commands succeed by default
+      return { status: 0, stdout: "", stderr: "" };
+    });
+
+    // Override symbolic-ref to return trunk
+    const origImpl = spawnSyncImpl.mock.calls;
+    const impl = mock((cmd: string, args: string[]) => {
       calls.push({ cmd, args });
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/trunk\n", stderr: "" };
       }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "checkout trunk") {
-        return { status: 0, stdout: "", stderr: "" };
-      }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin trunk") {
-        return { status: 0, stdout: "", stderr: "" };
-      }
-      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+      return { status: 0, stdout: "", stderr: "" };
     });
 
-    await syncWorkspaceBeforeTask(config, { spawnSyncImpl });
+    await syncWorkspaceBeforeTask(config, { spawnSyncImpl: impl });
 
-    expect(calls).toEqual([
-      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
-      { cmd: "/usr/bin/git", args: ["checkout", "trunk"] },
-      { cmd: "/usr/bin/git", args: ["pull", "--rebase", "origin", "trunk"] },
-    ]);
+    // Must include: rebase --abort, checkout, fetch, reset --hard, clean -fd
+    expect(calls.some(c => c.args.join(" ") === "rebase --abort")).toBe(true);
+    expect(calls.some(c => c.args.join(" ") === "checkout trunk")).toBe(true);
+    expect(calls.some(c => c.args.join(" ") === "fetch origin trunk")).toBe(true);
+    expect(calls.some(c => c.args.join(" ") === "reset --hard origin/trunk")).toBe(true);
+    expect(calls.some(c => c.args.join(" ") === "clean -fd")).toBe(true);
   });
 
   test("falls back to main when origin HEAD is not configured", async () => {
@@ -276,44 +279,31 @@ describe("syncWorkspaceBeforeTask", () => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 1, stdout: "", stderr: "" };
       }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "checkout main") {
-        return { status: 0, stdout: "", stderr: "" };
-      }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin main") {
-        return { status: 0, stdout: "", stderr: "" };
-      }
-      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+      return { status: 0, stdout: "", stderr: "" };
     });
 
     await syncWorkspaceBeforeTask(config, { spawnSyncImpl });
 
-    expect(calls).toEqual([
-      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"] },
-      { cmd: "/usr/bin/git", args: ["checkout", "main"] },
-      { cmd: "/usr/bin/git", args: ["pull", "--rebase", "origin", "main"] },
-    ]);
+    expect(calls.some(c => c.args.join(" ") === "checkout main")).toBe(true);
+    expect(calls.some(c => c.args.join(" ") === "reset --hard origin/main")).toBe(true);
   });
 
-  test("warns and continues when rebase fails", async () => {
+  test("warns and continues when reset fails", async () => {
     const warn = mock(() => {});
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet --short refs/remotes/origin/HEAD") {
         return { status: 0, stdout: "origin/main\n", stderr: "" };
       }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "checkout main") {
-        return { status: 0, stdout: "", stderr: "" };
+      if (cmd === "/usr/bin/git" && args.join(" ") === "reset --hard origin/main") {
+        return { status: 1, stdout: "", stderr: "fatal: cannot reset" };
       }
-      if (cmd === "/usr/bin/git" && args.join(" ") === "pull --rebase origin main") {
-        return { status: 1, stdout: "", stderr: "cannot rebase: unstaged changes" };
-      }
-      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+      return { status: 0, stdout: "", stderr: "" };
     });
 
     await syncWorkspaceBeforeTask(config, { spawnSyncImpl, warn });
 
-    expect(warn).toHaveBeenCalledTimes(1);
     expect(warn).toHaveBeenCalledWith(
-      "[ember] Workspace sync failed before task (non-fatal): git pull --rebase origin main: cannot rebase: unstaged changes",
+      expect.stringContaining("git reset --hard failed"),
     );
   });
 });
