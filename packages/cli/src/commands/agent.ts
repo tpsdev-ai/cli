@@ -13,14 +13,14 @@
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
-import { createInterface } from "node:readline/promises";
-import { accessSync, constants, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { createInterface as createPromptInterface } from "node:readline/promises";
+import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "healthcheck";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -46,6 +46,8 @@ export interface AgentArgs {
   sandbox?: boolean;
   /** Internal: set by re-exec under nono, skips re-wrapping */
   sandboxed?: boolean;
+  lines?: number;
+  follow?: boolean;
 }
 
 interface AgentHealthcheckResult {
@@ -75,7 +77,7 @@ async function confirmDecommission(agentId: string): Promise<void> {
     process.exit(1);
   }
 
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const rl = createPromptInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = await rl.question(
       `Decommission agent '${agentId}'? This archives local state and marks the Flair agent decommissioned. Type '${agentId}' to continue: `,
@@ -86,6 +88,86 @@ async function confirmDecommission(agentId: string): Promise<void> {
     }
   } finally {
     rl.close();
+  }
+}
+
+function normalizeLogLineCount(lines?: number): number {
+  if (lines === undefined) return 50;
+  if (!Number.isInteger(lines) || lines <= 0) {
+    console.error(`--lines must be a positive integer. Got: ${lines}`);
+    process.exit(1);
+  }
+  return lines;
+}
+
+function tailLines(content: string, count: number): string[] {
+  if (!content) return [];
+  const endsWithNewline = content.endsWith("\n");
+  const lines = content.split(/\r?\n/);
+  if (endsWithNewline) lines.pop();
+  return lines.slice(-count);
+}
+
+async function streamLogUpdates(logPath: string, offset: number): Promise<never> {
+  let position = offset;
+
+  const readFromPosition = (): void => {
+    const size = statSync(logPath).size;
+    if (size < position) {
+      position = 0;
+    }
+    if (size === position) return;
+
+    const stream = createReadStream(logPath, {
+      encoding: "utf-8",
+      start: position,
+      end: size - 1,
+    });
+
+    stream.on("data", (chunk) => {
+      process.stdout.write(chunk);
+    });
+
+    stream.on("end", () => {
+      position = size;
+    });
+  };
+
+  readFromPosition();
+
+  await new Promise<never>((_resolve) => {
+    watch(logPath, { persistent: true }, (eventType) => {
+      if (eventType === "change" || eventType === "rename") {
+        readFromPosition();
+      }
+    });
+  });
+
+  process.exit(0);
+}
+
+async function logAgentRuntime(args: AgentArgs): Promise<void> {
+  const agentId = args.id;
+  if (!agentId) {
+    console.error("Usage: tps agent logs --id <agent-id> [--lines <N>] [--follow]");
+    process.exit(1);
+  }
+
+  const lineCount = normalizeLogLineCount(args.lines);
+  const logPath = join(healthcheckHomeDir(), ".tps", "logs", `${agentId}.log`);
+  if (!existsSync(logPath)) {
+    console.error(`No log file found for ${agentId}`);
+    process.exit(1);
+  }
+
+  const content = readFileSync(logPath, "utf-8");
+  const lines = tailLines(content, lineCount);
+  for (const line of lines) {
+    process.stdout.write(`${line}\n`);
+  }
+
+  if (args.follow) {
+    await streamLogUpdates(logPath, statSync(logPath).size);
   }
 }
 // ─── create ──────────────────────────────────────────────────────────────────
@@ -585,6 +667,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
 
     case "isolate":
       return isolateAgent(args);
+
+    case "logs":
+      return logAgentRuntime(args);
 
     case "healthcheck":
       return healthcheckAgent(args);
