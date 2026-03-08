@@ -260,6 +260,7 @@ async function main() {
           "  tps agent run --id <agent-id> --message <text>\n" +
           "  tps agent start --id <agent-id>\n" +
           "  tps agent health --id <agent-id>\n" +
+          "  tps agent healthcheck <agent-id>\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>]",
         );
@@ -296,14 +297,11 @@ async function main() {
           force: cli.flags.force,
         });
       } else if (action === "healthcheck") {
-        const { runAgentHealthcheck } = await import("../src/commands/agent-healthcheck.js");
-        await runAgentHealthcheck({
-          agentId: rest[1] ?? getFlag("id"),
+        await runAgent({
+          action: "healthcheck",
+          id: rest[1] ?? getFlag("id"),
           flairUrl: getFlag("flair-url"),
-          mailDir: getFlag("mail-dir"),
-          workspace: getFlag("workspace"),
           json: cli.flags.json as boolean | undefined,
-          noColor: Boolean(cli.flags["no-color"]),
         });
       } else if (action === "logs") {
         const { runAgentLogs } = await import("../src/commands/agent-logs.js");
