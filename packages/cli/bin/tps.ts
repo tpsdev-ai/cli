@@ -583,7 +583,7 @@ async function main() {
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish"];
       if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread) [--lines N]\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
@@ -634,7 +634,10 @@ async function main() {
           messageId: action === "read" ? rest[2] : undefined,
           json: cli.flags.json,
           since: cli.flags.since,
-          limit: cli.flags.limit ? Number(cli.flags.limit) : undefined,
+          limit:
+            action === "list"
+              ? Number(cli.flags.lines ?? 20)
+              : (cli.flags.limit ? Number(cli.flags.limit) : undefined),
         });
       }
       break;
@@ -680,6 +683,7 @@ async function main() {
       break;
     }
     case "backup": {
+<<<<<<< HEAD
       const subCmd = rest[0];
       if (subCmd === "keys") {
         const { runBackupSecrets } = await import("../src/commands/backup.js");
@@ -688,6 +692,10 @@ async function main() {
         const { runBackup } = await import("../src/commands/backup.js");
         await runBackup({ agentId: subCmd });
       }
+=======
+      const { runBackup } = await import("../src/commands/backup.js");
+      await runBackup({});
+>>>>>>> f5544c6 (task complete: bc996f0e-e0c5-435f-afa7-3dda8c11a702)
       break;
     }
     case "restore": {

@@ -163,7 +163,10 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "list": {
       const agent = await resolveAgentId(args.agent);
-      const messages = listMessages(agent);
+      const limit = Math.max(0, Math.floor(args.limit ?? 20));
+      const messages = listMessages(agent)
+        .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
+        .slice(0, limit);
       if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
       } else if (messages.length === 0) {

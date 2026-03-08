@@ -490,22 +490,46 @@ function backupFilesWithManifest(workspace: string, entry: OpenClawAgent | null,
 }
 
 export async function runBackup(args: BackupArgs): Promise<void> {
+<<<<<<< HEAD
   if (!args.agentId) throw new Error("Usage: tps backup <agent-id>");
   const safeId = sanitizeAgentId(args.agentId);
   const workspace = workspacePath(safeId);
+=======
+  void args;
+>>>>>>> f5544c6 (task complete: bc996f0e-e0c5-435f-afa7-3dda8c11a702)
 
-  if (!existsSync(workspace)) {
-    throw new Error(`Workspace not found for ${safeId}`);
+  const home = homedir();
+  const backupDir = join(home, ".tps", "backups");
+  mkdirSync(backupDir, { recursive: true });
+
+  const archivePath = join(backupDir, `backup-${new Date().toISOString().slice(0, 10)}.tar.gz`);
+  const includedFiles = Array.from(new Set([
+    ...globSync(".tps/identity/*.key", { cwd: home }),
+    ...globSync(".tps/secrets/**/*", { cwd: home }),
+    ...globSync(".tps/agents/*/agent.yaml", { cwd: home }),
+    ...globSync(".codex/auth.json", { cwd: home }),
+  ])).filter((relativePath) => {
+    const absolutePath = join(home, relativePath);
+    return existsSync(absolutePath) && lstatSync(absolutePath).isFile();
+  }).sort();
+
+  if (includedFiles.length === 0) {
+    console.log("No TPS backup files found.");
+    return;
   }
 
-  const configPath = args.configPath ?? resolveConfigPath();
-  let config: OpenClawConfig | null = null;
-  let agentEntry: OpenClawAgent | null = null;
-  if (configPath) {
-    config = readOpenClawConfig(configPath);
-    agentEntry = findOpenClawAgentEntry(config, safeId) ?? null;
+  const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
+  const tarArgs = includedFiles.map(shellQuote).join(" ");
+  execSync(`tar czf ${shellQuote(archivePath)} -C ${shellQuote(home)} ${tarArgs}`, {
+    stdio: "pipe",
+  });
+  chmodSync(archivePath, 0o600);
+
+  for (const relativePath of includedFiles) {
+    console.log(relativePath);
   }
 
+<<<<<<< HEAD
   if (!agentEntry) {
     agentEntry = { id: safeId, name: safeId, workspace };
   }
@@ -641,6 +665,10 @@ export async function runBackupSecrets(): Promise<void> {
   console.log(`Archive: ${archivePath} (${statSync(archivePath).size} bytes)`);
 }
 
+=======
+  console.log(`Archive: ${archivePath} (${statSync(archivePath).size} bytes)`);
+}
+>>>>>>> f5544c6 (task complete: bc996f0e-e0c5-435f-afa7-3dda8c11a702)
 export async function runRestore(args: RestoreArgs): Promise<void> {
   const safeTarget = sanitizeAgentId(args.agentId);
   const archive = resolve(args.archivePath);
