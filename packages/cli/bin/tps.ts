@@ -430,6 +430,8 @@ async function main() {
               });
             } else if (runtimeArg === "gemini") {
               const { runGeminiRuntime } = await import("../src/utils/gemini-runtime.js");
+              const DEFAULT_GEMINI_SUFFIX =
+                "Be concise. Output only your final answer or conclusion. No thinking narration, no \"I\'ll do X\", no step-by-step commentary.";
               await runGeminiRuntime({
                 agentId: agentId!,
                 workspace: agentWorkspace,
@@ -440,6 +442,7 @@ async function main() {
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
                 workspaceProvider,
+                systemPromptSuffix: (agentCfg.gemini?.systemPromptSuffix as string | undefined) ?? DEFAULT_GEMINI_SUFFIX,
               });
             } else {
               const { runClaudeCodeRuntime } = await import("../src/utils/claude-code-runtime.js");
