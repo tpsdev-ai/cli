@@ -158,6 +158,8 @@ describe("runAutoCommit", () => {
           "tpsdev-ai/cli",
           "--head",
           "feat/task-456",
+          "--title",
+          "feat: ship task 456",
           "--body",
           "feat: ship task 456",
         ]);
@@ -179,6 +181,7 @@ describe("runAutoCommit", () => {
         openPr: true,
         prRepo: "tpsdev-ai/cli",
         ghAgent: "ember",
+        prTitle: "feat: ship task 456",
       },
       { spawnSyncImpl },
     )).rejects.toThrow("gh-as pr create failed: gh-as pr create failed");
