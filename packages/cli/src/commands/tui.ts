@@ -58,7 +58,13 @@ function fetchMail(mailDir: string, agentId: string): MailMessage[] {
   } catch { return []; }
 }
 
+const REPO_RE = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
+
 function fetchPRs(repo: string): PullRequest[] {
+  if (!REPO_RE.test(repo)) {
+    console.error(`[tui] Invalid repo format: ${repo}`);
+    return [];
+  }
   try {
     const out = runCmd("gh", ["pr", "list", "--repo", repo,
       "--json", "number,title,author,statusCheckRollup", "--limit", "10"]);

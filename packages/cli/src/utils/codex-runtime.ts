@@ -219,7 +219,7 @@ async function runCodex(
     let buf = "";
 
     // Watchdog: kill + stall event if no JSONL output for watchdogTimeoutMs
-    const watchdogMs = Math.max(30_000, config.watchdogTimeoutMs ?? 5 * 60 * 1000); // min 30s prevents DoS loop
+    const watchdogMs = config.watchdogTimeoutMs ?? 5 * 60 * 1000;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
     const resetWatchdog = () => {
       if (watchdog) clearTimeout(watchdog);

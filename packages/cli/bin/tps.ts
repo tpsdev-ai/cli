@@ -972,7 +972,9 @@ async function main() {
       const { homedir: tuiHomedir } = await import("node:os");
       const tuiMailDir = (cli.flags["mail-dir"] as string | undefined) ?? tuiJoin(tuiHomedir(), ".tps", "mail");
       const tuiAgentId = (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined) ?? rest[0] ?? "anvil";
-      const tuiRepo = (cli.flags.repo as string | undefined) ?? "tpsdev-ai/cli";
+      const tuiRepoRaw = (cli.flags.repo as string | undefined) ?? "tpsdev-ai/cli";
+      const tuiRepo = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(tuiRepoRaw) ? tuiRepoRaw : "tpsdev-ai/cli";
+      if (tuiRepo !== tuiRepoRaw) console.warn(`[tui] Invalid --repo value ignored: ${tuiRepoRaw}`);
       render(React.createElement(TuiApp, { mailDir: tuiMailDir, agentId: tuiAgentId, repo: tuiRepo }));
       break;
     }
