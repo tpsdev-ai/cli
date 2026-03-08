@@ -1,5 +1,5 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import { DiscordAdapter } from "../src/bridge/discord-adapter.js";
+import { DiscordAdapter, classifyMessage } from "../src/bridge/discord-adapter.js";
 
 describe("DiscordAdapter", () => {
   let fetchMock: ReturnType<typeof mock>;
@@ -102,5 +102,16 @@ describe("DiscordAdapter", () => {
       username: "Ember",
     });
     await adapter.stop();
+  });
+
+  test.each([
+    ["implement ops-78", "task"],
+    ["fix the build error in codex-runtime.ts", "task"],
+    ["how are you doing?", "chat"],
+    ["what is the status?", "chat"],
+    ["PR #174 needs review", "task"],
+    ["good morning", "chat"],
+  ] as const)("classifyMessage(%p) => %p", (content, expected) => {
+    expect(classifyMessage(content)).toBe(expected);
   });
 });
