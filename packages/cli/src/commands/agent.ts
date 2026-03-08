@@ -605,10 +605,19 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   }
 
   const diff = runGit(["diff", "--cached", "--quiet"], repoPath);
-  if (diff.status === 0) failWith("No changes staged for commit.");
-
-  runGitOrFail(["commit", "--author", `${authorName} <${authorEmail}>`, "-m", commitMessage!], repoPath, "git commit");
-  console.log(`Committed changes in ${repoPath} on branch ${branchName}.`);
+  if (diff.status === 0) {
+    // Nothing staged — check if HEAD is already ahead of origin (agent self-committed)
+    const ahead = runGit(["rev-list", "--count", `origin/${branchName!}..HEAD`], repoPath);
+    const aheadCount = parseInt((ahead.stdout ?? "").trim(), 10);
+    if (Number.isNaN(aheadCount) || aheadCount === 0) {
+      failWith("No changes staged for commit.");
+    }
+    // Already committed — skip to push
+    console.log(`Changes already committed on ${branchName}. Skipping commit step.`);
+  } else {
+    runGitOrFail(["commit", "--author", `${authorName} <${authorEmail}>`, "-m", commitMessage!], repoPath, "git commit");
+    console.log(`Committed changes in ${repoPath} on branch ${branchName}.`);
+  }
 
   if (!doPush) return;
 
