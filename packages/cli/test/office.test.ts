@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, existsSync, r
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { runOffice } from "../src/commands/office.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 
@@ -94,6 +95,32 @@ describe("office command", () => {
     const r = run(["office", "status", "brancha"]);
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("Office: not running");
+  });
+
+  test("status --json emits the expected single-agent payload", async () => {
+    const lines: string[] = [];
+    const originalLog = console.log;
+    console.log = (...args: unknown[]) => lines.push(args.join(" "));
+
+    try {
+      await runOffice({ action: "status", agent: "brancha", json: true });
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(lines).toHaveLength(1);
+    const payload = JSON.parse(lines[0]!);
+    expect(payload).toEqual({
+      agents: [
+        {
+          id: "brancha",
+          status: "not-running",
+          lastSeen: payload.timestamp,
+        },
+      ],
+      timestamp: payload.timestamp,
+    });
+    expect(new Date(payload.timestamp).toISOString()).toBe(payload.timestamp);
   });
 
   test("status shows paused message count when loop-detected messages exist", () => {

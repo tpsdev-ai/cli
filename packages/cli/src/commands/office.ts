@@ -445,11 +445,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     }
 
     case "status": {
+      const timestamp = new Date().toISOString();
       if (!args.agent) {
         const states = listHostStates();
         if (states.length === 0) {
           if (args.json) {
-            console.log(JSON.stringify({ agents: [], timestamp: new Date().toISOString() }, null, 2));
+            console.log(JSON.stringify({ agents: [], timestamp }, null, 2));
             return;
           }
           console.log("No active branch connections.");
@@ -461,7 +462,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
             status: connectionAlive(s.branch) ? "connected" : "stale",
             lastSeen: s.lastHeartbeatAck ?? s.connectedAt,
           }));
-          console.log(JSON.stringify({ agents, timestamp: new Date().toISOString() }, null, 2));
+          console.log(JSON.stringify({ agents, timestamp }, null, 2));
           return;
         }
         for (const s of states) {
@@ -490,9 +491,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
             {
               id: agent,
               status: sb?.state ?? "not-running",
+              lastSeen: timestamp,
             },
           ],
-          timestamp: new Date().toISOString(),
+          timestamp,
         }, null, 2));
         return;
       }
