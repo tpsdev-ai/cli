@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ export interface OfficeArgs {
   soundstage?: boolean;
   joinToken?: string;
   dryRun?: boolean;
+  json?: boolean;
 }
 
 
@@ -54,6 +55,13 @@ function outboxCounts(agentId: string): { newCount: number; curCount: number; fa
     curCount: countDir(join(root, "cur")),
     failedCount: countDir(join(root, "failed")),
   };
+}
+
+function lastSeenFromPaths(paths: string[]): string {
+  const timestamps = paths
+    .filter((path) => existsSync(path))
+    .map((path) => statSync(path).mtime.toISOString());
+  return timestamps[0] ?? new Date(0).toISOString();
 }
 
 function validateAgent(agent?: string): string {
@@ -444,8 +452,18 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     }
 
     case "status": {
+      const timestamp = new Date().toISOString();
       if (!args.agent) {
         const states = listHostStates();
+        if (args.json) {
+          const agents = states.map((state) => ({
+            id: state.branch,
+            status: connectionAlive(state.branch) ? "connected" : "STALE",
+            lastSeen: state.lastHeartbeatAck ?? state.connectedAt,
+          }));
+          console.log(JSON.stringify({ agents, timestamp }, null, 2));
+          return;
+        }
         if (states.length === 0) {
           console.log("No active branch connections.");
           return;
@@ -469,6 +487,17 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
+      if (args.json) {
+        const status = sb ? sb.state : relayRunning ? "relay-running" : "not running";
+        const lastSeen = lastSeenFromPaths([
+          relayPidFile(agent),
+          soundstageMarker,
+          join(ws, ".tps", "team.json"),
+          ws,
+        ]);
+        console.log(JSON.stringify({ agents: [{ id: agent, status, lastSeen }], timestamp }, null, 2));
+        return;
+      }
 
       console.log(`Agent: ${agent}`);
       console.log(`Workspace: ${ws}`);
