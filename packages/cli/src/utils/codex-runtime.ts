@@ -267,6 +267,7 @@ export interface AutoCommitOptions {
   prRepo?: string;
   ghAgent?: string;
   prTitle?: string;
+  prBody?: string;
 }
 
 export interface AutoCommitDeps {
@@ -358,6 +359,7 @@ export async function runAutoCommit(
     prRepo,
     ghAgent,
     prTitle,
+    prBody,
   } = options;
 
   // Ensure we're on a named branch (not detached HEAD) before committing
@@ -393,7 +395,7 @@ export async function runAutoCommit(
         branchName,
         "--title", prTitle ?? `task: ${taskId}`,
         "--body",
-        commitMessage,
+        prBody ?? commitMessage,
       ];
       const prResult = runSync("gh-as", prArgs, { cwd: repo, encoding: "utf-8" });
       if ((prResult.status ?? 1) === 0) return;
@@ -440,6 +442,8 @@ async function _runAutoCommitLegacy(
   taskId: string,
   cfg: AutoCommitConfig,
   flair: AutoCommitFlair,
+  taskSubject?: string,
+  taskBody?: string,
 ): Promise<string | null> {
   const branchPrefix = cfg.branchPrefix ?? "task/";
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
@@ -459,14 +463,15 @@ async function _runAutoCommitLegacy(
       {
         taskId,
         branchName: safeBranch,
-        commitMessage: `task complete: ${taskId}`,
+        commitMessage: taskSubject ? `${taskSubject}` : `task complete: ${taskId}`,
         authorName,
         authorEmail,
         push: cfg.push,
         openPr: cfg.openPr,
         prRepo: cfg.prRepo,
         ghAgent,
-        prTitle: cfg.prTitle,
+        prTitle: cfg.prTitle ?? taskSubject ?? `task: ${taskId}`,
+        prBody: taskBody,
       },
       { tpsCommand },
     );
@@ -564,7 +569,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher);
+        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody);
         if (branchRef && config.autoCommit.push) {
           try {
             await (flair as any).request("POST", "/OrgEvent", {
@@ -657,7 +662,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher);
+          const mailSubject = msg.body.split("\n")[0].slice(0, 72);
+          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body);
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
