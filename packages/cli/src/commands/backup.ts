@@ -490,6 +490,7 @@ function backupFilesWithManifest(workspace: string, entry: OpenClawAgent | null,
 }
 
 export async function runBackup(args: BackupArgs): Promise<void> {
+  if (!args.agentId) throw new Error("Usage: tps backup <agent-id>");
   const safeId = sanitizeAgentId(args.agentId);
   const workspace = workspacePath(safeId);
 
