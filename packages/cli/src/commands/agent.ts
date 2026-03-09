@@ -412,6 +412,12 @@ async function listAgents(args: AgentArgs): Promise<void> {
 
 async function agentStatus(args: AgentArgs): Promise<void> {
   const id = args.id;
+
+  // Prevent path traversal via crafted agent IDs (e.g. "../../foo")
+  if (id && (id.includes("/") || id.includes("\\") || id.includes(".."))) {
+    console.error(`Invalid agent id: ${id}`);
+    process.exit(1);
+  }
   if (!id) {
     console.error("Usage: tps agent status --id <agent-id>");
     process.exit(1);
