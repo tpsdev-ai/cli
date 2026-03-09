@@ -2,7 +2,7 @@
  * ops-36 — tps agent create / list / status tests
  */
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -54,15 +54,19 @@ describe("ops-36: FlairClient auth header format", () => {
 describe("ops-36: tps agent create — file system side effects", () => {
   let tmpDir: string;
   let originalHome: string | undefined;
+  let originalTpsHome: string | undefined;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-agent-test-"));
     originalHome = process.env.HOME;
+    originalTpsHome = process.env.TPS_HOME;
     process.env.HOME = tmpDir;
+    process.env.TPS_HOME = tmpDir;
   });
 
   afterEach(() => {
     process.env.HOME = originalHome;
+    process.env.TPS_HOME = originalTpsHome;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -139,6 +143,44 @@ describe("ops-36: tps agent create — file system side effects", () => {
       (process as any).exit = origExit;
     }
     expect(exitCode).toBe(1);
+  });
+
+  test("agentStatus verbose prints workspace and runtime", async () => {
+    const { runAgent } = await import("../src/commands/agent.js");
+
+    const agentDir = join(tmpDir, ".tps", "agents", "verbose-agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, "agent.yaml"), `agentId: verbose-agent
+name: Verbose Agent
+workspace: /tmp/verbose-workspace
+mailDir: /tmp/verbose-mail
+runtime: claude-code
+llm:
+  provider: anthropic
+  model: claude-sonnet-4-6
+`);
+
+    const logs: string[] = [];
+    const logSpy = mock((line: string) => {
+      logs.push(line);
+    });
+    const originalLog = console.log;
+    console.log = logSpy as typeof console.log;
+
+    try {
+      await runAgent({
+        action: "status",
+        id: "verbose-agent",
+        verbose: true,
+        flairUrl: "http://127.0.0.1:19926",
+      });
+    } finally {
+      console.log = originalLog;
+    }
+
+    const output = logs.join("\n");
+    expect(output).toContain("Workspace: /tmp/verbose-workspace");
+    expect(output).toContain("Runtime: claude-code");
   });
 });
 

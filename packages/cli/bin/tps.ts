@@ -119,6 +119,7 @@ const cli = meow(
       count: { type: "boolean", default: false },
       priority: { type: "string" },
       version: { type: "string" },
+      verbose: { type: "boolean", default: false },
     },
   }
 );
@@ -290,7 +291,13 @@ async function main() {
       } else if (action === "list") {
         await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });
       } else if (action === "status") {
-        await runAgent({ action: "status", id: getFlag("id") ?? rest[1], json: cli.flags.json, flairUrl: getFlag("flair-url") });
+        await runAgent({
+          action: "status",
+          id: getFlag("id") ?? rest[1],
+          json: cli.flags.json,
+          verbose: cli.flags.verbose as boolean | undefined,
+          flairUrl: getFlag("flair-url"),
+        });
       } else if (action === "decommission") {
         await runAgent({
           action: "decommission",

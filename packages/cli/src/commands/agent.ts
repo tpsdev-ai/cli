@@ -11,6 +11,7 @@
  */
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
+import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
@@ -33,6 +34,7 @@ export interface AgentArgs {
   model?: string;
   flairUrl?: string;
   json?: boolean;
+  verbose?: boolean;
   force?: boolean;
   port?: number;
   repo?: string;
@@ -57,6 +59,10 @@ interface AgentHealthcheckResult {
 }
 
 function healthcheckHomeDir(): string {
+  return process.env.TPS_HOME ?? homedir();
+}
+
+function agentHomeDir(): string {
   return process.env.TPS_HOME ?? homedir();
 }
 
@@ -411,8 +417,9 @@ async function agentStatus(args: AgentArgs): Promise<void> {
     process.exit(1);
   }
 
+  const homeDir = agentHomeDir();
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
-  const agentDir = join(homedir(), ".tps", "agents", id);
+  const agentDir = join(homeDir, ".tps", "agents", id);
   const configPath = join(agentDir, "agent.yaml");
 
   if (!existsSync(configPath)) {
@@ -420,7 +427,19 @@ async function agentStatus(args: AgentArgs): Promise<void> {
     process.exit(1);
   }
 
+  const config = loadAgentConfig(configPath);
+  const rawConfig = (yaml.load(readFileSync(configPath, "utf-8")) ?? {}) as Record<string, unknown>;
+  const runtime = typeof rawConfig.runtime === "string" ? rawConfig.runtime : undefined;
   const out: Record<string, unknown> = { id };
+
+  if (args.verbose) {
+    out.config = {
+      workspace: config.workspace,
+      runtime: runtime ?? "unknown",
+      model: config.llm.model,
+      mailDir: config.mailDir,
+    };
+  }
 
   // Process status
   const pidPath = join(agentDir, "run.pid");
@@ -438,7 +457,7 @@ async function agentStatus(args: AgentArgs): Promise<void> {
 
   // Flair status
   try {
-    const flair = createFlairClient(id, flairUrl, join(homedir(), ".tps", "identity", `${id}.key`));
+    const flair = createFlairClient(id, flairUrl, join(homeDir, ".tps", "identity", `${id}.key`));
     const online = await flair.ping();
     if (!online) {
       out.flair = { online: false };
@@ -463,6 +482,13 @@ async function agentStatus(args: AgentArgs): Promise<void> {
     console.log(`Agent: ${id}`);
     console.log(`Process: ${proc.running ? `running (pid ${proc.pid})` : proc.stalePid ? "stopped (stale pid)" : "stopped"}`);
     console.log(`Flair: ${flair.online ? (flair.registered ? `registered, ${flair.memoryCount} memories` : "not registered") : "offline"}`);
+    if (args.verbose) {
+      const verbose = out.config as { workspace: string; runtime: string; model: string; mailDir: string };
+      console.log(`Workspace: ${verbose.workspace}`);
+      console.log(`Runtime: ${verbose.runtime}`);
+      console.log(`Model: ${verbose.model}`);
+      console.log(`MailDir: ${verbose.mailDir}`);
+    }
   }
 }
 
