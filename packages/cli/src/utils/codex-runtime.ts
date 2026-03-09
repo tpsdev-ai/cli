@@ -92,6 +92,8 @@ export interface AutoCommitConfig {
   prTitle?: string;
   /** Path to the GitHub PAT file; basename maps to gh-as agent handle */
   githubPat?: string;
+  /** Agent IDs to notify via tps mail after PR opens (e.g. ["sherlock"]) */
+  reviewNotify?: string[];
 }
 
 export interface CodexRuntimeConfig {
@@ -303,6 +305,9 @@ export interface AutoCommitOptions {
   ghAgent?: string;
   prTitle?: string;
   prBody?: string;
+  reviewNotify?: string[];
+  /** Mail directory for reviewer notifications (required for reviewNotify) */
+  mailDir?: string;
 }
 
 export interface AutoCommitDeps {
@@ -459,7 +464,22 @@ export async function runAutoCommit(
       const prStderr2 = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
       console.log(`[autoCommit] gh-as pr create exit=${prResult.status} stdout=${prStdout2.slice(0, 200)}`);
       if (prStderr2) console.log(`[autoCommit] gh-as stderr: ${prStderr2.slice(0, 200)}`);
-      if ((prResult.status ?? 1) === 0) return;
+      if ((prResult.status ?? 1) === 0) {
+        const prUrl = prStdout2.trim();
+        const prNumber = prUrl.match(/\/pull\/(\d+)/)?.[1] ?? "?";
+        if (options.reviewNotify?.length && options.mailDir) {
+          for (const reviewer of options.reviewNotify) {
+            try {
+              const { sendMessage } = await import("../utils/mail.js");
+              sendMessage(reviewer, `PR #${prNumber} for review: ${prUrl}`, authorName.toLowerCase());
+              console.log(`[autoCommit] Notified reviewer: ${reviewer} (PR #${prNumber})`);
+            } catch (notifyErr: any) {
+              console.warn(`[autoCommit] Failed to notify ${reviewer}: ${notifyErr.message}`);
+            }
+          }
+        }
+        return;
+      }
 
       const prStderr = prStderr2;
       const prStdout = prStdout2;
@@ -505,6 +525,7 @@ async function _runAutoCommitLegacy(
   flair: AutoCommitFlair,
   taskSubject?: string,
   taskBody?: string,
+  mailDir?: string,
 ): Promise<string | null> {
   const branchPrefix = cfg.branchPrefix ?? "task/";
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
@@ -533,6 +554,8 @@ async function _runAutoCommitLegacy(
         ghAgent,
         prTitle: cfg.prTitle ?? taskSubject ?? `task: ${taskId}`,
         prBody: taskBody,
+        reviewNotify: cfg.reviewNotify,
+        mailDir: mailDir,
       },
       { tpsCommand },
     );
@@ -637,7 +660,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody);
+        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, config.mailDir);
         if (branchRef && config.autoCommit.push) {
           try {
             await (flair as any).request("POST", "/OrgEvent", {
@@ -761,7 +784,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
           }
           const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body);
+          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, config.mailDir);
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
