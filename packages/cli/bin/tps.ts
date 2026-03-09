@@ -32,6 +32,7 @@ const cli = meow(
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
     skill <action>    Skill governance (list/register/scan/revoke/show)
     flair install|start|stop|restart|status|logs  Flair (Harper backend) launchd service
+    pulse start|status|list  Office process engine — PR review workflow daemon
 
   Options
     --help            Show this help text
@@ -994,6 +995,17 @@ async function main() {
       const tuiRepo = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(tuiRepoRaw) ? tuiRepoRaw : "tpsdev-ai/cli";
       if (tuiRepo !== tuiRepoRaw) console.warn(`[tui] Invalid --repo value ignored: ${tuiRepoRaw}`);
       render(React.createElement(TuiApp, { mailDir: tuiMailDir, agentId: tuiAgentId, repo: tuiRepo }));
+      break;
+    }
+
+    case "pulse": {
+      const { runPulse } = await import("../src/commands/pulse.js");
+      await runPulse({
+        action: (rest[0] as "start" | "status" | "list" | undefined) ?? "start",
+        dryRun: Boolean(cli.flags["dry-run"]),
+        interval: cli.flags.interval ? Number(cli.flags.interval) : undefined,
+        repo: cli.flags.repo as string | undefined,
+      });
       break;
     }
 

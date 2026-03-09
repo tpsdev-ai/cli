@@ -1,0 +1,512 @@
+/**
+ * tps pulse start|status|list
+ *
+ * Phase 1: PR review lifecycle poll loop.
+ * Polls GitHub for open PRs, tracks state transitions, sends TPS mail notifications.
+ */
+
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type PrState = "opened" | "reviewing" | "changes-requested" | "approved" | "merged";
+
+export interface HistoryEntry {
+  at: string;
+  from: PrState | null;
+  to: PrState;
+}
+
+export interface PrInstance {
+  state: PrState;
+  prNumber: number;
+  repo: string;
+  title: string;
+  author: string;
+  reviewers: string[];
+  lastTransitionAt: string;
+  reminderSentAt: string | null;
+  history: HistoryEntry[];
+}
+
+export interface PulseState {
+  version: 1;
+  lastPollAt: string;
+  instances: Record<string, PrInstance>;
+}
+
+export interface PulseConfig {
+  repos: string[];
+  reviewers: string[];
+  mergeAuthority: string;
+  author: string;
+  human: string;
+  pollIntervalMs: number;
+  remindAfterMs: number;
+  ghAgent: string;
+}
+
+// Injectable runner type for testing
+export type SyncRunner = (cmd: string, args: string[], opts?: { encoding?: BufferEncoding; timeout?: number; env?: NodeJS.ProcessEnv }) => SpawnSyncReturns<string>;
+
+// Injectable mail sender for testing
+export type MailSender = (to: string, body: string, agentId: string) => void;
+
+// ---------------------------------------------------------------------------
+// Defaults
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CONFIG: PulseConfig = {
+  repos: ["tpsdev-ai/cli", "tpsdev-ai/flair"],
+  reviewers: ["sherlock", "kern"],
+  mergeAuthority: "flint",
+  author: "anvil",
+  human: "nathan",
+  pollIntervalMs: 120000,
+  remindAfterMs: 1800000,
+  ghAgent: "flint",
+};
+
+const PULSE_DIR = join(homedir(), ".tps", "pulse");
+const CONFIG_PATH = join(PULSE_DIR, "config.json");
+const STATE_PATH = join(PULSE_DIR, "state.json");
+
+// ---------------------------------------------------------------------------
+// Config & State I/O
+// ---------------------------------------------------------------------------
+
+export function loadConfig(): PulseConfig {
+  if (existsSync(CONFIG_PATH)) {
+    try {
+      const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      return { ...DEFAULT_CONFIG, ...raw };
+    } catch (e: unknown) {
+      console.warn(`[pulse] Failed to parse config: ${(e as Error).message}, using defaults`);
+    }
+  }
+  return { ...DEFAULT_CONFIG };
+}
+
+export function loadState(): PulseState {
+  if (existsSync(STATE_PATH)) {
+    try {
+      return JSON.parse(readFileSync(STATE_PATH, "utf-8")) as PulseState;
+    } catch (e: unknown) {
+      console.warn(`[pulse] Failed to parse state: ${(e as Error).message}, starting fresh`);
+    }
+  }
+  return { version: 1, lastPollAt: "", instances: {} };
+}
+
+export function saveState(state: PulseState): void {
+  mkdirSync(PULSE_DIR, { recursive: true });
+  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+}
+
+// ---------------------------------------------------------------------------
+// GitHub API
+// ---------------------------------------------------------------------------
+
+export function ghApi(endpoint: string, ghAgent: string, runner: SyncRunner = spawnSync as unknown as SyncRunner): unknown {
+  const r = runner("gh-as", [ghAgent, "api", endpoint], { encoding: "utf-8", timeout: 10000 });
+  if (r.status !== 0) throw new Error(r.stderr || "gh api failed");
+  return JSON.parse(r.stdout);
+}
+
+// ---------------------------------------------------------------------------
+// Mail
+// ---------------------------------------------------------------------------
+
+export function defaultMailSender(to: string, body: string, agentId: string): void {
+  spawnSync("tps", ["mail", "send", to, body], {
+    encoding: "utf-8",
+    env: { ...process.env, TPS_AGENT_ID: agentId },
+  });
+}
+
+function sendMail(to: string, body: string, config: PulseConfig, sender: MailSender): void {
+  console.log(`[pulse] mail → ${to}: ${body.slice(0, 80)}…`);
+  sender(to, body, config.ghAgent);
+}
+
+// ---------------------------------------------------------------------------
+// PR State Computation
+// ---------------------------------------------------------------------------
+
+interface GhReview {
+  state: string;
+  user?: { login?: string };
+}
+
+interface GhPr {
+  number: number;
+  title: string;
+  state: string;
+  merged_at: string | null;
+  user?: { login?: string };
+  requested_reviewers?: Array<{ login?: string }>;
+}
+
+export function computePrState(pr: GhPr, reviews: GhReview[]): PrState {
+  if (pr.merged_at || pr.state === "closed") return "merged";
+
+  // Deduplicate reviews: keep last review per user
+  const latestByUser = new Map<string, string>();
+  for (const r of reviews) {
+    const user = r.user?.login ?? "unknown";
+    latestByUser.set(user, r.state);
+  }
+
+  if (reviews.length === 0) return "opened";
+
+  const states = [...latestByUser.values()];
+  if (states.some((s) => s === "CHANGES_REQUESTED")) return "changes-requested";
+  if (states.every((s) => s === "APPROVED") && states.length > 0) return "approved";
+
+  return "reviewing";
+}
+
+// ---------------------------------------------------------------------------
+// Transition Handling
+// ---------------------------------------------------------------------------
+
+export function handleTransition(
+  key: string,
+  instance: PrInstance,
+  newState: PrState,
+  config: PulseConfig,
+  sender: MailSender,
+): void {
+  const oldState = instance.state;
+  if (oldState === newState) return;
+
+  const now = new Date().toISOString();
+  instance.history.push({ at: now, from: oldState, to: newState });
+  instance.state = newState;
+  instance.lastTransitionAt = now;
+  instance.reminderSentAt = null;
+
+  console.log(`[pulse] ${key}: ${oldState} → ${newState}`);
+
+  // Determine mail targets based on transition
+  switch (newState) {
+    case "opened": {
+      for (const reviewer of config.reviewers) {
+        sendMail(
+          reviewer,
+          `New PR #${instance.prNumber}: ${instance.title}. Review with: gh-as ${reviewer} pr diff ${instance.prNumber} --repo ${instance.repo}`,
+          config,
+          sender,
+        );
+      }
+      break;
+    }
+    case "changes-requested": {
+      sendMail(
+        config.author,
+        `Changes requested on PR #${instance.prNumber} (${instance.repo}): ${instance.title}`,
+        config,
+        sender,
+      );
+      break;
+    }
+    case "reviewing": {
+      // Only mail if coming from changes-requested (re-review needed)
+      if (oldState === "changes-requested") {
+        for (const reviewer of config.reviewers) {
+          sendMail(
+            reviewer,
+            `PR #${instance.prNumber} updated, please re-review: ${instance.title} (${instance.repo})`,
+            config,
+            sender,
+          );
+        }
+      }
+      break;
+    }
+    case "approved": {
+      sendMail(
+        config.mergeAuthority,
+        `PR #${instance.prNumber} is merge-ready: ${instance.title} (${instance.repo})`,
+        config,
+        sender,
+      );
+      break;
+    }
+    case "merged": {
+      sendMail(
+        config.author,
+        `PR #${instance.prNumber} merged: ${instance.title} (${instance.repo})`,
+        config,
+        sender,
+      );
+      break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Timer / Reminder Checks
+// ---------------------------------------------------------------------------
+
+export function checkReminders(
+  state: PulseState,
+  config: PulseConfig,
+  sender: MailSender,
+  now: Date = new Date(),
+): void {
+  for (const [key, instance] of Object.entries(state.instances)) {
+    if (instance.state === "merged") continue;
+
+    const elapsed = now.getTime() - new Date(instance.lastTransitionAt).getTime();
+    if (elapsed < config.remindAfterMs) continue;
+
+    // Already sent a reminder for this period
+    if (instance.reminderSentAt) {
+      const sinceLast = now.getTime() - new Date(instance.reminderSentAt).getTime();
+      if (sinceLast < config.remindAfterMs) continue;
+    }
+
+    if (instance.state === "reviewing") {
+      for (const reviewer of config.reviewers) {
+        sendMail(
+          reviewer,
+          `Reminder: PR #${instance.prNumber} (${instance.repo}) awaiting review for >30min: ${instance.title}`,
+          config,
+          sender,
+        );
+      }
+      instance.reminderSentAt = now.toISOString();
+      console.log(`[pulse] ${key}: sent review reminder`);
+    } else if (instance.state === "approved") {
+      sendMail(
+        config.mergeAuthority,
+        `Reminder: PR #${instance.prNumber} (${instance.repo}) is merge-ready for >30min: ${instance.title}`,
+        config,
+        sender,
+      );
+      instance.reminderSentAt = now.toISOString();
+      console.log(`[pulse] ${key}: sent merge reminder`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Single Poll Cycle
+// ---------------------------------------------------------------------------
+
+export function pollOnce(
+  config: PulseConfig,
+  state: PulseState,
+  runner: SyncRunner = spawnSync as unknown as SyncRunner,
+  sender: MailSender = defaultMailSender,
+): void {
+  const now = new Date().toISOString();
+
+  for (const repo of config.repos) {
+    let prs: GhPr[];
+    try {
+      prs = ghApi(`repos/${repo}/pulls?state=open&sort=updated`, config.ghAgent, runner) as GhPr[];
+    } catch (e: unknown) {
+      console.warn(`[pulse] Failed to fetch PRs for ${repo}: ${(e as Error).message}`);
+      continue;
+    }
+
+    // Also check recently merged/closed PRs we're tracking
+    const trackedInRepo = Object.entries(state.instances).filter(
+      ([, inst]) => inst.repo === repo && inst.state !== "merged",
+    );
+
+    for (const pr of prs) {
+      const key = `pr:${repo}#${pr.number}`;
+      let reviews: GhReview[];
+      try {
+        reviews = ghApi(`repos/${repo}/pulls/${pr.number}/reviews`, config.ghAgent, runner) as GhReview[];
+      } catch (e: unknown) {
+        console.warn(`[pulse] Failed to fetch reviews for ${key}: ${(e as Error).message}`);
+        continue;
+      }
+
+      const computed = computePrState(pr, reviews);
+      const existing = state.instances[key];
+
+      if (!existing) {
+        // New PR — create instance and handle transition from null
+        const instance: PrInstance = {
+          state: "opened" as PrState,
+          prNumber: pr.number,
+          repo,
+          title: pr.title,
+          author: pr.user?.login ?? "unknown",
+          reviewers: (pr.requested_reviewers ?? []).map((r) => r.login ?? "unknown"),
+          lastTransitionAt: now,
+          reminderSentAt: null,
+          history: [{ at: now, from: null, to: "opened" }],
+        };
+        state.instances[key] = instance;
+        console.log(`[pulse] ${key}: new PR tracked (${computed})`);
+
+        // Notify reviewers for new PR
+        for (const reviewer of config.reviewers) {
+          sendMail(
+            reviewer,
+            `New PR #${pr.number}: ${pr.title}. Review with: gh-as ${reviewer} pr diff ${pr.number} --repo ${repo}`,
+            config,
+            sender,
+          );
+        }
+
+        // If PR already has reviews, advance state
+        if (computed !== "opened") {
+          handleTransition(key, instance, computed, config, sender);
+        }
+      } else {
+        // Existing PR — check for state change
+        existing.title = pr.title;
+        handleTransition(key, existing, computed, config, sender);
+      }
+    }
+
+    // Check tracked PRs that might have been merged/closed (not in open list)
+    const openNumbers = new Set(prs.map((p) => p.number));
+    for (const [key, inst] of trackedInRepo) {
+      if (openNumbers.has(inst.prNumber)) continue;
+      // PR is no longer open — check if merged
+      try {
+        const prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, config.ghAgent, runner) as GhPr;
+        if (prData.merged_at) {
+          handleTransition(key, inst, "merged", config, sender);
+        }
+      } catch (e: unknown) {
+        console.warn(`[pulse] Failed to check closed PR ${key}: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  // Check timers
+  checkReminders(state, config, sender);
+
+  state.lastPollAt = now;
+}
+
+// ---------------------------------------------------------------------------
+// Poll Loop (foreground)
+// ---------------------------------------------------------------------------
+
+export async function startPollLoop(
+  config: PulseConfig,
+  state: PulseState,
+  opts: { dryRun?: boolean; runner?: SyncRunner; sender?: MailSender } = {},
+): Promise<void> {
+  const runner = opts.runner ?? (spawnSync as unknown as SyncRunner);
+  const sender = opts.dryRun
+    ? (to: string, body: string, _agentId: string) => {
+        console.log(`[pulse/dry-run] would mail ${to}: ${body.slice(0, 80)}…`);
+      }
+    : (opts.sender ?? defaultMailSender);
+
+  console.log(`[pulse] Starting poll loop (interval=${config.pollIntervalMs}ms, repos=${config.repos.join(", ")})`);
+
+  const poll = () => {
+    try {
+      pollOnce(config, state, runner, sender);
+      saveState(state);
+    } catch (e: unknown) {
+      console.error(`[pulse] Poll error: ${(e as Error).message}`);
+    }
+  };
+
+  // First poll immediately
+  poll();
+
+  // Then on interval
+  const handle = setInterval(poll, config.pollIntervalMs);
+
+  // Graceful shutdown
+  await new Promise<void>((resolve) => {
+    const stop = () => {
+      clearInterval(handle);
+      saveState(state);
+      console.log("[pulse] Stopped.");
+      resolve();
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Subcommands
+// ---------------------------------------------------------------------------
+
+function printStatus(): void {
+  const state = loadState();
+  if (!state.lastPollAt) {
+    console.log("Pulse has not run yet.");
+    return;
+  }
+  const active = Object.values(state.instances).filter((i) => i.state !== "merged");
+  console.log(`Last poll: ${state.lastPollAt}`);
+  console.log(`Active PRs: ${active.length}`);
+  for (const inst of active) {
+    console.log(`  PR #${inst.prNumber} (${inst.repo}): ${inst.state} since ${inst.lastTransitionAt}`);
+  }
+}
+
+function printList(): void {
+  const state = loadState();
+  const entries = Object.entries(state.instances);
+  if (entries.length === 0) {
+    console.log("No tracked PR instances.");
+    return;
+  }
+  for (const [key, inst] of entries) {
+    const transitions = inst.history.length;
+    console.log(`  ${key}: ${inst.state} (${transitions} transitions) — ${inst.title}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Command Entry Point
+// ---------------------------------------------------------------------------
+
+export interface PulseArgs {
+  action: string;
+  repo?: string;
+  interval?: number;
+  dryRun?: boolean;
+}
+
+export async function runPulse(args: PulseArgs): Promise<void> {
+  switch (args.action) {
+    case "start": {
+      const config = loadConfig();
+      if (args.repo) {
+        config.repos = [args.repo];
+      }
+      if (args.interval) {
+        config.pollIntervalMs = args.interval * 1000;
+      }
+      const state = loadState();
+      await startPollLoop(config, state, { dryRun: args.dryRun });
+      break;
+    }
+    case "status": {
+      printStatus();
+      break;
+    }
+    case "list": {
+      printList();
+      break;
+    }
+    default: {
+      console.error("Usage:\n  tps pulse start [--repo <repo>] [--interval <seconds>] [--dry-run]\n  tps pulse status\n  tps pulse list");
+      process.exit(1);
+    }
+  }
+}
