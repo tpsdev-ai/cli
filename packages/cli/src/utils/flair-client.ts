@@ -301,7 +301,7 @@ export class FlairClient {
   async search(query: string, limit = 5): Promise<SearchResult[]> {
     const result = await this.request<{ results: SearchResult[] }>(
       "POST",
-      "/FindMemories",
+      "/MemoryQuery",
       { agentId: this.agentId, q: query, limit },
     );
     return result.results ?? [];
