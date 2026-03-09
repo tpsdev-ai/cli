@@ -894,8 +894,18 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   const diff = runGit(["diff", "--cached", "--quiet"], repoPath);
   if (diff.status === 0) {
     // Nothing staged — check if HEAD is already ahead of origin (agent self-committed)
-    const ahead = runGit(["rev-list", "--count", `origin/${branchName!}..HEAD`], repoPath);
-    const aheadCount = parseInt((ahead.stdout ?? "").trim(), 10);
+    // Note: origin/<branch> may not exist yet if this is the first push.
+    const refExists = runGit(["rev-parse", "--verify", `refs/remotes/origin/${branchName!}`], repoPath).ok;
+    let aheadCount = 0;
+    if (refExists) {
+      const ahead = runGit(["rev-list", "--count", `origin/${branchName!}..HEAD`], repoPath);
+      aheadCount = parseInt((ahead.stdout ?? "").trim(), 10);
+    } else {
+      // Branch not yet pushed — count local commits; any commit means already committed
+      const localCommits = runGit(["rev-list", "--count", "HEAD"], repoPath);
+      const localCount = parseInt((localCommits.stdout ?? "").trim(), 10);
+      aheadCount = Number.isNaN(localCount) ? 0 : localCount;
+    }
     if (Number.isNaN(aheadCount) || aheadCount === 0) {
       failWith("No changes staged for commit.");
     }
