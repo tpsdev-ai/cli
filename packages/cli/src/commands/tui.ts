@@ -2,7 +2,7 @@
  * tui.ts — TPS Terminal UI (Phase 2: interactive)
  * ops-90 Phase 2: mail compose, PR actions
  */
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -81,10 +81,10 @@ function runCmd(cmd: string, args: string[]): string {
 function fetchAgents(): AgentStatus[] {
   try {
     const tpsBin = join(homedir(), "ops", "tps", "packages", "cli", "bin", "tps.ts");
-    const out = execSync(`bun ${tpsBin} office status --json 2>/dev/null`, {
+    const out = spawnSync("bun", [tpsBin, "office", "status", "--json"], {
       encoding: "utf-8",
       timeout: 5000,
-    }).trim();
+    }).stdout?.trim() ?? "";
     if (out) {
       const data = JSON.parse(out) as { agents?: AgentStatus[] };
       if (Array.isArray(data.agents)) return data.agents;
@@ -103,10 +103,11 @@ function fetchAgents(): AgentStatus[] {
 function fetchMail(_mailDir: string, agentId: string): MailMessage[] {
   try {
     const tpsBin = join(homedir(), "ops", "tps", "packages", "cli", "bin", "tps.ts");
-    const out = execSync(
-      `TPS_AGENT_ID=${agentId} bun ${tpsBin} mail list --agent ${agentId} --json --limit 15 2>/dev/null`,
-      { encoding: "utf-8", timeout: 5000 },
-    ).trim();
+    const out = spawnSync("bun", [tpsBin, "mail", "list", "--agent", agentId, "--json", "--limit", "15"], {
+      encoding: "utf-8",
+      timeout: 5000,
+      env: { ...process.env, TPS_AGENT_ID: agentId },
+    }).stdout?.trim() ?? "";
     if (!out) return [];
     return JSON.parse(out) as MailMessage[];
   } catch {
@@ -151,13 +152,18 @@ function fetchTasks(): string[] {
 
 // ── Actions ────────────────────────────────────────────────────────────────────
 
+const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
+
 function sendMailAction(agentId: string, to: string, body: string): { ok: boolean; err?: string } {
+  if (!AGENT_NAME_RE.test(to)) return { ok: false, err: `invalid recipient: ${to}` };
   try {
     const tpsBin = join(homedir(), "ops", "tps", "packages", "cli", "bin", "tps.ts");
-    execSync(
-      `TPS_AGENT_ID=${agentId} bun ${tpsBin} mail send ${to} ${JSON.stringify(body)} 2>&1`,
-      { encoding: "utf-8", timeout: 8000 },
-    );
+    const r = spawnSync("bun", [tpsBin, "mail", "send", to, body], {
+      encoding: "utf-8",
+      timeout: 8000,
+      env: { ...process.env, TPS_AGENT_ID: agentId },
+    });
+    if (r.status !== 0) return { ok: false, err: (r.stderr || r.stdout || "send failed").slice(0, 80) };
     return { ok: true };
   } catch (e: unknown) {
     return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "send failed" };
@@ -165,11 +171,14 @@ function sendMailAction(agentId: string, to: string, body: string): { ok: boolea
 }
 
 function approvePRAction(repo: string, prNumber: number): { ok: boolean; err?: string } {
+  if (!REPO_RE.test(repo)) return { ok: false, err: `invalid repo: ${repo}` };
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return { ok: false, err: `invalid PR number: ${prNumber}` };
   try {
-    execSync(
-      `gh-as flint pr review ${prNumber} --repo ${repo} --approve 2>&1`,
-      { encoding: "utf-8", timeout: 15000 },
-    );
+    const r = spawnSync("gh-as", ["flint", "pr", "review", String(prNumber), "--repo", repo, "--approve"], {
+      encoding: "utf-8",
+      timeout: 15000,
+    });
+    if (r.status !== 0) return { ok: false, err: (r.stderr || r.stdout || "approve failed").slice(0, 80) };
     return { ok: true };
   } catch (e: unknown) {
     return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "approve failed" };
@@ -177,11 +186,14 @@ function approvePRAction(repo: string, prNumber: number): { ok: boolean; err?: s
 }
 
 function mergePRAction(repo: string, prNumber: number): { ok: boolean; err?: string } {
+  if (!REPO_RE.test(repo)) return { ok: false, err: `invalid repo: ${repo}` };
+  if (!Number.isInteger(prNumber) || prNumber <= 0) return { ok: false, err: `invalid PR number: ${prNumber}` };
   try {
-    execSync(
-      `gh-as flint pr merge ${prNumber} --repo ${repo} --squash --delete-branch 2>&1`,
-      { encoding: "utf-8", timeout: 20000 },
-    );
+    const r = spawnSync("gh-as", ["flint", "pr", "merge", String(prNumber), "--repo", repo, "--squash", "--delete-branch"], {
+      encoding: "utf-8",
+      timeout: 20000,
+    });
+    if (r.status !== 0) return { ok: false, err: (r.stderr || r.stdout || "merge failed").slice(0, 80) };
     return { ok: true };
   } catch (e: unknown) {
     return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "merge failed" };
