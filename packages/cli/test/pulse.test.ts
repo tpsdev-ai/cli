@@ -1,0 +1,359 @@
+import { describe, expect, test } from "bun:test";
+import {
+  computePrState,
+  handleTransition,
+  checkReminders,
+  pollOnce,
+  type PrInstance,
+  type PrState,
+  type PulseConfig,
+  type PulseState,
+  type SyncRunner,
+  type MailSender,
+} from "../src/commands/pulse.js";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeConfig(overrides: Partial<PulseConfig> = {}): PulseConfig {
+  return {
+    repos: ["tpsdev-ai/cli"],
+    reviewers: ["sherlock", "kern"],
+    mergeAuthority: "flint",
+    author: "anvil",
+    human: "nathan",
+    pollIntervalMs: 120000,
+    remindAfterMs: 1800000,
+    ghAgent: "flint",
+    ...overrides,
+  };
+}
+
+function makeInstance(overrides: Partial<PrInstance> = {}): PrInstance {
+  return {
+    state: "opened",
+    prNumber: 42,
+    repo: "tpsdev-ai/cli",
+    title: "Test PR",
+    author: "tps-anvil",
+    reviewers: ["tps-sherlock", "tps-kern"],
+    lastTransitionAt: new Date().toISOString(),
+    reminderSentAt: null,
+    history: [{ at: new Date().toISOString(), from: null, to: "opened" }],
+    ...overrides,
+  };
+}
+
+function makeState(instances: Record<string, PrInstance> = {}): PulseState {
+  return { version: 1, lastPollAt: new Date().toISOString(), instances };
+}
+
+interface MailCall {
+  to: string;
+  body: string;
+  agentId: string;
+}
+
+function trackMails(): { calls: MailCall[]; sender: MailSender } {
+  const calls: MailCall[] = [];
+  const sender: MailSender = (to, body, agentId) => {
+    calls.push({ to, body, agentId });
+  };
+  return { calls, sender };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe("computePrState", () => {
+  test("returns opened when no reviews exist", () => {
+    const pr = { number: 1, title: "t", state: "open", merged_at: null };
+    expect(computePrState(pr, [])).toBe("opened");
+  });
+
+  test("returns merged when PR has merged_at", () => {
+    const pr = { number: 1, title: "t", state: "closed", merged_at: "2026-01-01T00:00:00Z" };
+    expect(computePrState(pr, [])).toBe("merged");
+  });
+
+  test("returns approved when all reviews are APPROVED", () => {
+    const pr = { number: 1, title: "t", state: "open", merged_at: null };
+    const reviews = [
+      { state: "APPROVED", user: { login: "sherlock" } },
+      { state: "APPROVED", user: { login: "kern" } },
+    ];
+    expect(computePrState(pr, reviews)).toBe("approved");
+  });
+
+  test("returns changes-requested when any review is CHANGES_REQUESTED", () => {
+    const pr = { number: 1, title: "t", state: "open", merged_at: null };
+    const reviews = [
+      { state: "APPROVED", user: { login: "sherlock" } },
+      { state: "CHANGES_REQUESTED", user: { login: "kern" } },
+    ];
+    expect(computePrState(pr, reviews)).toBe("changes-requested");
+  });
+
+  test("returns reviewing for COMMENTED reviews", () => {
+    const pr = { number: 1, title: "t", state: "open", merged_at: null };
+    const reviews = [{ state: "COMMENTED", user: { login: "sherlock" } }];
+    expect(computePrState(pr, reviews)).toBe("reviewing");
+  });
+});
+
+describe("handleTransition", () => {
+  test("null → opened sends mail to reviewers", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    // Simulate new PR: create instance at "opened" then transition to "opened" is no-op,
+    // so we test the initial transition by going from a fresh instance with state set externally
+    const instance = makeInstance({ state: "opened" as PrState });
+
+    // handleTransition is for state *changes* — test opened → approved instead
+    // For null → opened, the pollOnce function sends mails directly.
+    // Let's test opened → approved:
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("flint");
+    expect(calls[0].body).toContain("merge-ready");
+    expect(instance.state).toBe("approved");
+    expect(instance.history.length).toBe(2);
+  });
+
+  test("reviewing → changes-requested sends mail to author", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "reviewing" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "changes-requested", config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("anvil");
+    expect(calls[0].body).toContain("Changes requested");
+  });
+
+  test("changes-requested → reviewing sends mail to reviewers for re-review", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "changes-requested" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "reviewing", config, sender);
+
+    expect(calls.length).toBe(2);
+    expect(calls[0].to).toBe("sherlock");
+    expect(calls[1].to).toBe("kern");
+    expect(calls[0].body).toContain("re-review");
+  });
+
+  test("any → merged sends mail to author", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "approved" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "merged", config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("anvil");
+    expect(calls[0].body).toContain("merged");
+  });
+
+  test("same state does not send mail", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "reviewing" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "reviewing", config, sender);
+
+    expect(calls.length).toBe(0);
+  });
+});
+
+describe("checkReminders", () => {
+  test("sends reminder when reviewing >30min", () => {
+    const config = makeConfig({ remindAfterMs: 1800000 });
+    const { calls, sender } = trackMails();
+    const thirtyFiveMinAgo = new Date(Date.now() - 35 * 60 * 1000).toISOString();
+    const instance = makeInstance({
+      state: "reviewing",
+      lastTransitionAt: thirtyFiveMinAgo,
+      reminderSentAt: null,
+    });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
+
+    checkReminders(state, config, sender);
+
+    expect(calls.length).toBe(2); // sherlock + kern
+    expect(calls[0].body).toContain("Reminder");
+    expect(calls[0].body).toContain("awaiting review");
+    expect(instance.reminderSentAt).not.toBeNull();
+  });
+
+  test("sends reminder when approved >30min to merge authority", () => {
+    const config = makeConfig({ remindAfterMs: 1800000 });
+    const { calls, sender } = trackMails();
+    const fortyMinAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    const instance = makeInstance({
+      state: "approved",
+      lastTransitionAt: fortyMinAgo,
+      reminderSentAt: null,
+    });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
+
+    checkReminders(state, config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("flint");
+    expect(calls[0].body).toContain("merge-ready");
+  });
+
+  test("does not re-send reminder within window", () => {
+    const config = makeConfig({ remindAfterMs: 1800000 });
+    const { calls, sender } = trackMails();
+    const fortyMinAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const instance = makeInstance({
+      state: "reviewing",
+      lastTransitionAt: fortyMinAgo,
+      reminderSentAt: fiveMinAgo,
+    });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
+
+    checkReminders(state, config, sender);
+
+    expect(calls.length).toBe(0);
+  });
+
+  test("does not send reminder for merged PRs", () => {
+    const config = makeConfig({ remindAfterMs: 1800000 });
+    const { calls, sender } = trackMails();
+    const longAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const instance = makeInstance({
+      state: "merged",
+      lastTransitionAt: longAgo,
+      reminderSentAt: null,
+    });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
+
+    checkReminders(state, config, sender);
+
+    expect(calls.length).toBe(0);
+  });
+});
+
+describe("pollOnce", () => {
+  test("new PR triggers opened mail to reviewers", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const state = makeState();
+
+    const runner: SyncRunner = (cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "Add feature", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    pollOnce(config, state, runner, sender);
+
+    // Should have created instance and sent mail to reviewers
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeDefined();
+    expect(state.instances["pr:tpsdev-ai/cli#10"].state).toBe("opened");
+    expect(calls.length).toBe(2);
+    expect(calls[0].to).toBe("sherlock");
+    expect(calls[1].to).toBe("kern");
+    expect(calls[0].body).toContain("New PR #10");
+  });
+
+  test("existing PR with new approval triggers approved mail", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({
+      state: "reviewing",
+      prNumber: 10,
+      repo: "tpsdev-ai/cli",
+      title: "Add feature",
+    });
+    const state = makeState({ "pr:tpsdev-ai/cli#10": instance });
+
+    const runner: SyncRunner = (cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "Add feature", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { state: "APPROVED", user: { login: "sherlock" } },
+            { state: "APPROVED", user: { login: "kern" } },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    pollOnce(config, state, runner, sender);
+
+    expect(instance.state).toBe("approved");
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("flint");
+    expect(calls[0].body).toContain("merge-ready");
+  });
+
+  test("gh api failure for one PR does not stop others", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const state = makeState();
+
+    let reviewCallCount = 0;
+    const runner: SyncRunner = (cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "PR A", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+            { number: 11, title: "PR B", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        reviewCallCount++;
+        if (reviewCallCount === 1) {
+          // First PR reviews fail
+          return { status: 1, stdout: "", stderr: "API error" } as ReturnType<SyncRunner>;
+        }
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    pollOnce(config, state, runner, sender);
+
+    // PR #10 failed, but PR #11 should still be tracked
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeUndefined();
+    expect(state.instances["pr:tpsdev-ai/cli#11"]).toBeDefined();
+    expect(calls.length).toBe(2); // mail for PR #11 to both reviewers
+  });
+});
