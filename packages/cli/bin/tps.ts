@@ -942,16 +942,27 @@ async function main() {
 
     case "flair": {
       const action = rest[0];
-      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs"].includes(action)) {
+      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health"].includes(action)) {
         console.error(
           "Usage:\n" +
           "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
           "  tps flair uninstall\n" +
           "  tps flair start|stop|restart\n" +
           "  tps flair status\n" +
-          "  tps flair logs"
+          "  tps flair logs\n" +
+          "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]"
         );
         process.exit(1);
+      }
+      if (action === "health") {
+        const { runFlairHealth } = await import("../src/commands/flair-health.js");
+        await runFlairHealth({
+          agentId: (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined),
+          flairUrl: cli.flags["flair-url"] as string | undefined,
+          flairKeyPath: cli.flags["flair-key"] as string | undefined,
+          verbose: Boolean(cli.flags.verbose),
+        });
+        break;
       }
       const { flairCommand } = await import("../src/commands/flair.js");
       await flairCommand(action, {
