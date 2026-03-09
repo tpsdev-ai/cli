@@ -4,12 +4,14 @@ import {
   handleTransition,
   checkReminders,
   pollOnce,
+  pruneState,
   type PrInstance,
   type PrState,
   type PulseConfig,
   type PulseState,
   type SyncRunner,
   type MailSender,
+  type FlairPublisher,
 } from "../src/commands/pulse.js";
 
 // ---------------------------------------------------------------------------
@@ -355,5 +357,147 @@ describe("pollOnce", () => {
     expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeUndefined();
     expect(state.instances["pr:tpsdev-ai/cli#11"]).toBeDefined();
     expect(calls.length).toBe(2); // mail for PR #11 to both reviewers
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pruneState
+// ---------------------------------------------------------------------------
+
+describe("pruneState", () => {
+  function makeTerminalInstance(state: PrState, daysOld: number): PrInstance {
+    const ts = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000).toISOString();
+    return {
+      key: `pr:tpsdev-ai/cli#99`,
+      repo: "tpsdev-ai/cli",
+      prNumber: 99,
+      title: "Old PR",
+      state,
+      openedAt: ts,
+      lastTransitionAt: ts,
+      reminderSentAt: null,
+      history: [],
+    };
+  }
+
+  test("removes merged instances older than pruneAfterDays", () => {
+    const state: PulseState = {
+      version: 1,
+      lastPollAt: "",
+      instances: {
+        "pr:tpsdev-ai/cli#1": makeTerminalInstance("merged", 8),
+        "pr:tpsdev-ai/cli#2": makeTerminalInstance("merged", 3),
+      },
+    };
+    const pruned = pruneState(state, 7);
+    expect(pruned).toBe(1);
+    expect(state.instances["pr:tpsdev-ai/cli#1"]).toBeUndefined();
+    expect(state.instances["pr:tpsdev-ai/cli#2"]).toBeDefined();
+  });
+
+  test("keeps non-terminal instances regardless of age", () => {
+    const state: PulseState = {
+      version: 1,
+      lastPollAt: "",
+      instances: {
+        "pr:tpsdev-ai/cli#10": makeTerminalInstance("reviewing" as PrState, 30),
+      },
+    };
+    const pruned = pruneState(state, 7);
+    expect(pruned).toBe(0);
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeDefined();
+  });
+
+  test("returns 0 when nothing to prune", () => {
+    const state: PulseState = { version: 1, lastPollAt: "", instances: {} };
+    expect(pruneState(state, 7)).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Flair publisher (handleTransition integration)
+// ---------------------------------------------------------------------------
+
+describe("FlairPublisher integration", () => {
+  test("publisher is called on transition", async () => {
+    const calls: Array<{ key: string; from: PrState | null; to: PrState }> = [];
+    const publisher: FlairPublisher = async (key, from, to) => {
+      calls.push({ key, from, to });
+    };
+
+    const instance: PrInstance = {
+      key: "pr:tpsdev-ai/cli#42",
+      repo: "tpsdev-ai/cli",
+      prNumber: 42,
+      title: "Test PR",
+      state: "reviewing",
+      openedAt: new Date().toISOString(),
+      lastTransitionAt: new Date().toISOString(),
+      reminderSentAt: null,
+      history: [],
+    };
+    const config = makeConfig();
+    const mailCalls: string[] = [];
+    const sender: MailSender = (to) => { mailCalls.push(to); };
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender, publisher);
+
+    // Give microtask queue a tick
+    await Promise.resolve();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].from).toBe("reviewing");
+    expect(calls[0].to).toBe("approved");
+  });
+
+  test("publisher errors are swallowed (non-fatal)", async () => {
+    const publisher: FlairPublisher = async () => {
+      throw new Error("Flair unavailable");
+    };
+
+    const instance: PrInstance = {
+      key: "pr:tpsdev-ai/cli#1",
+      repo: "tpsdev-ai/cli",
+      prNumber: 1,
+      title: "T",
+      state: "reviewing",
+      openedAt: new Date().toISOString(),
+      lastTransitionAt: new Date().toISOString(),
+      reminderSentAt: null,
+      history: [],
+    };
+    const config = makeConfig();
+    const sender: MailSender = () => {};
+
+    // Should not throw
+    expect(() => {
+      handleTransition("pr:tpsdev-ai/cli#1", instance, "approved", config, sender, publisher);
+    }).not.toThrow();
+
+    // Give microtask queue a tick — error is caught internally
+    await Promise.resolve();
+  });
+
+  test("publisher is not called when state unchanged", async () => {
+    const calls: string[] = [];
+    const publisher: FlairPublisher = async (_, _from, to) => { calls.push(to); };
+
+    const instance: PrInstance = {
+      key: "pr:tpsdev-ai/cli#5",
+      repo: "tpsdev-ai/cli",
+      prNumber: 5,
+      title: "T",
+      state: "approved",
+      openedAt: new Date().toISOString(),
+      lastTransitionAt: new Date().toISOString(),
+      reminderSentAt: null,
+      history: [],
+    };
+    const config = makeConfig();
+    const sender: MailSender = () => {};
+
+    handleTransition("pr:tpsdev-ai/cli#5", instance, "approved", config, sender, publisher);
+    await Promise.resolve();
+    expect(calls).toHaveLength(0);
   });
 });
