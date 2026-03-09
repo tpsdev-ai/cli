@@ -9,6 +9,7 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { createFlairClient } from "../utils/flair-client.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +50,10 @@ export interface PulseConfig {
   pollIntervalMs: number;
   remindAfterMs: number;
   ghAgent: string;
+  pruneAfterDays: number;
+  flairUrl?: string;
+  flairAgentId?: string;
+  flairAgentKey?: string;
 }
 
 // Injectable runner type for testing
@@ -56,6 +61,14 @@ export type SyncRunner = (cmd: string, args: string[], opts?: { encoding?: Buffe
 
 // Injectable mail sender for testing
 export type MailSender = (to: string, body: string, agentId: string) => void;
+
+// Injectable Flair publisher for testing (null = disabled)
+export type FlairPublisher = (
+  key: string,
+  from: PrState | null,
+  to: PrState,
+  instance: PrInstance,
+) => Promise<void>;
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -70,6 +83,7 @@ const DEFAULT_CONFIG: PulseConfig = {
   pollIntervalMs: 120000,
   remindAfterMs: 1800000,
   ghAgent: "flint",
+  pruneAfterDays: 7,
 };
 
 const PULSE_DIR = join(homedir(), ".tps", "pulse");
@@ -106,6 +120,27 @@ export function loadState(): PulseState {
 export function saveState(state: PulseState): void {
   mkdirSync(PULSE_DIR, { recursive: true });
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+}
+
+/**
+ * Remove terminal instances (merged/closed) older than pruneAfterDays.
+ * Returns the number of instances pruned.
+ */
+export function pruneState(state: PulseState, pruneAfterDays: number): number {
+  const cutoff = Date.now() - pruneAfterDays * 24 * 60 * 60 * 1000;
+  const terminalStates = new Set<string>(["merged", "closed"]);
+  let pruned = 0;
+  for (const key of Object.keys(state.instances)) {
+    const inst = state.instances[key];
+    if (
+      terminalStates.has(inst.state) &&
+      new Date(inst.lastTransitionAt).getTime() < cutoff
+    ) {
+      delete state.instances[key];
+      pruned++;
+    }
+  }
+  return pruned;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +216,7 @@ export function handleTransition(
   newState: PrState,
   config: PulseConfig,
   sender: MailSender,
+  publisher?: FlairPublisher,
 ): void {
   const oldState = instance.state;
   if (oldState === newState) return;
@@ -192,6 +228,13 @@ export function handleTransition(
   instance.reminderSentAt = null;
 
   console.log(`[pulse] ${key}: ${oldState} → ${newState}`);
+
+  // Publish to Flair (non-blocking, best-effort)
+  if (publisher) {
+    publisher(key, oldState, newState, instance).catch((e: unknown) => {
+      console.warn(`[pulse] Flair publish failed: ${(e as Error).message}`);
+    });
+  }
 
   // Determine mail targets based on transition
   switch (newState) {
@@ -305,6 +348,7 @@ export function pollOnce(
   state: PulseState,
   runner: SyncRunner = spawnSync as unknown as SyncRunner,
   sender: MailSender = defaultMailSender,
+  publisher?: FlairPublisher,
 ): void {
   const now = new Date().toISOString();
 
@@ -363,12 +407,12 @@ export function pollOnce(
 
         // If PR already has reviews, advance state
         if (computed !== "opened") {
-          handleTransition(key, instance, computed, config, sender);
+          handleTransition(key, instance, computed, config, sender, publisher);
         }
       } else {
         // Existing PR — check for state change
         existing.title = pr.title;
-        handleTransition(key, existing, computed, config, sender);
+        handleTransition(key, existing, computed, config, sender, publisher);
       }
     }
 
@@ -380,7 +424,7 @@ export function pollOnce(
       try {
         const prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, config.ghAgent, runner) as GhPr;
         if (prData.merged_at) {
-          handleTransition(key, inst, "merged", config, sender);
+          handleTransition(key, inst, "merged", config, sender, publisher);
         }
       } catch (e: unknown) {
         console.warn(`[pulse] Failed to check closed PR ${key}: ${(e as Error).message}`);
@@ -398,10 +442,38 @@ export function pollOnce(
 // Poll Loop (foreground)
 // ---------------------------------------------------------------------------
 
+export function makeFlairPublisher(config: PulseConfig): FlairPublisher | undefined {
+  if (!config.flairUrl || !config.flairAgentId || !config.flairAgentKey) return undefined;
+  try {
+    const client = createFlairClient(config.flairAgentId, config.flairUrl, config.flairAgentKey);
+    return async (key: string, from: PrState | null, to: PrState, instance: PrInstance) => {
+      // Publish OrgEvent for state transition
+      await client.publishEvent({
+        kind: `pr.${to}`,
+        scope: key,
+        summary: `PR #${instance.prNumber} (${instance.repo}): ${from ?? "new"} → ${to}`,
+        detail: instance.title,
+        refId: key,
+      });
+      // Store as persistent memory (stable id per PR key — same PUT overwrites)
+      const memId = `${config.flairAgentId}-pulse-${key.replace(/[^a-z0-9]/gi, "-")}`;
+      const content = `PR ${key} state: ${to}. Title: "${instance.title}". Transition: ${from ?? "new"} → ${to} at ${instance.lastTransitionAt}.`;
+      await client.writeMemory(memId, content, {
+        durability: "persistent",
+        type: "fact",
+        tags: ["pulse", "pr-lifecycle", to],
+      });
+    };
+  } catch (e: unknown) {
+    console.warn(`[pulse] Failed to create Flair publisher: ${(e as Error).message}`);
+    return undefined;
+  }
+}
+
 export async function startPollLoop(
   config: PulseConfig,
   state: PulseState,
-  opts: { dryRun?: boolean; runner?: SyncRunner; sender?: MailSender } = {},
+  opts: { dryRun?: boolean; runner?: SyncRunner; sender?: MailSender; publisher?: FlairPublisher } = {},
 ): Promise<void> {
   const runner = opts.runner ?? (spawnSync as unknown as SyncRunner);
   const sender = opts.dryRun
@@ -409,12 +481,16 @@ export async function startPollLoop(
         console.log(`[pulse/dry-run] would mail ${to}: ${body.slice(0, 80)}…`);
       }
     : (opts.sender ?? defaultMailSender);
+  const publisher = opts.dryRun ? undefined : (opts.publisher ?? makeFlairPublisher(config));
 
   console.log(`[pulse] Starting poll loop (interval=${config.pollIntervalMs}ms, repos=${config.repos.join(", ")})`);
 
   const poll = () => {
     try {
-      pollOnce(config, state, runner, sender);
+      // Prune stale terminal instances before each poll
+      const pruned = pruneState(state, config.pruneAfterDays);
+      if (pruned > 0) console.log(`[pulse] Pruned ${pruned} completed instance(s) older than ${config.pruneAfterDays} days`);
+      pollOnce(config, state, runner, sender, publisher);
       saveState(state);
     } catch (e: unknown) {
       console.error(`[pulse] Poll error: ${(e as Error).message}`);
