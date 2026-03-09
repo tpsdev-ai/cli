@@ -47,7 +47,7 @@ afterEach(() => {
 function mockFlairAuth(status = 200): typeof globalThis.fetch {
   return (async (input: string | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.endsWith("/MemoryQuery")) {
+    if (url.endsWith("/SemanticSearch")) {
       expect(init?.method).toBe("POST");
       expect(String((init?.headers as Record<string, string>)?.Authorization ?? "")).toContain(`TPS-Ed25519 ${agentId}:`);
       return new Response(JSON.stringify({ results: [] }), { status });
@@ -84,7 +84,7 @@ describe("tps agent healthcheck", () => {
 
     expect(output).toEqual([
       `FAIL  Identity: ~/.tps/agents/${agentId}/agent.yaml unreadable or missing`,
-      'FAIL  Flair auth: Flair POST /MemoryQuery → 503: {"results":[]}',
+      'FAIL  Flair auth: Flair POST /SemanticSearch → 503: {"results":[]}',
       "FAIL  Process: no PID file found",
       `FAIL  Mail dir: ~/.tps/mail/${agentId}/new missing`,
     ]);

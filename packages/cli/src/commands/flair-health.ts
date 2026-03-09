@@ -5,7 +5,7 @@
  *   1. HTTP reachability
  *   2. Memory write (PUT /Memory/<test-id>)
  *   3. Memory read-back (GET /Memory/<test-id>)
- *   4. Semantic search roundtrip (POST /MemoryQuery)
+ *   4. Semantic search roundtrip (POST /SemanticSearch)
  *   5. Memory cleanup (DELETE /Memory/<test-id>)
  *
  * Exits 0 if all pass, 1 if any fail.
