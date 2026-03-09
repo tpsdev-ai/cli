@@ -783,8 +783,18 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
             spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
           }
-          const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-          await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, config.mailDir);
+          // Check for file changes before attempting autoCommit
+          const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
+          const hasChanges = (gitStatusResult.stdout ?? "").trim().length > 0;
+          if (!hasChanges) {
+            console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
+            sendMail(mailDir, agentId, msg.from,
+              `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
+            );
+          } else {
+            const mailSubject = msg.body.split("\n")[0].slice(0, 72);
+            await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, config.mailDir);
+          }
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
