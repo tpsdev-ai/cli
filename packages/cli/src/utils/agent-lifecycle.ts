@@ -487,29 +487,9 @@ export async function onTaskComplete(
     swarn(`[${agentId}] OrgEvent task_done publish failed (non-fatal): ${err.message}`);
   }
 
-  // Write structured task memory
-  const memId = `${agentId}-task-${taskId}-${Date.now()}`;
-  const memory = JSON.stringify({
-    type: "task_completion",
-    taskId,
-    taskLabel: taskId,
-    result: "success",
-    changes: {
-      files: changes.files ?? [],
-      summary: changes.summary ?? "no diff available",
-      linesChanged: 0,
-    },
-    learned: learned ?? "",
-    workspaceRef: postState.ref,
-    duration: "",
-  });
-
-  try {
-    const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-    await Promise.race([flair.writeMemory(memId, memory, { tags: ["task", taskId] }), timeout]);
-  } catch (err: any) {
-    swarn(`[${agentId}] Task completion memory write failed (non-fatal): ${err.message}`);
-  }
+  // NOTE: Task completion data is already captured in OrgEvents above.
+  // Memory is for knowledge and insights, not audit trails.
+  // If agents should learn from tasks, that's MemoryReflect's job (ops-31.2).
 }
 
 /**
@@ -575,27 +555,9 @@ export async function onTaskFailure(
     swarn(`[${agentId}] OrgEvent blocker publish failed (non-fatal): ${err2.message}`);
   }
 
-  // Write failure memory
-  const memId = `${agentId}-fail-${taskId}-${Date.now()}`;
-  const memory = JSON.stringify({
-    type: "task_failure",
-    taskId,
-    taskLabel: taskId,
-    result: "failure",
-    error: error.slice(0, 200),
-    changes: {
-      files: changes.files ?? [],
-      summary: changes.summary ?? "no diff available",
-    },
-    workspaceRef: failState?.ref ?? preTaskState.ref,
-  });
-
-  try {
-    const timeout = new Promise<void>((_, rej) => setTimeout(() => rej(new Error("timeout")), 5000));
-    await Promise.race([flair.writeMemory(memId, memory, { tags: ["task", taskId, "failure"] }), timeout]);
-  } catch (err: any) {
-    swarn(`[${agentId}] Task failure memory write failed (non-fatal): ${err.message}`);
-  }
+  // NOTE: Task failure data is already captured in OrgEvents above.
+  // Memory is for knowledge and insights, not audit trails.
+  // If agents should learn from failures, that's MemoryReflect's job (ops-31.2).
 }
 
 // ── Topic catch-up (re-export) ─────────────────────────────────────────────
