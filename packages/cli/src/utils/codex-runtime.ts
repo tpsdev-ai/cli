@@ -36,6 +36,10 @@ import { formatTaskCompleteMailBody } from "./task-result-mail.js";
 /** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
 const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
 
+function shouldSendTaskCompletion(recipient: string, reviewNotify?: string[]): boolean {
+  return !(reviewNotify?.includes(recipient));
+}
+
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
   const credPath = join(homedir(), ".tps", "auth", "openai.json");
@@ -713,7 +717,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       });
       const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
       console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
-      sendMail(mailDir, agentId, event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
+      if (shouldSendTaskCompletion(event.authorId, config.autoCommit?.reviewNotify)) {
+        sendMail(mailDir, agentId, event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
+      }
       try {
         await (flair as any).request("POST", "/OrgEvent", {
           kind: "task.completed", authorId: agentId, targetIds: [event.authorId],
@@ -814,7 +820,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         });
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
-        sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
+        if (shouldSendTaskCompletion(msg.from, config.autoCommit?.reviewNotify)) {
+          sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
+        }
         await publishTaskOutcomeEvent(flair, agentId, {
           kind: "task.completed",
           summary: `Task ${msg.id} completed by ${agentId}`,

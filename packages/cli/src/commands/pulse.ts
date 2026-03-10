@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createFlairClient } from "../utils/flair-client.js";
+import { gcMessages } from "../utils/mail.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -289,6 +290,12 @@ export function handleTransition(
         config,
         sender,
       );
+      for (const reviewer of config.reviewers) {
+        const removed = gcMessages(reviewer, "24h", instance.prNumber);
+        if (removed > 0) {
+          console.log(`[pulse] gc → ${reviewer}: removed ${removed} mail item(s) for PR #${instance.prNumber}`);
+        }
+      }
       break;
     }
   }
