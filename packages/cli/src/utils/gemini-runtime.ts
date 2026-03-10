@@ -31,6 +31,7 @@ export interface GeminiConfig {
   extraDirs?: string[];
   supervisorId?: string;
   taskTimeoutMs?: number;
+  watchdogTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
   flairKeyPath: string;
@@ -139,22 +140,36 @@ export function extractFinalAnswer(raw: string): string {
   const cleaned = lines.join("\n").trim();
   const paragraphs = cleaned.split(/\n\n+/).map((p) => p.trim()).filter(Boolean);
   if (paragraphs.length === 0) return cleaned;
-  // Walk backward to find last non-narration paragraph
   let end = paragraphs.length - 1;
   while (end > 0 && NARRATION_RE.test(paragraphs[end])) end--;
-  // For short outputs take just that paragraph; longer outputs take up to 3
   const count = paragraphs.length > 5 ? 3 : 1;
   return paragraphs.slice(Math.max(0, end - count + 1), end + 1).join("\n\n");
+}
+
+export function formatGeminiProcessError(
+  code: number | null,
+  stderr: string,
+  opts: { timedOut?: boolean; taskTimeoutMs?: number; stalled?: boolean; watchdogTimeoutMs?: number } = {},
+): Error {
+  if (opts.timedOut) {
+    return new Error(`timeout after ${opts.taskTimeoutMs ?? 0}ms`);
+  }
+  if (opts.stalled) {
+    return new Error(`stalled: no gemini output for ${opts.watchdogTimeoutMs ?? 0}ms`);
+  }
+
+  const detail = stderr.trim().slice(0, 500);
+  return new Error(detail ? `gemini exited ${code}: ${detail}` : `gemini exited ${code} with no result`);
 }
 
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
   const { systemPrompt, userTask } = await buildPrompt(message, config);
   const model = config.model ?? "gemini-2.5-pro";
+  const watchdogTimeoutMs = config.watchdogTimeoutMs ?? 5 * 60 * 1000;
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (gemini)\n${"=".repeat(60)}\n`);
   const logStream = createWriteStream(logPath, { flags: "a" });
 
-  // Gemini: pass prompt via stdin (avoids arg length limits with long system prompts)
   const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
@@ -163,16 +178,67 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
     const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"], env: geminiEnv });
     proc.stdin.write(systemPrompt);
     proc.stdin.end();
+
     const chunks: Buffer[] = [];
-    proc.stdout.on("data", (c: Buffer) => { chunks.push(c); logStream.write(c); });
-    proc.stderr.on("data", (c: Buffer) => logStream.write(c));
-    const timer = setTimeout(() => { proc.kill(); reject(new Error(`timeout after ${taskTimeoutMs}ms`)); }, taskTimeoutMs);
-    proc.on("close", (code) => {
-      clearTimeout(timer); logStream.end();
-      const raw = Buffer.concat(chunks).toString("utf-8").trim();
-      resolve(extractFinalAnswer(raw) || raw || `(exit ${code})`);
+    let stderr = "";
+    let timedOut = false;
+    let stalled = false;
+    let settled = false;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    const resetWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        stalled = true;
+        proc.kill("SIGTERM");
+      }, watchdogTimeoutMs);
+    };
+
+    resetWatchdog();
+
+    proc.stdout.on("data", (c: Buffer) => {
+      chunks.push(c);
+      logStream.write(c);
+      resetWatchdog();
     });
-    proc.on("error", (err) => { clearTimeout(timer); logStream.end(); reject(err); });
+    proc.stderr.on("data", (c: Buffer) => {
+      stderr += c.toString("utf-8");
+      logStream.write(c);
+      resetWatchdog();
+    });
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGTERM");
+    }, taskTimeoutMs);
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (watchdog) clearTimeout(watchdog);
+      logStream.end();
+
+      const raw = Buffer.concat(chunks).toString("utf-8").trim();
+      if (timedOut || stalled) {
+        settle(() => reject(formatGeminiProcessError(code, stderr, { timedOut, taskTimeoutMs, stalled, watchdogTimeoutMs })));
+        return;
+      }
+      if (code !== 0 && !raw) {
+        settle(() => reject(formatGeminiProcessError(code, stderr)));
+        return;
+      }
+      settle(() => resolve(extractFinalAnswer(raw) || raw || `(exit ${code})`));
+    });
+
+    proc.on("error", (err) => {
+      clearTimeout(timer);
+      if (watchdog) clearTimeout(watchdog);
+      logStream.end();
+      settle(() => reject(err));
+    });
   });
 }
 

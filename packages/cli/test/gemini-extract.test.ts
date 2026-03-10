@@ -1,5 +1,5 @@
 import { expect, test, describe } from "bun:test";
-import { extractFinalAnswer } from "../src/utils/gemini-runtime.js";
+import { extractFinalAnswer, formatGeminiProcessError } from "../src/utils/gemini-runtime.js";
 
 describe("extractFinalAnswer", () => {
   test("strips YOLO preamble lines", () => {
@@ -59,5 +59,22 @@ I've completed the analysis.
     const raw = "I've completed the task successfully.";
     const result = extractFinalAnswer(raw);
     expect(result).toBe("I've completed the task successfully.");
+  });
+});
+
+describe("formatGeminiProcessError", () => {
+  test("formats hard timeout errors", () => {
+    const error = formatGeminiProcessError(null, "", { timedOut: true, taskTimeoutMs: 1800000 });
+    expect(error.message).toBe("timeout after 1800000ms");
+  });
+
+  test("formats watchdog stall errors", () => {
+    const error = formatGeminiProcessError(null, "", { stalled: true, watchdogTimeoutMs: 300000 });
+    expect(error.message).toBe("stalled: no gemini output for 300000ms");
+  });
+
+  test("includes stderr for abnormal exits", () => {
+    const error = formatGeminiProcessError(1, "fatal: auth expired\n");
+    expect(error.message).toBe("gemini exited 1: fatal: auth expired");
   });
 });
