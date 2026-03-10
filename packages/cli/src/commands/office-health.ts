@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
@@ -7,12 +8,15 @@ import { createFlairClient, defaultFlairKeyPath, type FlairAgent } from "../util
 const DEFAULT_INTERVAL_SECONDS = 60;
 const STALE_MS = 5 * 60 * 1000;
 const CURSOR_DIR = join(process.env.HOME || homedir(), ".tps", "cursors");
+const PULSE_STATE_PATH = join(process.env.HOME || homedir(), ".tps", "pulse", "state.json");
 const STATE_DIR = join(process.env.HOME || homedir(), ".tps", "office-health");
 const STATE_PATH = join(STATE_DIR, "state.json");
+const LOCAL_AGENT_IDS = ["ember", "sherlock", "kern", "pixel"] as const;
 
 export interface OfficeHealthArgs {
   interval?: number;
   json?: boolean;
+  local?: boolean;
   viewerId?: string;
   flairUrl?: string;
   keyPath?: string;
@@ -39,6 +43,20 @@ export interface AgentHealthRecord {
   eventPublished: boolean;
 }
 
+export interface LocalHealthRecord {
+  agentId: string;
+  processCount: number;
+  pids: number[];
+  healthy: boolean;
+}
+
+export interface LocalHealthResult {
+  stuckMailProcesses: number;
+  agents: LocalHealthRecord[];
+  pulseRunning: boolean;
+  pulseLastPoll: string | null;
+}
+
 export interface OfficeHealthTickResult {
   timestamp: string;
   viewerId: string;
@@ -46,6 +64,7 @@ export interface OfficeHealthTickResult {
   staleAgents: number;
   publishedEvents: number;
   agents: AgentHealthRecord[];
+  local?: LocalHealthResult;
 }
 
 function fail(message: string): never {
@@ -146,22 +165,74 @@ function buildIssues(agent: FlairAgent, nowMs: number): Omit<AgentHealthRecord, 
   };
 }
 
+function readPids(pattern: string): number[] {
+  const result = spawnSync("pgrep", ["-f", pattern], { encoding: "utf-8" });
+  if (result.status !== 0 || !result.stdout.trim()) return [];
+  return result.stdout
+    .split("\n")
+    .map((line) => Number(line.trim()))
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+export function checkLocalHealth(): LocalHealthResult {
+  const agents = LOCAL_AGENT_IDS.map((agentId) => {
+    const pids = readPids(`agent start --id ${agentId}`);
+    return {
+      agentId,
+      processCount: pids.length,
+      pids,
+      healthy: pids.length === 1,
+    };
+  });
+
+  let pulseLastPoll: string | null = null;
+  if (existsSync(PULSE_STATE_PATH)) {
+    try {
+      const parsed = JSON.parse(readFileSync(PULSE_STATE_PATH, "utf-8")) as { lastPollAt?: string | null };
+      pulseLastPoll = parsed.lastPollAt ?? null;
+    } catch {
+      pulseLastPoll = null;
+    }
+  }
+
+  return {
+    stuckMailProcesses: readPids("tps mail send").length,
+    agents,
+    pulseRunning: readPids("pulse start").length > 0,
+    pulseLastPoll,
+  };
+}
+
 function renderText(result: OfficeHealthTickResult): string {
   const healthy = result.checkedAgents - result.staleAgents;
   const staleList = result.agents
     .filter((agent) => agent.stale)
     .map((agent) => `${agent.agentId}[${agent.issues.map((issue) => issue.summary).join(", ")}]`)
     .join("; ");
-  return [
+  const lines = [
     `[${result.timestamp}] checked=${result.checkedAgents} healthy=${healthy} stale=${result.staleAgents} published=${result.publishedEvents}`,
     staleList ? `stale: ${staleList}` : "stale: none",
-  ].join("\n");
+  ];
+
+  if (result.local) {
+    lines.push(
+      `local: ${result.local.agents
+        .map((agent) => `${agent.agentId}=${agent.processCount}${agent.healthy ? "" : ` pids=[${agent.pids.join(",")}]`}`)
+        .join(" ")}`
+    );
+    lines.push(
+      `local pulse: running=${result.local.pulseRunning} lastPoll=${result.local.pulseLastPoll ?? "missing"} stuckMail=${result.local.stuckMailProcesses}`
+    );
+  }
+
+  return lines.join("\n");
 }
 
 export async function runOfficeHealthTick(args: {
   viewerId: string;
   flairUrl?: string;
   keyPath?: string;
+  local?: boolean;
   nowMs?: number;
   state?: HealthState;
 }): Promise<{ result: OfficeHealthTickResult; state: HealthState }> {
@@ -181,9 +252,7 @@ export async function runOfficeHealthTick(args: {
 
     if (record.stale) {
       const summary = `${agent.id} unhealthy: ${record.issues.map((issue) => issue.summary).join(", ")}`;
-      const detail = record.issues
-        .map((issue) => `${issue.summary}; ${issue.detail}`)
-        .join("\n");
+      const detail = record.issues.map((issue) => `${issue.summary}; ${issue.detail}`).join("\n");
 
       if (!prior?.active) {
         await flair.publishEvent({
@@ -215,6 +284,7 @@ export async function runOfficeHealthTick(args: {
     staleAgents: records.filter((record) => record.stale).length,
     publishedEvents,
     agents: records.sort((a, b) => a.agentId.localeCompare(b.agentId)),
+    local: args.local ? checkLocalHealth() : undefined,
   };
 
   return { result, state: nextState };
@@ -244,6 +314,7 @@ export async function runOfficeHealth(args: OfficeHealthArgs): Promise<void> {
         viewerId,
         flairUrl: args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
         keyPath: args.keyPath ?? defaultFlairKeyPath(viewerId),
+        local: args.local,
         state,
       });
       state = tick.state;
