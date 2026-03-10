@@ -336,6 +336,10 @@ export interface WorkspaceSyncDeps {
   warn?: (message?: any, ...optionalParams: any[]) => void;
 }
 
+export function hasWorkspaceChangesOrNewCommit(statusOutput: string, baseline?: string | null, currentHead?: string | null): boolean {
+  return statusOutput.trim().length > 0 || currentHead !== baseline;
+}
+
 interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
 }
@@ -751,6 +755,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
+        const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
         const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
           flairPublisher: flairPub2,
           onStall: () => { sendMail(mailDir, agentId, msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
@@ -799,9 +804,10 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
             spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
           }
-          // Check for file changes before attempting autoCommit
+          // Check for file changes or Codex-created commits before attempting autoCommit
           const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
-          const hasChanges = (gitStatusResult.stdout ?? "").trim().length > 0;
+          const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+          const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
           if (!hasChanges) {
             console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
             sendMail(mailDir, agentId, msg.from,

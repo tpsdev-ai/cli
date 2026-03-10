@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   composeSystemPrompt,
+  hasWorkspaceChangesOrNewCommit,
   publishTaskOutcomeEvent,
   runAutoCommit,
   syncWorkspaceBeforeTask,
@@ -22,6 +23,14 @@ describe("composeSystemPrompt", () => {
     );
 
     expect(result).toBe("Flair soul\n\nAgent YAML instructions\n\nPast experience");
+  });
+});
+
+describe("hasWorkspaceChangesOrNewCommit", () => {
+  test("detects a new HEAD commit even when the working tree is clean", () => {
+    expect(hasWorkspaceChangesOrNewCommit("", "abc123", "def456")).toBe(true);
+    expect(hasWorkspaceChangesOrNewCommit("", "abc123", "abc123")).toBe(false);
+    expect(hasWorkspaceChangesOrNewCommit(" M file.ts", "abc123", "abc123")).toBe(true);
   });
 });
 
