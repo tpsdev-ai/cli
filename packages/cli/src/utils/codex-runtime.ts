@@ -530,9 +530,9 @@ export async function runAutoCommit(
   if (!hasWorkingTreeChanges && hasExistingCommits) {
     console.log(`[autoCommit] reusing existing commits on ${branchName}`);
     if (push) {
-      const checkoutResult = spawnSync(GIT_BIN, ["checkout", "-b", branchName], { cwd: repo, encoding: "utf-8" });
-      if (checkoutResult.status !== 0) {
-        spawnSync(GIT_BIN, ["checkout", branchName], { cwd: repo, encoding: "utf-8" });
+      const checkoutResult = runSync(GIT_BIN, ["checkout", "-b", branchName], { cwd: repo, encoding: "utf-8" });
+      if ((checkoutResult.status ?? 1) !== 0) {
+        runSync(GIT_BIN, ["checkout", branchName], { cwd: repo, encoding: "utf-8" });
       }
       const pushResult = runSync(GIT_BIN, ["push", "-u", "origin", branchName], { cwd: repo, encoding: "utf-8" });
       const pushStdout = typeof pushResult.stdout === "string" ? pushResult.stdout.trim() : "";

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { checkMessages, getInbox, listMessages, sendMessage } from "../src/utils/mail.js";
 
-const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 
 describe("mail utils", () => {
   let tempRoot: string;
@@ -39,7 +39,9 @@ describe("mail utils", () => {
 
     const read = checkMessages("kern");
     expect(read.length).toBe(1);
-    expect(read[0]!.read).toBe(true);
+    expect(read[0]!.read).toBe(false);
+    expect(read[0]!.checkedOutAt).toBeTruthy();
+    expect(read[0]!.checkedOutBy).toBe("kern");
     expect(readdirSync(inbox.fresh).length).toBe(0);
     expect(readdirSync(inbox.cur).length).toBe(1);
   });
@@ -78,10 +80,12 @@ describe("mail command", () => {
   });
 
   function run(args: string[], env: Record<string, string>) {
+    const home = env.HOME ?? join(tempRoot, "home");
+    mkdirSync(home, { recursive: true });
     return spawnSync("bun", [TPS_BIN, ...args], {
       encoding: "utf-8",
       cwd: tempRoot,
-      env: { ...process.env, ...env },
+      env: { ...process.env, HOME: home, ...env },
     });
   }
 
