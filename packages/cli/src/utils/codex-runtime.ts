@@ -336,6 +336,10 @@ export interface WorkspaceSyncDeps {
   warn?: (message?: any, ...optionalParams: any[]) => void;
 }
 
+export function hasWorkspaceChangesOrNewCommit(statusOutput: string, baseline?: string | null, currentHead?: string | null): boolean {
+  return statusOutput.trim().length > 0 || currentHead !== baseline;
+}
+
 interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
 }
@@ -411,6 +415,74 @@ export async function syncWorkspaceBeforeTask(
   console.log(`[${config.agentId}] Workspace synced to origin/${branch}.`);
 }
 
+function openPullRequest(
+  runSync: typeof spawnSync,
+  flair: AutoCommitFlair,
+  options: AutoCommitOptions,
+  authorEmail: string,
+  repo: string,
+): Promise<void> {
+  const {
+    taskId,
+    branchName,
+    commitMessage,
+    prRepo,
+    ghAgent,
+    prTitle,
+    prBody,
+    authorName,
+  } = options;
+
+  return (async () => {
+    if (!options.push || !options.openPr || !prRepo) return;
+    const prArgs = [
+      ghAgent ?? authorEmail.split("@")[0] ?? "",
+      "pr",
+      "create",
+      "--repo",
+      prRepo,
+      "--head",
+      branchName,
+      "--title", prTitle ?? `task: ${taskId}`,
+      "--body",
+      prBody ?? commitMessage,
+    ];
+    console.log(`[autoCommit] opening PR: gh-as ${prArgs[0]} pr create --repo ${prRepo} --head ${branchName}`);
+    const prResult = runSync("gh-as", prArgs, { cwd: repo, encoding: "utf-8" });
+    const prStdout2 = typeof prResult.stdout === "string" ? prResult.stdout.trim() : "";
+    const prStderr2 = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
+    console.log(`[autoCommit] gh-as pr create exit=${prResult.status} stdout=${prStdout2.slice(0, 200)}`);
+    if (prStderr2) console.log(`[autoCommit] gh-as stderr: ${prStderr2.slice(0, 200)}`);
+    if ((prResult.status ?? 1) === 0) {
+      const prUrl = prStdout2.trim();
+      const prNumber = prUrl.match(/\/pull\/(\d+)/)?.[1] ?? "?";
+      if (options.reviewNotify?.length && options.mailDir) {
+        for (const reviewer of options.reviewNotify) {
+          try {
+            const { sendMessage } = await import("../utils/mail.js");
+            sendMessage(reviewer, `PR #${prNumber} for review: ${prUrl}`, authorName.toLowerCase());
+            console.log(`[autoCommit] Notified reviewer: ${reviewer} (PR #${prNumber})`);
+          } catch (notifyErr: any) {
+            console.warn(`[autoCommit] Failed to notify ${reviewer}: ${notifyErr.message}`);
+          }
+        }
+      }
+      return;
+    }
+
+    const prErrMsg = prStderr2 || prStdout2 || `exit ${prResult.status ?? "unknown"}`;
+    try {
+      await flair.publishEvent({
+        kind: "blocker",
+        summary: `PR creation failed for ${taskId}`,
+        detail: prErrMsg,
+        refId: taskId,
+      });
+    } catch { /* non-fatal */ }
+    throw new Error(`gh-as pr create failed: ${prErrMsg}`);
+  })();
+}
+
 export async function runAutoCommit(
   config: Pick<CodexRuntimeConfig, "workspace">,
   flair: AutoCommitFlair,
@@ -444,6 +516,34 @@ export async function runAutoCommit(
     }
   }
 
+  const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
+  const hasWorkingTreeChanges = ((statusResult.stdout ?? "") as string).trim().length > 0;
+  const remoteRefCheck = runSync(GIT_BIN, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { cwd: repo, encoding: "utf-8" });
+  const aheadResult = runSync(
+    GIT_BIN,
+    ["rev-list", "--count", remoteRefCheck.status === 0 ? `origin/${branchName}..HEAD` : "HEAD"],
+    { cwd: repo, encoding: "utf-8" },
+  );
+  const aheadCount = parseInt(((aheadResult.stdout ?? "") as string).trim(), 10);
+  const hasExistingCommits = !Number.isNaN(aheadCount) && aheadCount > 0;
+
+  if (!hasWorkingTreeChanges && hasExistingCommits) {
+    console.log(`[autoCommit] reusing existing commits on ${branchName}`);
+    if (push) {
+      const pushResult = runSync(GIT_BIN, ["push", "-u", "origin", branchName], { cwd: repo, encoding: "utf-8" });
+      const pushStdout = typeof pushResult.stdout === "string" ? pushResult.stdout.trim() : "";
+      const pushStderr = typeof pushResult.stderr === "string" ? pushResult.stderr.trim() : "";
+      console.log(`[autoCommit] git push exit=${pushResult.status} branch=${branchName}`);
+      if (pushStdout) console.log(`[autoCommit] push stdout: ${pushStdout.slice(0, 200)}`);
+      if (pushStderr) console.log(`[autoCommit] push stderr: ${pushStderr.slice(0, 200)}`);
+      if ((pushResult.status ?? 1) !== 0) {
+        throw new Error(`git push failed: ${pushStderr || pushStdout || `exit ${pushResult.status ?? "unknown"}`}`);
+      }
+    }
+    await openPullRequest(runSync, flair, options, authorEmail, repo);
+    return;
+  }
+
   const args = [
     "agent", "commit",
     "--repo", repo,
@@ -461,55 +561,7 @@ export async function runAutoCommit(
   if (resultStdout) console.log(`[autoCommit] stdout: ${resultStdout.slice(0, 200)}`);
   if (resultStderr) console.log(`[autoCommit] stderr: ${resultStderr.slice(0, 200)}`);
   if (result.status === 0) {
-    if (push && openPr && prRepo) {
-      const prArgs = [
-        ghAgent ?? authorEmail.split("@")[0] ?? "",
-        "pr",
-        "create",
-        "--repo",
-        prRepo,
-        "--head",
-        branchName,
-        "--title", prTitle ?? `task: ${taskId}`,
-        "--body",
-        prBody ?? commitMessage,
-      ];
-      console.log(`[autoCommit] opening PR: gh-as ${prArgs[0]} pr create --repo ${prRepo} --head ${branchName}`);
-      const prResult = runSync("gh-as", prArgs, { cwd: repo, encoding: "utf-8" });
-      const prStdout2 = typeof prResult.stdout === "string" ? prResult.stdout.trim() : "";
-      const prStderr2 = typeof prResult.stderr === "string" ? prResult.stderr.trim() : "";
-      console.log(`[autoCommit] gh-as pr create exit=${prResult.status} stdout=${prStdout2.slice(0, 200)}`);
-      if (prStderr2) console.log(`[autoCommit] gh-as stderr: ${prStderr2.slice(0, 200)}`);
-      if ((prResult.status ?? 1) === 0) {
-        const prUrl = prStdout2.trim();
-        const prNumber = prUrl.match(/\/pull\/(\d+)/)?.[1] ?? "?";
-        if (options.reviewNotify?.length && options.mailDir) {
-          for (const reviewer of options.reviewNotify) {
-            try {
-              const { sendMessage } = await import("../utils/mail.js");
-              sendMessage(reviewer, `PR #${prNumber} for review: ${prUrl}`, authorName.toLowerCase());
-              console.log(`[autoCommit] Notified reviewer: ${reviewer} (PR #${prNumber})`);
-            } catch (notifyErr: any) {
-              console.warn(`[autoCommit] Failed to notify ${reviewer}: ${notifyErr.message}`);
-            }
-          }
-        }
-        return;
-      }
-
-      const prStderr = prStderr2;
-      const prStdout = prStdout2;
-      const prErrMsg = prStderr || prStdout || `exit ${prResult.status ?? "unknown"}`;
-      try {
-        await flair.publishEvent({
-          kind: "blocker",
-          summary: `PR creation failed for ${taskId}`,
-          detail: prErrMsg,
-          refId: taskId,
-        });
-      } catch { /* non-fatal */ }
-      throw new Error(`gh-as pr create failed: ${prErrMsg}`);
-    }
+    await openPullRequest(runSync, flair, options, authorEmail, repo);
     return;
   }
 
@@ -751,6 +803,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
+        const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
         const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
           flairPublisher: flairPub2,
           onStall: () => { sendMail(mailDir, agentId, msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
@@ -799,9 +852,10 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
             spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
           }
-          // Check for file changes before attempting autoCommit
+          // Check for file changes or Codex-created commits before attempting autoCommit
           const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
-          const hasChanges = (gitStatusResult.stdout ?? "").trim().length > 0;
+          const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+          const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
           if (!hasChanges) {
             console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
             sendMail(mailDir, agentId, msg.from,

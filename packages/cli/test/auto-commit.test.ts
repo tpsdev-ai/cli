@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
   composeSystemPrompt,
+  hasWorkspaceChangesOrNewCommit,
   publishTaskOutcomeEvent,
   runAutoCommit,
   syncWorkspaceBeforeTask,
@@ -25,6 +26,14 @@ describe("composeSystemPrompt", () => {
   });
 });
 
+describe("hasWorkspaceChangesOrNewCommit", () => {
+  test("detects a new HEAD commit even when the working tree is clean", () => {
+    expect(hasWorkspaceChangesOrNewCommit("", "abc123", "def456")).toBe(true);
+    expect(hasWorkspaceChangesOrNewCommit("", "abc123", "abc123")).toBe(false);
+    expect(hasWorkspaceChangesOrNewCommit(" M file.ts", "abc123", "abc123")).toBe(true);
+  });
+});
+
 describe("runAutoCommit", () => {
   test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
@@ -35,6 +44,15 @@ describe("runAutoCommit", () => {
       }
       if (cmd === "/usr/bin/git" && args.join(" ") === "checkout -b feat/task-123") {
         return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: 0, stdout: " M file.ts\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-parse --verify refs/remotes/origin/feat/task-123") {
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count HEAD") {
+        return { status: 0, stdout: "0\n", stderr: "" };
       }
       if (cmd === "tps") {
         return { status: 0, stdout: "", stderr: "" };
@@ -60,6 +78,9 @@ describe("runAutoCommit", () => {
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
       { cmd: "/usr/bin/git", args: ["checkout", "-b", "feat/task-123"] },
+      { cmd: "/usr/bin/git", args: ["status", "--porcelain"] },
+      { cmd: "/usr/bin/git", args: ["rev-parse", "--verify", "refs/remotes/origin/feat/task-123"] },
+      { cmd: "/usr/bin/git", args: ["rev-list", "--count", "HEAD"] },
       {
         cmd: "tps",
         args: [
@@ -88,6 +109,15 @@ describe("runAutoCommit", () => {
       calls.push({ cmd, args });
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: 0, stdout: " M file.ts\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-parse --verify refs/remotes/origin/feat/task-456") {
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count HEAD") {
+        return { status: 0, stdout: "0\n", stderr: "" };
       }
       if (cmd === "tps") {
         return { status: 0, stdout: "", stderr: "" };
@@ -118,6 +148,9 @@ describe("runAutoCommit", () => {
 
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["status", "--porcelain"] },
+      { cmd: "/usr/bin/git", args: ["rev-parse", "--verify", "refs/remotes/origin/feat/task-456"] },
+      { cmd: "/usr/bin/git", args: ["rev-list", "--count", "HEAD"] },
       {
         cmd: "tps",
         args: [
@@ -154,11 +187,91 @@ describe("runAutoCommit", () => {
     ]);
   });
 
+  test("pushes existing commits and opens a PR when Codex already committed", async () => {
+    const calls: Array<{ cmd: string; args: string[] }> = [];
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/feat/task-789\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-parse --verify refs/remotes/origin/feat/task-789") {
+        return { status: 0, stdout: "originref\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count origin/feat/task-789..HEAD") {
+        return { status: 0, stdout: "1\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "push -u origin feat/task-789") {
+        return { status: 0, stdout: "pushed\n", stderr: "" };
+      }
+      if (cmd === "gh-as") {
+        return { status: 0, stdout: "https://github.com/tpsdev-ai/cli/pull/789\n", stderr: "" };
+      }
+      if (cmd === "tps") {
+        throw new Error("tps agent commit should not run when reusing existing commits");
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    await runAutoCommit(
+      config,
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-789",
+        branchName: "feat/task-789",
+        commitMessage: "feat: ship task 789",
+        authorName: "Ember",
+        authorEmail: "ember@tps.dev",
+        push: true,
+        openPr: true,
+        prRepo: "tpsdev-ai/cli",
+        ghAgent: "ember",
+        prTitle: "feat: ship task 789",
+      },
+      { spawnSyncImpl },
+    );
+
+    expect(calls).toEqual([
+      { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
+      { cmd: "/usr/bin/git", args: ["status", "--porcelain"] },
+      { cmd: "/usr/bin/git", args: ["rev-parse", "--verify", "refs/remotes/origin/feat/task-789"] },
+      { cmd: "/usr/bin/git", args: ["rev-list", "--count", "origin/feat/task-789..HEAD"] },
+      { cmd: "/usr/bin/git", args: ["push", "-u", "origin", "feat/task-789"] },
+      {
+        cmd: "gh-as",
+        args: [
+          "ember",
+          "pr",
+          "create",
+          "--repo",
+          "tpsdev-ai/cli",
+          "--head",
+          "feat/task-789",
+          "--title",
+          "feat: ship task 789",
+          "--body",
+          "feat: ship task 789",
+        ],
+      },
+    ]);
+  });
+
   test("publishes a blocker OrgEvent when runtime PR creation fails", async () => {
     const publishEvent = mock(async () => {});
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/feat/task-456\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: 0, stdout: " M file.ts\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-parse --verify refs/remotes/origin/feat/task-456") {
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count HEAD") {
+        return { status: 0, stdout: "0\n", stderr: "" };
       }
       if (cmd === "tps") {
         return { status: 0, stdout: "", stderr: "" };
