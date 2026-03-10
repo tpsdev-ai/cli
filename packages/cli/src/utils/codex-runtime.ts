@@ -109,6 +109,7 @@ export interface CodexRuntimeConfig {
   sessionLogPath?: string;
   flairUrl?: string;
   flairKeyPath: string;
+  systemPrompt?: string;
   workspaceProvider?: WorkspaceProvider;
   /** If set, auto-commit workspace changes after each task completes */
   autoCommit?: AutoCommitConfig;
@@ -163,6 +164,21 @@ function sendMail(mailDir: string, from: string, to: string, body: string): void
   renameSync(tmpPath, newPath);
 }
 
+export function composeSystemPrompt(
+  flairSystemPrompt: string,
+  configSystemPrompt?: string,
+  experience?: string,
+): string {
+  let systemPrompt = flairSystemPrompt;
+  if (configSystemPrompt) {
+    systemPrompt += "\n\n" + configSystemPrompt;
+  }
+  if (experience) {
+    systemPrompt += "\n\n" + experience;
+  }
+  return systemPrompt;
+}
+
 async function buildSystemPrompt(
   message: MailMessage,
   config: CodexRuntimeConfig,
@@ -175,7 +191,7 @@ async function buildSystemPrompt(
     { allowedTools, supervisorId },
   );
   const experience = await searchPastExperience(flair, message.body, workspace);
-  return experience ? systemPrompt + "\n\n" + experience : systemPrompt;
+  return composeSystemPrompt(systemPrompt, config.systemPrompt, experience);
 }
 
 interface RunCodexOptions {

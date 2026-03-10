@@ -434,6 +434,7 @@ async function main() {
                 watchdogTimeoutMs: agentCfg.codex?.watchdogTimeoutMs,
                 flairUrl: agentCfg.flair?.url ?? process.env.FLAIR_URL,
                 flairKeyPath: agentCfg.flair?.keyPath,
+                systemPrompt: typeof agentCfg.systemPrompt === "string" ? agentCfg.systemPrompt : undefined,
                 workspaceProvider,
                 autoCommit: agentCfg.autoCommit,
               });
