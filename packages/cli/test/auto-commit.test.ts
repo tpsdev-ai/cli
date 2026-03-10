@@ -203,6 +203,9 @@ describe("runAutoCommit", () => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count origin/feat/task-789..HEAD") {
         return { status: 0, stdout: "1\n", stderr: "" };
       }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "checkout -b feat/task-789") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
       if (cmd === "/usr/bin/git" && args.join(" ") === "push -u origin feat/task-789") {
         return { status: 0, stdout: "pushed\n", stderr: "" };
       }
@@ -238,6 +241,7 @@ describe("runAutoCommit", () => {
       { cmd: "/usr/bin/git", args: ["status", "--porcelain"] },
       { cmd: "/usr/bin/git", args: ["rev-parse", "--verify", "refs/remotes/origin/feat/task-789"] },
       { cmd: "/usr/bin/git", args: ["rev-list", "--count", "origin/feat/task-789..HEAD"] },
+      { cmd: "/usr/bin/git", args: ["checkout", "-b", "feat/task-789"] },
       { cmd: "/usr/bin/git", args: ["push", "-u", "origin", "feat/task-789"] },
       {
         cmd: "gh-as",
