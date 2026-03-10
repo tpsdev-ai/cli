@@ -473,9 +473,18 @@ export function makeFlairPublisher(config: PulseConfig): FlairPublisher | undefi
 export async function startPollLoop(
   config: PulseConfig,
   state: PulseState,
-  opts: { dryRun?: boolean; runner?: SyncRunner; sender?: MailSender; publisher?: FlairPublisher } = {},
+  opts: {
+    dryRun?: boolean;
+    runner?: SyncRunner;
+    sender?: MailSender;
+    publisher?: FlairPublisher;
+    setIntervalFn?: typeof setInterval;
+    clearIntervalFn?: typeof clearInterval;
+  } = {},
 ): Promise<void> {
   const runner = opts.runner ?? (spawnSync as unknown as SyncRunner);
+  const setIntervalFn = opts.setIntervalFn ?? setInterval;
+  const clearIntervalFn = opts.clearIntervalFn ?? clearInterval;
   const sender = opts.dryRun
     ? (to: string, body: string, _agentId: string) => {
         console.log(`[pulse/dry-run] would mail ${to}: ${body.slice(0, 80)}…`);
@@ -501,12 +510,14 @@ export async function startPollLoop(
   poll();
 
   // Then on interval
-  const handle = setInterval(poll, config.pollIntervalMs);
+  const handle = setIntervalFn(poll, config.pollIntervalMs);
+  const keepalive = setIntervalFn(() => {}, 1 << 30);
 
   // Graceful shutdown
   await new Promise<void>((resolve) => {
     const stop = () => {
-      clearInterval(handle);
+      clearIntervalFn(handle);
+      clearIntervalFn(keepalive);
       saveState(state);
       console.log("[pulse] Stopped.");
       resolve();
