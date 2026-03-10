@@ -520,6 +520,7 @@ async function main() {
           viewerId: process.env.TPS_AGENT_ID ?? "anvil",
           interval: healthInterval ? Number(healthInterval) : 60,
           json: cli.flags.json as boolean | undefined,
+          local: process.argv.includes("--local"),
           once: process.argv.includes("--once"),
         });
         break;
