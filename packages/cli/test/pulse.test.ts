@@ -176,41 +176,40 @@ describe("handleTransition", () => {
 });
 
 describe("checkReminders", () => {
-  test("sends reminder when reviewing >30min", () => {
+  test("sends reminder to pending reviewers when review requested >30min", () => {
     const config = makeConfig({ remindAfterMs: 1800000 });
     const { calls, sender } = trackMails();
     const thirtyFiveMinAgo = new Date(Date.now() - 35 * 60 * 1000).toISOString();
     const instance = makeInstance({
-      state: "reviewing",
-      lastTransitionAt: thirtyFiveMinAgo,
-      reminderSentAt: null,
+      state: "opened",
+      reviewRequestedAt: thirtyFiveMinAgo,
+      lastRemindedAt: undefined,
     });
     const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
 
-    checkReminders(state, config, sender);
+    checkReminders(state, config, sender, { "pr:tpsdev-ai/cli#42": ["sherlock", "kern"] });
 
-    expect(calls.length).toBe(2); // sherlock + kern
-    expect(calls[0].body).toContain("Reminder");
-    expect(calls[0].body).toContain("awaiting review");
-    expect(instance.reminderSentAt).not.toBeNull();
+    expect(calls.length).toBe(2);
+    expect(calls[0].body).toContain("Reminder: PR #42 still needs your review");
+    expect(instance.lastRemindedAt).toBeTruthy();
   });
 
-  test("sends reminder when approved >30min to merge authority", () => {
+  test("escalates to merge authority when no review after 60min", () => {
     const config = makeConfig({ remindAfterMs: 1800000 });
     const { calls, sender } = trackMails();
-    const fortyMinAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString();
+    const sixtyFiveMinAgo = new Date(Date.now() - 65 * 60 * 1000).toISOString();
     const instance = makeInstance({
-      state: "approved",
-      lastTransitionAt: fortyMinAgo,
-      reminderSentAt: null,
+      state: "opened",
+      reviewRequestedAt: sixtyFiveMinAgo,
+      lastRemindedAt: undefined,
+      escalatedAt: undefined,
     });
     const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
 
-    checkReminders(state, config, sender);
+    checkReminders(state, config, sender, { "pr:tpsdev-ai/cli#42": ["sherlock"] });
 
-    expect(calls.length).toBe(1);
-    expect(calls[0].to).toBe("flint");
-    expect(calls[0].body).toContain("merge-ready");
+    expect(calls.some((c) => c.to === "flint" && c.body.includes("ESCALATE: PR #42"))).toBe(true);
+    expect(instance.escalatedAt).toBeTruthy();
   });
 
   test("does not re-send reminder within window", () => {
@@ -219,13 +218,13 @@ describe("checkReminders", () => {
     const fortyMinAgo = new Date(Date.now() - 40 * 60 * 1000).toISOString();
     const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
     const instance = makeInstance({
-      state: "reviewing",
-      lastTransitionAt: fortyMinAgo,
-      reminderSentAt: fiveMinAgo,
+      state: "opened",
+      reviewRequestedAt: fortyMinAgo,
+      lastRemindedAt: fiveMinAgo,
     });
     const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
 
-    checkReminders(state, config, sender);
+    checkReminders(state, config, sender, { "pr:tpsdev-ai/cli#42": ["sherlock"] });
 
     expect(calls.length).toBe(0);
   });
@@ -241,7 +240,7 @@ describe("checkReminders", () => {
     });
     const state = makeState({ "pr:tpsdev-ai/cli#42": instance });
 
-    checkReminders(state, config, sender);
+    checkReminders(state, config, sender, {});
 
     expect(calls.length).toBe(0);
   });
