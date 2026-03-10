@@ -33,6 +33,10 @@ export interface PrInstance {
   reviewers: string[];
   lastTransitionAt: string;
   reminderSentAt: string | null;
+  reviewRequestedAt?: string;
+  lastRemindedAt?: string;
+  escalatedAt?: string;
+  mergeReadyNotifiedAt?: boolean;
   history: HistoryEntry[];
 }
 
@@ -187,6 +191,11 @@ interface GhPr {
   merged_at: string | null;
   user?: { login?: string };
   requested_reviewers?: Array<{ login?: string }>;
+  head?: { sha?: string };
+}
+
+interface GhCommitStatus {
+  state?: string;
 }
 
 export function computePrState(pr: GhPr, reviews: GhReview[]): PrState {
@@ -249,6 +258,10 @@ export function handleTransition(
           sender,
         );
       }
+      instance.reviewRequestedAt = now;
+      instance.lastRemindedAt = undefined;
+      instance.escalatedAt = undefined;
+      instance.mergeReadyNotifiedAt = false;
       break;
     }
     case "changes-requested": {
@@ -309,40 +322,42 @@ export function checkReminders(
   state: PulseState,
   config: PulseConfig,
   sender: MailSender,
+  pendingReviews: Record<string, string[]>,
   now: Date = new Date(),
 ): void {
   for (const [key, instance] of Object.entries(state.instances)) {
     if (instance.state === "merged") continue;
+    const pending = pendingReviews[key] ?? [];
+    if (pending.length === 0) continue;
+    const requestedAt = instance.reviewRequestedAt ? Date.parse(instance.reviewRequestedAt) : NaN;
+    if (Number.isNaN(requestedAt)) continue;
+    const elapsed = now.getTime() - requestedAt;
 
-    const elapsed = now.getTime() - new Date(instance.lastTransitionAt).getTime();
-    if (elapsed < config.remindAfterMs) continue;
-
-    // Already sent a reminder for this period
-    if (instance.reminderSentAt) {
-      const sinceLast = now.getTime() - new Date(instance.reminderSentAt).getTime();
-      if (sinceLast < config.remindAfterMs) continue;
+    if (elapsed >= config.remindAfterMs) {
+      const lastRemindedAt = instance.lastRemindedAt ? Date.parse(instance.lastRemindedAt) : 0;
+      if (!instance.lastRemindedAt || (now.getTime() - lastRemindedAt) >= config.remindAfterMs) {
+        for (const reviewer of pending) {
+          sendMail(
+            reviewer,
+            `Reminder: PR #${instance.prNumber} still needs your review. Repo: ${instance.repo}. gh-as ${reviewer} pr diff ${instance.prNumber} --repo ${instance.repo}`,
+            config,
+            sender,
+          );
+        }
+        instance.lastRemindedAt = now.toISOString();
+        console.log(`[pulse] ${key}: sent review reminder`);
+      }
     }
 
-    if (instance.state === "reviewing") {
-      for (const reviewer of config.reviewers) {
-        sendMail(
-          reviewer,
-          `Reminder: PR #${instance.prNumber} (${instance.repo}) awaiting review for >30min: ${instance.title}`,
-          config,
-          sender,
-        );
-      }
-      instance.reminderSentAt = now.toISOString();
-      console.log(`[pulse] ${key}: sent review reminder`);
-    } else if (instance.state === "approved") {
+    if (elapsed >= (2 * config.remindAfterMs) && !instance.escalatedAt) {
       sendMail(
         config.mergeAuthority,
-        `Reminder: PR #${instance.prNumber} (${instance.repo}) is merge-ready for >30min: ${instance.title}`,
+        `ESCALATE: PR #${instance.prNumber} has no review after 60 min. Repo: ${instance.repo}. Missing: ${pending.join(", ")}`,
         config,
         sender,
       );
-      instance.reminderSentAt = now.toISOString();
-      console.log(`[pulse] ${key}: sent merge reminder`);
+      instance.escalatedAt = now.toISOString();
+      console.log(`[pulse] ${key}: escalated missing review`);
     }
   }
 }
@@ -360,6 +375,7 @@ export function pollOnce(
 ): void {
   const pollStartedAt = new Date().toISOString();
   const now = new Date().toISOString();
+  const pendingReviews: Record<string, string[]> = {};
 
   for (const repo of config.repos) {
     let prs: GhPr[];
@@ -386,6 +402,23 @@ export function pollOnce(
       }
 
       const computed = computePrState(pr, reviews);
+      const latestByUser = new Map<string, string>();
+      for (const r of reviews) latestByUser.set(r.user?.login ?? "unknown", r.state);
+      const configuredReviewers = config.reviewers;
+      const missingReviews = configuredReviewers.filter((reviewer) => {
+        const ghUser = reviewer.startsWith("tps-") ? reviewer : `tps-${reviewer}`;
+        return !latestByUser.has(ghUser);
+      });
+      pendingReviews[key] = missingReviews;
+      let ciGreen = false;
+      if (pr.head?.sha) {
+        try {
+          const status = ghApi(`repos/${repo}/commits/${pr.head.sha}/status`, config.ghAgent, runner) as GhCommitStatus;
+          ciGreen = status.state === "success";
+        } catch {
+          ciGreen = false;
+        }
+      }
       const existing = state.instances[key];
 
       if (!existing) {
@@ -399,6 +432,10 @@ export function pollOnce(
           reviewers: (pr.requested_reviewers ?? []).map((r) => r.login ?? "unknown"),
           lastTransitionAt: now,
           reminderSentAt: null,
+          reviewRequestedAt: now,
+          lastRemindedAt: undefined,
+          escalatedAt: undefined,
+          mergeReadyNotifiedAt: false,
           history: [{ at: now, from: null, to: "opened" }],
         };
         state.instances[key] = instance;
@@ -435,6 +472,21 @@ export function pollOnce(
         existing.title = pr.title;
         handleTransition(key, existing, computed, config, sender, publisher);
       }
+
+      const instance = state.instances[key];
+      if (instance.state === "opened" && !instance.reviewRequestedAt) {
+        instance.reviewRequestedAt = instance.lastTransitionAt;
+      }
+      if (instance.state === "approved" && ciGreen && !instance.mergeReadyNotifiedAt) {
+        sendMail(
+          config.mergeAuthority,
+          `MERGE READY: PR #${instance.prNumber} — all reviews in, CI green. Repo: ${instance.repo}`,
+          config,
+          sender,
+        );
+        instance.mergeReadyNotifiedAt = true;
+        console.log(`[pulse] ${key}: merge ready notified`);
+      }
     }
 
     // Check tracked PRs that might have been merged/closed (not in open list)
@@ -454,7 +506,7 @@ export function pollOnce(
   }
 
   // Check timers
-  checkReminders(state, config, sender);
+  checkReminders(state, config, sender, pendingReviews);
 
   state.lastPollAt = pollStartedAt;
 }
