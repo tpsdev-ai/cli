@@ -5,6 +5,7 @@ import {
   checkReminders,
   pollOnce,
   pruneState,
+  startPollLoop,
   type PrInstance,
   type PrState,
   type PulseConfig,
@@ -417,6 +418,49 @@ describe("pruneState", () => {
 // ---------------------------------------------------------------------------
 // Flair publisher (handleTransition integration)
 // ---------------------------------------------------------------------------
+
+describe("startPollLoop", () => {
+  test("does not resolve immediately after the first poll", async () => {
+    const config = makeConfig({ pollIntervalMs: 120000 });
+    const state = makeState();
+
+    let pollCalls = 0;
+    const runner: SyncRunner = (_cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        pollCalls++;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    const handles: Array<{ fn: () => void }> = [];
+    const setIntervalFn: typeof setInterval = ((fn: TimerHandler) => {
+      handles.push({ fn: fn as () => void });
+      return handles.length as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval;
+    const clearIntervalFn: typeof clearInterval = (() => {}) as typeof clearInterval;
+
+    let resolved = false;
+    const loopPromise = startPollLoop(config, state, {
+      dryRun: true,
+      runner,
+      setIntervalFn,
+      clearIntervalFn,
+    }).then(() => {
+      resolved = true;
+    });
+
+    await Promise.resolve();
+
+    expect(pollCalls).toBe(1);
+    expect(handles).toHaveLength(2);
+    expect(resolved).toBe(false);
+
+    process.emit("SIGTERM");
+    await loopPromise;
+    expect(resolved).toBe(true);
+  });
+});
 
 describe("FlairPublisher integration", () => {
   test("publisher is called on transition", async () => {
