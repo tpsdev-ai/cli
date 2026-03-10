@@ -590,11 +590,11 @@ async function main() {
       break;
     }
     case "mail": {
-      const action = rest[0] as "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | undefined;
-      const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish"];
+      const action = rest[0] as "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc" | undefined;
+      const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
       if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read new messages (marks as read)\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
@@ -640,13 +640,19 @@ async function main() {
       } else {
         await runMail({
           action,
-          agent: rest[1],
-          message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : undefined),
+          agent: action === "ack" || action === "nack" || action === "gc" ? getFlag("agent") : rest[1],
+          message: action === "relay" ? rest[2] : (action === "send" ? rest.slice(2).join(" ") : (action === "ack" || action === "nack" ? rest[1] : undefined)),
           messageId: action === "read" ? rest[2] : undefined,
           json: cli.flags.json,
           count: cli.flags.count,
           since: cli.flags.since,
           limit: cli.flags.limit ? Number(cli.flags.limit) : undefined,
+          reason: getFlag("reason"),
+          type: getFlag("type") as any,
+          retryAfter: getFlag("retry-after"),
+          maxAge: getFlag("max-age"),
+          pr: getFlag("pr") ? Number(getFlag("pr")) : undefined,
+          status: getFlag("status") as any,
         });
       }
       break;

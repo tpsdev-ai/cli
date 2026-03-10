@@ -1,4 +1,4 @@
-import { assertValidBody, checkMessages, getInbox, listMessages, sendMessage, type MailMessage } from "../utils/mail.js";
+import { ackMessage, assertValidBody, checkMessages, gcMessages, getInbox, listMessages, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -9,7 +9,7 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 
 interface MailArgs {
-  action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish";
+  action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
   agent?: string;
   message?: string;
   messageId?: string;
@@ -21,6 +21,12 @@ interface MailArgs {
   from?: string;
   fromBeginning?: boolean;
   topicAction?: string;
+  reason?: string;
+  type?: "transient" | "agent" | "permanent";
+  retryAfter?: string;
+  maxAge?: string;
+  pr?: number;
+  status?: "new" | "processing" | "done" | "failed" | "all";
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
@@ -164,8 +170,17 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "list": {
       const agent = await resolveAgentId(args.agent);
-      const messages = listMessages(agent)
+      let messages = listMessages(agent)
         .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+      if (args.status && args.status !== "all") {
+        messages = messages.filter((m) => {
+          if (args.status === "new") return !m.read && !m.checkedOutAt && !m.nackedAt;
+          if (args.status === "processing") return !m.read && !!m.checkedOutAt && !m.nackedAt;
+          if (args.status === "done") return !!m.ackedAt;
+          if (args.status === "failed") return !!m.nackedAt;
+          return true;
+        });
+      }
       if (args.count) {
         console.log(messages.length);
       } else if (args.json) {
@@ -357,6 +372,44 @@ export async function runMail(args: MailArgs): Promise<void> {
       console.error(`Usage: tps mail relay [start|stop|status]`);
       process.exit(1);
       break;
+    }
+
+    case "ack": {
+      const agent = await resolveAgentId(args.agent);
+      const id = args.messageId ?? args.message;
+      if (!id) {
+        console.error("Usage: tps mail ack <id> [agent]");
+        process.exit(1);
+      }
+      const msg = ackMessage(agent, id);
+      if (!msg) {
+        console.warn(`Message already gone or not found: ${id}`);
+        return;
+      }
+      console.log(`Acked ${msg.id}`);
+      return;
+    }
+
+    case "nack": {
+      const agent = await resolveAgentId(args.agent);
+      const id = args.messageId ?? args.message;
+      if (!id || !args.reason) {
+        console.error("Usage: tps mail nack <id> --reason <text> [--type transient|agent|permanent] [--retry-after <duration>]");
+        process.exit(1);
+      }
+      const msg = nackMessage(agent, id, args.reason, args.type ?? "transient", args.retryAfter);
+      if (!msg) {
+        console.warn(`Message already gone or not found: ${id}`);
+        return;
+      }
+      console.log(`Nacked ${msg.id} (${msg.nackType})`);
+      return;
+    }
+
+    case "gc": {
+      const removed = gcMessages(args.agent, args.maxAge, args.pr);
+      console.log(`GC removed ${removed} message(s)`);
+      return;
     }
 
     case "search": {
