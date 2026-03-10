@@ -625,7 +625,7 @@ async function _runAutoCommitLegacy(
         prRepo: cfg.prRepo,
         ghAgent,
         prTitle: cfg.prTitle ?? taskSubject ?? `task: ${taskId}`,
-        prBody: taskBody,
+        prBody: taskBody ? taskBody.split('\n\n')[0].slice(0, 500) : undefined,
         reviewNotify: cfg.reviewNotify,
         mailDir: mailDir,
       },
