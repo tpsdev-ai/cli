@@ -4,6 +4,7 @@ import {
   handleTransition,
   checkReminders,
   pollOnce,
+  printStatus,
   pruneState,
   startPollLoop,
   type PrInstance,
@@ -243,6 +244,32 @@ describe("checkReminders", () => {
     checkReminders(state, config, sender);
 
     expect(calls.length).toBe(0);
+  });
+});
+
+describe("printStatus", () => {
+  test("prints JSON status when requested", () => {
+    const state = makeState({
+      "pr:tpsdev-ai/cli#42": makeInstance(),
+    });
+    const logs: string[] = [];
+    const originalLog = console.log;
+    console.log = (value?: unknown) => {
+      logs.push(String(value));
+    };
+
+    try {
+      printStatus({ json: true }, state);
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(logs).toHaveLength(1);
+    const parsed = JSON.parse(logs[0]);
+    expect(parsed.lastPollAt).toBe(state.lastPollAt);
+    expect(parsed.activeCount).toBe(1);
+    expect(Array.isArray(parsed.active)).toBe(true);
+    expect(parsed.active[0].prNumber).toBe(42);
   });
 });
 

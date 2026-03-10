@@ -531,13 +531,22 @@ export async function startPollLoop(
 // Subcommands
 // ---------------------------------------------------------------------------
 
-function printStatus(): void {
-  const state = loadState();
+export function printStatus(args: Pick<PulseArgs, "json"> = {}, state = loadState()): void {
   if (!state.lastPollAt) {
     console.log("Pulse has not run yet.");
     return;
   }
   const active = Object.values(state.instances).filter((i) => i.state !== "merged");
+  if (args.json) {
+    console.log(
+      JSON.stringify({
+        lastPollAt: state.lastPollAt,
+        activeCount: active.length,
+        active,
+      }),
+    );
+    return;
+  }
   console.log(`Last poll: ${state.lastPollAt}`);
   console.log(`Active PRs: ${active.length}`);
   for (const inst of active) {
@@ -567,6 +576,7 @@ export interface PulseArgs {
   repo?: string;
   interval?: number;
   dryRun?: boolean;
+  json?: boolean;
 }
 
 export async function runPulse(args: PulseArgs): Promise<void> {
@@ -584,7 +594,7 @@ export async function runPulse(args: PulseArgs): Promise<void> {
       break;
     }
     case "status": {
-      printStatus();
+      printStatus({ json: args.json });
       break;
     }
     case "list": {
