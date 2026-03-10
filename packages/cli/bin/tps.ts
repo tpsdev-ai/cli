@@ -1005,6 +1005,7 @@ async function main() {
         action: (rest[0] as "start" | "status" | "list" | undefined) ?? "start",
         dryRun: Boolean(cli.flags["dry-run"]),
         interval: cli.flags.interval ? Number(cli.flags.interval) : undefined,
+        json: Boolean(cli.flags.json),
         repo: cli.flags.repo as string | undefined,
       });
       break;
