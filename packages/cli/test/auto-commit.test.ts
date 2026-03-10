@@ -1,5 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 import {
+  composeSystemPrompt,
   publishTaskOutcomeEvent,
   runAutoCommit,
   syncWorkspaceBeforeTask,
@@ -11,6 +12,18 @@ const config: CodexRuntimeConfig = {
   workspace: "/tmp/repo",
   mailDir: "/tmp/mail",
 };
+
+describe("composeSystemPrompt", () => {
+  test("appends config systemPrompt before past experience", () => {
+    const result = composeSystemPrompt(
+      "Flair soul",
+      "Agent YAML instructions",
+      "Past experience",
+    );
+
+    expect(result).toBe("Flair soul\n\nAgent YAML instructions\n\nPast experience");
+  });
+});
 
 describe("runAutoCommit", () => {
   test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
