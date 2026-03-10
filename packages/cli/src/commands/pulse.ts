@@ -181,6 +181,7 @@ interface GhReview {
 interface GhPr {
   number: number;
   title: string;
+  created_at: string;
   state: string;
   merged_at: string | null;
   user?: { login?: string };
@@ -350,6 +351,7 @@ export function pollOnce(
   sender: MailSender = defaultMailSender,
   publisher?: FlairPublisher,
 ): void {
+  const pollStartedAt = new Date().toISOString();
   const now = new Date().toISOString();
 
   for (const repo of config.repos) {
@@ -395,6 +397,18 @@ export function pollOnce(
         state.instances[key] = instance;
         console.log(`[pulse] ${key}: new PR tracked (${computed})`);
 
+        // Skip notifications for PRs that existed before this pulse session started
+        const isPreExisting =
+          state.lastPollAt && new Date(pr.created_at) < new Date(state.lastPollAt);
+        if (isPreExisting) {
+          console.log(`[pulse] ${key}: pre-existing PR, skipping notification`);
+          // Still advance state if needed
+          if (computed !== "opened") {
+            handleTransition(key, instance, computed, config, sender, publisher);
+          }
+          continue;
+        }
+
         // Notify reviewers for new PR
         for (const reviewer of config.reviewers) {
           sendMail(
@@ -435,7 +449,7 @@ export function pollOnce(
   // Check timers
   checkReminders(state, config, sender);
 
-  state.lastPollAt = now;
+  state.lastPollAt = pollStartedAt;
 }
 
 // ---------------------------------------------------------------------------
