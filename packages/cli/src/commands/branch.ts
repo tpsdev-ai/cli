@@ -6,6 +6,7 @@ import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js"
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
 import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT } from "../utils/wire-mail.js";
+import { startFlairProxy } from "../utils/flair-proxy.js";
 import { sendMessage } from "../utils/mail.js";
 import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
@@ -223,6 +224,8 @@ async function runStart(): Promise<void> {
     } catch { return []; }
   }
 
+  let flairProxy: { close: () => void } | null = null;
+
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {
       if (activeHostChannel) {
@@ -304,6 +307,12 @@ async function runStart(): Promise<void> {
           return onMessage(msg, channel);
         });
 
+  server.onConnection((channel) => {
+    activeHostChannel = channel;
+    try { flairProxy?.close(); } catch {}
+    flairProxy = startFlairProxy(9927, channel);
+  });
+
   const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
   mkdirSync(outboxNewDir, { recursive: true });
   const outboxWatcher = watch(outboxNewDir, async () => {
@@ -321,6 +330,7 @@ async function runStart(): Promise<void> {
   const onShutdown = async () => {
     logLine("STOPPED", "Signal received");
     try { outboxWatcher.close(); } catch {}
+    try { flairProxy?.close(); } catch {}
     activeHostChannel = null;
     clearBranchState();
     try { await server.close(); } catch {}
