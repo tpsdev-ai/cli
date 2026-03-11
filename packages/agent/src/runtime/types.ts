@@ -39,6 +39,10 @@ export interface AgentConfig {
   execAllowlist?: string[];
   /** Optional Flair memory/identity integration */
   flair?: FlairConfig;
+  /** Declarative runtime role */
+  role?: "reviewer" | "implementer" | "strategist" | "coordinator";
+  /** Role-specific config blob */
+  roleConfig?: Record<string, unknown>;
 }
 
 export interface ToolResult {
