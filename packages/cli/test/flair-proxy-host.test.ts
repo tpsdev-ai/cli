@@ -33,6 +33,10 @@ describe("flair proxy host", () => {
     globalThis.fetch = mock(async (url: string, init?: RequestInit) => {
       expect(url).toBe("http://127.0.0.1:9926/Memory");
       expect(init?.method).toBe("PUT");
+      expect((init?.headers as Record<string, string>).host).toBe("localhost:9926");
+      expect((init?.headers as Record<string, string>)["content-length"]).toBeUndefined();
+      expect((init?.headers as Record<string, string>).connection).toBeUndefined();
+      expect(init?.signal).toBeDefined();
       return new Response(JSON.stringify({ ok: true }), {
         status: 201,
         headers: { "content-type": "application/json" },
@@ -70,7 +74,7 @@ describe("flair proxy host", () => {
       body: {
         reqId: "550e8400-e29b-41d4-a716-446655440001",
         method: "GET",
-        path: "http://evil.test",
+        path: "//evil.test",
         headers: {},
       },
     });
@@ -78,6 +82,27 @@ describe("flair proxy host", () => {
     await Promise.resolve();
 
     expect(ch.sent[0]?.type).toBe(MSG_HTTP_RESPONSE);
+    expect((ch.sent[0]?.body as any).status).toBe(400);
+  });
+
+  test("rejects dot-dot traversal paths", async () => {
+    const ch = new MockChannel();
+    registerFlairProxyHandler(ch);
+
+    ch.emit({
+      type: MSG_HTTP_REQUEST,
+      seq: 0,
+      ts: new Date().toISOString(),
+      body: {
+        reqId: "550e8400-e29b-41d4-a716-446655440002",
+        method: "GET",
+        path: "/../../etc/passwd",
+        headers: {},
+      },
+    });
+
+    await Promise.resolve();
+
     expect((ch.sent[0]?.body as any).status).toBe(400);
   });
 });

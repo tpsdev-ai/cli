@@ -4,6 +4,7 @@ import type { TransportChannel, TpsMessage } from "./transport.js";
 import { MSG_HTTP_REQUEST, MSG_HTTP_RESPONSE, type HttpRequestBody, type HttpResponseBody } from "./wire-mail.js";
 
 const PROXY_TIMEOUT_MS = 30_000;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 export function startFlairProxy(port: number, channel: TransportChannel): { close: () => void } {
   const pending = new Map<string, {
@@ -27,13 +28,21 @@ export function startFlairProxy(port: number, channel: TransportChannel): { clos
   const server = createServer(async (req, res) => {
     const reqId = randomUUID();
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
     for await (const chunk of req) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buffer.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "payload too large" }));
+        return;
+      }
+      chunks.push(buffer);
     }
     const bodyStr = Buffer.concat(chunks).toString("utf-8");
     const path = req.url ?? "/";
 
-    if (!path.startsWith("/") || path.startsWith("//") || /^https?:/i.test(path)) {
+    if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
       res.writeHead(400, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: "invalid proxy path" }));
       return;

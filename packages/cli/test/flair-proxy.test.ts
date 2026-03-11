@@ -97,4 +97,19 @@ describe("flair proxy", () => {
       globalThis.clearTimeout = originalClearTimeout;
     }
   });
+
+  test("returns 413 when body exceeds 2MB", async () => {
+    const ch = new MockChannel();
+    const port = await getFreePort();
+    const proxy = startFlairProxy(port, ch);
+    cleanups.push(() => proxy.close());
+
+    const res = await fetch(`http://127.0.0.1:${port}/Memory`, {
+      method: "POST",
+      body: "x".repeat(2 * 1024 * 1024 + 1),
+    });
+
+    expect(res.status).toBe(413);
+    expect(ch.sent.length).toBe(0);
+  });
 });
