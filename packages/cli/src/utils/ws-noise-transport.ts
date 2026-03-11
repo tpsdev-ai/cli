@@ -214,7 +214,11 @@ export class WsNoiseTransport implements WireTransport {
     const isLocal = target.host === "localhost" || target.host === "127.0.0.1" || target.host === "::1";
     const scheme = isLocal ? "ws" : "wss";
     const url = `${scheme}://${target.host}:${target.port}${WS_PATH}`;
-    const ws = new WebSocket(url);
+    const ws = new WebSocket(url, {
+      // Force HTTP/1.1 — WebSocket upgrade doesn't work over HTTP/2
+      // Required for TLS-terminating proxies like exe.dev
+      headers: { "Connection": "Upgrade", "Upgrade": "websocket" },
+    });
 
     // Track early close from server (rejection before handshake completes)
     let earlyClose = false;
@@ -403,6 +407,8 @@ export async function listenForHostWs(
     secretKey: Buffer.from(branchKeyPair.encryption.privateKey),
   };
 
+  let connectionCallback: ((channel: TransportChannel) => void) | null = null;
+
   wss.on("connection", async (ws) => {
     try {
       const responder = new Noise("IK", false, branchStatic);
@@ -427,6 +433,7 @@ export async function listenForHostWs(
         fingerprint(Buffer.from(responder.rs))
       );
       channel.onMessage((msg) => onMessage(msg, channel));
+      connectionCallback?.(channel);
     } catch {
       ws.close(1011, "handshake failed");
     }
@@ -438,7 +445,7 @@ export async function listenForHostWs(
   });
 
   return {
-    onConnection: () => {},
+    onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },
     close: () =>
       new Promise<void>((resolve, reject) => {
         wss.close();
