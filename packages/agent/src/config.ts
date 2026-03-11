@@ -76,6 +76,8 @@ export function loadAgentConfig(path: string): AgentConfig {
       url: parsed.flair.url ? String(parsed.flair.url) : undefined,
       keyPath: parsed.flair.keyPath ? String(parsed.flair.keyPath) : undefined,
     } : undefined,
+    role: parsed.role ? String(parsed.role) as any : undefined,
+    roleConfig: parsed.roleConfig ? parsed.roleConfig as Record<string, unknown> : undefined,
     llm: {
       provider: parsed.llm?.provider || parsed.provider || "openai",
       model: parsed.llm?.model || parsed.model || "gpt-4o-mini",
