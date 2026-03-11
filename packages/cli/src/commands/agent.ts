@@ -14,6 +14,7 @@ import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
+import { loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -750,6 +751,14 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
+      if (config.flair) {
+        const flair = createFlairClient(
+          config.agentId,
+          config.flair.url ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+          config.flair.keyPath ?? join(homedir(), ".tps", "identity", `${config.agentId}.key`),
+        );
+        loadPlugins({ slots: { memory: "flair" } }, { flair });
+      }
       const runtime = new AgentRuntime(config);
 
       if (args.action === "run") {
