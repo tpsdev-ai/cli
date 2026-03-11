@@ -4,6 +4,8 @@ export const MSG_MAIL_DELIVER = 0x01;
 export const MSG_MAIL_ACK = 0x02;
 export const MSG_JOIN_COMPLETE = 0x0f;
 export const MSG_HEARTBEAT = 0x10;
+export const MSG_HTTP_REQUEST = 0x20;
+export const MSG_HTTP_RESPONSE = 0x21;
 
 const SAFE_ID = /^[a-zA-Z0-9._-]{1,64}$/;
 
@@ -29,3 +31,20 @@ export const JoinCompleteBodySchema = z.object({
   hostId: z.string(),
 });
 export type JoinCompleteBody = z.infer<typeof JoinCompleteBodySchema>;
+
+export const HttpRequestBodySchema = z.object({
+  reqId: z.string().uuid(),
+  method: z.string().min(1),
+  path: z.string().min(1),
+  headers: z.record(z.string(), z.string()),
+  body: z.string().optional(),
+});
+export type HttpRequestBody = z.infer<typeof HttpRequestBodySchema>;
+
+export const HttpResponseBodySchema = z.object({
+  reqId: z.string().uuid(),
+  status: z.number().int(),
+  headers: z.record(z.string(), z.string()),
+  body: z.string().optional(),
+});
+export type HttpResponseBody = z.infer<typeof HttpResponseBodySchema>;
