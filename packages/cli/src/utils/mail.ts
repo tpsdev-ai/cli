@@ -58,7 +58,12 @@ export function getMailDir(): string {
 
 export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
   assertValidAgentId(agent);
-  const root = join(getMailDir(), agent);
+
+  // Branch-office compatibility: if this agent has a local branch-office mail root,
+  // prefer that over ~/.tps/mail/<agent>. This keeps `tps mail check <agent>` aligned
+  // with branch delivery paths used by relay/deliverToSandbox.
+  const branchMailRoot = join(process.env.HOME || homedir(), ".tps", "branch-office", agent, "mail");
+  const root = existsSync(branchMailRoot) ? branchMailRoot : join(getMailDir(), agent);
   const tmp = join(root, "tmp");
   const fresh = join(root, "new");
   const cur = join(root, "cur");
