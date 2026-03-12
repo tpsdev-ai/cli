@@ -181,4 +181,23 @@ describe("mail command", () => {
     expect(counted.stdout.trim()).toBe("2");
     // stderr may contain nono warnings in CI — only assert stdout
   });
+
+  test("check reads branch-office inbox when present", () => {
+    const home = join(tempRoot, "home-branch");
+    mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "new"), { recursive: true });
+    mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "tmp"), { recursive: true });
+    mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "cur"), { recursive: true });
+    mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "dlq"), { recursive: true });
+    writeFileSync(
+      join(home, ".tps", "branch-office", "tps-anvil", "mail", "new", "msg.json"),
+      JSON.stringify({ id: "m1", from: "flint", to: "tps-anvil", body: "branch mail", timestamp: new Date().toISOString(), read: false }),
+      "utf-8",
+    );
+
+    const checked = run(["mail", "check", "tps-anvil", "--json"], { HOME: home, TPS_AGENT_ID: "tps-anvil" });
+    expect(checked.status).toBe(0);
+    const msgs = JSON.parse(checked.stdout);
+    expect(msgs.length).toBe(1);
+    expect(msgs[0].body).toBe("branch mail");
+  });
 });
