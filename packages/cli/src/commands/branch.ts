@@ -107,6 +107,13 @@ async function runInit(args: BranchArgs): Promise<void> {
     process.exit(1);
   }
 
+  // Guard against silently overwriting a live branch config.
+  // A stale or test-generated config can disrupt running daemons.
+  if (existsSync(confPath()) && !args.force) {
+    console.error("branch.conf.json already exists. Use --force to reinitialize.");
+    process.exit(1);
+  }
+
   const kp = existsSync(seedPath) && !args.force
     ? loadKeyPair(identityDir, "branch")
     : (() => {
