@@ -121,7 +121,10 @@ export async function runMail(args: MailArgs): Promise<void> {
       );
       if (existsSync(remoteJsonPath)) {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(effectiveTo, { to, from, body: args.message });
+        // Use effectiveTo (branch ID) as the wire 'to' field so the branch daemon
+        // stores mail under its own identity dir (e.g. "tps-anvil"), not the
+        // GAL logical name (e.g. "anvil"). Fixes #240.
+        await deliverToRemoteBranch(effectiveTo, { to: effectiveTo, from, body: args.message });
         if (args.json) {
           console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: effectiveTo }));
         } else {
