@@ -122,24 +122,17 @@ export function galSync(): { added: string[]; skipped: string[] } {
     const remoteJsonPath = join(branchDir, branchId, "remote.json");
     if (!existsSync(remoteJsonPath)) continue;
 
-    // Heuristic: strip "tps-" prefix to derive the logical agent name
-    // e.g. "tps-rockit" → "rockit", "tps-anvil" → "anvil"
-    // The branchId entry is always added; the stripped name is added as an alias if different.
-    const agentAlias = branchId.startsWith("tps-") ? branchId.slice(4) : branchId;
+    // Derive logical agent name: strip "tps-" prefix if present.
+    // e.g. "tps-rockit" → agentId="rockit", branchId="tps-rockit"
+    //      "ember"      → agentId="ember",   branchId="ember"
+    const agentId = branchId.startsWith("tps-") ? branchId.slice(4) : branchId;
 
-    // Add mapping for the branch ID itself (idempotent)
-    if (galLookup(branchId) !== null) {
-      skipped.push(branchId);
-    } else {
-      galSet(branchId, branchId);
-      added.push(branchId);
+    if (galLookup(agentId) !== null) {
+      skipped.push(agentId);
+      continue;
     }
-
-    // Add alias mapping (agentAlias → branchId) if different and not already present
-    if (agentAlias !== branchId && galLookup(agentAlias) === null) {
-      galSet(agentAlias, branchId);
-      added.push(agentAlias);
-    }
+    galSet(agentId, branchId);
+    added.push(agentId);
   }
 
   return { added, skipped };

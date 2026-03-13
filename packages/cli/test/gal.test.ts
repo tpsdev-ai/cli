@@ -87,8 +87,7 @@ describe("GAL utilities", () => {
   });
 
   it("galSync seeds from branch-office dirs with remote.json", async () => {
-    const { galSync, galList } = await getGal();
-    // Set up fake branch-office dirs
+    const { galSync, galList, galLookup } = await getGal();
     const branchDir = join(testRoot, "branch-office");
     mkdirSync(join(branchDir, "tps-rockit"), { recursive: true });
     writeFileSync(join(branchDir, "tps-rockit", "remote.json"), JSON.stringify({ host: "rockit" }));
@@ -96,31 +95,39 @@ describe("GAL utilities", () => {
     writeFileSync(join(branchDir, "tps-ember", "remote.json"), JSON.stringify({ host: "ember" }));
     // Dir without remote.json should be ignored
     mkdirSync(join(branchDir, "no-remote"), { recursive: true });
+    // Non-prefixed dir: agentId = branchId
+    mkdirSync(join(branchDir, "standalone"), { recursive: true });
+    writeFileSync(join(branchDir, "standalone", "remote.json"), JSON.stringify({}));
 
     const result = galSync();
-    // Each tps-prefixed dir adds branchId + alias (e.g. "tps-rockit" + "rockit")
-    expect(result.added).toContain("tps-rockit");
+    // tps-prefixed: agentId is stripped name, branchId is full name
     expect(result.added).toContain("rockit");
-    expect(result.added).toContain("tps-ember");
     expect(result.added).toContain("ember");
+    // non-prefixed: agentId = branchId
+    expect(result.added).toContain("standalone");
     expect(result.skipped).toHaveLength(0);
 
+    // Verify mappings
+    expect(galLookup("rockit")).toBe("tps-rockit");
+    expect(galLookup("ember")).toBe("tps-ember");
+    expect(galLookup("standalone")).toBe("standalone");
+
     const entries = galList();
-    expect(entries).toHaveLength(4); // tps-rockit, rockit, tps-ember, ember
+    expect(entries).toHaveLength(3);
   });
 
   it("galSync skips already-present entries", async () => {
     const { galSet, galSync } = await getGal();
-    galSet("tps-rockit", "tps-rockit");
+    // Pre-populate with the stripped agent name
+    galSet("rockit", "tps-rockit");
 
     const branchDir = join(testRoot, "branch-office");
     mkdirSync(join(branchDir, "tps-rockit"), { recursive: true });
     writeFileSync(join(branchDir, "tps-rockit", "remote.json"), JSON.stringify({}));
 
     const result = galSync();
-    expect(result.skipped).toContain("tps-rockit");
-    // The alias "rockit" is still new
-    expect(result.added).toContain("rockit");
+    expect(result.added).toHaveLength(0);
+    expect(result.skipped).toContain("rockit");
   });
 
   it("galSync returns empty result when branch-office dir missing", async () => {
