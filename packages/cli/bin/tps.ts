@@ -22,6 +22,7 @@ const cli = meow(
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
+    gal <action>      Global Address List (list/set/remove/sync)
     auth <action>     OAuth provider authentication (login/status/revoke/refresh)
     agent run|start|health  Manage tps-agent runtime from config
     identity <action> Key management (init/show/register/list/revoke/verify)
@@ -765,6 +766,25 @@ async function main() {
       });
       break;
     }
+    case "gal": {
+      const action = rest[0] as "list" | "set" | "remove" | "sync" | undefined;
+      const valid = ["list", "set", "remove", "sync"];
+      if (cli.flags.help || !action || !valid.includes(action)) {
+        console.log(
+          "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations"
+        );
+        process.exit(cli.flags.help ? 0 : 1);
+      }
+      const { runGal } = await import("../src/commands/gal.js");
+      runGal({
+        action,
+        agentId: rest[1],
+        branchId: rest[2],
+        json: !!cli.flags.json,
+      });
+      break;
+    }
+
     case "branch": {
       const action = rest[0] as "init" | "start" | "stop" | "status" | "log" | undefined;
       const valid = ["init", "start", "stop", "status", "log"];
