@@ -27,7 +27,7 @@ export interface BranchArgs {
 }
 
 function tpsRoot(): string {
-  return join(process.env.HOME || homedir(), ".tps");
+  return process.env.TPS_ROOT || join(process.env.HOME || homedir(), ".tps");
 }
 
 function getIdentityDir(): string {

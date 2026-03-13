@@ -32,12 +32,15 @@ describe("branch join handshake", () => {
     branchIdentityDir = join(tmpDir, "branch-identity");
     hostIdentityDir = join(tmpDir, "host-identity");
     hostRegistryDir = join(tmpDir, "host-registry");
+    // Override TPS_ROOT so branch init writes conf to temp dir, not ~/.tps
+    process.env.TPS_ROOT = tmpDir;
   });
 
   afterEach(() => {
     rmSync(tmpDir, { recursive: true, force: true });
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;
+    delete process.env.TPS_ROOT;
   });
 
   test("listenForJoin accepts JOIN_COMPLETE and exposes host identity", async () => {
