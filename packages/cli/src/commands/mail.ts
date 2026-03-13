@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
+import { galLookup } from "../utils/gal.js";
 
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
@@ -106,30 +107,35 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
+      // GAL lookup: resolve agent name → physical branch ID
+      const galBranchId = galLookup(to);
+      const effectiveTo = galBranchId ?? to;
+
       // Check for remote branch (has remote.json)
       const remoteJsonPath = join(
         process.env.HOME || homedir(),
         ".tps",
         "branch-office",
-        to,
+        effectiveTo,
         "remote.json"
       );
       if (existsSync(remoteJsonPath)) {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(to, { to, from, body: args.message });
+        await deliverToRemoteBranch(effectiveTo, { to, from, body: args.message });
         if (args.json) {
-          console.log(JSON.stringify({ status: "sent", to, transport: "remote" }));
+          console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: effectiveTo }));
         } else {
-          console.log(`Mail delivered to remote branch '${to}'.`);
+          const resolvedNote = galBranchId ? ` (via GAL: ${galBranchId})` : "";
+          console.log(`Mail delivered to remote branch '${to}'${resolvedNote}.`);
         }
         return;
       }
 
       // Inbound Bridge: check if recipient is a local branch office agent
-      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", to, "mail", "inbox");
+      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", effectiveTo, "mail", "inbox");
       if (existsSync(branchInbox)) {
         assertValidBody(args.message);
-        deliverToSandbox(to, {
+        deliverToSandbox(effectiveTo, {
           to,
           from,
           body: args.message,
