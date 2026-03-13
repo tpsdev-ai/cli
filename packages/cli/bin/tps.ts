@@ -122,6 +122,13 @@ const cli = meow(
       priority: { type: "string" },
       version: { type: "string" },
       verbose: { type: "boolean", default: false },
+      // Task envelope flags (mail send --task)
+      task: { type: "string" },
+      taskId: { type: "string" },
+      title: { type: "string" },
+      spec: { type: "string" },
+      output: { type: "string" },
+      taskContext: { type: "string" },
     },
   }
 );
@@ -654,6 +661,15 @@ async function main() {
           maxAge: getFlag("max-age"),
           pr: getFlag("pr") ? Number(getFlag("pr")) : undefined,
           status: getFlag("status") as any,
+          // Task envelope flags
+          task: cli.flags.task as string | undefined,
+          taskId: cli.flags.taskId as string | undefined,
+          title: cli.flags.title as string | undefined,
+          spec: cli.flags.spec as string | undefined,
+          branch: typeof cli.flags.branch === "string" ? cli.flags.branch : undefined,
+          priority: cli.flags.priority as string | undefined,
+          output: cli.flags.output as string | undefined,
+          taskContext: cli.flags.taskContext as string | undefined,
         });
       }
       break;
