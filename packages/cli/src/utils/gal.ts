@@ -4,9 +4,10 @@
  * Maps agent names (e.g. "flint") to their physical branch IDs (e.g. "tps-rockit").
  * Stored at ~/.tps/gal.json. Simple JSON file, no external deps.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 
 export interface GalEntry {
   agentId: string;     // logical name (e.g. "flint")
@@ -38,8 +39,17 @@ function loadGal(): GalFile {
 }
 
 function saveGal(gal: GalFile): void {
-  mkdirSync(tpsRoot(), { recursive: true });
-  writeFileSync(galPath(), JSON.stringify(gal, null, 2) + "\n", "utf-8");
+  const root = tpsRoot();
+  mkdirSync(root, { recursive: true });
+  // Atomic write: tmp file in same dir + rename
+  const tmp = join(root, `.gal-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmp, JSON.stringify(gal, null, 2) + "\n", "utf-8");
+    renameSync(tmp, galPath());
+  } catch (err) {
+    try { writeFileSync(galPath(), "", "utf-8"); } catch {} // cleanup attempt
+    throw err;
+  }
 }
 
 /**
@@ -111,12 +121,25 @@ export function galSync(): { added: string[]; skipped: string[] } {
   for (const branchId of dirs) {
     const remoteJsonPath = join(branchDir, branchId, "remote.json");
     if (!existsSync(remoteJsonPath)) continue;
+
+    // Heuristic: strip "tps-" prefix to derive the logical agent name
+    // e.g. "tps-rockit" → "rockit", "tps-anvil" → "anvil"
+    // The branchId entry is always added; the stripped name is added as an alias if different.
+    const agentAlias = branchId.startsWith("tps-") ? branchId.slice(4) : branchId;
+
+    // Add mapping for the branch ID itself (idempotent)
     if (galLookup(branchId) !== null) {
       skipped.push(branchId);
-      continue;
+    } else {
+      galSet(branchId, branchId);
+      added.push(branchId);
     }
-    galSet(branchId, branchId);
-    added.push(branchId);
+
+    // Add alias mapping (agentAlias → branchId) if different and not already present
+    if (agentAlias !== branchId && galLookup(agentAlias) === null) {
+      galSet(agentAlias, branchId);
+      added.push(agentAlias);
+    }
   }
 
   return { added, skipped };

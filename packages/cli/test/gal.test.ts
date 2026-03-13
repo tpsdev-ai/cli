@@ -98,12 +98,15 @@ describe("GAL utilities", () => {
     mkdirSync(join(branchDir, "no-remote"), { recursive: true });
 
     const result = galSync();
+    // Each tps-prefixed dir adds branchId + alias (e.g. "tps-rockit" + "rockit")
     expect(result.added).toContain("tps-rockit");
+    expect(result.added).toContain("rockit");
     expect(result.added).toContain("tps-ember");
+    expect(result.added).toContain("ember");
     expect(result.skipped).toHaveLength(0);
 
     const entries = galList();
-    expect(entries).toHaveLength(2);
+    expect(entries).toHaveLength(4); // tps-rockit, rockit, tps-ember, ember
   });
 
   it("galSync skips already-present entries", async () => {
@@ -115,8 +118,9 @@ describe("GAL utilities", () => {
     writeFileSync(join(branchDir, "tps-rockit", "remote.json"), JSON.stringify({}));
 
     const result = galSync();
-    expect(result.added).toHaveLength(0);
     expect(result.skipped).toContain("tps-rockit");
+    // The alias "rockit" is still new
+    expect(result.added).toContain("rockit");
   });
 
   it("galSync returns empty result when branch-office dir missing", async () => {

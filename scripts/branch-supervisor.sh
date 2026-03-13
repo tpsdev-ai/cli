@@ -25,10 +25,11 @@ else
 fi
 
 run_branch() {
+  # --nonono: skip nono process isolation check (not installed on all VMs)
   if [ -n "$TPS_SCRIPT" ]; then
-    TPS_BRANCH_DAEMON=1 "$TPS_BIN" "$TPS_SCRIPT" branch start
+    TPS_BRANCH_DAEMON=1 "$TPS_BIN" "$TPS_SCRIPT" branch start --nonono
   else
-    TPS_BRANCH_DAEMON=1 "$TPS_BIN" branch start
+    TPS_BRANCH_DAEMON=1 "$TPS_BIN" branch start --nonono
   fi
 }
 
