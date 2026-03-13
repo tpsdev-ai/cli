@@ -42,9 +42,10 @@ if [ -f "$SUPERVISOR_PID_FILE" ]; then
   fi
 fi
 
-# Start supervisor in background, detached from terminal
+# Start supervisor in a new session (setsid) so SIGKILL to the branch child
+# does not propagate up to the supervisor process group.
 log "Starting branch supervisor..."
-nohup "$SUPERVISOR_SCRIPT" >> "$SUPERVISOR_LOG" 2>&1 &
+setsid nohup "$SUPERVISOR_SCRIPT" >> "$SUPERVISOR_LOG" 2>&1 &
 SUPERVISOR_PID=$!
 
 # Give it a moment to write its PID file
