@@ -93,6 +93,7 @@ const cli = meow(
       baseModel: { type: "string" },
       since: { type: "string" },
       limit: { type: "number" },
+      interval: { type: "number" },
       from: { type: "string" },
       clone: { type: "boolean", default: false },
       overwrite: { type: "boolean", default: false },
@@ -661,6 +662,13 @@ async function main() {
           maxAge: getFlag("max-age"),
           pr: getFlag("pr") ? Number(getFlag("pr")) : undefined,
           status: getFlag("status") as any,
+          // mail watch flags
+          hook: action === "watch" ? (() => {
+            const idx = process.argv.indexOf("--exec");
+            if (idx < 0) return undefined;
+            return process.argv.slice(idx + 1);
+          })() : undefined,
+          interval: cli.flags.interval ? Number(cli.flags.interval) : undefined,
           // Task envelope flags
           task: cli.flags.task as string | undefined,
           taskId: cli.flags.taskId as string | undefined,
