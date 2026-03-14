@@ -207,9 +207,20 @@ describe("BoundaryManager.scrubEnvironment", () => {
   });
 
   test("preserves non-secret variables", () => {
-    const env = boundary.scrubEnvironment();
-    expect(env.PATH).toBeDefined();
-    expect(env.HOME).toBeDefined();
+    // Set PATH and HOME explicitly to guard against env pollution from
+    // parallel test files (e.g. nono.test.ts temporarily clears PATH).
+    const savedPath = process.env.PATH;
+    const savedHome = process.env.HOME;
+    process.env.PATH = "/usr/bin:/bin";
+    process.env.HOME = savedHome ?? "/tmp";
+    try {
+      const env = boundary.scrubEnvironment();
+      expect(env.PATH).toBeDefined();
+      expect(env.HOME).toBeDefined();
+    } finally {
+      if (savedPath !== undefined) process.env.PATH = savedPath;
+      else delete process.env.PATH;
+    }
   });
 
   test("removes extra keys specified by caller", () => {

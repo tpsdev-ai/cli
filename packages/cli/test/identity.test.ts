@@ -1,7 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
+
+// Absolute path to the compiled CLI binary — resolves correctly regardless of cwd
+const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 import {
   generateKeyPair,
   sign,
@@ -300,7 +303,7 @@ describe("CLI integration", () => {
   test("identity init shows signing and encryption keys via CLI", () => {
     const { execSync } = require("node:child_process");
     const result = execSync(
-      `bun dist/bin/tps.js identity init --json --nonono`,
+      `bun ${TPS_BIN} identity init --json --nonono`,
       {
         encoding: "utf-8",
         env: { ...process.env, TPS_VAULT_KEY: "test-passphrase", TPS_IDENTITY_DIR: join(tempDir, "cli-identity"), TPS_REGISTRY_DIR: join(tempDir, "cli-registry") },
@@ -328,7 +331,7 @@ describe("CLI integration", () => {
 
     // Host registers branch's PUBLIC keys (never sees private keys)
     const regResult = execSync(
-      `bun dist/bin/tps.js identity register test-branch --pubkey ${sigHex} --enc-pubkey ${encHex} --json --expires-in 90d --nonono`,
+      `bun ${TPS_BIN} identity register test-branch --pubkey ${sigHex} --enc-pubkey ${encHex} --json --expires-in 90d --nonono`,
       { encoding: "utf-8", env }
     );
     const reg = JSON.parse(regResult);
@@ -338,7 +341,7 @@ describe("CLI integration", () => {
 
     // List
     const listResult = execSync(
-      `bun dist/bin/tps.js identity list --json --nonono`,
+      `bun ${TPS_BIN} identity list --json --nonono`,
       { encoding: "utf-8", env }
     );
     const list = JSON.parse(listResult);
@@ -347,7 +350,7 @@ describe("CLI integration", () => {
 
     // Verify
     const verifyResult = execSync(
-      `bun dist/bin/tps.js identity verify test-branch --json --nonono`,
+      `bun ${TPS_BIN} identity verify test-branch --json --nonono`,
       { encoding: "utf-8", env }
     );
     const ver = JSON.parse(verifyResult);
@@ -355,14 +358,14 @@ describe("CLI integration", () => {
 
     // Revoke
     execSync(
-      `bun dist/bin/tps.js identity revoke test-branch --reason "test revocation" --nonono`,
+      `bun ${TPS_BIN} identity revoke test-branch --reason "test revocation" --nonono`,
       { env }
     );
 
     // Verify after revoke should fail
     try {
       execSync(
-        `bun dist/bin/tps.js identity verify test-branch --json --nonono`,
+        `bun ${TPS_BIN} identity verify test-branch --json --nonono`,
         { encoding: "utf-8", env }
       );
       expect(true).toBe(false);
