@@ -73,8 +73,11 @@ while true; do
   BRANCH_PID=$!
 
   # Wait for it to exit (or supervisor to be signaled)
+  # Use set +e so SIGKILL exit doesn't abort the script
+  set +e
   wait $BRANCH_PID 2>/dev/null
   EXIT_CODE=$?
+  set -e
 
   # Exit code 0 means intentional stop (e.g. tps branch stop sent SIGTERM)
   if [ $EXIT_CODE -eq 0 ]; then

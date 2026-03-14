@@ -27,7 +27,7 @@ export interface BranchArgs {
 }
 
 function tpsRoot(): string {
-  return join(process.env.HOME || homedir(), ".tps");
+  return process.env.TPS_ROOT || join(process.env.HOME || homedir(), ".tps");
 }
 
 function getIdentityDir(): string {
@@ -104,6 +104,13 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   if (existsSync(hostFile) && !args.force) {
     console.error("Already joined to a host. Use --force to re-initialize.");
+    process.exit(1);
+  }
+
+  // Guard against silently overwriting a live branch config.
+  // A stale or test-generated config can disrupt running daemons.
+  if (existsSync(confPath()) && !args.force) {
+    console.error("branch.conf.json already exists. Use --force to reinitialize.");
     process.exit(1);
   }
 
@@ -224,6 +231,19 @@ async function runStart(): Promise<void> {
     } catch { return []; }
   }
 
+  // Resolve the local agent identity for incoming mail storage.
+  // Preference order: TPS_AGENT_ID env → conf.agentId → hostname fragment.
+  // This ensures mail is stored under the branch's own identity, not the
+  // logical 'to' name used by the sender (which may be a GAL alias).
+  function getLocalAgentId(): string {
+    if (process.env.TPS_AGENT_ID) return process.env.TPS_AGENT_ID;
+    if ((conf as any).agentId) return String((conf as any).agentId);
+    // Fall back to hostname fragment (e.g. "tps-anvil" from hostname)
+    return hostname().split(".")[0]!;
+  }
+
+  const localAgentId = getLocalAgentId();
+
   let flairProxy: { close: () => void } | null = null;
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
@@ -278,7 +298,11 @@ async function runStart(): Promise<void> {
         break;
       case "inbox":
       default:
-        try { sendMessage(body.to, body.content, body.from); } catch (e: any) {
+        // Store under localAgentId (branch's own identity), not body.to.
+        // body.to may be a GAL logical name (e.g. "anvil") that differs from
+        // the branch's identity dir (e.g. "tps-anvil"). Preserving body.to
+        // in the message metadata keeps the original recipient visible.
+        try { sendMessage(localAgentId, body.content, body.from); } catch (e: any) {
           logLine("WARN", `Mail write failed: ${e.message}`);
         }
         break;

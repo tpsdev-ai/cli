@@ -22,6 +22,7 @@ const cli = meow(
     heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
+    gal <action>      Global Address List (list/set/remove/sync)
     auth <action>     OAuth provider authentication (login/status/revoke/refresh)
     agent run|start|health  Manage tps-agent runtime from config
     identity <action> Key management (init/show/register/list/revoke/verify)
@@ -121,6 +122,13 @@ const cli = meow(
       priority: { type: "string" },
       version: { type: "string" },
       verbose: { type: "boolean", default: false },
+      // Task envelope flags (mail send --task)
+      task: { type: "string" },
+      taskId: { type: "string" },
+      title: { type: "string" },
+      spec: { type: "string" },
+      output: { type: "string" },
+      taskContext: { type: "string" },
     },
   }
 );
@@ -653,6 +661,15 @@ async function main() {
           maxAge: getFlag("max-age"),
           pr: getFlag("pr") ? Number(getFlag("pr")) : undefined,
           status: getFlag("status") as any,
+          // Task envelope flags
+          task: cli.flags.task as string | undefined,
+          taskId: cli.flags.taskId as string | undefined,
+          title: cli.flags.title as string | undefined,
+          spec: cli.flags.spec as string | undefined,
+          branch: typeof cli.flags.branch === "string" ? cli.flags.branch : undefined,
+          priority: cli.flags.priority as string | undefined,
+          output: cli.flags.output as string | undefined,
+          taskContext: cli.flags.taskContext as string | undefined,
         });
       }
       break;
@@ -765,6 +782,25 @@ async function main() {
       });
       break;
     }
+    case "gal": {
+      const action = rest[0] as "list" | "set" | "remove" | "sync" | undefined;
+      const valid = ["list", "set", "remove", "sync"];
+      if (cli.flags.help || !action || !valid.includes(action)) {
+        console.log(
+          "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations"
+        );
+        process.exit(cli.flags.help ? 0 : 1);
+      }
+      const { runGal } = await import("../src/commands/gal.js");
+      runGal({
+        action,
+        agentId: rest[1],
+        branchId: rest[2],
+        json: !!cli.flags.json,
+      });
+      break;
+    }
+
     case "branch": {
       const action = rest[0] as "init" | "start" | "stop" | "status" | "log" | undefined;
       const valid = ["init", "start", "stop", "status", "log"];

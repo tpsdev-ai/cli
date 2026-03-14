@@ -7,11 +7,22 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
+import { galLookup } from "../utils/gal.js";
+import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
   agent?: string;
   message?: string;
+  // Task envelope flags
+  task?: string;
+  taskId?: string;
+  title?: string;
+  spec?: string;
+  branch?: string;
+  priority?: string;
+  output?: string;
+  taskContext?: string;
   messageId?: string;
   json?: boolean;
   count?: boolean;
@@ -87,10 +98,34 @@ export async function runMail(args: MailArgs): Promise<void> {
   switch (args.action) {
     case "send": {
       const to = validateAgent(args.agent);
-      if (!args.message) {
-        console.error("Usage: tps mail send <agent> <message>");
-        process.exit(1);
+
+      // Build message body: --task flag constructs a task envelope
+      let messageBody: string;
+      if (args.task) {
+        try {
+          messageBody = createTaskEnvelope(`task.${args.task}`, {
+            taskId: args.taskId,
+            title: args.title,
+            spec: args.spec,
+            branch: args.branch,
+            priority: args.priority,
+            output: args.output,
+            context: args.taskContext,
+          });
+        } catch (err) {
+          console.error(`Task envelope error: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      } else {
+        if (!args.message) {
+          console.error("Usage: tps mail send <agent> <message>");
+          process.exit(1);
+        }
+        messageBody = args.message;
       }
+      // Reassign for downstream use
+      args.message = messageBody;
+
       const from = await resolveAgentId();
 
       // Branch mode: queue outbound to be picked up by host on next connect
@@ -106,30 +141,35 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
+      // GAL lookup: resolve agent name → physical branch ID
+      const galBranchId = galLookup(to);
+      const effectiveTo = galBranchId ?? to;
+
       // Check for remote branch (has remote.json)
       const remoteJsonPath = join(
         process.env.HOME || homedir(),
         ".tps",
         "branch-office",
-        to,
+        effectiveTo,
         "remote.json"
       );
       if (existsSync(remoteJsonPath)) {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(to, { to, from, body: args.message });
+        await deliverToRemoteBranch(effectiveTo, { to, from, body: args.message });
         if (args.json) {
-          console.log(JSON.stringify({ status: "sent", to, transport: "remote" }));
+          console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: effectiveTo }));
         } else {
-          console.log(`Mail delivered to remote branch '${to}'.`);
+          const resolvedNote = galBranchId ? ` (via GAL: ${galBranchId})` : "";
+          console.log(`Mail delivered to remote branch '${to}'${resolvedNote}.`);
         }
         return;
       }
 
       // Inbound Bridge: check if recipient is a local branch office agent
-      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", to, "mail", "inbox");
+      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", effectiveTo, "mail", "inbox");
       if (existsSync(branchInbox)) {
         assertValidBody(args.message);
-        deliverToSandbox(to, {
+        deliverToSandbox(effectiveTo, {
           to,
           from,
           body: args.message,
@@ -161,7 +201,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       } else {
         for (const m of messages) {
           console.log(`📬 ${m.from} → ${m.to}  ${m.timestamp}`);
-          console.log(m.body);
+          const taskEnv = parseTaskEnvelope(m.body);
+          console.log(taskEnv ? formatTaskEnvelope(taskEnv) : m.body);
           console.log("---");
         }
       }
@@ -193,7 +234,13 @@ export async function runMail(args: MailArgs): Promise<void> {
         } else {
           for (const m of visible) {
             const marker = m.read ? "📖" : "📬";
-            console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}`);
+            const taskEnv = parseTaskEnvelope(m.body);
+            const summary = taskEnv
+              ? `  ${formatTaskEnvelope(taskEnv)}`
+              : m.body
+                ? `  ${m.body.slice(0, 60)}${m.body.length > 60 ? "…" : ""}`
+                : "";
+            console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}${summary}`);
           }
         }
       }
@@ -250,6 +297,10 @@ export async function runMail(args: MailArgs): Promise<void> {
         const marker = found.read ? "📖" : "📬";
         console.log(`${marker} ${found.from} → ${found.to}  ${found.timestamp}`);
         console.log(`ID: ${found.id}`);
+        const taskEnv = parseTaskEnvelope(found.body);
+        if (taskEnv) {
+          console.log(`Task: ${formatTaskEnvelope(taskEnv)}`);
+        }
         console.log("---");
         console.log(found.body);
       }
