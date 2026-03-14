@@ -77,6 +77,17 @@ class WsNoiseChannel implements TransportChannel {
       this.alive = false;
     });
 
+    // Catch post-connection WS errors (e.g. ErrorEvent on reconnect) before
+    // they propagate as unhandled process events and crash office connect. (#245)
+    ws.on("error", (err) => {
+      swarn("[ws-channel] socket error:", err instanceof Error ? err.message : String(err));
+      // Close cleanly — the reconnect loop in connectAndKeepAlive will restart.
+      if (this.alive) {
+        this.alive = false;
+        try { ws.close(1011, "socket error"); } catch {}
+      }
+    });
+
     ws.on("message", (data) => {
       try {
         const raw = toBuffer(data);
