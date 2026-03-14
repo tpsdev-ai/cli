@@ -121,8 +121,17 @@ class WsNoiseChannel implements TransportChannel {
   }
 
   async close(): Promise<void> {
-    this.ws.close();
     this.alive = false;
+    if (this.ws.readyState === WebSocket.CLOSED) return;
+    await new Promise<void>((resolve) => {
+      this.ws.once("close", () => resolve());
+      // Initiate close; if already closing, the 'close' event will still fire
+      if (this.ws.readyState !== WebSocket.CLOSING) {
+        try { this.ws.close(1000, "done"); } catch { resolve(); }
+      }
+      // Safety timeout — if close handshake stalls, don't hang forever
+      setTimeout(resolve, 2000).unref();
+    });
   }
 
   isAlive(): boolean {
