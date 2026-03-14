@@ -38,6 +38,9 @@ interface MailArgs {
   maxAge?: string;
   pr?: number;
   status?: "new" | "processing" | "done" | "failed" | "all";
+  // mail watch flags
+  hook?: string[];
+  interval?: number | string;
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
@@ -309,32 +312,17 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "watch": {
       const agent = await resolveAgentId(args.agent);
-      const { fresh, cur } = getInbox(agent);
+      const { runMailWatch } = await import("./mail-watch.js");
       console.log(`Watching ${agent} inbox... (Ctrl-C to stop)`);
-
-      const print = (file: string) => {
-        if (!file.endsWith(".json")) return;
-        const fullPath = join(fresh, file);
-        try {
-          const raw = readFileSync(fullPath, "utf-8");
-          const msg = JSON.parse(raw) as MailMessage;
-          console.log(`\n📬 ${msg.from} → ${msg.to}  ${msg.timestamp}`);
-          console.log(msg.body);
-          renameSync(fullPath, join(cur, file));
-        } catch {}
-      };
-
-      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach(print);
-
-      const watcher = watch(fresh, (_event, filename) => {
-        if (filename) print(filename.toString());
+      await runMailWatch({
+        agent,
+        hook: args.hook,
+        interval: args.interval ? Number(args.interval) : undefined,
+        json: args.json,
       });
-
+      // runMailWatch keeps alive until SIGINT/SIGTERM
       await new Promise<void>((resolve) => {
-        const stop = () => {
-          try { watcher.close(); } catch {}
-          resolve();
-        };
+        const stop = () => { resolve(); };
         process.on("SIGINT", stop);
         process.on("SIGTERM", stop);
       });
