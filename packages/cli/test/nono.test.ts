@@ -289,16 +289,31 @@ describe("runCommandUnderNono()", () => {
   });
 
   test("warns and falls back when nono not on PATH (non-strict)", () => {
-    // Set PATH to only include dirs that have echo but not nono
-    process.env.PATH = "/bin:/usr/bin";
+    // Create a tmpdir with a real 'echo' binary symlink but no 'nono'.
+    // On systems where /bin -> /usr/bin, we can't use /bin directly.
+    const { mkdtempSync, writeFileSync, symlinkSync, chmodSync } = require("node:fs");
+    const { join: pjoin } = require("node:path");
+    const fakeDir = mkdtempSync(pjoin(require("node:os").tmpdir(), "tps-nono-path-"));
+    // Symlink the real echo into our fake dir
+    try { symlinkSync("/usr/bin/echo", pjoin(fakeDir, "echo")); } catch {}
+
+    const savedPath = process.env.PATH;
+    process.env.PATH = fakeDir; // has echo, no nono
+
     const originalWarn = console.warn;
     const warnings: string[] = [];
     console.warn = (...args) => warnings.push(args.join(" "));
 
-    const exitCode = runCommandUnderNono("tps-hire", {}, ["echo", "fallback"]);
-    console.warn = originalWarn;
+    let exitCode: number;
+    try {
+      exitCode = runCommandUnderNono("tps-hire", {}, ["echo", "fallback"]);
+    } finally {
+      console.warn = originalWarn;
+      process.env.PATH = savedPath; // always restore PATH
+      require("node:fs").rmSync(fakeDir, { recursive: true, force: true });
+    }
 
-    expect(exitCode).toBe(0);
+    expect(exitCode!).toBe(0);
     expect(warnings.some((w) => w.includes("nono not found"))).toBe(true);
   });
 
