@@ -406,26 +406,9 @@ export async function deliverToRemoteBranch(
     });
 
     await acked;
-
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        channel.offMessage(handler);
-        resolve();
-      }, 2000);
-
-      const handler = (msg: TpsMessage) => {
-        if (msg.type !== MSG_MAIL_DELIVER) return;
-        const parsed = MailDeliverBodySchema.safeParse(msg.body);
-        if (!parsed.success) return;
-
-        const b = parsed.data;
-        try {
-          sendMessage(b.to, b.content, b.from);
-        } catch {}
-      };
-
-      channel.onMessage(handler);
-    });
+    // Close immediately after ACK — don't hold the connection open for a
+    // drain window. Inbound message sync is handled by connectAndKeepAlive /
+    // tps mail sync, not by individual send operations. (#mail-send-hang)
   } finally {
     await channel.close();
   }

@@ -160,8 +160,14 @@ class NoiseIkChannel implements TransportChannel {
   }
 
   async close(): Promise<void> {
-    this.socket.end();
     this.alive = false;
+    if (this.socket.destroyed) return;
+    await new Promise<void>((resolve) => {
+      this.socket.once("close", () => resolve());
+      try { this.socket.end(); } catch { resolve(); }
+      // Safety timeout — don't hang if close stalls
+      setTimeout(resolve, 2000).unref();
+    });
   }
 
   isAlive(): boolean {
