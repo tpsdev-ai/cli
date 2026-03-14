@@ -41,6 +41,7 @@ interface MailArgs {
   // mail watch flags
   hook?: string[];
   interval?: number | string;
+  daemon?: string;
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
@@ -319,6 +320,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         hook: args.hook,
         interval: args.interval ? Number(args.interval) : undefined,
         json: args.json,
+        daemon: args.daemon,
       });
       // runMailWatch keeps alive until SIGINT/SIGTERM
       await new Promise<void>((resolve) => {
