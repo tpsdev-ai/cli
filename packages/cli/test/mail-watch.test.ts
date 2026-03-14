@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { validateAgentId, watchMail } from "../src/commands/mail-watch.js";
+import { validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -214,6 +214,33 @@ describe("watchMail concurrency", () => {
     watcher.stop();
 
     expect(maxSeen).toBeLessThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// xmlEscape — plist injection prevention
+// ---------------------------------------------------------------------------
+
+describe("xmlEscape", () => {
+  it("escapes & < > \" '", () => {
+    expect(xmlEscape("a&b")).toBe("a&amp;b");
+    expect(xmlEscape("a<b>c")).toBe("a&lt;b&gt;c");
+    expect(xmlEscape('say "hi"')).toBe("say &quot;hi&quot;");
+    expect(xmlEscape("it's")).toBe("it&apos;s");
+  });
+
+  it("passes through safe strings unchanged", () => {
+    expect(xmlEscape("/usr/bin/tps")).toBe("/usr/bin/tps");
+    expect(xmlEscape("tps-kern")).toBe("tps-kern");
+  });
+
+  it("escapes a malicious exec arg", () => {
+    const evil = '</string></array><key>Foo</key><string>injected';
+    const escaped = xmlEscape(evil);
+    expect(escaped).not.toContain("<");
+    expect(escaped).not.toContain(">");
+    expect(escaped).toContain("&lt;");
+    expect(escaped).toContain("&gt;");
   });
 });
 

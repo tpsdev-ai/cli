@@ -207,20 +207,31 @@ function logDir(): string {
   return dir;
 }
 
+/** Escape a string for safe embedding inside a plist XML <string> element. */
+export function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[]): string {
   const label = plistLabel(agent);
   const stdout = join(logDir(), `mail-watch-${agent}.log`);
   const stderr = join(logDir(), `mail-watch-${agent}.error.log`);
 
-  const hookArgs = extraHookArgs.map((a) => `    <string>${a}</string>`).join("\n");
+  // XML-escape all args before embedding in plist
+  const hookArgs = extraHookArgs.map((a) => `    <string>${xmlEscape(a)}</string>`).join("\n");
 
-  // Build ProgramArguments array
+  // Build ProgramArguments array — escape paths too (handles spaces, &, etc.)
   const progArgs = [
-    `    <string>${process.execPath}</string>`,
-    `    <string>${tpsBin}</string>`,
+    `    <string>${xmlEscape(process.execPath)}</string>`,
+    `    <string>${xmlEscape(tpsBin)}</string>`,
     `    <string>mail</string>`,
     `    <string>watch</string>`,
-    `    <string>${agent}</string>`,
+    `    <string>${xmlEscape(agent)}</string>`,
     ...(extraHookArgs.length ? [`    <string>--exec</string>`, hookArgs] : []),
   ].join("\n");
 
@@ -230,7 +241,7 @@ function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[]): str
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${label}</string>
+  <string>${xmlEscape(label)}</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -250,15 +261,15 @@ ${progArgs}
   <integer>5</integer>
 
   <key>StandardOutPath</key>
-  <string>${stdout}</string>
+  <string>${xmlEscape(stdout)}</string>
 
   <key>StandardErrorPath</key>
-  <string>${stderr}</string>
+  <string>${xmlEscape(stderr)}</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>${homedir()}</string>
+    <string>${xmlEscape(homedir())}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
