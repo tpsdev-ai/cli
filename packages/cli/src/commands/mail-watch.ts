@@ -11,9 +11,11 @@
  * - max 3 concurrent handlers
  */
 
-import { existsSync, readdirSync, readFileSync, watch as fsWatch } from "node:fs";
-import { join } from "node:path";
-import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch as fsWatch, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir, platform } from "node:os";
+import { execSync, spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { getInbox } from "../utils/mail.js";
 import type { MailMessage } from "../utils/mail.js";
 
@@ -186,6 +188,151 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon (launchd on macOS, nohup on Linux)
+// ---------------------------------------------------------------------------
+
+const PLIST_LABEL_PREFIX = "ai.tpsdev.mail-watch";
+
+function plistLabel(agent: string): string {
+  return `${PLIST_LABEL_PREFIX}.${agent}`;
+}
+
+function plistPath(agent: string): string {
+  return join(homedir(), "Library", "LaunchAgents", `${plistLabel(agent)}.plist`);
+}
+
+function logDir(): string {
+  const dir = join(homedir(), ".tps", "logs");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[]): string {
+  const label = plistLabel(agent);
+  const stdout = join(logDir(), `mail-watch-${agent}.log`);
+  const stderr = join(logDir(), `mail-watch-${agent}.error.log`);
+
+  const hookArgs = extraHookArgs.map((a) => `    <string>${a}</string>`).join("\n");
+
+  // Build ProgramArguments array
+  const progArgs = [
+    `    <string>${process.execPath}</string>`,
+    `    <string>${tpsBin}</string>`,
+    `    <string>mail</string>`,
+    `    <string>watch</string>`,
+    `    <string>${agent}</string>`,
+    ...(extraHookArgs.length ? [`    <string>--exec</string>`, hookArgs] : []),
+  ].join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+
+  <key>ProgramArguments</key>
+  <array>
+${progArgs}
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>Crashed</key>
+    <true/>
+  </dict>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>${stdout}</string>
+
+  <key>StandardErrorPath</key>
+  <string>${stderr}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>${homedir()}</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+export function installDaemon(agent: string, hookArgs: string[] = []): void {
+  validateAgentId(agent); // validate before platform check
+  if (platform() !== "darwin") {
+    throw new Error("--daemon install is only supported on macOS (launchd). On Linux, use a supervisor or nohup manually.");
+  }
+
+  const tpsBin = resolve(fileURLToPath(import.meta.url), "../../bin/tps.js");
+  const plist = buildPlist(agent, tpsBin, hookArgs);
+  const path = plistPath(agent);
+  const label = plistLabel(agent);
+
+  mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
+  writeFileSync(path, plist, "utf-8");
+
+  // Unload if already loaded, then load fresh
+  try { execSync(`launchctl unload "${path}" 2>/dev/null`, { stdio: "ignore" }); } catch {}
+  execSync(`launchctl load "${path}"`, { stdio: "inherit" });
+
+  console.log(`✅ mail-watch daemon installed and started (${label})`);
+  console.log(`   Log: ${join(logDir(), `mail-watch-${agent}.log`)}`);
+  console.log(`   Plist: ${path}`);
+}
+
+export function uninstallDaemon(agent: string): void {
+  validateAgentId(agent); // validate before platform check
+  if (platform() !== "darwin") {
+    throw new Error("--daemon uninstall is only supported on macOS (launchd).");
+  }
+
+  const path = plistPath(agent);
+  if (!existsSync(path)) {
+    console.log(`No daemon installed for agent: ${agent}`);
+    return;
+  }
+
+  try { execSync(`launchctl unload "${path}"`, { stdio: "ignore" }); } catch {}
+  unlinkSync(path);
+  console.log(`✅ mail-watch daemon uninstalled (${plistLabel(agent)})`);
+}
+
+export function daemonStatus(agent: string): void {
+  validateAgentId(agent);
+  const path = plistPath(agent);
+  const label = plistLabel(agent);
+
+  if (!existsSync(path)) {
+    console.log(`mail-watch daemon: NOT INSTALLED (${label})`);
+    return;
+  }
+
+  try {
+    const out = execSync(`launchctl list | grep "${label}" 2>/dev/null`, { encoding: "utf-8" });
+    if (out.trim()) {
+      const parts = out.trim().split(/\s+/);
+      const pid = parts[0] !== "-" ? `PID ${parts[0]}` : "not running";
+      console.log(`mail-watch daemon: ✅ LOADED (${pid})`);
+    } else {
+      console.log(`mail-watch daemon: INSTALLED but NOT LOADED`);
+    }
+  } catch {
+    console.log(`mail-watch daemon: INSTALLED but NOT LOADED`);
+  }
+  console.log(`   Plist: ${path}`);
+}
+
+// ---------------------------------------------------------------------------
 // CLI runner
 // ---------------------------------------------------------------------------
 
@@ -195,9 +342,29 @@ export interface MailWatchArgs {
   debounce?: number;     // debounce window in ms
   json?: boolean;        // output messages as JSON
   interval?: number;     // kept for back-compat, unused (was polling interval)
+  daemon?: string;       // "install" | "uninstall" | "status"
 }
 
 export async function runMailWatch(args: MailWatchArgs): Promise<void> {
+  // Handle daemon subcommands
+  if (args.daemon) {
+    validateAgentId(args.agent);
+    switch (args.daemon) {
+      case "install":
+        installDaemon(args.agent, args.hook ?? []);
+        return;
+      case "uninstall":
+        uninstallDaemon(args.agent);
+        return;
+      case "status":
+        daemonStatus(args.agent);
+        return;
+      default:
+        console.error(`Unknown daemon action: ${args.daemon}. Use: install | uninstall | status`);
+        process.exit(1);
+    }
+  }
+
   validateAgentId(args.agent);
 
   const hook: WatchExecHook | undefined = args.hook?.length

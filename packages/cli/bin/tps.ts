@@ -94,6 +94,7 @@ const cli = meow(
       since: { type: "string" },
       limit: { type: "number" },
       interval: { type: "number" },
+      daemon: { type: "string" },
       from: { type: "string" },
       clone: { type: "boolean", default: false },
       overwrite: { type: "boolean", default: false },
@@ -603,7 +604,7 @@ async function main() {
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
       if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox for new messages\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox for new messages [--exec cmd args] [--daemon install|uninstall|status]\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
@@ -669,6 +670,7 @@ async function main() {
             return process.argv.slice(idx + 1);
           })() : undefined,
           interval: cli.flags.interval ? Number(cli.flags.interval) : undefined,
+          daemon: cli.flags.daemon as string | undefined,
           // Task envelope flags
           task: cli.flags.task as string | undefined,
           taskId: cli.flags.taskId as string | undefined,

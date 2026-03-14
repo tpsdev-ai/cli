@@ -216,3 +216,19 @@ describe("watchMail concurrency", () => {
     expect(maxSeen).toBeLessThanOrEqual(2);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Daemon install (macOS only — validates args without actually calling launchctl)
+// ---------------------------------------------------------------------------
+
+describe("installDaemon / uninstallDaemon arg validation", () => {
+  it("installDaemon throws on invalid agent ID", () => {
+    const { installDaemon } = require("../src/commands/mail-watch.js");
+    expect(() => installDaemon("agent;rm -rf")).toThrow(/Invalid agent ID/);
+  });
+
+  it("uninstallDaemon throws on invalid agent ID", () => {
+    const { uninstallDaemon } = require("../src/commands/mail-watch.js");
+    expect(() => uninstallDaemon("../../etc/passwd")).toThrow(/Invalid agent ID/);
+  });
+});
