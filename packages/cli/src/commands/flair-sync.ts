@@ -141,6 +141,15 @@ export async function runFlairSync(opts: {
     const syncedAt = new Date().toISOString();
 
     for (const m of toSync) {
+      // Sherlock guard: skip memories whose agentId doesn't match the
+      // authenticated agent — prevents pushing another agent's memories
+      // (e.g. from a corrupted or tampered local store).
+      if (m.agentId !== cfg.agentId) {
+        console.warn(`[flair-sync] SKIP ${m.id}: agentId mismatch (got "${m.agentId}", expected "${cfg.agentId}")`);
+        skipped++;
+        continue;
+      }
+
       const hash = contentHash(m);
       try {
         // Check if remote already has this exact content (dedup by content hash)

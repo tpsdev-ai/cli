@@ -257,6 +257,52 @@ describe("flair-sync", () => {
     }
   });
 
+  it("security: skips memories with mismatched agentId (spoofing guard)", async () => {
+    const putCount = { n: 0 };
+
+    // Local returns one legit memory and one with a foreign agentId
+    const localHandler: Handler = (req, _body, res) => {
+      if (req.method === "GET" && req.url?.startsWith("/Memory/")) {
+        jsonRes(res, 200, [
+          makeMemory("mem-legit", "legit content", NOW),
+          { ...makeMemory("mem-spoof", "spoofed content", NOW), agentId: "attacker" },
+        ]);
+        return;
+      }
+      jsonRes(res, 404, {});
+    };
+
+    const remoteHandler: Handler = (req, _body, res) => {
+      if (req.method === "GET" && req.url?.startsWith("/Health")) {
+        jsonRes(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === "GET" && req.url?.includes("/Memory/")) {
+        jsonRes(res, 404, {});
+        return;
+      }
+      if (req.method === "PUT") {
+        putCount.n++;
+        jsonRes(res, 200, {});
+        return;
+      }
+      jsonRes(res, 404, {});
+    };
+
+    const { server: ls, url: localUrl } = await startMockServer(localHandler);
+    const { server: rs, url: remoteUrl } = await startMockServer(remoteHandler);
+
+    writeConfig(localUrl, remoteUrl);
+    try {
+      await runFlairSync({ once: true, configPath: cfgPath, keyPath });
+      // Only the legit memory should be pushed; spoof memory is skipped
+      expect(putCount.n).toBe(1);
+    } finally {
+      await stopServer(ls);
+      await stopServer(rs);
+    }
+  });
+
   it("error handling: remote unreachable → graceful failure", async () => {
     const localHandler: Handler = (req, _body, res) => {
       if (req.method === "GET" && req.url?.startsWith("/Memory/")) {
