@@ -32,7 +32,7 @@ const cli = meow(
     stats            Aggregate structured JSONL telemetry events
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
     skill <action>    Skill governance (list/register/scan/revoke/show)
-    flair install|start|stop|restart|status|logs  Flair (Harper backend) launchd service
+    flair install|start|stop|restart|status|logs|sync  Flair (Harper backend) launchd service + sync
     pulse start|status|list  Office process engine — PR review workflow daemon
 
   Options
@@ -1004,7 +1004,7 @@ async function main() {
 
     case "flair": {
       const action = rest[0];
-      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health"].includes(action)) {
+      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health", "sync"].includes(action)) {
         console.error(
           "Usage:\n" +
           "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
@@ -1012,7 +1012,8 @@ async function main() {
           "  tps flair start|stop|restart\n" +
           "  tps flair status\n" +
           "  tps flair logs\n" +
-          "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]"
+          "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]\n" +
+          "  tps flair sync [--once] [--interval <seconds>] [--dry-run]"
         );
         process.exit(1);
       }
@@ -1022,6 +1023,22 @@ async function main() {
           agentId: (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined),
           flairUrl: cli.flags["flair-url"] as string | undefined,
           flairKeyPath: cli.flags["flair-key"] as string | undefined,
+          verbose: Boolean(cli.flags.verbose),
+        });
+        break;
+      }
+      if (action === "sync") {
+        const { runFlairSync } = await import("../src/commands/flair-sync.js");
+        const getFlag = (name: string): string | undefined => {
+          const idx = process.argv.indexOf(`--${name}`);
+          return idx >= 0 ? process.argv[idx + 1] : undefined;
+        };
+        const hasInterval = process.argv.includes("--interval");
+        const intervalVal = hasInterval ? (cli.flags.interval ? Number(cli.flags.interval) : 300) : undefined;
+        await runFlairSync({
+          once: !hasInterval || process.argv.includes("--once"),
+          interval: intervalVal,
+          dryRun: Boolean(cli.flags.dryRun),
           verbose: Boolean(cli.flags.verbose),
         });
         break;
