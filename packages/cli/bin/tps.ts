@@ -32,7 +32,7 @@ const cli = meow(
     stats            Aggregate structured JSONL telemetry events
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
     skill <action>    Skill governance (list/register/scan/revoke/show)
-    flair install|start|stop|restart|status|logs|sync  Flair (Harper backend) launchd service + sync
+    flair init|install|start|stop|restart|status|logs|sync  Flair (Harper backend) init + launchd service + sync
     pulse start|status|list  Office process engine — PR review workflow daemon
 
   Options
@@ -1004,9 +1004,10 @@ async function main() {
 
     case "flair": {
       const action = rest[0];
-      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health", "sync"].includes(action)) {
+      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health", "sync", "init"].includes(action)) {
         console.error(
           "Usage:\n" +
+          "  tps flair init [--agent-id <id>] [--port <port>] [--admin-pass <pass>]\n" +
           "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
           "  tps flair uninstall\n" +
           "  tps flair start|stop|restart\n" +
@@ -1016,6 +1017,19 @@ async function main() {
           "  tps flair sync [--once] [--interval <seconds>] [--dry-run]"
         );
         process.exit(1);
+      }
+      if (action === "init") {
+        const { runFlairInit } = await import("../src/commands/flair-init.js");
+        const getArg = (name: string): string | undefined => {
+          const idx = process.argv.indexOf(`--${name}`);
+          return idx >= 0 ? process.argv[idx + 1] : undefined;
+        };
+        await runFlairInit({
+          agentId: getArg("agent-id"),
+          port: getArg("port") ? Number(getArg("port")) : undefined,
+          adminPass: getArg("admin-pass"),
+        });
+        break;
       }
       if (action === "health") {
         const { runFlairHealth } = await import("../src/commands/flair-health.js");
