@@ -11,7 +11,7 @@ import { WsNoiseTransport } from "./ws-noise-transport.js";
 import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema } from "./wire-mail.js";
-import { registerFlairProxyHandler } from "./flair-proxy-host.js";
+import { registerServiceProxyHandler } from "./service-proxy-host.js";
 import { clearHostState, writeHostState, type HostConnectionState } from "./connection-state.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
@@ -526,7 +526,7 @@ export async function connectAndKeepAlive(
           } catch {}
         }, HEARTBEAT_INTERVAL_MS);
 
-        registerFlairProxyHandler(channel);
+        registerServiceProxyHandler(channel);
 
         const handler = (msg: TpsMessage) => {
           state.messagesReceived++;

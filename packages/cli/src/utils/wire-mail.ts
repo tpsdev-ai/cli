@@ -25,15 +25,26 @@ export const MailAckBodySchema = z.object({
 });
 export type MailAckBody = z.infer<typeof MailAckBodySchema>;
 
+// Re-export as canonical spec names (same wire codes)
+export const MSG_SERVICE_REQUEST = MSG_HTTP_REQUEST;
+export const MSG_SERVICE_RESPONSE = MSG_HTTP_RESPONSE;
+
 export const JoinCompleteBodySchema = z.object({
   hostPubkey: z.string(),
   hostFingerprint: z.string(),
   hostId: z.string(),
+  // OPS-122: advertised services — branch starts a local proxy for each
+  services: z.array(z.object({
+    name: z.string().min(1),
+    localPort: z.number().int().positive(),
+    description: z.string().optional(),
+  })).optional(),
 });
 export type JoinCompleteBody = z.infer<typeof JoinCompleteBodySchema>;
 
 export const HttpRequestBodySchema = z.object({
   reqId: z.string().uuid(),
+  service: z.string().min(1).optional(), // OPS-122: target service name
   method: z.string().min(1),
   path: z.string().min(1),
   headers: z.record(z.string(), z.string()),

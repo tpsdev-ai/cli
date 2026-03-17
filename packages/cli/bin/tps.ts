@@ -107,6 +107,7 @@ const cli = meow(
       follow: { type: "boolean", default: false },
       lines: { type: "number" },
       transport: { type: "string" },
+      port: { type: "number" },
       autoPrune: { type: "boolean", default: false },
       prune: { type: "boolean", default: false },
       staleMinutes: { type: "number" },
@@ -848,6 +849,24 @@ async function main() {
       }
       break;
     }
+    case "service": {
+      const action = rest[0] as "register" | "list" | "remove" | undefined;
+      if (!action || !["register", "list", "remove"].includes(action)) {
+        console.error("Usage:\n  tps service register <name> <url> [--port <local-port>] [--desc <text>]\n  tps service list [--json]\n  tps service remove <name>");
+        process.exit(1);
+      }
+      const { runService } = await import("../src/commands/service.js");
+      await runService({
+        action,
+        name: action === "register" ? rest[1] : rest[1],
+        url: action === "register" ? rest[2] : undefined,
+        port: cli.flags.port ? Number(cli.flags.port) : undefined,
+        desc: cli.flags.desc as string | undefined,
+        json: cli.flags.json as boolean | undefined,
+      });
+      break;
+    }
+
     case "memory": {
       // ops-31.2: reflect + consolidate (ops-31.1 governance commands come with PR #67)
       const action = rest[0] as "reflect" | "consolidate" | undefined;
