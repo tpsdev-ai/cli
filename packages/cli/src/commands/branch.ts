@@ -5,8 +5,8 @@ import { spawn } from "node:child_process";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
-import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT } from "../utils/wire-mail.js";
-import { startFlairProxy } from "../utils/flair-proxy.js";
+import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema } from "../utils/wire-mail.js";
+import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
 import { sendMessage } from "../utils/mail.js";
 import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
@@ -244,7 +244,7 @@ async function runStart(): Promise<void> {
 
   const localAgentId = getLocalAgentId();
 
-  let flairProxy: { close: () => void } | null = null;
+  let serviceProxies: ServiceProxySet | null = null;
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {
@@ -268,6 +268,21 @@ async function runStart(): Promise<void> {
       logLine("SYNC", "Heartbeat received — drained outbox");
       return;
     }
+
+    // OPS-122: host advertises services on join — start local proxies
+    if (msg.type === MSG_JOIN_COMPLETE) {
+      const parsed = JoinCompleteBodySchema.safeParse(msg.body);
+      const services = parsed.success ? (parsed.data.services ?? []) : [];
+      if (services.length > 0) {
+        try { serviceProxies?.close(); } catch {}
+        serviceProxies = startServiceProxies(services, channel);
+        for (const h of serviceProxies.handles) {
+          logLine("PROXY", `Service '${h.name}' proxied on 127.0.0.1:${h.port}`);
+        }
+      }
+      return;
+    }
+
     if (msg.type !== MSG_MAIL_DELIVER) return;
     const parsed = MailDeliverBodySchema.safeParse(msg.body);
     if (!parsed.success) {
@@ -333,8 +348,9 @@ async function runStart(): Promise<void> {
 
   server.onConnection((channel) => {
     activeHostChannel = channel;
-    try { flairProxy?.close(); } catch {}
-    flairProxy = startFlairProxy(9927, channel);
+    // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)
+    try { serviceProxies?.close(); } catch {}
+    serviceProxies = null;
   });
 
   const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
@@ -354,7 +370,8 @@ async function runStart(): Promise<void> {
   const onShutdown = async () => {
     logLine("STOPPED", "Signal received");
     try { outboxWatcher.close(); } catch {}
-    try { flairProxy?.close(); } catch {}
+    try { serviceProxies?.close(); } catch {}
+    serviceProxies = null;
     activeHostChannel = null;
     clearBranchState();
     try { await server.close(); } catch {}

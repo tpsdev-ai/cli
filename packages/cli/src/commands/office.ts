@@ -11,6 +11,7 @@ import { provisionTeam } from "../utils/provision.js";
 import { parseOfficeManifest } from "../schema/manifest.js";
 import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/relay.js";
 import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
+import { ensureDefaultServices, listServices } from "../utils/service-registry.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
 import { branchRoot as sharedBranchRoot, resolveTeamId, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
 import { runOfficeManager, OFFICE_READY_MARKER, loadWorkspaceManifest } from "./office-manager.js";
@@ -595,6 +596,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       console.log(`Noise_IK handshake OK — branch fingerprint verified: ${token.fingerprint}`);
 
+      // Ensure default services (e.g. flair) are in the registry before advertising
+      ensureDefaultServices();
+      const advertisedServices = listServices()
+        .filter((s) => s.localPort)
+        .map((s) => ({ name: s.name, localPort: s.localPort!, description: s.description }));
+
       await channel.send({
         type: MSG_JOIN_COMPLETE,
         seq: 0,
@@ -603,6 +610,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           hostPubkey: Buffer.from(hostKp.encryption.publicKey).toString("base64url"),
           hostFingerprint: fingerprint(hostKp.encryption.publicKey),
           hostId: process.env.TPS_HOST_ID || "host",
+          services: advertisedServices,
         },
       });
 
