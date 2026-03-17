@@ -257,6 +257,8 @@ async function runStart(): Promise<void> {
     writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
 
     if (msg.type === MSG_HEARTBEAT) {
+      // Echo heartbeat back so host can track bidirectional liveness
+      await channel.send({ type: MSG_HEARTBEAT, seq: msg.seq, ts: new Date().toISOString(), body: {} }).catch(() => {});
       for (const item of drainOutbox()) {
         await channel.send({
           type: MSG_MAIL_DELIVER,

@@ -12,7 +12,8 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostState, writeHostState, type HostConnectionState } from "./connection-state.js";
+import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
 
@@ -468,6 +469,23 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
+const SERVICE_HEALTH_INTERVAL_MS = 5 * 60_000; // 5 minutes
+
+async function probeServiceHealth(): Promise<ServiceHealth[]> {
+  const services = listServices();
+  const results: ServiceHealth[] = [];
+  const now = new Date().toISOString();
+  for (const svc of services) {
+    try {
+      const url = svc.localPort ? `http://127.0.0.1:${svc.localPort}/` : svc.url;
+      const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(5_000) });
+      results.push({ name: svc.name, status: "healthy", lastCheck: now, lastHealthy: now });
+    } catch (err: any) {
+      results.push({ name: svc.name, status: "unhealthy", lastCheck: now, lastHealthy: null, error: err?.message?.slice(0, 100) });
+    }
+  }
+  return results;
+}
 
 export async function connectAndKeepAlive(
   branchId: string,
@@ -528,17 +546,35 @@ export async function connectAndKeepAlive(
 
         registerServiceProxyHandler(channel);
 
+        // Periodic service health probes
+        const healthProbe = setInterval(async () => {
+          if (stopped || !channel.isAlive()) return;
+          try {
+            const health = await probeServiceHealth();
+            state.services = health;
+            writeHostState(state);
+          } catch {}
+        }, SERVICE_HEALTH_INTERVAL_MS);
+        // Initial probe on connect
+        probeServiceHealth().then((h) => { state.services = h; writeHostState(state); }).catch(() => {});
+
         const handler = (msg: TpsMessage) => {
           state.messagesReceived++;
-          state.lastHeartbeatAck = new Date().toISOString();
-          writeHostState(state);
-          if (msg.type === MSG_MAIL_DELIVER) {
+          const now = new Date().toISOString();
+          if (msg.type === MSG_HEARTBEAT) {
+            // Heartbeat echo from branch — track as ack
+            state.lastHeartbeatAck = now;
+          } else if (msg.type === MSG_MAIL_DELIVER) {
+            state.lastHeartbeatAck = now; // any traffic = alive
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
             if (parsed.success) {
               const b = parsed.data;
               try { sendMessage(b.to, b.content, b.from); } catch {}
             }
+          } else {
+            state.lastHeartbeatAck = now;
           }
+          writeHostState(state);
           opts.onMessage?.(msg);
         };
         channel.onMessage(handler);
@@ -547,6 +583,7 @@ export async function connectAndKeepAlive(
           await new Promise((r) => setTimeout(r, 1000));
         }
         clearInterval(hb);
+        clearInterval(healthProbe);
         channel.offMessage(handler);
         try { await channel.close(); } catch {}
         currentChannel = null;
