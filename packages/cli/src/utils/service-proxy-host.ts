@@ -59,8 +59,14 @@ export function registerServiceProxyHandler(channel: TransportChannel): void {
       return;
     }
 
-    // Validate path — prevent SSRF/traversal
-    const path = req.path;
+    // Validate path — prevent SSRF/traversal (decode first to catch %2e%2e, %2f%2f)
+    let path: string;
+    try {
+      path = decodeURIComponent(req.path);
+    } catch {
+      await sendResponse({ reqId: req.reqId, status: 400, headers: { "content-type": "application/json" }, body: JSON.stringify({ error: "invalid proxy path encoding" }) });
+      return;
+    }
     if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
       await sendResponse({ reqId: req.reqId, status: 400, headers: { "content-type": "application/json" }, body: JSON.stringify({ error: "invalid proxy path" }) });
       return;

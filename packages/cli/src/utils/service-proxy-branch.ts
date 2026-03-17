@@ -93,7 +93,14 @@ export function startServiceProxies(
         chunks.push(buf);
       }
       const bodyStr = Buffer.concat(chunks).toString("utf-8");
-      const path = req.url ?? "/";
+      let path: string;
+      try {
+        path = decodeURIComponent(req.url ?? "/");
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid proxy path encoding" }));
+        return;
+      }
 
       // Validate path
       if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
