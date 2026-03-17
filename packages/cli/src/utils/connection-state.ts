@@ -4,6 +4,14 @@ import { join } from "node:path";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
 
+export interface ServiceHealth {
+  name: string;
+  status: "healthy" | "unhealthy" | "unknown";
+  lastCheck: string | null;
+  lastHealthy: string | null;
+  error?: string;
+}
+
 export interface HostConnectionState {
   branch: string;
   connectedAt: string;
@@ -15,6 +23,7 @@ export interface HostConnectionState {
   messagesSent: number;
   messagesReceived: number;
   pid: number;
+  services?: ServiceHealth[];
 }
 
 export interface BranchConnectionState {
@@ -33,8 +42,8 @@ function branchStatePath(): string {
 }
 
 export function writeHostState(state: HostConnectionState): void {
-  mkdirSync(connectionsDir(), { recursive: true });
-  writeFileSync(hostStatePath(state.branch), JSON.stringify(state, null, 2), "utf-8");
+  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
+  writeFileSync(hostStatePath(state.branch), JSON.stringify(state, null, 2), { encoding: "utf-8", mode: 0o600 });
 }
 
 export function readHostState(branch: string): HostConnectionState | null {

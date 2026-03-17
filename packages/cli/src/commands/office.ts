@@ -471,12 +471,32 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         }
         for (const s of states) {
           const alive = connectionAlive(s.branch);
-          const age = Math.round((Date.now() - new Date(s.connectedAt).getTime()) / 1000);
+          const ageSec = Math.round((Date.now() - new Date(s.connectedAt).getTime()) / 1000);
+          const uptime = ageSec < 60 ? `${ageSec}s` : ageSec < 3600 ? `${Math.floor(ageSec / 60)}m` : `${Math.floor(ageSec / 3600)}h ${Math.floor((ageSec % 3600) / 60)}m`;
+          const lastHb = s.lastHeartbeatSent
+            ? Math.round((Date.now() - new Date(s.lastHeartbeatSent).getTime()) / 1000)
+            : null;
+          const hbStr = lastHb !== null ? `${lastHb}s ago` : "never";
           const lastAck = s.lastHeartbeatAck
             ? Math.round((Date.now() - new Date(s.lastHeartbeatAck).getTime()) / 1000) + "s ago"
             : "never";
-          const anomaly = !alive ? " ⚠️  STALE (PID dead)" : s.reconnectCount > 3 ? ` ⚠️  ${s.reconnectCount} reconnects` : "";
-          console.log(`${s.branch.padEnd(12)} ${alive ? "connected" : "STALE"}  ${age}s  ↑${s.messagesSent}msg  ↓${s.messagesReceived}msg  last ack: ${lastAck}${anomaly}`);
+          const status = !alive ? "🔴 STALE" : "🟢 connected";
+          const anomaly = !alive ? " (PID dead)" : s.reconnectCount > 3 ? ` (${s.reconnectCount} reconnects)` : "";
+          console.log(`${s.branch}:`);
+          console.log(`  Status:     ${status}${anomaly}`);
+          console.log(`  Uptime:     ${uptime} (since ${s.connectedAt})`);
+          console.log(`  Heartbeat:  sent ${hbStr}, ack ${lastAck}`);
+          console.log(`  Reconnects: ${s.reconnectCount}`);
+          console.log(`  Messages:   ↑${s.messagesSent} sent / ↓${s.messagesReceived} received`);
+          if (s.services && s.services.length > 0) {
+            console.log(`  Services:`);
+            for (const svc of s.services) {
+              const icon = svc.status === "healthy" ? "✅" : svc.status === "unhealthy" ? "❌" : "❓";
+              const lastCheck = svc.lastCheck ? `, checked ${Math.round((Date.now() - new Date(svc.lastCheck).getTime()) / 1000)}s ago` : "";
+              console.log(`    ${icon} ${svc.name} (${svc.status}${lastCheck}${svc.error ? `, error: ${svc.error}` : ""})`);
+            }
+          }
+          console.log();
         }
         return;
       }
