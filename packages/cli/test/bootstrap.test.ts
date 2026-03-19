@@ -103,7 +103,8 @@ exit 0
 
     expect(existsSync(join(tempRoot, ".tps", "bootstrap-state", agentId, ".bootstrap-complete"))).toBe(true);
 
-    const mailDir = join(workspace, "mail", "inbox", "new");
+    // Canonical path: branch-office/<agent>/mail/new/ (matches getInbox().fresh)
+    const mailDir = join(workspace, "mail", "new");
     const mailFiles = readdirSync(mailDir).filter((f) => f.endsWith(".json"));
     expect(mailFiles.length).toBeGreaterThanOrEqual(1);
 

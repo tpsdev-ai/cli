@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { sanitizeIdentifier, sanitizeFreeText, sanitizeModelIdentifier } from "../schema/sanitizer.js";
 import { workspacePath as resolveWorkspacePath, resolveTeamId, branchRoot as workspaceRoot } from "../utils/workspace.js";
 import { runCommandUnderNono } from "../utils/nono.js";
-import { deliverToSandbox } from "../utils/relay.js";
+import { deliverToSandbox, resolveAgentMailRoot } from "../utils/relay.js";
 import { readOpenClawConfig, findOpenClawConfig, type OpenClawConfig } from "../utils/config.js";
 
 export interface BootstrapArgs {
@@ -168,10 +168,12 @@ function healthGateway(): boolean {
   return runCommandUnderNono("tps-bootstrap", {}, ["openclaw", "gateway", "status"]) === 0;
 }
 
-function healthMail(teamWorkspace: string, teamId: string): boolean {
-  const inbox = join(teamWorkspace, "mail", "inbox", "new");
-  mkdirSync(inbox, { recursive: true });
-  const before = readdirSync(inbox).filter((f) => f.endsWith(".json")).length;
+function healthMail(_teamWorkspace: string, teamId: string): boolean {
+  // Use resolveAgentMailRoot() — same path derivation as deliverToSandbox()
+  const mailRoot = resolveAgentMailRoot(teamId);
+  const freshDir = join(mailRoot, "new");
+  mkdirSync(freshDir, { recursive: true });
+  const before = readdirSync(freshDir).filter((f) => f.endsWith(".json")).length;
 
   const msg = {
     id: randomUUID(),
@@ -187,24 +189,25 @@ function healthMail(teamWorkspace: string, teamId: string): boolean {
     return false;
   }
 
-  const after = readdirSync(inbox).filter((f) => f.endsWith(".json")).length;
+  const after = readdirSync(freshDir).filter((f) => f.endsWith(".json")).length;
 
   if (after <= before) {
     return false;
   }
 
-  // mark probe as received by attempting to move one file to cur (read path) and parse
+  // mark probe as received by moving one file to cur and parsing
   try {
-    const files = readdirSync(inbox)
+    const curDir = join(mailRoot, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const files = readdirSync(freshDir)
       .filter((f) => f.endsWith(".json"))
       .sort()
       .reverse();
-    const probe = join(inbox, files[0]!);
+    const probe = join(freshDir, files[0]!);
     const raw = readFileSync(probe, "utf-8");
     const parsed = JSON.parse(raw);
     if (!parsed.from?.startsWith("system:")) return false;
-    mkdirSync(join(teamWorkspace, "mail", "inbox", "cur"), { recursive: true });
-    renameSync(probe, join(teamWorkspace, "mail", "inbox", "cur", files[0]!));
+    renameSync(probe, join(curDir, files[0]!));
   } catch {
     return false;
   }
@@ -212,10 +215,7 @@ function healthMail(teamWorkspace: string, teamId: string): boolean {
   return true;
 }
 
-function sendIntroduction(teamId: string, teamWorkspace: string, body: string): void {
-  const inbox = join(teamWorkspace, "mail", "inbox", "new");
-  mkdirSync(inbox, { recursive: true });
-
+function sendIntroduction(teamId: string, _teamWorkspace: string, body: string): void {
   deliverToSandbox(teamId, {
     id: randomUUID(),
     from: "system:bootstrap",

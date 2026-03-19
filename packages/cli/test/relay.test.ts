@@ -104,14 +104,19 @@ describe("relay utils", () => {
     expect(curFiles.length).toBe(1);
   });
 
-  test("deliverToSandbox writes to inbox/new atomically", async () => {
+  test("deliverToSandbox writes to mail/new (canonical inbox path)", async () => {
+    // Pre-create the branch-office mail root so getInbox() treats brancha as a branch agent
+    const branchMail = join(root, ".tps", "branch-office", "brancha", "mail");
+    mkdirSync(branchMail, { recursive: true });
+
     deliverToSandbox("brancha", {
       to: "brancha",
       from: "flint",
       body: "hi from host",
     });
 
-    const inbox = join(root, ".tps", "branch-office", "brancha", "mail", "inbox", "new");
+    // Canonical path: branch-office/<agent>/mail/new/ (matches getInbox().fresh)
+    const inbox = join(branchMail, "new");
     const files = readdirSync(inbox).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(1);
     const payload = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
@@ -146,7 +151,7 @@ describe("relay utils", () => {
     };
 
     mkdirSync(teamDir, { recursive: true });
-    mkdirSync(join(workspaceMail, "inbox", "new"), { recursive: true });
+    mkdirSync(join(workspaceMail, "new"), { recursive: true });
     writeJson(join(teamDir, "team.json"), teamSidecar);
 
     // Test delivery to member
@@ -156,8 +161,8 @@ describe("relay utils", () => {
       body: "hello team member",
     });
 
-    // Verify it landed in team workspace inbox
-    const inbox = join(workspaceMail, "inbox", "new");
+    // Canonical path: workspaceMail/new/ (matches getInbox().fresh)
+    const inbox = join(workspaceMail, "new");
     const files = readdirSync(inbox).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(1);
     const msg = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
