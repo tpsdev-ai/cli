@@ -29,6 +29,11 @@ export interface RelayMessage {
   error?: string;
 }
 
+/** Returns the mail root dir for an agent (branch-office or team workspace). Used by deliverToSandbox and external callers that need to read delivered messages. */
+export function resolveAgentMailRoot(agentId: string): string {
+  return resolveDeliveryPath(agentId);
+}
+
 function resolveDeliveryPath(agentId: string): string {
   const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office");
   if (!existsSync(branchDir)) return join(branchDir, agentId, "mail");
@@ -605,11 +610,40 @@ export async function connectAndKeepAlive(
   };
 }
 
+/**
+ * One-time migration: move any orphaned messages from the old
+ * `mail/inbox/new/` path into the canonical `mail/new/` path.
+ * Safe to call on every delivery — exits early if nothing to migrate.
+ */
+function migrateOrphanedInboxMessages(mailRoot: string): void {
+  const legacyDir = join(mailRoot, "inbox", "new");
+  if (!existsSync(legacyDir)) return;
+  const freshDir = join(mailRoot, "new");
+  try {
+    const files = readdirSync(legacyDir).filter((f) => f.endsWith(".json"));
+    for (const f of files) {
+      const src = join(legacyDir, f);
+      const dst = join(freshDir, f);
+      if (!existsSync(dst)) {
+        renameSync(src, dst);
+      }
+    }
+  } catch {
+    // Non-fatal — best-effort migration
+  }
+}
+
 export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   assertAgent(agentId);
-  const root = branchRoot(agentId);
-  const inboxNew = join(root, "inbox", "new");
-  ensureDir(inboxNew);
+
+  // branchRoot() returns the mail root (e.g. ~/.tps/branch-office/<agent>/mail or team workspace/mail)
+  // Messages always go to <mailRoot>/new/ — this matches where tps mail check reads from.
+  const mailRoot = branchRoot(agentId);
+  const freshDir = join(mailRoot, "new");
+  ensureDir(freshDir);
+
+  // Migrate any orphaned messages from old inbox/new/ path on first delivery
+  migrateOrphanedInboxMessages(mailRoot);
 
   const payload = {
     id: message.id || randomUUID(),
@@ -622,5 +656,5 @@ export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   };
 
   const filename = `${timestampPrefix()}-${randomUUID()}.json`;
-  atomicWriteJson(join(inboxNew, filename), payload);
+  atomicWriteJson(join(freshDir, filename), payload);
 }

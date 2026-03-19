@@ -81,7 +81,8 @@ describe("handleIncomingMail", () => {
   });
 
   test("delivers valid mail to local inbox", async () => {
-    const inbox = join(tmpDir, ".tps", "branch-office", "local-agent", "mail", "inbox", "new");
+    // Canonical path: branch-office/<agent>/mail/new/ (matches getInbox().fresh)
+    const inbox = join(tmpDir, ".tps", "branch-office", "local-agent", "mail", "new");
     mkdirSync(inbox, { recursive: true });
 
     const { handleIncomingMail } = await import("../src/utils/relay.js");
