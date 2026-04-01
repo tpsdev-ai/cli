@@ -204,6 +204,9 @@ export function checkMessages(agent: string, checkedOutBy = agent): MailMessage[
     messages.push(msg);
   }
 
+  // Best-effort GC: purge acked/expired messages older than 24h on every check
+  try { gcMessages(agent); } catch { /* never block delivery */ }
+
   return messages.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }
 
