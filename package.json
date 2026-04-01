@@ -18,5 +18,8 @@
     "typescript": "^5.7.0"
   },
   "author": "tpsdev-ai",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "dependencies": {
+    "handlebars": "^4.7.9"
+  }
 }
