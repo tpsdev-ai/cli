@@ -1,0 +1,36 @@
+{
+  "name": "@tpsdev-ai/openclaw-tps-mail",
+  "version": "0.1.0",
+  "description": "OpenClaw channel plugin for TPS mail — inter-agent messaging via the local filesystem mail queue",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src/index.ts",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "openclaw-channel",
+    "tps",
+    "tps-mail",
+    "agent-messaging"
+  ],
+  "license": "Apache-2.0",
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.7"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {}
+}

@@ -1,0 +1,23 @@
+{
+  "id": "openclaw-tps-mail",
+  "channels": [
+    "tps-mail"
+  ],
+  "uiHints": {
+    "mailDir": {
+      "label": "TPS Mail Directory",
+      "placeholder": "~/.tps/mail",
+      "help": "Root directory containing per-agent mail inboxes (new/, cur/, tmp/, dlq/, outbox/)",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mailDir": {
+        "type": "string"
+      }
+    }
+  }
+}
