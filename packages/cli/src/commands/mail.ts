@@ -286,8 +286,10 @@ export async function runMail(args: MailArgs): Promise<void> {
         if (!existsSync(dir)) continue;
         const files = readdirSync(dir).filter(f => f.endsWith(".json"));
         for (const f of files) {
-          const msg = JSON.parse(readFileSync(join(dir, f), "utf-8")) as MailMessage;
-          if (msg.id === id || msg.id.startsWith(id)) { found = msg; break; }
+          try {
+            const msg = JSON.parse(readFileSync(join(dir, f), "utf-8")) as MailMessage;
+            if (msg.id === id || msg.id.startsWith(id)) { found = msg; break; }
+          } catch { /* skip corrupt files */ }
         }
         if (found) break;
       }

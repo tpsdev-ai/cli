@@ -68,6 +68,11 @@ function readMessageSafe(filePath: string): MailMessage | null {
   } catch (err: unknown) {
     // ENOENT: file moved to cur/ between readdir and read — expected race
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    // JSON parse error: corrupt file — log and skip instead of crashing
+    if (err instanceof SyntaxError) {
+      console.error(`[mail-watch] skipping corrupt message ${filePath}: ${err.message}`);
+      return null;
+    }
     throw err;
   }
 }

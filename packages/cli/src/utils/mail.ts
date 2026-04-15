@@ -77,15 +77,18 @@ export function getInbox(agent: string): { root: string; tmp: string; fresh: str
 
 function readMessagesFromDir(dir: string, read: boolean): MailMessage[] {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith(".json"))
-    .map((f) => {
+  const messages: MailMessage[] = [];
+  for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
+    try {
       const raw = readFileSync(join(dir, f), "utf-8");
       const msg = JSON.parse(raw) as MailMessage;
       msg.read = read;
-      return msg;
-    })
-    .sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+      messages.push(msg);
+    } catch (err: any) {
+      console.error(`[mail] skipping corrupt message ${f}: ${err.message}`);
+    }
+  }
+  return messages.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }
 
 function listMessageFiles(dir: string): string[] {
@@ -94,7 +97,11 @@ function listMessageFiles(dir: string): string[] {
 }
 
 function readMessageFile(path: string): MailMessage {
-  return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
+  try {
+    return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
+  } catch (err: any) {
+    throw new Error(`corrupt message file ${path}: ${err.message}`);
+  }
 }
 
 function writeMessageFile(path: string, msg: MailMessage): void {
