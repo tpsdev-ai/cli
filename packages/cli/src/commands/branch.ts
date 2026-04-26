@@ -384,8 +384,10 @@ async function runStart(): Promise<void> {
   process.on("SIGTERM", onShutdown);
   process.on("SIGINT", onShutdown);
 
-  // Keep alive
-  setInterval(() => {}, 60_000);
+  // Keep alive — bun does not treat a no-op interval as a ref'd handle, so the
+  // event loop drains and the daemon exits ~150ms after listen(). A
+  // never-resolving promise holds the loop until SIGTERM/SIGINT calls process.exit.
+  await new Promise<void>(() => {});
 }
 
 async function runStop(): Promise<void> {
