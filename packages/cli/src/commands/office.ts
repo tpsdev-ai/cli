@@ -558,7 +558,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         stop();
         process.exit(0);
       });
-      setInterval(() => {}, 60_000);
+      // bun drops the no-op interval; hold the loop until SIGTERM/SIGINT.
+      await new Promise<void>(() => {});
       return;
     }
 
@@ -695,7 +696,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         await stop();
         process.exit(0);
       });
-      setInterval(() => {}, 60_000);
+      // bun drops the no-op interval; hold the loop until SIGTERM/SIGINT.
+      await new Promise<void>(() => {});
       return;
     }
 
