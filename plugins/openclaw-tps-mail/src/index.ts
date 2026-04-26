@@ -372,20 +372,20 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     );
 
     const watchers: FSWatcher[] = [];
+    // seenFiles dedupes inotify events (fs.watch can fire multiple times per
+    // write — see the debounce in the watcher callback). It is intentionally
+    // NOT pre-populated from the existing new/ snapshot at startup: any file
+    // already sitting in new/ when the gateway starts is mail that arrived
+    // while the gateway was down (or that a previous turn never ack'd) and
+    // MUST be processed on this startup, not silently swallowed.
+    //
+    // Replay safety comes from `moveToCur` after dispatch — successful turns
+    // ack and move the file to cur/, failed dispatches nack and also move to
+    // cur/, malformed files are moved to dlq/. None of these paths leave a
+    // file in new/, so re-processing the same id twice is impossible across
+    // restarts unless the gateway crashed mid-turn (acceptable: at-least-once
+    // delivery is the contract).
     const seenFiles = new Set<string>();
-
-    // Pre-populate seenFiles with existing entries in new/ so we don't replay
-    // mail from before plugin startup. This matches the behavior of the old
-    // tps mail watch CLI.
-    for (const agentId of boundAgents) {
-      const newDir = resolve(account.mailDir, agentId, "new");
-      if (!existsSync(newDir)) continue;
-      try {
-        for (const filename of readdirSync(newDir)) {
-          seenFiles.add(resolve(newDir, filename));
-        }
-      } catch { /* ignore */ }
-    }
 
     async function processNewFile(recipient: string, filePath: string): Promise<void> {
       if (seenFiles.has(filePath)) return;
