@@ -155,6 +155,61 @@ function writeMailFile(mailDir: string, recipient: string, message: TpsMailBody)
 }
 
 /**
+ * Write to ~/.tps/outbox/new/ for cross-host delivery via the TPS branch
+ * service. The branch service drains this directory on each heartbeat and
+ * relays messages over the wire to the host, which dispatches to the
+ * recipient's actual host. Format matches packages/cli/src/utils/outbox.ts
+ * `OutboxMessage`.
+ */
+function writeOutboxFile(message: TpsMailBody): string {
+  const outboxNew = resolve(process.env.HOME ?? homedir(), ".tps", "outbox", "new");
+  mkdirSync(outboxNew, { recursive: true });
+  const tsSlug = message.timestamp.replace(/[:.]/g, "-");
+  const filename = `${tsSlug}-${message.id}.json`;
+  const target = resolve(outboxNew, filename);
+  writeFileSync(
+    target,
+    JSON.stringify(
+      {
+        id: message.id,
+        to: message.to,
+        from: message.from,
+        body: message.body,
+        timestamp: message.timestamp,
+      },
+      null,
+      2,
+    ),
+    "utf-8",
+  );
+  return target;
+}
+
+/**
+ * Decide where to write outbound mail.
+ * - Local recipient (bound to this gateway via `bindings`): write to the
+ *   recipient's local inbox so the watcher picks it up directly.
+ * - Remote recipient (no binding): write to ~/.tps/outbox/new/ so the
+ *   branch service relays it over the wire to the appropriate host.
+ *
+ * Without this split, replies addressed to off-host agents (the cross-host
+ * case) silently land in this host's local mail/<recipient>/new/ and
+ * never reach the actual recipient.
+ */
+function deliverOutboundMail(
+  cfg: any,
+  accountId: string,
+  mailDir: string,
+  message: TpsMailBody,
+): { path: string; route: "local" | "outbox" } {
+  const localAgents = findBoundAgents(cfg, accountId);
+  if (localAgents.includes(message.to)) {
+    return { path: writeMailFile(mailDir, message.to, message), route: "local" };
+  }
+  return { path: writeOutboxFile(message), route: "outbox" };
+}
+
+/**
  * Move a mail file from <inbox>/new/ to <inbox>/cur/ with the given state
  * patch applied (typically `ackedAt` on success or `nackedAt` on failure).
  *
@@ -272,12 +327,17 @@ const outbound: ChannelOutboundAdapter = {
       },
       deliveryAttempts: 0,
     };
-    const filePath = writeMailFile(account.mailDir, ctx.to, message);
+    const { path: filePath, route } = deliverOutboundMail(
+      ctx.cfg as any,
+      ctx.accountId ?? "default",
+      account.mailDir,
+      message,
+    );
     return {
       ok: true,
       id: message.id,
       externalId: message.id,
-      details: { path: filePath },
+      details: { path: filePath, route },
     } as any;
   },
 };
@@ -433,9 +493,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 },
                 deliveryAttempts: 0,
               };
-              writeMailFile(account.mailDir, msg.from, reply);
+              const { route } = deliverOutboundMail(
+                cfg as any,
+                ctx.accountId ?? "default",
+                account.mailDir,
+                reply,
+              );
               log?.info?.(
-                `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher)`,
+                `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${route})`,
               );
             },
           },
