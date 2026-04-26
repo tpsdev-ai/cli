@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from "node
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { checkMessages, getInbox, listMessages, sendMessage } from "../src/utils/mail.js";
+import { checkMessages, getInbox, inboxExists, listMessages, sendMessage } from "../src/utils/mail.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 
@@ -67,6 +67,25 @@ describe("mail utils", () => {
   test("rejects body over 64KB", () => {
     const huge = "a".repeat(70_000);
     expect(() => sendMessage("kern", huge, "anvil")).toThrow(/64KB/);
+  });
+
+  test("inboxExists is false until something writes to the inbox", () => {
+    expect(inboxExists("never-seen")).toBe(false);
+    sendMessage("never-seen", "hello", "anvil");
+    expect(inboxExists("never-seen")).toBe(true);
+  });
+
+  test("inboxExists does not create the inbox dir", () => {
+    expect(inboxExists("ghost")).toBe(false);
+    // Calling it again still returns false — no side effect.
+    expect(inboxExists("ghost")).toBe(false);
+    // listMessages on a never-created agent returns [] without crashing.
+    expect(listMessages("ghost")).toEqual([]);
+  });
+
+  test("inboxExists returns false for invalid ids without throwing", () => {
+    expect(inboxExists("../etc/passwd")).toBe(false);
+    expect(inboxExists("")).toBe(false);
   });
 });
 

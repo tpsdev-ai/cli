@@ -56,6 +56,23 @@ export function getMailDir(): string {
   return dir;
 }
 
+/**
+ * Returns true if an inbox directory already exists for `agent` — without
+ * creating one. Use this when you need to choose a routing target between
+ * candidate recipients (e.g. branch service deciding whether to deliver to
+ * body.to or fall back to its own identity).
+ */
+export function inboxExists(agent: string): boolean {
+  try {
+    assertValidAgentId(agent);
+  } catch {
+    return false;
+  }
+  const branchMailRoot = join(process.env.HOME || homedir(), ".tps", "branch-office", agent, "mail");
+  if (existsSync(branchMailRoot)) return true;
+  return existsSync(join(getMailDir(), agent));
+}
+
 export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
   assertValidAgentId(agent);
 
