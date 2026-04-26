@@ -7,7 +7,7 @@ import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
 import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema } from "../utils/wire-mail.js";
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
-import { sendMessage } from "../utils/mail.js";
+import { sendMessage, inboxExists } from "../utils/mail.js";
 import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
@@ -314,15 +314,18 @@ async function runStart(): Promise<void> {
         logLine("HANDLER", `Message ${body.id} dropped`);
         break;
       case "inbox":
-      default:
-        // Store under localAgentId (branch's own identity), not body.to.
-        // body.to may be a GAL logical name (e.g. "anvil") that differs from
-        // the branch's identity dir (e.g. "tps-anvil"). Preserving body.to
-        // in the message metadata keeps the original recipient visible.
-        try { sendMessage(localAgentId, body.content, body.from); } catch (e: any) {
+      default: {
+        // Route by body.to when the recipient has an inbox on this branch
+        // (multi-agent case: tps-anvil hosts both `anvil` and `anvil-2`).
+        // Fall back to localAgentId when body.to has no inbox here — that
+        // preserves the original behavior for the GAL-alias case where
+        // body.to is a logical name that doesn't match any local agent dir.
+        const recipient = inboxExists(body.to) ? body.to : localAgentId;
+        try { sendMessage(recipient, body.content, body.from); } catch (e: any) {
           logLine("WARN", `Mail write failed: ${e.message}`);
         }
         break;
+      }
     }
 
     await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } }).catch(() => {});
