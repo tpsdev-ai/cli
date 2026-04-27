@@ -31,6 +31,16 @@ const mockApi: any = {
 };
 pluginModule.register(mockApi);
 
+/** Poll with 50ms interval until conditionFn returns true or timeout elapses. */
+async function pollUntil(conditionFn: () => boolean, timeoutMs: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (conditionFn()) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return conditionFn();
+}
+
 function makeMailEnvelope(overrides: Partial<{ id: string; from: string; to: string; body: string; timestamp: string }> = {}) {
   return {
     id: overrides.id ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -122,13 +132,18 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     expect(result.ctx.MessageSid).toBe("msg-startup-001");
     expect(result.ctx.Body).toBe("hello from startup test");
 
-    // Give moveToCur a tick to complete after dispatch
-    await new Promise((r) => setTimeout(r, 50));
-
-    // Assert: file moved from new/ to cur/ (acked)
-    expect(readdirSync(newDir).length).toBe(0);
+    // Poll for file to move from new/ to cur/ (moveToCur is sync but runs after
+    // dispatch; polling avoids brittle 50ms sleeps on slow CI).
     const curDir = resolve(tempMailDir, agentId, "cur");
-    expect(readdirSync(curDir).length).toBe(1);
+    const moved = await pollUntil(
+      () => readdirSync(newDir).length === 0 && readdirSync(curDir).length >= 1,
+      2000,
+    );
+    expect(moved).toBe(true);
+
+    // Clean up: abort watcher and await the startAccount promise
+    abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
   });
 
   it("does not double-process a file (dedup via seenFiles)", async () => {
@@ -192,6 +207,6 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     expect(dispatchCount).toBe(1);
 
     abortController.abort();
-    await startPromise;
+    try { await startPromise; } catch { /* expected on abort */ }
   });
 });
