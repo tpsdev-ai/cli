@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from "node
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { checkMessages, getInbox, inboxExists, listMessages, sendMessage } from "../src/utils/mail.js";
+import { checkMessages, getInbox, inboxExists, listMessages, sendMessage, ackMessage, countInboxMessages } from "../src/utils/mail.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 
@@ -86,6 +86,46 @@ describe("mail utils", () => {
   test("inboxExists returns false for invalid ids without throwing", () => {
     expect(inboxExists("../etc/passwd")).toBe(false);
     expect(inboxExists("")).toBe(false);
+  });
+
+  test("ackMessage removes the file from cur/", () => {
+    const m = sendMessage("kern", "ack-test", "anvil");
+    expect(m.to).toBe("kern");
+    const inbox = getInbox("kern");
+
+    // Move from new -> cur via check
+    checkMessages("kern");
+    expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length).toBe(0);
+
+    const curFilesBefore = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
+    expect(curFilesBefore.length).toBe(1);
+
+    // Ack removes it
+    const acked = ackMessage("kern", m.id);
+    expect(acked).not.toBeNull();
+
+    const curFilesAfter = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
+    expect(curFilesAfter.length).toBe(0);
+  });
+
+  test("countInboxMessages drops after ack", () => {
+    // Send 5 messages
+    for (let i = 0; i < 5; i++) {
+      sendMessage("kern", `msg-${i}`, "anvil");
+    }
+    expect(countInboxMessages("kern")).toBe(5);
+
+    // Check all (moves new -> cur)
+    const msgs = checkMessages("kern");
+    expect(msgs.length).toBe(5);
+    expect(countInboxMessages("kern")).toBe(5);
+
+    // Ack 3
+    ackMessage("kern", msgs[0]!.id);
+    ackMessage("kern", msgs[1]!.id);
+    ackMessage("kern", msgs[2]!.id);
+
+    expect(countInboxMessages("kern")).toBe(2);
   });
 });
 
