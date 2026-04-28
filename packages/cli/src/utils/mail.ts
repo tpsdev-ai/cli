@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -256,6 +256,8 @@ export function ackMessage(agent: string, id: string): MailMessage | null {
   delete msg.checkedOutBy;
   delete msg.retryAfter;
   writeMessageFile(path, msg);
+  // Remove the file from cur/ now that it's acked — audit trail is in log/
+  try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
   return msg;
 }
 
