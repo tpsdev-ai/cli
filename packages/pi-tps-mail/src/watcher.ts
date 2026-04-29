@@ -1,7 +1,7 @@
 // Watcher core logic
 import { spawn } from "node:child_process";
 import { readdir, readFile, rename } from "node:fs/promises";
-import { join, basename } from "node:path";
+import { join, basename, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { MailMessage, MailWatcher, WatchOptions } from "./types.js";
@@ -9,27 +9,42 @@ import type { MailMessage, MailWatcher, WatchOptions } from "./types.js";
 const DEFAULT_TIMEOUT_MS = 1_800_000; // 30 minutes
 const POLL_INTERVAL_MS = 5000;
 
+const VALID_AGENT_ID = /^[a-zA-Z0-9_-]+$/;
+
 function getAgentPaths(inboxRoot: string, options: WatchOptions): {
   inboxNew: string;
   inboxCur: string;
   launcher: string;
   tpsVaultKey: string;
-  tpsCli: string;
+  tpsBin: string;
   agentId: string;
 } {
   const agent = options.agent ?? "ember";
+  
+  // Validate agent ID to prevent path traversal
+  if (!VALID_AGENT_ID.test(agent)) {
+    throw new Error(`Invalid agent ID: ${agent}`);
+  }
+  
   const launcher = options.launcher ?? join(inboxRoot, "agents", agent, "bin", agent);
   const inboxNew = join(inboxRoot, ".tps", "mail", agent, "new");
   const inboxCur = join(inboxRoot, ".tps", "mail", agent, "cur");
-  const tpsVaultKey = process.env.TPS_VAULT_KEY ?? "tps-rockit-2026";
-  const tpsCli = "packages/cli/dist/bin/tps.js";
+  
+  // Require TPS_VAULT_KEY env var — no fallback credential
+  const tpsVaultKey = process.env.TPS_VAULT_KEY;
+  if (!tpsVaultKey) {
+    throw new Error("TPS_VAULT_KEY is required");
+  }
+  
+  // Use installed CLI on PATH, or env var override
+  const tpsBin = process.env.TPS_BIN || "tps";
   
   return {
     inboxNew,
     inboxCur,
     launcher,
     tpsVaultKey,
-    tpsCli,
+    tpsBin,
     agentId: agent,
   };
 }
@@ -76,6 +91,14 @@ async function dispatchMessage(
     throw err;
   }
 
+  // Validate launcher path to prevent arbitrary exec
+  const expectedDir = join(inboxRoot, "agents", paths.agentId, "bin");
+  const resolvedLauncher = resolve(paths.launcher);
+  const sep = "/";
+  if (!resolvedLauncher.startsWith(expectedDir + sep) && resolvedLauncher !== expectedDir) {
+    throw new Error(`Launcher must be within ${expectedDir}`);
+  }
+
   // Delegate to the agent launcher — it owns provider/model selection
   // Launcher args: first any configured args, then the message body
   const launcherArgs = options.launcherArgs ?? [];
@@ -113,28 +136,48 @@ async function dispatchMessage(
     ? `(launcher dispatch timed out after ${timeoutMs}ms — partial stdout ${stdout.length}B, stderr: ${stderr.slice(0, 500)})`
     : (stdout.trim() || `(no output, stderr: ${stderr.slice(0, 500)})`);
 
-  // Send reply via TPS mail CLI
-  const send = spawn("bun", ["run", paths.tpsCli, "mail", "send", sender, reply], {
+  // Send reply via TPS mail CLI with timeout
+  const send = spawn(paths.tpsBin, ["mail", "send", sender, reply], {
     env: { ...process.env, TPS_VAULT_KEY: paths.tpsVaultKey, TPS_AGENT_ID: paths.agentId },
-    cwd: join(inboxRoot, "ops", "tps"),
     stdio: ["ignore", "pipe", "pipe"],
   });
+  
+  let sendTimedOut = false;
+  const sendTimer = setTimeout(() => {
+    sendTimedOut = true;
+    console.error(`[${new Date().toISOString()}] tps mail send TIMEOUT — killing pid ${send.pid}`);
+    try { send.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { send.kill("SIGKILL"); } catch {} }, 5_000).unref();
+  }, 5_000);
+  sendTimer.unref();
+  
   const sendCode = await new Promise<number>((r) => send.on("close", r));
+  clearTimeout(sendTimer);
   if (sendCode !== 0) {
-    console.error(`[${new Date().toISOString()}] tps mail send failed with ${sendCode} for ${msgId}`);
+    console.error(`[${new Date().toISOString()}] tps mail send failed with ${sendCode} for ${msgId}${sendTimedOut ? " (timed out)" : ""}`);
   } else {
     console.log(`[${new Date().toISOString()}] replied to ${sender} (${reply.length} chars)`);
   }
 
-  // Ack the original message
-  const ack = spawn("bun", ["run", paths.tpsCli, "mail", "ack", msgId, paths.agentId], {
+  // Ack the original message with timeout
+  const ack = spawn(paths.tpsBin, ["mail", "ack", msgId, paths.agentId], {
     env: { ...process.env, TPS_VAULT_KEY: paths.tpsVaultKey, TPS_AGENT_ID: paths.agentId },
-    cwd: join(inboxRoot, "ops", "tps"),
     stdio: ["ignore", "pipe", "pipe"],
   });
+  
+  let ackTimedOut = false;
+  const ackTimer = setTimeout(() => {
+    ackTimedOut = true;
+    console.error(`[${new Date().toISOString()}] tps mail ack TIMEOUT — killing pid ${ack.pid}`);
+    try { ack.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { ack.kill("SIGKILL"); } catch {} }, 5_000).unref();
+  }, 5_000);
+  ackTimer.unref();
+  
   const ackCode = await new Promise<number>((r) => ack.on("close", r));
+  clearTimeout(ackTimer);
   if (ackCode !== 0) {
-    console.error(`[${new Date().toISOString()}] tps mail ack failed with ${ackCode} for ${msgId}`);
+    console.error(`[${new Date().toISOString()}] tps mail ack failed with ${ackCode} for ${msgId}${ackTimedOut ? " (timed out)" : ""}`);
   } else {
     console.log(`[${new Date().toISOString()}] acked ${msgId}`);
   }
