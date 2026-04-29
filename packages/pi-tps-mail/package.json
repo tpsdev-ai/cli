@@ -1,0 +1,54 @@
+{
+  "name": "@tpsdev-ai/pi-tps-mail",
+  "version": "0.1.0",
+  "description": "TPS Mail watcher for Pi dispatch with launcher delegation and hard timeout",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./watcher": {
+      "import": "./dist/watcher.js",
+      "types": "./dist/watcher.d.ts"
+    },
+    "./bin": {
+      "import": "./dist/bin.js",
+      "types": "./dist/bin.d.ts"
+    }
+  },
+  "bin": {
+    "tps-mail-watcher": "./dist/bin.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "bun test",
+    "lint": "biome lint ./src",
+    "lint:ci": "biome lint ./src --max-diagnostics=200"
+  },
+  "keywords": [
+    "agents",
+    "tps",
+    "mail",
+    "pi",
+    "watcher"
+  ],
+  "license": "Apache-2.0",
+  "dependencies": {
+    "glob": "^10.4.5",
+    "minimist": "^1.2.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.4",
+    "@types/minimist": "^1.2.5",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "author": "tpsdev-ai",
+  "publishConfig": {
+    "access": "public"
+  }
+}
