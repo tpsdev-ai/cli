@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
-# test-ci-gate.sh - Test script for the CG gate
+# test-ci-gate.sh - Test script for the CI gate
 
-set -euo pipefail
+set -uo pipefail
 
-GATE_SCRIPT="scripts/mail-send-ci-gate.sh"
+GATE_SCRIPT="$(dirname "$0")/mail-send-ci-gate.sh"
+
+# Gate uses TPS_AGENT_ID via gh-as; set a sensible default for the test harness.
+export TPS_AGENT_ID="${TPS_AGENT_ID:-anvil}"
 
 echo "Testing CI gate..."
 
-# Test 1: Non-existent PR (should fail)
+# Test 1: Non-existent PR (gate should reject)
 echo "Test 1: Non-existent PR (expecting failure)"
-"$GATE_SCRIPT" test "DONE https://github.com/tpsdev-ai/cli/pull/999999" 2>&1
-result=$?
+result=0
+"$GATE_SCRIPT" test "DONE https://github.com/tpsdev-ai/cli/pull/999999" 2>&1 || result=$?
 if [[ $result -ne 0 ]]; then
     echo "Test 1 PASSED: gate correctly rejected non-existent PR (exit code $result)"
 else
-    echo "Test 1 FAILED: gate should have rejected non-existent PR but didn't"
+    echo "Test 1 FAILED: gate should have rejected non-existent PR but did not"
     exit 1
 fi
 
-# Test 2: Known green PR (should pass)
+# Test 2: Known green PR (gate should allow)
 echo "Test 2: Known green PR (expecting success)"
-"$GATE_SCRIPT" test "DONE https://github.com/tpsdev-ai/cli/pull/271" 2>&1
-result=$?
+result=0
+"$GATE_SCRIPT" test "DONE https://github.com/tpsdev-ai/cli/pull/271" 2>&1 || result=$?
 if [[ $result -eq 0 ]]; then
     echo "Test 2 PASSED: gate correctly allowed green PR (exit code $result)"
 else
@@ -29,10 +32,10 @@ else
     exit 1
 fi
 
-# Test 3: Non-DONE message (should pass)
+# Test 3: Non-DONE message (gate should pass through)
 echo "Test 3: Non-DONE message (expecting success)"
-"$GATE_SCRIPT" test "Just a regular message" 2>&1
-result=$?
+result=0
+"$GATE_SCRIPT" test "Just a regular message" 2>&1 || result=$?
 if [[ $result -eq 0 ]]; then
     echo "Test 3 PASSED: gate correctly allowed non-DONE message (exit code $result)"
 else
