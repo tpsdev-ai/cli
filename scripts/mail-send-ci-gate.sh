@@ -83,15 +83,18 @@ if echo "$BODY" | grep -q -E 'DONE[[:space:]]+https?://[^[:space:]]+'; then
             die "Could not extract repo path from URL: $PR_URL"
         fi
 
-        # Now run gh-as.
-        # We'll use the JSON output and check the statusCheckRollup.
-        # We'll look for any check that is not SUCCESS.
-        # We'll use jq to parse the JSON.
-
-        # We'll run the command and capture the output.
-        # We'll set a timeout for the gh-as command.
-        CHECK_OUTPUT=$(gh-as "$AGENT_ID" pr view "$PR_NUMBER" --repo "$REPO_PATH" --json statusCheckRollup 2>/dev/null) || \
-            die "Failed to fetch PR status for $PR_URL using gh-as"
+        # Prefer gh-as for per-agent attribution (so the check shows the
+        # invoking agent's identity in audit logs); fall back to plain gh on
+        # hosts where gh-as isn't installed (e.g. tps-anvil currently).
+        # Either tool returns the same JSON shape for `pr view --json statusCheckRollup`.
+        if command -v gh-as >/dev/null 2>&1; then
+            GH_CMD=(gh-as "$AGENT_ID")
+        else
+            echo "gh-as not found; falling back to gh (assuming current user)" >&2
+            GH_CMD=(gh)
+        fi
+        CHECK_OUTPUT=$("${GH_CMD[@]}" pr view "$PR_NUMBER" --repo "$REPO_PATH" --json statusCheckRollup 2>/dev/null) || \
+            die "Failed to fetch PR status for $PR_URL"
 
         # Now parse the JSON to see if all checks are SUCCESS.
         # We'll use jq to check the statusCheckRollup. We need to look at the checks array.
@@ -111,17 +114,27 @@ if echo "$BODY" | grep -q -E 'DONE[[:space:]]+https?://[^[:space:]]+'; then
         # We'll also check if there are any pending checks? The spec says: if any check is FAILURE/PENDING, refuse.
         # So we should also reject if the state is PENDING.
 
-        # We'll extract the state from the statusCheckRollup.
-        STATE=$(echo "$CHECK_OUTPUT" | jq -r '.statusCheckRollup.state // empty')
+        # `gh pr view --json statusCheckRollup` returns an ARRAY of check
+        # objects ({name, conclusion, status, ...}), not an object with a
+        # top-level `state` field. Compute SUCCESS only when all conclusions
+        # are SUCCESS; refuse on any FAILURE / PENDING / SKIPPED / NEUTRAL /
+        # missing conclusion.
+        STATE=$(echo "$CHECK_OUTPUT" | jq -r '
+          if (.statusCheckRollup | length) == 0 then "NO_CHECKS"
+          elif all(.statusCheckRollup[]; .conclusion == "SUCCESS") then "SUCCESS"
+          else "PENDING_OR_FAILURE"
+          end
+        ')
         if [ -z "$STATE" ]; then
-            die "Could not determine CI state for PR $PR_URL"
+            die "Could not parse CI state for PR $PR_URL"
         fi
 
         echo "CI state for PR $PR_URL: $STATE" >&2
 
         if [ "$STATE" != "SUCCESS" ]; then
-            # Refuse to send.
-            echo "CI not green for PR $PR_URL (state: $STATE). Refusing to send DONE mail." >&2
+            # Surface failing/pending check names for actionable diagnostics.
+            FAILING=$(echo "$CHECK_OUTPUT" | jq -r '[.statusCheckRollup[] | select(.conclusion != "SUCCESS") | (.name + ":" + (.conclusion // "PENDING"))] | join(", ")' 2>/dev/null || echo "(unparseable)")
+            echo "CI not green for PR $PR_URL (state: $STATE). Failing/pending: $FAILING. Refusing to send DONE mail." >&2
             exit 1
         fi
 
@@ -133,17 +146,8 @@ else
     echo "No DONE PR URL found in mail body. Sending without CI check." >&2
 fi
 
-# If we reach here, we are allowed to send the mail.
-# We'll send the mail using the TPS CLI.
-# We'll use the TPS_VAULT_KEY and TPS_AGENT_ID from the environment.
-# We'll run the command from the tps repo root.
-
-# We are already in the tps repo root.
-# We'll use the bun command to run the TPS CLI.
-# We'll send the mail.
-
-# We'll use the same environment variables that we have.
-# We'll run: TPS_VAULT_KEY=$TPS_VAULT_KEY TPS_AGENT_ID=$TPS_AGENT_ID bun run packages/cli/dist/bin/tps.js mail send "$RECIPIENT" "$BODY"
-
-# We'll execute the command.
-exec TPS_VAULT_KEY="$TPS_VAULT_KEY" TPS_AGENT_ID="$TPS_AGENT_ID" bun run packages/cli/dist/bin/tps.js mail send "$RECIPIENT" "$BODY"
+# Gate passed (or no DONE PR detected). Send the mail via the TPS CLI.
+# TPS_VAULT_KEY + TPS_AGENT_ID inherit from the caller's environment via exec —
+# no need to re-export inline (the previous `exec VAR=val cmd` form is invalid
+# bash: `exec` treats `VAR=val` as a command name, not an assignment).
+exec bun run packages/cli/dist/bin/tps.js mail send "$RECIPIENT" "$BODY"
