@@ -869,7 +869,7 @@ function runGitOrFail(args: string[], cwd: string, label: string): string {
 }
 
 
-function getMostRecentTaskMailBody(agentId) {
+function getMostRecentTaskMailBody(agentId: string) {
   const mailDir = join(homedir(), ".tps", "mail", agentId, "cur");
   if (!existsSync(mailDir)) return null;
   const files = readdirSync(mailDir);
@@ -887,7 +887,7 @@ function getMostRecentTaskMailBody(agentId) {
   }
 }
 
-function countFilesInText(text, repoRoot) {
+function countFilesInText(text: string, repoRoot: string) {
   const repoRootNorm = repoRoot.endsWith("/") ? repoRoot : repoRoot + "/";
   const lines = text.split("\n");
   const paths = new Set();
