@@ -277,7 +277,7 @@ async function main() {
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
-          "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>]",
+          "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>] [--ack-scope-expansion] [--scope-warn-threshold <factor>]",
         );
         process.exit(1);
       }
@@ -350,6 +350,8 @@ async function main() {
           paths: pathValues,
           push: process.argv.includes("--push"),
           prTitle: getFlag("pr-title"),
+          ackScopeExpansion: process.argv.includes("--ack-scope-expansion"),
+          scopeWarnThreshold: getFlag("scope-warn-threshold") ? parseInt(getFlag("scope-warn-threshold")!, 10) : undefined,
         });
       } else if (action === "isolate") {
         const portArg = getFlag("port");
