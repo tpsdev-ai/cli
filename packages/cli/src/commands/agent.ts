@@ -18,7 +18,7 @@ import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve as resolvePathMod } from "node:path";
 import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
 
 export interface AgentArgs {
@@ -51,6 +51,8 @@ export interface AgentArgs {
   sandboxed?: boolean;
   lines?: number;
   follow?: boolean;
+  ackScopeExpansion?: boolean;
+  scopeWarnThreshold?: number;
 }
 
 interface AgentHealthcheckResult {
@@ -866,11 +868,59 @@ function runGitOrFail(args: string[], cwd: string, label: string): string {
   return r.stdout;
 }
 
+
+function getMostRecentTaskMailBody(agentId) {
+  const mailDir = join(homedir(), ".tps", "mail", agentId, "cur");
+  if (!existsSync(mailDir)) return null;
+  const files = readdirSync(mailDir);
+  if (files.length === 0) return null;
+  const sorted = files
+    .map(f => ({ f, mtime: statSync(join(mailDir, f)).mtime }))
+    .sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+  const latestFile = join(mailDir, sorted[0].f);
+  const raw = readFileSync(latestFile, "utf-8");
+  try {
+    const mail = JSON.parse(raw);
+    return mail.body || null;
+  } catch {
+    return raw;
+  }
+}
+
+function countFilesInText(text, repoRoot) {
+  const repoRootNorm = repoRoot.endsWith("/") ? repoRoot : repoRoot + "/";
+  const lines = text.split("\n");
+  const paths = new Set();
+  const extRe = /\.[a-zA-Z0-9]+$/;
+  for (const line of lines) {
+    const tokens = line.trim().split(/\\s+/);
+    for (let token of tokens) {
+      token = token.replace(/^[.,:;!?"`']+|[.,:;!?"`']+$/g, "");
+      if (!token) continue;
+      if (token.startsWith(repoRootNorm)) { paths.add(token); continue; }
+      if (token.startsWith("./") || token.startsWith("../")) {
+        const resolved = resolvePathMod(repoRoot, token);
+        if (resolved.startsWith(repoRoot)) paths.add(resolved);
+        continue;
+      }
+      if (extRe.test(token) && !token.includes("/")) {
+        const resolved = resolvePathMod(repoRoot, token);
+        if (resolved.startsWith(repoRoot)) paths.add(resolved);
+        continue;
+      }
+      if (token.includes("/") && token.includes(".") && !token.startsWith("http://") && !token.startsWith("https://")) {
+        const resolved = resolvePathMod(repoRoot, token);
+        if (resolved.startsWith(repoRoot)) paths.add(resolved);
+      }
+    }
+  }
+  return paths.size;
+}
 async function commitAgentChanges(args: AgentArgs): Promise<void> {
   const { repo, branchName, commitMessage, authorName, authorEmail, paths, push: doPush, prTitle } = args;
 
   if (!repo || !branchName || !commitMessage || !authorName || !authorEmail) {
-    failWith("Usage: tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <file>] [--push] [--pr-title <title>]");
+    failWith("Usage: tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <file>] [--push] [--pr-title <title>] [--ack-scope-expansion] [--scope-warn-threshold <factor>]");
   }
   if (!SIMPLE_EMAIL_RE.test(authorEmail!)) failWith(`Invalid author email: ${authorEmail}`);
   if (branchName!.startsWith("-") || !SAFE_GIT_REF_RE.test(branchName!)) failWith(`Invalid branch name: ${branchName}`);
@@ -882,6 +932,39 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   if (!repoPath.startsWith("/")) failWith("Repository path must be absolute.");
   const gitCheck = runGit(["rev-parse", "--is-inside-work-tree"], repoPath);
   if (!gitCheck.ok || gitCheck.stdout !== "true") failWith(`Not a git repository: ${repoPath}`);
+
+  // Scope expansion guardrail (ops-43zd)
+  const scopeAgentId = process.env.TPS_AGENT_ID ?? "anvil";
+  const taskMailBody = getMostRecentTaskMailBody(scopeAgentId);
+  if (taskMailBody !== null) {
+    const hintFileCount = countFilesInText(taskMailBody, repoPath);
+    const scopeThresholdFactor = args.scopeWarnThreshold
+      ?? (process.env.TPS_SCOPE_WARN_THRESHOLD ? parseInt(process.env.TPS_SCOPE_WARN_THRESHOLD, 10) : undefined)
+      ?? 3;
+    let filesToStageCount = 0;
+    if (args.paths && args.paths.length > 0) {
+      const pathSet = new Set();
+      for (const p of args.paths) {
+        const abs = resolvePath(repoPath, p);
+        if (isWithinDir(repoPath, abs)) pathSet.add(abs);
+      }
+      filesToStageCount = pathSet.size;
+    } else {
+      const diff = runGit(["diff", "--name-only"], repoPath);
+      const diffFiles = diff.status === 0 && diff.stdout ? diff.stdout.split("\n").filter(Boolean) : [];
+      const untracked = runGit(["ls-files", "--others", "--exclude-standard"], repoPath);
+      const untrackedFiles = untracked.status === 0 && untracked.stdout ? untracked.stdout.split("\n").filter(Boolean) : [];
+      filesToStageCount = new Set([...diffFiles, ...untrackedFiles]).size;
+    }
+    if (hintFileCount > 0 && filesToStageCount > hintFileCount * scopeThresholdFactor) {
+      const warning = `SCOPE EXPANSION DETECTED — original task hinted at ${hintFileCount} files; diff touches ${filesToStageCount} files. Continue with --ack-scope-expansion or revise.`;
+      if (!args.ackScopeExpansion) {
+        console.error(warning);
+        process.exit(1);
+      }
+      console.warn("\u26a0\ufe0f  " + warning);
+    }
+  }
 
   // Create or checkout branch
   const branchExists = runGit(["show-ref", "--verify", "--quiet", `refs/heads/${branchName}`], repoPath).ok;
