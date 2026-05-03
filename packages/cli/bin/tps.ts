@@ -707,11 +707,36 @@ async function main() {
       break;
     }
     case "secrets": {
-      const action = rest[0] as "set" | "list" | "remove" | undefined;
-      if (!action || !["set", "list", "remove"].includes(action)) {
-        console.error("Usage:\n  tps secrets set <KEY>=<VALUE>\n  tps secrets list\n  tps secrets remove <KEY>");
+      const action = rest[0];
+      const allowedActions = ["set", "list", "remove", "rotate-github-pat", "list-github-pats"];
+      if (!action || !allowedActions.includes(action)) {
+        console.error([
+          "Usage:",
+          "  tps secrets set <KEY>=<VALUE>",
+          "  tps secrets list",
+          "  tps secrets remove <KEY>",
+          "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
+          "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
+        ].join("\n"));
         process.exit(1);
       }
+      // GitHub PAT helpers (ops-njgl)
+      if (action === "rotate-github-pat") {
+        const agent = rest[1];
+        if (!agent) {
+          console.error("Usage: tps secrets rotate-github-pat <agent>");
+          process.exit(1);
+        }
+        const { runRotateGithubPat } = await import("../src/commands/pat-rotate.js");
+        await runRotateGithubPat(agent);
+        break;
+      }
+      if (action === "list-github-pats") {
+        const { runListGithubPats } = await import("../src/commands/pat-rotate.js");
+        await runListGithubPats({ json: cli.flags.json });
+        break;
+      }
+      // Vault secrets (existing)
       const { runSecrets } = await import("../src/commands/secrets.js");
       let key: string | undefined;
       let value: string | undefined;
@@ -722,7 +747,7 @@ async function main() {
       } else {
         key = rest[1];
       }
-      await runSecrets({ action, key, value, json: cli.flags.json });
+      await runSecrets({ action: action as "set" | "list" | "remove", key, value, json: cli.flags.json });
       break;
     }
     case "backup": {
