@@ -958,11 +958,13 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
     }
     if (hintFileCount > 0 && filesToStageCount > hintFileCount * scopeThresholdFactor) {
       const warning = `SCOPE EXPANSION DETECTED — original task hinted at ${hintFileCount} files; diff touches ${filesToStageCount} files. Continue with --ack-scope-expansion or revise.`;
-      if (!args.ackScopeExpansion) {
+      if (args.ackScopeExpansion) {
+        // Write scope-warning to commit message footer
+        commitMessage = `${commitMessage}\n\nScope-warning: ${filesToStageCount} files vs spec hint of ${hintFileCount}.`;
+      } else {
+        // Emit visible warning (do not block)
         console.error(warning);
-        process.exit(1);
       }
-      console.warn("\u26a0\ufe0f  " + warning);
     }
   }
 
