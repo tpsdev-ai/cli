@@ -1,17 +1,26 @@
 {
   "name": "@tpsdev-ai/openclaw-tps-mail",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "OpenClaw channel plugin for TPS mail — inter-agent messaging via the local filesystem mail queue",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
   },
   "files": [
-    "src/index.ts",
+    "dist/",
     "openclaw.plugin.json",
     "README.md"
   ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
   "keywords": [
     "openclaw",
     "openclaw-plugin",
@@ -23,8 +32,19 @@
   "license": "Apache-2.0",
   "openclaw": {
     "extensions": [
-      "./src/index.ts"
-    ]
+      "./dist/src/index.js"
+    ],
+    "runtimeExtensions": [
+      "./dist/src/index.js"
+    ],
+    "channel": {
+      "id": "tps-mail",
+      "label": "TPS Mail",
+      "blurb": "Inter-agent messaging via the local filesystem mail queue"
+    },
+    "compat": {
+      "pluginApi": ">=2026.5.7"
+    }
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.7"
