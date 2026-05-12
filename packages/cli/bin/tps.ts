@@ -1014,8 +1014,8 @@ async function main() {
     }
 
     case "skill": {
-      const action = rest[0] as "list" | "register" | "scan" | "revoke" | "show" | undefined;
-      const validSkillActions = ["list", "register", "scan", "revoke", "show"];
+      const action = rest[0] as "list" | "register" | "scan" | "revoke" | "show" | "add-pack" | undefined;
+      const validSkillActions = ["list", "register", "scan", "revoke", "show", "add-pack"];
       if (!action || !validSkillActions.includes(action)) {
         console.error(
           "Usage:\n" +
@@ -1023,7 +1023,8 @@ async function main() {
           "  tps skill register <source> --name <n> --version <hash> --agent <id> [--priority standard]\n" +
           "  tps skill scan <file>                                          Static analysis of skill content\n" +
           "  tps skill revoke <name> --agent <id>                           Remove skill assignment\n" +
-          "  tps skill show <name> --agent <id>                             Show skill details"
+          "  tps skill show <name> --agent <id>                             Show skill details\n" +
+          "  tps skill add-pack <npm-package> --agent <id>                  Bulk-import npm-shipped skill pack"
         );
         process.exit(1);
       }
@@ -1035,15 +1036,18 @@ async function main() {
 
       const { runSkill } = await import("../src/commands/skill.js");
       await runSkill({
-        action,
+        action: action === "add-pack" ? "addPack" : action,
         agent: getFlag("agent") ?? cli.flags.agent,
         name: getFlag("name") ?? cli.flags.name,
         version: getFlag("version"),
-        source: action === "register" ? rest[1] : undefined,
+        source: action === "register" ? rest[1] : (action === "add-pack" ? rest[1] : undefined),
         file: action === "scan" ? rest[1] : (action === "register" ? rest[1] : undefined),
         priority: getFlag("priority"),
         json: cli.flags.json,
         flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
+        includeRules: getFlag("include-rules"),
+        ruleNameFormat: getFlag("rule-name-format"),
+        registry: getFlag("registry"),
       });
       break;
     }
