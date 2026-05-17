@@ -78,6 +78,26 @@ export function readFlairConfigFile(): FlairConfigFile {
   };
 }
 
+/**
+ * Strip user:pass@ userinfo from a URL for display. Returns the original
+ * string unchanged if it isn't a parseable URL with userinfo. Used by
+ * `tps flair show` so a previously-stored credential-bearing URL doesn't
+ * leak via stdout. set-hub rejects credential URLs at write time;
+ * this is defense-in-depth.
+ */
+export function redactUrlCredentials(input: string): string {
+  try {
+    const u = new URL(input);
+    if (!u.username && !u.password) return input;
+    u.username = "";
+    u.password = "";
+    // Re-encode without trailing colon-only userinfo block.
+    return u.toString();
+  } catch {
+    return input;
+  }
+}
+
 export function writeFlairConfigFile(config: FlairConfigFile): void {
   const p = flairConfigPath();
   mkdirSync(dirname(p), { recursive: true });
@@ -394,6 +414,24 @@ export async function flairCommand(
         );
         process.exit(1);
       }
+      // Reject embedded credentials. set-hub should not store `https://user:pass@host`
+      // — credentials belong in --auth-mode/--auth-path. Sherlock nit (PR #284
+      // review): URLs with userinfo leak via `tps flair show` output and shell
+      // history. Refuse at write time; downstream `show` also redacts as
+      // defense-in-depth (forward-compat for already-stored configs).
+      if (parsed.username || parsed.password) {
+        console.error(
+          "URL contains embedded credentials. Use --auth-mode + --auth-path instead; the hub URL should not carry user:pass@host.",
+        );
+        process.exit(1);
+      }
+      // Bounds-check the local port if provided.
+      if (typeof opts.port === "number") {
+        if (!Number.isInteger(opts.port) || opts.port <= 0 || opts.port > 65535) {
+          console.error(`Invalid --port: ${opts.port}. Must be an integer in 1..65535.`);
+          process.exit(1);
+        }
+      }
       const existing = readFlairConfigFile();
       const config: FlairConfigFile = {
         hub: trimmed,
@@ -426,15 +464,21 @@ export async function flairCommand(
 
     case "show": {
       const config = readFlairConfigFile();
+      // Defense-in-depth: even though set-hub rejects URLs with embedded
+      // credentials, an already-stored config (from a pre-fix version or
+      // hand-edited flair.json) could contain user:pass@host. Redact before
+      // any output reaches stdout / shell history / screen scrollback.
+      // Sherlock nit (PR #284 review).
+      const hubDisplay = config.hub ? redactUrlCredentials(config.hub) : null;
       const safe = {
-        hub: config.hub,
+        hub: hubDisplay,
         auth: config.auth ? { mode: config.auth.mode, path: config.auth.path } : null,
         localPort: config.localPort,
       };
       if (opts.json) {
         console.log(JSON.stringify(safe, null, 2));
       } else {
-        console.log(`Hub:        ${config.hub ?? "(none — hub-less mode)"}`);
+        console.log(`Hub:        ${hubDisplay ?? "(none — hub-less mode)"}`);
         console.log(
           `Auth:       ${config.auth ? `${config.auth.mode} at ${config.auth.path}` : "(none)"}`,
         );

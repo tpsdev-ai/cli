@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   readFlairConfigFile,
   writeFlairConfigFile,
+  redactUrlCredentials,
   type FlairConfigFile,
 } from "../src/commands/flair.js";
 
@@ -119,5 +120,29 @@ describe("flair config (ops-wn6g)", () => {
     expect(cfg.hub).toBe("https://flair.example.com");
     // No leading/trailing whitespace at rest
     expect(cfg.hub).toBe((cfg.hub as string).trim());
+  });
+});
+
+describe("redactUrlCredentials (Sherlock nit, PR #284)", () => {
+  test("strips user:pass@ from a URL with embedded credentials", () => {
+    expect(redactUrlCredentials("https://admin:secret@flair.example.com/path")).toBe(
+      "https://flair.example.com/path",
+    );
+  });
+
+  test("strips username-only (no password)", () => {
+    expect(redactUrlCredentials("https://admin@flair.example.com")).toBe(
+      "https://flair.example.com/",
+    );
+  });
+
+  test("leaves a credential-free URL unchanged", () => {
+    expect(redactUrlCredentials("https://flair.example.com/path?q=1")).toBe(
+      "https://flair.example.com/path?q=1",
+    );
+  });
+
+  test("returns the input unchanged for non-URL strings", () => {
+    expect(redactUrlCredentials("not-a-url")).toBe("not-a-url");
   });
 });
