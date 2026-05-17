@@ -21,6 +21,7 @@ export interface BranchArgs {
   port?: number;
   host?: string;
   transport?: "ws" | "tcp";
+  agent?: string;
   force?: boolean;
   lines?: number;
   follow?: boolean;
@@ -63,7 +64,7 @@ function processAlive(pid: number): boolean {
   }
 }
 
-function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", agentsDir?: string): void {
+export function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", agentsDir?: string, agentId?: string): void {
   writeFileSync(
     confPath(),
     JSON.stringify(
@@ -72,6 +73,7 @@ function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", ag
         host,
         transport,
         agentsDir,
+        agentId,
         createdAt: new Date().toISOString(),
       },
       null,
@@ -81,7 +83,7 @@ function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", ag
   );
 }
 
-function readBranchConf(): { port: number; host: string; transport: "ws" | "tcp"; agentsDir?: string } {
+function readBranchConf(): { port: number; host: string; transport: "ws" | "tcp"; agentsDir?: string; agentId?: string } {
   const p = confPath();
   if (!existsSync(p)) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
   const raw = JSON.parse(readFileSync(p, "utf-8"));
@@ -90,7 +92,8 @@ function readBranchConf(): { port: number; host: string; transport: "ws" | "tcp"
     port: Number(raw.port),
     host: String(raw.host || ""),
     transport: t,
-    agentsDir: raw.agentsDir ? String(raw.agentsDir) : undefined
+    agentsDir: raw.agentsDir ? String(raw.agentsDir) : undefined,
+    agentId: raw.agentId ? String(raw.agentId) : undefined
   };
 }
 
@@ -125,7 +128,11 @@ async function runInit(args: BranchArgs): Promise<void> {
   const port = args.port ?? 6458;
   const advertiseHost = args.host ?? hostname();
   const transport = args.transport ?? "ws";
-  writeBranchConf(port, advertiseHost, transport, undefined);
+  // agentId resolves the maildir for branch-delivered messages. Default to
+  // the value at runBranch start time (TPS_AGENT_ID env → conf.agentId →
+  // hostname). Persisting at init time lets `tps branch start` pick it up
+  // without re-setting TPS_AGENT_ID in the environment.
+  writeBranchConf(port, advertiseHost, transport, undefined, args.agent);
 
   const pubkeyB64 = Buffer.from(kp.encryption.publicKey).toString("base64url");
   const sigPubkeyB64 = Buffer.from(kp.signing.publicKey).toString("base64url");

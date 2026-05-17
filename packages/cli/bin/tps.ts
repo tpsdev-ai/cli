@@ -843,7 +843,7 @@ async function main() {
       const action = rest[0] as "init" | "start" | "stop" | "status" | "log" | undefined;
       const valid = ["init", "start", "stop", "status", "log"];
       if (!action || !valid.includes(action)) {
-        console.error("Usage:\n  tps branch init [--listen <port>] [--host <hostname>] [--transport ws|tcp]\n  tps branch start\n  tps branch stop\n  tps branch status\n  tps branch log [--lines N] [--follow]");
+        console.error("Usage:\n  tps branch init [--listen <port>] [--host <hostname>] [--transport ws|tcp] [--agent <id>]\n  tps branch start\n  tps branch stop\n  tps branch status\n  tps branch log [--lines N] [--follow]");
         process.exit(1);
       }
       const { runBranch } = await import("../src/commands/branch.js");
@@ -852,6 +852,7 @@ async function main() {
         port: typeof cli.flags.listen === "number" ? Number(cli.flags.listen) : undefined,
         host: cli.flags.host,
         transport: cli.flags.transport === "tcp" ? "tcp" : cli.flags.transport === "ws" ? "ws" : undefined,
+        agent: cli.flags.agent,
         force: cli.flags.force,
         lines: typeof cli.flags.lines === "number" ? Number(cli.flags.lines) : undefined,
         follow: !!cli.flags.follow,
