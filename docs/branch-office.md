@@ -183,6 +183,71 @@ tps mail check flint
 
 The branch daemon log (`~/.tps/branch.log`) shows `MAIL: Received message for reed` and `SYNC: Heartbeat received — drained outbox` events.
 
+## Flair spoke (ops-209a)
+
+After a successful join with `--tunnel-via`, `tps office join` can automatically provision a **Flair spoke** on the remote branch. Flair is the TPS local memory engine (Harper). A spoke gives the branch its own persistent memory that can optionally federate with the team's Flair hub.
+
+### Plan inference
+
+Before touching the remote, `tps office join` reads `~/.tps/flair.json` (set by `tps flair set-hub`, see [commands.md](commands.md)) and determines one of three plans:
+
+| Plan | Condition | Behavior |
+|---|---|---|
+| **hub-less** | `hub` is null (no team hub configured) | Install Flair on the branch. Branch memories are an island — not synced anywhere. |
+| **spoke** | `hub` + `auth` both set and valid | Install Flair + configure periodic fed-sync to the hub + run one-shot validation. |
+| **error** | `hub` is set but `auth` is missing or invalid | Abort Flair provisioning entirely. The join still succeeds — just no Flair. Fix with `tps flair set-hub --auth-mode admin-pass-file --auth-path <path>`. |
+
+### Remote install flow
+
+When proceeding (hub-less or spoke), `tps office join` executes over SSH:
+
+1. **Install package:** `ssh <tunnel-via> 'mkdir -p ~/.flair && cd ~/.flair && npm install @tpsdev-ai/flair'`
+2. **Generate admin pass:** `openssl rand -base64 24` locally, `scp` to `~/.flair/admin-pass` on the branch (mode 0600). The pass is never written to a local temp file.
+3. **Install as a service:** OS-adaptive —
+   - **Linux (systemd):** Write a `~/.config/systemd/user/tps-flair-<name>.service` unit, run `systemctl --user daemon-reload && enable --now`.
+   - **macOS (launchd):** Write a `~/Library/LaunchAgents/ai.tpsdev.flair-<name>.plist`, `launchctl load` it.
+
+Harper runs on port 9926 (default Flair port) with its data at `~/.harper/flair`.
+
+### Fed-sync (spoke mode only)
+
+In spoke mode, after Flair is running, `tps office join` configures periodic memory federation from the branch back to the hub:
+
+1. **Config:** Write `~/.tps/flair-sync.json` on the branch with `localUrl`, `remoteUrl` (hub), `agentId`, and the hub's `admin-pass` auth.
+2. **Timer + service:** On Linux, install `~/.config/systemd/user/tps-fed-sync-<name>.{service,timer}`. The timer triggers every 30s (with a 30s randomized delay to avoid thundering-herd). The service is `Type=oneshot` running `tps flair sync --once`.
+3. **Validate:** Run a one-shot sync immediately. Success writes the timestamp to the manifest; failure leaves the branch hub-less until the sync is working.
+
+### Opt-outs and re-provisioning
+
+| Flag | Effect |
+|---|---|
+| `--no-flair` | Skip Flair spoke provisioning entirely. Join still completes with just supervision. |
+| `--force-reinstall-flair` | If Flair is already installed on the remote, tear down and reinstall (preserves data unless `--purge-flair`). Without this flag, rejoin with an existing Flair install errors out. |
+
+### Teardown on revoke
+
+`tps office revoke <name>` tears down the Flair spoke by:
+1. Stopping and disabling the fed-sync timer + service, removing their unit files.
+2. Stopping and disabling the Flair service, removing its unit/plist.
+
+Pass `--purge-flair` to also `rm -rf ~/.flair ~/.harper/flair` on the branch.
+
+### Status reporting
+
+`tps office status <name>` shows Flair spoke health when the branch has a supervision manifest:
+
+```
+🔒 Supervision (launchd):
+   🟢 Tunnel: ai.tpsdev.tunnel-reed → port 33744 via tps-reed (PID 12345)
+   🟢 Office: ai.tpsdev.office-reed (PID 12346)
+   Installed: 2026-05-17T12:00:00.000Z
+
+🧠 Flair spoke:
+   Flair:    🟢 ~/.flair (port 9926)
+   API:      ✅ reachable
+   Fed-Sync: 🟢 → hub (last: 2026-05-17T12:30:05.000Z)
+```
+
 ## Operational commands
 
 ### On the branch

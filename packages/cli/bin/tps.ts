@@ -128,6 +128,10 @@ const cli = meow(
       // ops-7x9y: office join supervision flags (--force is already declared above)
       tunnelVia: { type: "string" },
       keepUnits: { type: "boolean", default: false },
+      // ops-209a: Flair spoke provisioning flags
+      noFlair: { type: "boolean", default: false },
+      forceReinstallFlair: { type: "boolean", default: false },
+      purgeFlair: { type: "boolean", default: false },
       // Task envelope flags (mail send --task)
       task: { type: "string" },
       taskId: { type: "string" },
@@ -565,7 +569,7 @@ async function main() {
       } else if (action === "join") {
         const joinToken = rest[2];
         if (!rest[1] || !joinToken) {
-          console.error("Usage: tps office join <name> <join-token-url> [--tunnel-via <ssh-host>] [--port <n>] [--force]");
+          console.error("Usage: tps office join <name> <join-token-url> [--tunnel-via <ssh-host>] [--port <n>] [--force] [--no-flair] [--force-reinstall-flair]");
           process.exit(1);
         }
         await runOffice({
@@ -575,16 +579,19 @@ async function main() {
           tunnelVia: cli.flags.tunnelVia as string | undefined,
           port: cli.flags.port as number | undefined,
           force: cli.flags.force as boolean,
+          noFlair: cli.flags.noFlair as boolean,
+          forceReinstallFlair: cli.flags.forceReinstallFlair as boolean,
         });
       } else if (action === "revoke") {
         if (!rest[1]) {
-          console.error("Usage: tps office revoke <name> [--keep-units]");
+          console.error("Usage: tps office revoke <name> [--keep-units] [--purge-flair]");
           process.exit(1);
         }
         await runOffice({
           action: "revoke",
           agent: rest[1],
           keepUnits: cli.flags.keepUnits as boolean,
+          purgeFlair: cli.flags.purgeFlair as boolean,
         });
       } else if (action === "setup") {
         const dryRun = process.argv.includes("--dry-run") || process.argv.includes("--dry");
