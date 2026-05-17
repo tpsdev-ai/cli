@@ -372,19 +372,31 @@ export async function flairCommand(
         );
         process.exit(1);
       }
-      if (opts.hub.trim() === "") {
+      const trimmed = opts.hub.trim();
+      if (trimmed === "") {
         console.error("Empty URL not allowed. Use `tps flair clear-hub` to remove the hub.");
         process.exit(1);
       }
+      let parsed: URL;
       try {
-        new URL(opts.hub);
+        parsed = new URL(trimmed);
       } catch {
         console.error(`Invalid URL: ${opts.hub}`);
         process.exit(1);
       }
+      // Allowlist protocols. set-hub points the team's Flair config at an HTTP
+      // endpoint — accepting `file://`, `ftp://`, `ws://`, etc. would let a
+      // typo write something the probe action then tries to fetch with
+      // unexpected semantics. Kern nit (PR #284 review).
+      if (!["https:", "http:"].includes(parsed.protocol)) {
+        console.error(
+          `Unsupported protocol: ${parsed.protocol}. Hub must be https:// or http://.`,
+        );
+        process.exit(1);
+      }
       const existing = readFlairConfigFile();
       const config: FlairConfigFile = {
-        hub: opts.hub,
+        hub: trimmed,
         auth:
           opts.authMode === "admin-pass-file" && opts.authPath
             ? { mode: "admin-pass-file", path: opts.authPath }

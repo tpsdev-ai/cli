@@ -110,4 +110,14 @@ describe("flair config (ops-wn6g)", () => {
     const raw = JSON.parse(readFileSync(join(process.env.TPS_ROOT!, "flair.json"), "utf-8"));
     expect(raw).toHaveProperty("hub", null);
   });
+
+  // Round-trip persistence of trimmed URL (Kern nit, PR #284 review)
+  test("writeFlairConfigFile preserves the trimmed URL exactly as set", () => {
+    // Direct write of a normalized URL — set-hub trims before passing this in.
+    writeFlairConfigFile({ hub: "https://flair.example.com", auth: null, localPort: 9926 });
+    const cfg = readFlairConfigFile();
+    expect(cfg.hub).toBe("https://flair.example.com");
+    // No leading/trailing whitespace at rest
+    expect(cfg.hub).toBe((cfg.hub as string).trim());
+  });
 });
