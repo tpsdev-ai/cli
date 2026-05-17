@@ -164,6 +164,18 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   assertValidAgentId(sender);
   assertValidBody(body);
 
+  // Guard: when running in test mode or when the caller has explicitly
+  // opted in, refuse to write to the default ~/.tps/mail/ directory
+  // unless TPS_MAIL_DIR is set. This prevents tests from accidentally
+  // spraying messages into the real production maildir (e.g. when
+  // imported directly without beforeEach setting TPS_MAIL_DIR to a temp dir).
+  if ((process.env.NODE_ENV === "test" || process.env.TPS_MAIL_REQUIRE_EXPLICIT_DIR) && !process.env.TPS_MAIL_DIR) {
+    throw new Error(
+      "TPS_MAIL_DIR must be set explicitly in test mode. " +
+      "Refusing to write to the default production maildir.",
+    );
+  }
+
   const inbox = getInbox(to);
   const quotaCount = countInboxMessages(to);
   if (quotaCount >= MAX_INBOX_MESSAGES) {
