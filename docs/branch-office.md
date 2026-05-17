@@ -52,19 +52,6 @@ curl -fsSL https://bun.sh/install | bash
 sudo npm install -g @tpsdev-ai/cli
 ```
 
-> **Known issue on Linux**: the `@tpsdev-ai/cli-linux-x64` standalone binary (bundled as an optional dep) currently ships without a working `sodium-native` prebuild and crashes any command that touches branch crypto. Until that's fixed upstream, run `tps` from source:
-> ```sh
-> mkdir -p ~/src && cd ~/src
-> git clone --depth 1 https://github.com/tpsdev-ai/cli.git
-> cd cli && bun install
-> mkdir -p ~/bin && cat > ~/bin/tps <<'EOF'
-> #!/bin/sh
-> exec ~/.bun/bin/bun run ~/src/cli/packages/cli/bin/tps.ts "$@"
-> EOF
-> chmod +x ~/bin/tps
-> # Add ~/bin to PATH ahead of /usr/bin
-> ```
-
 ### 2. Initialize the branch
 
 Pick a free port (the example uses `33744`) and assign the agent identity:
@@ -242,12 +229,6 @@ jq '. + {agentId: "reed"}' ~/.tps/branch.conf.json > /tmp/c.json \
 tps branch stop && tps branch start
 ```
 Then `mv ~/.tps/mail/<hostname>/cur/* ~/.tps/mail/<agentId>/cur/` to consolidate any stranded messages.
-
-### Linux `tps` errors with `Cannot find addon '.' imported from … sodium-native/binding.js`
-
-**Cause:** The `@tpsdev-ai/cli-linux-x64` standalone binary is missing its sodium-native prebuild ([tracked upstream](https://github.com/tpsdev-ai/cli/issues)). The Bun `--compile` step doesn't bundle the .node addon alongside.
-
-**Action:** Run `tps` from cloned source via a shim, per the prereqs in [Provisioning](#1-vm-side-prereqs).
 
 ### `tps office join` says "Connecting to localhost:<port>…" then times out
 
