@@ -100,8 +100,8 @@ tps office revoke <name>            # Drop a paired branch from the registry
 - `revoke <name>`: Remove the branch from `~/.tps/registry/`. Does not remove launchd/systemd units — clean those up separately.
 
 **Common to both:**
-- `list`: List all known branches and their workspace presence.
-- `status [agent]`: Show connection state (Docker container status, or relay heartbeat / message counters).
+- `list`: List entries from `~/.tps/branch-office/` (one row per known branch alias, with sandbox-presence flag). Output is local registry state, not live connection health — use `status` for that.
+- `status [agent]`: Show live connection state (Docker container status for sandboxes, or relay heartbeat + reconnect-count + message counters from `~/.tps/connections/<agent>.json` for remote relays).
 
 ### `tps branch` (branch side)
 
