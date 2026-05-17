@@ -81,6 +81,27 @@ function resolveSsh(): string {
   }
 }
 
+/**
+ * Resolve the path to the bundled tps.js CLI entrypoint.
+ * Precedence: 1) TPS_CLI_PATH env var, 2) <home>/ops/tps/packages/cli/dist/bin/tps.js
+ */
+function resolveTpsJs(home: string): string {
+  if (process.env.TPS_CLI_PATH) return process.env.TPS_CLI_PATH;
+  return join(home, "ops/tps/packages/cli/dist/bin/tps.js");
+}
+
+/**
+ * Escape XML special characters for safe string interpolation into plist XML.
+ * Covers: & < > "
+ */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 export interface TunnelPlistParams {
   name: string;
   localPort: number;
@@ -104,11 +125,12 @@ export function generateTunnelPlist(params: TunnelPlistParams): string {
 
   <key>ProgramArguments</key>
   <array>
-    <string>${ssh}</string>
+    <string>${xmlEscape(ssh)}</string>
     <string>-N</string>
     <string>-L</string>
     <string>${params.localPort}:127.0.0.1:${params.localPort}</string>
-    <string>${params.tunnelVia}</string>
+    <string>--</string>
+    <string>${xmlEscape(params.tunnelVia)}</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -136,7 +158,7 @@ export function generateOfficePlist(params: OfficePlistParams): string {
   const home = params.home ?? homedir();
   const label = `ai.tpsdev.office-${params.name}`;
   const bun = resolveBun();
-  const tpsJs = join(home, "ops/tps/packages/cli/dist/bin/tps.js");
+  const tpsJs = resolveTpsJs(home);
   const logDir = join(home, ".tps", "logs");
 
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -149,9 +171,9 @@ export function generateOfficePlist(params: OfficePlistParams): string {
 
   <key>ProgramArguments</key>
   <array>
-    <string>${bun}</string>
+    <string>${xmlEscape(bun)}</string>
     <string>run</string>
-    <string>${tpsJs}</string>
+    <string>${xmlEscape(tpsJs)}</string>
     <string>office</string>
     <string>connect</string>
     <string>${params.name}</string>
@@ -185,7 +207,7 @@ function plistPath(label: string, home: string = homedir()): string {
 export function writePlist(label: string, content: string, home?: string): string {
   const h = home ?? homedir();
   const dest = plistPath(label, h);
-  const tmp = dest + ".tmp";
+  const tmp = `${dest}.${process.pid}.tmp`;
 
   mkdirSync(join(h, "Library", "LaunchAgents"), { recursive: true });
   writeFileSync(tmp, content, { encoding: "utf-8", mode: 0o644 });
@@ -204,10 +226,10 @@ export function deletePlist(label: string, home?: string): void {
 
 function isUnitLoaded(label: string): boolean {
   try {
-    execSync(`launchctl list "${label}" 2>/dev/null || true`, {
+    const out = execSync(`launchctl list "${label}" 2>/dev/null || true`, {
       encoding: "utf-8",
     }).trim();
-    return true;
+    return out.length > 0 && out !== "-";
   } catch {
     return false;
   }
@@ -307,7 +329,12 @@ export function supervisionExists(name: string, home?: string): boolean {
 export function readSupervision(name: string, home?: string): SupervisionManifest | null {
   const p = supervisionPath(name, home);
   if (!existsSync(p)) return null;
-  const raw = JSON.parse(readFileSync(p, "utf-8"));
+  let raw: any;
+  try {
+    raw = JSON.parse(readFileSync(p, "utf-8"));
+  } catch {
+    throw new Error(`Supervision manifest corrupt at ${p}: invalid JSON`);
+  }
   // Basic validation
   if (!raw.tunnel || !raw.office || !raw.installedAt) return null;
   return raw as SupervisionManifest;
@@ -335,15 +362,18 @@ export function deleteSupervision(name: string, home?: string): void {
 
 export function validateSshReachable(host: string): void {
   // Test with a simple `ssh <host> exit 0` — the actual reachability check.
-  const result = spawnSync("ssh", [host, "exit", "0"], {
+  // Use `--` to terminate option processing so hostnames starting with `-`
+  // aren't misinterpreted as SSH options.
+  const result = spawnSync("ssh", ["--", host, "exit", "0"], {
     stdio: "pipe",
     encoding: "utf-8",
     timeout: 15_000,
   });
   if (result.status !== 0) {
     const stderr = (result.stderr || "").trim();
+    const fullCmd = `ssh -- ${host} exit 0`;
     throw new Error(
-      `SSH reachability check failed: ssh ${host} exit 0\n` +
+      `SSH reachability check failed: ${fullCmd}\n` +
         (stderr ? `  ${stderr}` : `  exit code ${result.status}`)
     );
   }

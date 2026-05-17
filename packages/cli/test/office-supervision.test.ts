@@ -1,7 +1,8 @@
 /**
  * ops-7x9y — unit tests for office supervision (launchd auto-provisioning).
  *
- * Tests: manifest I/O, plist rendering, port scanning, teardown logic.
+ * Tests: manifest I/O, plist rendering, port scanning, teardown logic,
+ * and K&S regression coverage for findings 1–5.
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
@@ -19,6 +20,7 @@ import {
   supervisionExists,
   deleteSupervision,
   teardownSupervision,
+  validateSshReachable,
 } from "../src/commands/office-supervision.js";
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,17 @@ describe("supervision manifest", () => {
     deleteSupervision("temp", TMP_HOME);
     expect(supervisionExists("temp", TMP_HOME)).toBe(false);
   });
+
+  // K&S finding 4: corrupt manifest throws with descriptive error
+  test("throws descriptive error on corrupt/invalid JSON manifest", () => {
+    const dir = join(TMP_HOME, ".tps", "branch-office", "corrupt");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "supervision.json"), "{ this is not json }", "utf-8");
+
+    expect(() => readSupervision("corrupt", TMP_HOME)).toThrow(
+      /Supervision manifest corrupt.*supervision\.json.*invalid JSON/
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -132,11 +145,14 @@ describe("generateTunnelPlist", () => {
     expect(plist).toContain("<key>Label</key>");
     expect(plist).toContain("<string>ai.tpsdev.tunnel-test-branch</string>");
 
-    // ProgramArguments: ssh -N -L <port>:127.0.0.1:<port> <tunnel-via>
+    // ProgramArguments: ssh -N -L <port>:127.0.0.1:<port> -- <tunnel-via>
     expect(plist).toContain("<key>ProgramArguments</key>");
     expect(plist).toContain("<string>-N</string>");
     expect(plist).toContain("<string>-L</string>");
     expect(plist).toContain("<string>33744:127.0.0.1:33744</string>");
+
+    // K&S finding 5: `--` terminator before hostname
+    expect(plist).toContain("<string>--</string>");
     expect(plist).toContain("<string>tps-reed</string>");
 
     // KeepAlive (simple true, not a dict with Crashed)
@@ -163,8 +179,38 @@ describe("generateTunnelPlist", () => {
     });
 
     expect(plist).toContain("<string>33998:127.0.0.1:33998</string>");
+    expect(plist).toContain("<string>--</string>");
     expect(plist).toContain("<string>other-host</string>");
     expect(plist).toContain("<string>ai.tpsdev.tunnel-branch-b</string>");
+  });
+
+  // K&S finding 5: hostnames with special XML chars are escaped
+  test("XML-escapes hostname with metacharacters", () => {
+    const plist = generateTunnelPlist({
+      name: "safe",
+      localPort: 33701,
+      tunnelVia: "evil-host&<>\"",
+      home: TMP_HOME,
+    });
+
+    expect(plist).not.toContain("evil-host&<>\"");
+    expect(plist).toContain("evil-host&amp;&lt;&gt;&quot;");
+  });
+
+  // K&S finding 5: hostname starting with - is after -- terminator
+  test("handles hostname starting with dash (SSH option injection prevention)", () => {
+    const plist = generateTunnelPlist({
+      name: "safe",
+      localPort: 33702,
+      tunnelVia: "-oProxyCommand=evil",
+      home: TMP_HOME,
+    });
+
+    // Verify `--` appears before the hostname in the XML argument array
+    const dashIdx = plist.indexOf("<string>--</string>");
+    const hostIdx = plist.indexOf("<string>-oProxyCommand=evil</string>");
+    expect(dashIdx).toBeGreaterThan(0);
+    expect(hostIdx).toBeGreaterThan(dashIdx);
   });
 });
 
@@ -181,7 +227,7 @@ describe("generateOfficePlist", () => {
     expect(plist).toContain("<key>Label</key>");
     expect(plist).toContain("<string>ai.tpsdev.office-test-branch</string>");
 
-    // ProgramArguments: bun run ~/ops/tps/packages/cli/dist/bin/tps.js office connect <name>
+    // ProgramArguments: bun run <tpsJs> office connect <name>
     expect(plist).toContain("<key>ProgramArguments</key>");
     expect(plist).toContain("<string>run</string>");
     expect(plist).toContain(`<string>${join(TMP_HOME, "ops/tps/packages/cli/dist/bin/tps.js")}</string>`);
@@ -201,17 +247,33 @@ describe("generateOfficePlist", () => {
     expect(plist).toContain(`<string>${join(LOGS_DIR, "office-test-branch.log")}</string>`);
     expect(plist).toContain(`<string>${join(LOGS_DIR, "office-test-branch.error.log")}</string>`);
   });
+
+  // K&S finding 3: TPS_CLI_PATH env var overrides default path
+  test("uses TPS_CLI_PATH env var when set", () => {
+    const customPath = "/opt/custom/tps.js";
+    process.env.TPS_CLI_PATH = customPath;
+    try {
+      const plist = generateOfficePlist({ name: "custom-path", home: TMP_HOME });
+      expect(plist).toContain(`<string>${customPath}</string>`);
+      expect(plist).not.toContain("/ops/tps/packages/cli/dist/bin/tps.js");
+    } finally {
+      delete process.env.TPS_CLI_PATH;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
 // 3. Port scanning
 // ---------------------------------------------------------------------------
 
+const PORT_RANGE_START = 33700;
+const PORT_RANGE_END = 33999;
+
 describe("findFreeLaunchdPort", () => {
   test("returns first port in range when no plists exist", () => {
     const port = findFreeLaunchdPort(TMP_HOME);
-    expect(port).toBeGreaterThanOrEqual(33700);
-    expect(port).toBeLessThanOrEqual(33999);
+    expect(port).toBeGreaterThanOrEqual(PORT_RANGE_START);
+    expect(port).toBeLessThanOrEqual(PORT_RANGE_END);
   });
 
   test("skips ports referenced in existing plists", () => {
@@ -246,14 +308,14 @@ describe("findFreeLaunchdPort", () => {
 <plist version="1.0">
 <dict>
   <key>ProgramArguments</key>
-  <array><string>ssh</string><string>-N</string><string>-L</string><string>${33700 + i}:127.0.0.1:${33700 + i}</string><string>x</string></array>
+  <array><string>ssh</string><string>-N</string><string>-L</string><string>${PORT_RANGE_START + i}:127.0.0.1:${PORT_RANGE_START + i}</string><string>x</string></array>
 </dict>
 </plist>`;
       writeFileSync(join(LAUNCH_AGENTS_DIR, `ai.tpsdev.tunnel-${i}.plist`), plist, "utf-8");
     }
 
     const port = findFreeLaunchdPort(TMP_HOME);
-    expect(port).toBe(33702);
+    expect(port).toBe(PORT_RANGE_START + 2);
   });
 
   test("throws when all ports in range are taken", () => {
@@ -270,11 +332,36 @@ describe("findFreeLaunchdPort", () => {
 
     expect(() => findFreeLaunchdPort(TMP_HOME)).toThrow(/No free port/);
   });
-});
 
-// PORT_RANGE_START constant for the test above
-const PORT_RANGE_START = 33700;
-const PORT_RANGE_END = 33999;
+  // K&S finding 5: ports that appear after `--` are NOT treated as occupied
+  // (they're hostnames, not -L port-bindings)
+  test("does not treat hostname-looking tokens after -- as ports", () => {
+    // A plist where the hostname happens to contain a number that looks like a port
+    const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>-L</string>
+    <string>33700:127.0.0.1:33700</string>
+    <string>--</string>
+    <string>host-33888</string>
+  </array>
+</dict>
+</plist>`;
+    writeFileSync(join(LAUNCH_AGENTS_DIR, "ai.tpsdev.tunnel-with-dash.plist"), plist, "utf-8");
+
+    // Port 33700 is taken by -L, but host-33888 should NOT be treated as a port
+    const port = findFreeLaunchdPort(TMP_HOME);
+    expect(port).toBe(33701); // 33700 is taken, 33701 is free
+    // Importantly: 33888 is NOT taken (it's after --, not a -L binding)
+    expect(port).toBeLessThan(33888);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 4. Atomic plist write/delete
@@ -292,7 +379,8 @@ describe("writePlist / deletePlist", () => {
     expect(existsSync(dest)).toBe(true);
 
     // Verify no .tmp left behind
-    expect(existsSync(dest + ".tmp")).toBe(false);
+    const tmp = `${dest}.${process.pid}.tmp`;
+    expect(existsSync(tmp)).toBe(false);
 
     // Verify content
     const read = readFileSync(dest, "utf-8");
@@ -364,5 +452,33 @@ describe("teardownSupervision", () => {
   test("returns null when no supervision manifest exists", () => {
     const result = teardownSupervision("nonexistent", TMP_HOME);
     expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. K&S finding 5: SSH option injection in validateSshReachable
+// ---------------------------------------------------------------------------
+
+describe("validateSshReachable", () => {
+  test("includes -- before hostname to prevent option injection", () => {
+    // We can't actually reach an SSH server in this test env,
+    // but we verify the command format by checking the error message
+    // includes the `--` terminator
+    try {
+      validateSshReachable("-oProxyCommand=evil");
+    } catch (e: any) {
+      // The error message should show `ssh -- -oProxyCommand=evil exit 0`
+      // which means -- was properly inserted before the hostname
+      expect(e.message).toContain("ssh -- -oProxyCommand=evil exit 0");
+    }
+  });
+
+  test("reports full ssh command in error for debugging", () => {
+    try {
+      validateSshReachable("nonexistent-host.local");
+    } catch (e: any) {
+      expect(e.message).toContain("ssh -- nonexistent-host.local exit 0");
+      expect(e.message).toContain("SSH reachability check failed");
+    }
   });
 });

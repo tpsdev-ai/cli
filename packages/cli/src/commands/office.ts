@@ -722,7 +722,16 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "revoke": {
       const agent = validateAgent(args.agent);
 
-      // ops-7x9y: tear down supervision unless --keep-units
+      revokeBranch(agent, "manual revocation");
+      const ws = workspacePath(agent);
+      const rPath = join(ws, "remote.json");
+      if (existsSync(rPath)) {
+        try { unlinkSync(rPath); } catch {}
+      }
+      console.log(`Branch '${agent}' revoked.`);
+
+      // ops-7x9y: tear down supervision AFTER branch revocation succeeds.
+      // Doing it after ensures supervision is not orphaned if revokeBranch throws.
       if (!args.keepUnits) {
         try {
           const { teardownSupervision, supervisionExists: supExists } = await import("./office-supervision.js");
@@ -734,17 +743,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           }
         } catch (e: any) {
           console.error(`⚠️  Supervision teardown warning: ${e.message}`);
-          // Don't fail — revocation should still proceed
+          // Don't fail — revocation already succeeded
         }
       }
 
-      revokeBranch(agent, "manual revocation");
-      const ws = workspacePath(agent);
-      const rPath = join(ws, "remote.json");
-      if (existsSync(rPath)) {
-        try { unlinkSync(rPath); } catch {}
-      }
-      console.log(`Branch '${agent}' revoked.`);
       return;
     }
 
