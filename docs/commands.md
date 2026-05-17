@@ -84,9 +84,12 @@ tps office list
 tps office status [agent]
 
 tps office join <name> <join-token> # Remote-relay model: pair a remote branch
+  [--tunnel-via <ssh-host>] [--port <n>] [--force]
+  [--no-flair] [--force-reinstall-flair]
 tps office connect <name>           # Long-running connection (use under KeepAlive)
 tps office sync <name>              # One-shot connect+drain
 tps office revoke <name>            # Drop a paired branch from the registry
+  [--keep-units] [--purge-flair]
 ```
 
 **Docker-sandbox commands:**
@@ -94,10 +97,10 @@ tps office revoke <name>            # Drop a paired branch from the registry
 - `stop <agent>`: Stop the sandbox.
 
 **Remote-relay commands:**
-- `join <name> <join-token>`: Register a remote branch using the `tps://join?…` token printed by `tps branch init` on the branch.
+- `join <name> <join-token>`: Register a remote branch using the `tps://join?…` token printed by `tps branch init` on the branch. With `--tunnel-via <ssh-host>`, also provisions macOS launchd supervision (ops-7x9y) and a Flair spoke on the remote (ops-209a, opt-out with `--no-flair`). Use `--force-reinstall-flair` to re-provision an existing Flair install.
 - `connect <name>`: Open a persistent encrypted channel to the named branch. Designed for KeepAlive (launchd/systemd).
 - `sync <name>`: One-shot connect, drain inbound/outbound mail, disconnect. Useful for catch-up.
-- `revoke <name>`: Remove the branch from `~/.tps/registry/`. Does not remove launchd/systemd units — clean those up separately.
+- `revoke <name>`: Remove the branch from `~/.tps/registry/`. Tears down supervision units (unless `--keep-units`) and Flair spoke (unless `--keep-units`). Pass `--purge-flair` to also `rm -rf ~/.flair ~/.harper/flair` on the branch.
 
 **Common to both:**
 - `list`: List entries from `~/.tps/branch-office/` (one row per known branch alias, with sandbox-presence flag). Output is local registry state, not live connection health — use `status` for that.

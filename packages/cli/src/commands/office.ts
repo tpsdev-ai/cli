@@ -31,6 +31,10 @@ export interface OfficeArgs {
   port?: number;
   force?: boolean;
   keepUnits?: boolean;
+  // ops-209a: Flair spoke auto-provisioning
+  noFlair?: boolean;
+  forceReinstallFlair?: boolean;
+  purgeFlair?: boolean;
 }
 
 
@@ -235,6 +239,76 @@ function injectSecrets(containerName: string, secrets: Array<{ key: string; valu
   ], { stdio: "pipe", encoding: "utf-8", timeout: 5_000 });
   if (readyResult.status !== 0) {
     throw new Error("failed to mark /run/secrets/.ready");
+  }
+}
+
+/**
+ * ops-209a: Conditionally provision Flair spoke on the remote branch.
+ * Called from join when --tunnel-via is given and --no-flair is not set.
+ */
+async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promise<void> {
+  if (args.noFlair) {
+    console.log("ℹ️  --no-flair: skipping Flair spoke provisioning.");
+    return;
+  }
+
+  try {
+    const {
+      buildFlairPlan,
+      flairSpokeExists,
+      installFlairSpoke,
+      configureFederation,
+    } = await import("./office-flair-spoke.js");
+
+    const plan = buildFlairPlan();
+
+    if (plan.mode === "error") {
+      console.error(`❌ Flair spoke provisioning blocked: ${plan.error}`);
+      return;
+    }
+
+    // Idempotency check
+    if (flairSpokeExists(args.tunnelVia!, agent)) {
+      if (!args.forceReinstallFlair) {
+        console.error(
+          `❌ Flair is already installed on '${args.tunnelVia}'.\n` +
+          `   Use --force-reinstall-flair to reinstall (preserves data unless --purge-flair).`
+        );
+        return;
+      }
+      console.log("♻️  Force-reinstalling Flair spoke...");
+    }
+
+    console.log("");
+    console.log(`🧠 Flair spoke provisioning (mode: ${plan.mode}):`);
+    console.log(`   Branch: ${agent}`);
+    console.log(`   Remote: ${args.tunnelVia}`);
+    if (plan.mode === "hub-less") {
+      console.log("   Hub:    (none — hub-less mode, branch memories are an island)");
+    } else {
+      console.log(`   Hub:    ${plan.hub}`);
+    }
+
+    const state = installFlairSpoke(args.tunnelVia!, agent, plan);
+    console.log(`   ✅ Flair installed (port ${state.port}, unit ${state.unitName})`);
+
+    if (plan.mode === "spoke") {
+      try {
+        const fed = configureFederation(args.tunnelVia!, agent, plan);
+        if (fed.lastSync) {
+          console.log(`   ✅ Fed-sync configured + validated (timer ${fed.timerName})`);
+        } else {
+          console.log(`   ⚠️  Fed-sync partially configured: initial sync failed.`);
+          console.log(`       Branch is hub-less until the sync is working.`);
+        }
+      } catch (e: any) {
+        console.error(`   ⚠️  Fed-sync configuration failed: ${e.message}`);
+        console.error(`       Flair is installed but federation is not active.`);
+      }
+    }
+  } catch (e: any) {
+    console.error(`❌ Flair spoke provisioning failed: ${e.message}`);
+    console.error("   The join was successful — fix the issue and re-run with --force-reinstall-flair.");
   }
 }
 
@@ -567,6 +641,22 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
             console.log(`   ${loadedIcon(tunnelState)} Tunnel: ${sup.tunnel.plistLabel} → port ${sup.tunnel.localPort} via ${sup.tunnel.tunnelVia}${tunnelState.pid ? ` (PID ${tunnelState.pid})` : ""}`);
             console.log(`   ${loadedIcon(officeState)} Office: ${sup.office.plistLabel}${officeState.pid ? ` (PID ${officeState.pid})` : ""}`);
             console.log(`   Installed: ${sup.installedAt}`);
+
+            // ops-209a: report Flair spoke health if installed
+            try {
+              const { checkFlairHealth } = await import("./office-flair-spoke.js");
+              const fl = checkFlairHealth(sup.tunnel.tunnelVia, agent);
+              if (fl.installed) {
+                console.log(`\n🧠 Flair spoke:`);
+                console.log(`   Flair:    ${fl.unitActive ? "🟢" : "🔴"} ${fl.flairDir} (port ${fl.port})`);
+                console.log(`   API:      ${fl.apiReachable ? "✅ reachable" : "❌ unreachable"}`);
+                if (fl.fedSyncConfigured) {
+                  console.log(`   Fed-Sync: ${fl.fedSyncActive ? "🟢" : "🔴"} → ${fl.fedSyncConfigured ? "hub" : "none"}${fl.lastFedSync ? ` (last: ${fl.lastFedSync})` : " (never synced)"}`);
+                }
+              }
+            } catch {
+              // best-effort — status should never crash on missing flair spoke module
+            }
           }
         }
       } catch {
@@ -714,6 +804,9 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           // Don't undo the join — the branch is still registered
           // But warn that supervision didn't take
         }
+
+        // ops-209a: provision Flair spoke on the remote branch (default=on, opt-out with --no-flair)
+        await provisionFlairIfRequested(args, agent);
       }
 
       return;
@@ -745,6 +838,21 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           console.error(`⚠️  Supervision teardown warning: ${e.message}`);
           // Don't fail — revocation already succeeded
         }
+      }
+
+      // ops-209a: tear down Flair spoke (fed-sync + Flair unit + manifest fields)
+      try {
+        const { readSupervision } = await import("./office-supervision.js");
+        const sup = readSupervision(agent);
+        if (sup) {
+          const { teardownFlairSpoke } = await import("./office-flair-spoke.js");
+          await teardownFlairSpoke(sup.tunnel.tunnelVia, agent, {
+            purgeFlair: args.purgeFlair,
+          });
+        }
+      } catch (e: any) {
+        console.error(`⚠️  Flair spoke teardown warning: ${e.message}`);
+        // Don't fail — revocation already succeeded
       }
 
       return;
