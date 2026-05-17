@@ -2,7 +2,8 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { buildJoinToken, isAlreadyJoined } from "../src/commands/branch.js";
+import { readFileSync } from "node:fs";
+import { buildJoinToken, isAlreadyJoined, writeBranchConf } from "../src/commands/branch.js";
 
 describe("tps branch init", () => {
   let tmpDir: string;
@@ -56,6 +57,32 @@ describe("tps branch init", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "host.json"), JSON.stringify({ hostId: "existing" }));
     expect(isAlreadyJoined(dir)).toBe(true);
+  });
+
+  test("writeBranchConf persists agentId when --agent supplied (ops-hs19)", () => {
+    process.env.TPS_ROOT = tmpDir;
+    try {
+      writeBranchConf(33744, "localhost", "ws", undefined, "reed");
+      const conf = JSON.parse(readFileSync(join(tmpDir, "branch.conf.json"), "utf-8"));
+      expect(conf.agentId).toBe("reed");
+      expect(conf.port).toBe(33744);
+      expect(conf.host).toBe("localhost");
+      expect(conf.transport).toBe("ws");
+    } finally {
+      delete process.env.TPS_ROOT;
+    }
+  });
+
+  test("writeBranchConf omits agentId when not supplied (back-compat)", () => {
+    process.env.TPS_ROOT = tmpDir;
+    try {
+      writeBranchConf(6458, "tps-host", "ws");
+      const conf = JSON.parse(readFileSync(join(tmpDir, "branch.conf.json"), "utf-8"));
+      expect(conf.agentId).toBeUndefined();
+      expect(conf.port).toBe(6458);
+    } finally {
+      delete process.env.TPS_ROOT;
+    }
   });
 });
 
