@@ -76,12 +76,20 @@
       "bin": {
         "tps": "./tps",
       },
+      "dependencies": {
+        "require-addon": "^1.2.0",
+        "sodium-native": "^5.0.10",
+      },
     },
     "packages/cli-darwin-x64": {
       "name": "@tpsdev-ai/cli-darwin-x64",
       "version": "0.5.4",
       "bin": {
         "tps": "./tps",
+      },
+      "dependencies": {
+        "require-addon": "^1.2.0",
+        "sodium-native": "^5.0.10",
       },
     },
     "packages/cli-linux-arm64": {
@@ -90,12 +98,20 @@
       "bin": {
         "tps": "./tps",
       },
+      "dependencies": {
+        "require-addon": "^1.2.0",
+        "sodium-native": "^5.0.10",
+      },
     },
     "packages/cli-linux-x64": {
       "name": "@tpsdev-ai/cli-linux-x64",
       "version": "0.5.4",
       "bin": {
         "tps": "./tps",
+      },
+      "dependencies": {
+        "require-addon": "^1.2.0",
+        "sodium-native": "^5.0.10",
       },
     },
     "packages/pi-tps-mail": {
