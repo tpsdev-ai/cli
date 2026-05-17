@@ -125,6 +125,9 @@ const cli = meow(
       priority: { type: "string" },
       version: { type: "string" },
       verbose: { type: "boolean", default: false },
+      // ops-7x9y: office join supervision flags (--force is already declared above)
+      tunnelVia: { type: "string" },
+      keepUnits: { type: "boolean", default: false },
       // Task envelope flags (mail send --task)
       task: { type: "string" },
       taskId: { type: "string" },
@@ -562,16 +565,27 @@ async function main() {
       } else if (action === "join") {
         const joinToken = rest[2];
         if (!rest[1] || !joinToken) {
-          console.error("Usage: tps office join <name> <join-token-url>");
+          console.error("Usage: tps office join <name> <join-token-url> [--tunnel-via <ssh-host>] [--port <n>] [--force]");
           process.exit(1);
         }
-        await runOffice({ action: "join", agent: rest[1], joinToken });
+        await runOffice({
+          action: "join",
+          agent: rest[1],
+          joinToken,
+          tunnelVia: cli.flags.tunnelVia as string | undefined,
+          port: cli.flags.port as number | undefined,
+          force: cli.flags.force as boolean,
+        });
       } else if (action === "revoke") {
         if (!rest[1]) {
-          console.error("Usage: tps office revoke <name>");
+          console.error("Usage: tps office revoke <name> [--keep-units]");
           process.exit(1);
         }
-        await runOffice({ action: "revoke", agent: rest[1] });
+        await runOffice({
+          action: "revoke",
+          agent: rest[1],
+          keepUnits: cli.flags.keepUnits as boolean,
+        });
       } else if (action === "setup") {
         const dryRun = process.argv.includes("--dry-run") || process.argv.includes("--dry");
         await runOffice({ action: "setup", agent: rest[1], dryRun });
