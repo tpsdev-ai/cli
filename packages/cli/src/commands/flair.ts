@@ -405,9 +405,9 @@ export async function flairCommand(
         process.exit(1);
       }
       // Allowlist protocols. set-hub points the team's Flair config at an HTTP
-      // endpoint — accepting `file://`, `ftp://`, `ws://`, etc. would let a
-      // typo write something the probe action then tries to fetch with
-      // unexpected semantics. Kern nit (PR #284 review).
+      // endpoint — accepting non-HTTP schemes (file, ftp, websocket, etc.)
+      // would let a typo write something the probe action then tries to fetch
+      // with unexpected semantics. Kern nit (PR #284 review).
       if (!["https:", "http:"].includes(parsed.protocol)) {
         console.error(
           `Unsupported protocol: ${parsed.protocol}. Hub must be https:// or http://.`,
