@@ -65,25 +65,63 @@ tps roster find --channel <channel>
 
 ---
 
-## Branch Office (Sandboxing)
+## Branch Office
 
-### `tps office`
+TPS supports two branch-office models:
 
-Manage Docker-based sandboxes ("Branch Offices"). Requires Docker Desktop.
+- **Docker sandboxes** (`tps office start <agent>`) — short-lived agent containers on the local host.
+- **Remote relay** (`tps branch …` on the remote + `tps office join`/`connect` on the host) — persistent agents on a separate machine, paired over Noise IK + WebSocket.
+
+For the remote-relay model — including provisioning a new branch office VM, troubleshooting, and security notes — see [branch-office.md](branch-office.md).
+
+### `tps office` (host side)
 
 **Usage:**
 ```bash
-tps office start <agent>
+tps office start <agent>            # Docker-sandbox model
 tps office stop <agent>
 tps office list
-tps office status <agent>
+tps office status [agent]
+
+tps office join <name> <join-token> # Remote-relay model: pair a remote branch
+tps office connect <name>           # Long-running connection (use under KeepAlive)
+tps office sync <name>              # One-shot connect+drain
+tps office revoke <name>            # Drop a paired branch from the registry
+```
+
+**Docker-sandbox commands:**
+- `start <agent>`: Create and start a sandbox for the agent. Installs OpenClaw and TPS inside.
+- `stop <agent>`: Stop the sandbox.
+
+**Remote-relay commands:**
+- `join <name> <join-token>`: Register a remote branch using the `tps://join?…` token printed by `tps branch init` on the branch.
+- `connect <name>`: Open a persistent encrypted channel to the named branch. Designed for KeepAlive (launchd/systemd).
+- `sync <name>`: One-shot connect, drain inbound/outbound mail, disconnect. Useful for catch-up.
+- `revoke <name>`: Remove the branch from `~/.tps/registry/`. Does not remove launchd/systemd units — clean those up separately.
+
+**Common to both:**
+- `list`: List all known branches and their workspace presence.
+- `status [agent]`: Show connection state (Docker container status, or relay heartbeat / message counters).
+
+### `tps branch` (branch side)
+
+Run on the remote machine that hosts the agent.
+
+**Usage:**
+```bash
+tps branch init [--listen <port>] [--host <hostname>] [--transport ws|tcp] [--agent <id>] [--force]
+tps branch start
+tps branch stop
+tps branch status
+tps branch log [--lines N] [--follow]
 ```
 
 **Commands:**
-- `start <agent>`: Create and start a sandbox for the agent. Installs OpenClaw and TPS inside.
-- `stop <agent>`: Stop the sandbox.
-- `list`: List all branch office workspaces.
-- `status <agent>`: Show sandbox status and mail relay details.
+- `init`: Generate branch identity, write `~/.tps/branch.conf.json`, and wait for an incoming host `office join`. Pass `--agent <id>` to fix the local maildir name (otherwise falls back to `hostname()` — see [branch-office.md troubleshooting](branch-office.md#troubleshooting)).
+- `start`: Run the long-lived listener daemon. Daemonizes; logs to `~/.tps/branch.log`.
+- `stop`: Stop the daemon (reads `~/.tps/branch.pid`).
+- `status`: Report whether the daemon is running, the listen address, and the paired host fingerprint.
+- `log`: Tail `~/.tps/branch.log`.
 
 ---
 
