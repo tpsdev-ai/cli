@@ -27,6 +27,10 @@ export interface OfficeArgs {
   joinToken?: string;
   dryRun?: boolean;
   json?: boolean;
+  tunnelVia?: string;
+  port?: number;
+  force?: boolean;
+  keepUnits?: boolean;
 }
 
 
@@ -544,6 +548,31 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           console.log(`   Review: ${pausedDir}`);
         }
       }
+
+      // ops-7x9y: report supervision state via launchd
+      try {
+        const { readSupervision, getUnitState } = await import("./office-supervision.js");
+        const sup = readSupervision(agent);
+        if (sup) {
+          const tunnelState = getUnitState(sup.tunnel.plistLabel);
+          const officeState = getUnitState(sup.office.plistLabel);
+          
+          const loadedIcon = (s: { loaded: boolean }) => s.loaded ? "🟢" : "🔴";
+          
+          if (args.json) {
+            // Already printed json above — re-print with supervision added
+            console.error("Note: --json output for supervised offices is not yet merged. Use plain text status.");
+          } else {
+            console.log(`\n🔒 Supervision (launchd):`);
+            console.log(`   ${loadedIcon(tunnelState)} Tunnel: ${sup.tunnel.plistLabel} → port ${sup.tunnel.localPort} via ${sup.tunnel.tunnelVia}${tunnelState.pid ? ` (PID ${tunnelState.pid})` : ""}`);
+            console.log(`   ${loadedIcon(officeState)} Office: ${sup.office.plistLabel}${officeState.pid ? ` (PID ${officeState.pid})` : ""}`);
+            console.log(`   Installed: ${sup.installedAt}`);
+          }
+        }
+      } catch {
+        // best-effort — status should never crash on missing supervision module
+      }
+
       return;
     }
 
@@ -587,7 +616,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
     case "join": {
       if (!args.agent || !args.joinToken) {
-        console.error("Usage: tps office join <name> <join-token>");
+        console.error("Usage: tps office join <name> <join-token> [--tunnel-via <ssh-host>] [--port <n>] [--force]");
         process.exit(1);
       }
       const agent = validateAgent(args.agent);
@@ -651,11 +680,64 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       await channel.close();
       console.log(`Branch '${agent}' registered.`);
       console.log("Host pubkey sent to branch.");
+
+      // ops-7x9y: provision launchd supervision when --tunnel-via is given
+      if (args.tunnelVia) {
+        const { installSupervision, supervisionExists: supExists, teardownSupervision } = await import("./office-supervision.js");
+
+        if (supExists(agent)) {
+          if (!args.force) {
+            console.error(
+              `❌ Supervision already exists for '${agent}'.\n` +
+              `   Use --force to regenerate and reload, or tps office revoke ${agent} to tear down.`
+            );
+            process.exit(1);
+          }
+          // With --force: tear down existing first, then reinstall
+          console.log("♻️  Force-regenerating supervision units...");
+          teardownSupervision(agent);
+        }
+
+        try {
+          const result = installSupervision(agent, args.tunnelVia, args.port);
+          console.log("");
+          console.log("🔒 Supervision installed (launchd):");
+          console.log(`   Tunnel:    ${result.tunnelLabel} → port ${result.localPort} via ${args.tunnelVia}`);
+          console.log(`   Office:    ${result.officeLabel}`);
+          console.log(`   Manifest:  ~/.tps/branch-office/${agent}/supervision.json`);
+          console.log(`   Logs:      ~/.tps/logs/`);
+          console.log("");
+          console.log("   Units auto-start at login and restart on crash.");
+          console.log(`   Revoke with: tps office revoke ${agent}`);
+        } catch (e: any) {
+          console.error(`❌ Supervision provisioning failed: ${e.message}`);
+          // Don't undo the join — the branch is still registered
+          // But warn that supervision didn't take
+        }
+      }
+
       return;
     }
 
     case "revoke": {
       const agent = validateAgent(args.agent);
+
+      // ops-7x9y: tear down supervision unless --keep-units
+      if (!args.keepUnits) {
+        try {
+          const { teardownSupervision, supervisionExists: supExists } = await import("./office-supervision.js");
+          if (supExists(agent)) {
+            const result = teardownSupervision(agent);
+            if (result) {
+              console.log(`🧹 Supervision units unloaded: ${result.tunnelLabel}, ${result.officeLabel}`);
+            }
+          }
+        } catch (e: any) {
+          console.error(`⚠️  Supervision teardown warning: ${e.message}`);
+          // Don't fail — revocation should still proceed
+        }
+      }
+
       revokeBranch(agent, "manual revocation");
       const ws = workspacePath(agent);
       const rPath = join(ws, "remote.json");
