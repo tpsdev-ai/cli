@@ -125,9 +125,8 @@ const cli = meow(
       priority: { type: "string" },
       version: { type: "string" },
       verbose: { type: "boolean", default: false },
-      // ops-7x9y: office join supervision flags
+      // ops-7x9y: office join supervision flags (--force is already declared above)
       tunnelVia: { type: "string" },
-      force: { type: "boolean", default: false },
       keepUnits: { type: "boolean", default: false },
       // Task envelope flags (mail send --task)
       task: { type: "string" },

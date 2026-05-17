@@ -44,8 +44,7 @@ export function findFreeLaunchdPort(home: string = homedir()): number {
         const content = readFileSync(join(launchAgentsDir, f), "utf-8");
         // Match -L <port>:127.0.0.1:<port> or -L <port>:localhost:<port>
         const re = /<string>-L<\/string>\s*<string>(\d+):/g;
-        let m: RegExpExecArray | null;
-        while ((m = re.exec(content)) !== null) {
+        for (const m of content.matchAll(re)) {
           taken.add(parseInt(m[1], 10));
         }
       } catch {
