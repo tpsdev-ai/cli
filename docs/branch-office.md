@@ -23,7 +23,7 @@ If the agent is short-lived and just needs filesystem isolation, prefer `tps off
 │                  │                              │                      │
 │  tps office       │   SSH tunnel                │  tps branch          │
 │  connect <name>  ├───-L <p>:127.0.0.1:<p>──────►│  start (listens     │
-│  (KeepAlive)     │   (encrypted by SSH)         │   on 127.0.0.1:<p>) │
+│  (KeepAlive)     │   (encrypted by SSH)         │   on 0.0.0.0:<p>)   │
 │                  │                              │                      │
 │                  │   Inside the SSH tunnel:     │                      │
 │                  │   WebSocket + Noise IK       │                      │
@@ -75,7 +75,7 @@ tps branch init \
   --host localhost \
   --transport ws \
   --agent reed \
-  --nonono
+  --nonono   # global flag — suppresses the nono-availability warning
 ```
 
 What this does:
@@ -275,6 +275,16 @@ Look at `~/.tps/logs/office-<name>.log`. Common causes:
 - **Trust radius**: the SSH tunnel is operational, not a trust boundary. Compromise of the SSH key does **not** compromise mail content — the Noise IK channel inside the tunnel is independently encrypted.
 - **Mail content is at rest in plaintext** on both sides (`~/.tps/mail/<agent>/`). Treat those directories as you would `~/.ssh/`: mode-700, owned by the agent's user.
 - **Replay & forgery** are protected by the Noise IK per-message AEAD; outside the channel, the maildir filenames include the issuing UUID and timestamp so duplicates are detectable.
+
+### Rotating branch identity
+
+If a branch's keypair is ever suspected compromised, rotate it:
+
+1. On the branch: `tps branch init --force` (generates a fresh keypair, prints a new join token).
+2. On the host: `tps office revoke <name>` followed by `tps office join <name> <new-token>`.
+3. Restart the branch daemon (`tps branch start`).
+
+Note: `tps office revoke` moves the revoked entry to `~/.tps/registry/revoked/` on the host but leaves `~/.tps/identity/` keypairs in place on the branch. That's intentional — `tps branch init --force` will overwrite them in place — but if you're decommissioning the branch entirely, `rm -rf ~/.tps/identity/` on the branch after revoke. Also clean up the host-side launchd/systemd units (`launchctl unload …` or `systemctl disable …`); `revoke` doesn't touch those.
 
 ## See also
 
