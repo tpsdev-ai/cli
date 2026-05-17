@@ -1055,7 +1055,12 @@ async function main() {
 
     case "flair": {
       const action = rest[0];
-      if (!action || !["install", "uninstall", "start", "stop", "restart", "status", "logs", "health", "sync"].includes(action)) {
+      const validActions = [
+        "install", "uninstall", "start", "stop", "restart", "status", "logs", "health", "sync",
+        // Config actions (ops-wn6g)
+        "set-hub", "clear-hub", "show", "probe",
+      ];
+      if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
           "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
@@ -1064,7 +1069,11 @@ async function main() {
           "  tps flair status\n" +
           "  tps flair logs\n" +
           "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]\n" +
-          "  tps flair sync [--once] [--interval <seconds>] [--dry-run]"
+          "  tps flair sync [--once] [--interval <seconds>] [--dry-run]\n" +
+          "  tps flair set-hub <url> [--auth-mode admin-pass-file --auth-path <path>] [--port <n>]\n" +
+          "  tps flair clear-hub\n" +
+          "  tps flair show [--json]\n" +
+          "  tps flair probe [--json]"
         );
         process.exit(1);
       }
@@ -1100,6 +1109,16 @@ async function main() {
           ? process.argv[process.argv.indexOf("--flair-dir") + 1]
           : undefined,
         dev: process.argv.includes("--dev"),
+        // set-hub: first positional after action is the URL.
+        hub: action === "set-hub" ? rest[1] : undefined,
+        authMode: process.argv.includes("--auth-mode")
+          ? process.argv[process.argv.indexOf("--auth-mode") + 1]
+          : undefined,
+        authPath: process.argv.includes("--auth-path")
+          ? process.argv[process.argv.indexOf("--auth-path") + 1]
+          : undefined,
+        port: typeof cli.flags.port === "number" ? Number(cli.flags.port) : undefined,
+        json: Boolean(cli.flags.json),
       });
       break;
     }

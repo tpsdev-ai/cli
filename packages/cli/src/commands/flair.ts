@@ -1,8 +1,14 @@
 /**
- * tps harper install|uninstall|start|stop|restart|status|logs
+ * tps flair install|uninstall|start|stop|restart|status|logs   (local lifecycle)
+ * tps flair set-hub|clear-hub|show|probe                       (team config — ops-wn6g)
  *
- * Manages Harper (Flair backend) as a macOS launchd agent.
- * Auto-restarts on crash, starts on login.
+ * Local lifecycle actions manage Harper (Flair backend) as a macOS launchd
+ * agent. Auto-restarts on crash, starts on login.
+ *
+ * Config actions manage ~/.tps/flair.json so other TPS subcommands (and
+ * future branch-init) know the team's Flair hub URL without scraping env
+ * vars. Hub-less mode is valid: set-hub is optional; branches without a
+ * configured hub get local Flair only (no fed-sync). See ops-wn6g.
  */
 
 import { execSync } from "node:child_process";
@@ -12,8 +18,9 @@ import {
   readFileSync,
   mkdirSync,
   chmodSync,
+  renameSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 
@@ -31,6 +38,54 @@ const STDERR_LOG = join(LOG_DIR, "flair.error.log");
 interface HarperOpts {
   flairDir?: string;
   dev?: boolean;
+  // Config action args (set-hub / clear-hub / show / probe)
+  hub?: string;
+  authMode?: string;
+  authPath?: string;
+  port?: number;
+  json?: boolean;
+}
+
+export interface FlairConfigFile {
+  hub: string | null;
+  auth: { mode: "admin-pass-file"; path: string } | null;
+  localPort: number;
+}
+
+const DEFAULT_LOCAL_PORT = 9926;
+
+function tpsRoot(): string {
+  return process.env.TPS_ROOT || join(process.env.HOME || homedir(), ".tps");
+}
+
+function flairConfigPath(): string {
+  return join(tpsRoot(), "flair.json");
+}
+
+export function readFlairConfigFile(): FlairConfigFile {
+  const p = flairConfigPath();
+  if (!existsSync(p)) {
+    return { hub: null, auth: null, localPort: DEFAULT_LOCAL_PORT };
+  }
+  const raw = JSON.parse(readFileSync(p, "utf-8"));
+  return {
+    hub: raw.hub ? String(raw.hub) : null,
+    auth:
+      raw.auth && raw.auth.mode === "admin-pass-file" && raw.auth.path
+        ? { mode: "admin-pass-file", path: String(raw.auth.path) }
+        : null,
+    localPort: typeof raw.localPort === "number" ? raw.localPort : DEFAULT_LOCAL_PORT,
+  };
+}
+
+export function writeFlairConfigFile(config: FlairConfigFile): void {
+  const p = flairConfigPath();
+  mkdirSync(dirname(p), { recursive: true });
+  // Atomic write: tmp + rename so a concurrent reader never sees a partial
+  // file. Same pattern as cli#281 outbox fix.
+  const tmp = `${p}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+  renameSync(tmp, p);
 }
 
 function getFlairDir(opts: HarperOpts): string {
@@ -307,9 +362,127 @@ export async function flairCommand(
       execSync(`tail -50 "${STDOUT_LOG}"`, { stdio: "inherit" });
       break;
     }
+
+    // -- Config actions (ops-wn6g) ---------------------------------------
+
+    case "set-hub": {
+      if (!opts.hub) {
+        console.error(
+          "Usage: tps flair set-hub <url> [--auth-mode admin-pass-file --auth-path <path>] [--port <n>]",
+        );
+        process.exit(1);
+      }
+      if (opts.hub.trim() === "") {
+        console.error("Empty URL not allowed. Use `tps flair clear-hub` to remove the hub.");
+        process.exit(1);
+      }
+      try {
+        new URL(opts.hub);
+      } catch {
+        console.error(`Invalid URL: ${opts.hub}`);
+        process.exit(1);
+      }
+      const existing = readFlairConfigFile();
+      const config: FlairConfigFile = {
+        hub: opts.hub,
+        auth:
+          opts.authMode === "admin-pass-file" && opts.authPath
+            ? { mode: "admin-pass-file", path: opts.authPath }
+            : existing.auth,
+        localPort: typeof opts.port === "number" ? opts.port : existing.localPort,
+      };
+      writeFlairConfigFile(config);
+      console.log(`Flair hub set: ${config.hub}`);
+      if (config.auth) {
+        console.log(`Auth: ${config.auth.mode} at ${config.auth.path}`);
+      } else {
+        console.log("Auth: none configured (set with --auth-mode + --auth-path)");
+      }
+      break;
+    }
+
+    case "clear-hub": {
+      if (!existsSync(flairConfigPath())) {
+        console.log("No Flair config to clear.");
+        return;
+      }
+      const existing = readFlairConfigFile();
+      writeFlairConfigFile({ hub: null, auth: null, localPort: existing.localPort });
+      console.log("Flair hub cleared. Branches will provision in hub-less mode (no fed-sync).");
+      break;
+    }
+
+    case "show": {
+      const config = readFlairConfigFile();
+      const safe = {
+        hub: config.hub,
+        auth: config.auth ? { mode: config.auth.mode, path: config.auth.path } : null,
+        localPort: config.localPort,
+      };
+      if (opts.json) {
+        console.log(JSON.stringify(safe, null, 2));
+      } else {
+        console.log(`Hub:        ${config.hub ?? "(none — hub-less mode)"}`);
+        console.log(
+          `Auth:       ${config.auth ? `${config.auth.mode} at ${config.auth.path}` : "(none)"}`,
+        );
+        console.log(`Local port: ${config.localPort}`);
+      }
+      break;
+    }
+
+    case "probe": {
+      const config = readFlairConfigFile();
+      const results: Record<string, unknown> = {
+        config: { hub: config.hub, localPort: config.localPort },
+        localFlair: null,
+        hubReachable: null,
+      };
+      try {
+        const res = await fetch(`http://127.0.0.1:${config.localPort}/Health/0`, {
+          signal: AbortSignal.timeout(2_000),
+        });
+        results.localFlair = { ok: res.ok, status: res.status };
+      } catch (err) {
+        results.localFlair = { ok: false, error: (err as Error).message };
+      }
+      if (config.hub) {
+        try {
+          const u = new URL(config.hub);
+          const probeUrl = `${u.protocol}//${u.host}/Health/0`;
+          const res = await fetch(probeUrl, { signal: AbortSignal.timeout(5_000) });
+          results.hubReachable = { ok: res.ok, status: res.status };
+        } catch (err) {
+          results.hubReachable = { ok: false, error: (err as Error).message };
+        }
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(results, null, 2));
+      } else {
+        console.log(`Hub:         ${config.hub ?? "(none)"}`);
+        const local = results.localFlair as { ok: boolean; status?: number; error?: string };
+        console.log(
+          `Local Flair: ${local.ok ? `OK (${local.status})` : `UNREACHABLE (${local.error ?? "?"})`}`,
+        );
+        if (config.hub) {
+          const hub = results.hubReachable as { ok: boolean; status?: number; error?: string };
+          console.log(
+            `Hub probe:   ${hub.ok ? `OK (${hub.status})` : `UNREACHABLE (${hub.error ?? "?"})`}`,
+          );
+        }
+      }
+      break;
+    }
+
     default:
       console.error(
-        `Unknown action: ${action}\nUsage: tps harper install|uninstall|start|stop|restart|status|logs`,
+        `Unknown action: ${action}\n` +
+          `Usage:\n` +
+          `  tps flair install|uninstall|start|stop|restart|status|logs   (local lifecycle)\n` +
+          `  tps flair set-hub <url> [--auth-mode admin-pass-file --auth-path <path>]\n` +
+          `  tps flair clear-hub\n` +
+          `  tps flair show [--json]\n` +
+          `  tps flair probe [--json]`,
       );
       process.exit(1);
   }
