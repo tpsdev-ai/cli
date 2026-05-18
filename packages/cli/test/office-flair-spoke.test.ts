@@ -191,9 +191,25 @@ describe("generateFedSyncTimer", () => {
   test("generates valid timer unit", () => {
     const timer = generateFedSyncTimer("tps-fed-sync-reed", "tps-fed-sync-reed", 300);
     expect(timer).toContain("[Timer]");
-    expect(timer).toContain("OnCalendar=");
+    expect(timer).toContain("OnUnitActiveSec=300s");
     expect(timer).toContain("Persistent=true");
     expect(timer).toContain("WantedBy=timers.target");
+  });
+
+  test("intervalSeconds is honored (ops-r4dm regression)", () => {
+    // Previous OnCalendar=*:*:00/30 hardcode fired every 30s regardless of param.
+    // Verify a non-default interval is interpolated.
+    const fast = generateFedSyncTimer("t", "s", 60);
+    expect(fast).toContain("OnUnitActiveSec=60s");
+    expect(fast).not.toContain("OnUnitActiveSec=300s");
+
+    const slow = generateFedSyncTimer("t", "s", 3600);
+    expect(slow).toContain("OnUnitActiveSec=3600s");
+  });
+
+  test("default cadence is 5 minutes when intervalSeconds omitted", () => {
+    const timer = generateFedSyncTimer("t", "s");
+    expect(timer).toContain("OnUnitActiveSec=300s");
   });
 });
 
@@ -215,6 +231,24 @@ describe("generateLaunchdFlairPlist", () => {
     expect(plist).toContain("KeepAlive");
     expect(plist).toContain("HARPER_SET_CONFIG");
     expect(plist).toContain("/Users/testuser/.tps/logs/");
+  });
+
+  test("uses the remote home explicitly — not whatever happens to be passed (ops-r4dm)", () => {
+    // The macOS branch may have a different $HOME than rockit (e.g.,
+    // local=/Users/squeued, remote=/Users/exedev). Caller is responsible
+    // for detecting + passing remote $HOME; the generator must use it
+    // verbatim for log paths + HOME env var.
+    const plist = generateLaunchdFlairPlist(
+      "ai.tpsdev.flair-test",
+      "~/.flair",
+      "~/.harper/flair",
+      "/Users/exedev",
+      9926,
+    );
+    expect(plist).toContain("/Users/exedev/.tps/logs/flair-ai.tpsdev.flair-test.log");
+    expect(plist).toContain("/Users/exedev/.tps/logs/flair-ai.tpsdev.flair-test.error.log");
+    expect(plist).toContain("<string>/Users/exedev</string>"); // HOME env var
+    expect(plist).not.toContain(homedir()); // no leak of the local home
   });
 });
 
