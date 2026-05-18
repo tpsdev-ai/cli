@@ -250,6 +250,46 @@ describe("generateLaunchdFlairPlist", () => {
     expect(plist).toContain("<string>/Users/exedev</string>"); // HOME env var
     expect(plist).not.toContain(homedir()); // no leak of the local home
   });
+
+  test("XML-escapes caller-supplied string values (ops-y722)", () => {
+    // K&S flagged on PR #290 that the plist embedded caller strings raw —
+    // a `&` or `<` in any interpolated value would silently corrupt the
+    // XML and break launchctl load with an unhelpful parser error.
+    // Note: harperDataDir is only used inside the JSON config (covered by
+    // the separate HARPER_SET_CONFIG test); these assertions cover the
+    // direct <string> embedding paths.
+    const plist = generateLaunchdFlairPlist(
+      "label&with<special>chars",
+      "~/.flair'apos",
+      "~/.harper/flair",
+      "/Users/<weird&user>",
+      9926,
+    );
+    // Raw metachars must not appear in the value positions
+    expect(plist).not.toContain("label&with<special>chars");
+    expect(plist).not.toContain("/Users/<weird&user>");
+    // Encoded forms must be present
+    expect(plist).toContain("label&amp;with&lt;special&gt;chars");
+    expect(plist).toContain("/Users/&lt;weird&amp;user&gt;");
+    expect(plist).toContain("~/.flair&apos;apos");
+  });
+
+  test("XML-escapes HARPER_SET_CONFIG JSON before embedding (ops-y722)", () => {
+    // HARPER_SET_CONFIG is a JSON string wrapped in <string>...</string>.
+    // The inner JSON has quotes which would tear out of the XML element
+    // unless XML-escaped. Verify the embedded config is encoded.
+    const plist = generateLaunchdFlairPlist(
+      "ai.tpsdev.flair-test",
+      "~/.flair",
+      "~/.harper/flair",
+      "/Users/exedev",
+      9926,
+    );
+    // The inner JSON quotes must be encoded; the surrounding XML must be parseable
+    expect(plist).toContain("&quot;rootPath&quot;");
+    expect(plist).toContain("&quot;http&quot;");
+    expect(plist).not.toMatch(/<string>\{"rootPath":/); // raw unescaped JSON would have this
+  });
 });
 
 // ─── 4. Extended supervision manifest round-trip ──────────────────────────────
