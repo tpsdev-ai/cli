@@ -57,7 +57,8 @@ export interface SecretsArgs {
   adoptApply?: boolean;
   adoptNonInteractive?: boolean;
   adoptSecretsDir?: string;
-  adoptKeysDir?: string;
+  adoptIdentityDir?: string;
+  adoptFlairKeysDir?: string;
   // verify
   verifyFix?: boolean;
   // common
@@ -368,7 +369,8 @@ function handleAdopt(args: SecretsArgs): void {
 
   const dirs = {
     secretsDir: args.adoptSecretsDir ?? join(homedir(), ".tps", "secrets"),
-    keysDir: args.adoptKeysDir ?? join(homedir(), ".tps", "keys"),
+    identityDir: args.adoptIdentityDir ?? join(homedir(), ".tps", "identity"),
+    flairKeysDir: args.adoptFlairKeysDir ?? join(homedir(), ".flair", "keys"),
     openclawConfigPath: join(homedir(), ".openclaw", "openclaw.json"),
   };
 

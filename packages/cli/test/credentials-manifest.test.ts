@@ -62,8 +62,14 @@ function createSecretsDir(baseDir: string): string {
   return d;
 }
 
-function createKeysDir(baseDir: string): string {
-  const d = join(baseDir, "keys");
+function createIdentityDir(baseDir: string): string {
+  const d = join(baseDir, "identity");
+  mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function createFlairKeysDir(baseDir: string): string {
+  const d = join(baseDir, "flair", "keys");
   mkdirSync(d, { recursive: true });
   return d;
 }
@@ -226,6 +232,10 @@ describe("inferTypeFromPath", () => {
     expect(inferTypeFromPath("/path/to/anvil-discord-bot-token")).toBe("discord-bot-token");
   });
 
+  test("detects discord-webhook by basename", () => {
+    expect(inferTypeFromPath("/path/to/discord-webhook-tps-activity")).toBe("discord-webhook");
+  });
+
   test("defaults to api-key for unknown", () => {
     expect(inferTypeFromPath("/path/to/random-file")).toBe("api-key");
   });
@@ -286,6 +296,10 @@ describe("sensitivityForType", () => {
 
   test("x25519-key is medium", () => {
     expect(sensitivityForType("x25519-key")).toBe("medium");
+  });
+
+  test("discord-webhook is medium", () => {
+    expect(sensitivityForType("discord-webhook")).toBe("medium");
   });
 });
 
@@ -490,6 +504,31 @@ describe("verifyEntry", () => {
     expect(result.ok).toBe(true);
   });
 
+  test("passes valid discord-webhook", () => {
+    const p = writeFixtureFile(tmp, "valid-webhook", "https://discord.com/api/webhooks/123456/abcdef", 0o600);
+    const entry: CredentialEntry = {
+      path: p,
+      type: "discord-webhook",
+      owners: ["anvil"],
+      sensitivity: "medium",
+    };
+    const result = verifyEntry(entry);
+    expect(result.ok).toBe(true);
+  });
+
+  test("fails bad discord-webhook format", () => {
+    const p = writeFixtureFile(tmp, "bad-webhook", "not-a-discord-url", 0o600);
+    const entry: CredentialEntry = {
+      path: p,
+      type: "discord-webhook",
+      owners: ["anvil"],
+      sensitivity: "medium",
+    };
+    const result = verifyEntry(entry);
+    expect(result.ok).toBe(false);
+    expect(result.issues.some(i => i.kind === "bad-format")).toBe(true);
+  });
+
   test("fails bad mode", () => {
     const p = writeFixtureFile(tmp, "bad-mode", "ghp_1234567890abcdef1234567890abcdef123456", 0o644);
     const entry: CredentialEntry = {
@@ -680,18 +719,22 @@ describe("walkAdoptCandidates", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  test("finds candidates in secrets dir", () => {
-    const secretsDir = createSecretsDir(tmp);
-    writeFixtureFile(secretsDir, "anvil-github-pat", "ghp_test1234567890abcdef1234567890abcdef123456", 0o600);
-    writeFixtureFile(secretsDir, "anvil-ollama", "sk-test123456", 0o600);
-    writeFixtureFile(secretsDir, "flair-admin-pass", "admin-pass", 0o600);
-
-    const keysDir = createKeysDir(tmp);
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
+  function makeDirs() {
+    return {
+      secretsDir: createSecretsDir(tmp),
+      identityDir: createIdentityDir(tmp),
+      flairKeysDir: createFlairKeysDir(tmp),
       openclawConfigPath: join(tmp, "nonexistent.json"),
-    });
+    };
+  }
+
+  test("finds candidates in secrets dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.secretsDir, "anvil-github-pat", "ghp_test1234567890abcdef1234567890abcdef123456", 0o600);
+    writeFixtureFile(dirs.secretsDir, "anvil-ollama", "sk-test123456", 0o600);
+    writeFixtureFile(dirs.secretsDir, "flair-admin-pass", "admin-pass", 0o600);
+
+    const result = walkAdoptCandidates(dirs);
 
     expect(result.candidates.length).toBe(3);
     expect(result.candidates.find(c => c.name === "anvil-github-pat")!.entry.type).toBe("github-pat-classic");
@@ -699,16 +742,39 @@ describe("walkAdoptCandidates", () => {
     expect(result.candidates.find(c => c.name === "flair-admin-pass")!.entry.type).toBe("harper-admin-password");
   });
 
-  test("finds ed25519-seed candidates in keys dir", () => {
-    const keysDir = createKeysDir(tmp);
-    writeFixtureFile(keysDir, "anvil.key", Buffer.alloc(32, 1).toString("base64"), 0o600);
+  test("skips .pub files in secrets dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.secretsDir, "pulse.pub", "ed25519_public_key_data", 0o644);
+    writeFixtureFile(dirs.secretsDir, "anvil-github-pat", "ghp_test1234567890abcdef1234567890abcdef123456", 0o600);
 
-    const secretsDir = createSecretsDir(tmp);
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
-      openclawConfigPath: join(tmp, "nonexistent.json"),
-    });
+    const result = walkAdoptCandidates(dirs);
+
+    // .pub should NOT be a candidate
+    const pubCandidate = result.candidates.find(c => c.name === "pulse.pub");
+    expect(pubCandidate).toBeUndefined();
+
+    // But the real secret IS found
+    const realSecret = result.candidates.find(c => c.name === "anvil-github-pat");
+    expect(realSecret).toBeDefined();
+    expect(realSecret!.entry.type).toBe("github-pat-classic");
+  });
+
+  test("detects discord-webhook type from basename", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.secretsDir, "discord-webhook-tps-activity", "https://discord.com/api/webhooks/123/abc", 0o600);
+
+    const result = walkAdoptCandidates(dirs);
+
+    const wh = result.candidates.find(c => c.name === "discord-webhook-tps-activity");
+    expect(wh).toBeDefined();
+    expect(wh!.entry.type).toBe("discord-webhook");
+  });
+
+  test("finds ed25519-seed candidates in identity dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.identityDir, "anvil.key", Buffer.alloc(32, 1).toString("base64"), 0o600);
+
+    const result = walkAdoptCandidates(dirs);
 
     const keyCandidate = result.candidates.find(c => c.name === "anvil.key");
     expect(keyCandidate).toBeDefined();
@@ -716,16 +782,28 @@ describe("walkAdoptCandidates", () => {
     expect(keyCandidate!.entry.sensitivity).toBe("high");
   });
 
-  test("finds x25519-key candidates", () => {
-    const keysDir = createKeysDir(tmp);
-    writeFixtureFile(keysDir, "anvil.x25519.key", Buffer.alloc(32, 3).toString("base64"), 0o600);
+  test("skips *.meta.json files in identity dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.identityDir, "anvil.key", Buffer.alloc(32, 1).toString("base64"), 0o600);
+    writeFixtureFile(dirs.identityDir, "anvil.meta.json", '{"created":"2025-01-01"}', 0o644);
 
-    const secretsDir = createSecretsDir(tmp);
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
-      openclawConfigPath: join(tmp, "nonexistent.json"),
-    });
+    const result = walkAdoptCandidates(dirs);
+
+    // .meta.json should NOT be a candidate
+    const meta = result.candidates.find(c => c.name === "anvil.meta.json");
+    expect(meta).toBeUndefined();
+
+    // But the .key IS found
+    const keyCand = result.candidates.find(c => c.name === "anvil.key");
+    expect(keyCand).toBeDefined();
+    expect(keyCand!.entry.type).toBe("ed25519-seed");
+  });
+
+  test("finds x25519-key candidates in identity dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.identityDir, "anvil.x25519.key", Buffer.alloc(32, 3).toString("base64"), 0o600);
+
+    const result = walkAdoptCandidates(dirs);
 
     const xCandidate = result.candidates.find(c => c.name === "anvil.x25519.key");
     expect(xCandidate).toBeDefined();
@@ -733,16 +811,11 @@ describe("walkAdoptCandidates", () => {
     expect(xCandidate!.entry.sensitivity).toBe("medium");
   });
 
-  test("flags vault.json in keys dir", () => {
-    const keysDir = createKeysDir(tmp);
-    writeFixtureFile(keysDir, "vault.json", '{"encrypted":true}', 0o600);
+  test("flags vault.json in identity dir", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.identityDir, "vault.json", '{"encrypted":true}', 0o600);
 
-    const secretsDir = createSecretsDir(tmp);
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
-      openclawConfigPath: join(tmp, "nonexistent.json"),
-    });
+    const result = walkAdoptCandidates(dirs);
 
     const vaultCandidate = result.candidates.find(c => c.name === "vault.json");
     expect(vaultCandidate).toBeDefined();
@@ -750,18 +823,32 @@ describe("walkAdoptCandidates", () => {
     expect(vaultCandidate!.entry.notes).toContain("LEGACY vault");
   });
 
-  test("owner inference from filename prefix", () => {
-    const secretsDir = createSecretsDir(tmp);
-    writeFixtureFile(secretsDir, "anvil-github-pat", "ghp_test1234567890abcdef1234567890abcdef123456", 0o600);
-    writeFixtureFile(secretsDir, "ember-secret", "test", 0o600);
-    writeFixtureFile(secretsDir, "unknown-file", "test", 0o600);
+  test("scans ~/.flair/keys/ for ed25519-seed and x25519-key", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.flairKeysDir, "admin.key", Buffer.alloc(32, 1).toString("base64"), 0o600);
+    writeFixtureFile(dirs.flairKeysDir, "server.x25519.key", Buffer.alloc(32, 2).toString("base64"), 0o600);
 
-    const keysDir = createKeysDir(tmp);
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
-      openclawConfigPath: join(tmp, "nonexistent.json"),
-    });
+    const result = walkAdoptCandidates(dirs);
+
+    const adminKey = result.candidates.find(c => c.name === "flair-admin.key");
+    expect(adminKey).toBeDefined();
+    expect(adminKey!.entry.type).toBe("ed25519-seed");
+    expect(adminKey!.entry.sensitivity).toBe("high");
+    expect(adminKey!.entry.path).toContain("flair/keys/admin.key");
+
+    const xKey = result.candidates.find(c => c.name === "flair-server.x25519.key");
+    expect(xKey).toBeDefined();
+    expect(xKey!.entry.type).toBe("x25519-key");
+    expect(xKey!.entry.path).toContain("flair/keys/server.x25519.key");
+  });
+
+  test("owner inference from filename prefix", () => {
+    const dirs = makeDirs();
+    writeFixtureFile(dirs.secretsDir, "anvil-github-pat", "ghp_test1234567890abcdef1234567890abcdef123456", 0o600);
+    writeFixtureFile(dirs.secretsDir, "ember-secret", "test", 0o600);
+    writeFixtureFile(dirs.secretsDir, "unknown-file", "test", 0o600);
+
+    const result = walkAdoptCandidates(dirs);
 
     const anvilCand = result.candidates.find(c => c.name === "anvil-github-pat")!;
     expect(anvilCand.entry.owners).toEqual(["anvil"]);
@@ -774,8 +861,7 @@ describe("walkAdoptCandidates", () => {
   });
 
   test("scans openclaw.json for embedded tokens", () => {
-    const secretsDir = createSecretsDir(tmp);
-    const keysDir = createKeysDir(tmp);
+    const dirs = makeDirs();
     const ocPath = join(tmp, "openclaw.json");
 
     const ocConfig = {
@@ -792,11 +878,7 @@ describe("walkAdoptCandidates", () => {
     };
     writeFileSync(ocPath, JSON.stringify(ocConfig));
 
-    const result = walkAdoptCandidates({
-      secretsDir,
-      keysDir,
-      openclawConfigPath: ocPath,
-    });
+    const result = walkAdoptCandidates({ ...dirs, openclawConfigPath: ocPath });
 
     expect(result.openclawTokens.length).toBe(1);
     expect(result.openclawTokens[0].agent).toBe("discord-bridge");
@@ -806,7 +888,8 @@ describe("walkAdoptCandidates", () => {
   test("handles missing directories gracefully", () => {
     const result = walkAdoptCandidates({
       secretsDir: join(tmp, "nonexistent-secrets"),
-      keysDir: join(tmp, "nonexistent-keys"),
+      identityDir: join(tmp, "nonexistent-identity"),
+      flairKeysDir: join(tmp, "nonexistent-flair-keys"),
       openclawConfigPath: join(tmp, "nonexistent-oc.json"),
     });
 

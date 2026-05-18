@@ -25,6 +25,7 @@ export type CredentialType =
   | "ed25519-seed"
   | "x25519-key"
   | "discord-bot-token"
+  | "discord-webhook"
   | "vaulted-secret";
 
 export type Sensitivity = "high" | "medium" | "low";
@@ -94,6 +95,7 @@ const TYPE_SENSITIVITY: Record<CredentialType, Sensitivity> = {
   "github-pat-fine-grained": "medium",
   "api-key": "medium",
   "discord-bot-token": "medium",
+  "discord-webhook": "medium",
   "x25519-key": "medium",
   "vaulted-secret": "high",
 };
@@ -190,6 +192,11 @@ export function inferTypeFromPath(
   // Discord bot token
   if (base.includes("discord") && (base.includes("token") || base.includes("bot"))) {
     return "discord-bot-token";
+  }
+
+  // Discord webhook URL
+  if (base.includes("webhook")) {
+    return "discord-webhook";
   }
 
   // Default
@@ -367,6 +374,11 @@ function checkFormatInternal(
         return "expected discord bot token to match [A-Za-z0-9._-]{50,}";
       return null;
 
+    case "discord-webhook":
+      if (!content.startsWith("https://discord.com/api/webhooks/"))
+        return "expected discord webhook URL to start with https://discord.com/api/webhooks/";
+      return null;
+
     case "vaulted-secret":
       return null;
 
@@ -381,9 +393,13 @@ function checkFormatInternal(
 
 export interface AdoptDirs {
   secretsDir: string;
-  keysDir: string;
+  identityDir: string;
+  flairKeysDir: string;
   openclawConfigPath: string;
 }
+
+/** Public-file extensions that should never appear in a credentials manifest. */
+const PUBLIC_EXTENSIONS = new Set([".pub", ".public", ".crt", ".cert"]);
 
 /** Walk the filesystem and produce adoption candidates (non-interactive core). */
 export function walkAdoptCandidates(
@@ -392,11 +408,16 @@ export function walkAdoptCandidates(
   const candidates: AdoptCandidate[] = [];
   const openclawTokens: OpenClawTokenProposal[] = [];
 
-  // 1. ~/.tps/secrets/* (skip vault.json)
+  // 1. ~/.tps/secrets/* (skip vault.json, skip public-key files)
   try {
     const secretsFiles = readdirSync(dirs.secretsDir);
     for (const file of secretsFiles) {
       if (file === "vault.json") continue;
+
+      // Skip public-key / certificate files
+      const lowerFile = file.toLowerCase();
+      if (PUBLIC_EXTENSIONS.has(lowerFile.slice(lowerFile.lastIndexOf(".")))) continue;
+
       const absPath = join(dirs.secretsDir, file);
       let content: string | null = null;
       try {
@@ -424,13 +445,13 @@ export function walkAdoptCandidates(
     // secrets dir may not exist
   }
 
-  // 2. ~/.tps/keys/*.key (but NOT *.x25519.key) → ed25519-seed
+  // 2. ~/.tps/identity/*.key (but NOT *.x25519.key, NOT *.meta.json) → ed25519-seed
   try {
-    const keyFiles = readdirSync(dirs.keysDir).filter(
-      f => f.endsWith(".key") && !f.endsWith(".x25519.key")
+    const keyFiles = readdirSync(dirs.identityDir).filter(
+      f => f.endsWith(".key") && !f.endsWith(".x25519.key") && !f.endsWith(".meta.json")
     );
     for (const file of keyFiles) {
-      const absPath = join(dirs.keysDir, file);
+      const absPath = join(dirs.identityDir, file);
       const owner = inferOwnerFromName(file);
       candidates.push({
         name: file,
@@ -443,16 +464,16 @@ export function walkAdoptCandidates(
       });
     }
   } catch {
-    // keys dir may not exist
+    // identity dir may not exist
   }
 
-  // 3. ~/.tps/keys/*.x25519.key → x25519-key
+  // 3. ~/.tps/identity/*.x25519.key → x25519-key
   try {
-    const xKeyFiles = readdirSync(dirs.keysDir).filter(
+    const xKeyFiles = readdirSync(dirs.identityDir).filter(
       f => f.endsWith(".x25519.key")
     );
     for (const file of xKeyFiles) {
-      const absPath = join(dirs.keysDir, file);
+      const absPath = join(dirs.identityDir, file);
       const owner = inferOwnerFromName(file);
       candidates.push({
         name: file,
@@ -465,11 +486,11 @@ export function walkAdoptCandidates(
       });
     }
   } catch {
-    // keys dir may not exist
+    // identity dir may not exist
   }
 
-  // 4. ~/.tps/keys/vault.json — flag for human attention
-  const vaultJsonPath = join(dirs.keysDir, "vault.json");
+  // 4. ~/.tps/identity/vault.json — flag for human attention
+  const vaultJsonPath = join(dirs.identityDir, "vault.json");
   if (existsSync(vaultJsonPath)) {
     candidates.push({
       name: "vault.json",
@@ -483,7 +504,51 @@ export function walkAdoptCandidates(
     });
   }
 
-  // 5. ~/.openclaw/openclaw.json — scan for embedded tokens
+  // 5. ~/.flair/keys/*.key (but NOT *.x25519.key, NOT *.meta.json) → ed25519-seed
+  try {
+    const flairKeyFiles = readdirSync(dirs.flairKeysDir).filter(
+      f => f.endsWith(".key") && !f.endsWith(".x25519.key") && !f.endsWith(".meta.json")
+    );
+    for (const file of flairKeyFiles) {
+      const absPath = join(dirs.flairKeysDir, file);
+      const owner = inferOwnerFromName(file);
+      candidates.push({
+        name: `flair-${file}`,
+        entry: {
+          path: absPath,
+          type: "ed25519-seed",
+          owners: owner ? [owner] : [],
+          sensitivity: "high",
+        },
+      });
+    }
+  } catch {
+    // flair keys dir may not exist
+  }
+
+  // 6. ~/.flair/keys/*.x25519.key → x25519-key
+  try {
+    const flairXKeyFiles = readdirSync(dirs.flairKeysDir).filter(
+      f => f.endsWith(".x25519.key")
+    );
+    for (const file of flairXKeyFiles) {
+      const absPath = join(dirs.flairKeysDir, file);
+      const owner = inferOwnerFromName(file);
+      candidates.push({
+        name: `flair-${file}`,
+        entry: {
+          path: absPath,
+          type: "x25519-key",
+          owners: owner ? [owner] : [],
+          sensitivity: "medium",
+        },
+      });
+    }
+  } catch {
+    // flair keys dir may not exist
+  }
+
+  // 7. ~/.openclaw/openclaw.json — scan for embedded tokens
   if (existsSync(dirs.openclawConfigPath)) {
     try {
       const ocRaw = readFileSync(dirs.openclawConfigPath, "utf-8");

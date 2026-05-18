@@ -137,6 +137,8 @@ const cli = meow(
       expires: { type: "string" },
       expiresWithin: { type: "string" },
       fix: { type: "boolean", default: false },
+      flairKeysDir: { type: "string" },
+      identityDir: { type: "string" },
       keysDir: { type: "string" },
       nonInteractive: { type: "boolean", default: false },
       owner: { type: "string" },
@@ -803,7 +805,8 @@ async function main() {
           adoptApply: cli.flags.apply as boolean,
           adoptNonInteractive: (cli.flags as any).nonInteractive as boolean | undefined,
           adoptSecretsDir: (cli.flags as any).secretsDir as string | undefined,
-          adoptKeysDir: (cli.flags as any).keysDir as string | undefined,
+          adoptIdentityDir: (cli.flags as any).identityDir as string | undefined,
+          adoptFlairKeysDir: (cli.flags as any).flairKeysDir as string | undefined,
           verifyFix: cli.flags.fix as boolean,
           json: cli.flags.json as boolean,
         });
