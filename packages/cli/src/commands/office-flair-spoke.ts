@@ -282,7 +282,33 @@ WantedBy=timers.target
 // ─── launchd plist generation (macOS branches) ────────────────────────────────
 
 /**
+ * Escape XML metacharacters in a string so it can be embedded inside an XML
+ * element value (e.g., `<string>...</string>` in a launchd plist) without
+ * breaking the surrounding markup or, worse, silently corrupting the plist
+ * and causing `launchctl load` to fail without a clear error.
+ *
+ * launchd's plist parser unescapes the standard 5 entities when reading, so
+ * values escaped here round-trip cleanly to whatever the spawned process
+ * sees in argv / env.
+ */
+function xmlEscape(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/**
  * Generate a launchd plist for Harper on a macOS branch.
+ *
+ * All caller-supplied string values (label, flairDir, harperDataDir, home)
+ * are XML-escaped before interpolation — flagged by K&S on #290 as a
+ * defense-in-depth gap. Today's callers pass safe internal values but the
+ * `home` path comes from the remote shell via `detectRemoteHome` and a
+ * hostile / mistyped home with `&`, `<`, `>`, `"`, or `'` would silently
+ * break the plist.
  */
 export function generateLaunchdFlairPlist(
   label: string,
@@ -291,24 +317,57 @@ export function generateLaunchdFlairPlist(
   home: string,
   port: number = DEFAULT_FLAIR_PORT,
 ): string {
+  const eLabel = xmlEscape(label);
+  const eFlairDir = xmlEscape(flairDir);
+  const eDataDir = xmlEscape(harperDataDir);
+  const eHome = xmlEscape(home);
+  const eStdout = xmlEscape(join(home, ".tps", "logs", `flair-${label}.log`));
+  const eStderr = xmlEscape(join(home, ".tps", "logs", `flair-${label}.error.log`));
+
+  // Build the inner JSON config with native JSON escaping, then XML-escape
+  // the whole string before embedding in <string>...</string>. launchd's
+  // plist parser undoes the XML layer; Harper consumes the resulting JSON.
+  const harperConfigJson = JSON.stringify({
+    rootPath: harperDataDir,
+    http: {
+      port,
+      cors: true,
+      corsAccessList: [`http://127.0.0.1:${port}`, `http://localhost:${port}`],
+    },
+    operationsApi: {
+      network: {
+        port: DEFAULT_HARPER_OPS_PORT,
+        cors: true,
+        corsAccessList: [
+          `http://127.0.0.1:${DEFAULT_HARPER_OPS_PORT}`,
+          `http://localhost:${DEFAULT_HARPER_OPS_PORT}`,
+        ],
+        domainSocket: `${harperDataDir}/operations-server`,
+      },
+    },
+    mqtt: { network: { port: null }, webSocket: false },
+    localStudio: { enabled: false },
+  });
+  const eHarperConfig = xmlEscape(harperConfigJson);
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${label}</string>
+  <string>${eLabel}</string>
 
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/node</string>
-    <string>${flairDir}/node_modules/harper/dist/bin/harper.js</string>
+    <string>${eFlairDir}/node_modules/harper/dist/bin/harper.js</string>
     <string>dev</string>
-    <string>${flairDir}</string>
+    <string>${eFlairDir}</string>
   </array>
 
   <key>WorkingDirectory</key>
-  <string>${flairDir}</string>
+  <string>${eFlairDir}</string>
 
   <key>RunAtLoad</key>
   <true/>
@@ -323,19 +382,19 @@ export function generateLaunchdFlairPlist(
   <integer>10</integer>
 
   <key>StandardOutPath</key>
-  <string>${join(home, ".tps", "logs", `flair-${label}.log`)}</string>
+  <string>${eStdout}</string>
 
   <key>StandardErrorPath</key>
-  <string>${join(home, ".tps", "logs", `flair-${label}.error.log`)}</string>
+  <string>${eStderr}</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
-    <string>${home}</string>
+    <string>${eHome}</string>
     <key>HARPER_SET_CONFIG</key>
-    <string>{"rootPath":"${harperDataDir}","http":{"port":${port},"cors":true,"corsAccessList":["http://127.0.0.1:${port}","http://localhost:${port}"]},"operationsApi":{"network":{"port":${DEFAULT_HARPER_OPS_PORT},"cors":true,"corsAccessList":["http://127.0.0.1:${DEFAULT_HARPER_OPS_PORT}","http://localhost:${DEFAULT_HARPER_OPS_PORT}"],"domainSocket":"${harperDataDir}/operations-server"}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
+    <string>${eHarperConfig}</string>
   </dict>
 </dict>
 </plist>
