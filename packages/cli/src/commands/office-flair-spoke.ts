@@ -140,6 +140,23 @@ export function detectBranchOS(tunnelVia: string): BranchOS {
   }
 }
 
+/**
+ * SSH to the remote branch and return its $HOME path.
+ *
+ * Required for macOS launchd plists since launchd doesn't expand `~` in
+ * path attributes — the plist needs the absolute remote home directory,
+ * not whatever `homedir()` returns locally.
+ */
+export function detectRemoteHome(tunnelVia: string): string {
+  const result = sshExec(tunnelVia, "printf '%s' \"$HOME\"", 10_000);
+  if (result.status !== 0 || !result.stdout) {
+    throw new Error(
+      `Failed to detect remote $HOME on ${tunnelVia}: ${result.stderr || `exit ${result.status}`}`
+    );
+  }
+  return result.stdout;
+}
+
 // ─── Systemd unit generation ──────────────────────────────────────────────────
 
 /**
@@ -237,6 +254,10 @@ WantedBy=multi-user.target
 
 /**
  * Generate a systemd timer that triggers the fed-sync service periodically.
+ *
+ * Uses `OnUnitActiveSec` so the actual cadence honors `intervalSeconds`
+ * (previous `OnCalendar=*:*:00/30` hardcode fired every 30s regardless
+ * of the parameter — see ops-r4dm).
  */
 export function generateFedSyncTimer(
   timerName: string,
@@ -248,7 +269,8 @@ Description=Periodic Flair fed-sync spoke→hub
 Requires=${serviceName}.service
 
 [Timer]
-OnCalendar=*-*-* *:*:00/30
+OnBootSec=30s
+OnUnitActiveSec=${intervalSeconds}s
 Persistent=true
 RandomizedDelaySec=30
 
@@ -481,11 +503,12 @@ export function installFlairSpoke(
   if (os === "macos") {
     // Launchd path
     const label = `ai.tpsdev.flair-${name}`;
+    const remoteHome = detectRemoteHome(tunnelVia);
     const plistContent = generateLaunchdFlairPlist(
       label,
       flairDirRemote,
       harperDataDirRemote,
-      homedir(), // remote's home
+      remoteHome,
       DEFAULT_FLAIR_PORT,
     );
     const plistPath = `~/Library/LaunchAgents/${label}.plist`;
@@ -671,7 +694,10 @@ export function teardownFlairSpoke(
   const ext = sup as ExtendedSupervisionManifest;
 
   // --- 1. Stop fed-sync units ---
-  if (ext.fedSync) {
+  // Fed-sync today only emits systemd units (configureFederation is Linux-only),
+  // so teardown is only meaningful when the branch ran Linux. Guard the
+  // systemctl calls so macOS teardowns don't shell out to a missing systemctl.
+  if (ext.fedSync && ext.flair?.os === "linux") {
     const fs = ext.fedSync;
     console.log(`   🛑 Stopping fed-sync: ${fs.timerName}`);
     sshExec(
@@ -688,6 +714,9 @@ export function teardownFlairSpoke(
     // Remove sync config
     sshExec(tunnelVia, `rm -f ${fs.syncConfigPath} 2>/dev/null || true`, 10_000);
     console.log("   ✅ Fed-sync units removed");
+  } else if (ext.fedSync) {
+    // Manifest had fed-sync but no Linux flair — best-effort remove the config file only
+    sshExec(tunnelVia, `rm -f ${ext.fedSync.syncConfigPath} 2>/dev/null || true`, 10_000);
   }
 
   // --- 2. Stop Flair unit ---

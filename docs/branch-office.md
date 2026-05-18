@@ -214,7 +214,7 @@ Harper runs on port 9926 (default Flair port) with its data at `~/.harper/flair`
 In spoke mode, after Flair is running, `tps office join` configures periodic memory federation from the branch back to the hub:
 
 1. **Config:** Write `~/.tps/flair-sync.json` on the branch with `localUrl`, `remoteUrl` (hub), `agentId`, and the hub's `admin-pass` auth.
-2. **Timer + service:** On Linux, install `~/.config/systemd/user/tps-fed-sync-<name>.{service,timer}`. The timer triggers every 30s (with a 30s randomized delay to avoid thundering-herd). The service is `Type=oneshot` running `tps flair sync --once`.
+2. **Timer + service:** On Linux, install `~/.config/systemd/user/tps-fed-sync-<name>.{service,timer}`. The timer triggers every 5 minutes (`OnUnitActiveSec=300s`, with a 30s randomized delay to avoid thundering-herd; first fire at boot + 30s). The service is `Type=oneshot` running `tps flair sync --once`. Override via `configureFederation`'s `intervalSeconds` arg.
 3. **Validate:** Run a one-shot sync immediately. Success writes the timestamp to the manifest; failure leaves the branch hub-less until the sync is working.
 
 ### Opt-outs and re-provisioning
