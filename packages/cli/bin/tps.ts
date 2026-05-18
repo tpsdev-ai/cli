@@ -132,6 +132,21 @@ const cli = meow(
       noFlair: { type: "boolean", default: false },
       forceReinstallFlair: { type: "boolean", default: false },
       purgeFlair: { type: "boolean", default: false },
+      // ops-568p: Cred substrate S1 (credentials manifest)
+      apply: { type: "boolean", default: false },
+      expires: { type: "string" },
+      expiresWithin: { type: "string" },
+      fix: { type: "boolean", default: false },
+      flairKeysDir: { type: "string" },
+      identityDir: { type: "string" },
+      keysDir: { type: "string" },
+      nonInteractive: { type: "boolean", default: false },
+      owner: { type: "string" },
+      path: { type: "string" },
+      scope: { type: "string" },
+      secretsDir: { type: "string" },
+      sensitivity: { type: "string" },
+      credType: { type: "string" },
       // Task envelope flags (mail send --task)
       task: { type: "string" },
       taskId: { type: "string" },
@@ -731,13 +746,23 @@ async function main() {
     }
     case "secrets": {
       const action = rest[0];
-      const allowedActions = ["set", "list", "remove", "rotate-github-pat", "list-github-pats"];
+      const allowedActions = [
+        "set", "list", "remove",
+        "show", "emit", "register", "unregister", "adopt", "verify",
+        "rotate-github-pat", "list-github-pats",
+      ];
       if (!action || !allowedActions.includes(action)) {
         console.error([
           "Usage:",
           "  tps secrets set <KEY>=<VALUE>",
-          "  tps secrets list",
+          "  tps secrets list [--owner <id>] [--expires-within <d>] [--json]",
           "  tps secrets remove <KEY>",
+          "  tps secrets show <name> [--json]",
+          "  tps secrets emit <name>",
+          "  tps secrets register <name> --path <p> --type <t> --owner <o> [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
+          "  tps secrets unregister <name>",
+          "  tps secrets adopt [--dry-run] [--apply] [--non-interactive] [--secrets-dir <dir>] [--keys-dir <dir>]",
+          "  tps secrets verify [--fix] [--json]",
           "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
           "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
         ].join("\n"));
@@ -759,7 +784,35 @@ async function main() {
         await runListGithubPats({ json: cli.flags.json });
         break;
       }
-      // Vault secrets (existing)
+      // Cred substrate commands (ops-568p)
+      if (
+        action === "show" || action === "emit" ||
+        action === "register" || action === "unregister" ||
+        action === "adopt" || action === "verify"
+      ) {
+        const { runSecrets } = await import("../src/commands/secrets.js");
+        await runSecrets({
+          action: action as any,
+          key: rest[1],
+          owner: cli.flags.owner as string | undefined,
+          expiresWithin: cli.flags.expiresWithin as string | undefined,
+          registerPath: cli.flags.path as string | undefined,
+          registerType: cli.flags.credType as string | undefined,
+          registerOwner: cli.flags.owner as string | undefined,
+          registerScope: cli.flags.scope as string | undefined,
+          registerExpires: cli.flags.expires as string | undefined,
+          registerSensitivity: cli.flags.sensitivity as string | undefined,
+          adoptApply: cli.flags.apply as boolean,
+          adoptNonInteractive: (cli.flags as any).nonInteractive as boolean | undefined,
+          adoptSecretsDir: (cli.flags as any).secretsDir as string | undefined,
+          adoptIdentityDir: (cli.flags as any).identityDir as string | undefined,
+          adoptFlairKeysDir: (cli.flags as any).flairKeysDir as string | undefined,
+          verifyFix: cli.flags.fix as boolean,
+          json: cli.flags.json as boolean,
+        });
+        break;
+      }
+      // Vault secrets (existing: set / list / remove)
       const { runSecrets } = await import("../src/commands/secrets.js");
       let key: string | undefined;
       let value: string | undefined;
