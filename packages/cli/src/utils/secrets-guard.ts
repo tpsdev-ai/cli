@@ -8,14 +8,14 @@
  * No global state. Same purity contract as credentials-manifest.ts.
  */
 
-import {
-  readManifest,
-  expandPath,
-  CredentialEntry,
-  CredentialType,
-  CredentialsManifest,
-} from "./credentials-manifest.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import {
+  CredentialEntry,
+  type CredentialsManifest,
+  type CredentialType,
+  expandPath,
+  readManifest,
+} from "./credentials-manifest.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -369,8 +369,8 @@ function escapeRegex(s: string): string {
 
 import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { join, dirname } from "node:path";
 import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 // Note: overlap window is now per-FingerprintSet (set.overlapBytes), computed
 // at buildFingerprintSet time so it always exceeds the longest registered

@@ -9,12 +9,10 @@
 import { readManifest } from "../utils/credentials-manifest.js";
 import {
   buildFingerprintSet,
-  redactBuffer,
   countMatches,
-  spawnGuarded,
-  FingerprintSet,
+  type FingerprintSet,
   getGuardLogPath,
-  appendGuardLog,
+  spawnGuarded,
 } from "../utils/secrets-guard.js";
 
 export interface SecretsGuardArgs {
