@@ -300,6 +300,12 @@ async function runStart(): Promise<void> {
     }
     const body = parsed.data;
 
+    // Track delivery failure so the ACK reflects actual write success/failure.
+    // Without this, an "Inbox full" or similar write error would silently turn
+    // into accepted=true and the host's deliverToRemoteBranch would log
+    // "Mail delivered" while the message was actually dropped.
+    let deliveryError: string | null = null;
+
     const action = await runHandlerPipeline(
       { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
       manifests,
@@ -328,14 +334,28 @@ async function runStart(): Promise<void> {
         // preserves the original behavior for the GAL-alias case where
         // body.to is a logical name that doesn't match any local agent dir.
         const recipient = inboxExists(body.to) ? body.to : localAgentId;
-        try { sendMessage(recipient, body.content, body.from); } catch (e: any) {
-          logLine("WARN", `Mail write failed: ${e.message}`);
+        try {
+          sendMessage(recipient, body.content, body.from);
+        } catch (e: any) {
+          // Honest NACK: an "Inbox full" or other write failure must NOT be
+          // ACKed as accepted=true. Silent drops here strand entire dispatches
+          // because the host's deliverToRemoteBranch only checks the ACK.
+          deliveryError = e?.message || "Mail write failed";
+          logLine("WARN", `Mail write failed: ${deliveryError}`);
         }
         break;
       }
     }
 
-    await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } }).catch(() => {});
+    const ackAccepted = deliveryError === null;
+    await channel.send({
+      type: MSG_MAIL_ACK,
+      seq: msg.seq,
+      ts: new Date().toISOString(),
+      body: ackAccepted
+        ? { id: body.id, accepted: true }
+        : { id: body.id, accepted: false, error: deliveryError },
+    }).catch(() => {});
 
     for (const item of drainOutbox()) {
       await channel.send({
