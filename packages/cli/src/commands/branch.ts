@@ -55,6 +55,21 @@ function logLine(event: string, msg: string): void {
   appendFileSync(logPath(), `[${new Date().toISOString()}] ${event}: ${msg}\n`, "utf-8");
 }
 
+/**
+ * Map a raw sendMessage error to a sanitized category safe to send on-wire.
+ * Raw errors can include filesystem paths or internal state (Sherlock #294);
+ * the host only needs to know the category to surface a useful failure.
+ */
+function sanitizeDeliveryError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes("inbox full")) return "inbox-full";
+  if (r.includes("eacces") || r.includes("eperm") || r.includes("permission denied")) return "permission-denied";
+  if (r.includes("enospc") || r.includes("no space")) return "disk-full";
+  if (r.includes("enoent") || r.includes("no such")) return "path-missing";
+  if (r.includes("invalid")) return "invalid-input";
+  return "write-failed";
+}
+
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -340,8 +355,12 @@ async function runStart(): Promise<void> {
           // Honest NACK: an "Inbox full" or other write failure must NOT be
           // ACKed as accepted=true. Silent drops here strand entire dispatches
           // because the host's deliverToRemoteBranch only checks the ACK.
-          deliveryError = e?.message || "Mail write failed";
-          logLine("WARN", `Mail write failed: ${deliveryError}`);
+          // Log the raw error locally, but send only a sanitized category
+          // to the host (Sherlock #294: raw error messages can include
+          // filesystem paths or internal state — leak surface to remote).
+          const rawError = e?.message || "Mail write failed";
+          logLine("WARN", `Mail write failed: ${rawError}`);
+          deliveryError = sanitizeDeliveryError(rawError);
         }
         break;
       }
