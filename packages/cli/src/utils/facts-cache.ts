@@ -73,7 +73,7 @@ export function readCache(): FactsCache {
  */
 export function writeCache(cache: FactsCache): void {
   ensureFactsDir();
-  const content = JSON.stringify(cache, null, 2) + "\n";
+  const content = `${JSON.stringify(cache, null, 2)}\n`;
   atomicWrite(cachePath(), content, 0o600);
 }
 

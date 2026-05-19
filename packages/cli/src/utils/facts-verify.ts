@@ -81,6 +81,7 @@ export function verifyEnv(): Record<string, string> {
  * Applied to verify stdout before storage/display. (Sherlock §A)
  */
 export function stripControlChars(str: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate — strip terminal control chars from verify stdout (Sherlock §B Appendix item: terminal escape injection)
   return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
 }
 
@@ -102,7 +103,7 @@ function coerceValue(raw: string, type: FactType): string | number | boolean | o
     }
     case "int": {
       const parsed = parseInt(trimmed, 10);
-      if (isNaN(parsed) || String(parsed) !== trimmed) return null;
+      if (Number.isNaN(parsed) || String(parsed) !== trimmed) return null;
       return parsed;
     }
     case "bool": {
@@ -191,9 +192,7 @@ export async function runVerify(
 
   return new Promise<VerifyResult>((resolve) => {
     let stdout = "";
-    let stderr = "";
     let timedOut = false;
-    let killed = false;
 
     const child = spawn(command, args, {
       cwd: homedir(),
@@ -219,10 +218,6 @@ export async function runVerify(
       if (stdout.length >= MAX_STDOUT_BYTES) {
         stdout = stdout.slice(0, MAX_STDOUT_BYTES);
       }
-    });
-
-    child.stderr?.on("data", (data: Buffer) => {
-      stderr += data.toString("utf-8");
     });
 
     child.on("error", (err) => {

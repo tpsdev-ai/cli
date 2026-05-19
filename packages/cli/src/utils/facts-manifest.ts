@@ -9,7 +9,7 @@
  * Atomic writes: temp file + rename for both manifest and cache.
  */
 
-import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, statSync, chmodSync, readdirSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
@@ -145,6 +145,7 @@ export interface ValidationError {
  * Validate a single ManifestEntry. Returns an array of ValidationErrors
  * (empty = valid). Non-destructive — never throws.
  */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: linear field validation — clean set of if-checks, not deeply nested
 export function validateEntry(entry: unknown, name: string): ValidationError[] {
   const errors: ValidationError[] = [];
 
@@ -279,7 +280,7 @@ export function readManifest(): FactsManifest {
  */
 export function writeManifest(manifest: FactsManifest): void {
   ensureFactsDir();
-  const content = JSON.stringify(manifest, null, 2) + "\n";
+  const content = `${JSON.stringify(manifest, null, 2)}\n`;
   atomicWrite(manifestPath(), content, 0o600);
 }
 
@@ -303,7 +304,7 @@ export function readLocalSchema(name: string): ManifestEntry | null {
  */
 export function writeLocalSchema(name: string, entry: ManifestEntry): void {
   ensureFactsDir();
-  const content = JSON.stringify(entry, null, 2) + "\n";
+  const content = `${JSON.stringify(entry, null, 2)}\n`;
   atomicWrite(localSchemasPath(name), content, 0o600);
 }
 
