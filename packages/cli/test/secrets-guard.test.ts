@@ -430,6 +430,54 @@ describe("streaming integrity", () => {
     expect(finalOutput).toContain("[REDACTED-api-key]");
     expect(finalOutput).not.toContain(token);
   });
+
+  test("long literal (>512 bytes) spanning chunk boundary is caught via dynamic overlap (Sherlock #293)", () => {
+    // Sherlock flagged: hardcoded 128-byte overlap missed literals longer
+    // than that when split across chunks. Verify the dynamic per-set overlap
+    // (sized to max literal length) catches a 600-char API key.
+    const longToken = "X".repeat(300) + "MARKER" + "Y".repeat(300); // 606 chars
+    const tokenPath = join(secretsDir, "long-token");
+    writeFileSync(tokenPath, longToken);
+
+    const manifest = makeManifest({
+      "long-token": {
+        path: tokenPath,
+        type: "api-key",
+        owners: ["test"],
+        sensitivity: "medium",
+      },
+    });
+
+    const set = buildFingerprintSet(manifest);
+    // The set's overlapBytes must exceed the longest literal length.
+    expect(set.overlapBytes).toBeGreaterThan(longToken.length);
+
+    // Split the token at byte 300 (right at MARKER) across two simulated chunks.
+    const splitPoint = 303;
+    const before = "noise noise " + longToken.slice(0, splitPoint);
+    const after = longToken.slice(splitPoint) + " trailing noise";
+
+    let pending = "";
+    const outputParts: string[] = [];
+
+    pending += before;
+    if (pending.length > set.overlapBytes) {
+      const flush = pending.slice(0, -set.overlapBytes);
+      pending = pending.slice(-set.overlapBytes);
+      outputParts.push(redactBuffer(flush, set, "stdout").redacted);
+    }
+
+    pending += after;
+    const finalResult = redactBuffer(pending, set, "stdout");
+    outputParts.push(finalResult.redacted);
+
+    const finalOutput = outputParts.join("");
+    expect(finalOutput).toContain("[REDACTED-api-key]");
+    expect(finalOutput).not.toContain(longToken);
+    // Defense-in-depth: even the MARKER fragment should be gone since the
+    // whole token was redacted.
+    expect(finalOutput).not.toContain("MARKER");
+  });
 });
 
 // ---------------------------------------------------------------------------

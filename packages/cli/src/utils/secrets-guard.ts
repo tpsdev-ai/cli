@@ -15,7 +15,7 @@ import {
   CredentialType,
   CredentialsManifest,
 } from "./credentials-manifest.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +28,10 @@ export interface FingerprintSet {
   fragments: Map<string, { name: string; type: CredentialType }>;
   /** Ordered shape patterns */
   shapes: Array<{ type: CredentialType | "shape"; regex: RegExp }>;
+  /** Overlap window required to guarantee no literal/shape spans a flush boundary.
+   *  Sized to max(MIN_OVERLAP, longest literal in the manifest, longest shape match).
+   *  Consumed by the streaming redactor's chunk-boundary buffer (Sherlock #293). */
+  overlapBytes: number;
 }
 
 export interface RedactResult {
@@ -93,6 +97,7 @@ export function buildFingerprintSet(
 ): FingerprintSet {
   const literalToEntry = new Map<string, { name: string; type: CredentialType }>();
   const fragments = new Map<string, { name: string; type: CredentialType }>();
+  let maxLiteralLength = 0;
 
   for (const [name, entry] of Object.entries(manifest.credentials)) {
     const resolvedPath = expandPath(entry.path);
@@ -100,14 +105,13 @@ export function buildFingerprintSet(
     // Skip files that don't exist or are unreadable
     if (!existsSync(resolvedPath)) continue;
 
-    // Skip files that are too large
+    // Stat-before-read: avoid loading large files into memory only to discard.
+    // Cheap fstat-level size check first (Sherlock #293 follow-up).
     let content: string;
     try {
-      const stat = readFileSync(resolvedPath, { encoding: "utf-8" });
-      // Check size before reading content (stat check is cheap)
-      const size = Buffer.byteLength(stat, "utf-8");
-      if (size > MAX_FILE_SIZE) continue;
-      content = stat;
+      const st = statSync(resolvedPath);
+      if (st.size > MAX_FILE_SIZE) continue;
+      content = readFileSync(resolvedPath, { encoding: "utf-8" });
     } catch {
       continue;
     }
@@ -121,6 +125,10 @@ export function buildFingerprintSet(
     // Add exact-match literal
     literalToEntry.set(trimmed, { name, type: entry.type });
 
+    // Track longest literal so the streaming overlap window can guarantee no
+    // boundary-spanning literal escapes redaction (Sherlock #293 blocker).
+    if (trimmed.length > maxLiteralLength) maxLiteralLength = trimmed.length;
+
     // Add fragment fingerprint (first 12 chars)
     const fragment = trimmed.slice(0, 12);
     fragments.set(fragment, { name, type: entry.type });
@@ -131,7 +139,19 @@ export function buildFingerprintSet(
     regex,
   }));
 
-  return { literalToEntry, fragments, shapes };
+  // Streaming overlap window must exceed the longest fingerprint AND the
+  // longest possible shape match so no literal/shape spans a chunk boundary
+  // unseen by either flush. Discord JWT-shape can hit ~400 chars; pick a
+  // generous lower bound and scale with manifest max literal length.
+  const MIN_OVERLAP = 512;
+  const SHAPE_MAX_LEN = 512; // generous upper bound for any shape regex match
+  const overlapBytes = Math.max(
+    MIN_OVERLAP,
+    maxLiteralLength + 1,
+    SHAPE_MAX_LEN,
+  );
+
+  return { literalToEntry, fragments, shapes, overlapBytes };
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +372,9 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 
-const OVERLAP_BYTES = 128;
+// Note: overlap window is now per-FingerprintSet (set.overlapBytes), computed
+// at buildFingerprintSet time so it always exceeds the longest registered
+// literal + shape match. Sherlock #293 blocker.
 
 /**
  * Get the guard log path (creates parent dir if needed).
@@ -406,9 +428,9 @@ export function spawnGuarded(
       const text = chunk.toString("utf-8");
       stdoutPending += text;
 
-      if (stdoutPending.length > OVERLAP_BYTES) {
-        const flush = stdoutPending.slice(0, -OVERLAP_BYTES);
-        stdoutPending = stdoutPending.slice(-OVERLAP_BYTES);
+      if (stdoutPending.length > set.overlapBytes) {
+        const flush = stdoutPending.slice(0, -set.overlapBytes);
+        stdoutPending = stdoutPending.slice(-set.overlapBytes);
         const result = redactBuffer(flush, set, "stdout");
         process.stdout.write(result.redacted);
         for (const ev of result.events) {
@@ -446,9 +468,9 @@ export function spawnGuarded(
       const text = chunk.toString("utf-8");
       stderrPending += text;
 
-      if (stderrPending.length > OVERLAP_BYTES) {
-        const flush = stderrPending.slice(0, -OVERLAP_BYTES);
-        stderrPending = stderrPending.slice(-OVERLAP_BYTES);
+      if (stderrPending.length > set.overlapBytes) {
+        const flush = stderrPending.slice(0, -set.overlapBytes);
+        stderrPending = stderrPending.slice(-set.overlapBytes);
         const result = redactBuffer(flush, set, "stderr");
         process.stderr.write(result.redacted);
         for (const ev of result.events) {
