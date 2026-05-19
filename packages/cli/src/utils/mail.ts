@@ -261,7 +261,14 @@ export function checkMessages(agent: string, checkedOutBy = agent): MailMessage[
   // Opportunistic cur/ archive — keeps the processed tail from accumulating
   // indefinitely. Safe to no-op when there's nothing old; cost is one stat()
   // per cur entry, capped at the directory size.
-  try { archiveOldCur(agent); } catch { /* non-fatal */ }
+  try {
+    archiveOldCur(agent);
+  } catch (e: any) {
+    // Non-fatal: archive failure must never block mail processing. Log so
+    // operators can see ENOSPC, permissions, or other persistent issues
+    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
+    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
+  }
 
   const messages: MailMessage[] = [];
   const nowIso = new Date().toISOString();
