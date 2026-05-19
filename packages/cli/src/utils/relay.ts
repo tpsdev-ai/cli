@@ -398,7 +398,15 @@ export async function deliverToRemoteBranch(
         if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
           clearTimeout(timeout);
           channel.offMessage(handler);
-          resolve();
+          // Honor the branch's honest ACK: accepted:false means the write
+          // failed (inbox full, mode error, etc). Surface as a real delivery
+          // error rather than treating any ACK as success.
+          const ackBody = msg.body as any;
+          if (ackBody?.accepted === false) {
+            reject(new Error(`Branch refused delivery: ${ackBody?.error ?? "unknown reason"}`));
+          } else {
+            resolve();
+          }
         }
       };
       channel.onMessage(handler);

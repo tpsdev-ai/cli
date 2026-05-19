@@ -55,6 +55,21 @@ function logLine(event: string, msg: string): void {
   appendFileSync(logPath(), `[${new Date().toISOString()}] ${event}: ${msg}\n`, "utf-8");
 }
 
+/**
+ * Map a raw sendMessage error to a sanitized category safe to send on-wire.
+ * Raw errors can include filesystem paths or internal state (Sherlock #294);
+ * the host only needs to know the category to surface a useful failure.
+ */
+function sanitizeDeliveryError(raw: string): string {
+  const r = raw.toLowerCase();
+  if (r.includes("inbox full")) return "inbox-full";
+  if (r.includes("eacces") || r.includes("eperm") || r.includes("permission denied")) return "permission-denied";
+  if (r.includes("enospc") || r.includes("no space")) return "disk-full";
+  if (r.includes("enoent") || r.includes("no such")) return "path-missing";
+  if (r.includes("invalid")) return "invalid-input";
+  return "write-failed";
+}
+
 function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -300,6 +315,12 @@ async function runStart(): Promise<void> {
     }
     const body = parsed.data;
 
+    // Track delivery failure so the ACK reflects actual write success/failure.
+    // Without this, an "Inbox full" or similar write error would silently turn
+    // into accepted=true and the host's deliverToRemoteBranch would log
+    // "Mail delivered" while the message was actually dropped.
+    let deliveryError: string | null = null;
+
     const action = await runHandlerPipeline(
       { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
       manifests,
@@ -328,14 +349,32 @@ async function runStart(): Promise<void> {
         // preserves the original behavior for the GAL-alias case where
         // body.to is a logical name that doesn't match any local agent dir.
         const recipient = inboxExists(body.to) ? body.to : localAgentId;
-        try { sendMessage(recipient, body.content, body.from); } catch (e: any) {
-          logLine("WARN", `Mail write failed: ${e.message}`);
+        try {
+          sendMessage(recipient, body.content, body.from);
+        } catch (e: any) {
+          // Honest NACK: an "Inbox full" or other write failure must NOT be
+          // ACKed as accepted=true. Silent drops here strand entire dispatches
+          // because the host's deliverToRemoteBranch only checks the ACK.
+          // Log the raw error locally, but send only a sanitized category
+          // to the host (Sherlock #294: raw error messages can include
+          // filesystem paths or internal state — leak surface to remote).
+          const rawError = e?.message || "Mail write failed";
+          logLine("WARN", `Mail write failed: ${rawError}`);
+          deliveryError = sanitizeDeliveryError(rawError);
         }
         break;
       }
     }
 
-    await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } }).catch(() => {});
+    const ackAccepted = deliveryError === null;
+    await channel.send({
+      type: MSG_MAIL_ACK,
+      seq: msg.seq,
+      ts: new Date().toISOString(),
+      body: ackAccepted
+        ? { id: body.id, accepted: true }
+        : { id: body.id, accepted: false, error: deliveryError },
+    }).catch(() => {});
 
     for (const item of drainOutbox()) {
       await channel.send({
