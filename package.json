@@ -20,6 +20,10 @@
   "author": "tpsdev-ai",
   "license": "Apache-2.0",
   "dependencies": {
-    "handlebars": "^4.7.9"
+    "handlebars": "^4.7.9",
+    "ws": "^8.20.1"
+  },
+  "overrides": {
+    "ws": "^8.20.1"
   }
 }
