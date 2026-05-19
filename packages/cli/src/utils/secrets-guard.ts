@@ -188,13 +188,13 @@ export function redactBuffer(
     // Use split+join for reliable replacement (skip if literal contains regex chars risk)
     // Actually, use replaceAll with string arg
     let matchesFound = 0;
-    let idx = 0;
-    while ((idx = redacted.indexOf(literal, idx)) !== -1) {
+    let idx = redacted.indexOf(literal, 0);
+    while (idx !== -1) {
       // Verify it's not already inside a [REDACTED-...] tag
       if (!isInsideRedactedTag(redacted, idx)) {
         matchesFound++;
       }
-      idx += literal.length;
+      idx = redacted.indexOf(literal, idx + literal.length);
     }
 
     if (matchesFound > 0) {
@@ -222,13 +222,14 @@ export function redactBuffer(
     );
 
     let matchCount = 0;
-    let m: RegExpExecArray | null;
     // Reset lastIndex
     fragmentRegex.lastIndex = 0;
-    while ((m = fragmentRegex.exec(redacted)) !== null) {
+    let m = fragmentRegex.exec(redacted);
+    while (m !== null) {
       if (!isInsideRedactedTag(redacted, m.index)) {
         matchCount++;
       }
+      m = fragmentRegex.exec(redacted);
     }
 
     if (matchCount > 0) {
@@ -238,12 +239,14 @@ export function redactBuffer(
       let pos = 0;
       const searchRegex = new RegExp(escapeRegex(fragment), "g");
       searchRegex.lastIndex = 0;
-      while ((m = searchRegex.exec(redacted)) !== null) {
-        if (!isInsideRedactedTag(redacted, m.index)) {
-          result.push(redacted.slice(pos, m.index));
+      let m2 = searchRegex.exec(redacted);
+      while (m2 !== null) {
+        if (!isInsideRedactedTag(redacted, m2.index)) {
+          result.push(redacted.slice(pos, m2.index));
           result.push(`[REDACTED-${type}]`);
-          pos = m.index + fragmentLen;
+          pos = m2.index + fragmentLen;
         }
+        m2 = searchRegex.exec(redacted);
       }
       if (pos > 0) {
         result.push(redacted.slice(pos));
@@ -263,15 +266,16 @@ export function redactBuffer(
 
     const re = new RegExp(regex.source, regex.flags);
     let matchCount = 0;
-    let m: RegExpExecArray | null;
     re.lastIndex = 0;
     const matchedRanges: Array<{ start: number; end: number }> = [];
 
-    while ((m = re.exec(redacted)) !== null) {
+    let m = re.exec(redacted);
+    while (m !== null) {
       if (!isInsideRedactedTag(redacted, m.index)) {
         matchedRanges.push({ start: m.index, end: m.index + m[0].length });
         matchCount++;
       }
+      m = re.exec(redacted);
     }
 
     if (matchCount > 0) {
@@ -298,11 +302,12 @@ export function redactBuffer(
   // Pass 4: base64 shape counting (flag only, no redaction)
   const base64Pattern = /[A-Za-z0-9+/=]{40,}/g;
   let b64Count = 0;
-  let bm: RegExpExecArray | null;
-  while ((bm = base64Pattern.exec(redacted)) !== null) {
+  let bm = base64Pattern.exec(redacted);
+  while (bm !== null) {
     if (!isInsideRedactedTag(redacted, bm.index)) {
       b64Count++;
     }
+    bm = base64Pattern.exec(redacted);
   }
   if (b64Count > 0) {
     matches["shape-base64"] = b64Count;
@@ -335,12 +340,12 @@ export function countMatches(input: string, set: FingerprintSet): number {
 function countOccurrences(str: string, substr: string): number {
   if (substr.length === 0) return 0;
   let count = 0;
-  let idx = 0;
-  while ((idx = str.indexOf(substr, idx)) !== -1) {
+  let idx = str.indexOf(substr, 0);
+  while (idx !== -1) {
     if (!isInsideRedactedTag(str, idx)) {
       count++;
     }
-    idx += substr.length;
+    idx = str.indexOf(substr, idx + substr.length);
   }
   return count;
 }
