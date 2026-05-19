@@ -27,6 +27,7 @@ const cli = meow(
     agent run|start|health  Manage tps-agent runtime from config
     identity <action> Key management (init/show/register/list/revoke/verify)
     secrets <action>  Secret management (set/list/remove)
+    secrets-guard <cmd> [args...]  Wrap a command through the leak-shape guard
     git <action>      Git utilities (worktree)
     branch <action>   Branch office node (init/start/stop/status/log)
     stats            Aggregate structured JSONL telemetry events
@@ -147,6 +148,8 @@ const cli = meow(
       secretsDir: { type: "string" },
       sensitivity: { type: "string" },
       credType: { type: "string" },
+      check: { type: "boolean", default: false },
+      noGuard: { type: "boolean", default: false },
       // Task envelope flags (mail send --task)
       task: { type: "string" },
       taskId: { type: "string" },
@@ -741,6 +744,40 @@ async function main() {
         trust: cli.flags.trust as any,
         pubkey: cli.flags.pubkey,
         encPubkey: cli.flags.encPubkey,
+      });
+      break;
+    }
+    case "secrets-guard": {
+      const { runSecretsGuard } = await import("../src/commands/secrets-guard.js");
+
+      // --check mode: read stdin, print match count
+      if (process.argv.includes("--check")) {
+        // Collect stdin
+        let data = "";
+        process.stdin.setEncoding("utf-8");
+        for await (const chunk of process.stdin) {
+          data += chunk;
+        }
+        await runSecretsGuard({ action: "check", stdinText: data });
+        break;
+      }
+
+      // Guard mode: wrap a command
+      const cmd = rest[0];
+      if (!cmd) {
+        console.error([
+          "Usage:",
+          "  tps secrets-guard <cmd> [args...]       Wrap a command through the leak guard",
+          "  tps secrets-guard --check                Read stdin, print match count (dry-run)",
+        ].join("\n"));
+        process.exit(1);
+      }
+
+      await runSecretsGuard({
+        action: "guard",
+        cmd,
+        args: rest.slice(1),
+        noGuard: process.argv.includes("--no-guard"),
       });
       break;
     }
