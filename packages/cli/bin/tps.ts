@@ -34,6 +34,7 @@ const cli = meow(
     bridge start|stop|status  OpenClaw mail bridge (connects Discord → TPS mail)
     skill <action>    Skill governance (list/register/scan/revoke/show)
     flair install|start|stop|restart|status|logs|sync  Flair (Harper backend) launchd service + sync
+    facts <action>   Facts substrate (list/show/get/verify/register/unregister)
     pulse start|status|list  Office process engine — PR review workflow daemon
 
   Options
@@ -150,6 +151,10 @@ const cli = meow(
       credType: { type: "string" },
       check: { type: "boolean", default: false },
       noGuard: { type: "boolean", default: false },
+      // Facts substrate flags
+      failOnDrift: { type: "boolean", default: false },
+      noVerify: { type: "boolean", default: false },
+      verifyPreview: { type: "boolean", default: false },
       // Task envelope flags (mail send --task)
       task: { type: "string" },
       taskId: { type: "string" },
@@ -929,6 +934,50 @@ async function main() {
         cost: !!cli.flags.cost,
         shared: !!cli.flags.shared,
       });
+      break;
+    }
+    case "facts": {
+      const { runFacts } = await import("../src/commands/facts.js");
+
+      // Build args from meow flags
+      const action = rest[0];
+      const argsObj: Record<string, unknown> = { action };
+
+      if (cli.flags.json) argsObj.json = true;
+      if (cli.flags.scope) argsObj.scope = cli.flags.scope as string;
+      if (cli.flags.name) argsObj.name = cli.flags.name as string;
+      if (cli.flags.credType) argsObj.type = cli.flags.credType as string;
+      if (cli.flags.schedule) argsObj.ttl = cli.flags.schedule as string;
+      if (cli.flags.reason) argsObj.rationale = cli.flags.reason as string;
+      // --command and --args are passed positionally via rest
+      if (rest[1]) argsObj.name = rest[1]; // positional name comes after action
+
+      if (action === "register") {
+        // Parse --command and --args from CLI
+        const cmdIdx = process.argv.indexOf("--command");
+        if (cmdIdx !== -1 && process.argv[cmdIdx + 1]) {
+          argsObj.command = process.argv[cmdIdx + 1];
+        }
+        const argsArgIdx = process.argv.indexOf("--args");
+        if (argsArgIdx !== -1 && process.argv[argsArgIdx + 1]) {
+          try {
+            const parsed = JSON.parse(process.argv[argsArgIdx + 1]);
+            if (Array.isArray(parsed)) argsObj.parsedArgs = parsed;
+          } catch {
+            console.error("--args must be a JSON array, e.g. --args '[\"a\",\"b\"]'");
+            process.exit(1);
+          }
+        }
+        argsObj.name = rest[1] as string | undefined;
+      } else if (action === "get") {
+        if (process.argv.includes("--no-verify")) argsObj.noVerify = true;
+        if (process.argv.includes("--verify-preview")) argsObj.verifyPreview = true;
+        argsObj.name = rest[1] as string | undefined;
+      } else if (action === "verify") {
+        if (process.argv.includes("--fail-on-drift")) argsObj.failOnDrift = true;
+      }
+
+      await runFacts(argsObj as any);
       break;
     }
     case "gal": {
