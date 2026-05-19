@@ -152,10 +152,57 @@ function messagePathById(agent: string, id: string): string | null {
   return null;
 }
 
+/**
+ * Count of UNPROCESSED inbox messages — files in new/.
+ *
+ * The MAX_INBOX_MESSAGES cap is back-pressure for "agent isn't processing,"
+ * not "agent ran for too long." Previously this counted new+cur, which meant
+ * a busy agent's processed-but-not-archived mail would silently bounce
+ * incoming dispatches. Anvil hit this 2026-05-19 with 100 cur/ entries dating
+ * back to May 4 — fresh dispatches NACK'd with "Inbox full" while his
+ * processed mail sat there. Pair with archiveOldCur() for cur hygiene.
+ */
 export function countInboxMessages(agent: string): number {
   const inbox = getInbox(agent);
-  return readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length +
-    readdirSync(inbox.cur).filter((f) => f.endsWith(".json")).length;
+  return readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length;
+}
+
+/**
+ * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
+ *
+ * Returns the count moved. Idempotent and non-failing — corrupt or unreadable
+ * files are skipped without blocking the others. Called opportunistically
+ * from mail check / mail watch so the cap doesn't drift back into the
+ * combined-count failure mode if a future change re-introduces it.
+ *
+ * The 30-day default is conservative: agents that ack mail are essentially
+ * done with it, and the audit log + git history are the durable record. cur/
+ * just holds the "processed but not yet GC'd" tail.
+ */
+export function archiveOldCur(agent: string, maxAgeDays = 30): number {
+  const inbox = getInbox(agent);
+  if (!existsSync(inbox.cur)) return 0;
+  const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+  const archiveRoot = join(inbox.root, "archive");
+  let moved = 0;
+  for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
+    const src = join(inbox.cur, file);
+    try {
+      const st = statSync(src);
+      // Use mtime as the archive boundary — covers both naturally-old files
+      // and ones manually touched. Most cur/ entries are written-once when
+      // ack'd, so mtime ≈ when the agent processed them.
+      if (st.mtimeMs > cutoffMs) continue;
+      const ts = new Date(st.mtimeMs);
+      const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
+      mkdirSync(monthDir, { recursive: true });
+      renameSync(src, join(monthDir, file));
+      moved++;
+    } catch {
+      // Skip on stat/rename failure — non-fatal; next call retries.
+    }
+  }
+  return moved;
 }
 
 export function sendMessage(to: string, body: string, from?: string): MailMessage & { filePath: string } {
@@ -210,6 +257,19 @@ export function checkMessages(agent: string, checkedOutBy = agent): MailMessage[
   assertValidAgentId(agent);
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
+
+  // Opportunistic cur/ archive — keeps the processed tail from accumulating
+  // indefinitely. Safe to no-op when there's nothing old; cost is one stat()
+  // per cur entry, capped at the directory size.
+  try {
+    archiveOldCur(agent);
+  } catch (e: any) {
+    // Non-fatal: archive failure must never block mail processing. Log so
+    // operators can see ENOSPC, permissions, or other persistent issues
+    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
+    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
+  }
+
   const messages: MailMessage[] = [];
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
