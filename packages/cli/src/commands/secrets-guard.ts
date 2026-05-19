@@ -31,15 +31,10 @@ export async function runSecretsGuard(args: SecretsGuardArgs): Promise<void> {
   let set: FingerprintSet;
 
   if (!manifest) {
-    // No manifest → guard runs in shape-only mode
-    set = {
-      literalToEntry: new Map(),
-      fragments: new Map(),
-      shapes: [],
-    };
-    // Still build shapes even without manifest
-    const { buildFingerprintSet: build } = await import("../utils/secrets-guard.js");
-    set = build({ version: 1, credentials: {} });
+    // No manifest → guard runs in shape-only mode.
+    // Build via the canonical path so overlapBytes (and any future fields)
+    // come from one place instead of being hand-maintained here.
+    set = buildFingerprintSet({ version: 1, credentials: {} });
   } else {
     set = buildFingerprintSet(manifest);
   }
