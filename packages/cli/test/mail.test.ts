@@ -9,9 +9,15 @@ const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 
 describe("mail utils", () => {
   let tempRoot: string;
+  let savedHome: string | undefined;
 
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-mail-test-"));
+    // Override HOME alongside TPS_MAIL_DIR — getInbox() prefers
+    // ~/.tps/branch-office/<agent>/mail when it exists, which would
+    // otherwise leak the test into the real on-host kern/anvil inboxes.
+    savedHome = process.env.HOME;
+    process.env.HOME = tempRoot;
     process.env.TPS_MAIL_DIR = join(tempRoot, "mail");
     process.env.TPS_AGENT_ID = "anvil";
   });
@@ -19,6 +25,8 @@ describe("mail utils", () => {
   afterEach(() => {
     delete process.env.TPS_MAIL_DIR;
     delete process.env.TPS_AGENT_ID;
+    if (savedHome !== undefined) process.env.HOME = savedHome;
+    else delete process.env.HOME;
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
@@ -108,24 +116,94 @@ describe("mail utils", () => {
     expect(curFilesAfter.length).toBe(0);
   });
 
-  test("countInboxMessages drops after ack", () => {
-    // Send 5 messages
+  test("countInboxMessages counts new/ only — drops after check (semantic change 2026-05-19)", () => {
+    // Previously this counted new+cur, which caused Anvil to bounce fresh
+    // dispatches once his cur/ filled to 100 with processed-but-not-archived
+    // mail. New semantic: cap is back-pressure for "agent isn't processing,"
+    // so checkMessages (new -> cur) should drop the count to zero.
     for (let i = 0; i < 5; i++) {
       sendMessage("kern", `msg-${i}`, "anvil");
     }
     expect(countInboxMessages("kern")).toBe(5);
 
-    // Check all (moves new -> cur)
+    // Check all (moves new -> cur). With new semantic, count drops to 0.
     const msgs = checkMessages("kern");
     expect(msgs.length).toBe(5);
-    expect(countInboxMessages("kern")).toBe(5);
+    expect(countInboxMessages("kern")).toBe(0);
 
-    // Ack 3
+    // Ack doesn't change the count further (we're already at 0).
     ackMessage("kern", msgs[0]!.id);
-    ackMessage("kern", msgs[1]!.id);
-    ackMessage("kern", msgs[2]!.id);
+    expect(countInboxMessages("kern")).toBe(0);
+  });
 
-    expect(countInboxMessages("kern")).toBe(2);
+  test("100 messages in cur does NOT block new sends (Anvil 2026-05-19 regression)", async () => {
+    // Anvil's bug: cur/ filled to 100 with old processed mail; fresh
+    // dispatches NACK'd with "Inbox full" silently. Reproduce by stuffing
+    // cur/ then verifying a send still succeeds.
+    const inbox = getInbox("kern");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    mkdirSync(inbox.cur, { recursive: true });
+    for (let i = 0; i < 100; i++) {
+      writeFileSync(
+        join(inbox.cur, `2026-05-04-old-${i}.json`),
+        JSON.stringify({ id: `old-${i}`, from: "anvil", to: "kern", body: "old", timestamp: "2026-05-04T00:00:00Z" }),
+      );
+    }
+    // 100 in cur, 0 in new. Should NOT throw.
+    expect(() => sendMessage("kern", "fresh dispatch", "anvil")).not.toThrow();
+  });
+
+  test("archiveOldCur moves only entries older than maxAgeDays", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("kern");
+    const { writeFileSync, mkdirSync, utimesSync, existsSync, readdirSync } = await import("node:fs");
+    mkdirSync(inbox.cur, { recursive: true });
+
+    // Write 3 entries with backdated mtimes — only one (60d old) should archive
+    // under default maxAgeDays=30.
+    const old60 = join(inbox.cur, "old-60d.json");
+    const old10 = join(inbox.cur, "old-10d.json");
+    const recent = join(inbox.cur, "recent.json");
+    for (const p of [old60, old10, recent]) {
+      writeFileSync(p, JSON.stringify({ id: "x", from: "anvil", to: "kern", body: "x", timestamp: new Date().toISOString() }));
+    }
+    const now = Date.now();
+    utimesSync(old60, new Date(now - 60 * 86_400_000), new Date(now - 60 * 86_400_000));
+    utimesSync(old10, new Date(now - 10 * 86_400_000), new Date(now - 10 * 86_400_000));
+
+    const moved = archiveOldCur("kern", 30);
+    expect(moved).toBe(1);
+
+    const curRemaining = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
+    expect(curRemaining).toContain("old-10d.json");
+    expect(curRemaining).toContain("recent.json");
+    expect(curRemaining).not.toContain("old-60d.json");
+
+    // Archive structure: ~/.tps/mail/<agent>/archive/YYYY-MM/<file>.json
+    const archiveRoot = join(inbox.root, "archive");
+    expect(existsSync(archiveRoot)).toBe(true);
+  });
+
+  test("checkMessages opportunistically archives old cur entries", async () => {
+    const { getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("kern");
+    const { writeFileSync, mkdirSync, utimesSync, readdirSync } = await import("node:fs");
+    mkdirSync(inbox.cur, { recursive: true });
+
+    // Plant a 60-day-old entry in cur/
+    const oldFile = join(inbox.cur, "ancient.json");
+    writeFileSync(oldFile, JSON.stringify({ id: "ancient", from: "anvil", to: "kern", body: "x", timestamp: new Date().toISOString() }));
+    const sixtyDaysAgo = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(oldFile, sixtyDaysAgo, sixtyDaysAgo);
+
+    // Send a new msg + check — should trigger auto-archive
+    sendMessage("kern", "fresh", "anvil");
+    checkMessages("kern");
+
+    // Ancient should be archived, fresh should be in cur/
+    const curContents = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
+    expect(curContents).not.toContain("ancient.json");
+    expect(curContents.length).toBe(1); // just the freshly-checked one
   });
 });
 
