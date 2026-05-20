@@ -56,6 +56,7 @@ import {
   auditStats,
   AuditStats,
 } from "../utils/credentials-audit.js";
+import { realpathSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
 // CLI entry point types
@@ -752,6 +753,20 @@ function handleAdoptSingle(args: SecretsArgs): void {
   if (!resolvedPath.startsWith("/") && !resolvedPath.startsWith(homedir())) {
     // Treat as name; look in ~/.tps/secrets/<name>
     resolvedPath = join(homedir(), ".tps", "secrets", candidatePath);
+  }
+
+  // Path-traversal hardening: canonicalize + bound-check against secrets root
+  const secretsRoot = join(homedir(), ".tps", "secrets");
+  try {
+    const canonicalPath = realpathSync(resolvedPath);
+    if (!canonicalPath.startsWith(realpathSync(secretsRoot))) {
+      console.error(`Error: path resolves outside ~/.tps/secrets/: ${canonicalPath}`);
+      process.exit(1);
+    }
+    resolvedPath = canonicalPath;
+  } catch (err: any) {
+    // realpathSync throws if file doesn't exist; handled by existsSync below
+    if (err?.code !== "ENOENT") throw err;
   }
 
   // Validate path exists
