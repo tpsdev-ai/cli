@@ -40,6 +40,22 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSy
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { tmpdir } from "node:os";
+import {
+  logAdopted,
+  logAdoptedSingle,
+  logEmit,
+  logList,
+  logRegister,
+  logScan,
+  logShow,
+  logUnregister,
+  logVerify,
+  readAuditLog,
+  tailAuditLog,
+  grepAuditLog,
+  auditStats,
+  AuditStats,
+} from "../utils/credentials-audit.js";
 
 // ---------------------------------------------------------------------------
 // CLI entry point types
@@ -52,7 +68,8 @@ export type SecretsAction =
   | "adopt"                         // bulk scan + propose
   | "adopt-single"                  // adopt a single candidate
   | "verify"                        // check manifest integrity
-  | "scan";                          // detect orphans
+  | "scan"                           // detect orphans
+  | "audit";                         // audit log (tail, grep, stats)
 
 export interface SecretsArgs {
   action: SecretsAction;
@@ -83,6 +100,11 @@ export interface SecretsArgs {
   failOnDrift?: boolean;
   // scan
   scanRoot?: string;
+  // audit
+  auditSubAction?: string;
+  auditLimit?: number;
+  auditPattern?: string;
+  auditWindow?: string;
   // common
   json?: boolean;
 }
@@ -125,6 +147,9 @@ export async function runSecrets(args: SecretsArgs): Promise<void> {
       break;
     case "scan":
       handleScan(args);
+      break;
+    case "audit":
+      handleAudit(args);
       break;
   }
 }
@@ -201,6 +226,8 @@ async function handleList(args: SecretsArgs): Promise<void> {
   }
 
   let entries = manifest.credentials;
+
+  logList();
 
   // Filter by owner
   if (args.owner) {
@@ -287,8 +314,11 @@ function handleShow(args: SecretsArgs): void {
   const entry = manifest.credentials[args.key];
   if (!entry) {
     console.error(`Credential '${args.key}' not found in manifest.`);
+    logShow(args.key);
     process.exit(1);
   }
+
+  logShow(args.key);
 
   if (args.json) {
     console.log(JSON.stringify({ entry, verify: verifyEntry(entry) }, null, 2));
@@ -342,12 +372,14 @@ function handleEmit(args: SecretsArgs): void {
   const entry = manifest.credentials[args.key];
   if (!entry) {
     console.error(`Credential '${args.key}' not found in manifest.`);
+    logEmit(args.key, false, "not_found");
     process.exit(1);
   }
 
   const resolvedPath = expandPath(entry.path);
   if (!existsSync(resolvedPath)) {
     console.error(`File not found: ${resolvedPath}`);
+    logEmit(args.key, false, "file_not_found");
     process.exit(1);
   }
 
@@ -356,11 +388,13 @@ function handleEmit(args: SecretsArgs): void {
     content = readFileSync(resolvedPath, "utf-8");
   } catch {
     console.error(`Could not read: ${resolvedPath}`);
+    logEmit(args.key, false, "unreadable");
     process.exit(1);
   }
 
-  // Log read for audit (S2 will write to audit log; S1 just stderr trace)
+  // Log successful read to audit
   console.error(`[audit] emit '${args.key}' from ${resolvedPath}`);
+  logEmit(args.key, true);
 
   process.stdout.write(content);
 }
@@ -409,6 +443,7 @@ function handleRegister(args: SecretsArgs): void {
 
   manifest.credentials[args.key] = entry;
   writeManifest(manifest);
+  logRegister(args.key, true);
   console.log(`Registered '${args.key}' (${ctype}).`);
 }
 
@@ -430,6 +465,7 @@ function handleUnregister(args: SecretsArgs): void {
 
   delete manifest.credentials[args.key];
   writeManifest(manifest);
+  logUnregister(args.key);
   console.log(`Unregistered '${args.key}' (file not deleted).`);
 }
 
@@ -486,6 +522,12 @@ function handleAdopt(args: SecretsArgs): void {
 
   writeManifest(existing);
   console.log(`Adopt complete: ${added} added, ${skipped} skipped`);
+  // Audit log each adopted entry
+  for (const candidate of result.candidates) {
+    const candidatePath = expandPath(candidate.entry.path);
+    if (!existingPaths.has(candidatePath)) continue;
+    logAdopted(candidate.name, true);
+  }
 
   if (result.openclawTokens.length > 0) {
     console.log(`\n⚠️  Found ${result.openclawTokens.length} embedded token(s) in openclaw.json (not extracted):`);
@@ -631,6 +673,9 @@ function handleVerify(args: SecretsArgs): void {
   // Summary line
   console.log(`\nOK: ${summary.ok}  STALE: ${summary.stale}  MISSING: ${summary.missing}  DRIFT: ${summary.drift}`);
 
+  const verifyFailed = summary.drift > 0 || summary.missing > 0;
+  logVerify(null, !verifyFailed, verifyFailed ? `drift=${summary.drift} missing=${summary.missing}` : undefined);
+
   if (args.failOnDrift && hasDrift) {
     process.exit(1);
   }
@@ -656,6 +701,8 @@ function handleScan(args: SecretsArgs): void {
   };
 
   const orphans = scanOrphans(dirs, manifest);
+
+  logScan();
 
   if (args.json) {
     const output = {
@@ -759,10 +806,120 @@ function handleAdoptSingle(args: SecretsArgs): void {
   // Ensure dir mode 0700 before writing
   mkdirSync(dirname(manifestPath()), { recursive: true, mode: 0o700 });
   writeManifest(manifest);
+  logAdoptedSingle(name, true);
 
   if (args.json) {
     console.log(JSON.stringify(entry, null, 2));
   } else {
     console.log(`Adopted '${name}' (${credType}, ${sensitivity}).`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// S2: Audit log commands
+//   NOTE: These commands NEVER write to the audit log themselves.
+// ---------------------------------------------------------------------------
+
+function handleAudit(args: SecretsArgs): void {
+  const sub = args.auditSubAction;
+
+  if (!sub || !["tail", "grep", "stats"].includes(sub)) {
+    console.error("Usage:");
+    console.error("  tps secrets audit tail [-n <count>]");
+    console.error("  tps secrets audit grep <pattern>");
+    console.error("  tps secrets audit stats [--window <d>] [--json]");
+    process.exit(1);
+  }
+
+  switch (sub) {
+    case "tail":
+      handleAuditTail(args);
+      break;
+    case "grep":
+      handleAuditGrep(args);
+      break;
+    case "stats":
+      handleAuditStats(args);
+      break;
+  }
+}
+
+function handleAuditTail(args: SecretsArgs): void {
+  const n = args.auditLimit ?? 50;
+  const lines = tailAuditLog(n);
+
+  if (lines.length === 0) {
+    console.log("No audit log entries.");
+    return;
+  }
+
+  // Print JSONL to stdout (parseable by jq, etc.)
+  for (const line of lines) {
+    console.log(JSON.stringify(line));
+  }
+}
+
+function handleAuditGrep(args: SecretsArgs): void {
+  const pattern = args.auditPattern;
+  if (!pattern) {
+    console.error("Usage: tps secrets audit grep <pattern>");
+    process.exit(1);
+  }
+
+  const lines = grepAuditLog(pattern);
+
+  if (lines.length === 0) {
+    console.log(`No audit log entries matching "${pattern}".`);
+    return;
+  }
+
+  for (const line of lines) {
+    console.log(JSON.stringify(line));
+  }
+}
+
+function handleAuditStats(args: SecretsArgs): void {
+  const window = args.auditWindow ?? "7d";
+  const stats = auditStats(window);
+
+  if (args.json) {
+    // Sort by_op and by_result keys for deterministic output
+    const sorted: AuditStats = {
+      window: stats.window,
+      total: stats.total,
+      by_op: Object.fromEntries(
+        Object.entries(stats.by_op).sort(([a], [b]) => a.localeCompare(b))
+      ),
+      by_result: Object.fromEntries(
+        Object.entries(stats.by_result).sort(([a], [b]) => a.localeCompare(b))
+      ),
+    };
+    console.log(JSON.stringify(sorted, null, 2));
+    return;
+  }
+
+  console.log(`Audit stats (window: ${window}):`);
+  console.log(`  Total operations: ${stats.total}`);
+
+  console.log("\n  By operation:");
+  const opEntries = Object.entries(stats.by_op).sort(([a], [b]) => a.localeCompare(b));
+  if (opEntries.length === 0) {
+    console.log("    (none)");
+  } else {
+    const maxOpLen = Math.max(...opEntries.map(([k]) => k.length));
+    for (const [op, count] of opEntries) {
+      console.log(`    ${op.padEnd(maxOpLen)}  ${count}`);
+    }
+  }
+
+  console.log("\n  By result:");
+  const resEntries = Object.entries(stats.by_result).sort(([a], [b]) => a.localeCompare(b));
+  if (resEntries.length === 0) {
+    console.log("    (none)");
+  } else {
+    const maxResLen = Math.max(...resEntries.map(([k]) => k.length));
+    for (const [result, count] of resEntries) {
+      console.log(`    ${result.padEnd(maxResLen)}  ${count}`);
+    }
   }
 }
