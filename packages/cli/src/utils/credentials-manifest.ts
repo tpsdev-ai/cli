@@ -628,3 +628,205 @@ export function filterExpiresWithin(
   }
   return filtered;
 }
+
+// ---------------------------------------------------------------------------
+// S2: Scope & type filtering
+// ---------------------------------------------------------------------------
+
+/** Filter manifest entries by scope substring match. */
+export function filterByScope(
+  entries: Record<string, CredentialEntry>,
+  scope: string
+): Record<string, CredentialEntry> {
+  const filtered: Record<string, CredentialEntry> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    if (entry.scope && entry.scope.includes(scope)) {
+      filtered[name] = entry;
+    }
+  }
+  return filtered;
+}
+
+/** Filter manifest entries by exact type match. */
+export function filterByType(
+  entries: Record<string, CredentialEntry>,
+  type: string
+): Record<string, CredentialEntry> {
+  const filtered: Record<string, CredentialEntry> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    if (entry.type === type) {
+      filtered[name] = entry;
+    }
+  }
+  return filtered;
+}
+
+// ---------------------------------------------------------------------------
+// S2: Staleness detection
+// ---------------------------------------------------------------------------
+
+/** Check if a credential entry is stale (expired, past its expires date). */
+export function isEntryStale(entry: CredentialEntry, now: Date = new Date()): boolean {
+  if (!entry.expires) return false;
+  const expiresMs = new Date(entry.expires).getTime();
+  if (isNaN(expiresMs)) return false;
+  return expiresMs < now.getTime();
+}
+
+/** Filter manifest to only entries that are stale (expired). */
+export function filterStaleOnly(
+  entries: Record<string, CredentialEntry>,
+  now: Date = new Date()
+): Record<string, CredentialEntry> {
+  const filtered: Record<string, CredentialEntry> = {};
+  for (const [name, entry] of Object.entries(entries)) {
+    if (isEntryStale(entry, now)) {
+      filtered[name] = entry;
+    }
+  }
+  return filtered;
+}
+
+// ---------------------------------------------------------------------------
+// S2: Verify summary
+// ---------------------------------------------------------------------------
+
+export type VerifyCategory = "ok" | "stale" | "missing" | "drift";
+
+export interface VerifyEntrySummary {
+  name: string;
+  category: VerifyCategory;
+  issues: VerifyIssue[];
+  entry: CredentialEntry;
+}
+
+export interface VerifySummary {
+  ok: number;
+  stale: number;
+  missing: number;
+  drift: number;
+  entries: VerifyEntrySummary[];
+}
+
+/** Run verifyAll with staleness and category classification for S2 reporting. */
+export function verifySummary(
+  manifest: CredentialsManifest,
+  now: Date = new Date()
+): VerifySummary {
+  const summary: VerifySummary = { ok: 0, stale: 0, missing: 0, drift: 0, entries: [] };
+
+  for (const [name, entry] of Object.entries(manifest.credentials)) {
+    const result = verifyEntry(entry);
+    const stale = isEntryStale(entry, now);
+
+    let category: VerifyCategory;
+    if (!result.ok) {
+      // Check if it's missing vs drift
+      if (result.issues.some(i => i.kind === "missing-file")) {
+        category = "missing";
+      } else {
+        category = "drift";
+      }
+    } else if (stale) {
+      category = "stale";
+    } else {
+      category = "ok";
+    }
+
+    summary[category]++;
+    summary.entries.push({ name, category, issues: result.issues, entry });
+  }
+
+  return summary;
+}
+
+// ---------------------------------------------------------------------------
+// S2: Orphan scan (candidates NOT in manifest)
+// ---------------------------------------------------------------------------
+
+/**
+ * Walk candidates and return only those that are NOT already in the manifest.
+ * Compares resolved paths.
+ */
+export function scanOrphans(
+  dirs: AdoptDirs,
+  manifest: CredentialsManifest
+): AdoptCandidate[] {
+  const result = walkAdoptCandidates(dirs);
+  const registeredPaths = new Set(
+    Object.values(manifest.credentials).map(e => expandPath(e.path))
+  );
+
+  const orphans: AdoptCandidate[] = [];
+  for (const candidate of result.candidates) {
+    const candidatePath = expandPath(candidate.entry.path);
+    if (!registeredPaths.has(candidatePath)) {
+      orphans.push(candidate);
+    }
+  }
+  return orphans;
+}
+
+/**
+ * Compute a relative "age" string for display (e.g., "3h ago", "5d ago").
+ * For entries without issued/lastUsed, returns null.
+ */
+export function entryAge(entry: CredentialEntry, now: Date = new Date()): string | null {
+  const ts = entry.issued ?? entry.lastUsed ?? entry.lastRotated;
+  if (!ts) return null;
+  const ms = now.getTime() - new Date(ts).getTime();
+  if (ms < 0 || isNaN(ms)) return null;
+
+  const minutes = Math.floor(ms / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// S2: Adopt a single candidate
+// ---------------------------------------------------------------------------
+
+/**
+ * Adopt a single file path into the manifest.
+ * Infers type, owner, and sensitivity; validates the path exists.
+ * Returns the new entry, or throws on validation failure.
+ */
+export function adoptSingle(
+  candidatePath: string,
+  name?: string
+): { name: string; entry: CredentialEntry } {
+  const resolvedPath = expandPath(candidatePath);
+
+  // Validate path exists
+  if (!existsSync(resolvedPath)) {
+    throw new Error(`path does not exist: ${resolvedPath}`);
+  }
+
+  // Read content for type inference
+  let content: string | null = null;
+  try {
+    content = readFileSync(resolvedPath, "utf-8");
+  } catch {
+    throw new Error(`cannot read file: ${resolvedPath}`);
+  }
+
+  // Infer metadata
+  const type = inferTypeFromPath(resolvedPath, content);
+  const credType: CredentialType = type === "unknown" ? "api-key" : type as CredentialType;
+  const inferredName = name ?? basename(resolvedPath);
+  const owner = inferOwnerFromName(inferredName);
+  const sensitivity = sensitivityForType(credType);
+
+  const entry: CredentialEntry = {
+    path: resolvedPath,
+    type: credType,
+    owners: owner ? [owner] : [],
+    sensitivity,
+  };
+
+  return { name: inferredName, entry };
+}
