@@ -8,7 +8,7 @@
  * No global state. No I/O on construction.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, statSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, basename } from "node:path";
 
@@ -114,6 +114,11 @@ export function manifestPath(): string {
  *   expandPath("~/foo") → `${homedir()}/foo`
  *   expandPath("/absolute/foo") → "/absolute/foo"
  */
+/** Absolute path to the secrets root: ~/.tps/secrets/ */
+export function secretsRoot(): string {
+  return join(homedir(), ".tps", "secrets");
+}
+
 export function expandPath(p: string): string {
   if (p.startsWith("~/")) {
     return join(homedir(), p.slice(2));
@@ -800,6 +805,17 @@ export function adoptSingle(
   name?: string
 ): { name: string; entry: CredentialEntry } {
   const resolvedPath = expandPath(candidatePath);
+
+  // Path-traversal hardening: canonicalize + bound-check against secrets root
+  try {
+    const canonicalPath = realpathSync(resolvedPath);
+    if (!canonicalPath.startsWith(realpathSync(secretsRoot()))) {
+      throw new Error(`path resolves outside ~/.tps/secrets/: ${canonicalPath}`);
+    }
+  } catch (err: any) {
+    // realpathSync throws ENOENT if file doesn't exist; handled below
+    if (err?.code !== "ENOENT" && !err.message?.includes("outside")) throw err;
+  }
 
   // Validate path exists
   if (!existsSync(resolvedPath)) {
