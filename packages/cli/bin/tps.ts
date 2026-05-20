@@ -134,7 +134,7 @@ const cli = meow(
       noFlair: { type: "boolean", default: false },
       forceReinstallFlair: { type: "boolean", default: false },
       purgeFlair: { type: "boolean", default: false },
-      // ops-568p: Cred substrate S1 (credentials manifest)
+      // ops-568p: Cred substrate S1+S2 (credentials manifest)
       apply: { type: "boolean", default: false },
       expires: { type: "string" },
       expiresWithin: { type: "string" },
@@ -151,6 +151,8 @@ const cli = meow(
       credType: { type: "string" },
       check: { type: "boolean", default: false },
       noGuard: { type: "boolean", default: false },
+      staleOnly: { type: "boolean", default: false },
+      root: { type: "string" },
       // Facts substrate flags
       failOnDrift: { type: "boolean", default: false },
       noVerify: { type: "boolean", default: false },
@@ -790,21 +792,23 @@ async function main() {
       const action = rest[0];
       const allowedActions = [
         "set", "list", "remove",
-        "show", "emit", "register", "unregister", "adopt", "verify",
+        "show", "emit", "register", "unregister", "adopt", "verify", "scan",
         "rotate-github-pat", "list-github-pats",
       ];
       if (!action || !allowedActions.includes(action)) {
         console.error([
           "Usage:",
           "  tps secrets set <KEY>=<VALUE>",
-          "  tps secrets list [--owner <id>] [--expires-within <d>] [--json]",
+          "  tps secrets list [--owner <id>] [--scope <s>] [--type <t>] [--stale-only] [--expires-within <d>] [--json]",
           "  tps secrets remove <KEY>",
           "  tps secrets show <name> [--json]",
           "  tps secrets emit <name>",
           "  tps secrets register <name> --path <p> --type <t> --owner <o> [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
           "  tps secrets unregister <name>",
           "  tps secrets adopt [--dry-run] [--apply] [--non-interactive] [--secrets-dir <dir>] [--keys-dir <dir>]",
-          "  tps secrets verify [--fix] [--json]",
+          "  tps secrets adopt <path-or-name>  (single candidate)",
+          "  tps secrets verify [--scope <s>] [--type <t>] [--fix] [--fail-on-drift] [--json]",
+          "  tps secrets scan [--root <path>] [--json]",
           "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
           "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
         ].join("\n"));
@@ -830,13 +834,23 @@ async function main() {
       if (
         action === "show" || action === "emit" ||
         action === "register" || action === "unregister" ||
-        action === "adopt" || action === "verify"
+        action === "adopt" || action === "verify" ||
+        action === "scan"
       ) {
         const { runSecrets } = await import("../src/commands/secrets.js");
+
+        // Detect adopt-single: `tps secrets adopt <path-or-name>` with a positional arg
+        const effectiveAction = (action === "adopt" && rest[1])
+          ? "adopt-single"
+          : action;
+
         await runSecrets({
-          action: action as any,
+          action: effectiveAction as any,
           key: rest[1],
           owner: cli.flags.owner as string | undefined,
+          scope: cli.flags.scope as string | undefined,
+          type: cli.flags.credType as string | undefined,
+          staleOnly: (cli.flags as any).staleOnly as boolean | undefined,
           expiresWithin: cli.flags.expiresWithin as string | undefined,
           registerPath: cli.flags.path as string | undefined,
           registerType: cli.flags.credType as string | undefined,
@@ -850,6 +864,8 @@ async function main() {
           adoptIdentityDir: (cli.flags as any).identityDir as string | undefined,
           adoptFlairKeysDir: (cli.flags as any).flairKeysDir as string | undefined,
           verifyFix: cli.flags.fix as boolean,
+          failOnDrift: (cli.flags as any).failOnDrift as boolean | undefined,
+          scanRoot: (cli.flags as any).root as string | undefined,
           json: cli.flags.json as boolean,
         });
         break;
