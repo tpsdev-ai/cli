@@ -794,6 +794,7 @@ async function main() {
         "set", "list", "remove",
         "show", "emit", "register", "unregister", "adopt", "verify", "scan",
         "rotate-github-pat", "list-github-pats",
+        "audit",
       ];
       if (!action || !allowedActions.includes(action)) {
         console.error([
@@ -811,6 +812,9 @@ async function main() {
           "  tps secrets scan [--root <path>] [--json]",
           "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
           "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
+          "  tps secrets audit tail [-n <count>]       Show last N audit log entries",
+          "  tps secrets audit grep <pattern>           Filter audit log by op or name",
+          "  tps secrets audit stats [--window <d>] [--json]   Audit log statistics",
         ].join("\n"));
         process.exit(1);
       }
@@ -830,6 +834,21 @@ async function main() {
         await runListGithubPats({ json: cli.flags.json });
         break;
       }
+      // Audit log commands (read-only — these do NOT write to audit log themselves)
+      if (action === "audit") {
+        const { runSecrets } = await import("../src/commands/secrets.js");
+        const subAction = rest[1];
+        await runSecrets({
+          action: "audit",
+          auditSubAction: subAction,
+          auditLimit: cli.flags.n !== undefined ? parseInt(String(cli.flags.n), 10) : 50,
+          auditPattern: rest[2],
+          auditWindow: (cli.flags as any).window as string | undefined,
+          json: cli.flags.json as boolean,
+        });
+        break;
+      }
+
       // Cred substrate commands (ops-568p)
       if (
         action === "show" || action === "emit" ||
