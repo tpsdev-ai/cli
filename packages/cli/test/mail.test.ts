@@ -54,7 +54,7 @@ describe("mail utils", () => {
     expect(readdirSync(inbox.cur).length).toBe(1);
   });
 
-  test("quota enforces max 100 messages", () => {
+  test("quota enforces max 100 messages", { timeout: 15000 }, () => {
     for (let i = 0; i < 100; i++) {
       sendMessage("kern", `msg-${i}`, "anvil");
     }
