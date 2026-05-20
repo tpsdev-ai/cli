@@ -13,9 +13,12 @@ import {
   removeLocalSchema,
   refreshManifestFromLocalSchemas,
   localSchemasPath,
+  writeManifest,
+  ensureFactsDir,
   type ManifestEntry,
   type FactType,
   type FactTtl,
+  type FactsManifest,
 } from "../utils/facts-manifest.js";
 
 import {
@@ -31,6 +34,16 @@ import {
   runVerify,
   buildSpawnDescriptor,
 } from "../utils/facts-verify.js";
+
+import {
+  discoverSchemas,
+  resolveConflicts,
+  isNamespaceAllowed,
+  DEFAULT_ALLOWED_NAMESPACES,
+  type DiscoveredSchema,
+  type DiscoveryResult,
+  type RefreshReport,
+} from "../utils/facts-discovery.js";
 
 import { appendFileSync } from "node:fs";
 import { driftLogPath } from "../utils/facts-manifest.js";
@@ -109,8 +122,20 @@ export async function runFacts(args: CmdArgs): Promise<void> {
     case "unregister":
       await handleUnregister(args);
       break;
+    case "init":
+      await handleInit(args);
+      break;
+    case "refresh":
+      await handleRefresh(args);
+      break;
+    case "schemas":
+      await handleSchemas(args);
+      break;
+    case "which":
+      await handleWhich(args);
+      break;
     default:
-      console.error("Usage: tps facts <list|show|get|verify|register|unregister>");
+      console.error("Usage: tps facts <list|show|get|verify|register|unregister|init|refresh|schemas|which>");
       process.exit(1);
   }
 }
@@ -497,4 +522,298 @@ async function handleUnregister(args: CmdArgs): Promise<void> {
   refreshManifestFromLocalSchemas();
 
   console.log(`Unregistered fact "${args.name}"`);
+}
+
+// ---------------------------------------------------------------------------
+// S2: init — First-run discovery
+// ---------------------------------------------------------------------------
+
+async function handleInit(args: CmdArgs): Promise<void> {
+  const strictMode = process.argv.includes("--strict");
+  const allowlist = strictMode ? [] : DEFAULT_ALLOWED_NAMESPACES;
+
+  const result = discoverSchemas(process.cwd(), {
+    allowlist: strictMode ? undefined : allowlist,
+    strict: strictMode,
+  });
+
+  // Load existing manifest to merge
+  const existing = readManifest();
+  const existingFacts = existing.facts ?? {};
+
+  // Merge discovered entries into manifest (idempotent)
+  const manifest: FactsManifest = {
+    version: 1,
+    facts: { ...existingFacts }, // preserve local-schema entries
+    registeredAt: new Date().toISOString(),
+  };
+
+  let newCount = 0;
+  const conflictMap = new Map<string, DiscoveredSchema[]>();
+  for (const disc of result.discovered) {
+    const name = disc.name ?? disc.relPath.replace(".json", "");
+    // Idempotent: don't duplicate if already present with same schema
+    if (existingFacts[name] && existingFacts[name].schema === disc.entry.schema) {
+      continue;
+    }
+
+    // Track potential conflicts
+    if (!conflictMap.has(name)) conflictMap.set(name, []);
+    conflictMap.get(name)!.push(disc);
+
+    // If not yet in manifest, add it
+    if (!manifest.facts[name]) {
+      manifest.facts[name] = disc.entry;
+      newCount++;
+    } else {
+      // Conflict resolution: higher priority wins
+      const existing = manifest.facts[name];
+      const discPriority = disc.entry.priority ?? 0;
+      const existingPriority = existing.priority ?? 0;
+      if (discPriority > existingPriority ||
+          (discPriority === existingPriority && disc.relPath < (existing.schema ?? ""))) {
+        manifest.facts[name] = disc.entry;
+      }
+    }
+  }
+
+  // Report conflict warnings
+  for (const [name, decls] of conflictMap) {
+    if (decls.length > 1) {
+      console.warn(`conflict: "${name}" declared in ${decls.length} schemas — ` +
+        `winner: ${manifest.facts[name]?.schema}`);
+    }
+  }
+
+  writeManifest(manifest);
+
+  if (args.json) {
+    const schemaList = result.discovered.map(d => ({
+      schema: `${d.package}@${d.version}/${d.relPath}`,
+      name: d.name,
+    }));
+    console.log(JSON.stringify({
+      discovered: result.discovered.length,
+      schemas: schemaList,
+      facts: Object.keys(manifest.facts).length,
+    }, null, 2));
+    return;
+  }
+
+  console.log(`Initialized facts manifest.`);
+  console.log(`  Discovered: ${result.discovered.length} schemas`);
+  console.log(`  Facts: ${Object.keys(manifest.facts).length}`);
+
+  if (result.errors.length > 0) {
+    console.warn(`  Errors: ${result.errors.length}`);
+    for (const err of result.errors.slice(0, 5)) {
+      console.warn(`    ${err.package}: ${err.reason}`);
+    }
+    if (result.errors.length > 5) {
+      console.warn(`    ... and ${result.errors.length - 5} more`);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// S2: refresh — Re-discover and merge
+// ---------------------------------------------------------------------------
+
+async function handleRefresh(args: CmdArgs): Promise<void> {
+  const strictMode = process.argv.includes("--strict");
+  const allowlist = strictMode ? [] : DEFAULT_ALLOWED_NAMESPACES;
+
+  const result = discoverSchemas(process.cwd(), {
+    allowlist: strictMode ? undefined : allowlist,
+    strict: strictMode,
+  });
+
+  const existing = readManifest();
+  const oldKeys = new Set(Object.keys(existing.facts));
+  const discoveredKeys = new Set<string>();
+
+  // Build discovered set
+  const discoveredByName = new Map<string, DiscoveredSchema[]>();
+  for (const disc of result.discovered) {
+    const name = disc.name ?? disc.relPath.replace(".json", "");
+    discoveredKeys.add(name);
+    if (!discoveredByName.has(name)) discoveredByName.set(name, []);
+    discoveredByName.get(name)!.push(disc);
+  }
+
+  const report: RefreshReport = { added: [], updated: [], removed: [] };
+  const newFacts: Record<string, ManifestEntry> = {};
+
+  // First pass: copy local-schema facts (they weren't discovered)
+  for (const [name, entry] of Object.entries(existing.facts)) {
+    if (entry.schema.startsWith("local:")) {
+      newFacts[name] = entry;
+    }
+  }
+
+  // Second pass: merge discovered facts
+  for (const [name, decls] of discoveredByName) {
+    // Conflict resolution: highest priority wins
+    const sorted = decls.map(d => ({
+      entry: d.entry,
+      priority: d.entry.priority ?? 0,
+      relPath: d.relPath,
+    })).sort((a, b) => {
+      if (b.priority !== a.priority) return b.priority - a.priority;
+      return a.relPath.localeCompare(b.relPath);
+    });
+
+    const winner = sorted[0].entry;
+    newFacts[name] = winner;
+
+    if (!oldKeys.has(name)) {
+      report.added.push(name);
+    } else if (JSON.stringify(existing.facts[name]) !== JSON.stringify(winner)) {
+      report.updated.push(name);
+    }
+  }
+
+  // Third pass: detect removed (in old but not in discovered and not local)
+  for (const name of oldKeys) {
+    if (!discoveredKeys.has(name) && !existing.facts[name].schema.startsWith("local:")) {
+      report.removed.push(name);
+    }
+  }
+
+  const manifest: FactsManifest = {
+    version: 1,
+    facts: newFacts,
+    registeredAt: new Date().toISOString(),
+  };
+
+  writeManifest(manifest);
+
+  if (args.json) {
+    console.log(JSON.stringify(report, null, 2));
+    return;
+  }
+
+  console.log(`Refreshed facts manifest.`);
+  console.log(`  Added: ${report.added.length}  Updated: ${report.updated.length}  Removed: ${report.removed.length}`);
+
+  for (const name of report.added) console.log(`  + ${name}`);
+  for (const name of report.updated) console.log(`  ~ ${name}`);
+  for (const name of report.removed) console.log(`  - ${name}`);
+}
+
+// ---------------------------------------------------------------------------
+// S2: schemas — List discovered schemas with provenance
+// ---------------------------------------------------------------------------
+
+async function handleSchemas(args: CmdArgs): Promise<void> {
+  const result = discoverSchemas(process.cwd());
+
+  if (args.json) {
+    const list = result.discovered.map(d => ({
+      package: d.package,
+      version: d.version,
+      file: d.relPath,
+      fact_name: d.name,
+      scope: d.entry.scope,
+      type: d.entry.type,
+    }));
+    console.log(JSON.stringify({ schemas: list }, null, 2));
+    return;
+  }
+
+  if (result.discovered.length === 0) {
+    console.log("No discovered schemas.");
+    return;
+  }
+
+  // Aggregated by package+file for the table
+  const agg = new Map<string, { pkg: string; ver: string; file: string; count: number }>();
+  for (const d of result.discovered) {
+    const key = `${d.package}/${d.relPath}`;
+    if (!agg.has(key)) {
+      agg.set(key, { pkg: d.package, ver: d.version, file: d.relPath, count: 0 });
+    }
+    agg.get(key)!.count++;
+  }
+
+  // Render table: Pkg, Version, File, Facts
+  const rows = Array.from(agg.values()).map(a => [a.pkg, a.ver, a.file, String(a.count)]);
+  const cols = ["Package", "Version", "File", "Facts"];
+  const widths = cols.map((_, i) =>
+    Math.max(cols[i].length, ...rows.map(r => (r[i] ?? "").length))
+  );
+  const pad = (s: string, w: number) => s + " ".repeat(Math.max(0, w - s.length));
+
+  console.log(cols.map((c, i) => pad(c, widths[i])).join("  "));
+  console.log(widths.map(w => "─".repeat(w)).join("  "));
+  for (const row of rows) {
+    console.log(row.map((c, i) => pad(c, widths[i])).join("  "));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// S2: which — Show which schema declared a fact + conflict resolution chain
+// ---------------------------------------------------------------------------
+
+async function handleWhich(args: CmdArgs): Promise<void> {
+  if (!args.name) {
+    console.error("Usage: tps facts which <name>");
+    process.exit(1);
+  }
+
+  const manifest = readManifest();
+  const winnerEntry = manifest.facts[args.name];
+
+  if (!winnerEntry) {
+    console.error(`Fact "${args.name}" not found in manifest.`);
+    process.exit(1);
+  }
+
+  // Discover to find all declarations
+  const result = discoverSchemas(process.cwd());
+  const conflicts = resolveConflicts(result.discovered);
+
+  // Find the conflict for this fact name
+  const conflict = conflicts.find(c => c.factName === args.name);
+
+  if (args.json) {
+    if (conflict) {
+      console.log(JSON.stringify({
+        name: args.name,
+        declarations: conflict.declarations.map(d => ({
+          package: d.package,
+          version: d.version,
+          path: d.relPath,
+          priority: d.priority,
+          is_winner: d.isWinner,
+        })),
+        winner_schema: winnerEntry.schema,
+      }, null, 2));
+    } else {
+      console.log(JSON.stringify({
+        name: args.name,
+        declarations: [{
+          schema: winnerEntry.schema,
+          priority: winnerEntry.priority ?? 0,
+          is_winner: true,
+        }],
+        winner_schema: winnerEntry.schema,
+      }, null, 2));
+    }
+    return;
+  }
+
+  console.log(`Fact: ${args.name}`);
+  console.log(`Winner: ${winnerEntry.schema}`);
+  console.log(`Priority: ${winnerEntry.priority ?? 0}`);
+
+  if (conflict && conflict.declarations.length > 1) {
+    console.log(`\nConflict chain (${conflict.declarations.length} declarations):`);
+    for (const d of conflict.declarations) {
+      const marker = d.isWinner ? "→ WINNER" : "  (shadowed)";
+      console.log(`  ${d.package}@${d.version}/${d.relPath}  priority=${d.priority}  ${marker}`);
+    }
+  } else {
+    console.log(`\nNo conflicts — single declaration from ${winnerEntry.schema}`);
+  }
 }

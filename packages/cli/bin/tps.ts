@@ -956,6 +956,29 @@ async function main() {
       const { runFacts } = await import("../src/commands/facts.js");
 
       // Build args from meow flags
+      const validActions = [
+        "list", "show", "get", "verify", "register", "unregister",
+        "init", "refresh", "schemas", "which",
+      ];
+
+      if (!rest[0] || !validActions.includes(rest[0])) {
+        console.error([
+          "Usage:",
+          "  tps facts list [--scope <s>] [--json]",
+          "  tps facts show <name> [--json]",
+          "  tps facts get <name> [--no-verify] [--verify-preview] [--json]",
+          "  tps facts verify [--scope <s>] [--fail-on-drift]",
+          "  tps facts register <name> --command <cmd> --args <json-array> --type <t> [--ttl <ttl>] [--scope <s>] --rationale <text>",
+          "  tps facts unregister <name>",
+          "  tps facts init [--strict] [--json]",
+          "  tps facts refresh [--strict] [--json]",
+          "  tps facts schemas [--json]",
+          "  tps facts which <name> [--json]",
+        ].join("\n"));
+        process.exit(1);
+      }
+
+      // Build args from meow flags
       const action = rest[0];
       const argsObj: Record<string, unknown> = { action };
 
