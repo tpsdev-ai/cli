@@ -44,12 +44,46 @@ function base64Encode(buf: Uint8Array): string {
   return Buffer.from(buf).toString("base64");
 }
 
+function base64Decode(s: string): Uint8Array {
+  return new Uint8Array(Buffer.from(s, "base64"));
+}
+
 /**
  * Sign payload bytes with an Ed25519 seed (32 bytes).
  * Returns a 64-byte signature.
  */
 function signPayload(payload: Uint8Array, seed: Uint8Array): Uint8Array {
   return ed.sign(payload, seed);
+}
+
+/**
+ * Verify an Ed25519 signature against a payload and public key.
+ */
+function verifyPayload(
+  payload: Uint8Array,
+  signature: Uint8Array,
+  publicKey: Uint8Array,
+): boolean {
+  try {
+    return ed.verify(signature, payload, publicKey);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decode a "ed25519:<base64>" signature string into raw bytes.
+ * Returns null if the signature is null/undefined or malformed.
+ */
+function decodeSignature(sig: string | null | undefined): Uint8Array | null {
+  if (sig == null) return null;
+  const prefix = "ed25519:";
+  if (!sig.startsWith(prefix)) return null;
+  try {
+    return base64Decode(sig.slice(prefix.length));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -164,4 +198,135 @@ export function signEnvelope(
   result.signature = `ed25519:${base64Encode(outerSig)}`;
 
   return result;
+}
+
+// ─── Flair client interface (dependency-injected) ──────────────────────────
+
+export interface FlairClient {
+  getAgent(name: string): Promise<{ publicKey: Buffer } | null>;
+}
+
+// ─── Verify result types ────────────────────────────────────────────────────
+
+export interface VerifyOk {
+  ok: true;
+}
+
+export interface VerifyReject {
+  ok: false;
+  reason: string;
+}
+
+/**
+ * Verify a signed envelope:
+ * - v must be 1
+ * - delegationChain must be non-empty and length <= 16
+ * - last chain entry's agent must equal envelope.from
+ * - outer signature must verify against envelope.from's pubkey over
+ *   jcs({ ...envelope, signature: undefined })
+ * - each agent-kind chain entry's signature must verify against that
+ *   agent's pubkey over jcs({ prior: chain[0..i], entry: { ...entry, signature: undefined } })
+ * - each human-kind entry must have signature === null
+ *
+ * Pure function with DI'd flairClient — no Flair HTTP coupling.
+ */
+export async function verifyEnvelope(
+  envelope: Envelope,
+  flairClient: FlairClient,
+): Promise<VerifyOk | VerifyReject> {
+  // 1. Version check
+  if (envelope.v !== 1) {
+    return { ok: false, reason: "unsupported version" };
+  }
+
+  // 2. Chain must exist and be non-empty
+  const chain = envelope.delegationChain;
+  if (!chain || chain.length === 0) {
+    return { ok: false, reason: "missing chain" };
+  }
+
+  // 3. Chain length limit
+  if (chain.length > 16) {
+    return { ok: false, reason: "chain too long" };
+  }
+
+  // 4. Chain tip must match envelope.from
+  if (chain[chain.length - 1].agent !== envelope.from) {
+    return { ok: false, reason: "chain tip / from mismatch" };
+  }
+
+  // 5. Human entries must have null signature
+  for (const entry of chain) {
+    if (entry.kind === "human" && entry.signature !== null) {
+      return { ok: false, reason: "human entry must have null signature" };
+    }
+  }
+
+  // 6. Resolve all agent pubkeys from Flair
+  const pubkeys = new Map<string, Buffer>();
+  const agentsToResolve = new Set<string>();
+  for (const entry of chain) {
+    if (entry.kind === "agent") agentsToResolve.add(entry.agent);
+  }
+  agentsToResolve.add(envelope.from);
+
+  for (const agent of agentsToResolve) {
+    const info = await flairClient.getAgent(agent);
+    if (!info) {
+      return { ok: false, reason: `agent ${agent} not found in Flair` };
+    }
+    pubkeys.set(agent, info.publicKey);
+  }
+
+  // 7. Verify each agent-kind chain entry signature
+  for (let i = 0; i < chain.length; i++) {
+    const entry = chain[i];
+    if (entry.kind !== "agent") continue;
+
+    const sigBytes = decodeSignature(entry.signature);
+    if (!sigBytes) {
+      return { ok: false, reason: `chain entry ${i} signature invalid` };
+    }
+
+    const prior = chain.slice(0, i);
+    const entryForSig = {
+      agent: entry.agent,
+      kind: entry.kind,
+      timestamp: entry.timestamp,
+      rationale: entry.rationale,
+      signature: undefined,
+    } as const;
+    const payload = { prior, entry: entryForSig };
+
+    const canonical = canonicalize(payload);
+    if (canonical === undefined) {
+      return { ok: false, reason: `chain entry ${i} signature invalid` };
+    }
+
+    const payloadBuf = new TextEncoder().encode(canonical);
+    const pubKey = pubkeys.get(entry.agent)!;
+    if (!verifyPayload(payloadBuf, sigBytes, new Uint8Array(pubKey))) {
+      return { ok: false, reason: `chain entry ${i} signature invalid` };
+    }
+  }
+
+  // 8. Verify outer signature
+  const sigBytes = decodeSignature(envelope.signature);
+  if (!sigBytes) {
+    return { ok: false, reason: "outer signature invalid" };
+  }
+
+  const { signature: _, ...envelopeWithoutSig } = envelope;
+  const canonical = canonicalize(envelopeWithoutSig);
+  if (canonical === undefined) {
+    return { ok: false, reason: "outer signature invalid" };
+  }
+
+  const payloadBuf = new TextEncoder().encode(canonical);
+  const fromPubKey = pubkeys.get(envelope.from)!;
+  if (!verifyPayload(payloadBuf, sigBytes, new Uint8Array(fromPubKey))) {
+    return { ok: false, reason: "outer signature invalid" };
+  }
+
+  return { ok: true };
 }
