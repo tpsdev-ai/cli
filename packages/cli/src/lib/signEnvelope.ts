@@ -130,13 +130,13 @@ export function signEnvelope(
 
     // Build signing payload: { prior: chain[0..i], entry: { ...entry, signature: undefined } }
     const prior = resultChain.slice(0, i);
-    const entryForSig: ChainEntry & { signature: undefined } = {
+    const entryForSig = {
       agent: entry.agent,
       kind: entry.kind,
       timestamp: entry.timestamp,
       rationale: entry.rationale,
       signature: undefined,
-    };
+    } as const;
     const payload = { prior, entry: entryForSig };
 
     const canonical = canonicalize(payload);
