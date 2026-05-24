@@ -89,7 +89,9 @@ jobs:
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
-      - name: Build agent package (required by CLI compile)
+      - name: Build CLI package (required by agent compile)
+        run: cd packages/cli && bun run build || true
+      - name: Build agent package
         run: cd packages/agent && bun run build
       - name: Build compiled binary
         run: |

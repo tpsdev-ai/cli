@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
+import { verifyEnvelope, type FlairClient } from "../lib/signEnvelope.js";
 
 export interface MailMessage {
   id: string;
@@ -253,7 +254,64 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   return { ...message, filePath: newPath };
 }
 
-export function checkMessages(agent: string, checkedOutBy = agent): MailMessage[] {
+/**
+ * Check inbox: promote new messages from fresh/ to cur/, verifying signed
+ * envelopes when a FlairClient is provided.
+ *
+ * Verification (strict — rejects unsigned envelopes to dlq):
+ *   1. Parse message body as JSON.
+ *   2. If the body looks like a v1 envelope (has v, delegationChain, signature),
+ *      call verifyEnvelope().
+ *   3. On pass → promote to cur/ as normal.
+ *   4. On fail → move to dlq/ with a <filename>.reject sidecar.
+ *   5. If body cannot be parsed as JSON → move to dlq/ with .reject sidecar.
+ *   6. If body is JSON but missing envelope fields → move to dlq/ with .reject.
+ *
+ * When no FlairClient is available, legacy plain-text messages pass through
+ * unchanged (backward compat until all consumers have Flair wired).
+ */
+/**
+ * Write a .reject sidecar file in the dlq/ directory.
+ * Format: plain text. File: <original-filename>.reject
+ */
+function writeRejectSidecar(dlqDir: string, filename: string, reason: string): void {
+  const sidecar = join(dlqDir, `${filename}.reject`);
+  writeFileSync(sidecar, reason, "utf-8");
+}
+
+/**
+ * Try to parse a message body as a TPS v1 signed envelope.
+ *
+ * Returns:
+ *   - An Envelope object if the body is a valid v1 envelope (has v + delegationChain + signature)
+ *   - "json-parse-error" if the body is not valid JSON
+ *   - "missing-fields" if the body is JSON but missing required envelope fields
+ */
+function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-error" | "missing-fields" {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return "json-parse-error";
+  }
+
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return "missing-fields";
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  if (
+    typeof obj.v !== "number" ||
+    !Array.isArray(obj.delegationChain) ||
+    typeof obj.signature !== "string"
+  ) {
+    return "missing-fields";
+  }
+
+  return obj;
+}
+
+export async function checkMessages(agent: string, checkedOutBy = agent, flairClient?: FlairClient): Promise<MailMessage[]> {
   assertValidAgentId(agent);
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
@@ -275,10 +333,61 @@ export function checkMessages(agent: string, checkedOutBy = agent): MailMessage[
   const nowMs = Date.now();
 
   for (const f of listMessageFiles(inbox.fresh)) {
-    const from = join(inbox.fresh, f);
+    const fromPath = join(inbox.fresh, f);
+
+    // Read the message before promoting so we can verify it.
+    let msg: MailMessage;
+    try {
+      msg = readMessageFile(fromPath);
+    } catch (err: any) {
+      // Corrupt file (JSON parse error inside readMessageFile).
+      // Move to dlq with sidecar instead of crashing the consumer.
+      const dlqFile = join(inbox.dlq, f);
+      renameSync(fromPath, dlqFile);
+      writeRejectSidecar(inbox.dlq, f, `json parse error: ${err?.message ?? String(err)}`);
+      console.warn(`[mail] checkMessages(${agent}): dlq ${f} — json parse error`);
+      continue;
+    }
+
+    // Envelope verification (strict when FlairClient is available).
+    let verified = false;
+    if (flairClient) {
+      const parseResult = tryParseEnvelope(msg.body);
+      if (parseResult === "json-parse-error") {
+        const dlqFile = join(inbox.dlq, f);
+        renameSync(fromPath, dlqFile);
+        writeRejectSidecar(inbox.dlq, f, "json parse error: invalid JSON body");
+        console.warn(`[mail] checkMessages(${agent}): dlq ${f} — json parse error (invalid JSON body)`);
+        continue;
+      }
+      if (parseResult === "missing-fields") {
+        const dlqFile = join(inbox.dlq, f);
+        renameSync(fromPath, dlqFile);
+        writeRejectSidecar(inbox.dlq, f, "unsigned envelope (v1 required)");
+        console.warn(`[mail] checkMessages(${agent}): dlq ${f} — unsigned envelope (v1 required)`);
+        continue;
+      }
+      // parseResult is the Envelope — verify it
+      try {
+        const vr = await verifyEnvelope(parseResult as any, flairClient);
+        if (!vr.ok) {
+          const dlqFile = join(inbox.dlq, f);
+          renameSync(fromPath, dlqFile);
+          writeRejectSidecar(inbox.dlq, f, vr.reason);
+          console.warn(`[mail] checkMessages(${agent}): dlq ${f} — ${vr.reason}`);
+          continue;
+        }
+        verified = true;
+      } catch (err: any) {
+        // verifyEnvelope threw (e.g. Flair network error).
+        // Don't drop the message — promote and log the error.
+        console.warn(`[mail] verifyEnvelope failed for ${f}: ${err?.message ?? err}`);
+      }
+    }
+
+    // Promote to cur/
     const to = join(inbox.cur, f);
-    renameSync(from, to);
-    const msg = readMessageFile(to);
+    renameSync(fromPath, to);
     msg.read = false;
     msg.checkedOutAt = nowIso;
     msg.checkedOutBy = checkedOutBy;

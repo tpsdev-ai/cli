@@ -11,6 +11,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { FlairConfig } from "../runtime/types.js";
 
+export interface FlairAgent {
+  id: string;
+  name: string;
+  publicKey: string;
+}
+
 export interface FlairMemory {
   id: string;
   agentId: string;
@@ -84,6 +90,14 @@ export class FlairContextProvider {
       return res.ok;
     } catch {
       return false;
+    }
+  }
+
+  async getAgent(name: string): Promise<FlairAgent | null> {
+    try {
+      return await this.req<FlairAgent>("GET", `/Agent/${name}`);
+    } catch {
+      return null;
     }
   }
 
