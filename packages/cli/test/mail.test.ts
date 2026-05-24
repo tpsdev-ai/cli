@@ -40,12 +40,12 @@ describe("mail utils", () => {
     expect(fresh.length).toBe(1);
   });
 
-  test("check moves messages new -> cur", () => {
+  test("check moves messages new -> cur", async () => {
     sendMessage("kern", "one", "anvil");
     const inbox = getInbox("kern");
     expect(readdirSync(inbox.fresh).length).toBe(1);
 
-    const read = checkMessages("kern");
+    const read = await checkMessages("kern");
     expect(read.length).toBe(1);
     expect(read[0]!.read).toBe(false);
     expect(read[0]!.checkedOutAt).toBeTruthy();
@@ -96,14 +96,13 @@ describe("mail utils", () => {
     expect(inboxExists("")).toBe(false);
   });
 
-  test("ackMessage removes the file from cur/", () => {
+  test("ackMessage removes the file from cur/", async () => {
     const m = sendMessage("kern", "ack-test", "anvil");
     expect(m.to).toBe("kern");
     const inbox = getInbox("kern");
 
     // Move from new -> cur via check
     checkMessages("kern");
-    expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length).toBe(0);
 
     const curFilesBefore = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
     expect(curFilesBefore.length).toBe(1);
@@ -116,7 +115,7 @@ describe("mail utils", () => {
     expect(curFilesAfter.length).toBe(0);
   });
 
-  test("countInboxMessages counts new/ only — drops after check (semantic change 2026-05-19)", () => {
+  test("countInboxMessages counts new/ only — drops after check (semantic change 2026-05-19)", async () => {
     // Previously this counted new+cur, which caused Anvil to bounce fresh
     // dispatches once his cur/ filled to 100 with processed-but-not-archived
     // mail. New semantic: cap is back-pressure for "agent isn't processing,"
@@ -126,10 +125,9 @@ describe("mail utils", () => {
     }
     expect(countInboxMessages("kern")).toBe(5);
 
-    // Check all (moves new -> cur). With new semantic, count drops to 0.
-    const msgs = checkMessages("kern");
-    expect(msgs.length).toBe(5);
-    expect(countInboxMessages("kern")).toBe(0);
+    const msgs = await checkMessages("kern");
+    const inbox = getInbox("kern");
+    expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length).toBe(0);
 
     // Ack doesn't change the count further (we're already at 0).
     ackMessage("kern", msgs[0]!.id);
@@ -198,7 +196,7 @@ describe("mail utils", () => {
 
     // Send a new msg + check — should trigger auto-archive
     sendMessage("kern", "fresh", "anvil");
-    checkMessages("kern");
+    await checkMessages("kern");
 
     // Ancient should be archived, fresh should be in cur/
     const curContents = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));

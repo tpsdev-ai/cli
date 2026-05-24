@@ -249,7 +249,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "check": {
       const agent = await resolveAgentId(args.agent);
-      const messages = checkMessages(agent);
+      const messages = await checkMessages(agent);
       if (args.json) {
         console.log(JSON.stringify(messages, null, 2));
       } else if (messages.length === 0) {
