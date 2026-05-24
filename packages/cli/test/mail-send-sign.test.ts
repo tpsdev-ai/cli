@@ -74,6 +74,8 @@ function readSentEnvelope(mailDir: string, recipient: string): Envelope | null {
 
 const FLINT_SEED = seedFromByte(0x01);
 const SHERLOCK_SEED = seedFromByte(0x03);
+const NATHAN_SEED = seedFromByte(0x05);
+const RESEARCH_SEED = seedFromByte(0x04);
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
@@ -169,6 +171,114 @@ describe("tps mail send with signed envelopes", () => {
     // All sigs verify
     const vr = await verifyEnvelope(env!, mockFlair({ flint: FLINT_SEED, sherlock: SHERLOCK_SEED }));
     expect(vr).toEqual({ ok: true });
+  });
+
+  // ── Test 3: Custom rationale ──────────────────────────────────────────
+
+  // ── Test 4: 4-hop chain end-to-end (PR-5) ───────────────────────────
+
+  test("builds and verifies a 4-hop chain nathan→flint→sherlock→research-agent", async () => {
+    const mailDir = join(tempRoot, "mail");
+    writeFileSync(join(keysDir, "flint.key"), FLINT_SEED);
+    writeFileSync(join(keysDir, "sherlock.key"), SHERLOCK_SEED);
+    writeFileSync(join(keysDir, "research-agent.key"), RESEARCH_SEED);
+
+    // ── Hop 1: nathan (human) → flint (agent) ──
+    // Build a 2-entry chain: nathan originates, flint signs and delivers.
+    const hop1Chain: ChainEntry[] = [
+      { agent: "nathan", kind: "human", timestamp: "2026-05-24T12:00:00.000Z", rationale: "Originates request", signature: null },
+      { agent: "flint", kind: "agent", timestamp: "2026-05-24T12:01:00.000Z", rationale: "Dispatches to sherlock", signature: null },
+    ];
+    const hop1Signed = signEnvelope(
+      { v: 1, from: "flint", to: "sherlock", body: "Audit PR-1", messageId: "hop1-001", timestamp: "2026-05-24T12:01:00.000Z", delegationChain: hop1Chain },
+      { flint: FLINT_SEED },
+    );
+    expect(hop1Signed.delegationChain.length).toBe(2);
+    expect(hop1Signed.delegationChain[1].signature).toMatch(/^ed25519:/);
+
+    const hop1ChainJson = JSON.stringify(hop1Signed.delegationChain);
+    const hop1Vr = await verifyEnvelope(hop1Signed, mockFlair({ flint: FLINT_SEED }));
+    expect(hop1Vr).toEqual({ ok: true });
+
+    // ── Hop 2: sherlock receives via TPS_INBOUND_CHAIN_JSON, forwards ──
+    const hop2Result = runMailSend(
+      ["research-agent", "Review complete"],
+      {
+        TPS_MAIL_DIR: mailDir,
+        TPS_AGENT_ID: "sherlock",
+        TPS_TEST_KEYS_DIR: keysDir,
+        TPS_INBOUND_CHAIN_JSON: hop1ChainJson,
+        TPS_CHAIN_RATIONALE: "K&S review of hop1",
+      },
+    );
+    expect(hop2Result.status).toBe(0);
+
+    const hop2Env = readSentEnvelope(mailDir, "research-agent");
+    expect(hop2Env).not.toBeNull();
+    // Chain should now have 3 entries: nathan, flint, sherlock
+    expect(hop2Env!.delegationChain.length).toBe(3);
+    expect(hop2Env!.delegationChain[0].agent).toBe("nathan");
+    expect(hop2Env!.delegationChain[0].kind).toBe("human");
+    expect(hop2Env!.delegationChain[0].signature).toBeNull();
+    expect(hop2Env!.delegationChain[1].agent).toBe("flint");
+    expect(hop2Env!.delegationChain[1].kind).toBe("agent");
+    expect(hop2Env!.delegationChain[2].agent).toBe("sherlock");
+    expect(hop2Env!.delegationChain[2].kind).toBe("agent");
+    expect(hop2Env!.delegationChain[2].rationale).toBe("K&S review of hop1");
+    // Flint's prior sig must be preserved across the chain
+    expect(hop2Env!.delegationChain[1].signature).toBe(hop1Signed.delegationChain[1].signature);
+
+    const hop2Vr = await verifyEnvelope(hop2Env!, mockFlair({ flint: FLINT_SEED, sherlock: SHERLOCK_SEED }));
+    expect(hop2Vr).toEqual({ ok: true });
+
+    // ── Hop 3: research-agent receives via TPS_INBOUND_CHAIN_JSON, forwards ──
+    const hop2ChainJson = JSON.stringify(hop2Env!.delegationChain);
+    const hop3Result = runMailSend(
+      ["archive", "Report delivered"],
+      {
+        TPS_MAIL_DIR: mailDir,
+        TPS_AGENT_ID: "research-agent",
+        TPS_TEST_KEYS_DIR: keysDir,
+        TPS_INBOUND_CHAIN_JSON: hop2ChainJson,
+        TPS_CHAIN_RATIONALE: "research findings",
+      },
+    );
+    expect(hop3Result.status).toBe(0);
+
+    const hop3Env = readSentEnvelope(mailDir, "archive");
+    expect(hop3Env).not.toBeNull();
+
+    // ── Verify the 4-hop chain ──
+    expect(hop3Env!.delegationChain.length).toBe(4);
+    // Entry 0: nathan (human, origin)
+    expect(hop3Env!.delegationChain[0].agent).toBe("nathan");
+    expect(hop3Env!.delegationChain[0].kind).toBe("human");
+    expect(hop3Env!.delegationChain[0].signature).toBeNull();
+    // Entry 1: flint (agent, first signer)
+    expect(hop3Env!.delegationChain[1].agent).toBe("flint");
+    expect(hop3Env!.delegationChain[1].kind).toBe("agent");
+    expect(hop3Env!.delegationChain[1].signature).toMatch(/^ed25519:/);
+    expect(hop3Env!.delegationChain[1].signature).toBe(hop1Signed.delegationChain[1].signature);
+    // Entry 2: sherlock (agent, reviewer — at index 2, not 3)
+    expect(hop3Env!.delegationChain[2].agent).toBe("sherlock");
+    expect(hop3Env!.delegationChain[2].kind).toBe("agent");
+    expect(hop3Env!.delegationChain[2].signature).toMatch(/^ed25519:/);
+    expect(hop3Env!.delegationChain[2].signature).toBe(hop2Env!.delegationChain[2].signature);
+    // Entry 3: research-agent (agent, final forwarder)
+    expect(hop3Env!.delegationChain[3].agent).toBe("research-agent");
+    expect(hop3Env!.delegationChain[3].kind).toBe("agent");
+    expect(hop3Env!.delegationChain[3].signature).toMatch(/^ed25519:/);
+    expect(hop3Env!.delegationChain[3].rationale).toBe("research findings");
+    // Outer envelope from
+    expect(hop3Env!.from).toBe("research-agent");
+    expect(hop3Env!.to).toBe("archive");
+
+    // All 4 entries have valid signatures (human entry has null)
+    const hop3Vr = await verifyEnvelope(
+      hop3Env!,
+      mockFlair({ flint: FLINT_SEED, sherlock: SHERLOCK_SEED, "research-agent": RESEARCH_SEED }),
+    );
+    expect(hop3Vr).toEqual({ ok: true });
   });
 
   // ── Test 3: Custom rationale ──────────────────────────────────────────
