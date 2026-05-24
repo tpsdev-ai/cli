@@ -10,6 +10,7 @@ import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
+import type { FlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
 
 export class AgentRuntime {
   private loop: EventLoop;
@@ -22,14 +23,27 @@ export class AgentRuntime {
       config.agentId,
       join(config.workspace, ".tps", "events"),
     );
-    const mail = new MailClient(config.mailDir, events, config.agentId);
+    this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
+
+    // Build FlairClient adapter for envelope verification
+    let flailClient: FlairClient | undefined;
+    if (this.flair) {
+      flailClient = {
+        getAgent: async (name: string) => {
+          const a = await this.flair!.getAgent(name);
+          if (!a) return null;
+          return { publicKey: Buffer.from(a.publicKey, "hex") };
+        },
+      };
+    }
+
+    const mail = new MailClient(config.mailDir, events, config.agentId, flailClient);
     const memory = new MemoryStore(config.memoryPath);
     const context = new ContextManager(memory, config.contextWindowTokens ?? 8000);
     const provider = new ProviderManager(config.llm, events, config.agentId);
 
     this.mail = mail;
     this.boundary = new BoundaryManager(config.workspace);
-    this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
     const tools = createDefaultToolset({
       boundary: this.boundary,
       mail,
