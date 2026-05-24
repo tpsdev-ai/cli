@@ -9,6 +9,9 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { galLookup } from "../utils/gal.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
+import { signEnvelope, type Envelope } from "../lib/signEnvelope.js";
+import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
+import { randomUUID } from "node:crypto";
 
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
@@ -184,6 +187,55 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log(`Message sent to branch office ${to}`);
         }
         return;
+      }
+
+      // Direct Maildir send: sign envelope before writing (PR-3).
+      // Best-effort: sign if the agent's private key is available;
+      // fall back to unsigned send with a warning for backward compat.
+      const privkey = readAgentPrivateKey(from);
+      if (privkey) {
+        const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+        const hopRationale = process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`;
+        const now = new Date().toISOString();
+
+        const chain = priorChain ?? [
+          {
+            agent: "system",
+            kind: "human" as const,
+            timestamp: now,
+            rationale: "tps mail send (no inbound chain)",
+            signature: null,
+          },
+        ];
+
+        chain.push({
+          agent: from,
+          kind: "agent" as const,
+          timestamp: now,
+          rationale: hopRationale,
+          signature: null, // signEnvelope will fill
+        });
+
+        const envelope: Envelope = {
+          v: 1,
+          from,
+          to,
+          subject: `mail to ${to}`,
+          body: args.message,
+          messageId: randomUUID(),
+          timestamp: now,
+          delegationChain: chain,
+        };
+
+        const signed = signEnvelope(envelope, { [from]: privkey });
+        const signedEnvelopeBody = JSON.stringify(signed);
+        args.message = signedEnvelopeBody;
+      } else {
+        console.warn(
+          `No private key found for agent "${from}" — sending unsigned. ` +
+          `Place a 32-byte Ed25519 seed at ~/.flair/keys/${from}.key or set ` +
+          `TPS_TEST_KEYS_DIR to enable envelope signing.`,
+        );
       }
 
       const msg = sendMessage(to, args.message, from);
