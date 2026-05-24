@@ -1,13 +1,8 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { createPublicKey, verify } from "node:crypto";
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
-const canonicalize = require("canonicalize") as (input: unknown) => string | undefined;
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
-
-// ─── Types ──────────────────────────────────────────────────────────────────
+import { verifyEnvelope, type FlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
 
 export interface MailMessage {
   filename: string;
@@ -18,115 +13,6 @@ export interface MailMessage {
   /** Sender agent ID */
   from: string;
 }
-
-/** Subset of FlairClient needed for envelope verification. */
-interface EnvelopeVerifier {
-  /** Look up an agent's public key by name. Returns null if not found. */
-  getAgent(name: string): Promise<{ publicKey: string } | null>;
-}
-
-// ─── Envelope verification (inline, no cross-package import) ────────────────
-
-interface V1Envelope {
-  v: number;
-  from?: string;
-  delegationChain: Array<{ agent: string }>;
-  signature: string;
-  [key: string]: unknown;
-}
-
-/**
- * Verify a v1 signed envelope body using Ed25519.
- * Parses the mail JSON, validates envelope fields, and checks the outer
- * Ed25519 signature against the sender's published public key.
- */
-async function verifyMailBody(
-  body: string,
-  filename: string,
-  verifier: EnvelopeVerifier,
-): Promise<{ pass: true } | { pass: false; reason: string; from?: string }> {
-  // 1. Parse the mail file as JSON
-  let mailMsg: { from?: string; body: string };
-  try {
-    mailMsg = JSON.parse(body);
-  } catch {
-    return { pass: false, reason: "json parse error: invalid JSON" };
-  }
-
-  if (!mailMsg.body || typeof mailMsg.body !== "string") {
-    return { pass: false, reason: "json parse error: missing body field" };
-  }
-
-  // 2. Parse the body field as an envelope
-  let envelope: unknown;
-  try {
-    envelope = JSON.parse(mailMsg.body);
-  } catch {
-    return { pass: false, reason: "json parse error: invalid envelope body", from: mailMsg.from };
-  }
-
-  if (envelope == null || typeof envelope !== "object" || Array.isArray(envelope)) {
-    return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
-  }
-
-  const env = envelope as Record<string, unknown>;
-  if (
-    typeof env.v !== "number" ||
-    !Array.isArray(env.delegationChain) ||
-    typeof env.signature !== "string"
-  ) {
-    return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
-  }
-
-  // 3. Look up the sender's public key
-  const sender = typeof env.from === "string" ? env.from : "unknown";
-  let pubkey: string | null;
-  try {
-    const agent = await verifier.getAgent(sender);
-    pubkey = agent?.publicKey ?? null;
-  } catch {
-    return { pass: false, reason: `agent ${sender} lookup failed`, from: mailMsg.from };
-  }
-
-  if (!pubkey) {
-    return { pass: false, reason: `agent ${sender} not found in Flair`, from: mailMsg.from };
-  }
-
-  // 4. Verify the outer Ed25519 signature
-  try {
-    const sig = env.signature;
-    if (!sig.startsWith("ed25519:")) {
-      return { pass: false, reason: "unsupported signature format", from: mailMsg.from };
-    }
-
-    // Strip signature, canonicalize payload
-    const { signature: _sig, ...unsigned } = env;
-    const payload = canonicalize(unsigned);
-    if (!payload) {
-      return { pass: false, reason: "failed to canonicalize envelope", from: mailMsg.from };
-    }
-
-    const sigBuf = Buffer.from(sig.slice("ed25519:".length), "base64");
-    const pubKey = createPublicKey({
-      key: Buffer.from(pubkey, "hex"),
-      format: "der",
-      type: "spki",
-    });
-    const payloadBuf = Buffer.from(payload, "utf-8");
-    const valid = verify(null, payloadBuf, pubKey, sigBuf);
-
-    if (!valid) {
-      return { pass: false, reason: "outer signature invalid", from: mailMsg.from };
-    }
-  } catch (err: any) {
-    console.warn(`[MailClient] verify error for ${filename}: ${err?.message ?? err}`);
-    // Don't drop on crypto errors — pass through
-  }
-
-  return { pass: true };
-}
-
-// ─── MailClient ─────────────────────────────────────────────────────────────
 
 /**
  * Maildir-compatible mail client.
@@ -143,7 +29,7 @@ export class MailClient {
     public readonly mailDir: string,
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
-    private readonly verifier?: EnvelopeVerifier,
+    private readonly flairClient?: FlairClient,
   ) {
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
@@ -156,7 +42,7 @@ export class MailClient {
 
   /**
    * Return all messages in inbox/new and move them to inbox/cur.
-   * When an EnvelopeVerifier is provided, signed envelopes are verified
+   * When a FlairClient is provided, signed envelopes are verified
    * before promotion; invalid/malformed messages go to dlq/.
    */
   async checkNewMail(): Promise<MailMessage[]> {
@@ -171,9 +57,9 @@ export class MailClient {
       try {
         const body = readFileSync(srcPath, "utf-8");
 
-        // Envelope verification (strict when verifier is available).
-        if (this.verifier) {
-          const verifyResult = await verifyMailBody(body, file, this.verifier);
+        // Envelope verification (strict when FlairClient is available).
+        if (this.flairClient) {
+          const verifyResult = await this.verifyMailBody(body, file);
           if (!verifyResult.pass) {
             const dlqPath = join(this.inboxDlq, file);
             renameSync(srcPath, dlqPath);
@@ -274,5 +160,64 @@ export class MailClient {
         // Leave in outbox on error
       }
     }
+  }
+
+  /**
+   * Verify a mail body against the v1 signed envelope spec.
+   * Returns { pass: true } if verified, or { pass: false, reason: "..." } on failure.
+   * Requires flairClient to be set.
+   */
+  private async verifyMailBody(
+    body: string,
+    filename: string,
+  ): Promise<{ pass: true } | { pass: false; reason: string; from?: string }> {
+    const client = this.flairClient!;
+
+    // 1. Parse the mail file as JSON
+    let mailMsg: { from?: string; body: string };
+    try {
+      mailMsg = JSON.parse(body);
+    } catch {
+      return { pass: false, reason: "json parse error: invalid JSON" };
+    }
+
+    if (!mailMsg.body || typeof mailMsg.body !== "string") {
+      return { pass: false, reason: "json parse error: missing body field" };
+    }
+
+    // 2. Parse the body field as an envelope
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(mailMsg.body);
+    } catch {
+      return { pass: false, reason: "json parse error: invalid envelope body", from: mailMsg.from };
+    }
+
+    if (envelope == null || typeof envelope !== "object" || Array.isArray(envelope)) {
+      return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
+    }
+
+    const env = envelope as Record<string, unknown>;
+    if (
+      typeof env.v !== "number" ||
+      !Array.isArray(env.delegationChain) ||
+      typeof env.signature !== "string"
+    ) {
+      return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
+    }
+
+    // 3. Verify the envelope using the canonical verifyEnvelope
+    try {
+      const vr = await verifyEnvelope(env as any, client);
+      if (!vr.ok) {
+        return { pass: false, reason: vr.reason, from: mailMsg.from };
+      }
+    } catch (err: any) {
+      // verifyEnvelope threw (e.g. Flair network error).
+      // Don't drop the message — pass it through and log.
+      console.warn(`[MailClient] verifyEnvelope error for ${filename}: ${err?.message ?? err}`);
+    }
+
+    return { pass: true };
   }
 }

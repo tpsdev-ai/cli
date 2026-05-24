@@ -10,6 +10,7 @@ import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
+import type { FlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
 
 export class AgentRuntime {
   private loop: EventLoop;
@@ -24,15 +25,19 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Build verifier adapter for envelope verification
-    let verifier;
+    // Build FlairClient adapter for envelope verification
+    let flairClient: FlairClient | undefined;
     if (this.flair) {
-      verifier = {
-        getAgent: async (name: string) => this.flair!.getAgent(name),
+      flairClient = {
+        getAgent: async (name: string) => {
+          const a = await this.flair!.getAgent(name);
+          if (!a) return null;
+          return { publicKey: Buffer.from(a.publicKey, "hex") };
+        },
       };
     }
 
-    const mail = new MailClient(config.mailDir, events, config.agentId, verifier);
+    const mail = new MailClient(config.mailDir, events, config.agentId, flairClient);
     const memory = new MemoryStore(config.memoryPath);
     const context = new ContextManager(memory, config.contextWindowTokens ?? 8000);
     const provider = new ProviderManager(config.llm, events, config.agentId);

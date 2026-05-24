@@ -6,6 +6,11 @@
   "bin": {
     "tps": "./bin/tps.cjs"
   },
+  "main": "./dist/src/index.js",
+  "exports": {
+    ".": "./dist/src/index.js",
+    "./lib/signEnvelope": "./dist/src/lib/signEnvelope.js"
+  },
   "optionalDependencies": {
     "@tpsdev-ai/cli-darwin-arm64": "0.5.4",
     "@tpsdev-ai/cli-darwin-x64": "0.5.4",
