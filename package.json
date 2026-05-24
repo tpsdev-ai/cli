@@ -20,6 +20,7 @@
   "author": "tpsdev-ai",
   "license": "Apache-2.0",
   "dependencies": {
+    "canonicalize": "^3.0.0",
     "handlebars": "^4.7.9",
     "ws": "^8.20.1"
   },
