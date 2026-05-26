@@ -9,7 +9,7 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { galLookup } from "../utils/gal.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
-import { signEnvelope, type Envelope } from "../lib/signEnvelope.js";
+import { signEnvelope, type Envelope, type ChainEntry } from "../lib/signEnvelope.js";
 import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
 import { randomUUID } from "node:crypto";
 
@@ -91,6 +91,59 @@ function validateAgent(agent?: string): string {
   return agent;
 }
 
+// Sign the outbound body if a private key is available for `from`.
+// Returns the JSON-stringified signed envelope, or the original body
+// (with warning) when no key is present. Called once before route
+// dispatch so all delivery paths (branch-mode outbox, remote-branch,
+// branch-office bridge, direct maildir) ship signed bodies.
+function maybeSignEnvelopeBody(from: string, to: string, body: string): string {
+  const privkey = readAgentPrivateKey(from);
+  if (!privkey) {
+    console.warn(
+      `No private key found for agent "${from}" — sending unsigned. ` +
+      `Place a 32-byte Ed25519 seed at ~/.flair/keys/${from}.key or set ` +
+      `TPS_TEST_KEYS_DIR to enable envelope signing.`,
+    );
+    return body;
+  }
+
+  const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+  const hopRationale = process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`;
+  const now = new Date().toISOString();
+
+  const chain: ChainEntry[] = priorChain ?? [
+    {
+      agent: "system",
+      kind: "human" as const,
+      timestamp: now,
+      rationale: "tps mail send (no inbound chain)",
+      signature: null,
+    },
+  ];
+
+  chain.push({
+    agent: from,
+    kind: "agent" as const,
+    timestamp: now,
+    rationale: hopRationale,
+    signature: null, // signEnvelope will fill
+  });
+
+  const envelope: Envelope = {
+    v: 1,
+    from,
+    to,
+    subject: `mail to ${to}`,
+    body,
+    messageId: randomUUID(),
+    timestamp: now,
+    delegationChain: chain,
+  };
+
+  const signed = signEnvelope(envelope, { [from]: privkey });
+  return JSON.stringify(signed);
+}
+
 function newestJsonMtime(dir: string): string | null {
   if (!existsSync(dir)) return null;
   const newest = readdirSync(dir)
@@ -134,6 +187,12 @@ export async function runMail(args: MailArgs): Promise<void> {
       args.message = messageBody;
 
       const from = await resolveAgentId();
+
+      // Sign the envelope BEFORE route dispatch so all four delivery paths
+      // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
+      // ship signed bodies. Previously only the direct-maildir path signed,
+      // leaving K&S/branch-office dispatches unsigned (signed-envelopes gap #1).
+      args.message = maybeSignEnvelopeBody(from, to, args.message);
 
       // Branch mode: queue outbound to be picked up by host on next connect
       const branchHostFile = join(process.env.HOME || homedir(), ".tps", "identity", "host.json");
@@ -189,55 +248,8 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
-      // Direct Maildir send: sign envelope before writing (PR-3).
-      // Best-effort: sign if the agent's private key is available;
-      // fall back to unsigned send with a warning for backward compat.
-      const privkey = readAgentPrivateKey(from);
-      if (privkey) {
-        const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
-        const hopRationale = process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`;
-        const now = new Date().toISOString();
-
-        const chain = priorChain ?? [
-          {
-            agent: "system",
-            kind: "human" as const,
-            timestamp: now,
-            rationale: "tps mail send (no inbound chain)",
-            signature: null,
-          },
-        ];
-
-        chain.push({
-          agent: from,
-          kind: "agent" as const,
-          timestamp: now,
-          rationale: hopRationale,
-          signature: null, // signEnvelope will fill
-        });
-
-        const envelope: Envelope = {
-          v: 1,
-          from,
-          to,
-          subject: `mail to ${to}`,
-          body: args.message,
-          messageId: randomUUID(),
-          timestamp: now,
-          delegationChain: chain,
-        };
-
-        const signed = signEnvelope(envelope, { [from]: privkey });
-        const signedEnvelopeBody = JSON.stringify(signed);
-        args.message = signedEnvelopeBody;
-      } else {
-        console.warn(
-          `No private key found for agent "${from}" — sending unsigned. ` +
-          `Place a 32-byte Ed25519 seed at ~/.flair/keys/${from}.key or set ` +
-          `TPS_TEST_KEYS_DIR to enable envelope signing.`,
-        );
-      }
-
+      // Direct Maildir send: args.message was already signed by
+      // maybeSignEnvelopeBody above.
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
         console.log(JSON.stringify(msg, null, 2));
