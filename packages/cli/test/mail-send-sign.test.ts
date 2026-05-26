@@ -283,6 +283,47 @@ describe("tps mail send with signed envelopes", () => {
 
   // ── Test 3: Custom rationale ──────────────────────────────────────────
 
+  // ── Test 5: Branch-office route also ships signed body (gap #1) ────────
+
+  test("branch-office route writes a signed envelope (not raw body)", async () => {
+    // Repro of the rollout gap: pre-PR, the branch-office bridge path
+    // (`tps mail send` → ~/.tps/branch-office/<to>/mail/...) returned BEFORE
+    // the signing block ran, so K&S/branch-office dispatches shipped unsigned.
+    // After the lift, this route ships a signed envelope JSON as body.
+    const home = join(tempRoot, "home");
+    const branchInbox = join(home, ".tps", "branch-office", "anvil", "mail", "inbox");
+    mkdirSync(branchInbox, { recursive: true });
+    writeFileSync(join(keysDir, "flint.key"), FLINT_SEED);
+
+    const result = runMailSend(["anvil", "Dispatch via branch-office"], {
+      HOME: home,
+      TPS_AGENT_ID: "flint",
+      TPS_TEST_KEYS_DIR: keysDir,
+    });
+
+    expect(result.status).toBe(0);
+
+    // Branch-office delivery lands in <branch-office>/<to>/mail/new/<file>.json
+    // (deliverToSandbox writes to mail/new/, not the inbox/ gate-dir).
+    const deliveredDir = join(home, ".tps", "branch-office", "anvil", "mail", "new");
+    const files = readdirSync(deliveredDir).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBe(1);
+
+    const wrapper = JSON.parse(readFileSync(join(deliveredDir, files[0]!), "utf-8"));
+    // The wrapper.body is the signed envelope JSON string.
+    const env = JSON.parse(wrapper.body) as Envelope;
+    expect(env.v).toBe(1);
+    expect(env.from).toBe("flint");
+    expect(env.to).toBe("anvil");
+    expect(env.body).toBe("Dispatch via branch-office");
+    expect(env.delegationChain.length).toBe(2);
+    expect(env.delegationChain[1].signature).toMatch(/^ed25519:/);
+    expect(env.signature).toMatch(/^ed25519:/);
+
+    const vr = await verifyEnvelope(env, mockFlair({ flint: FLINT_SEED }));
+    expect(vr).toEqual({ ok: true });
+  });
+
   test("uses TPS_CHAIN_RATIONALE in the current hop entry", async () => {
     const mailDir = join(tempRoot, "mail");
     writeFileSync(join(keysDir, "flint.key"), FLINT_SEED);
