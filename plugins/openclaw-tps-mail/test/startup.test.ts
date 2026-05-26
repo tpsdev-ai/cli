@@ -8,14 +8,35 @@
  *
  * This test locks in the correct behavior: files sitting in new/ when the
  * gateway starts MUST be dispatched.
+ *
+ * Updated (ops-ibw8): body must be a valid signed envelope (strict day-1).
+ * Tests use hermetic mock verify client via module mocking.
  */
-import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import * as ed from "@noble/ed25519";
+import { createHash } from "node:crypto";
+import {
+  signEnvelope,
+  type Envelope,
+  type ChainEntry,
+} from "@tpsdev-ai/cli/lib/signEnvelope";
+
+// Wire sha512 for sync sign operations.
+import { hashes } from "@noble/ed25519";
+hashes.sha512 = (message: Uint8Array) => {
+  return new Uint8Array(createHash("sha512").update(message).digest());
+};
+
+const FLINT_SEED = Buffer.alloc(32, 0x01);
+
+function pubkeyFromSeed(seed: Buffer): Buffer {
+  return Buffer.from(ed.getPublicKey(new Uint8Array(seed)));
+}
 
 // Import the plugin — default export gives us { register }.
-// We extract the channel plugin object via a mock registration.
 import pluginModule from "../src/index.js";
 
 let capturedPlugin: any;
@@ -41,16 +62,28 @@ async function pollUntil(conditionFn: () => boolean, timeoutMs: number): Promise
   return conditionFn();
 }
 
-function makeMailEnvelope(overrides: Partial<{ id: string; from: string; to: string; body: string; timestamp: string }> = {}) {
+function makeMailEnvelope(body: string, overrides: Partial<{ id: string; from: string; to: string; timestamp: string }> = {}) {
   return {
     id: overrides.id ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     from: overrides.from ?? "sender",
     to: overrides.to ?? "recipient",
-    body: overrides.body ?? "test message",
+    body,
     timestamp: overrides.timestamp ?? new Date().toISOString(),
     headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" },
     deliveryAttempts: 0,
   };
+}
+
+function buildSignedBody(from: string, to: string, body: string): string {
+  const chain: ChainEntry[] = [
+    { agent: "system", kind: "human", timestamp: new Date().toISOString(), rationale: "originates", signature: null },
+    { agent: from, kind: "agent", timestamp: new Date().toISOString(), rationale: `agent ${from} dispatches`, signature: null },
+  ];
+  const env = signEnvelope(
+    { v: 1, from, to, body, messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, timestamp: new Date().toISOString(), delegationChain: chain },
+    { [from]: FLINT_SEED },
+  );
+  return JSON.stringify(env);
 }
 
 describe("openclaw-tps-mail: seenFiles startup behavior", () => {
@@ -72,15 +105,25 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
   });
 
   it("processes mail file present in new/ at startup", async () => {
+    // Mock the verify-adapter to return a hermetic Flair mock
+    mock.module("../src/verify-adapter.js", () => ({
+      createVerifyClient: async () => ({
+        async getAgent(name: string) {
+          if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
+          return null;
+        },
+      }),
+    }));
+
     const agentId = "test-agent";
     const newDir = resolve(tempMailDir, agentId, "new");
     mkdirSync(newDir, { recursive: true });
 
-    // Write a valid mail envelope BEFORE starting the plugin
-    const envelope = makeMailEnvelope({
+    // Write a valid mail envelope with signed body BEFORE starting the plugin
+    const signedBody = buildSignedBody("flint", agentId, "hello from startup test");
+    const envelope = makeMailEnvelope(signedBody, {
       from: "flint",
       to: agentId,
-      body: "hello from startup test",
       id: "msg-startup-001",
     });
     const filename = `2026-04-27T00-00-00-${envelope.id}.json`;
@@ -127,6 +170,7 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     ]);
 
     // Assert: dispatch was called with the right message context
+    // Body was replaced with inner envelope body after verification
     expect(result.ctx.From).toBe("flint");
     expect(result.ctx.To).toBe(agentId);
     expect(result.ctx.MessageSid).toBe("msg-startup-001");
@@ -147,14 +191,23 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
   });
 
   it("does not double-process a file (dedup via seenFiles)", async () => {
+    mock.module("../src/verify-adapter.js", () => ({
+      createVerifyClient: async () => ({
+        async getAgent(name: string) {
+          if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
+          return null;
+        },
+      }),
+    }));
+
     const agentId = "test-agent";
     const newDir = resolve(tempMailDir, agentId, "new");
     mkdirSync(newDir, { recursive: true });
 
-    const envelope = makeMailEnvelope({
+    const signedBody = buildSignedBody("flint", agentId, "dedup test");
+    const envelope = makeMailEnvelope(signedBody, {
       from: "flint",
       to: agentId,
-      body: "dedup test",
       id: "msg-dedup-001",
     });
     const filename = `2026-04-27T00-00-00-${envelope.id}.json`;
