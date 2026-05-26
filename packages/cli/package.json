@@ -9,7 +9,8 @@
   "main": "./dist/src/index.js",
   "exports": {
     ".": "./dist/src/index.js",
-    "./lib/signEnvelope": "./dist/src/lib/signEnvelope.js"
+    "./lib/signEnvelope": "./dist/src/lib/signEnvelope.js",
+    "./utils/flair-client": "./dist/src/utils/flair-client.js"
   },
   "optionalDependencies": {
     "@tpsdev-ai/cli-darwin-arm64": "0.5.4",

@@ -38,6 +38,9 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
+import type { Envelope } from "@tpsdev-ai/cli/lib/signEnvelope";
+import { verifyEnvelope } from "@tpsdev-ai/cli/lib/signEnvelope";
+import { createVerifyClient } from "./verify-adapter.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   ChannelGatewayAdapter,
@@ -404,6 +407,48 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       }
 
       log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
+
+      // ─── Strict signed-envelope verification (ops-ibw8) ────────────────
+      // Sherlock-mandated strict-day-1: every inbound message must be a valid
+      // signed envelope. Anything that can't be verified → dlq with .reason.
+      // The verified inner body replaces msg.body so the agent sees the
+      // actual payload, not the JSON wrapper.
+      let signedEnvelope: Envelope;
+      try {
+        signedEnvelope = JSON.parse(msg.body) as Envelope;
+      } catch {
+        moveToDlq(filePath, "body is not JSON (signed envelope required, strict day-1)");
+        return;
+      }
+
+      if (
+        signedEnvelope.v !== 1 ||
+        !Array.isArray(signedEnvelope.delegationChain) ||
+        typeof signedEnvelope.signature !== "string"
+      ) {
+        moveToDlq(filePath, "body is not a v1 signed envelope (strict day-1)");
+        return;
+      }
+
+      try {
+        const verifyClient = await createVerifyClient(recipient);
+        const vr = await verifyEnvelope(signedEnvelope, verifyClient);
+        if (!vr.ok) {
+          moveToDlq(filePath, `signed envelope verification failed: ${vr.reason}`);
+          return;
+        }
+      } catch (err: any) {
+        // Never swallow verify errors — false security if we fall through.
+        moveToDlq(
+          filePath,
+          `signed envelope verification error: ${err?.message ?? String(err)}`,
+        );
+        return;
+      }
+
+      // Verified — replace msg.body with the inner envelope body so the agent
+      // sees the actual payload, not the JSON wrapper.
+      msg.body = signedEnvelope.body;
 
       // Session key: one conversation per (channel, sender) pair.
       // Using `dmScope: "per-channel-peer"` isolates each tps-mail sender

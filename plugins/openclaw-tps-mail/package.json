@@ -52,5 +52,7 @@
   "engines": {
     "node": ">=22"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@tpsdev-ai/cli": "file:../../packages/cli"
+  }
 }
