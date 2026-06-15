@@ -2,7 +2,7 @@ import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { deliverToSandbox, processOutboxOnce } from "../src/utils/relay.js";
+import { deliverToSandbox, processOutboxOnce, resolveAgentMailRoot } from "../src/utils/relay.js";
 
 function writeJson(path: string, obj: unknown) {
   writeFileSync(path, JSON.stringify(obj, null, 2), "utf-8");
@@ -168,6 +168,52 @@ describe("relay utils", () => {
     const msg = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
     expect(msg.to).toBe("member1");
     expect(msg.body).toBe("hello team member");
+  });
+
+  test("ignores out-of-bounds workspaceMail on a team and falls back to safe default (ops-23)", () => {
+    const teamDir = join(root, ".tps", "branch-office", "team1");
+    // Misconfigured/hostile team.json: workspaceMail escaping the office root.
+    const escape = join(root, "evil-mail");
+    mkdirSync(teamDir, { recursive: true });
+    writeJson(join(teamDir, "team.json"), {
+      teamId: "team1",
+      members: ["member1"],
+      workspaceMail: escape,
+      createdAt: new Date().toISOString(),
+    });
+
+    const resolved = resolveAgentMailRoot("team1");
+    expect(resolved).toBe(join(teamDir, "workspace", "mail"));
+    expect(resolved).not.toBe(escape);
+  });
+
+  test("ignores out-of-bounds workspaceMail for a team member and falls back to safe default (ops-23)", () => {
+    const teamDir = join(root, ".tps", "branch-office", "team1");
+    // Traversal that resolves outside ~/.tps/branch-office.
+    const escape = join(teamDir, "..", "..", "..", "escape", "mail");
+    mkdirSync(teamDir, { recursive: true });
+    writeJson(join(teamDir, "team.json"), {
+      teamId: "team1",
+      members: ["member1"],
+      workspaceMail: escape,
+      createdAt: new Date().toISOString(),
+    });
+
+    const resolved = resolveAgentMailRoot("member1");
+    expect(resolved).toBe(join(teamDir, "workspace", "mail"));
+  });
+
+  test("returns an in-bounds workspaceMail unchanged (ops-23 regression guard)", () => {
+    const teamDir = join(root, ".tps", "branch-office", "team1");
+    const legit = join(teamDir, "workspace", "mail");
+    mkdirSync(teamDir, { recursive: true });
+    writeJson(join(teamDir, "team.json"), {
+      teamId: "team1",
+      members: ["member1"],
+      workspaceMail: legit,
+      createdAt: new Date().toISOString(),
+    });
+    expect(resolveAgentMailRoot("member1")).toBe(legit);
   });
 
   test("relay pauses duplicate messages (loop detection)", async () => {
