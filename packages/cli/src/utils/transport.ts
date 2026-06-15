@@ -107,13 +107,25 @@ function hostMailRoot(): string {
 }
 
 export class FileSystemTransport implements DeliveryTransport {
+  /**
+   * @param resolveRecipientDir Optional hook: given a recipient id, return the mail
+   *   root to deliver into (its `<root>/new` is used), or null to use the flat host
+   *   mail path. relay.ts injects a branch-aware resolver so a message to a local
+   *   branch agent lands in that branch's workspace inbox (where it actually reads),
+   *   not the host path (ops-16). With no hook, host delivery is unchanged.
+   */
+  constructor(private readonly resolveRecipientDir?: (recipient: string) => string | null) {}
+
   name(): string {
     return "filesystem";
   }
 
   async deliver(envelope: MailEnvelope): Promise<DeliveryResult> {
     try {
-      const recipientNew = join(hostMailRoot(), envelope.to, "new");
+      const branchRoot = this.resolveRecipientDir?.(envelope.to) ?? null;
+      const recipientNew = branchRoot
+        ? join(branchRoot, "new")
+        : join(hostMailRoot(), envelope.to, "new");
       ensureDir(recipientNew);
 
       const payload = {

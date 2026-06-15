@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { deliverToSandbox, processOutboxOnce } from "../src/utils/relay.js";
@@ -168,6 +168,65 @@ describe("relay utils", () => {
     const msg = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
     expect(msg.to).toBe("member1");
     expect(msg.body).toBe("hello team member");
+  });
+
+  test("relays branch→branch mail to the recipient's workspace inbox, not the host path (ops-16)", async () => {
+    const out = outboxNew("brancha");
+    // branchb is a registered branch (has a branch-office dir) → reads its workspace inbox.
+    const recipBranch = join(root, ".tps", "branch-office", "branchb");
+    mkdirSync(recipBranch, { recursive: true });
+    writeJson(join(out, "m1.json"), {
+      id: "msg-bb", from: "brancha", to: "branchb",
+      body: "hello branch b", timestamp: new Date().toISOString(),
+    });
+
+    const res = await processOutboxOnce("brancha");
+    expect(res.processed).toBe(1);
+
+    // Lands in branchb's workspace inbox (branch-office/branchb/mail/new)...
+    const wsInbox = join(recipBranch, "mail", "new");
+    expect(readdirSync(wsInbox).filter((f) => f.endsWith(".json")).length).toBe(1);
+    // ...not the flat host path (~/.tps/mail/branchb/new).
+    const hostPath = join(root, ".tps", "mail", "branchb", "new");
+    const hostCount = existsSync(hostPath) ? readdirSync(hostPath).filter((f) => f.endsWith(".json")).length : 0;
+    expect(hostCount).toBe(0);
+  });
+
+  test("relays to a team member's workspace inbox, not the host path (ops-16)", async () => {
+    const out = outboxNew("brancha");
+    const teamDir = join(root, ".tps", "branch-office", "team1");
+    const workspaceMail = join(teamDir, "workspace", "mail");
+    mkdirSync(teamDir, { recursive: true });
+    writeJson(join(teamDir, "team.json"), {
+      teamId: "team1", members: ["member1"], workspaceMail, createdAt: new Date().toISOString(),
+    });
+    writeJson(join(out, "m1.json"), {
+      id: "msg-m1", from: "brancha", to: "member1",
+      body: "hello member", timestamp: new Date().toISOString(),
+    });
+
+    const res = await processOutboxOnce("brancha");
+    expect(res.processed).toBe(1);
+
+    expect(readdirSync(join(workspaceMail, "new")).filter((f) => f.endsWith(".json")).length).toBe(1);
+    const hostPath = join(root, ".tps", "mail", "member1", "new");
+    const hostCount = existsSync(hostPath) ? readdirSync(hostPath).filter((f) => f.endsWith(".json")).length : 0;
+    expect(hostCount).toBe(0);
+  });
+
+  test("relays to a non-branch (host) recipient via the host mail path (ops-16 regression guard)", async () => {
+    const out = outboxNew("brancha");
+    writeJson(join(out, "m1.json"), {
+      id: "msg-host", from: "brancha", to: "kern",
+      body: "hello host agent", timestamp: new Date().toISOString(),
+    });
+
+    const res = await processOutboxOnce("brancha");
+    expect(res.processed).toBe(1);
+
+    // kern has no branch-office presence → host path, unchanged.
+    const hostInbox = join(root, ".tps", "mail", "kern", "new");
+    expect(readdirSync(hostInbox).filter((f) => f.endsWith(".json")).length).toBe(1);
   });
 
   test("relay pauses duplicate messages (loop detection)", async () => {
