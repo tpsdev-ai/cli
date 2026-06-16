@@ -1,5 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
@@ -34,6 +34,18 @@ export function resolveAgentMailRoot(agentId: string): string {
   return resolveDeliveryPath(agentId);
 }
 
+/**
+ * True if `p` resolves to within ~/.tps/branch-office (the only place a delivery
+ * path may point). Mirrors assertOfficeDir in wall.ts / internal-mail.ts so a
+ * team.json `workspaceMail` value can't redirect mail writes outside the office
+ * root via path traversal or an absolute path (ops-23).
+ */
+function isWithinBranchOffice(p: string): boolean {
+  const resolved = resolve(p);
+  const root = resolve(join(process.env.HOME || homedir(), ".tps", "branch-office"));
+  return resolved === root || resolved.startsWith(root + sep);
+}
+
 function resolveDeliveryPath(agentId: string): string {
   const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office");
   if (!existsSync(branchDir)) return join(branchDir, agentId, "mail");
@@ -44,7 +56,10 @@ function resolveDeliveryPath(agentId: string): string {
   if (existsSync(teamSidecar)) {
     try {
       const sidecar = JSON.parse(readFileSync(teamSidecar, "utf-8"));
-      if (sidecar.workspaceMail) return sidecar.workspaceMail;
+      if (sidecar.workspaceMail) {
+        if (isWithinBranchOffice(sidecar.workspaceMail)) return sidecar.workspaceMail;
+        swarn(`team.json workspaceMail out of bounds, ignoring: ${sidecar.workspaceMail}`);
+      }
     } catch {}
     return join(teamPath, "workspace", "mail");
   }
@@ -59,7 +74,9 @@ function resolveDeliveryPath(agentId: string): string {
       const sidecarPath = join(branchDir, team, "team.json");
       const sidecar = JSON.parse(readFileSync(sidecarPath, "utf-8"));
       if (Array.isArray(sidecar.members) && sidecar.members.includes(agentId)) {
-        return sidecar.workspaceMail || join(branchDir, team, "workspace", "mail");
+        if (sidecar.workspaceMail && isWithinBranchOffice(sidecar.workspaceMail)) return sidecar.workspaceMail;
+        if (sidecar.workspaceMail) swarn(`team.json workspaceMail out of bounds, ignoring: ${sidecar.workspaceMail}`);
+        return join(branchDir, team, "workspace", "mail");
       }
     }
   } catch {
