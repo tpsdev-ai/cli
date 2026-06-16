@@ -91,6 +91,31 @@ function branchRoot(agentId: string): string {
   return resolveDeliveryPath(agentId);
 }
 
+/** True if `recipient` is a local branch agent or team member (has a branch-office presence). */
+function isBranchRecipient(recipient: string): boolean {
+  const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office");
+  if (!existsSync(branchDir)) return false;
+  if (existsSync(join(branchDir, recipient))) return true; // registered branch / team root
+  try {
+    for (const d of readdirSync(branchDir)) {
+      const sidecar = join(branchDir, d, "team.json");
+      if (!existsSync(sidecar)) continue;
+      const s = JSON.parse(readFileSync(sidecar, "utf-8"));
+      if (Array.isArray(s.members) && s.members.includes(recipient)) return true;
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Delivery hook for FileSystemTransport (ops-16): a local branch/team recipient
+ * reads its workspace inbox, not the flat host mail path, so route relayed mail
+ * there. Returns null for host agents so they keep the host path unchanged.
+ */
+function resolveBranchRecipientDir(recipient: string): string | null {
+  return isBranchRecipient(recipient) ? resolveDeliveryPath(recipient) : null;
+}
+
 function assertAgent(agentId: string): void {
   const safe = sanitizeIdentifier(agentId);
   if (!agentId || safe !== agentId) {
@@ -109,7 +134,7 @@ function atomicWriteJson(targetPath: string, data: unknown): void {
 }
 
 const detectors = new Map<string, LoopDetector>();
-const transportRegistry = new TransportRegistry(new FileSystemTransport());
+const transportRegistry = new TransportRegistry(new FileSystemTransport(resolveBranchRecipientDir));
 
 function getDetector(agentId: string): LoopDetector {
   if (!detectors.has(agentId)) {
