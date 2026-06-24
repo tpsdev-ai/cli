@@ -95,9 +95,13 @@ describe("watchMail (fs.watch)", () => {
     expect(received).toContain("msg-001");
   });
 
-  it("does not replay pre-existing messages present before watch starts", async () => {
+  it("delivers pre-existing undelivered messages waiting in new/ at startup", async () => {
+    // new/ holds UNDELIVERED mail — the exec hook moves delivered mail to cur/
+    // on ack. So a (re)started watcher MUST deliver whatever is already waiting:
+    // this is the recovery path that lets a kickstart drain mail stranded by an
+    // fs.watch stall, instead of marking it seen and forcing a re-dispatch.
     const { fresh } = makeInbox(tmp, "test-agent");
-    writeMsg(fresh, "old-msg", "sender", "test-agent", "pre-existing");
+    writeMsg(fresh, "waiting-msg", "sender", "test-agent", "stranded before watch start");
 
     const received: string[] = [];
     const watcher = watchMail({
@@ -108,7 +112,7 @@ describe("watchMail (fs.watch)", () => {
 
     await sleep(150);
     watcher.stop();
-    expect(received).not.toContain("old-msg");
+    expect(received).toContain("waiting-msg");
   });
 
   it("does not deliver the same message twice (dedup via seen set)", async () => {
@@ -188,32 +192,37 @@ describe("watchMail concurrency", () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it("respects maxConcurrent=2 — at most 2 handlers run simultaneously", async () => {
+  it("respects maxConcurrent=2 and still delivers every message (over-cap mail is retried)", async () => {
     const { fresh } = makeInbox(tmp, "conc-agent");
     let active = 0;
     let maxSeen = 0;
+    const received: string[] = [];
 
     const watcher = watchMail({
       agent: "conc-agent",
       debounceMs: 20,
       maxConcurrent: 2,
-      onMessage: async () => {
+      onMessage: async (msg) => {
         active++;
         maxSeen = Math.max(maxSeen, active);
-        await sleep(80);
+        await sleep(60);
+        received.push(msg.id);
         active--;
       },
     });
 
     await sleep(30);
-    // Write 5 messages — all arrive in a single debounce window
+    // Write 5 messages — all arrive in a single debounce window, over the cap.
     for (let i = 0; i < 5; i++) {
       writeMsg(fresh, `m${i}`, "s", "conc-agent", `body${i}`);
     }
-    await sleep(400);
+    await sleep(500);
     watcher.stop();
 
     expect(maxSeen).toBeLessThanOrEqual(2);
+    // All 5 must be delivered: mail over the cap is left UNSEEN and retried as
+    // slots free (the old code marked it seen then dropped it → lost forever).
+    expect(received.sort()).toEqual(["m0", "m1", "m2", "m3", "m4"]);
   });
 });
 

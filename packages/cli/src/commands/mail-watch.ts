@@ -1,8 +1,11 @@
 /**
  * mail-watch — watch an agent's inbox for new messages and run exec hooks.
  *
- * OPS-121: event-driven mail watcher using fs.watch + debounce.
- * Zero CPU overhead when idle — no polling.
+ * OPS-121: mail watcher using fs.watch + debounce for low-latency delivery,
+ * backed by a low-frequency poll fallback. fs.watch (FSEvents on macOS) goes
+ * deaf after uptime, so it can't be the sole trigger — the poll guarantees
+ * delivery and lets a (re)start recover any mail stranded in new/. Near-zero
+ * idle CPU; reliability over strictly-zero-CPU.
  *
  * Security mitigations (K&S):
  * - exec hooks use args[] array, no shell interpolation
@@ -41,6 +44,8 @@ export interface MailWatchOptions {
   onMessage?: (msg: MailMessage) => void | Promise<void>;
   /** Max concurrent handlers (default: 3) */
   maxConcurrent?: number;
+  /** Polling-fallback interval in ms — guards against fs.watch going deaf (default: 15000) */
+  pollMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -145,21 +150,23 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
   const inbox = getInbox(opts.agent);
 
-  // Pre-populate seen with already-present files so we don't replay old mail
-  for (const f of listNewFiles(inbox.fresh)) {
-    seen.add(f);
-  }
-
+  // NOTE: we intentionally do NOT pre-populate `seen` with files already in
+  // new/. new/ holds UNDELIVERED mail — the exec hook moves delivered mail to
+  // cur/ on ack — so anything present at (re)start must be delivered. Marking
+  // it seen on boot is what made a mail-watch kickstart silently strand stuck
+  // dispatches (and forced re-dispatches, which double-posted K&S reviews).
   const processNew = async () => {
     if (stopped) return;
     for (const filePath of listNewFiles(inbox.fresh)) {
       if (seen.has(filePath)) continue;
+      // Check the concurrency cap BEFORE marking seen. If we're at the limit,
+      // leave the file UNSEEN so the next pass (poll or fs event) retries it.
+      // The old order marked it seen and THEN dropped it → never delivered.
+      if (activeHandlers >= maxConcurrent) continue;
       seen.add(filePath);
 
       const msg = readMessageSafe(filePath);
       if (!msg) continue; // moved to cur/ before we could read — skip
-
-      if (activeHandlers >= maxConcurrent) continue; // drop when at limit
       activeHandlers++;
 
       (async () => {
@@ -169,7 +176,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         try {
           if (opts.hook) await runHook(opts.hook, msg);
         } catch { /* hook errors don't crash the watcher */ }
-      })().finally(() => { activeHandlers--; });
+      })().finally(() => {
+        activeHandlers--;
+        // A slot just freed — immediately re-check for mail that was over the
+        // concurrency cap on a prior pass, so a burst drains as slots cycle
+        // instead of waiting for the next fs event or poll.
+        if (!stopped) void processNew();
+      });
     }
   };
 
@@ -180,13 +193,24 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
     debounceTimer = setTimeout(() => { void processNew(); }, debounceMs);
   };
 
-  // fs.watch on the new/ directory — fires on file create/rename
+  // fs.watch on new/ fires on file create/rename — low-latency, but fs.watch
+  // (FSEvents on macOS) silently stops emitting after uptime, which strands
+  // mail. So treat fs.watch as a latency optimization, NOT the source of truth:
+  // a low-frequency poll guarantees delivery even if the watcher goes deaf.
+  // Reliability > idle CPU for the review/mail pipeline.
   const watcher = fsWatch(inbox.fresh, onFsEvent);
+  const pollMs = opts.pollMs ?? 15_000;
+  const pollTimer = setInterval(() => { void processNew(); }, pollMs);
+
+  // Deliver anything already waiting in new/ at (re)start, immediately — so a
+  // kickstart RECOVERS stuck mail instead of waiting for the first event/poll.
+  void processNew();
 
   return {
     stop() {
       stopped = true;
       if (debounceTimer) clearTimeout(debounceTimer);
+      clearInterval(pollTimer);
       try { watcher.close(); } catch {}
     },
   };
