@@ -133,6 +133,41 @@ describe("watchMail (fs.watch)", () => {
     expect(received.filter((id) => id === "dedup-msg")).toHaveLength(1);
   });
 
+  it("fires onPoll once at startup and on each poll cycle (liveness heartbeat, ops-i3vw)", async () => {
+    makeInbox(tmp, "test-agent");
+    let beats = 0;
+    const watcher = watchMail({
+      agent: "test-agent",
+      debounceMs: 20,
+      pollMs: 40, // fast poll for the test
+      onPoll: () => { beats++; },
+    });
+
+    await sleep(150); // startup beat + ~3 poll cycles at 40ms
+    watcher.stop();
+    // At least the startup beat plus a couple poll beats.
+    expect(beats).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a throwing onPoll never crashes the watcher (heartbeat failure is swallowed)", async () => {
+    const { fresh } = makeInbox(tmp, "test-agent");
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: "test-agent",
+      debounceMs: 20,
+      pollMs: 40,
+      onPoll: () => { throw new Error("simulated heartbeat failure"); },
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+
+    await sleep(60);
+    // Mail delivery must still work despite a throwing heartbeat.
+    writeMsg(fresh, "after-bad-beat", "sender", "test-agent", "still alive");
+    await sleep(150);
+    watcher.stop();
+    expect(received).toContain("after-bad-beat");
+  });
+
   it("handles ENOENT gracefully when file is moved before read", async () => {
     const { fresh, cur } = makeInbox(tmp, "test-agent");
 

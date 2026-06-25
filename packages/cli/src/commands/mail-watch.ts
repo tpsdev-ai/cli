@@ -46,6 +46,15 @@ export interface MailWatchOptions {
   maxConcurrent?: number;
   /** Polling-fallback interval in ms — guards against fs.watch going deaf (default: 15000) */
   pollMs?: number;
+  /**
+   * Liveness heartbeat fired once per poll cycle (ops-i3vw — Flair Presence dogfood).
+   * Binding the heartbeat to the SAME poll loop that delivers mail means a stalled
+   * or dead watcher stops beating — so its Presence record goes stale and the
+   * staleness monitor flags it. This directly catches the 2026-06-25 failure
+   * (a watcher stalled 13h with nothing recording its liveness). Errors are
+   * swallowed: a heartbeat failure must never crash the mail loop.
+   */
+  onPoll?: () => void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,11 +209,25 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // Reliability > idle CPU for the review/mail pipeline.
   const watcher = fsWatch(inbox.fresh, onFsEvent);
   const pollMs = opts.pollMs ?? 15_000;
-  const pollTimer = setInterval(() => { void processNew(); }, pollMs);
+
+  // Liveness heartbeat — fire once per GUARANTEED poll cycle (not the fs-event
+  // path, which can go deaf). A heartbeat error never propagates: it must not
+  // crash the mail loop. If the watcher stalls/dies, the heartbeat stops with
+  // it → Presence goes stale → the staleness monitor flags it. (ops-i3vw)
+  const beat = () => {
+    if (stopped || !opts.onPoll) return;
+    Promise.resolve()
+      .then(() => opts.onPoll!())
+      .catch(() => { /* heartbeat failure must not crash the watcher */ });
+  };
+
+  const pollTimer = setInterval(() => { void processNew(); beat(); }, pollMs);
 
   // Deliver anything already waiting in new/ at (re)start, immediately — so a
   // kickstart RECOVERS stuck mail instead of waiting for the first event/poll.
   void processNew();
+  // Beat once at startup so a fresh (re)start registers liveness immediately.
+  beat();
 
   return {
     stop() {
@@ -411,11 +434,28 @@ export async function runMailWatch(args: MailWatchArgs): Promise<void> {
     ? { args: args.hook }
     : undefined;
 
+  // Flair Presence heartbeat (ops-i3vw) — DEFAULT-OFF, byte-identical when off.
+  // Enable per-agent by setting TPS_PRESENCE_BEAT_CMD to an executable that
+  // emits the agent's Presence (it reads TPS_AGENT_ID / FLAIR_AGENT_ID). The
+  // watcher fires it once per poll cycle; failures are swallowed inside watchMail.
+  const beatCmd = process.env.TPS_PRESENCE_BEAT_CMD;
+  const onPoll: (() => void) | undefined = beatCmd
+    ? () => {
+        // Fire-and-forget; never block or crash the mail loop. No shell interp.
+        const child = spawn(beatCmd, [], {
+          env: { ...process.env, FLAIR_AGENT_ID: process.env.FLAIR_AGENT_ID ?? args.agent, TPS_AGENT_ID: process.env.TPS_AGENT_ID ?? args.agent },
+          stdio: "ignore",
+        });
+        child.on("error", () => { /* heartbeat failure must not crash the watcher */ });
+      }
+    : undefined;
+
   const watcher = watchMail({
     agent: args.agent,
     debounceMs: args.debounce,
     hook,
     maxConcurrent: 3,
+    onPoll,
     onMessage: (msg) => {
       if (args.json) {
         console.log(JSON.stringify(msg));
