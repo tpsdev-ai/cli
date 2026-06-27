@@ -13,7 +13,9 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
+import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
+import { execFileSync } from "node:child_process";
+import { platform } from "node:os";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -285,6 +287,43 @@ describe("xmlEscape", () => {
     expect(escaped).not.toContain(">");
     expect(escaped).toContain("&lt;");
     expect(escaped).toContain("&gt;");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildPlist — generated launchd plist shape (ops-bayh: idle-reap immunity)
+// ---------------------------------------------------------------------------
+
+describe("buildPlist", () => {
+  it("sets ProcessType=Background so macOS does not idle-reap the watcher", () => {
+    const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
+    expect(xml).toContain("<key>ProcessType</key>");
+    // The <string> follows the <key> on the next line — assert the pairing.
+    expect(xml).toMatch(/<key>ProcessType<\/key>\s*<string>Background<\/string>/);
+  });
+
+  it("sets a non-zero ThrottleInterval", () => {
+    const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
+    expect(xml).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>10<\/integer>/);
+  });
+
+  it("keeps KeepAlive(Crashed:true) so a real crash still restarts", () => {
+    const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>\s*<key>Crashed<\/key>\s*<true\/>/);
+  });
+
+  it("generates plist that passes plutil -lint (valid XML, macOS only)", () => {
+    if (platform() !== "darwin") return; // plutil is macOS-only
+    const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", ["arg with spaces & <special>"]);
+    const tmpFile = join(tmpdir(), `buildplist-lint-${Date.now()}.plist`);
+    writeFileSync(tmpFile, xml);
+    try {
+      // Throws (non-zero exit) if the plist is malformed.
+      const out = execFileSync("plutil", ["-lint", tmpFile], { encoding: "utf-8" });
+      expect(out).toContain("OK");
+    } finally {
+      rmSync(tmpFile, { force: true });
+    }
   });
 });
 

@@ -269,7 +269,11 @@ export function xmlEscape(s: string): string {
     .replace(/'/g, "&apos;");
 }
 
-function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[]): string {
+/**
+ * Build the launchd plist for an agent's mail-watch daemon.
+ * Exported for unit testing (asserts ProcessType=Background + valid XML).
+ */
+export function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[]): string {
   const label = plistLabel(agent);
   const stdout = join(logDir(), `mail-watch-${agent}.log`);
   const stderr = join(logDir(), `mail-watch-${agent}.error.log`);
@@ -309,8 +313,18 @@ ${progArgs}
     <true/>
   </dict>
 
+  <!--
+    ProcessType=Background tells launchd this is a long-lived background daemon.
+    Without it, the watcher's idle poll timer (waking every ~15s) gets the job
+    power-classified as "inefficient" and macOS reaps it with a clean exit 0 —
+    which KeepAlive(Crashed:true) does NOT restart, so the agent goes silently
+    deaf. Background processing type opts the job out of that idle-reap. (ops-bayh)
+  -->
+  <key>ProcessType</key>
+  <string>Background</string>
+
   <key>ThrottleInterval</key>
-  <integer>5</integer>
+  <integer>10</integer>
 
   <key>StandardOutPath</key>
   <string>${xmlEscape(stdout)}</string>
