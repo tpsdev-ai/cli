@@ -25,6 +25,33 @@ It uses a layered design: **TPS Reports** define the agent's identity and capabi
 
 ---
 
+## 0. Communication Channels
+
+Agents in TPS do not dump code, text, and data into a single massive LLM context window.
+Communication is strictly segregated across three channels, each suited to a different
+kind of payload:
+
+1. **Mail** — control plane messages, status updates, commands, and webhook events. Sent
+   as Ed25519-signed JSON envelopes (see [§2 The Mail Bridge](#2-the-mail-bridge-ipc) for
+   the trust boundary they cross, and [docs/branch-office.md](branch-office.md) for the
+   Noise_IK wire transport used between Host and a remote Branch).
+2. **Git** — artifacts. Code, specs, and documentation are committed and pushed. Agents
+   pull the repo to see the state of the world rather than holding it in-context.
+3. **APIs** — external data (web searches, tool use, third-party services).
+
+### Mail Handlers & Manifests (`tps.yaml`)
+
+Each agent directory carries a `tps.yaml` manifest — this is the "TPS Report" in the
+System Layers diagram above (the Definition Layer). The Branch Daemon discovers these
+manifests and wires up a **mail handler pipeline**: when mail arrives, the daemon checks
+the sender and body against the handler's `match` rules, and on a match executes the
+handler script, passing the mail body on `stdin` and metadata via environment variables.
+A handler can return plain text (sent back as a reply) or a JSON envelope
+(`{"action": "forward", "to": "other-agent"}`) to route the message on within the branch
+without a round-trip to the Host.
+
+---
+
 ## 1. The Trust Model
 
 TPS operates on a **Host/Branch** security model.
@@ -70,6 +97,8 @@ This ensures that even a compromised Branch Agent cannot forge its identity or f
 ---
 
 ## 3. Isolation Strategies
+
+![Milton's Sandbox](media/miltons-sandbox.png)
 
 TPS employs "Defense in Depth" using two different isolation technologies.
 

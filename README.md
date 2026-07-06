@@ -12,6 +12,8 @@ Most agent frameworks assume all agents run in the same memory space. TPS assume
 
 > "I have eight different bosses right now. So that means that when I make a mistake, I have eight different people coming by to tell me about it." — Make your agents communicate through a single, auditable mail interface instead.
 
+See **[DESIGN.md](DESIGN.md)** for the invariants behind that — why identity is signed, why failures self-heal instead of hiding, and why every task moves through review before it merges.
+
 ### What You Get
 
 - **Identity & Keys** — Ed25519 keypairs per agent. Agents prove who they are cryptographically, not by env var.
