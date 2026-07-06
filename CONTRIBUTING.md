@@ -8,8 +8,8 @@ TPS is built with TypeScript and [Bun](https://bun.sh/).
 
 ```bash
 # Clone the repository
-git clone https://github.com/tpsdev-ai/tps.git
-cd tps
+git clone https://github.com/tpsdev-ai/cli.git
+cd cli
 
 # Install dependencies
 bun install
@@ -23,9 +23,9 @@ bun test
 
 ## Architecture Notes
 
-Before contributing, please read the [ARCHITECTURE.md](ARCHITECTURE.md). TPS uses a strict hub-and-spoke topology and isolates communication across three channels (Mail, Git, APIs).
+Before contributing, please read [docs/architecture.md](docs/architecture.md) (the system model) and [DESIGN.md](DESIGN.md) (why it's built this way).
 
-When modifying the branch daemon or transport layers, keep the following security boundaries in mind:
+When modifying the branch daemon or transport layers, keep the following security boundaries in mind — see [DESIGN.md § Trust boundaries](DESIGN.md#trust-boundaries) for the rationale:
 - **Never expose the Host's private key**.
 - **Always validate inputs** on cross-boundary messaging.
 - **Fail closed** on authentication or permission errors.
