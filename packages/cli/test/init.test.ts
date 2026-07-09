@@ -5,7 +5,17 @@ import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
-const HOME = homedir();
+// Prefer the live $HOME over homedir(), which resolves via the OS user
+// database as a fallback. In the Docker test image (root, no matching
+// /etc/passwd entry for the injected HOME=/home/tps) that fallback can
+// disagree with $HOME, and Bun's os.homedir() has been observed to cache
+// its result independent of later env mutations performed by sibling test
+// files in this same process — so relying on it here (and independently
+// again inside the spawned subprocess) risks the test's expected path and
+// the subprocess's actual write path silently diverging. Reading
+// process.env.HOME directly, and threading that same string through to
+// the subprocess's env below, keeps both sides in lockstep.
+const HOME = process.env.HOME || homedir();
 const TEST_ID = "tps-init-test-agent";
 
 afterEach(() => {
@@ -32,15 +42,15 @@ describe("tps init", () => {
   });
 
   test("errors if agent already exists without --force", () => {
-    spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: process.env });
-    const result = spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: process.env });
+    spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: { ...process.env, HOME } });
+    const result = spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: { ...process.env, HOME } });
     expect(result.status).not.toBe(0);
     expect((result.stderr ?? "") + (result.stdout ?? "")).toContain("already exists");
   });
 
   test("--force overwrites existing", () => {
-    spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: process.env });
-    const result = spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID, "--force"], { encoding: "utf-8", env: process.env });
+    spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID], { encoding: "utf-8", env: { ...process.env, HOME } });
+    const result = spawnSync("bun", [TPS_BIN, "init", "--id", TEST_ID, "--force"], { encoding: "utf-8", env: { ...process.env, HOME } });
     expect(result.status).toBe(0);
   });
 });
