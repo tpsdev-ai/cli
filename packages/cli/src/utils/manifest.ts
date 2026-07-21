@@ -120,7 +120,7 @@ export function matchesFilter(
   }
 
   if (filter.bodyPattern) {
-    const re = new RegExp(filter.bodyPattern); // nosemgrep: detect-non-literal-regexp — pattern from validated tps.yaml config
+    const re = new RegExp(filter.bodyPattern); // nosemgrep: detect-non-literal-regexp — pattern safety-validated at schema load (RegexStringSchema)
     const bodyToTest = msg.body.trim().slice(0, 1024); // Capped at 1024 (S15)
     if (!re.test(bodyToTest)) return false;
   }

@@ -1,13 +1,29 @@
 import { z } from "zod";
+import safeRegex from "safe-regex";
 
-const RegexStringSchema = z.string().refine((val) => {
-  try {
-    new RegExp(val); // nosemgrep: detect-non-literal-regexp — validating user-provided pattern from config
-    return true;
-  } catch {
-    return false;
-  }
-}, { message: "Invalid regular expression" });
+// Patterns come from tps.yaml manifests and are evaluated against inbound mail
+// bodies. Compiling a pattern only proves it is well-formed — it does not prove
+// it is safe to evaluate: a well-formed pattern can still have super-linear
+// match cost on short input. We therefore validate on two axes here so that
+// "validated" means "safe to run", not merely "parses":
+//   1. it compiles to a RegExp, and
+//   2. safeRegex accepts it (rejects nested-quantifier / ambiguous-repetition
+//      patterns whose evaluation cost is not bounded by the input length).
+// Manifests carrying a rejected pattern fail schema validation and are dropped,
+// so an unsafe pattern never reaches the runtime match sites.
+const RegexStringSchema = z
+  .string()
+  .refine((val) => {
+    try {
+      new RegExp(val); // nosemgrep: detect-non-literal-regexp — validating a config-provided pattern for well-formedness
+      return true;
+    } catch {
+      return false;
+    }
+  }, { message: "Invalid regular expression" })
+  .refine((val) => safeRegex(val), {
+    message: "Regular expression pattern rejected by safety validation",
+  });
 
 export const MailHandlerMatchSchema = z.object({
   from: z.array(z.string()).optional(),
