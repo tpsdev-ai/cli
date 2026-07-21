@@ -2,15 +2,13 @@ import { z } from "zod";
 import safeRegex from "safe-regex";
 
 // Patterns come from tps.yaml manifests and are evaluated against inbound mail
-// bodies. Compiling a pattern only proves it is well-formed — it does not prove
-// it is safe to evaluate: a well-formed pattern can still have super-linear
-// match cost on short input. We therefore validate on two axes here so that
-// "validated" means "safe to run", not merely "parses":
+// bodies. Compiling a pattern only proves it is well-formed — not that its
+// evaluation cost is bounded by input length. We therefore validate on two
+// axes so "validated" means "safe to run", not merely "parses":
 //   1. it compiles to a RegExp, and
-//   2. safeRegex accepts it (rejects nested-quantifier / ambiguous-repetition
-//      patterns whose evaluation cost is not bounded by the input length).
+//   2. safeRegex accepts it (keeps match cost bounded relative to input).
 // Manifests carrying a rejected pattern fail schema validation and are dropped,
-// so an unsafe pattern never reaches the runtime match sites.
+// so a rejected pattern never reaches the runtime match sites.
 const RegexStringSchema = z
   .string()
   .refine((val) => {
