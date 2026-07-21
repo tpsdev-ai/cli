@@ -44,7 +44,7 @@ export async function runHandlerPipeline(
     if (manifest.routing) {
       for (const rule of manifest.routing) {
         try {
-          const re = new RegExp(rule.pattern); // nosemgrep: detect-non-literal-regexp — pattern from validated tps.yaml config
+          const re = new RegExp(rule.pattern); // nosemgrep: detect-non-literal-regexp — pattern safety-validated at schema load (RegexStringSchema)
           if (re.test(bodyToTest)) {
             return { type: "forward", to: rule.to, body: msg.body };
           }
