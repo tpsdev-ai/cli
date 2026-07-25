@@ -169,6 +169,29 @@ export function countInboxMessages(agent: string): number {
 }
 
 /**
+ * The "Inbox full" rejection, phrased so the SENDER can act on it.
+ *
+ * The cap is back-pressure aimed at the recipient, but the recipient is the
+ * one party the throw never reaches — a sender sees the error, the blocked
+ * agent sees nothing. A bare "Inbox full" therefore stranded the useful
+ * detail on the wrong side of the wire: which agent, how deep, and what
+ * clears it. Flint's inbox sat at the cap silently bouncing agent mail
+ * because every diagnostic said "full" and none said "run mail check".
+ *
+ * Naming the remedy matters more than naming the number: `mail check` is the
+ * only path that drains new/ (and runs archiveOldCur); `mail log` and reading
+ * the maildir directly do neither, which is exactly how an inbox reaches the
+ * cap without anyone noticing.
+ */
+export function inboxFullMessage(recipient: string, count: number): string {
+  return (
+    `Inbox full: ${recipient} has ${count} unprocessed messages (cap ${MAX_INBOX_MESSAGES}). ` +
+    `Message NOT delivered. ${recipient} must run \`tps mail check ${recipient}\` to drain new/ — ` +
+    `note that \`mail log\` and reading the maildir directly do not consume.`
+  );
+}
+
+/**
  * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
  *
  * Returns the count moved. Idempotent and non-failing — corrupt or unreadable
@@ -227,7 +250,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   const inbox = getInbox(to);
   const quotaCount = countInboxMessages(to);
   if (quotaCount >= MAX_INBOX_MESSAGES) {
-    throw new Error("Inbox full");
+    throw new Error(inboxFullMessage(to, quotaCount));
   }
 
   const timestamp = new Date().toISOString();

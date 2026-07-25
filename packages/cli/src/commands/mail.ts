@@ -1,4 +1,4 @@
-import { ackMessage, assertValidBody, checkMessages, gcMessages, getInbox, listMessages, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
+import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -45,6 +45,34 @@ interface MailArgs {
   hook?: string[];
   interval?: number | string;
   daemon?: string;
+}
+
+// Warn threshold as a fraction of the cap. 80% leaves ~20 messages of runway —
+// enough that a reader who acts on the warning drains before anything bounces,
+// while staying quiet for the normal case of a few unread.
+const INBOX_WARN_RATIO = 0.8;
+
+/**
+ * Print a back-pressure warning when the agent's own inbox is filling up.
+ *
+ * Deliberately best-effort and never throwing: this is advisory output on a
+ * read-only command, so a missing or unreadable maildir must not turn `mail
+ * log` into a failure.
+ */
+function warnIfInboxDeep(agent: string): void {
+  try {
+    const depth = countInboxMessages(agent);
+    const threshold = Math.floor(MAX_INBOX_MESSAGES * INBOX_WARN_RATIO);
+    if (depth < threshold) return;
+    const atCap = depth >= MAX_INBOX_MESSAGES;
+    console.warn(
+      atCap
+        ? `\n⚠️  ${agent}: ${depth}/${MAX_INBOX_MESSAGES} unprocessed — INBOX IS FULL. Incoming mail is being REJECTED right now. Run \`tps mail check ${agent}\` to drain it.`
+        : `\n⚠️  ${agent}: ${depth}/${MAX_INBOX_MESSAGES} unprocessed. At the cap, incoming mail is rejected. Run \`tps mail check ${agent}\` to drain it — this command does not consume.`,
+    );
+  } catch {
+    // Advisory only — never let the warning break the command it rides on.
+  }
 }
 
 async function resolveAgentId(override?: string): Promise<string> {
@@ -414,6 +442,14 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log(`${icon} [${e.event}] ${e.from} → ${e.to} @ ${e.timestamp}${preview}`);
         }
       }
+      // Back-pressure is aimed at the recipient but the "Inbox full" throw only
+      // ever reaches the sender. `log` is read-only — it does NOT consume — so
+      // an agent that reads its mail this way can sit at the cap indefinitely,
+      // bouncing every inbound message, and see nothing wrong. Surfacing depth
+      // here puts the warning in front of the one party who can clear it, on
+      // the command they actually run. (Not printed under --json: that output
+      // is parsed by callers.)
+      if (!args.json) warnIfInboxDeep(await resolveAgentId(args.agent));
       return;
     }
 

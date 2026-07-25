@@ -3,7 +3,7 @@ import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, MAX_INBOX_MESSAGES, sendMessage } from "./mail.js";
+import { countInboxMessages, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -199,8 +199,9 @@ export async function processOutboxOnce(agentId: string): Promise<{ processed: n
         throw new Error("Message body exceeds maximum size (64KB)");
       }
 
-      if (countInboxMessages(recipient) >= MAX_INBOX_MESSAGES) {
-        throw new Error("Inbox full");
+      const recipientDepth = countInboxMessages(recipient);
+      if (recipientDepth >= MAX_INBOX_MESSAGES) {
+        throw new Error(inboxFullMessage(recipient, recipientDepth));
       }
 
       const transport = resolveTransport(recipient, transportRegistry);
