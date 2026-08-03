@@ -64,8 +64,11 @@ export interface PulseConfig {
 // Injectable runner type for testing
 export type SyncRunner = (cmd: string, args: string[], opts?: { encoding?: BufferEncoding; timeout?: number; env?: NodeJS.ProcessEnv }) => SpawnSyncReturns<string>;
 
-// Injectable mail sender for testing
-export type MailSender = (to: string, body: string, agentId: string) => void;
+// Injectable mail sender for testing.  May return a Promise for async
+// senders; sendMail handles both sync throws and async rejections, and
+// races async senders against a timeout so one hung delivery cannot
+// wedge the daemon.
+export type MailSender = (to: string, body: string, agentId: string) => void | Promise<void>;
 
 // Injectable Flair publisher for testing (null = disabled)
 export type FlairPublisher = (
@@ -162,7 +165,18 @@ export function ghApi(endpoint: string, ghAgent: string, runner: SyncRunner = sp
 // Mail
 // ---------------------------------------------------------------------------
 
-export const MAIL_SEND_TIMEOUT_MS = 5_000;
+/** Per-send timeout — defense in depth.  sendMessage is synchronous and
+ * fast, but an injected async sender (e.g. a future bridge transport)
+ * could hang.  One hung delivery must not stop notifications for everyone
+ * else.
+ *
+ * Settable at runtime via setSendTimeoutMs for tests that need a short
+ * timeout. */
+let SEND_TIMEOUT_MS = 5_000;
+
+export function setSendTimeoutMs(ms: number): void {
+  SEND_TIMEOUT_MS = ms;
+}
 
 export function defaultMailSender(to: string, body: string, agentId: string): void {
   // Call sendMessage in-process instead of shelling out to the 'tps' PATH shim.
@@ -181,7 +195,20 @@ export function defaultMailSender(to: string, body: string, agentId: string): vo
 function sendMail(to: string, body: string, config: PulseConfig, sender: MailSender): void {
   console.log(`[pulse] mail → ${to}: ${body.slice(0, 80)}…`);
   try {
-    sender(to, body, config.ghAgent);
+    const result = sender(to, body, config.ghAgent);
+    if (result instanceof Promise) {
+      // Async sender — race against timeout so one hung delivery cannot
+      // wedge the daemon.
+      const timeout = new Promise<void>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`mail send to ${to} timed out after ${SEND_TIMEOUT_MS}ms`)),
+          SEND_TIMEOUT_MS,
+        ),
+      );
+      Promise.race([result, timeout]).catch((e: unknown) => {
+        console.error(`[pulse/mail] FAILED to send to ${to}: ${(e as Error).message}`);
+      });
+    }
   } catch (e: unknown) {
     // One bad recipient must not stop the world. Log loudly and continue.
     console.error(`[pulse/mail] FAILED to send to ${to}: ${(e as Error).message}`);
