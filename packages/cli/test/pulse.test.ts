@@ -7,6 +7,7 @@ import {
   printStatus,
   pruneState,
   startPollLoop,
+  setSendTimeoutMs,
   type PrInstance,
   type PrState,
   type PulseConfig,
@@ -569,5 +570,187 @@ describe("FlairPublisher integration", () => {
     handleTransition("pr:tpsdev-ai/cli#5", instance, "approved", config, sender, publisher);
     await Promise.resolve();
     expect(calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mail send failure resilience
+//
+// The published PATH shim hung forever on mail send, and spawnSync had no
+// timeout.  One undeliverable message wedged the pulse daemon permanently.
+// These tests assert that a failed or hung sender does not block subsequent
+// notifications.
+// ---------------------------------------------------------------------------
+
+describe("mail send failure resilience", () => {
+  // ── Ember's tests (kept — complementary coverage) ──────────────────
+
+  test("sendMail catches sender errors and continues the loop", () => {
+    const config = makeConfig();
+    const { calls } = trackMails();
+    const instance = makeInstance({ state: "opened" });
+
+    let callCount = 0;
+    const failingSender: MailSender = (to, body, agentId) => {
+      callCount++;
+      if (callCount === 1) throw new Error("simulated send hang/failure");
+      calls.push({ to, body, agentId });
+    };
+
+    // handleTransition for opened → approved sends 1 mail to mergeAuthority.
+    expect(() => {
+      handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, failingSender);
+    }).not.toThrow();
+
+    expect(instance.state).toBe("approved");
+
+    // Second transition should succeed
+    expect(() => {
+      handleTransition("pr:tpsdev-ai/cli#42", instance, "merged", config, failingSender);
+    }).not.toThrow();
+
+    expect(instance.state).toBe("merged");
+    expect(calls.length).toBe(1);
+    expect(calls[0].to).toBe("anvil");
+  });
+
+  test("pollOnce continues processing PRs when mail send fails for one PR", () => {
+    const config = makeConfig();
+    const { calls } = trackMails();
+    const state = makeState();
+
+    let callCount = 0;
+    const failingSender: MailSender = (to, body, agentId) => {
+      callCount++;
+      if (callCount <= 2) throw new Error("simulated send failure for first PR");
+      calls.push({ to, body, agentId });
+    };
+
+    const runner: SyncRunner = (_cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "PR A", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+            { number: 11, title: "PR B", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    expect(() => {
+      pollOnce(config, state, runner, failingSender);
+    }).not.toThrow();
+
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeDefined();
+    expect(state.instances["pr:tpsdev-ai/cli#11"]).toBeDefined();
+    expect(calls.length).toBe(2);
+    expect(calls[0].body).toContain("PR #11");
+    expect(calls[1].body).toContain("PR #11");
+  });
+
+  // ── Hang + timeout tests (anvil) ───────────────────────────────────
+
+  test("hung sender does not block subsequent notifications", () => {
+    const config = makeConfig();
+    const state = makeState();
+
+    const mailLog: string[] = [];
+    let hangCount = 0;
+
+    const sender: MailSender = (to, _body, _agentId) => {
+      if (hangCount === 0) {
+        hangCount++;
+        return new Promise<void>(() => {}); // never resolves
+      }
+      mailLog.push(to);
+    };
+
+    const runner: SyncRunner = (_cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "PR A", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+            { number: 11, title: "PR B", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    pollOnce(config, state, runner, sender);
+
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeDefined();
+    expect(state.instances["pr:tpsdev-ai/cli#11"]).toBeDefined();
+    // First PR's first mail hung; 3 mails succeed (kern for PR #10,
+    // sherlock + kern for PR #11).
+    expect(mailLog.length).toBe(3);
+    expect(mailLog[0]).toBe("kern");
+    expect(mailLog[1]).toBe("sherlock");
+    expect(mailLog[2]).toBe("kern");
+  });
+
+  test("slow async sender is timed out, subsequent notifications still delivered", async () => {
+    setSendTimeoutMs(100);
+    const config = makeConfig();
+    const state = makeState();
+
+    const errors: string[] = [];
+    const originalError = console.error;
+    console.error = (msg: string) => { errors.push(msg); };
+
+    const mailLog: string[] = [];
+    let slowResolved = false;
+
+    try {
+      const sender: MailSender = (to, _body, _agentId) => {
+        if (to === "sherlock") {
+          return new Promise<void>((resolve) => {
+            setTimeout(() => { slowResolved = true; resolve(); }, 500);
+          });
+        }
+        mailLog.push(to);
+      };
+
+      const runner: SyncRunner = (_cmd, args) => {
+        const endpoint = args[2];
+        if (endpoint?.includes("/pulls?")) {
+          return {
+            status: 0,
+            stdout: JSON.stringify([
+              { number: 10, title: "PR A", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+            ]),
+            stderr: "",
+          } as ReturnType<SyncRunner>;
+        }
+        if (endpoint?.includes("/reviews")) {
+          return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+        }
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      };
+
+      pollOnce(config, state, runner, sender);
+
+      await new Promise((r) => setTimeout(r, 200));
+
+      expect(errors.some((e) => e.includes("timed out after 100ms"))).toBe(true);
+      expect(slowResolved).toBe(false);
+      expect(mailLog).toContain("kern");
+    } finally {
+      console.error = originalError;
+      setSendTimeoutMs(5_000);
+    }
   });
 });
