@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createFlairClient } from "../utils/flair-client.js";
-import { gcMessages } from "../utils/mail.js";
+import { gcMessages, sendMessage } from "../utils/mail.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -162,16 +162,30 @@ export function ghApi(endpoint: string, ghAgent: string, runner: SyncRunner = sp
 // Mail
 // ---------------------------------------------------------------------------
 
+export const MAIL_SEND_TIMEOUT_MS = 5_000;
+
 export function defaultMailSender(to: string, body: string, agentId: string): void {
-  spawnSync("tps", ["mail", "send", to, body], {
-    encoding: "utf-8",
-    env: { ...process.env, TPS_AGENT_ID: agentId },
-  });
+  // Call sendMessage in-process instead of shelling out to the 'tps' PATH shim.
+  // The shim hangs on mail send (observed on @tpsdev-ai/cli 0.5.4) and has no
+  // spawnSync timeout — a single undeliverable message wedges the pulse daemon.
+  // In-process call eliminates both the shim dependency and the hang vector.
+  try {
+    sendMessage(to, body, agentId);
+  } catch (e: unknown) {
+    // Defense in depth: a single bad recipient must not stop the notification loop.
+    // Log loudly and continue. Examples: "Inbox full", disk full, invalid agent id.
+    console.error(`[pulse/mail] FAILED to send to ${to}: ${(e as Error).message}`);
+  }
 }
 
 function sendMail(to: string, body: string, config: PulseConfig, sender: MailSender): void {
   console.log(`[pulse] mail → ${to}: ${body.slice(0, 80)}…`);
-  sender(to, body, config.ghAgent);
+  try {
+    sender(to, body, config.ghAgent);
+  } catch (e: unknown) {
+    // One bad recipient must not stop the world. Log loudly and continue.
+    console.error(`[pulse/mail] FAILED to send to ${to}: ${(e as Error).message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------

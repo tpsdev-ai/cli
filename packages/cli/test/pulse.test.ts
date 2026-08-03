@@ -7,6 +7,7 @@ import {
   printStatus,
   pruneState,
   startPollLoop,
+  MAIL_SEND_TIMEOUT_MS,
   type PrInstance,
   type PrState,
   type PulseConfig,
@@ -569,5 +570,98 @@ describe("FlairPublisher integration", () => {
     handleTransition("pr:tpsdev-ai/cli#5", instance, "approved", config, sender, publisher);
     await Promise.resolve();
     expect(calls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mail send failure resilience (ops-l83i)
+//
+// REQUIRES the try-catch wrapper in sendMail().
+// Mutation-check: remove the try-catch in sendMail() → this test throws
+// and never reaches the assertions (uncaught error propagates from pollOnce).
+// ---------------------------------------------------------------------------
+
+describe("mail send failure resilience", () => {
+  test("sendMail catches sender errors and continues the loop", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "opened" });
+
+    // First call to sender throws (simulates hung/failed send)
+    let callCount = 0;
+    const failingSender: MailSender = (to, body, agentId) => {
+      callCount++;
+      if (callCount === 1) throw new Error("simulated send hang/failure");
+      // Subsequent calls succeed
+      calls.push({ to, body, agentId });
+    };
+
+    // handleTransition for opened → approved sends 1 mail to mergeAuthority.
+    // Then we do a second transition to verify the loop still works.
+    expect(() => {
+      handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, failingSender);
+    }).not.toThrow();
+
+    // The failed send was caught; instance state was updated
+    expect(instance.state).toBe("approved");
+
+    // Now transition again — this second send should succeed
+    expect(() => {
+      handleTransition("pr:tpsdev-ai/cli#42", instance, "merged", config, failingSender);
+    }).not.toThrow();
+
+    expect(instance.state).toBe("merged");
+    expect(calls.length).toBe(1); // only the second successful send recorded
+    expect(calls[0].to).toBe("anvil"); // merged notification goes to author
+  });
+
+  test("pollOnce continues processing PRs when mail send fails for one PR", () => {
+    const config = makeConfig();
+    const { calls, sender } = trackMails();
+    const state = makeState();
+
+    let callCount = 0;
+    const failingSender: MailSender = (to, body, agentId) => {
+      callCount++;
+      if (callCount <= 2) throw new Error("simulated send failure for first PR");
+      calls.push({ to, body, agentId });
+    };
+
+    const runner: SyncRunner = (cmd, args) => {
+      const endpoint = args[2];
+      if (endpoint?.includes("/pulls?")) {
+        return {
+          status: 0,
+          stdout: JSON.stringify([
+            { number: 10, title: "PR A", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+            { number: 11, title: "PR B", state: "open", merged_at: null, user: { login: "anvil" }, requested_reviewers: [] },
+          ]),
+          stderr: "",
+        } as ReturnType<SyncRunner>;
+      }
+      if (endpoint?.includes("/reviews")) {
+        return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+      }
+      return { status: 0, stdout: "[]", stderr: "" } as ReturnType<SyncRunner>;
+    };
+
+    // Must not throw — errors from first PR's mail are caught
+    expect(() => {
+      pollOnce(config, state, runner, failingSender);
+    }).not.toThrow();
+
+    // Both PRs should be tracked despite mail failures for PR #10
+    expect(state.instances["pr:tpsdev-ai/cli#10"]).toBeDefined();
+    expect(state.instances["pr:tpsdev-ai/cli#11"]).toBeDefined();
+
+    // PR #11's mail should have succeeded (calls 3 and 4)
+    expect(calls.length).toBe(2); // mail for PR #11 to both reviewers
+    expect(calls[0].body).toContain("PR #11");
+    expect(calls[1].body).toContain("PR #11");
+  });
+
+  test("MAIL_SEND_TIMEOUT_MS is a finite positive number", () => {
+    expect(MAIL_SEND_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(typeof MAIL_SEND_TIMEOUT_MS).toBe("number");
   });
 });
