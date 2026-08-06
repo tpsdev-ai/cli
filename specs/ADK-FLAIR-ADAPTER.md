@@ -189,3 +189,41 @@ regardless), per-user Flair principals, any Flair server changes.
 - Hardening follow-up (phase 2, not a gate): `FLAIR_ALLOW_REMOTE_URL=<exact
   URL>` compared against the resolved URL, instead of `=1` — kills the
   "set the flag, then typo'd the URL" mode.
+
+---
+
+## TypeScript adapter addendum (2026-08-06, seam verified against adk-js v1.6.0)
+
+Everything above ports except as noted. Source-verified facts: `@google/adk`
+(github.com/google/adk-js) defines `BaseMemoryService` as a two-method TS
+interface (`addSessionToMemory`, `searchMemory`) — stable since inception;
+`PreloadMemoryTool` behaves like Python's (every-turn, exception-swallowing,
+`parts[0].text` query, text-only injection); `Runner({memoryService})` and
+`AdkApiServerOptions.memoryService` accept third-party implementations with
+zero forking.
+
+**Package:** `packages/adk-flair-js` in the flair monorepo, npm name
+`@tpsdev-ai/adk-flair`. Being a normal npm workspace package, it rides the
+release train — Nathan's minor-match policy costs nothing here; version
+alignment is automatic.
+
+**Deltas from the Python design:**
+1. **Registration story changes** — adk-js has NO memory URI registry (its
+   session/artifact URI resolvers are closed if-chains; no memory flag on the
+   dev CLI at all). Ship: exported `FlairMemoryService` class + README showing
+   `new Runner({ memoryService })` and a ~10-line `AdkApiServer` wrapper entry
+   for dev-UI use. No `flair://` scheme.
+2. **Interface surface is exactly two methods** — `addEventsToMemory`/
+   `addMemory` may exist as extra methods (Vertex parity) but nothing in ADK
+   calls them; document that.
+3. **Timestamp units:** adk-js `Event.timestamp` is epoch MILLISECONDS
+   (Python: seconds). `MemoryEntry.timestamp` out is an ISO string. Do not
+   port Python's seconds assumption.
+4. Everything else ports verbatim: compound tag `adk:<app>:<user>` with colon
+   sanitization, mandatory-userId-or-empty, per-hit tag re-verification,
+   timeout budget (2s lifecycle: connect 0.5/read 1.5), localhost-free /
+   `FLAIR_ALLOW_REMOTE_URL=1` gate, key parse-and-validate in ctor with
+   variable-named errors, deterministic record ids, silent-degrade health
+   warning. The 9-test integration suite is the conformance spec — the TS
+   package implements the same tests (explain-plan via the same server
+   support, portability, quickstart-parity with a real model).
