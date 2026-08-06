@@ -41,6 +41,12 @@
     "tps"
   ],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tpsdev-ai/cli.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/tpsdev-ai/cli#readme",
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "@noble/ed25519": "^3.0.0",

@@ -18,6 +18,12 @@
   "dependencies": {
     "require-addon": "^1.2.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tpsdev-ai/cli.git",
+    "directory": "packages/cli-linux-arm64"
+  },
+  "homepage": "https://github.com/tpsdev-ai/cli#readme",
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"

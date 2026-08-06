@@ -32,6 +32,12 @@
     "mail-driven"
   ],
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tpsdev-ai/cli.git",
+    "directory": "packages/agent"
+  },
+  "homepage": "https://github.com/tpsdev-ai/cli/tree/main/packages/agent#readme",
   "dependencies": {
     "@tpsdev-ai/cli": "workspace:*",
     "js-yaml": "^4.1.0",
