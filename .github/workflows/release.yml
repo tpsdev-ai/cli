@@ -70,18 +70,19 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - name: Build workspace packages
-        run: bun run build
+        run: |
+          cd packages/agent && bun run build
+          cd ../cli && bun run build
+          (cd ../pi-tps-mail && bun run build) || true
       - name: Build ${TARGET}
         env:
           TARGET: ${{ matrix.target }}
           PKG: ${{ matrix.pkg }}
           ART: ${{ matrix.artifact }}
         run: |
-          PKG_VERSION=$(node -p "require('./packages/cli/package.json').version")
-          bun build --compile ./packages/cli/bin/tps.ts \
-            --target=${TARGET} \
-            --define "INJECTED_VERSION=\"$PKG_VERSION\"" \
-            --outfile=packages/cli/dist/${ART}
+          bun run --filter @tpsdev-ai/cli build:binary:${TARGET#bun-}
+          # The build script outputs to dist/tps-<platform>, copy to artifact name
+          cp packages/cli/dist/tps-${TARGET#bun-} packages/cli/dist/${ART}
           sha256sum packages/cli/dist/${ART} > packages/cli/dist/${ART}.sha256
       - name: Stage binary
         env:
@@ -113,10 +114,15 @@ jobs:
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
+      - name: Build workspace packages
+        run: |
+          cd packages/agent && bun run build
+          cd ../cli && bun run build
+          (cd ../pi-tps-mail && bun run build) || true
       - name: Build linux-x64 release binary
         run: |
-          PKG_VERSION=$(node -p "require('./packages/cli/package.json').version")
-          bun build --compile ./packages/cli/bin/tps.ts             --target=bun-linux-x64             --define "INJECTED_VERSION=\"$PKG_VERSION\""             --outfile=/tmp/tps-release-smoke
+          bun run --filter @tpsdev-ai/cli build:binary:linux-x64
+          cp packages/cli/dist/tps-linux-x64 /tmp/tps-release-smoke
           chmod +x /tmp/tps-release-smoke
       - name: Smoke test --version
         run: |
@@ -126,11 +132,36 @@ jobs:
             echo "❌ version mismatch: binary=$VERSION_OUTPUT package=$PKG_VERSION"
             exit 1
           fi
-      - name: Smoke test office list
+          echo "✅ --version OK"
+      - name: Smoke test identity init
         run: |
           export HOME=$(mktemp -d)
-          mkdir -p "$HOME/.tps/branch-office"
-          TPS_OFFICE_SKIP_VM=1 /tmp/tps-release-smoke office list >/tmp/tps-office-list.log 2>&1
+          export TPS_VAULT_KEY="ci-release-smoke"
+          /tmp/tps-release-smoke identity init --json > /tmp/tps-identity.json
+          FP=$(node -p "try { JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint } catch(e) { '' }")
+          if [ -z "$FP" ]; then
+            echo "❌ identity init failed"
+            exit 1
+          fi
+          echo "✅ identity init OK (fingerprint: $FP)"
+      - name: Smoke test Noise handshake
+        run: |
+          export HOME=$(mktemp -d)
+          export TPS_VAULT_KEY="ci-release-smoke"
+          timeout 15 /tmp/tps-release-smoke branch init --name release-smoke 2>&1 | tee /tmp/tps-branch.log || true
+          if grep -qE "Branch identity created|Listening on" /tmp/tps-branch.log; then
+            echo "✅ Noise handshake OK"
+          else
+            echo "❌ Noise handshake failed"
+            exit 1
+          fi
+      - name: Smoke test no baked paths
+        run: |
+          if grep -q "/home/runner" /tmp/tps-release-smoke; then
+            echo "❌ Found /home/runner references in binary"
+            exit 1
+          fi
+          echo "✅ No baked CI paths"
 
   publish-packages:
     name: Publish npm packages

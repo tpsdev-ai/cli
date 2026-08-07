@@ -9,7 +9,7 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { galLookup } from "../utils/gal.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
-import { signEnvelope, type Envelope, type ChainEntry } from "../lib/signEnvelope.js";
+import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
 import { randomUUID } from "node:crypto";
 

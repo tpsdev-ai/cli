@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { verifyEnvelope, type FlairClient } from "../lib/signEnvelope.js";
+import { verifyEnvelope, type FlairClient } from "@tpsdev-ai/agent";
 
 export interface MailMessage {
   id: string;

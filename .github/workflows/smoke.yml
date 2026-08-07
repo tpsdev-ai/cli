@@ -1,0 +1,121 @@
+name: Smoke (compiled binaries)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'packages/cli/**'
+      - 'packages/agent/**'
+      - 'bun.lock'
+      - '.github/workflows/smoke.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/cli/**'
+      - 'packages/agent/**'
+      - 'bun.lock'
+      - '.github/workflows/smoke.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runs-on: ubuntu-latest
+          - target: linux-arm64
+            runs-on: ubuntu-24.04-arm
+          # GitHub retired Intel mac runners (macos-13 queues forever).
+          # This job runs on Apple Silicon under Rosetta 2 translation —
+          # bun-compiled x64 binaries auto-translate. Bare-metal Intel mac
+          # is untested and that is a documented gap, not a hidden one.
+          - target: darwin-x64
+            runs-on: macos-latest
+          - target: darwin-arm64
+            runs-on: macos-latest
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - name: Build workspace packages (agent → cli)
+        run: |
+          # Build agent first — it no longer depends on cli's build output
+          # (signEnvelope was moved to agent, breaking the circular dep).
+          cd packages/agent && bun run build
+          # Build cli with agent types now available
+          cd ../cli && bun run build
+          # Build pi-tps-mail if present
+          (cd ../pi-tps-mail && bun run build) || true
+      - name: Build portable binary (${{ matrix.target }})
+        run: bun run --filter @tpsdev-ai/cli build:binary:${{ matrix.target }}
+      - name: Set up Rosetta 2 prefix (darwin-x64)
+        if: matrix.target == 'darwin-x64'
+        run: echo "ARCH_PREFIX=arch -x86_64" >> $GITHUB_ENV
+      - name: Acceptance — version
+        run: |
+          BIN="packages/cli/dist/tps-${{ matrix.target }}"
+          chmod +x "$BIN"
+          VERSION_OUTPUT=$($ARCH_PREFIX "$BIN" --version)
+          PKG_VERSION=$(node -p "require('./packages/cli/package.json').version")
+          echo "Binary version: $VERSION_OUTPUT"
+          echo "Package version: $PKG_VERSION"
+          if [ "$VERSION_OUTPUT" != "$PKG_VERSION" ]; then
+            echo "❌ version mismatch"
+            exit 1
+          fi
+          echo "✅ --version OK"
+      - name: Acceptance — identity init (exercises sodium)
+        run: |
+          BIN="packages/cli/dist/tps-${{ matrix.target }}"
+          export HOME=$(mktemp -d)
+          export TPS_VAULT_KEY="ci-smoke-test-key"
+          # Capture stdout only — stderr (warnings) goes to CI log
+          $ARCH_PREFIX "$BIN" identity init --json > /tmp/tps-identity.json
+          echo "Identity output:"
+          cat /tmp/tps-identity.json
+          # Verify we got a valid fingerprint
+          FP=$(node -p "try { JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint } catch(e) { '' }")
+          if [ -z "$FP" ]; then
+            echo "❌ identity init failed — no fingerprint"
+            exit 1
+          fi
+          echo "✅ identity init OK (fingerprint: $FP)"
+      - name: Acceptance — Noise handshake (branch init)
+        run: |
+          BIN="packages/cli/dist/tps-${{ matrix.target }}"
+          export HOME=$(mktemp -d)
+          export TPS_VAULT_KEY="ci-smoke-test-key"
+          # branch init exercises the full noise-handshake → sodium-javascript path
+          # portable timeout: GNU `timeout` does not exist on stock macOS runners (this exact line
+          # failed with "timeout: command not found" on darwin-arm64 while every linux lane passed)
+          perl -e 'alarm shift; exec @ARGV' 15 $ARCH_PREFIX "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
+          if grep -q "Branch identity created" /tmp/tps-branch.log; then
+            echo "✅ Noise handshake OK"
+          elif grep -q "Listening on" /tmp/tps-branch.log; then
+            echo "✅ Noise handshake OK (listening)"
+          else
+            echo "Branch init output:"
+            cat /tmp/tps-branch.log
+            echo "❌ Noise handshake failed"
+            exit 1
+          fi
+      - name: Acceptance — no baked paths
+        run: |
+          BIN="packages/cli/dist/tps-${{ matrix.target }}"
+          COUNT=$(grep -ac "/home/runner" "$BIN" || echo 0)
+          if [ "$COUNT" -ne 0 ]; then
+            echo "❌ Found $COUNT /home/runner references in binary"
+            exit 1
+          fi
+          echo "✅ No baked CI paths"

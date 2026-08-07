@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
-import { signEnvelope, type Envelope, type ChainEntry } from "../src/lib/signEnvelope.js";
+import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 // Wire sha512 for sync sign operations (same as production).
 import { hashes } from "@noble/ed25519";

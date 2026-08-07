@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFile
 import { join } from "node:path";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
-import { verifyEnvelope, type FlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
+import { verifyEnvelope, type FlairClient } from "../lib/signEnvelope.js";
 
 export interface MailMessage {
   filename: string;

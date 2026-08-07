@@ -121,7 +121,7 @@ export async function withNono(
       );
       process.exit(1);
     } else {
-      console.warn(
+      console.error(
         `⚠️  nono not found — running ${profile} WITHOUT isolation. Install nono for security: https://nono.sh`
       );
       return fn();
@@ -154,7 +154,7 @@ export function runCommandUnderNono(
       );
       return 1;
     }
-    console.warn(
+    console.error(
       `⚠️  nono not found — running WITHOUT isolation: ${cmd.join(" ")}`
     );
     const result = spawnSync(cmd[0]!, cmd.slice(1), {
@@ -197,7 +197,7 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
   const bundledDir = findBundledProfilesDir();
 
   if (!existsSync(bundledDir)) {
-    if (!silent) console.warn(`⚠️  No bundled nono profiles found at ${bundledDir}`);
+    if (!silent) console.error(`⚠️  No bundled nono profiles found at ${bundledDir}`);
     return;
   }
 

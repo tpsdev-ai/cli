@@ -16,9 +16,14 @@
     "README.md"
   ],
   "dependencies": {
-    "sodium-native": "^5.0.10",
     "require-addon": "^1.2.0"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tpsdev-ai/cli.git",
+    "directory": "packages/cli-darwin-x64"
+  },
+  "homepage": "https://github.com/tpsdev-ai/cli#readme",
   "license": "Apache-2.0",
   "publishConfig": {
     "access": "public"
