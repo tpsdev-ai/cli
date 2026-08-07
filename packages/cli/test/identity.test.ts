@@ -373,4 +373,29 @@ describe("CLI integration", () => {
       expect(e.status).toBe(1);
     }
   });
+
+  test("identity init --json emits parseable JSON on stdout (warnings on stderr)", () => {
+    const { execSync } = require("node:child_process");
+    // Run WITHOUT --nonono so any warnings (nono not found, etc.) would fire.
+    // They must go to stderr — stdout must be clean parseable JSON.
+    const result = execSync(
+      `bun ${TPS_BIN} identity init --json`,
+      {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          TPS_VAULT_KEY: "test-passphrase",
+          TPS_IDENTITY_DIR: join(tempDir, "cli-identity-stdout"),
+          TPS_REGISTRY_DIR: join(tempDir, "cli-registry-stdout"),
+        },
+        // Capture stdout only — stderr is separate
+        stdio: ["pipe", "pipe", "pipe"],
+      }
+    );
+    // Must be parseable JSON — no warning text mixed in
+    const parsed = JSON.parse(result);
+    expect(parsed.fingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(parsed.signingPublicKey).toMatch(/^[0-9a-f]{64}$/);
+    expect(parsed.encryptionPublicKey).toMatch(/^[0-9a-f]{64}$/);
+  });
 });

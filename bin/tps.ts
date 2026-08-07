@@ -88,7 +88,7 @@ async function checkNono() {
   if (command === "office" && rest[0] === "relay") return; // relay runs in background
   const { findNono } = await import("../src/utils/nono.js");
   if (!findNono()) {
-    console.warn(
+    console.error(
       "⚠️  nono not found. Host agents will run without process isolation.\n" +
       "   Install nono for syscall filtering + filesystem boundaries.\n" +
       "   Use --nonono to run anyway (not recommended).\n"

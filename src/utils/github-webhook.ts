@@ -76,7 +76,7 @@ function formatEvent(event: string, payload: Record<string, unknown>): string {
 
 export async function handleGithubWebhook(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!webhookSecret()) {
-    console.warn("[webhook] GITHUB_WEBHOOK_SECRET not set — all webhook requests will be rejected");
+    console.error("[webhook] GITHUB_WEBHOOK_SECRET not set — all webhook requests will be rejected");
     res.statusCode = 503;
     res.end("Webhook not configured");
     return;

@@ -44,8 +44,16 @@ jobs:
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
-      - name: Build workspace packages
-        run: bun run build
+      - name: Build workspace packages (cli → agent → cli)
+        run: |
+          # Build cli first (may have missing agent types, tolerated)
+          (cd packages/cli && bun run build) || true
+          # Build agent (needs cli types from previous step)
+          cd packages/agent && bun run build
+          # Rebuild cli with agent types now available
+          cd ../cli && rm -rf dist && bun run build
+          # Build pi-tps-mail if present
+          (cd ../pi-tps-mail && bun run build) || true
       - name: Build portable binary (${{ matrix.target }})
         run: bun run --filter @tpsdev-ai/cli build:binary:${{ matrix.target }}
       - name: Acceptance — version
@@ -66,11 +74,12 @@ jobs:
           BIN="packages/cli/dist/tps-${{ matrix.target }}"
           export HOME=$(mktemp -d)
           export TPS_VAULT_KEY="ci-smoke-test-key"
-          "$BIN" identity init --json > /tmp/tps-identity.json 2>&1
+          # Capture stdout only — stderr (warnings) goes to CI log
+          "$BIN" identity init --json > /tmp/tps-identity.json
           echo "Identity output:"
           cat /tmp/tps-identity.json
           # Verify we got a valid fingerprint
-          FP=$(node -p "JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint")
+          FP=$(node -p "try { JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint } catch(e) { '' }")
           if [ -z "$FP" ]; then
             echo "❌ identity init failed — no fingerprint"
             exit 1

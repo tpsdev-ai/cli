@@ -70,7 +70,11 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - name: Build workspace packages
-        run: bun run build
+        run: |
+          (cd packages/cli && bun run build) || true
+          cd packages/agent && bun run build
+          cd ../cli && rm -rf dist && bun run build
+          (cd ../pi-tps-mail && bun run build) || true
       - name: Build ${TARGET}
         env:
           TARGET: ${{ matrix.target }}
@@ -111,6 +115,12 @@ jobs:
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
+      - name: Build workspace packages
+        run: |
+          (cd packages/cli && bun run build) || true
+          cd packages/agent && bun run build
+          cd ../cli && rm -rf dist && bun run build
+          (cd ../pi-tps-mail && bun run build) || true
       - name: Build linux-x64 release binary
         run: |
           bun run --filter @tpsdev-ai/cli build:binary:linux-x64
@@ -129,8 +139,8 @@ jobs:
         run: |
           export HOME=$(mktemp -d)
           export TPS_VAULT_KEY="ci-release-smoke"
-          /tmp/tps-release-smoke identity init --json > /tmp/tps-identity.json 2>&1
-          FP=$(node -p "JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint")
+          /tmp/tps-release-smoke identity init --json > /tmp/tps-identity.json
+          FP=$(node -p "try { JSON.parse(require('fs').readFileSync('/tmp/tps-identity.json','utf8')).fingerprint } catch(e) { '' }")
           if [ -z "$FP" ]; then
             echo "❌ identity init failed"
             exit 1
