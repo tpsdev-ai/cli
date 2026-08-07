@@ -30,8 +30,12 @@ jobs:
             runs-on: ubuntu-latest
           - target: linux-arm64
             runs-on: ubuntu-24.04-arm
+          # GitHub retired Intel mac runners (macos-13 queues forever).
+          # This job runs on Apple Silicon under Rosetta 2 translation —
+          # bun-compiled x64 binaries auto-translate. Bare-metal Intel mac
+          # is untested and that is a documented gap, not a hidden one.
           - target: darwin-x64
-            runs-on: macos-13
+            runs-on: macos-latest
           - target: darwin-arm64
             runs-on: macos-latest
     runs-on: ${{ matrix.runs-on }}
@@ -55,11 +59,14 @@ jobs:
           (cd ../pi-tps-mail && bun run build) || true
       - name: Build portable binary (${{ matrix.target }})
         run: bun run --filter @tpsdev-ai/cli build:binary:${{ matrix.target }}
+      - name: Set up Rosetta 2 prefix (darwin-x64)
+        if: matrix.target == 'darwin-x64'
+        run: echo "ARCH_PREFIX=arch -x86_64" >> $GITHUB_ENV
       - name: Acceptance — version
         run: |
           BIN="packages/cli/dist/tps-${{ matrix.target }}"
           chmod +x "$BIN"
-          VERSION_OUTPUT=$("$BIN" --version)
+          VERSION_OUTPUT=$($ARCH_PREFIX "$BIN" --version)
           PKG_VERSION=$(node -p "require('./packages/cli/package.json').version")
           echo "Binary version: $VERSION_OUTPUT"
           echo "Package version: $PKG_VERSION"
@@ -74,7 +81,7 @@ jobs:
           export HOME=$(mktemp -d)
           export TPS_VAULT_KEY="ci-smoke-test-key"
           # Capture stdout only — stderr (warnings) goes to CI log
-          "$BIN" identity init --json > /tmp/tps-identity.json
+          $ARCH_PREFIX "$BIN" identity init --json > /tmp/tps-identity.json
           echo "Identity output:"
           cat /tmp/tps-identity.json
           # Verify we got a valid fingerprint
@@ -92,7 +99,7 @@ jobs:
           # branch init exercises the full noise-handshake → sodium-javascript path
           # portable timeout: GNU `timeout` does not exist on stock macOS runners (this exact line
           # failed with "timeout: command not found" on darwin-arm64 while every linux lane passed)
-          perl -e 'alarm shift; exec @ARGV' 15 "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
+          perl -e 'alarm shift; exec @ARGV' 15 $ARCH_PREFIX "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
           if grep -q "Branch identity created" /tmp/tps-branch.log; then
             echo "✅ Noise handshake OK"
           elif grep -q "Listening on" /tmp/tps-branch.log; then
