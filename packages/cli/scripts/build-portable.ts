@@ -51,6 +51,19 @@ const result = await Bun.build({
         });
       },
     },
+    {
+      name: "stub-msgpackr-extract",
+      setup(build) {
+        // msgpackr-extract is an optional native addon for msgpackr.
+        // It bakes __dirname into the bundle (→ /home/runner on CI),
+        // which fails the binary-hygiene gate. Stub it out so msgpackr
+        // falls back to its pure-JS codec — the portable binary doesn't
+        // ship native addons anyway.
+        build.onResolve({ filter: /^msgpackr-extract$/ }, () => {
+          return { path: resolve(pkgRoot, "scripts", "stubs", "empty.js") };
+        });
+      },
+    },
   ],
   naming: "[dir]/tps-bundle.[ext]",
 });

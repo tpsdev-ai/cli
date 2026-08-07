@@ -12,7 +12,7 @@ import {
   type Envelope,
   type ChainEntry,
   type FlairClient,
-} from "../src/lib/signEnvelope.js";
+} from "@tpsdev-ai/agent";
 
 // Wire sha512 for sync sign operations (same as production).
 import { hashes } from "@noble/ed25519";

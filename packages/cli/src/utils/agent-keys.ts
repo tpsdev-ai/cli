@@ -86,7 +86,7 @@ function seedFromPkcs8Der(der: Buffer): Buffer | null {
  * Parse TPS_INBOUND_CHAIN_JSON into a ChainEntry array.
  * Returns null if unset, empty, or invalid.
  */
-import type { ChainEntry } from "../lib/signEnvelope.js";
+import type { ChainEntry } from "@tpsdev-ai/agent";
 
 export function parseInboundChain(raw: string | undefined): ChainEntry[] | null {
   if (!raw || raw.trim() === "") return null;

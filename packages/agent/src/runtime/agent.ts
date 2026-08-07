@@ -10,7 +10,7 @@ import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
-import type { FlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
+import type { FlairClient } from "../lib/signEnvelope.js";
 
 export class AgentRuntime {
   private loop: EventLoop;

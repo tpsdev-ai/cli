@@ -15,7 +15,7 @@ import {
   signEnvelope,
   type Envelope,
   type ChainEntry,
-} from "../src/lib/signEnvelope.js";
+} from "@tpsdev-ai/agent";
 
 // Wire sha512 for sync sign operations.
 import { hashes } from "@noble/ed25519";

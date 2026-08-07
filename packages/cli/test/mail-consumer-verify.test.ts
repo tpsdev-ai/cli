@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import canonicalize from "canonicalize";
-import { signEnvelope, type Envelope, verifyEnvelope } from "../src/lib/signEnvelope.js";
+import { signEnvelope, type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
 import { sendMessage, checkMessages, getInbox } from "../src/utils/mail.js";
 
 // Wire sha512 for sync sign operations.

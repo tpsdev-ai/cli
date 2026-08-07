@@ -44,14 +44,13 @@ jobs:
         with:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
-      - name: Build workspace packages (cli → agent → cli)
+      - name: Build workspace packages (agent → cli)
         run: |
-          # Build cli first (may have missing agent types, tolerated)
-          (cd packages/cli && bun run build) || true
-          # Build agent (needs cli types from previous step)
+          # Build agent first — it no longer depends on cli's build output
+          # (signEnvelope was moved to agent, breaking the circular dep).
           cd packages/agent && bun run build
-          # Rebuild cli with agent types now available
-          cd ../cli && rm -rf dist && bun run build
+          # Build cli with agent types now available
+          cd ../cli && bun run build
           # Build pi-tps-mail if present
           (cd ../pi-tps-mail && bun run build) || true
       - name: Build portable binary (${{ matrix.target }})

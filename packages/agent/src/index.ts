@@ -40,3 +40,7 @@ export { loadAgentConfig } from "./config.js";
 // Flair integration
 export { FlairContextProvider } from "./io/flair.js";
 export type { FlairConfig } from "./runtime/types.js";
+
+// Signing
+export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
+export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";

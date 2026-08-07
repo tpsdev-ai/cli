@@ -71,9 +71,8 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - name: Build workspace packages
         run: |
-          (cd packages/cli && bun run build) || true
           cd packages/agent && bun run build
-          cd ../cli && rm -rf dist && bun run build
+          cd ../cli && bun run build
           (cd ../pi-tps-mail && bun run build) || true
       - name: Build ${TARGET}
         env:
@@ -117,9 +116,8 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - name: Build workspace packages
         run: |
-          (cd packages/cli && bun run build) || true
           cd packages/agent && bun run build
-          cd ../cli && rm -rf dist && bun run build
+          cd ../cli && bun run build
           (cd ../pi-tps-mail && bun run build) || true
       - name: Build linux-x64 release binary
         run: |
