@@ -90,7 +90,9 @@ jobs:
           export HOME=$(mktemp -d)
           export TPS_VAULT_KEY="ci-smoke-test-key"
           # branch init exercises the full noise-handshake → sodium-javascript path
-          timeout 15 "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
+          # portable timeout: GNU `timeout` does not exist on stock macOS runners (this exact line
+          # failed with "timeout: command not found" on darwin-arm64 while every linux lane passed)
+          perl -e 'alarm shift; exec @ARGV' 15 "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
           if grep -q "Branch identity created" /tmp/tps-branch.log; then
             echo "✅ Noise handshake OK"
           elif grep -q "Listening on" /tmp/tps-branch.log; then
