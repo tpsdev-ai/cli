@@ -17,7 +17,7 @@ import {
   verifyEnvelope,
   type Envelope,
   type ChainEntry,
-} from "@tpsdev-ai/cli/lib/signEnvelope";
+} from "@tpsdev-ai/agent";
 
 // Wire sha512 for sync sign operations.
 import { hashes } from "@noble/ed25519";

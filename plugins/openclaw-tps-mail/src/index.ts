@@ -38,8 +38,9 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
-import type { Envelope } from "@tpsdev-ai/cli/lib/signEnvelope";
-import { verifyEnvelope } from "@tpsdev-ai/cli/lib/signEnvelope";
+import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope } from "@tpsdev-ai/agent";
+import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { createVerifyClient } from "./verify-adapter.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
@@ -210,6 +211,88 @@ function deliverOutboundMail(
     return { path: writeMailFile(mailDir, message.to, message), route: "local" };
   }
   return { path: writeOutboxFile(message), route: "outbox" };
+}
+
+/**
+ * Sign a dispatcher reply as a v1 signed envelope, exactly like `tps mail
+ * send` (packages/cli/src/commands/mail.ts `maybeSignEnvelopeBody`). Returns
+ * the JSON-stringified signed envelope, or null when the agent has no
+ * signing key (caller must warn and write nothing).
+ */
+function signReplyEnvelope(from: string, to: string, body: string): string | null {
+  const privkey = readAgentPrivateKey(from);
+  if (!privkey) return null;
+
+  const now = new Date().toISOString();
+  const chain: ChainEntry[] = [
+    {
+      agent: "system",
+      kind: "human",
+      timestamp: now,
+      rationale: "tps-mail dispatcher reply (no inbound chain)",
+      signature: null,
+    },
+    {
+      agent: from,
+      kind: "agent",
+      timestamp: now,
+      rationale: `agent ${from} dispatcher reply`,
+      signature: null,
+    },
+  ];
+
+  const envelope: Envelope = {
+    v: 1,
+    from,
+    to,
+    subject: `mail to ${to}`,
+    body,
+    messageId: randomUUID(),
+    timestamp: now,
+    delegationChain: chain,
+  };
+
+  return JSON.stringify(signEnvelope(envelope, { [from]: privkey }));
+}
+
+/**
+ * Idempotency check (cli#338 requirement 2): has this agent already sent an
+ * explicit reply to `sender` since the inbound was delivered? Scans the
+ * sender's new/ and cur/ maildirs for a mail whose `from == fromAgent` and
+ * `timestamp >= sinceTs` — the signed envelope `tps mail send` writes.
+ */
+function hasExplicitReply(
+  mailDir: string,
+  sender: string,
+  fromAgent: string,
+  sinceTs: string,
+): boolean {
+  for (const sub of ["new", "cur"]) {
+    const dir = resolve(mailDir, sender, sub);
+    if (!existsSync(dir)) continue;
+    for (const f of readdirSync(dir)) {
+      if (!f.endsWith(".json")) continue;
+      const m = readMailFile(resolve(dir, f));
+      if (!m) continue;
+      if (m.from === fromAgent && m.timestamp >= sinceTs) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Is `to` a local recipient? True when it has a maildir under `mailDir` on
+ * this host, or when it is bound to this gateway. Local recipients are
+ * delivered to their maildir — never to ~/.tps/outbox (cli#338 requirement 3).
+ */
+function isLocalRecipient(
+  mailDir: string,
+  cfg: any,
+  accountId: string,
+  to: string,
+): boolean {
+  if (existsSync(resolve(mailDir, to))) return true;
+  return findBoundAgents(cfg, accountId).includes(to);
 }
 
 /**
@@ -498,21 +581,22 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         ? await channelRuntime.reply.finalizeInboundContext(rawMsgCtx)
         : { ...rawMsgCtx, CommandAuthorized: false };
 
+      // One reply per inbound, at most (cli#338). The dispatcher's deliver
+      // callback receives blocks in order; we emit only the FINAL message,
+      // once, and only if the agent did not already send an explicit reply
+      // via `tps mail send` during the turn.
+      let delivered = false;
       try {
-        // NOTE on the deliver callback: in practice, openclaw agents using
-        // tool-based replies (e.g., `tps mail send flint "..."`) write their
-        // responses via their own tool calls rather than emitting through
-        // the reply dispatcher. The deliver callback below handles the case
-        // where an agent DOES emit output through the dispatcher — useful
-        // for future agents that use the reply path instead of tools. For
-        // tool-using agents (the current K&S / Anvil / Pulse pattern) the
-        // deliver callback is a no-op and the reply still lands in the
-        // recipient's inbox via the `tps mail send` tool path.
         await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
           ctx: msgCtx,
           cfg,
           dispatcherOptions: {
-            deliver: async (payload: any, _info: any) => {
+            deliver: async (payload: any, info: any) => {
+              // Requirement 1: only the final message, once.
+              if (info?.kind !== "final") return;
+              if (delivered) return;
+              delivered = true;
+
               const replyText: string =
                 (typeof payload?.text === "string" ? payload.text : "") ||
                 (Array.isArray(payload?.content)
@@ -524,29 +608,49 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 "";
               if (!replyText.trim()) return;
 
-              const reply: TpsMailBody = {
-                id: randomUUID(),
-                from: recipient,
-                to: msg.from,
-                body: replyText,
-                timestamp: new Date().toISOString(),
-                replyToId: msg.id,
-                headers: {
-                  "X-TPS-Trust": "agent",
-                  "X-TPS-Surface": CHANNEL_ID,
-                  "X-TPS-InReplyTo": msg.id,
-                },
-                deliveryAttempts: 0,
-              };
-              const { route } = deliverOutboundMail(
-                cfg as any,
-                ctx.accountId ?? "default",
-                account.mailDir,
-                reply,
-              );
-              log?.info?.(
-                `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${route})`,
-              );
+              // Requirement 2: idempotent with explicit sends — if the agent
+              // already ran `tps mail send <sender>`, write nothing.
+              if (hasExplicitReply(account.mailDir, msg.from, recipient, msg.timestamp)) {
+                log?.info?.(
+                  `tps-mail: explicit reply already sent to ${msg.from}; dispatcher skipping`,
+                );
+                return;
+              }
+
+              // Requirement 4: sign the reply (Ed25519 + messageId).
+              const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
+              if (!signedBody) {
+                log?.warn?.(
+                  `tps-mail: no signing key for ${recipient}; cannot sign dispatcher reply to ${msg.from}`,
+                );
+                return;
+              }
+
+              // Requirement 3 + 5: local recipient → maildir (signed); else warn.
+              if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
+                const reply: TpsMailBody = {
+                  id: randomUUID(),
+                  from: recipient,
+                  to: msg.from,
+                  body: signedBody,
+                  timestamp: new Date().toISOString(),
+                  replyToId: msg.id,
+                  headers: {
+                    "X-TPS-Trust": "agent",
+                    "X-TPS-Surface": CHANNEL_ID,
+                    "X-TPS-InReplyTo": msg.id,
+                  },
+                  deliveryAttempts: 0,
+                };
+                writeMailFile(account.mailDir, msg.from, reply);
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
+                );
+              } else {
+                log?.warn?.(
+                  `tps-mail: cannot deliver reply to ${msg.from}: no local maildir or binding`,
+                );
+              }
             },
           },
         });

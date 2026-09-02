@@ -10,6 +10,7 @@
   "exports": {
     ".": "./dist/src/index.js",
     "./lib/signEnvelope": "./dist/src/lib/signEnvelope.js",
+    "./utils/agent-keys": "./dist/src/utils/agent-keys.js",
     "./utils/flair-client": "./dist/src/utils/flair-client.js"
   },
   "optionalDependencies": {

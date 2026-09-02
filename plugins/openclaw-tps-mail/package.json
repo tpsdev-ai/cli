@@ -53,6 +53,7 @@
     "node": ">=22"
   },
   "dependencies": {
+    "@tpsdev-ai/agent": "file:../../packages/agent",
     "@tpsdev-ai/cli": "file:../../packages/cli"
   }
 }
