@@ -13,7 +13,7 @@
  */
 
 import { FlairClient as CliFlairClient, createFlairClient } from "@tpsdev-ai/cli/utils/flair-client";
-import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/cli/lib/signEnvelope";
+import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
