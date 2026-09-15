@@ -15,7 +15,8 @@
 #   scripts/check-nono-profiles.sh
 #   NONO_BIN=/path/to/nono scripts/check-nono-profiles.sh
 #
-# CI: set NONO_BIN (pinned) — see .github/workflows/test.yml "nono-gate".
+# CI: set NONO_BIN (pinned) — see .github/workflows/test.yml "nono-profile-gate"
+# (ubuntu-latest + macos-14).
 
 set -euo pipefail
 
@@ -78,7 +79,7 @@ ok "all ${#json_files[@]} profiles pass 'nono profile validate --strict'"
 # root. (A genuine enforcement break still fails loudly below.)
 TMP="$(mktemp -d "${HOME:?}/.nono-gate-probe.XXXXXX")"
 trap 'rm -rf "${TMP}"' EXIT
-mkdir -p "${TMP}/home/.tps/secrets" "${TMP}/ws"
+mkdir -p "${TMP}/home/.tps/secrets" "${TMP}/home/.tps/identity" "${TMP}/ws"
 
 AGENT_PROFILE="${PROFILE_DIR}/tps-agent-run.json"
 
@@ -99,5 +100,34 @@ if HOME="${TMP}/home" "${NONO_BIN}" run --profile "${AGENT_PROFILE}" \
 fi
 [[ ! -f "${TMP}/home/.tps/secrets/leak" ]] || fail "deny-list FAILED: ${TMP}/home/.tps/secrets/leak exists"
 ok "deny-list: write to ~/.tps/secrets is blocked"
+
+# The agent must be able to read its OWN identity key (the launch grants
+# ~/.tps/identity read; the base must not deny it — nono resolves deny over
+# grant, so a stale deny would silently break signing). cli#341 S1b r2.
+printf 'KEYMATERIAL' > "${TMP}/home/.tps/identity/agent1.key"
+if ! ident_out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" run --profile "${AGENT_PROFILE}" \
+      --workdir "${TMP}/ws" --allow "${TMP}/ws" --read "${TMP}/home/.tps/identity" \
+      -- sh -c "cat '${TMP}/home/.tps/identity/agent1.key'" 2>&1)"; then
+  fail "identity key read FAILED: the agent cannot read its own key under tps-agent-run"
+fi
+case "${ident_out}" in
+  *KEYMATERIAL*) ok "agent identity key is readable under tps-agent-run" ;;
+  *) fail "agent identity key not readable (got: ${ident_out})" ;;
+esac
+
+# nono why assertions (deny must survive the broad system reads).
+why_denied() { # <path>
+  local out verdict
+  out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" why --path "$1" --op read --profile "${AGENT_PROFILE}" 2>&1 || true)"
+  verdict="${out%%$'\n'*}"
+  case "${out}" in
+    *DENIED*) ok "denied: $1" ;;
+    *) fail "expected DENIED for $1, got: ${verdict}" ;;
+  esac
+}
+why_denied "${TMP}/home/.tps/secrets/leak"
+why_denied "/etc/shadow"
+why_denied "/etc/sudoers"
+why_denied "/etc/ssh/ssh_host_rsa_key"
 
 echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement verified)"

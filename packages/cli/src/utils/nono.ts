@@ -213,7 +213,13 @@ export function buildNonoArgs(
   options: NonoOptions,
   cmd: string[]
 ): string[] {
-  const args = ["run", "--profile", profile, "--allow-cwd"];
+  // Pass the RESOLVED path, not the bare name (cli#351 r2, MEDIUM 3).
+  // checkProfileLoadable validates resolveProfilePath(name) (user dir, then
+  // bundled), but nono resolves a bare name against its own search path
+  // (the user dir). Passing the path makes what we validate the artifact that
+  // actually runs.
+  const profilePath = resolveProfilePath(profile) ?? profile;
+  const args = ["run", "--profile", profilePath, "--allow-cwd"];
 
   if (options.workdir) {
     args.push("--workdir", options.workdir);
@@ -329,7 +335,9 @@ export function runCommandUnderNono(
   const result = spawnSync(nono, args, {
     stdio: "inherit",
     encoding: "utf-8",
-    env: process.env,
+    // TPS_NONO_ACTIVE is the double-wrap guard the CLI UIs read; setting it on
+    // every nono child keeps one launch path (cli#351 r2).
+    env: { ...process.env, TPS_NONO_ACTIVE: "1" },
   });
   return result.status ?? 1;
 }

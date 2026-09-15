@@ -11,13 +11,14 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   checkProfileLoadable,
   resolveProfilePath,
   systemReadPaths,
   harnessReadPaths,
+  buildNonoArgs,
 } from "../src/utils/nono.js";
 
 const FAKE_NONO_DIR = join(import.meta.dir, "fakes/nono/bin");
@@ -93,6 +94,35 @@ describe("the read set replaces `--read /`", () => {
     expect(paths).not.toContain("/");
     expect(paths.some((p) => p.endsWith(join(".tps", "identity")))).toBe(true);
     expect(paths.some((p) => p.endsWith(".bun"))).toBe(true);
+  });
+});
+
+describe("one validated launch path", () => {
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) out.push(...walk(p));
+      else out.push(p);
+    }
+    return out;
+  }
+
+  test("no source file spawnSync's nono outside the validated helper", () => {
+    const srcDir = join(import.meta.dir, "..", "src");
+    const offenders = walk(srcDir)
+      .filter((f) => /\.(ts|tsx)$/.test(f))
+      .filter((f) => readFileSync(f, "utf-8").includes("spawnSync(nono"))
+      .map((f) => f.slice(srcDir.length + 1));
+    // Only the validated helper (runCommandUnderNono) may invoke nono directly.
+    expect(offenders).toEqual(["utils/nono.ts"]);
+  });
+
+  test("buildNonoArgs passes the resolved absolute profile path, not the bare name", () => {
+    const args = buildNonoArgs("tps-hire", {}, ["echo", "x"]);
+    const profileArg = args[args.indexOf("--profile") + 1];
+    expect(profileArg.startsWith("/")).toBe(true);
+    expect(profileArg.endsWith("tps-hire.json")).toBe(true);
   });
 });
 

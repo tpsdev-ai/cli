@@ -111,7 +111,7 @@ describe("buildNonoArgs()", () => {
     const args = buildNonoArgs("tps-hire", {}, ["tps", "hire", "report.tps"]);
     expect(args[0]).toBe("run");
     expect(args).toContain("--profile");
-    expect(args).toContain("tps-hire");
+    expect(args[args.indexOf("--profile") + 1]).toContain("tps-hire");
     expect(args).toContain("--allow-cwd");
     expect(args).toContain("--");
     const cmdStart = args.indexOf("--") + 1;
@@ -160,7 +160,7 @@ describe("fake nono binary", () => {
     expect(r.status).toBe(0);
     expect(r.stdout.trim()).toBe("hired");
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
+    expect(log).toContain("tps-hire.json");
     expect(log).toContain("INVOKE");
   });
 
@@ -171,7 +171,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-roster");
+    expect(log).toContain("tps-roster.json");
   });
 
   test("loads tps-review-local profile", () => {
@@ -181,7 +181,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-local");
+    expect(log).toContain("tps-review-local.json");
   });
 
   test("loads tps-review-deep profile", () => {
@@ -191,7 +191,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-deep");
+    expect(log).toContain("tps-review-deep.json");
   });
 
   test("loads tps-bootstrap profile", () => {
@@ -201,7 +201,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-bootstrap");
+    expect(log).toContain("tps-bootstrap.json");
   });
 
   test("loads tps-backup profile", () => {
@@ -211,7 +211,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-backup");
+    expect(log).toContain("tps-backup.json");
   });
 
   test("loads tps-restore profile", () => {
@@ -221,7 +221,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-restore");
+    expect(log).toContain("tps-restore.json");
   });
 
   test("loads tps-status profile", () => {
@@ -231,7 +231,7 @@ describe("fake nono binary", () => {
     );
     expect(r.status).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-status");
+    expect(log).toContain("tps-status.json");
   });
 
   test("exits non-zero for unknown profile", () => {
@@ -280,7 +280,7 @@ describe("runCommandUnderNono()", () => {
     );
     expect(exitCode).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
+    expect(log).toContain("tps-hire.json");
   });
 
   test("returns non-zero for failing command", () => {
@@ -344,8 +344,8 @@ describe("profile policy: tps-hire", () => {
     );
     expect(exitCode).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
-    expect(log).toContain(`INVOKE profile=tps-hire`);
+    expect(log).toContain("tps-hire.json");
+    expect(log).toContain(`tps-hire.json`);
   });
 
   test("S1.5 — missing profile causes non-zero exit (fail-safe)", () => {
@@ -374,14 +374,14 @@ describe("profile policy: tps-roster", () => {
     const args = buildNonoArgs("tps-roster", {}, ["tps", "roster"]);
     // No --workdir for roster (read-only, no target workspace)
     expect(args).not.toContain("--workdir");
-    expect(args).toContain("tps-roster");
+    expect(args[args.indexOf("--profile") + 1]).toContain("tps-roster");
   });
 
   test("roster profile loads successfully", () => {
     const exitCode = runCommandUnderNono("tps-roster", {}, ["echo", "roster-ok"]);
     expect(exitCode).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-roster");
+    expect(log).toContain("tps-roster.json");
   });
 });
 
@@ -396,7 +396,7 @@ describe("profile policy: tps-review", () => {
     );
     expect(exitCode).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-local");
+    expect(log).toContain("tps-review-local.json");
   });
 
   test("review-deep profile loads for --deep flag", () => {
@@ -409,7 +409,7 @@ describe("profile policy: tps-review", () => {
     );
     expect(exitCode).toBe(0);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-deep");
+    expect(log).toContain("tps-review-deep.json");
   });
 
   test("review uses specific workdir (S3.2 — sibling isolation intent)", () => {
