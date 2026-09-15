@@ -35,25 +35,35 @@
 #      the file may define only two stages, `nono-builder` and `base`, whitelisted
 #      by name. A stage name is a provenance guarantee only if the set of stages
 #      is closed.
-#   7. Imperative fetch primitives. Declarative provenance is not the whole
-#      surface: bytes can arrive inside a `RUN` (`curl`/`wget`/`fetch(`/`nc`, or
-#      a pipe/redirect into `/usr/local/bin`) or through a BuildKit
-#      `--mount=…,from=<operand>` whose operand is not a local stage. Rule 7
-#      refuses those, and heredoc (`<<EOF`) bodies are folded into the owning
-#      `RUN`'s logical line so they cannot hide from it. This scan is the second
-#      layer; the primary control is that the runtime stage simply does not carry
-#      a fetch tool (see docker/Dockerfile).
-#   8. Positive shape of the shipped binary. `/usr/local/bin/nono` is written
-#      exactly once, by the pinned `COPY --from=nono-builder`, and no logical line
-#      after that one names the path. This is the rule that survives the next
-#      verb: whatever the syntax, the last write to the shipped path must be the
-#      pinned copy.
+#   7. Imperative fetch primitives (defence-in-depth). Declarative provenance is
+#      not the whole surface: bytes can arrive inside a `RUN` (`curl`/`wget`/
+#      `fetch(`/`nc`, or a pipe/redirect into `/usr/local/bin`) or through a
+#      BuildKit `--mount=…,from=<operand>` whose operand is not a local stage.
+#      Rule 7 refuses those, normalises path spellings (`//`, `/./`, quotes)
+#      before matching, and folds heredoc (`<<EOF`) bodies into the owning `RUN`'s
+#      logical line. It is a *heuristic*: no list of spellings whitelists a shell.
+#      What backs it up is the capability removal (the runtime stage carries no
+#      fetch tool) and rule 8.
+#   8. THE POSITIVE ARTIFACT INVARIANT — the control, not a heuristic. The
+#      `nono-builder` stage records the sha256 of the binary it built at the
+#      asserted commit (`/nono.sha256`). The `base` stage copies that hash in, may
+#      write `/usr/local/bin/nono` only via the pinned `COPY --from=nono-builder`,
+#      and its LAST instruction must assert the shipped binary's sha256 equals the
+#      recorded one. A rewrite by any primitive, spelling, variable or interpreter
+#      changes the bytes and fails the *build*. Rule 8 asserts this invariant is
+#      present and last; it does not try to enumerate how the path might be spelled.
+#
+# SCOPE: this gate governs IMAGE BUILD time — what the image is built from and
+# what it asserts before it is saved. Runtime provenance (a container fetching
+# nono after start) is a different control: image signing, no-network-at-run,
+# read-only rootfs. This script deliberately does not attempt it.
 #
 # Pre-S4 (`git clone --depth 1 .../nono.git /tmp/nono`, no pin file) fails rules
 # 1–3; a `--branch v0.74.0` fetch fails rule 3; the two-stage bypass fails rules
 # 3 & 4; `COPY --from=<image>` and `ADD <url>` fail rules 5–6; a `RUN`
-# `curl`/`wget`, a `--mount=…,from=<image>`, an `ADD --checksum=<url>` and a
-# post-copy rewrite of the shipped path fail rules 7–8. All of those are
+# `curl`/`wget`, a `--mount=…,from=<image>`, an `ADD --checksum=<url>`, a
+# variable-directory or quoted-spelling rewrite of the shipped path, and a `base`
+# stage that does not end with the hash assertion fail rules 7–8. All of those are
 # executable fixtures in scripts/test-check-nono-pin.sh.
 #
 # NONO_PIN_ROOT overrides the tree under test. It exists only for that fixture
@@ -66,6 +76,12 @@ dockerfile="$root/docker/Dockerfile"
 fail=0
 
 err() { printf 'check-nono-pin: %s\n' "$1" >&2; fail=1; }
+
+# Normalise a logical line for path matching: drop single/double quotes (so
+# `/usr/local/bin/"nono"` and `"/usr/local/bin/"nono` collapse to one path),
+# collapse `/./` and repeated slashes. Rules 7–8 use it so a spelling cannot hide
+# a write to the shipped path.
+nrm() { printf '%s' "$1" | sed -e "s/[\"']//g" -e 's|/\./|/|g' -e 's|//*|/|g'; }
 
 canonical='https://github.com/nolabs-ai/nono'
 allowed_assertion='test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"'
@@ -176,6 +192,8 @@ else
       || err "nono stage does not contain the pinned checkout: git -C /tmp/nono checkout \"\${commit}\""
     printf '%s\n' "$code" | grep -qF "$allowed_assertion" \
       || err "nono stage does not assert the checkout: $allowed_assertion"
+    printf '%s\n' "$code" | grep -qF '> /nono.sha256' \
+      || err "nono stage does not record the built binary's sha256 (> /nono.sha256) — the base stage would have no baseline to verify the artifact against"
 
     # Rule 3 (tag-name clause) — scoped to the nono stage, so a version literal
     # in another stage (e.g. `@tpsdev-ai/agent@v1.2.3`) never false-positives.
@@ -268,7 +286,7 @@ else
     if printf '%s' "$rline" | grep -qE '(^|[^A-Za-z0-9_-])(curl|wget|fetch\(|nc[[:space:]])'; then
       err "docker/Dockerfile RUN uses a network fetch primitive (curl/wget/fetch/nc) — bytes must come from the pinned clone"
     fi
-    if printf '%s' "$rline" | grep -qE '(\||>>?)[^|]*/usr/local/bin'; then
+    if printf '%s' "$(nrm "$rline")" | grep -qE '(\||>>?)[^|]*/usr/local/bin'; then
       err "docker/Dockerfile RUN pipes or redirects into /usr/local/bin — the shipped path must come only from the pinned COPY"
     fi
   done < <(printf '%s\n' "$logical" | grep -E '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)' || true)
@@ -283,17 +301,65 @@ else
     done < <(printf '%s\n' "$m" | grep -oE 'from=[^,[:space:]]+' | sed 's/^from=//' || true)
   done < <(printf '%s\n' "$logical" | grep -oE -- '--mount=[^[:space:]]*' || true)
 
-  # ── Rule 8 — the shipped path is written exactly once, by the pinned COPY ──
-  pinned="$(printf '%s\n' "$logical" \
-    | grep -nE '^[[:space:]]*[Cc][Oo][Pp][Yy][[:space:]].*--from=nono-builder.*/usr/local/bin/nono' || true)"
-  pinned_count="$(printf '%s\n' "$pinned" | grep -c . || true)"
-  if [ "$pinned_count" != "1" ]; then
-    err "docker/Dockerfile must write /usr/local/bin/nono exactly once, by COPY --from=nono-builder (found $pinned_count such COPY line(s))"
+  # ── Rule 8 — base stage: shipped path only from the pinned COPY; the LAST
+  #             instruction asserts the artifact hash (the real control) ───────
+  # A shell cannot lie about a hash it is forced to assert. This is what closes
+  # the variable-directory / quoted-spelling / interpreter writes that rules 5–7
+  # can only partially see. The gate asserts the invariant EXISTS and is LAST.
+  base="$(printf '%s\n' "$logical" | awk '
+    /^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]/ { f = ($0 ~ /AS[[:space:]]+base([[:space:]]|$)/) }
+    f { print }
+  ')"
+  base_lines=()
+  while IFS= read -r bl; do
+    if [ -n "$bl" ]; then base_lines+=("$bl"); fi
+  done <<<"$base"
+  if [ "${#base_lines[@]}" -eq 0 ]; then
+    err "docker/Dockerfile: no 'FROM ... AS base' stage found"
   else
-    cutline="$(printf '%s\n' "$pinned" | cut -d: -f1)"
-    if printf '%s\n' "$logical" | tail -n +"$((cutline + 1))" | grep -qF '/usr/local/bin/nono'; then
-      err "docker/Dockerfile names /usr/local/bin/nono again after the pinned COPY --from=nono-builder — the last write to the shipped path must be the pinned copy"
+    nbase="${#base_lines[@]}"
+    last_line="${base_lines[$((nbase - 1))]}"
+    hash_copied=0
+    pinned_copy=0
+    other_path=0
+    idx=0
+    for bl in "${base_lines[@]}"; do
+      idx=$((idx + 1))
+      bn="$(nrm "$bl")"
+      is_copy=0
+      if printf '%s' "$bl" | grep -qE '^[[:space:]]*[Cc][Oo][Pp][Yy]([[:space:]]|$)'; then is_copy=1; fi
+      is_pinned=0
+      case "$bn" in *--from=nono-builder*) is_pinned=1 ;; esac
+      if [ "$is_copy" = 1 ] && [ "$is_pinned" = 1 ]; then
+        case "$bn" in *nono.sha256*) hash_copied=1 ;; esac
+      fi
+      case "$bn" in
+        *"/usr/local/bin/nono"*)
+          if [ "$is_copy" = 1 ] && [ "$is_pinned" = 1 ]; then
+            pinned_copy=$((pinned_copy + 1))
+          elif [ "$idx" != "$nbase" ]; then
+            other_path=$((other_path + 1))
+          fi
+          ;;
+      esac
+    done
+    [ "$hash_copied" = 1 ] \
+      || err "docker/Dockerfile base does not COPY the pinned stage's sha256 (nono.sha256) — nothing verifies the shipped artifact"
+    [ "$pinned_copy" = 1 ] \
+      || err "docker/Dockerfile base must contain exactly one COPY --from=nono-builder onto /usr/local/bin/nono (found $pinned_copy)"
+    [ "$other_path" = 0 ] \
+      || err "docker/Dockerfile base names /usr/local/bin/nono on $other_path instruction(s) other than the pinned COPY and the final hash assertion — the shipped path may be written only by the pinned copy (matched with //, /./ and quotes normalised)"
+
+    lastn="$(nrm "$last_line")"
+    if ! printf '%s' "$last_line" | grep -qE '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)'; then
+      err "docker/Dockerfile: the last instruction of base is not a RUN — the stage must END by asserting the shipped binary's hash"
     fi
+    printf '%s' "$lastn" | grep -qF 'sha256sum' \
+      || err "docker/Dockerfile: the last instruction of base does not hash the shipped binary (sha256sum) — the artifact invariant is missing"
+    printf '%s' "$lastn" | grep -qF '/usr/local/bin/nono' \
+      || err "docker/Dockerfile: the last instruction of base does not read the shipped path /usr/local/bin/nono"
+    printf '%s' "$lastn" | grep -qF 'nono.sha256' \
+      || err "docker/Dockerfile: the last instruction of base does not compare against the pinned sha256 (nono.sha256)"
   fi
 fi
 

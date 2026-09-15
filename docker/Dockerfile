@@ -14,19 +14,35 @@ RUN set -eux; \
     test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
     cd /tmp/nono; \
     cargo build --release -p nono-cli; \
-    cp target/release/nono /usr/local/bin/nono
+    cp target/release/nono /usr/local/bin/nono; \
+    sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
 
 FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
 RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
+# The shipped binary AND the sha256 the pinned stage recorded for exactly those
+# bytes. The last instruction of this stage re-derives the hash from the path a
+# fetcher would have to write and fails the BUILD if it differs (cli#341 S4).
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-# No fetch tool in the runtime image: the shipped binary is the pinned build, and
-# a stage with no curl/wget capability cannot repull bytes into /usr/local/bin
-# (cli#341 S4). jq stays — docker/tps-office-supervisor.sh uses it.
-RUN apt-get update && apt-get install -y --no-install-recommends git jq ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+# Runtime stage: only what the supervisor needs. jq has six callers in
+# docker/tps-office-supervisor.sh; git/curl/wget have none (grep), so the fetch
+# surface is dropped — no git, curl, wget, python3, perl, openssl, nc, socat or
+# php remains. ca-certificates is dropped too: it hard-depends on openssl, and
+# node carries its own CA store (cli#341 S4). node stays — the agent needs it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq libdbus-1-3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && dpkg --purge --force-all perl-base
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
 # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["tps-office-supervisor"]
+# LAST instruction of the stage — after every other RUN/COPY, so it runs whatever
+# they were. The shipped binary must be the bytes the pinned stage built; any
+# rewrite of this path, by any primitive, spelling, variable or interpreter,
+# changes its hash and fails THIS BUILD rather than a grep.
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" \
+ && rm -f /tmp/nono.sha256

