@@ -25,15 +25,19 @@ RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
 # fetcher would have to write and fails the BUILD if it differs (cli#341 S4).
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
-# Runtime stage: only what the supervisor needs. jq has six callers in
-# docker/tps-office-supervisor.sh; git/curl/wget have none (grep), so the fetch
-# surface is dropped — no git, curl, wget, python3, perl, openssl, nc, socat or
-# php remains. ca-certificates is dropped too: it hard-depends on openssl, and
-# node carries its own CA store (cli#341 S4). node stays — the agent needs it.
+# Runtime stage: only what the shipped workload needs. This image RUNS AGENTS
+# (docker/tps-office-supervisor.sh starts `tps-agent start` per agent user), and
+# the agent toolchain shells out to git — packages/agent/src/runtime/event-loop.ts,
+# packages/cli/src/utils/workspace-provider.ts, agent-lifecycle.ts,
+# generators/brief.ts, commands/git.ts — so git stays. ca-certificates stays for
+# git over TLS (openssl comes with it). curl/wget/python3/nc/socat/php are never
+# installed: the runtime stage carries no general-purpose fetcher.
+# Capability removal is best-effort hardening; the control is the sha256
+# assertion at the end of this stage — whatever is installed, the bytes shipped
+# at /usr/local/bin/nono must hash to the pinned build.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends jq libdbus-1-3 \
- && rm -rf /var/lib/apt/lists/* \
- && dpkg --purge --force-all perl-base
+ && apt-get install -y --no-install-recommends git jq ca-certificates libdbus-1-3 \
+ && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace
