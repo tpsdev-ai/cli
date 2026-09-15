@@ -37,7 +37,8 @@
       "/dev/null"
     ],
     "read": [
-      "/etc/ssl"
+      "/etc/ssl",
+      "/usr/share/ca-certificates"
     ]
   }
 }

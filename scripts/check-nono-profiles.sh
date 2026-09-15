@@ -175,7 +175,8 @@ if ! command -v bun >/dev/null 2>&1; then
   fail "bun not on PATH — the workload smoke needs it to build the launch args"
 else
   PROBE_WS="${TMP}/ws"
-  mapfile -t LAUNCH < <(WS="${PROBE_WS}" ID=probeagent PROF="${AGENT_PROFILE}" \
+  LAUNCH=()
+  while IFS= read -r _arg; do LAUNCH+=("$_arg"); done < <(WS="${PROBE_WS}" ID=probeagent PROF="${AGENT_PROFILE}" \
     bun -e 'import { harnessReadPaths, harnessReadFiles } from "./packages/cli/src/utils/nono.ts"; const a=["run","--profile",process.env.PROF,"--allow-cwd","--workdir",process.env.WS,"--allow",process.env.WS]; for(const p of harnessReadPaths()) a.push("--read",p); for(const p of harnessReadFiles(process.env.ID)) a.push("--read-file",p); for(const x of a) console.log(x);')
   smoke() { # <label> <cmd...>
     local label="$1"; shift
@@ -184,7 +185,7 @@ else
     else
       # Surface the failure detail: a sandboxed git/fetch that fails must not be
       # a silent red. (flint: never skip silently.)
-      fail "workload FAILED under the launch args: ${label} — $(tail -n 2 "${TMP}/smoke.log" | tr '\n' ' ')"
+      fail "workload FAILED under the launch args: ${label} — $(tail -n 6 "${TMP}/smoke.log" | tr '\n' ' ')"
     fi
   }
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
