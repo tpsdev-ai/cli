@@ -58,7 +58,7 @@ COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 ENTRYPOINT ["tps-office-supervisor"]
-RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
 EOF
 }
 
@@ -228,7 +228,7 @@ RUN set -eux; \
     sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
 FROM node:24-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
 EOF
 run_case "digest-pinned-control" pass "$d"
 
@@ -281,7 +281,7 @@ d="$(mk run-mount-pinned-control)"; good_pin "$d"
 FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 RUN --mount=type=bind,from=nono-builder,target=/m true
-RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
 EOF
 } >"$d/docker/Dockerfile"
 run_case "run-mount-pinned-control" pass "$d"
@@ -448,6 +448,64 @@ RUN d=/usr/local/bin; mv /tmp/evil $d/nono
 EOF
 } >"$d/docker/Dockerfile"
 run_case "builder-swap-after-record" fail "$d"
+
+# ── 33. mount-shadow-mountpoint (r9 Kern P5): a SECOND --mount on the assertion
+# line shadows /b with fake tools+baseline — the single-mount clause refuses it.
+d="$(mk mount-shadow-mountpoint)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
+EOF
+} >"$d/docker/Dockerfile"
+run_case "mount-shadow-mountpoint" fail "$d"
+
+# ── 34. mount-shadow-shipped-path (r9 Kern P3): a SECOND --mount shadows
+# /usr/local/bin with honest bytes over a tampered shipped path.
+d="$(mk mount-shadow-shipped-path)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro --mount=type=bind,from=nono-builder,source=/usr/local/bin,target=/usr/local/bin,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
+EOF
+} >"$d/docker/Dockerfile"
+run_case "mount-shadow-shipped-path" fail "$d"
+
+# ── 35. shell-overwritten (r9 Sherlock): base overwrites /bin/sh; the assertion
+# is the shell-form RUN the old gate accepted → refused (must be exec-form).
+d="$(mk shell-overwritten-bin-sh)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN printf '#!/bin/sh\nexit 0\n' > /bin/sh && chmod +x /bin/sh
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
+EOF
+} >"$d/docker/Dockerfile"
+run_case "shell-overwritten-bin-sh" fail "$d"
+
+# ── 36. SHELL directive shim (r9 Sherlock): `SHELL ["/shim","-c"]` reinterprets
+# RUN → refused (base must contain no SHELL directive).
+d="$(mk shell-directive-shim)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+SHELL ["/shim","-c"]
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
+EOF
+} >"$d/docker/Dockerfile"
+run_case "shell-directive-shim" fail "$d"
+
+# ── 37. env-overwritten (r9 Sherlock): /usr/bin/env replaced → refused (assertion
+# must be exec-form, so no PATH/env interpreter is involved).
+d="$(mk env-overwritten)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN printf '#!/bin/sh\nexit 0\n' > /usr/bin/env && chmod +x /usr/bin/env
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
+EOF
+} >"$d/docker/Dockerfile"
+run_case "env-overwritten" fail "$d"
 
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then

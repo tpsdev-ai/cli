@@ -273,14 +273,19 @@ else
   done <<<"$refs"
 
   # ── Rule 5 — THE POSITIVE ARTIFACT INVARIANT (the control) ─────────────────
-  # The runtime stage's LAST instruction must be a RUN whose read-only bind mount
-  # of the builder stage supplies the baseline hash AND the tools, hashing the
-  # shipped /usr/local/bin/nono against the mounted baseline. The shipped binary
-  # must come only from the pinned COPY. Because the baseline and the tools are
-  # read from the immutable builder stage, no runtime-stage instruction can alter
-  # what the assertion compares — recompute, variable spelling or tool overwrite
-  # are all defeated by the BUILD, not by this scan. The scan only asserts the
-  # shape is present and last (no literal-path whitelist).
+  # The runtime stage's LAST instruction must be an EXEC-FORM RUN (`RUN [ … ]`,
+  # no shell interpretation) whose read-only bind mount of the builder stage
+  # supplies the baseline hash, the tools AND the interpreter (/b/bin/sh), hashing
+  # the shipped /usr/local/bin/nono against the mounted baseline. It must carry
+  # EXACTLY ONE --mount, and the base stage must contain NO `SHELL` directive.
+  # The shipped binary must come only from the pinned COPY. Because baseline,
+  # tools and interpreter are read from the immutable builder stage, no
+  # runtime-stage instruction can alter what the assertion compares OR who runs
+  # it — recompute, variable spelling, tool overwrite, a writable /bin/sh, a
+  # SHELL directive, an ENV PATH, or a second mount shadowing /b or the shipped
+  # path are all refused. (Rule 8b's "no ENV PATH" is subsumed: exec-form +
+  # mount-sourced tools leave PATH with nothing to substitute.) The scan only
+  # asserts the shape is present and last (no literal-path whitelist).
   base="$(printf '%s\n' "$logical" | awk '
     /^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]/ { f = ($0 ~ /AS[[:space:]]+base([[:space:]]|$)/) }
     f { print }
@@ -311,6 +316,14 @@ else
     if ! printf '%s' "$last_line" | grep -qE '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)'; then
       err "docker/Dockerfile: the last instruction of base is not a RUN — the stage must END with the read-only-mount artifact assertion"
     fi
+    # EXEC FORM with the interpreter from the mount: `RUN [ "/b/bin/sh", … ]`.
+    if ! printf '%s' "$last_line" | grep -qE '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]+--[^[]*)?[[:space:]]*\[[[:space:]]*"/b/bin/sh"'; then
+      err "docker/Dockerfile: the last instruction of base is not exec-form starting with \"/b/bin/sh\" — a shell-form RUN is interpreted by writable runtime-stage state (/bin/sh, SHELL, env)"
+    fi
+    # EXACTLY ONE --mount (a second can shadow /b or the shipped path).
+    nmounts="$(printf '%s' "$lastn" | grep -o -- '--mount=' | wc -l | tr -d ' ')"
+    [ "$nmounts" -eq 1 ] \
+      || err "docker/Dockerfile: the assertion line carries $nmounts mounts — a second mount can shadow the read-only baseline or the shipped path"
     printf '%s' "$lastn" | grep -qF -- '--mount=type=bind' \
       || err "docker/Dockerfile: the last instruction of base is not a --mount=type=bind of the builder stage — the assertion must read immutable state, not the writable runtime stage"
     printf '%s' "$lastn" | grep -qF 'from=nono-builder' \
@@ -323,6 +336,10 @@ else
       || err "docker/Dockerfile: the last instruction of base does not read the baseline (nono.sha256) from the mount"
     printf '%s' "$lastn" | grep -qF 'sha256sum' \
       || err "docker/Dockerfile: the last instruction of base does not call sha256sum from the mount"
+    # No SHELL directive anywhere in base (it would reinterpret any RUN).
+    if printf '%s\n' "$base" | grep -qE '^[[:space:]]*[Ss][Hh][Ee][Ll][Ll]([[:space:]]|$)'; then
+      err "docker/Dockerfile: the base stage sets a SHELL directive — it reinterprets RUN and can neuter the assertion"
+    fi
   fi
 fi
 
