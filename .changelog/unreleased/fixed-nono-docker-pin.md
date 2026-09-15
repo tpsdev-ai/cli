@@ -1,0 +1,1 @@
+- Pin the Docker image's nono install to a tagged release verified by sha256 (`.nono-version`), replacing the unpinned default-branch clone (cli#341).
