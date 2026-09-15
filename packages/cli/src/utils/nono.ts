@@ -29,7 +29,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -244,12 +244,14 @@ export const NO_SANDBOX_FLAG = "--no-sandbox";
 
 /**
  * The launcher's private "I am already inside nono" assertion. Honoured only
- * when that is verifiable (see `insideNono`); a user-typed `--sandboxed` from a
- * non-TTY caller is refused like `--no-sandbox` (cli#350 fix-round).
+ * when the process PROVES confinement by capability (`confinedByCapability`);
+ * a user-typed `--sandboxed` from a non-TTY caller is refused like `--no-sandbox`.
+ * The nono marker / parent check are HINTS only, never proof (both are forgeable
+ * by the same caller: an env var, or a shadowed `ps` / self-named argv).
  */
 export const SANDBOXED_FLAG = "--sandboxed";
 
-/** Marker nono sets for its own child (nono >= 0.7x). Proof of a nono parent. */
+/** Hint nono sets for its own child (nono >= 0.7x). Never used as proof. */
 export const NONO_CHILD_ENV = "NONO_CAP_FILE";
 
 /**
@@ -290,23 +292,50 @@ export function isSupervised(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
- * True only when this process is *verifiably* a child of nono: the marker nono
- * sets for its child (`NONO_CAP_FILE`), or a parent process literally named
- * nono. `--sandboxed` is not a user flag — it is the launcher's own re-exec
- * marker, and the control may only honour it when a real nono stands behind it.
+ * HINT ONLY — never proof. The marker nono sets (any non-empty value is
+ * forgeable by the caller) or a parent literally named nono (also forgeable:
+ * `exec -a nono …`, or a shadowed `ps`). Used only for refusal wording.
+ * Hardened where cheap: absolute `/bin/ps` and an exact comm match (no PATH
+ * resolution, no substring).
  */
-export function insideNono(
+export function nonoLaunchHint(
   env: NodeJS.ProcessEnv = process.env,
   ppid: number = process.ppid
 ): boolean {
   if (env[NONO_CHILD_ENV]) return true;
   try {
-    if (readFileSync(`/proc/${ppid}/comm`, "utf-8").trim().includes("nono")) return true;
+    if (readFileSync(`/proc/${ppid}/comm`, "utf-8").trim() === "nono") return true;
   } catch {
     // not Linux, or /proc unreadable — fall back to ps
   }
-  const ps = spawnSync("ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf-8" });
-  return (ps.stdout ?? "").trim().includes("nono");
+  const ps = spawnSync("/bin/ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf-8" });
+  return (ps.stdout ?? "").trim() === "nono";
+}
+
+/**
+ * PROVE confinement by CAPABILITY, not by a marker. Before honouring
+ * `--sandboxed` this process attempts an operation the tps policy must deny —
+ * creating a file under the agent's own denied state dir (`~/.tps/secrets`,
+ * denied by `tps-base`). A sandboxed process is refused the write (EPERM /
+ * EACCES / EROFS); an unsandboxed process SUCCEEDS, which proves the "already
+ * inside nono" claim is false. Nothing a caller can plant changes the answer.
+ */
+export function confinedByCapability(env: NodeJS.ProcessEnv = process.env): boolean {
+  const home = env.HOME || homedir() || "/tmp";
+  const probe = join(home, ".tps", "secrets", ".tps-nono-probe");
+  try {
+    writeFileSync(probe, String(process.pid));
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM" || code === "EACCES" || code === "EROFS";
+  }
+  // The write SUCCEEDED — this process is not confined by the tps policy.
+  try {
+    unlinkSync(probe);
+  } catch {
+    /* best-effort cleanup */
+  }
+  return false;
 }
 
 /**
@@ -333,7 +362,7 @@ export interface LaunchControlInput {
   interactiveTty?: boolean;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
-  /** Override nono-parent detection (tests). */
+  /** Override capability-confinement detection (tests). */
   insideNono?: boolean;
 }
 
@@ -353,7 +382,8 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
   const supervised = input.supervised ?? isSupervised();
-  const inside = input.insideNono ?? insideNono();
+  // Proof is BY CAPABILITY, never by the (forgeable) marker/parent hint.
+  const inside = input.insideNono ?? confinedByCapability();
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
@@ -366,14 +396,19 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
     );
   }
 
-  // (1b) --sandboxed claims "already inside nono". Honour it only when that is
-  // verifiable; otherwise a non-TTY caller could skip the sandbox by typing it.
+  // (1b) --sandboxed claims "already inside nono". Honour it only when the
+  // process PROVES confinement by capability; otherwise a non-TTY caller could
+  // skip the sandbox by typing it (or by planting the marker / shadowing ps).
   if (argv.includes(SANDBOXED_FLAG) && !tty && !inside) {
+    const hint = nonoLaunchHint();
     return deny(
       `${SANDBOXED_FLAG} is refused: it asserts this process is already inside nono, but it is ` +
-        "not (no nono parent process and no nono sandbox marker). From a non-interactive " +
-        "caller that is an unsandboxed launch — only the launcher's own re-exec, which runs " +
-        "as a child of nono, may assert it.",
+        "not confined — a write under ~/.tps/secrets (denied by tps-base) SUCCEEDED, and " +
+        (hint
+          ? "the nono marker/parent hint is present but is not proof. "
+          : "no nono confinement is in effect. ") +
+        "From a non-interactive caller that is an unsandboxed launch — only the launcher's " +
+        "own re-exec, which runs confined, may assert it.",
     );
   }
 

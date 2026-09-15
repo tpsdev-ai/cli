@@ -124,6 +124,12 @@ describe("T5 — the re-exec child carries --sandbox-required and the agent star
       const agentDir = join(home, ".tps", "agents", "probe");
       mkdirSync(ws, { recursive: true });
       mkdirSync(agentDir, { recursive: true });
+      // The fake nono "enforces": make the denied state dir unwritable so the
+      // child's capability probe is REFUSED (this is what real nono does via the
+      // tps-base deny). Without this, the child correctly proves it is not
+      // confined and refuses to run.
+      mkdirSync(join(home, ".tps", "secrets"), { recursive: true });
+      chmodSync(join(home, ".tps", "secrets"), 0o000);
       writeFileSync(
         join(agentDir, "agent.yaml"),
         `agentId: probe\nname: probe\nworkspace: ${ws}\n` +
@@ -161,6 +167,11 @@ describe("T5 — the re-exec child carries --sandbox-required and the agent star
         }
       }
     } finally {
+      try {
+        chmodSync(join(home, ".tps", "secrets"), 0o700);
+      } catch {
+        /* best-effort: restore so the tree can be removed */
+      }
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -170,21 +181,50 @@ describe("T5 — the re-exec child carries --sandbox-required and the agent star
 // T6 — --sandboxed is only honoured when the caller is verifiably inside nono
 // ---------------------------------------------------------------------------
 
-describe("T6 — --sandboxed cannot skip the sandbox from a non-TTY caller", () => {
-  test("non-TTY --sandboxed (combination) is refused, naming the flag, exit 78", () => {
+describe("T6 — --sandboxed cannot skip the sandbox from a non-TTY caller (proof by capability)", () => {
+  test("plain --sandboxed is refused, naming the flag, exit 78", () => {
     const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED, "--sandboxed"]);
     const out = output(r);
     expect(out).toContain("--sandboxed");
-    expect(out.toLowerCase()).toContain("already inside nono");
+    expect(out.toLowerCase()).toContain("not confined");
     expect(r.status).toBe(78);
   });
 
-  test("the same invocation is allowed when a nono parent marker is present (reaches config check)", () => {
+  test("planting NONO_CAP_FILE does NOT make it sufficient (refused)", () => {
     const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED, "--sandboxed"], {
       NONO_CAP_FILE: "/tmp/nono-cap-test.json",
     });
-    expect(output(r)).not.toContain("--sandboxed is refused");
-    expect(r.status).toBe(1); // config not found → the control let it through
+    expect(output(r)).toContain("--sandboxed");
+    expect(r.status).toBe(78);
+  });
+
+  test("a shadowed 'ps' on PATH does NOT make it sufficient (refused)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-fake-ps-"));
+    try {
+      const fakePs = join(dir, "ps");
+      writeFileSync(fakePs, "#!/bin/sh\necho nono\n", "utf-8");
+      chmodSync(fakePs, 0o755);
+      const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED, "--sandboxed"], {
+        PATH: `${dir}:${process.env.PATH ?? ""}`,
+      });
+      expect(output(r)).toContain("--sandboxed");
+      expect(r.status).toBe(78);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a self-named 'nono' parent (exec -a) does NOT make it sufficient (refused)", () => {
+    const r = spawnSync(
+      "bash",
+      [
+        "-c",
+        `exec -a nono bun ${TPS_BIN} agent start --id ghost ${SANDBOX_REQUIRED} --sandboxed`,
+      ],
+      { encoding: "utf-8", env: { ...process.env } },
+    );
+    expect(output(r)).toContain("--sandboxed");
+    expect(r.status).toBe(78);
   });
 });
 
