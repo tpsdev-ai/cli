@@ -7,6 +7,10 @@
  *        launcher in a non-TTY context.
  *   T4 = the KeepAlive clause: generated agent units use `{SuccessfulExit:false}`
  *        ONLY together with "the launcher logs the refusal and exits 0".
+ *   T5 = the re-exec child carries `--sandbox-required` verbatim, so the shipped
+ *        unit actually launches (nono-present path; fake nono logs argv).
+ *   T6 = `--sandboxed` cannot skip the sandbox from a non-TTY caller (only a
+ *        verifiable nono child may assert it).
  *
  * The launcher cases spawn the real built binary (`dist/bin/tps.js`) with piped
  * stdio — a non-TTY context — so they exercise the same path launchd would.
@@ -14,8 +18,17 @@
  * `main` (where none of this exists) as well as pass on the branch.
  */
 import { describe, test, expect, beforeAll } from "bun:test";
-import { resolve } from "node:path";
-import { existsSync } from "node:fs";
+import { resolve, join } from "node:path";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  chmodSync,
+  readFileSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
@@ -75,6 +88,102 @@ describe("T3 — missing --sandbox-required is refused in non-TTY", () => {
     const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED]);
     const out = output(r);
     expect(out).not.toContain(`${SANDBOX_REQUIRED} is required`);
+    expect(r.status).toBe(1); // config not found → the control let it through
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T5 — the re-exec child must carry --sandbox-required (nono PRESENT path)
+// ---------------------------------------------------------------------------
+
+describe("T5 — the re-exec child carries --sandbox-required and the agent starts", () => {
+  test("nono-present agent start: child argv asserts the flag; the agent actually starts", () => {
+    const home = mkdtempSync(join(tmpdir(), "tps-reexec-argv-"));
+    try {
+      const binDir = join(home, "bin");
+      const logPath = join(home, "nono-argv.log");
+      mkdirSync(binDir, { recursive: true });
+      // A fake nono that records its argv, sets the marker real nono sets for
+      // its child, then execs the wrapped command.
+      const shim = [
+        "#!/usr/bin/env bash",
+        `echo "NONO-ARGV $*" >> ${JSON.stringify(logPath)}`,
+        'export NONO_CAP_FILE="${NONO_CAP_FILE:-/tmp/nono-fake-cap.json}"',
+        'args=("$@")',
+        "cmd=()",
+        "seen=0",
+        'for a in "${args[@]}"; do if [ "$seen" = 1 ]; then cmd+=("$a"); fi; if [ "$a" = "--" ]; then seen=1; fi; done',
+        'exec "${cmd[@]}"',
+        "",
+      ].join("\n");
+      const shimPath = join(binDir, "nono");
+      writeFileSync(shimPath, shim, "utf-8");
+      chmodSync(shimPath, 0o755);
+
+      const ws = join(home, "ws");
+      const agentDir = join(home, ".tps", "agents", "probe");
+      mkdirSync(ws, { recursive: true });
+      mkdirSync(agentDir, { recursive: true });
+      writeFileSync(
+        join(agentDir, "agent.yaml"),
+        `agentId: probe\nname: probe\nworkspace: ${ws}\n` +
+          `mailDir: ${join(home, ".tps", "mail")}\n` +
+          `memoryPath: ${join(agentDir, "memory.jsonl")}\n` +
+          `llm:\n  provider: ollama\n  model: probe-model\n`,
+        "utf-8",
+      );
+
+      const r = spawnSync("bun", [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
+        encoding: "utf-8",
+        timeout: 3000,
+        killSignal: "SIGKILL",
+        env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}`, HOME: home },
+      });
+
+      const log = existsSync(logPath) ? readFileSync(logPath, "utf-8") : "";
+      // The child (re-exec under nono) must carry BOTH flags...
+      expect(log).toContain("--sandboxed");
+      expect(log).toContain(SANDBOX_REQUIRED);
+      expect(log).toContain("agent start --id probe");
+      // ...and must not be refused (which under a supervisor would exit 0 and
+      // silently never launch the agent).
+      expect(output(r)).not.toContain(`${SANDBOX_REQUIRED} is required`);
+
+      // The agent actually started: the runtime writes its pid file first thing.
+      const pidPath = join(ws, ".tps-agent.pid");
+      expect(existsSync(pidPath)).toBe(true);
+      if (existsSync(pidPath)) {
+        const pid = Number.parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {
+          /* already gone */
+        }
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T6 — --sandboxed is only honoured when the caller is verifiably inside nono
+// ---------------------------------------------------------------------------
+
+describe("T6 — --sandboxed cannot skip the sandbox from a non-TTY caller", () => {
+  test("non-TTY --sandboxed (combination) is refused, naming the flag, exit 78", () => {
+    const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED, "--sandboxed"]);
+    const out = output(r);
+    expect(out).toContain("--sandboxed");
+    expect(out.toLowerCase()).toContain("already inside nono");
+    expect(r.status).toBe(78);
+  });
+
+  test("the same invocation is allowed when a nono parent marker is present (reaches config check)", () => {
+    const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED, "--sandboxed"], {
+      NONO_CAP_FILE: "/tmp/nono-cap-test.json",
+    });
+    expect(output(r)).not.toContain("--sandboxed is refused");
     expect(r.status).toBe(1); // config not found → the control let it through
   });
 });

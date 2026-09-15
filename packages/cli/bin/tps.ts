@@ -556,7 +556,7 @@ async function main() {
               if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
             }
           } else {
-            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: !process.argv.includes("--no-sandbox"), sandboxed: process.argv.includes("--sandboxed") });
+            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: !process.argv.includes("--no-sandbox"), sandboxed: process.argv.includes("--sandboxed"), sandboxRequired: process.argv.includes("--sandbox-required") });
           }
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });

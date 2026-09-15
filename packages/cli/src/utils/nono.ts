@@ -29,7 +29,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -243,6 +243,16 @@ export const SANDBOX_REQUIRED_FLAG = "--sandbox-required";
 export const NO_SANDBOX_FLAG = "--no-sandbox";
 
 /**
+ * The launcher's private "I am already inside nono" assertion. Honoured only
+ * when that is verifiable (see `insideNono`); a user-typed `--sandboxed` from a
+ * non-TTY caller is refused like `--no-sandbox` (cli#350 fix-round).
+ */
+export const SANDBOXED_FLAG = "--sandboxed";
+
+/** Marker nono sets for its own child (nono >= 0.7x). Proof of a nono parent. */
+export const NONO_CHILD_ENV = "NONO_CAP_FILE";
+
+/**
  * Set by generated units (launchd/systemd) in their environment. A refusal then
  * exits 0 instead of 78 — see the KeepAlive coupling note below.
  */
@@ -280,6 +290,26 @@ export function isSupervised(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
+ * True only when this process is *verifiably* a child of nono: the marker nono
+ * sets for its child (`NONO_CAP_FILE`), or a parent process literally named
+ * nono. `--sandboxed` is not a user flag — it is the launcher's own re-exec
+ * marker, and the control may only honour it when a real nono stands behind it.
+ */
+export function insideNono(
+  env: NodeJS.ProcessEnv = process.env,
+  ppid: number = process.ppid
+): boolean {
+  if (env[NONO_CHILD_ENV]) return true;
+  try {
+    if (readFileSync(`/proc/${ppid}/comm`, "utf-8").trim().includes("nono")) return true;
+  } catch {
+    // not Linux, or /proc unreadable — fall back to ps
+  }
+  const ps = spawnSync("ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf-8" });
+  return (ps.stdout ?? "").trim().includes("nono");
+}
+
+/**
  * Commands that hand control to an agent. These are exactly the commands that
  * generated units invoke, and the ones that must assert `--sandbox-required`
  * when there is no TTY to ask.
@@ -303,6 +333,8 @@ export interface LaunchControlInput {
   interactiveTty?: boolean;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
+  /** Override nono-parent detection (tests). */
+  insideNono?: boolean;
 }
 
 export interface LaunchControlResult {
@@ -321,6 +353,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
   const supervised = input.supervised ?? isSupervised();
+  const inside = input.insideNono ?? insideNono();
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
@@ -330,6 +363,17 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
       `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
         "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
         "so the agent must launch under nono. Remove the flag, or run it yourself in a terminal.",
+    );
+  }
+
+  // (1b) --sandboxed claims "already inside nono". Honour it only when that is
+  // verifiable; otherwise a non-TTY caller could skip the sandbox by typing it.
+  if (argv.includes(SANDBOXED_FLAG) && !tty && !inside) {
+    return deny(
+      `${SANDBOXED_FLAG} is refused: it asserts this process is already inside nono, but it is ` +
+        "not (no nono parent process and no nono sandbox marker). From a non-interactive " +
+        "caller that is an unsandboxed launch — only the launcher's own re-exec, which runs " +
+        "as a child of nono, may assert it.",
     );
   }
 

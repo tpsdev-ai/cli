@@ -49,6 +49,8 @@ export interface AgentArgs {
   sandbox?: boolean;
   /** Internal: set by re-exec under nono, skips re-wrapping */
   sandboxed?: boolean;
+  /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
+  sandboxRequired?: boolean;
   lines?: number;
   follow?: boolean;
   ackScopeExpansion?: boolean;
@@ -779,6 +781,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       if (args.action === "start") {
         const sandbox = (args as any).sandbox ?? true; // default ON — nono is the required isolation layer
         const sandboxed = (args as any).sandboxed ?? false;
+        const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
         const nonoAvailable = findNono();
 
         if (sandboxed) {
@@ -797,6 +800,23 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             const agentDir = join(homedir(), ".tps", "agents", config.agentId);
             const bunDir = join(homedir(), ".bun");
             const tmpDir = process.env.TMPDIR ?? "/tmp";
+            // Carry the launch-control assertion verbatim into the re-exec child.
+            // The child is a non-TTY context too: if it does not carry
+            // --sandbox-required it refuses itself, and under TPS_SUPERVISED=1
+            // that refusal exits 0 — launchd sees success and KeepAlive
+            // {SuccessfulExit:false} never relaunches, so the agent silently
+            // never starts. (cli#350 fix-round, Sherlock.)
+            const relaunch = [
+              process.execPath,
+              ...process.execArgv,
+              process.argv[1]!,
+              "agent",
+              "start",
+              "--id",
+              config.agentId,
+              "--sandboxed",
+            ];
+            if (sandboxRequired) relaunch.push("--sandbox-required");
             const exitCode = runCommandUnderNono(
               "tps-agent-run",
               {
@@ -805,7 +825,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 read: [identityDir, bunDir, "/"],
                 allow: [mailDir, tmpDir, config.workspace, agentDir],
               },
-              [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId, "--sandboxed"],
+              relaunch,
             );
             process.exit(exitCode);
           }

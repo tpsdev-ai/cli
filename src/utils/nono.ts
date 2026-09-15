@@ -46,7 +46,6 @@ export interface NonoOptions {
  * Find the nono binary on PATH. Returns the resolved path or null.
  */
 export function findNono(): string | null {
-  if (process.env.TPS_FORCE_NO_NONO === "1") return null;
   const result = spawnSync("which", ["nono"], {
     encoding: "utf-8",
     env: process.env, // explicitly pass so PATH mutations in tests are respected
