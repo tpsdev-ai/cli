@@ -200,13 +200,19 @@ else
   echo "  · host resolv.conf realpath: $(bun -e 'import {realpathSync} from "node:fs"; console.log(realpathSync("/etc/resolv.conf"))' 2>&1 || true)"
   echo "  · host /etc/resolv.conf: $(tr '\n' ' ' </etc/resolv.conf 2>&1 || true)"
   HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- \
-    sh -c 'echo "  · sandbox resolv.conf realpath: $(bun -e '\''import{realpathSync}from"node:fs";console.log(realpathSync("/etc/resolv.conf"))'\'' 2>&1)"; echo "  · sandbox /etc/resolv.conf: $(tr "\n" " " </etc/resolv.conf 2>&1)"; echo "  · sandbox getent hosts github.com:"; getent hosts github.com 2>&1 | head -n 2; echo "  · sandbox GIT_CURL_VERBOSE (head):"; GIT_CURL_VERBOSE=1 git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1 | head -n 20' 2>&1 || true
+    sh -c 'echo "  · sandbox resolv.conf realpath: $(bun -e '\''import{realpathSync}from"node:fs";console.log(realpathSync("/etc/resolv.conf"))'\'' 2>&1)"; echo "  · sandbox /etc/resolv.conf: $(tr "\n" " " </etc/resolv.conf 2>&1)"; echo "  · sandbox resolution (getent/dns):"; (getent hosts github.com 2>&1 || bun -e '\''require("node:dns").lookup("github.com",(e,a)=>console.log(e?("DNS ERR "+e.code):("DNS OK "+a)))'\'') | head -n 2; echo "  · sandbox GIT_CURL_VERBOSE (head):"; GIT_CURL_VERBOSE=1 git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1 | head -n 20' 2>&1 || true
 
   # ── 5b. the workloads ─────────────────────────────────────────────────────
   # The child's stderr is merged into its stdout (2>&1) so git's own "fatal:"
   # line survives into the log the ❌ message quotes.
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
-  smoke "getent hosts github.com" sh -c 'getent hosts github.com >/dev/null 2>&1'
+  # `getent` is Linux-only (macOS has no getent); fall back to the resolver
+  # itself so the SAME check runs on both lanes (cli#351 r5b).
+  if command -v getent >/dev/null 2>&1; then
+    smoke "getent hosts github.com" sh -c 'getent hosts github.com >/dev/null 2>&1'
+  else
+    smoke "dns lookup github.com (no getent on macOS)" bun -e 'require("node:dns").lookup("github.com",(e)=>process.exit(e?1:0))'
+  fi
   smoke "git ls-remote over https" sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1'
   smoke "fetch https://api.github.com/zen" bun -e 'fetch("https://api.github.com/zen").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
 
