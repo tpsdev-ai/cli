@@ -185,7 +185,7 @@ else
     else
       # Surface the failure detail: a sandboxed git/fetch that fails must not be
       # a silent red. (flint: never skip silently.)
-      fail "workload FAILED under the launch args: ${label} — $(tail -n 6 "${TMP}/smoke.log" | tr '\n' ' ')"
+      fail "workload FAILED under the launch args: ${label} — $(tail -n 14 "${TMP}/smoke.log" | tr '\n' ' ')"
     fi
   }
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'

@@ -34,7 +34,8 @@
       "/etc/ssh"
     ],
     "allow_file": [
-      "/dev/null"
+      "/dev/null",
+      "/dev/dtracehelper"
     ],
     "read": [
       "/etc/ssl",
