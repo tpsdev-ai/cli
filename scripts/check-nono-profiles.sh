@@ -183,14 +183,45 @@ else
     if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >"${TMP}/smoke.log" 2>&1; then
       ok "workload: ${label}"
     else
-      # Surface the failure detail: a sandboxed git/fetch that fails must not be
-      # a silent red. (flint: never skip silently.)
-      fail "workload FAILED under the launch args: ${label} — $(tail -n 14 "${TMP}/smoke.log" | tr '\n' ' ')"
+      # Show the COMMAND's own error line (git's "fatal: …"), not just the exit
+      # code: the lane log must make the cause readable (cli#351 r5b). Fall back
+      # to nono's report tail when the command itself said nothing.
+      local detail
+      detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):|denied|Permission denied|Name or service not known' "${TMP}/smoke.log" 2>/dev/null || true)"
+      [[ -n "${detail}" ]] || detail="$(tail -n 3 "${TMP}/smoke.log" | tr '\n' ' ')"
+      fail "workload FAILED under the launch args: ${label} — ${detail}"
     fi
   }
+
+  # ── 5a. probe: what the sandbox can see for name resolution ────────────────
+  # Informational, printed on BOTH lanes so a failure is diagnosable from the
+  # log alone (Ubuntu's /etc/resolv.conf is a SYMLINK to a systemd stub file).
+  echo "  · read-file grants: $(bun -e 'import { harnessReadFiles } from "./packages/cli/src/utils/nono.ts"; console.log(harnessReadFiles().join(" "))' 2>&1)"
+  echo "  · host resolv.conf realpath: $(bun -e 'import {realpathSync} from "node:fs"; console.log(realpathSync("/etc/resolv.conf"))' 2>&1 || true)"
+  echo "  · host /etc/resolv.conf: $(tr '\n' ' ' </etc/resolv.conf 2>&1 || true)"
+  HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- \
+    sh -c 'echo "  · sandbox resolv.conf realpath: $(bun -e '\''import{realpathSync}from"node:fs";console.log(realpathSync("/etc/resolv.conf"))'\'' 2>&1)"; echo "  · sandbox /etc/resolv.conf: $(tr "\n" " " </etc/resolv.conf 2>&1)"; echo "  · sandbox getent hosts github.com:"; getent hosts github.com 2>&1 | head -n 2; echo "  · sandbox GIT_CURL_VERBOSE (head):"; GIT_CURL_VERBOSE=1 git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1 | head -n 20' 2>&1 || true
+
+  # ── 5b. the workloads ─────────────────────────────────────────────────────
+  # The child's stderr is merged into its stdout (2>&1) so git's own "fatal:"
+  # line survives into the log the ❌ message quotes.
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
-  smoke "git ls-remote over https" git ls-remote https://github.com/tpsdev-ai/cli HEAD
+  smoke "getent hosts github.com" sh -c 'getent hosts github.com >/dev/null 2>&1'
+  smoke "git ls-remote over https" sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1'
   smoke "fetch https://api.github.com/zen" bun -e 'fetch("https://api.github.com/zen").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+
+  # ── 5c. mechanism probe: does nono resolve a symlinked --read-file? ────────
+  # Informational. Ubuntu's /etc/resolv.conf is a symlink into /run; this shows
+  # whether granting the SYMLINK path is enough on the pinned nono, or whether
+  # the target needs granting too (cli#351 r5b evidence).
+  SYM_DIR="${TMP}/symrepro"; mkdir -p "${SYM_DIR}/real"
+  printf 'nameserver 127.0.0.53\n' >"${SYM_DIR}/real/stub-resolv.conf"
+  ln -sf "${SYM_DIR}/real/stub-resolv.conf" "${SYM_DIR}/resolv.conf"
+  sym_read() { # <flags...> — cat the symlink under the launch args
+    HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" "$@" -- cat "${SYM_DIR}/resolv.conf" >/dev/null 2>&1
+  }
+  if sym_read; then echo "  · symlink with NO grant: readable (unexpected — fixture dir is inside a grant?)"; else echo "  · symlink with NO grant: DENIED (control: the fixture dir is outside every grant)"; fi
+  if sym_read --read-file "${SYM_DIR}/resolv.conf"; then echo "  · symlink-only --read-file: ALLOWED (nono resolves the grant's symlink itself)"; else echo "  · symlink-only --read-file: DENIED (the target needs granting too)"; fi
 fi
 
 echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement + workload verified)"
