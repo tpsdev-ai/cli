@@ -32,6 +32,12 @@
       "/etc/shadow",
       "/etc/sudoers",
       "/etc/ssh"
+    ],
+    "allow_file": [
+      "/dev/null"
+    ],
+    "read": [
+      "/etc/ssl"
     ]
   }
 }

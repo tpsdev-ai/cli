@@ -154,4 +154,40 @@ why_denied "/etc/shadow"
 why_denied "/etc/sudoers"
 why_denied "/etc/ssh/ssh_host_rsa_key"
 
-echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement verified)"
+# /dev/null read+write must be ALLOWED for EVERY shipped profile — it is the
+# tps-base allow_file every profile inherits, and without it `cmd >/dev/null`
+# and `git ls-remote` die inside the sandbox (cli#351 r5). HOME=/ keeps the
+# synthetic state root clear of profiles that grant /home or /tmp.
+for f in "${PROFILE_DIR}"/*.json; do
+  pname="$(basename "$f" .json)"
+  out="$(HOME=/ NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" why --path /dev/null --op readwrite --profile "$f" 2>&1 || true)"
+  case "${out}" in
+    *ALLOWED*) ok "/dev/null readwrite ALLOWED (${pname})" ;;
+    *) fail "/dev/null readwrite DENIED under ${pname}" ;;
+  esac
+done
+
+# ── 5. WORKLOAD smoke under the EXACT launch args (cli#351 r5) ───────────────
+# Built with the SAME helper the launch uses (harnessReadPaths/harnessReadFiles),
+# so the gate exercises what the agent actually gets: a shell redirect to
+# /dev/null, `git ls-remote` over https (TLS CA), and a `fetch`.
+if ! command -v bun >/dev/null 2>&1; then
+  fail "bun not on PATH — the workload smoke needs it to build the launch args"
+else
+  PROBE_WS="${TMP}/ws"
+  mapfile -t LAUNCH < <(WS="${PROBE_WS}" ID=probeagent PROF="${AGENT_PROFILE}" \
+    bun -e 'import { harnessReadPaths, harnessReadFiles } from "./packages/cli/src/utils/nono.ts"; const a=["run","--profile",process.env.PROF,"--allow-cwd","--workdir",process.env.WS,"--allow",process.env.WS]; for(const p of harnessReadPaths()) a.push("--read",p); for(const p of harnessReadFiles(process.env.ID)) a.push("--read-file",p); for(const x of a) console.log(x);')
+  smoke() { # <label> <cmd...>
+    local label="$1"; shift
+    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >/dev/null 2>&1; then
+      ok "workload: ${label}"
+    else
+      fail "workload FAILED under the launch args: ${label}"
+    fi
+  }
+  smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
+  smoke "git ls-remote over https" git ls-remote https://github.com/tpsdev-ai/cli HEAD
+  smoke "fetch https://api.github.com/zen" bun -e 'fetch("https://api.github.com/zen").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+fi
+
+echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement + workload verified)"

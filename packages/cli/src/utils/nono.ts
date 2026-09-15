@@ -192,11 +192,12 @@ export function checkProfileLoadable(name: string, bin: string | null = findNono
  */
 export function systemReadPaths(): string[] {
   return process.platform === "darwin"
-    ? ["/opt/homebrew", "/usr", "/bin", "/sbin", "/Library"]
-    : // NOTE: /etc is deliberately NOT granted on Linux: the tps-base profile
-      // denies /etc/shadow, /etc/sudoers, /etc/ssh, and Landlock cannot express
-      // deny-within-allow, so nono refuses to start with both. The few /etc
-      // files resolution/TLS need are granted individually (systemReadFiles).
+    ? ["/opt/homebrew", "/usr", "/bin", "/sbin", "/Library", "/private/etc/ssl"]
+    : // NOTE: /etc is deliberately NOT granted on Linux (Landlock cannot express
+      // deny-within-allow with the tps-base /etc/* denies), but /etc/ssl carries
+      // the TLS CA bundle git/openssl need and has no deny under it — it is
+      // granted via tps-base's read list (and /private/etc/ssl on macOS, where
+      // /etc is a symlink and the real path is what the kernel resolves).
       ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt"];
 }
 
