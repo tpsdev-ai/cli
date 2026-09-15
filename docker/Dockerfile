@@ -16,15 +16,17 @@ RUN set -eux; \
     cargo build --release -p nono-cli; \
     cp target/release/nono /usr/local/bin/nono; \
     sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
+# ^ Rule 2b: the sha256 recording is the LAST instruction of this stage and lives
+# in the SAME logical line as the pinned checkout+build — a later RUN cannot swap
+# the binary and recompute the baseline.
 
 FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
 RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
-# The shipped binary AND the sha256 the pinned stage recorded for exactly those
-# bytes. The last instruction of this stage re-derives the hash from the path a
-# fetcher would have to write and fails the BUILD if it differs (cli#341 S4).
+# The shipped binary comes only from the pinned stage. The baseline sha256 is
+# NOT copied in — it is read from a read-only bind mount of the builder stage by
+# the assertion below, so no instruction in this stage can rewrite it.
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 # Runtime stage: only what the shipped workload needs. This image RUNS AGENTS
 # (docker/tps-office-supervisor.sh starts `tps-agent start` per agent user), and
 # the agent toolchain shells out to git — packages/agent/src/runtime/event-loop.ts,
@@ -44,12 +46,11 @@ WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
 # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["tps-office-supervisor"]
-# LAST instruction of the stage — after every other RUN/COPY, so it runs whatever
-# they were. The shipped binary must be the bytes the pinned stage built; any
-# rewrite of this path, by any primitive, spelling, variable or interpreter,
-# changes its hash and fails THIS BUILD rather than a grep. The tools are called
-# by absolute path so a PATH shadow in an earlier ENV/RUN cannot substitute
-# them, and the baseline hash file cannot be rewritten within the stage — so the
-# comparison cannot be made vacuous (cli#341 S4 r7).
-RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" \
- && rm -f /tmp/nono.sha256
+# LAST instruction of the stage. It reads the baseline (/nono.sha256) AND every
+# tool (sha256sum, cut, xargs, test, cat) from a READ-ONLY bind mount of the
+# builder stage at /b. Nothing in this stage can write what the assertion reads
+# or the tools it calls — no shell variable spelling, no tool overwrite, no
+# earlier RUN — so the comparison cannot be made vacuous. The only thing hashed
+# is the shipped path, which comes solely from the pinned COPY above (cli#341 S4
+# r8: the read-only mount is the control, not the scanner).
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"

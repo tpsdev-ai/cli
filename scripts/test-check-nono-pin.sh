@@ -55,11 +55,10 @@ good_base() {
   cat <<'EOF'
 FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 ENTRYPOINT ["tps-office-supervisor"]
-RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
 EOF
 }
 
@@ -229,8 +228,7 @@ RUN set -eux; \
     sha256sum target/release/nono | cut -d' ' -f1 > /nono.sha256
 FROM node:24-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
-RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
 EOF
 run_case "digest-pinned-control" pass "$d"
 
@@ -282,9 +280,8 @@ d="$(mk run-mount-pinned-control)"; good_pin "$d"
 { good_stage; cat <<'EOF'
 FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN --mount=type=bind,from=nono-builder,target=/m true
-RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro /b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = "$(/b/bin/cat /b/nono.sha256)"
 EOF
 } >"$d/docker/Dockerfile"
 run_case "run-mount-pinned-control" pass "$d"
@@ -419,6 +416,38 @@ RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.s
 EOF
 } >"$d/docker/Dockerfile"
 run_case "path-shadow-sha256sum" fail "$d"
+
+# ── 29. builder-recompute-defeat (r8 Kern): the baseline is recomputed in the
+# BUILDER stage — a second RUN swaps the binary and rewrites /nono.sha256, so the
+# runtime assertion would compare evil to evil (gate exit 0 before rule 2b).
+d="$(mk builder-recompute-defeat)"; good_pin "$d"
+cat >"$d/docker/Dockerfile" <<'EOF'
+FROM rust:bookworm AS nono-builder
+COPY .nono-version /tmp/.nono-version
+RUN set -eux; \
+    . /tmp/.nono-version; \
+    git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono; \
+    git -C /tmp/nono checkout "${commit}"; \
+    test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
+    cd /tmp/nono; \
+    cargo build --release -p nono-cli; \
+    cp target/release/nono /usr/local/bin/nono
+RUN printf '#!/bin/sh\nexit 42\n' > /tmp/evil && chmod +x /tmp/evil
+RUN d=/usr/local/bin; mv /tmp/evil $d/nono
+RUN sha256sum /usr/local/bin/nono | cut -d' ' -f1 > /nono.sha256
+EOF
+run_case "builder-recompute-defeat" fail "$d"
+
+# ── 30. builder-swap-after-record (r8 Kern): the recipe records honestly, then a
+# later builder RUN swaps the binary — the recording must be the LAST builder
+# instruction so nothing can follow it.
+d="$(mk builder-swap-after-record)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+RUN printf '#!/bin/sh\nexit 42\n' > /tmp/evil && chmod +x /tmp/evil
+RUN d=/usr/local/bin; mv /tmp/evil $d/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "builder-swap-after-record" fail "$d"
 
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then
