@@ -19,7 +19,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
-import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
+import { findNono, runCommandUnderNono, isNonoStrict, harnessReadPaths } from "../utils/nono.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
@@ -792,17 +792,19 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             console.warn("⚠️  nono not found — starting WITHOUT sandbox isolation. Pass --sandbox after installing nono.");
           } else {
             // Re-exec this process under nono with tps-agent-run profile
-            const identityDir = join(homedir(), ".tps", "identity");
             const mailDir = join(homedir(), ".tps", "mail");
             const agentDir = join(homedir(), ".tps", "agents", config.agentId);
-            const bunDir = join(homedir(), ".bun");
             const tmpDir = process.env.TMPDIR ?? "/tmp";
             const exitCode = runCommandUnderNono(
               "tps-agent-run",
               {
                 workdir: config.workspace,
-                // System-wide read: bun needs macOS dylibs/frameworks, read-only is safe
-                read: [identityDir, bunDir, "/"],
+                // CHANGE (cli#341 S1b): this used to grant a read of the
+                // filesystem root. A root grant is refused outright by nono
+                // 0.70+ (exit 1). Use the explicit toolchain read set instead —
+                // the macOS roots Kern validated, and their Linux equivalents
+                // (systemReadPaths()).
+                read: harnessReadPaths(),
                 allow: [mailDir, tmpDir, config.workspace, agentDir],
               },
               [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId, "--sandboxed"],

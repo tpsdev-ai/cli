@@ -1,0 +1,12 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-review-local",
+  "meta": {
+    "name": "tps-review-deep",
+    "version": "2.0.0",
+    "description": "tps review --deep — same filesystem access as local review, plus network for LLM-assisted review."
+  },
+  "network": {
+    "block": false
+  }
+}

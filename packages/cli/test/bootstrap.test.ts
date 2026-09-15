@@ -32,7 +32,7 @@ describe("bootstrap command", () => {
     mkdirSync(fakeBin, { recursive: true });
 
     const fakeNonoSource = join(import.meta.dir, "fakes", "nono", "bin", "nono");
-    const fakeProfileSource = join(import.meta.dir, "..", "nono-profiles", "tps-bootstrap.toml");
+    const fakeProfileSource = join(import.meta.dir, "..", "nono-profiles", "tps-bootstrap.json");
     copyFileSync(fakeNonoSource, join(fakeBin, "nono"));
 
     writeFileSync(
@@ -52,7 +52,7 @@ exit 0
 
     const profileDir = join(tempRoot, ".config", "nono", "profiles");
     mkdirSync(profileDir, { recursive: true });
-    copyFileSync(fakeProfileSource, join(profileDir, "tps-bootstrap.toml"));
+    copyFileSync(fakeProfileSource, join(profileDir, "tps-bootstrap.json"));
   });
 
   afterEach(() => {

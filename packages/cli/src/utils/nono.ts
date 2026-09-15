@@ -2,15 +2,20 @@
  * nono integration — wraps TPS CLI commands in nono process isolation.
  *
  * When nono is available on PATH, TPS commands run with kernel-level
- * filesystem and network restrictions defined by per-command TOML profiles.
+ * filesystem and network restrictions defined by per-command JSON profiles.
  *
  * If nono is not installed:
  *   - Default (warn) mode: logs a warning and runs unprotected
  *   - Strict mode (TPS_NONO_STRICT=1): exits non-zero immediately
  *
+ * Profiles (cli#341 S1b). A profile is JSON (nono 0.70+ shape) with `extends`.
+ * A profile that is MISSING or fails `nono profile validate --strict` is a
+ * FAILURE — the run stops (EX_CONFIG). There is no warn-and-continue path for
+ * an unloadable sandbox.
+ *
  * Profile locations (searched in order):
- *   1. ~/.config/nono/profiles/<name>.toml
- *   2. <tps-install-dir>/nono-profiles/<name>.toml
+ *   1. ~/.config/nono/profiles/<name>.json
+ *   2. <tps-install-dir>/nono-profiles/<name>.json
  *
  * Usage:
  *   import { withNono } from "./nono.js";
@@ -68,6 +73,133 @@ export function findNono(): string | null {
  */
 export function isNonoStrict(): boolean {
   return process.env.TPS_NONO_STRICT === "1";
+}
+
+// ---------------------------------------------------------------------------
+// Profile loading (cli#341 S1b) — validate-or-FAIL, never warn-and-continue
+// ---------------------------------------------------------------------------
+
+/** First nono release with the JSON profile schema and `nono profile`. */
+export const NONO_MIN_VERSION = "0.70.0";
+
+/** sysexits.h EX_CONFIG — the configuration (here: the profile) is wrong. */
+export const EX_CONFIG = 78;
+
+/**
+ * Resolve a profile name to a JSON file on disk, or null.
+ * Searches ~/.config/nono/profiles/ then the bundled nono-profiles/ directory.
+ */
+export function resolveProfilePath(name: string): string | null {
+  const home = process.env.HOME || homedir() || "/tmp";
+  const candidates = [
+    join(home, ".config", "nono", "profiles", `${name}.json`),
+    join(findBundledProfilesDir(), `${name}.json`),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return null;
+}
+
+/** `nono --version` → "x.y.z", or null if it cannot be parsed. */
+export function nonoVersion(bin: string): string | null {
+  const result = spawnSync(bin, ["--version"], { encoding: "utf-8", env: process.env });
+  if (result.status !== 0 || !result.stdout) return null;
+  const m = result.stdout.match(/(\d+)\.(\d+)\.(\d+)/);
+  return m ? `${m[1]}.${m[2]}.${m[3]}` : null;
+}
+
+/** Semver-ish >= for the version floor (no prerelease handling needed). */
+export function versionAtLeast(actual: string, min: string): boolean {
+  const a = actual.split(".").map((n) => Number.parseInt(n, 10));
+  const b = min.split(".").map((n) => Number.parseInt(n, 10));
+  for (let i = 0; i < 3; i++) {
+    const x = Number.isFinite(a[i]) ? a[i]! : 0;
+    const y = Number.isFinite(b[i]) ? b[i]! : 0;
+    if (x !== y) return x > y;
+  }
+  return true;
+}
+
+export interface ProfileCheck {
+  ok: boolean;
+  /** Resolved profile path when found. */
+  path?: string;
+  /** Human-readable reason when not ok. */
+  reason?: string;
+}
+
+/**
+ * Validate-or-FAIL. The profile must exist AND pass `nono profile validate
+ * --strict`. Anything else is a refusal: a sandbox that cannot be loaded stops
+ * the run. Returns the resolved path on success.
+ *
+ * `bin` is injectable for tests; pass null to check existence only (used when
+ * nono is absent and the caller's nono policy handles that separately).
+ */
+export function checkProfileLoadable(name: string, bin: string | null = findNono()): ProfileCheck {
+  const path = resolveProfilePath(name);
+  if (!path) {
+    return {
+      ok: false,
+      reason:
+        `profile ${name}.json was not found in ~/.config/nono/profiles/ or the bundled ` +
+        `nono-profiles/ directory`,
+    };
+  }
+  if (!bin) return { ok: true, path };
+
+  const version = nonoVersion(bin);
+  if (version && !versionAtLeast(version, NONO_MIN_VERSION)) {
+    return {
+      ok: false,
+      path,
+      reason: `nono ${version} at ${bin} is below the ${NONO_MIN_VERSION} floor — it predates JSON profiles`,
+    };
+  }
+
+  const validate = spawnSync(bin, ["profile", "validate", "--strict", path], {
+    encoding: "utf-8",
+    env: process.env,
+  });
+  if (validate.status !== 0) {
+    const detail = `${validate.stdout ?? ""}${validate.stderr ?? ""}`
+      .trim()
+      .split("\n")
+      .slice(-6)
+      .join("\n");
+    return {
+      ok: false,
+      path,
+      reason: `\`nono profile validate --strict ${path}\` exited ${validate.status}:\n${detail}`,
+    };
+  }
+  return { ok: true, path };
+}
+
+/**
+ * System read roots. Replaces the old blanket `--read /`: a root grant is
+ * refused by nono 0.70+, so the harness grants the toolchain roots explicitly.
+ * Kern validated the macOS set; the Linux set is its equivalent.
+ */
+export function systemReadPaths(): string[] {
+  return process.platform === "darwin"
+    ? ["/opt/homebrew", "/usr", "/bin", "/sbin", "/Library"]
+    : ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"];
+}
+
+/**
+ * Read grants every TPS harness family needs: the agent identity dir, the bun
+ * cache, the running interpreter's own directory, plus the system roots. One
+ * definition so `agent start` and `mail watch` cannot drift apart (cli#341 S1b).
+ */
+export function harnessReadPaths(): string[] {
+  return [
+    join(homedir(), ".tps", "identity"),
+    join(homedir(), ".bun"),
+    dirname(process.execPath),
+    ...systemReadPaths(),
+  ];
 }
 
 /**
@@ -133,6 +265,17 @@ export async function withNono(
     }
   }
 
+  // nono is available — but only proceed if the profile can actually load.
+  // Validate-or-FAIL: an unloadable sandbox stops the run (cli#341 S1b).
+  const check = checkProfileLoadable(profile, nono);
+  if (!check.ok) {
+    console.error(
+      `❌ nono profile failed to load — refusing to run outside the sandbox (cli#341):\n` +
+        `   profile: ${profile}\n   reason:  ${check.reason}`
+    );
+    process.exit(EX_CONFIG);
+  }
+
   // nono is available — run the callback directly (the current process IS already
   // being run via nono by the calling shell, or we re-exec under nono).
   // For TPS's architecture, we use runCommandUnderNono() for subprocess isolation.
@@ -170,6 +313,17 @@ export function runCommandUnderNono(
     return result.status ?? 1;
   }
 
+  // Validate-or-FAIL before we depend on the profile (cli#341 S1b): a missing
+  // or invalid profile is a refusal, never a warn-and-continue.
+  const check = checkProfileLoadable(profile, nono);
+  if (!check.ok) {
+    console.error(
+      `❌ nono profile failed to load — refusing to run without isolation (cli#341):\n` +
+        `   profile: ${profile}\n   reason:  ${check.reason}`
+    );
+    return EX_CONFIG;
+  }
+
   const args = buildNonoArgs(profile, options, cmd);
   const result = spawnSync(nono, args, {
     stdio: "inherit",
@@ -193,6 +347,11 @@ function findBundledProfilesDir(): string {
 /**
  * Install nono profiles to ~/.config/nono/profiles/.
  * Called during `tps install` or first-run setup.
+ *
+ * JSON profiles (nono 0.70+) only. The pre-2.0 TOML dialect is not valid on
+ * 0.70+; a leftover *.toml is not copied. Every installed profile is
+ * validate-or-FAIL when nono is available — an unloadable profile must not be
+ * installed silently (cli#341 S1b).
  */
 export function installNonoProfiles(targetDir?: string, silent?: boolean): void {
   const home = process.env.HOME || homedir() || "/tmp";
@@ -208,13 +367,29 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
 
   mkdirSync(profilesDir, { recursive: true });
 
+  const bin = findNono();
+  // Validate only when nono is new enough to have JSON profiles at all. An
+  // absent/too-old nono cannot load them either way; the *launch* path
+  // (checkProfileLoadable) is where an unsupported nono is refused.
+  const version = bin ? nonoVersion(bin) : null;
+  const canValidate = Boolean(bin && version && versionAtLeast(version, NONO_MIN_VERSION));
   for (const file of readdirSync(bundledDir)) {
-    if (file.endsWith(".toml")) {
-      const src = join(bundledDir, file);
-      const dst = join(profilesDir, file);
-      if (!existsSync(dst)) {
-        copyFileSync(src, dst);
-        if (!silent) console.log(`  ✓ Installed nono profile: ${file}`);
+    if (!file.endsWith(".json")) continue;
+    const src = join(bundledDir, file);
+    const dst = join(profilesDir, file);
+    if (!existsSync(dst)) {
+      copyFileSync(src, dst);
+      if (!silent) console.log(`  ✓ Installed nono profile: ${file}`);
+    }
+    if (canValidate) {
+      const name = file.replace(/\.json$/, "");
+      const check = checkProfileLoadable(name, bin);
+      if (!check.ok) {
+        console.error(
+          `❌ installed nono profile fails validation — refusing to continue (cli#341):\n` +
+            `   profile: ${dst}\n   reason:  ${check.reason}`
+        );
+        process.exit(EX_CONFIG);
       }
     }
   }

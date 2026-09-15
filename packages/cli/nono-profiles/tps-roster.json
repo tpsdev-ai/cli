@@ -1,0 +1,30 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-roster",
+    "version": "2.0.0",
+    "description": "tps roster \u2014 read-only org chart. Reads ~/.openclaw/openclaw.json as metadata (the base profile denies it to agents; this operator-side profile exempts it explicitly) and nothing else. No writes, no network. Linux note: Landlock cannot express deny-within-allow, so a deny nested inside an allowed parent makes nono refuse to start (it will not silently weaken the deny) \u2014 keep every deny at or above the allow roots. Matters for the exe.dev profiles (ops-mxf9). Never grant the state root: ~/.tps/secrets and ~/.tps/identity are siblings of the mailbox and agent state, so a grant or deny at ~/.tps level takes the mailbox and agent state with it."
+  },
+  "groups": {
+    "exclude": [
+      "system_write_macos",
+      "system_write_linux",
+      "user_tools"
+    ]
+  },
+  "workdir": {
+    "access": "read"
+  },
+  "filesystem": {
+    "bypass_protection": [
+      "~/.openclaw/openclaw.json"
+    ],
+    "read_file": [
+      "~/.openclaw/openclaw.json"
+    ]
+  },
+  "network": {
+    "block": true
+  }
+}
