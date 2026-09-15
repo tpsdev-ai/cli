@@ -12,21 +12,38 @@
 #      No other keys, no duplicate assignments.
 #   2. docker/Dockerfile's nono stage sources .nono-version and checks out
 #      ${commit} from the canonical repo, then asserts `git rev-parse HEAD` is
-#      exactly ${commit}.
-#   3. Nothing ELSE in that stage names a ref: no --branch/--depth, no
-#      refs/heads|tags, no generated-archive URL, no tag name, no master/main/HEAD
-#      (the rev-parse assertion, which must read HEAD, is the one allowed use).
+#      exactly ${commit}. (The required positive shape is tied to the nono stage.)
+#   3. WHOLE-FILE ref scan: no line ANYWHERE in docker/Dockerfile may fetch a
+#      moving ref — no --branch/--depth, no refs/heads|tags, no generated-archive
+#      URL, no branch/HEAD name (the rev-parse assertion is the one allowed use of
+#      HEAD). The scan is file-wide because the binary that actually ships comes
+#      from a `COPY --from=` in the `base` stage: a second stage could otherwise
+#      clone a moving ref while nono-builder stays perfectly pinned (the S4
+#      bypass). The only permitted source clone in the file is the pinned one.
+#      The bare tag-name rule stays scoped to nono lines so a version literal in
+#      another stage cannot false-positive.
+#   4. Canonical identity: any line naming a nono repository URL/ref must name
+#      https://github.com/nolabs-ai/nono — a crafted second stage cloning a
+#      look-alike at a "pinned-looking" sha is still a fail.
 #
 # Pre-S4 (`git clone --depth 1 .../nono.git /tmp/nono`, no pin file) fails rules
-# 1–3; a `--branch v0.74.0` fetch fails rule 3.
+# 1–3; a `--branch v0.74.0` fetch fails rule 3; the two-stage bypass fails rules
+# 3 & 4. All of those are executable fixtures in scripts/test-check-nono-pin.sh.
+#
+# NONO_PIN_ROOT overrides the tree under test. It exists only for that fixture
+# harness; it is unset in CI, where the gate reads the repository it lives in.
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="${NONO_PIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 pin_file="$root/.nono-version"
 dockerfile="$root/docker/Dockerfile"
 fail=0
 
 err() { printf 'check-nono-pin: %s\n' "$1" >&2; fail=1; }
+
+canonical='https://github.com/nolabs-ai/nono'
+allowed_assertion='test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"'
+allowed_clone='git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono'
 
 # ── Rule 1: the pin file has exactly two keys, both well-formed ───────────────
 version=""
@@ -66,7 +83,7 @@ else
   fi
 fi
 
-# ── Rules 2 & 3: the Dockerfile's nono stage ──────────────────────────────────
+# ── Rules 2–4: docker/Dockerfile ─────────────────────────────────────────────
 if [ ! -f "$dockerfile" ]; then
   err "missing docker/Dockerfile"
 else
@@ -78,41 +95,89 @@ else
     f { print }
   ' "$dockerfile")"
 
+  # The whole file as logical lines: comments dropped and `\` continuations
+  # joined, so a ref cannot hide by wrapping across physical lines. Rule 3 scans
+  # this, not just the nono stage — every stage may fetch source, and the shipped
+  # binary is a `COPY --from=` in base.
+  logical="$(awk '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      while (line ~ /\\[[:space:]]*$/) {
+        if ((getline nxt) <= 0) break
+        sub(/\\[[:space:]]*$/, "", line)
+        line = line " " nxt
+      }
+      print line
+    }
+  ' "$dockerfile")"
+
+  # ── Rule 2 — the required positive shape (nono stage only) ─────────────────
   if [ -z "$stage" ]; then
     err "docker/Dockerfile: no 'FROM ... AS nono-builder' stage found"
   else
-    # Full-line comments are prose; they must not trip the ref scan.
+    # Full-line comments are prose; they must not trip the scans.
     code="$(printf '%s\n' "$stage" | grep -vE '^[[:space:]]*#')"
 
-    # Rule 2 — the required positive shape.
     printf '%s\n' "$code" | grep -qF 'COPY .nono-version' \
       || err "nono stage does not COPY .nono-version — the pin must be sourced from the repo file"
     printf '%s\n' "$code" | grep -qF '. /tmp/.nono-version' \
       || err "nono stage does not source .nono-version — \${commit} would be undefined"
-    printf '%s\n' "$code" | grep -qF 'https://github.com/nolabs-ai/nono' \
-      || err "nono stage does not clone the canonical repo https://github.com/nolabs-ai/nono"
+    printf '%s\n' "$code" | grep -qF "$canonical" \
+      || err "nono stage does not clone the canonical repo $canonical"
     printf '%s\n' "$code" | grep -qF 'checkout "${commit}"' \
       || err "nono stage does not contain the pinned checkout: git -C /tmp/nono checkout \"\${commit}\""
-    printf '%s\n' "$code" | grep -qF 'test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"' \
-      || err "nono stage does not assert the checkout: test \"\$(git -C /tmp/nono rev-parse HEAD)\" = \"\${commit}\""
+    printf '%s\n' "$code" | grep -qF "$allowed_assertion" \
+      || err "nono stage does not assert the checkout: $allowed_assertion"
 
-    # Rule 3 — whitelist: drop the one allowed assertion line, then reject any
-    # remaining ref. A blacklist of branch names is not enough; anything that
-    # *names* a ref (rather than the commit id) is a fail.
-    scan="$(printf '%s\n' "$code" | grep -vF 'rev-parse HEAD')"
-    if printf '%s\n' "$scan" | grep -qIE '(^|[^A-Za-z0-9_-])(master|main|HEAD)([^A-Za-z0-9_-]|$)'; then
-      err "nono stage names a branch/HEAD ref — only the pinned commit id may be referenced"
-    fi
-    if printf '%s\n' "$scan" | grep -qIE 'refs/heads/|refs/tags/|--branch([[:space:]]|=)|--depth([[:space:]]|=)'; then
-      err "nono stage fetches a ref (refs/*, --branch, --depth) — pin the commit instead"
-    fi
-    if printf '%s\n' "$scan" | grep -qIE 'archive/refs|releases/download'; then
-      err "nono stage fetches a generated archive (mutable bytes) — clone and check out the commit"
-    fi
-    if printf '%s\n' "$scan" | grep -qIE 'v[0-9]+\.[0-9]+\.[0-9]+'; then
+    # Rule 3 (tag-name clause) — scoped to the nono stage, so a version literal
+    # in another stage (e.g. `@tpsdev-ai/agent@v1.2.3`) never false-positives.
+    if printf '%s\n' "$code" | grep -vF 'rev-parse HEAD' | grep -qE 'v[0-9]+\.[0-9]+\.[0-9]+'; then
       err "nono stage names a tag (mutable) — the commit id is the pin"
     fi
   fi
+
+  # ── Rule 3 — whole-file ref scan ───────────────────────────────────────────
+  # Drop the one allowed HEAD assertion, then any remaining ref name is illicit.
+  scan="$(printf '%s\n' "$logical" | awk -v a="$allowed_assertion" '
+    {
+      i = index($0, a)
+      while (i > 0) {
+        $0 = substr($0, 1, i - 1) substr($0, i + length(a))
+        i = index($0, a)
+      }
+      print
+    }')"
+  if printf '%s\n' "$scan" | grep -qE '(^|[^A-Za-z0-9_-])(master|main|HEAD)([^A-Za-z0-9_-]|$)'; then
+    err "docker/Dockerfile names a branch/HEAD ref — outside the rev-parse assertion only the pinned commit id may be referenced"
+  fi
+  if printf '%s\n' "$scan" | grep -qE 'refs/heads/|refs/tags/|--branch([[:space:]]|=)|--depth([[:space:]]|=)'; then
+    err "docker/Dockerfile fetches a moving ref (refs/*, --branch, --depth) — pin the commit instead"
+  fi
+  if printf '%s\n' "$scan" | grep -qE 'archive/refs|releases/download'; then
+    err "docker/Dockerfile fetches a generated archive (mutable bytes) — clone and check out the commit"
+  fi
+
+  # ── Rule 3 (clone clause) — the only permitted source clone is the pinned one
+  offenders="$(printf '%s\n' "$logical" \
+    | grep -E '(^|[^A-Za-z0-9_-])git[[:space:]]+clone([^A-Za-z0-9_-]|$)' \
+    | grep -vF "$allowed_clone" || true)"
+  if [ -n "$offenders" ]; then
+    err "docker/Dockerfile contains a git clone other than the pinned canonical clone — no stage may fetch nono (or anything) from a moving source"
+  fi
+
+  # ── Rule 4 — canonical identity: every nono repository ref must be canonical
+  refs="$(printf '%s\n' "$logical" \
+    | grep -oE "([A-Za-z][A-Za-z0-9+.-]*://|git@)[^[:space:]\"']+" \
+    | grep -E '[/:]nono(\.git)?$' || true)"
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    norm="${ref%.git}"
+    norm="${norm%/}"
+    if [ "$norm" != "$canonical" ]; then
+      err "docker/Dockerfile names a non-canonical nono source '$ref' — the only allowed nono source is $canonical"
+    fi
+  done <<<"$refs"
 fi
 
 if [ "$fail" -ne 0 ]; then

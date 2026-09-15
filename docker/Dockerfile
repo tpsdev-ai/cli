@@ -4,6 +4,8 @@ RUN apt-get update && apt-get install -y libdbus-1-dev pkg-config git ca-certifi
 # cli#341 S1's CI gate reads the same file). Clone the canonical repo, check out
 # the pinned commit, assert we got exactly it, then build. The commit id is the
 # content hash; no branch, tag or generated-archive URL is ever fetched.
+# https://github.com/nolabs-ai/nono is the canonical repo; the older
+# always-further/nono only redirects to it — do not "correct" the URL back.
 COPY .nono-version /tmp/.nono-version
 RUN set -eux; \
     . /tmp/.nono-version; \
