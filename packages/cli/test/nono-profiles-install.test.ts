@@ -19,6 +19,7 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  readdirSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { installNonoProfiles } from "../src/utils/nono.js";
@@ -93,5 +94,33 @@ describe("installNonoProfiles migration", () => {
     installNonoProfiles(profilesDir, true);
 
     expect(readFileSync(join(profilesDir, "tps-base.json"), "utf-8")).toBe(before);
+  });
+
+  test("completes when a stale child is seeded before its parent (two-pass install, cli#351 r3)", () => {
+    // Stale weak child present; its parent (tps-base) is absent. Validating in
+    // the same pass as copying is order-dependent (readdir is arbitrary) and
+    // aborts mid-install, leaving exactly the partial shadowing state the
+    // migration exists to prevent.
+    writeFileSync(
+      join(profilesDir, "tps-agent-run.json"),
+      JSON.stringify({
+        extends: "tps-base",
+        meta: { name: "tps-agent-run", version: "0.0.0" },
+        filesystem: { read: ["/"] },
+      }),
+      "utf-8",
+    );
+    // Fake nono on PATH so validation runs AND resolves `extends` by name.
+    const fakeDir = join(import.meta.dir, "fakes/nono/bin");
+    process.env.PATH = `${fakeDir}:${origPath ?? ""}`;
+
+    installNonoProfiles(profilesDir, true);
+
+    const names = readdirSync(profilesDir);
+    expect(names.filter((f) => f.endsWith(".json")).length).toBe(13);
+    expect(names).toContain("tps-base.json");
+    const child = JSON.parse(readFileSync(join(profilesDir, "tps-agent-run.json"), "utf-8"));
+    expect(child.meta.version).toBe("2.0.0"); // bundled wins over the stale child
+    expect(child.filesystem.read).not.toContain("/");
   });
 });

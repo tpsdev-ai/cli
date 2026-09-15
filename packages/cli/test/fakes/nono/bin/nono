@@ -126,6 +126,21 @@ if [[ "${1:-}" == "profile" ]]; then
     echo "nono: profile invalid: $VALIDATE_PATH: no such file" >&2
     exit 1
   fi
+  # Resolve `extends` by name across locations (user dir, then builtin), like
+  # real nono — a child whose parent is not present fails validation. This is
+  # what makes install ordering observable.
+  base_name="$(grep -oE '"extends"[[:space:]]*:[[:space:]]*"[^"]+"' "$VALIDATE_PATH" | head -n1 | sed -E 's/.*:[[:space:]]*"([^"]+)"/\1/')"
+  if [[ -n "$base_name" && "$base_name" != "default" && "$base_name" != "builtin" ]]; then
+    found=0
+    for dir in "${HOME:-}/.config/nono/profiles" "$BUILTIN_PROFILE_DIR"; do
+      if [[ -f "$dir/${base_name}.json" ]]; then found=1; break; fi
+    done
+    if [[ "$found" -ne 1 ]]; then
+      log "PROFILE_INVALID path=$VALIDATE_PATH (extends '$base_name' not found)"
+      echo "nono: profile invalid: base profile '$base_name' not found" >&2
+      exit 1
+    fi
+  fi
   log "PROFILE_VALID path=$VALIDATE_PATH"
   echo "Result: valid"
   exit 0

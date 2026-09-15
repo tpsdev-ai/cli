@@ -399,28 +399,36 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
     if (!silent) console.log(`  ✓ Retired stale nono profile: ${entry}`);
   }
 
+  // ── Pass 1: copy/overwrite the FULL set (no validation yet) ────────────────
+  // Copy and validate must be separate passes: `readdirSync` order is
+  // filesystem-arbitrary, so validating a child (e.g. tps-office extends
+  // tps-base) before its parent has been copied aborts mid-install and leaves
+  // exactly the partial state the migration exists to prevent (cli#351 r3).
+  for (const file of bundled) {
+    const src = join(bundledDir, file);
+    const dst = join(profilesDir, file);
+    const present = existsSync(dst);
+    if (!present || fileSha256(src) !== fileSha256(dst)) {
+      copyFileSync(src, dst);
+      if (!silent) console.log(`  ✓ ${present ? "Updated" : "Installed"} nono profile: ${file}`);
+    }
+  }
+
+  // ── Pass 2: validate the complete set; fail closed only now ────────────────
   const bin = findNono();
   // Validate only when nono is new enough to have JSON profiles at all. An
   // absent/too-old nono cannot load them either way; the *launch* path
   // (checkProfileLoadable) is where an unsupported nono is refused.
   const version = bin ? nonoVersion(bin) : null;
   const canValidate = Boolean(bin && version && versionAtLeast(version, NONO_MIN_VERSION));
-  for (const file of bundled) {
-    const src = join(bundledDir, file);
-    const dst = join(profilesDir, file);
-    // (a) Overwrite whenever the content differs (content-hash versioned).
-    const present = existsSync(dst);
-    if (!present || fileSha256(src) !== fileSha256(dst)) {
-      copyFileSync(src, dst);
-      if (!silent) console.log(`  ✓ ${present ? "Updated" : "Installed"} nono profile: ${file}`);
-    }
-    if (canValidate) {
+  if (canValidate) {
+    for (const file of bundled) {
       const name = file.replace(/\.json$/, "");
       const check = checkProfileLoadable(name, bin);
       if (!check.ok) {
         console.error(
           `❌ installed nono profile fails validation — refusing to continue (cli#341):\n` +
-            `   profile: ${dst}\n   reason:  ${check.reason}`
+            `   profile: ${join(profilesDir, file)}\n   reason:  ${check.reason}`
         );
         process.exit(EX_CONFIG);
       }
