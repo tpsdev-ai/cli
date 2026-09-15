@@ -19,7 +19,7 @@ const cli = meow(
     backup            Archive critical TPS host files
     restore <agent-id> <archive> [--clone] [--overwrite] [--from <archive>] Restore agent workspace from a backup
     status [agent-id] [--auto-prune] [--prune] [--json] [--cost] [--shared]
-    heartbeat <agent-id> [--nonono] Send a heartbeat/ping for an agent
+    heartbeat <agent-id> [--quiet-nono-check] Send a heartbeat/ping for an agent
     context <action>  Workstream context memory (read/update/list)
     mail <action>     Mailroom operations (send/check/list/search)
     gal <action>      Global Address List (list/set/remove/sync)
@@ -89,7 +89,15 @@ const cli = meow(
       branch: { type: "boolean", default: false },
       manifest: { type: "string" },
       soundstage: { type: "boolean", default: false },
+      // --quiet-nono-check: skips only the loud availability check; it is NOT a
+      // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
+      quietNonoCheck: { type: "boolean", default: false },
       nonono: { type: "boolean", default: false },
+      // Launch-path control (cli#341 S1a): --sandbox-required is asserted by every
+      // generated agent unit. (--no-sandbox is the interactive-TTY-only escape hatch;
+      // it is read from process.argv directly because yargs parses `--no-x` as a
+      // negation, which would shadow a declared `noSandbox` key.)
+      sandboxRequired: { type: "boolean", default: false },
       inject: { type: "boolean", default: true },
       runtime: { type: "string", default: "openclaw" },
       baseModel: { type: "string" },
@@ -170,9 +178,32 @@ const cli = meow(
 
 const [command, ...rest] = cli.input;
 
-// nono availability check (skip for --no-nono or office/mail relay commands)
+/**
+ * Launch-path control (cli#341 S1a). Fail-closed: refuses `--no-sandbox` outside
+ * an interactive TTY, and refuses a non-interactive agent launch that did not
+ * assert `--sandbox-required`. Implementation lives in src/utils/nono.ts.
+ */
+async function enforceLaunchControlOrExit(): Promise<void> {
+  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG } = await import(
+    "../src/utils/nono.js"
+  );
+  enforceLaunchControl({ command, rest, argv: process.argv });
+  if (process.argv.includes(NO_SANDBOX_FLAG) && isInteractiveTty()) {
+    console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
+  }
+}
+
+// nono availability check (skip for --quiet-nono-check or office/mail relay commands)
 async function checkNono() {
-  if (cli.flags.nonono) return;
+  // --nonono → --quiet-nono-check (cli#341 S1a). Hidden alias for one release.
+  const legacyNonono = Boolean(cli.flags.nonono);
+  if (legacyNonono && !cli.flags.quietNonoCheck) {
+    console.warn(
+      "⚠️  --nonono is deprecated and will be removed after one release; use --quiet-nono-check. " +
+        "It only skips the loud availability check — it is not a sandbox bypass."
+    );
+  }
+  if (cli.flags.quietNonoCheck || legacyNonono) return;
   if (command === "office" && rest[0] === "relay") return; // relay runs in background
   const { findNono } = await import("../src/utils/nono.js");
   // Suppress warning if already running inside nono sandbox
@@ -181,7 +212,7 @@ async function checkNono() {
     console.warn(
       "⚠️  nono not found. Host agents will run without process isolation.\n" +
       "   Install nono for syscall filtering + filesystem boundaries.\n" +
-      "   Use --nonono to run anyway (not recommended).\n"
+      "   Use --quiet-nono-check to silence this check (it does NOT disable isolation).\n"
     );
   }
 }
@@ -197,6 +228,7 @@ async function main() {
     return;
   }
 
+  await enforceLaunchControlOrExit();
   await checkNono();
   switch (command) {
     case "init": {
@@ -524,7 +556,7 @@ async function main() {
               if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
             }
           } else {
-            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: process.argv.includes("--sandbox"), sandboxed: process.argv.includes("--sandboxed") });
+            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: !process.argv.includes("--no-sandbox"), sandboxed: process.argv.includes("--sandboxed") });
           }
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });
@@ -942,7 +974,7 @@ async function main() {
       await runHeartbeat({
         agentId,
         status: (cli.flags.statusOverride as any) || undefined,
-        nonono: !!cli.flags.nonono,
+        nonono: !!(cli.flags.nonono || cli.flags.quietNonoCheck),
         profile: "tps-status",
       });
       break;

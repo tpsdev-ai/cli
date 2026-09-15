@@ -8,6 +8,15 @@
  *   - Default (warn) mode: logs a warning and runs unprotected
  *   - Strict mode (TPS_NONO_STRICT=1): exits non-zero immediately
  *
+ * Launch-path control (cli#341 S1a) — fail-closed, no env escape hatch:
+ *   - The old `TPS_FORCE_NO_NONO` environment bypass is GONE. No environment
+ *     variable can make the launcher forget that nono exists.
+ *   - `--no-sandbox` (the only human escape hatch) is honoured ONLY from an
+ *     interactive TTY (stdin AND stdout). Anywhere else it is refused.
+ *   - A non-interactive invocation that launches an agent MUST carry
+ *     `--sandbox-required`; a launcher that dropped it is refused rather than
+ *     silently running unsandboxed. See `evaluateLaunchControl`.
+ *
  * Profile locations (searched in order):
  *   1. ~/.config/nono/profiles/<name>.toml
  *   2. <tps-install-dir>/nono-profiles/<name>.toml
@@ -51,7 +60,6 @@ export interface NonoOptions {
  * Find the nono binary on PATH. Returns the resolved path or null.
  */
 export function findNono(): string | null {
-  if (process.env.TPS_FORCE_NO_NONO === "1") return null;
   const result = spawnSync("which", ["nono"], {
     encoding: "utf-8",
     env: process.env, // explicitly pass so PATH mutations in tests are respected
@@ -218,4 +226,134 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Launch-path sandbox control (cli#341 S1a)
+// ---------------------------------------------------------------------------
+//
+// This is the control that decides whether a *launcher* is allowed to start an
+// agent, and under what isolation. It is deliberately small and dependency-free
+// so it can be unit tested with injected TTY/supervisor state.
+
+/** Asserted by every generated unit that launches an agent. */
+export const SANDBOX_REQUIRED_FLAG = "--sandbox-required";
+
+/** The only human escape hatch. Interactive TTY only. */
+export const NO_SANDBOX_FLAG = "--no-sandbox";
+
+/**
+ * Set by generated units (launchd/systemd) in their environment. A refusal then
+ * exits 0 instead of 78 — see the KeepAlive coupling note below.
+ */
+export const SUPERVISED_ENV = "TPS_SUPERVISED";
+
+/** Exit code for a refusal when NOT running under a supervisor (sysexits: EX_CONFIG). */
+export const REFUSAL_EXIT_CODE = 78;
+
+/**
+ * KeepAlive coupling (measured, Sherlock):
+ *   - `{Crashed:true}` restarts only on *signal* death — `exit 78` gives 1 launch.
+ *   - `{SuccessfulExit:false}` + `exit 78` gives 13 relaunches in 12 s.
+ * Generated agent units therefore pair `{SuccessfulExit:false}` with "the
+ * launcher logs the refusal and exits 0" (`${SUPERVISED_ENV}=1`). A refusal is a
+ * clean exit 0 → no relaunch storm; a genuine crash is non-zero/signal → relaunch.
+ */
+export const SUPERVISED_REFUSAL_EXIT_CODE = 0;
+
+/** `--quiet-nono-check` (renamed from `--nonono`): only skips the loud check. */
+export const QUIET_NONO_CHECK_FLAG = "--quiet-nono-check";
+/** Deprecated hidden alias, kept for one release. */
+export const LEGACY_NONONO_FLAG = "--nonono";
+
+export function isInteractiveTty(
+  stdin: { isTTY?: boolean } = process.stdin,
+  stdout: { isTTY?: boolean } = process.stdout
+): boolean {
+  // Both ends must be a terminal: a piped stdin with a TTY stdout (or vice
+  // versa) is scripted, not a human at the keyboard.
+  return Boolean(stdin?.isTTY && stdout?.isTTY);
+}
+
+export function isSupervised(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[SUPERVISED_ENV] === "1";
+}
+
+/**
+ * Commands that hand control to an agent. These are exactly the commands that
+ * generated units invoke, and the ones that must assert `--sandbox-required`
+ * when there is no TTY to ask.
+ */
+export function launchesAgent(command: string | undefined, rest: readonly string[] = []): boolean {
+  const sub = rest[0];
+  if (command === "agent") return sub === "start";
+  if (command === "mail") return sub === "watch";
+  if (command === "office") return sub === "connect";
+  return false;
+}
+
+export interface LaunchControlInput {
+  /** Top-level command word (argv[2]). */
+  command?: string;
+  /** Remaining words after the command. */
+  rest?: readonly string[];
+  /** Full argv (defaults to process.argv). */
+  argv?: readonly string[];
+  /** Override TTY detection (tests). */
+  interactiveTty?: boolean;
+  /** Override supervisor detection (tests). */
+  supervised?: boolean;
+}
+
+export interface LaunchControlResult {
+  allowed: boolean;
+  /** Human-readable refusal naming the flag and the reason. */
+  refusal?: string;
+  /** Process exit code to use for the refusal (0 when supervised). */
+  refusalExitCode: number;
+}
+
+/**
+ * Pure decision function for the launch-path control. Never touches the
+ * process; the caller applies the result.
+ */
+export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchControlResult {
+  const argv = input.argv ?? process.argv;
+  const tty = input.interactiveTty ?? isInteractiveTty();
+  const supervised = input.supervised ?? isSupervised();
+  const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
+  const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
+
+  // (1) --no-sandbox is honoured only from an interactive TTY.
+  if (argv.includes(NO_SANDBOX_FLAG) && !tty) {
+    return deny(
+      `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
+        "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
+        "so the agent must launch under nono. Remove the flag, or run it yourself in a terminal.",
+    );
+  }
+
+  // (2) Non-interactive agent launch must assert --sandbox-required.
+  if (launchesAgent(input.command, input.rest) && !tty && !argv.includes(SANDBOX_REQUIRED_FLAG)) {
+    const sub = input.rest?.[0] ?? "";
+    return deny(
+      `${SANDBOX_REQUIRED_FLAG} is required: this non-interactive context is launching an agent ` +
+        `(\`${input.command} ${sub}\`) and the launcher did not assert it. A hand-edited plist, ` +
+        `a stale wrapper or a dropped argument would otherwise run the agent unsandboxed. ` +
+        `Refusing to launch.`,
+    );
+  }
+
+  return { allowed: true, refusalExitCode: 0 };
+}
+
+/**
+ * Apply `evaluateLaunchControl` to the current process: log and exit on refusal.
+ * Safe to call unconditionally at the top of the launcher.
+ */
+export function enforceLaunchControl(input: LaunchControlInput = {}): void {
+  const result = evaluateLaunchControl(input);
+  if (result.allowed || !result.refusal) return;
+  console.error(`❌ ${result.refusal}`);
+  process.exit(result.refusalExitCode);
 }
