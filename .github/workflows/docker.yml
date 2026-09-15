@@ -54,6 +54,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build (single-platform, loaded locally) so the artifact can be smoked
+      # BEFORE anything is pushed (cli#345 r10).
+      - name: Build (load, no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: |
+            TPS_VERSION=${{ steps.version.outputs.tps_version }}
+          tags: |
+            tps-office-verify:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # THE PRIMARY CONTROL: a Dockerfile shape cannot fake an executed artifact.
+      - name: Smoke the built image (primary control)
+        run: |
+          set -eux
+          # 1. the shipped binary executes, without an image shell
+          docker run --rm --entrypoint /usr/local/bin/nono tps-office-verify:latest --version | grep -q 'nono 0.74.0'
+          # 2. it is a regular file (not a symlink) whose bytes match the pin,
+          #    compared ON THE RUNNER HOST
+          cid="$(docker create tps-office-verify:latest)"
+          docker cp "$cid:/usr/local/bin/nono" ./nono-from-image
+          docker rm "$cid" >/dev/null
+          test -f ./nono-from-image
+          test ! -L ./nono-from-image
+          echo "$(cat docker/nono.sha256)  ./nono-from-image" | sha256sum -c -
+          # 3. and the in-image path is a regular file too
+          docker run --rm --entrypoint sh tps-office-verify:latest -c 'test -f /usr/local/bin/nono && test ! -L /usr/local/bin/nono'
+          rm -f ./nono-from-image
+
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
