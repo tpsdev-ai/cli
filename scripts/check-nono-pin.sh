@@ -25,10 +25,20 @@
 #   4. Canonical identity: any line naming a nono repository URL/ref must name
 #      https://github.com/nolabs-ai/nono — a crafted second stage cloning a
 #      look-alike at a "pinned-looking" sha is still a fail.
+#   5. No remote fetch primitive. Any `ADD <url>` is refused, and the archive
+#      rule covers `releases/latest/download`: bytes pulled into the image over
+#      the network bypass the pin no matter how they are fetched.
+#   6. Provenance of the shipped bytes. Every `COPY --from=` must name the pinned
+#      local stage `nono-builder` — a registry image ref (Docker resolves an
+#      unknown name against a registry), or any other stage, is refused — and
+#      the file may define only two stages, `nono-builder` and `base`, whitelisted
+#      by name. A stage name is a provenance guarantee only if the set of stages
+#      is closed.
 #
 # Pre-S4 (`git clone --depth 1 .../nono.git /tmp/nono`, no pin file) fails rules
 # 1–3; a `--branch v0.74.0` fetch fails rule 3; the two-stage bypass fails rules
-# 3 & 4. All of those are executable fixtures in scripts/test-check-nono-pin.sh.
+# 3 & 4; `COPY --from=<image>` and `ADD <url>` fail rules 5–6. All of those are
+# executable fixtures in scripts/test-check-nono-pin.sh.
 #
 # NONO_PIN_ROOT overrides the tree under test. It exists only for that fixture
 # harness; it is unset in CI, where the gate reads the repository it lives in.
@@ -44,6 +54,8 @@ err() { printf 'check-nono-pin: %s\n' "$1" >&2; fail=1; }
 canonical='https://github.com/nolabs-ai/nono'
 allowed_assertion='test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"'
 allowed_clone='git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono'
+# The complete set of build stages the file may define (rule 6b), by name.
+allowed_stages='nono-builder base'
 
 # ── Rule 1: the pin file has exactly two keys, both well-formed ───────────────
 version=""
@@ -154,7 +166,7 @@ else
   if printf '%s\n' "$scan" | grep -qE 'refs/heads/|refs/tags/|--branch([[:space:]]|=)|--depth([[:space:]]|=)'; then
     err "docker/Dockerfile fetches a moving ref (refs/*, --branch, --depth) — pin the commit instead"
   fi
-  if printf '%s\n' "$scan" | grep -qE 'archive/refs|releases/download'; then
+  if printf '%s\n' "$scan" | grep -qE 'archive/refs|releases/(latest/)?download'; then
     err "docker/Dockerfile fetches a generated archive (mutable bytes) — clone and check out the commit"
   fi
 
@@ -178,6 +190,39 @@ else
       err "docker/Dockerfile names a non-canonical nono source '$ref' — the only allowed nono source is $canonical"
     fi
   done <<<"$refs"
+
+  # ── Rule 5 — no remote fetch primitive (ADD with a URL) ────────────────────
+  if printf '%s\n' "$logical" | grep -qE '^[[:space:]]*[Aa][Dd][Dd][[:space:]]+[A-Za-z][A-Za-z0-9+.-]*://'; then
+    err "docker/Dockerfile uses ADD with a remote URL — bytes fetched into the image bypass the pin"
+  fi
+
+  # ── Rule 6a — only the pinned local stage may supply bytes via COPY --from ─
+  while IFS= read -r from; do
+    [ -z "$from" ] && continue
+    if [ "$from" != "nono-builder" ]; then
+      err "docker/Dockerfile COPY --from='$from' — the only permitted source stage is nono-builder (no image refs, no other stages)"
+    fi
+  done < <(printf '%s\n' "$logical" \
+    | grep -oiE 'COPY[[:space:]]+--from[=[:space:]][^[:space:]]+' \
+    | sed -E 's/.*--from//; s/^[=[:space:]]+//' || true)
+
+  # ── Rule 6b — the set of build stages is closed and whitelisted by name ────
+  while IFS= read -r fromline; do
+    [ -z "$fromline" ] && continue
+    sname="$(printf '%s\n' "$fromline" | awk '
+      { line = $0; sub(/^[[:space:]]+/, "", line); n = split(line, p, /[[:space:]]+/)
+        name = ""
+        for (i = 2; i <= n; i++) if (tolower(p[i]) == "as" && i + 1 <= n) { name = p[i+1]; break }
+        print name }')"
+    if [ -z "$sname" ]; then
+      err "docker/Dockerfile: FROM without an explicit 'AS <stage>' name — the file may define only the nono-builder and base stages"
+      continue
+    fi
+    case " $allowed_stages " in
+      *" $sname "*) ;;
+      *) err "docker/Dockerfile: unexpected build stage '$sname' — only 'nono-builder' and 'base' are permitted" ;;
+    esac
+  done < <(printf '%s\n' "$logical" | grep -E '^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]' || true)
 fi
 
 if [ "$fail" -ne 0 ]; then

