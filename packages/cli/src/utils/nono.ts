@@ -25,7 +25,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -344,14 +345,26 @@ function findBundledProfilesDir(): string {
   return join(__dirname, "..", "..", "nono-profiles"); // fallback
 }
 
+/** sha256 of a file's bytes — the content hash installNonoProfiles compares. */
+function fileSha256(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
 /**
- * Install nono profiles to ~/.config/nono/profiles/.
- * Called during `tps install` or first-run setup.
+ * Install the bundled nono profiles into `~/.config/nono/profiles/`
+ * (or `targetDir`). Called during `tps install` / first-run setup.
  *
- * JSON profiles (nono 0.70+) only. The pre-2.0 TOML dialect is not valid on
- * 0.70+; a leftover *.toml is not copied. Every installed profile is
- * validate-or-FAIL when nono is available — an unloadable profile must not be
- * installed silently (cli#341 S1b).
+ * MIGRATION (cli#341 S1b, spec v1/v2 — the window-closer):
+ *   - Overwrite an installed TPS profile whenever the bundled content differs
+ *     (content-hash versioned). nono resolves `extends` BY NAME across locations
+ *     (~/.config first), so a stale `~/.config/.../tps-base.json` SHADOWS the
+ *     bundled deny list for every child everywhere — a changed deny list MUST
+ *     propagate, not be masked by an if-not-exists copy.
+ *   - Retire a stale TPS-named `*.toml` profile (the pre-2.0 dialect).
+ *   - Never touch user-authored NON-TPS profiles: everything is keyed on the set
+ *     of names we ship, not a blanket glob of the directory.
+ *   - validate-or-FAIL when nono supports JSON profiles: an unloadable profile
+ *     is never installed silently.
  */
 export function installNonoProfiles(targetDir?: string, silent?: boolean): void {
   const home = process.env.HOME || homedir() || "/tmp";
@@ -367,19 +380,31 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
 
   mkdirSync(profilesDir, { recursive: true });
 
+  const bundled = readdirSync(bundledDir).filter((f) => f.endsWith(".json"));
+  const shippedNames = new Set(bundled.map((f) => f.replace(/\.json$/, "")));
+
+  // (b) Retire stale TPS-named *.toml (only names we ship — user files stay).
+  for (const entry of readdirSync(profilesDir)) {
+    if (!entry.endsWith(".toml")) continue;
+    if (!shippedNames.has(entry.replace(/\.toml$/, ""))) continue;
+    unlinkSync(join(profilesDir, entry));
+    if (!silent) console.log(`  ✓ Retired stale nono profile: ${entry}`);
+  }
+
   const bin = findNono();
   // Validate only when nono is new enough to have JSON profiles at all. An
   // absent/too-old nono cannot load them either way; the *launch* path
   // (checkProfileLoadable) is where an unsupported nono is refused.
   const version = bin ? nonoVersion(bin) : null;
   const canValidate = Boolean(bin && version && versionAtLeast(version, NONO_MIN_VERSION));
-  for (const file of readdirSync(bundledDir)) {
-    if (!file.endsWith(".json")) continue;
+  for (const file of bundled) {
     const src = join(bundledDir, file);
     const dst = join(profilesDir, file);
-    if (!existsSync(dst)) {
+    // (a) Overwrite whenever the content differs (content-hash versioned).
+    const present = existsSync(dst);
+    if (!present || fileSha256(src) !== fileSha256(dst)) {
       copyFileSync(src, dst);
-      if (!silent) console.log(`  ✓ Installed nono profile: ${file}`);
+      if (!silent) console.log(`  ✓ ${present ? "Updated" : "Installed"} nono profile: ${file}`);
     }
     if (canValidate) {
       const name = file.replace(/\.json$/, "");

@@ -11,7 +11,7 @@
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
-import { mkdtempSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import {
   checkProfileLoadable,
@@ -93,5 +93,19 @@ describe("the read set replaces `--read /`", () => {
     expect(paths).not.toContain("/");
     expect(paths.some((p) => p.endsWith(join(".tps", "identity")))).toBe(true);
     expect(paths.some((p) => p.endsWith(".bun"))).toBe(true);
+  });
+});
+
+describe("the gate is a durable control", () => {
+  test("CI wires scripts/check-nono-profiles.sh against a pinned nono, on Linux and macOS", () => {
+    const yml = readFileSync(
+      join(import.meta.dir, "..", "..", "..", ".github", "workflows", "test.yml"),
+      "utf-8",
+    );
+    // The gate cannot be silently orphaned by a later workflow edit.
+    expect(yml).toContain("./scripts/check-nono-profiles.sh");
+    expect(yml).toContain("NONO_BIN=");
+    expect(yml).toMatch(/macos-\d+/);
+    expect(yml).toMatch(/nono-pin|\.nono-version|bc1406e9/);
   });
 });

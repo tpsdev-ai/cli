@@ -69,7 +69,14 @@ done
 ok "all ${#json_files[@]} profiles pass 'nono profile validate --strict'"
 
 # ── 4. real enforcement (control + denial) ───────────────────────────────────
-TMP="$(mktemp -d)"
+# The probe tree lives under the REAL $HOME, not $TMPDIR. On macOS $TMPDIR is
+# /private/var/folders/…, which the tps-agent-run profile reads (system_read_macos),
+# and nono's own state root for the synthetic HOME ($TMP/home/.local/state/nono)
+# would then sit inside /private — nono refuses the run outright
+# ("… overlaps protected nono state root"), failing the positive control for the
+# wrong reason. Under $HOME the synthetic state root cannot overlap a granted
+# root. (A genuine enforcement break still fails loudly below.)
+TMP="$(mktemp -d "${HOME:?}/.nono-gate-probe.XXXXXX")"
 trap 'rm -rf "${TMP}"' EXIT
 mkdir -p "${TMP}/home/.tps/secrets" "${TMP}/ws"
 
