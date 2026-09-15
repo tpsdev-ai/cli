@@ -507,6 +507,24 @@ EOF
 } >"$d/docker/Dockerfile"
 run_case "env-overwritten" fail "$d"
 
+# ── 38-40. base tampering with the shipped path (r10 Sherlock): rm / mv /
+# symlink of /usr/local/bin/nono before the assertion. The assertion can now
+# fail closed on absence, and the gate's coarse rule refuses any OTHER base
+# instruction naming the path.
+suffix_line='RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","[ -f /usr/local/bin/nono ] && [ ! -L /usr/local/bin/nono ] || exit 1; h=$(/b/usr/bin/sha256sum /usr/local/bin/nono) || exit 1; /b/usr/bin/test \"${h%% *}\" = \"$(/b/bin/cat /b/nono.sha256)\""]'
+for tamper in "base-rm-nono:RUN rm -f /usr/local/bin/nono" "base-mv-nono:RUN mv /usr/local/bin/nono /tmp/keep" "base-symlink-nono:RUN ln -sf /b/nono /usr/local/bin/nono"; do
+  name="${tamper%%:*}"; instr="${tamper#*:}"
+  d="$(mk "$name")"; good_pin "$d"
+  { good_stage; cat <<EOF
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+$instr
+$suffix_line
+EOF
+  } >"$d/docker/Dockerfile"
+  run_case "$name" fail "$d"
+done
+
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then
   printf 'PASS  %-26s test.yml invokes check-nono-pin.sh\n' "workflow-invokes-gate"; npass=$((npass + 1))

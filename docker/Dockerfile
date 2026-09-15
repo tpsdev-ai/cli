@@ -46,12 +46,12 @@ WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
 # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint
 ENTRYPOINT ["tps-office-supervisor"]
-# LAST instruction of the stage, in EXEC form: the interpreter itself comes from
-# the read-only bind mount. It reads the baseline (/nono.sha256), every tool
-# (sha256sum, cut, xargs, test, cat) AND the shell (/b/bin/sh) from the immutable
-# builder stage, and carries EXACTLY ONE --mount — so no runtime-stage state can
-# alter what it compares, nor who runs the comparison (a writable /bin/sh, a
-# SHELL directive, an ENV PATH, or a second mount shadowing /b or the shipped
-# path all fail the gate). The only thing hashed is the shipped path, which comes
-# solely from the pinned COPY above (cli#341 S4 r9).
-RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","/b/usr/bin/sha256sum /usr/local/bin/nono | /b/usr/bin/cut -d' ' -f1 | /b/usr/bin/xargs -I{} /b/usr/bin/test {} = \"$(/b/bin/cat /b/nono.sha256)\""]
+# LAST instruction of the stage, in EXEC form with the interpreter from the
+# read-only mount, and FAIL-CLOSED on absence (cli#345 r10). It requires the
+# shipped path to be a regular file (not a symlink), captures the hash status
+# itself (no pipeline whose exit is xargs's — dash has no pipefail), and compares
+# with a single test. The baseline, the tools AND the shell come from the
+# immutable builder stage; the only thing hashed is the shipped path, which comes
+# solely from the pinned COPY above. A `base` RUN that removes, moves or dangles
+# the shipped path now fails the BUILD.
+RUN --mount=type=bind,from=nono-builder,source=/,target=/b,ro ["/b/bin/sh","-c","[ -f /usr/local/bin/nono ] && [ ! -L /usr/local/bin/nono ] || exit 1; h=$(/b/usr/bin/sha256sum /usr/local/bin/nono) || exit 1; /b/usr/bin/test \"${h%% *}\" = \"$(/b/bin/cat /b/nono.sha256)\""]

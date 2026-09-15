@@ -312,6 +312,27 @@ else
     [ "$pinned_copy" = 1 ] \
       || err "docker/Dockerfile base must contain exactly one COPY --from=nono-builder onto /usr/local/bin/nono (found $pinned_copy) — the shipped binary may come only from the pinned stage"
 
+    # Coarse rule (cli#345 r10): no OTHER base-stage instruction may name the
+    # shipped path (rm/mv/ln of it is how the artifact went missing while the
+    # old pipeline assertion still exited 0). Only the pinned COPY and the final
+    # assertion line itself may mention it.
+    coarse_other=0
+    idx=0
+    for bl in "${base_lines[@]}"; do
+      idx=$((idx + 1))
+      bn="$(nrm "$bl")"
+      case "$bn" in *"/usr/local/bin/nono"*) ;; *) continue ;; esac
+      is_copy=0
+      if printf '%s' "$bl" | grep -qE '^[[:space:]]*[Cc][Oo][Pp][Yy]([[:space:]]|$)'; then is_copy=1; fi
+      is_pinned=0
+      case "$bn" in *--from=nono-builder*) is_pinned=1 ;; esac
+      if [ "$is_copy" = 1 ] && [ "$is_pinned" = 1 ]; then continue; fi
+      if [ "$idx" = "$nbase" ]; then continue; fi
+      coarse_other=$((coarse_other + 1))
+    done
+    [ "$coarse_other" = 0 ] \
+      || err "docker/Dockerfile: $coarse_other base-stage instruction(s) other than the pinned COPY and the assertion name /usr/local/bin/nono — a coarse rule (cli#345 r10): rm/mv/symlink of the shipped path is refused here because the assertion alone cannot see an absent artifact"
+
     lastn="$(nrm "$last_line")"
     if ! printf '%s' "$last_line" | grep -qE '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)'; then
       err "docker/Dockerfile: the last instruction of base is not a RUN — the stage must END with the read-only-mount artifact assertion"
