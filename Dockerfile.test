@@ -2,11 +2,12 @@ FROM oven/bun:1-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git jq procps && rm -rf /var/lib/apt/lists/*
 
 # Create fake home directory with OpenClaw structure
 RUN mkdir -p /home/tps/.openclaw/workspace-test \
-    && mkdir -p /home/tps/.openclaw/agents
+    && mkdir -p /home/tps/.openclaw/agents \
+    && mkdir -p /workspace
 
 ENV HOME=/home/tps
 

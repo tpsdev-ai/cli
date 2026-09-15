@@ -53,6 +53,13 @@ if grep -qE 'exec tps-agent start' "$sup"; then bad "UID-only fallback ('exec tp
 if grep -qi 'falling back to UID isolation only' "$sup"; then bad "old UID-fallback message still present"; else ok "old UID-fallback message gone"; fi
 if grep -q 'refusing to launch the agent without isolation' "$sup"; then ok "fail-closed refusal message present"; else bad "no fail-closed refusal message"; fi
 
+# The harness cannot be silently orphaned by a workflow edit (S4-gate shape).
+if grep -qF 'scripts/test-tps-office-supervisor.sh' "$repo_root/.github/workflows/test.yml"; then
+  ok "test.yml invokes the supervisor harness"
+else
+  bad "test.yml does not invoke scripts/test-tps-office-supervisor.sh"
+fi
+
 # ── Part B — behavioural ─────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
   printf 'SKIP  behavioural run (needs root; run inside the image — see header)\n'
@@ -89,6 +96,32 @@ SH
   mkshims "$tmp/bin-nono" yes
   mkshims "$tmp/bin-nonono" no
 
+  # Fake nono for the orphan case: agent 2's probe refuses (the wrapped command
+  # names probe2); a real agent launch becomes a long sleep so "running" is
+  # observable.
+  mkorphan() {
+    local d="$1"
+    mkshims "$d" no
+    cat >"$d/nono" <<'SH'
+#!/usr/bin/env bash
+printf 'NONO-ARGV nono %s\n' "$*" >> "${NONO_ARGV_LOG:?}"
+args=("$@"); cmd=(); seen=0
+for a in "${args[@]}"; do if [ "$seen" = 1 ]; then cmd+=("$a"); fi; if [ "$a" = "--" ]; then seen=1; fi; done
+joined="${cmd[*]}"
+case "$joined" in
+  *probe2*) exit 1 ;;
+  *tps-agent*start*)
+    echo started >> "${ORPHAN_MARKER:?}"
+    trap 'echo stopped >> "${ORPHAN_MARKER:?}"; exit 0' TERM INT
+    i=0; while [ "$i" -lt 15 ]; do sleep 1; i=$((i + 1)); done
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+    chmod +x "$d/nono"
+  }
+  mkorphan "$tmp/bin-orphan"
+
   seed() {
     mkdir -p /workspace/.tps /run/secrets
     printf '[{"id":"probe","configPath":"/workspace/probe/agent.yaml"}]\n' >/workspace/.tps/team.json
@@ -101,7 +134,8 @@ SH
   # (1) nono present (fake, logs argv)
   seed
   export NONO_ARGV_LOG="$tmp/argv1.log"; : >"$NONO_ARGV_LOG"
-  out1="$(PATH="$tmp/bin-nono:$cleanpath" bash "$sup" 2>&1)"; rc1=$?
+  PATH="$tmp/bin-nono:$cleanpath" timeout 20 bash "$sup" >"$tmp/out1.log" 2>&1; rc1=$?
+  out1="$(cat "$tmp/out1.log")"
   if [ "$rc1" -eq 0 ]; then ok "run with nono present exits 0"; else bad "run with nono present exited $rc1"; fi
   runs1="$(grep -c 'nono run' "$NONO_ARGV_LOG" || true)"
   if [ "$runs1" -ge 2 ]; then ok "fake nono saw $runs1 invocations"; else bad "fake nono saw only $runs1 invocations"; fi
@@ -116,11 +150,30 @@ SH
   # (2) nono absent -> fail closed
   seed
   export NONO_ARGV_LOG="$tmp/argv2.log"; : >"$NONO_ARGV_LOG"
-  out2="$(PATH="$tmp/bin-nonono:$cleanpath" bash "$sup" 2>&1)"; rc2=$?
+  PATH="$tmp/bin-nonono:$cleanpath" timeout 20 bash "$sup" >"$tmp/out2.log" 2>&1; rc2=$?
+  out2="$(cat "$tmp/out2.log")"
   if [ "$rc2" -ne 0 ]; then ok "run with nono absent exits non-zero ($rc2)"; else bad "run with nono absent exited 0 (should fail closed)"; fi
   case "$out2" in *nono*) ok "refusal names nono" ;; *) bad "refusal does not name nono" ;; esac
   if [ ! -s "$NONO_ARGV_LOG" ]; then ok "no nono invocation (no agent started)"; else bad "an agent was launched despite nono being absent"; fi
-  if pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "a 'tps-agent start' process is running after the nono-absent run"; else ok "no 'tps-agent start' process running after the nono-absent run"; fi
+  if command -v pgrep >/dev/null 2>&1 && pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "a 'tps-agent start' process is running after the nono-absent run"; else ok "no 'tps-agent start' process running after the nono-absent run"; fi
+
+  # (3) orphan-on-refusal: agent 1 launches, agent 2 refuses → agent 1 must be
+  # stopped (all-or-nothing; a refusal leaves NO agent running).
+  mkdir -p /workspace/.tps /run/secrets
+  printf '[{"id":"probe","configPath":"/workspace/probe/agent.yaml"},{"id":"probe2","configPath":"/workspace/probe2/agent.yaml"}]\n' >/workspace/.tps/team.json
+  printf 'x' >/run/secrets/.ready
+  rm -f /workspace/.tps/pids.json
+  export NONO_ARGV_LOG="$tmp/argv3.log"; : >"$NONO_ARGV_LOG"
+  export ORPHAN_MARKER="$tmp/orphan.log"; : >"$ORPHAN_MARKER"
+  PATH="$tmp/bin-orphan:$cleanpath" timeout 20 bash "$sup" >"$tmp/out3.log" 2>&1; rc3=$?
+  out3="$(cat "$tmp/out3.log")"
+  if [ "$rc3" -ne 0 ]; then ok "refusal with an earlier agent running exits non-zero ($rc3)"; else bad "refusal run exited 0 (should fail closed)"; fi
+  case "$out3" in *nono*) ok "refusal names nono" ;; *) bad "refusal does not name nono" ;; esac
+  if grep -q 'tps-agent start --config /workspace/probe/agent.yaml' "$NONO_ARGV_LOG"; then ok "first agent had launched before the refusal"; else bad "first agent never launched (case invalid)"; fi
+  # The launched agent writes 'started' on launch and 'stopped' on SIGTERM. The
+  # refusal must shut it down before exiting (all-or-nothing; no orphan).
+  if grep -q '^started' "$ORPHAN_MARKER"; then ok "first agent started"; else bad "first agent never started"; fi
+  if grep -q '^stopped' "$ORPHAN_MARKER"; then ok "first agent STOPPED on refusal (no orphan)"; else bad "ORPHAN: the first agent was not stopped on refusal"; fi
 fi
 
 printf '\ntest-tps-office-supervisor: %d passed, %d failed\n' "$npass" "$nfail"

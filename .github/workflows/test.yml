@@ -80,6 +80,11 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
       - name: Run tests in Docker
         run: docker compose run --rm test
+      - name: Supervisor harness (Part B) in the container
+        # Builds the image once (above), then runs the behavioural half — fake
+        # nono logging argv; nono-absent → exit non-zero, no agent started;
+        # refusal with an earlier agent running → no orphan (cli#352).
+        run: docker compose run --rm test bash scripts/test-tps-office-supervisor.sh
 
   binary-smoke:
     name: Binary Smoke Test

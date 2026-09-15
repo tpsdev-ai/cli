@@ -221,7 +221,13 @@ for ((i=0; i<count; i++)); do
     # with NO nono isolation; that path is deleted. If nono cannot engage (it is
     # missing, or Landlock cannot enforce the tps-office profile) the supervisor
     # refuses rather than running an agent unsandboxed.
+    #
+    # All-or-nothing (cli#352 r): the refusal fires mid-loop, so agents launched
+    # in earlier iterations are already backgrounded. Stop them before exiting so
+    # a refusal leaves NO agent running — a team is either whole or absent,
+    # never partial. (The EXIT trap only removes pids.json.)
     echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the tps-office profile) — refusing to launch the agent without isolation" >&2
+    shutdown_children TERM
     exit 1
   fi
 
