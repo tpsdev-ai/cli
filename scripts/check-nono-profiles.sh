@@ -179,10 +179,12 @@ else
     bun -e 'import { harnessReadPaths, harnessReadFiles } from "./packages/cli/src/utils/nono.ts"; const a=["run","--profile",process.env.PROF,"--allow-cwd","--workdir",process.env.WS,"--allow",process.env.WS]; for(const p of harnessReadPaths()) a.push("--read",p); for(const p of harnessReadFiles(process.env.ID)) a.push("--read-file",p); for(const x of a) console.log(x);')
   smoke() { # <label> <cmd...>
     local label="$1"; shift
-    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >/dev/null 2>&1; then
+    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >"${TMP}/smoke.log" 2>&1; then
       ok "workload: ${label}"
     else
-      fail "workload FAILED under the launch args: ${label}"
+      # Surface the failure detail: a sandboxed git/fetch that fails must not be
+      # a silent red. (flint: never skip silently.)
+      fail "workload FAILED under the launch args: ${label} — $(tail -n 2 "${TMP}/smoke.log" | tr '\n' ' ')"
     fi
   }
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
