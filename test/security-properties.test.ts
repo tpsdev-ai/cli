@@ -40,12 +40,16 @@ describe("security properties regression checks", () => {
     expect(sh).toContain('chmod 644 "$PIDS_FILE"');
   });
 
-  test("agent processes are launched under non-root per-agent users", () => {
+  test("agent processes are launched under non-root per-agent users, inside nono (cli#341 S2)", () => {
     const sh = src("docker/tps-office-supervisor.sh");
     expect(sh).toContain('user="agent-$id"');
     expect(sh).toContain('useradd -u "$uid" -g tps -m -s /bin/bash "$user"');
-    expect(sh).toContain('su -m -s /bin/bash "$user" -c "exec nono run');
-    expect(sh).toContain('su -m -s /bin/bash "$user" -c "exec tps-agent start');
+    // Every agent launch goes through nono with the tps-office profile...
+    expect(sh).toContain('su -m -s /bin/bash "$user" -c "exec nono run --profile tps-office');
+    expect(sh).toContain('tps-agent start --config');
+    // ...and the UID-only fallback (nono-less agent launch) is gone — fail closed.
+    expect(sh).not.toContain("exec tps-agent start");
+    expect(sh).toContain("refusing to launch the agent without isolation");
   });
 
   test("nono allowlist does not include /run/secrets (S52)", () => {

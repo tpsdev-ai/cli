@@ -166,7 +166,7 @@ supports_landlock_for_agent() {
     return 1
   fi
 
-  su -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
+  su -s /bin/bash "$user" -c "exec nono run --profile tps-office --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
   local rc=$?
   su -s /bin/bash "$user" -c "rm -f '$probe_file'" >/dev/null 2>&1 || true
   set -e
@@ -215,10 +215,14 @@ for ((i=0; i<count; i++)); do
   chmod 700 "$tmpdir"
 
   if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
-    su -m -s /bin/bash "$user" -c "exec nono run --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock -- tps-agent start --config '$config_path'" &
+    su -m -s /bin/bash "$user" -c "exec nono run --profile tps-office --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock -- tps-agent start --config '$config_path'" &
   else
-    echo "⚠ Landlock incompatible with mount type for agent '$id' — falling back to UID isolation only" >&2
-    su -m -s /bin/bash "$user" -c "exec tps-agent start --config '$config_path'" &
+    # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
+    # with NO nono isolation; that path is deleted. If nono cannot engage (it is
+    # missing, or Landlock cannot enforce the tps-office profile) the supervisor
+    # refuses rather than running an agent unsandboxed.
+    echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the tps-office profile) — refusing to launch the agent without isolation" >&2
+    exit 1
   fi
 
   pid=$!
