@@ -101,30 +101,54 @@ fi
 [[ ! -f "${TMP}/home/.tps/secrets/leak" ]] || fail "deny-list FAILED: ${TMP}/home/.tps/secrets/leak exists"
 ok "deny-list: write to ~/.tps/secrets is blocked"
 
-# The agent must be able to read its OWN identity key (the launch grants
-# ~/.tps/identity read; the base must not deny it — nono resolves deny over
-# grant, so a stale deny would silently break signing). cli#341 S1b r2.
+# Identity reads (cli#351 r4): the launch grants exactly the launching agent's
+# OWN key via --read-file. nono's read model is an allow-list, so no directory
+# deny is needed; the assertion proves own-key ALLOWED and a sibling DENIED.
 printf 'KEYMATERIAL' > "${TMP}/home/.tps/identity/agent1.key"
+printf 'PUB' > "${TMP}/home/.tps/identity/agent1.pub"
+printf 'OTHERKEY' > "${TMP}/home/.tps/identity/agent2.key"
 if ! ident_out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" run --profile "${AGENT_PROFILE}" \
-      --workdir "${TMP}/ws" --allow "${TMP}/ws" --read "${TMP}/home/.tps/identity" \
+      --workdir "${TMP}/ws" --allow "${TMP}/ws" --read-file "${TMP}/home/.tps/identity/agent1.key" \
       -- sh -c "cat '${TMP}/home/.tps/identity/agent1.key'" 2>&1)"; then
-  fail "identity key read FAILED: the agent cannot read its own key under tps-agent-run"
+  fail "own-key read FAILED: the agent cannot read its own key under tps-agent-run"
 fi
 case "${ident_out}" in
-  *KEYMATERIAL*) ok "agent identity key is readable under tps-agent-run" ;;
-  *) fail "agent identity key not readable (got: ${ident_out})" ;;
+  *KEYMATERIAL*) ok "own identity key is readable under tps-agent-run" ;;
+  *) fail "own identity key not readable (got: ${ident_out})" ;;
 esac
+# the sibling key must NOT be readable (no directory grant)
+if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" run --profile "${AGENT_PROFILE}" \
+      --workdir "${TMP}/ws" --allow "${TMP}/ws" --read-file "${TMP}/home/.tps/identity/agent1.key" \
+      -- sh -c "cat '${TMP}/home/.tps/identity/agent2.key'" >/dev/null 2>&1; then
+  fail "sibling identity key is READABLE under tps-agent-run — the launch must grant only the agent's own key"
+else
+  ok "sibling identity key is not readable under tps-agent-run"
+fi
 
-# nono why assertions (deny must survive the broad system reads).
+# nono why assertions (the launch's own-key grant is the only identity read;
+# everything else is denied).
 why_denied() { # <path>
   local out verdict
-  out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" why --path "$1" --op read --profile "${AGENT_PROFILE}" 2>&1 || true)"
+  out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" why --path "$1" --op read \
+        --profile "${AGENT_PROFILE}" --read-file "${TMP}/home/.tps/identity/agent1.key" 2>&1 || true)"
   verdict="${out%%$'\n'*}"
   case "${out}" in
     *DENIED*) ok "denied: $1" ;;
     *) fail "expected DENIED for $1, got: ${verdict}" ;;
   esac
 }
+why_allowed() { # <path>
+  local out verdict
+  out="$(HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" why --path "$1" --op read \
+        --profile "${AGENT_PROFILE}" --read-file "${TMP}/home/.tps/identity/agent1.key" 2>&1 || true)"
+  verdict="${out%%$'\n'*}"
+  case "${out}" in
+    *ALLOWED*) ok "allowed: $1" ;;
+    *) fail "expected ALLOWED for $1, got: ${verdict}" ;;
+  esac
+}
+why_allowed "${TMP}/home/.tps/identity/agent1.key"
+why_denied "${TMP}/home/.tps/identity/agent2.key"
 why_denied "${TMP}/home/.tps/secrets/leak"
 why_denied "/etc/shadow"
 why_denied "/etc/sudoers"

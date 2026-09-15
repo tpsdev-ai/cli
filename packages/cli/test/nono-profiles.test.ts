@@ -12,12 +12,14 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import {
   checkProfileLoadable,
   resolveProfilePath,
   systemReadPaths,
+  systemReadFiles,
   harnessReadPaths,
+  harnessReadFiles,
   buildNonoArgs,
 } from "../src/utils/nono.js";
 
@@ -89,11 +91,30 @@ describe("the read set replaces `--read /`", () => {
     }
   });
 
-  test("harnessReadPaths() includes identity, bun and the interpreter dir", () => {
+  test("harnessReadPaths() grants dirs only — never the shared identity directory", () => {
     const paths = harnessReadPaths();
     expect(paths).not.toContain("/");
-    expect(paths.some((p) => p.endsWith(join(".tps", "identity")))).toBe(true);
+    expect(paths.some((p) => p.endsWith(join(".tps", "identity")))).toBe(false);
     expect(paths.some((p) => p.endsWith(".bun"))).toBe(true);
+  });
+
+  test("harnessReadFiles() is the system files plus exactly the agent's own key (.key/.pub)", () => {
+    const idDir = join(homedir(), ".tps", "identity");
+    const files = harnessReadFiles("agent1");
+    expect(files).toContain(join(idDir, "agent1.key"));
+    expect(files).toContain(join(idDir, "agent1.pub"));
+    // no other agent's files
+    expect(files.some((p) => p.includes("agent2"))).toBe(false);
+    // without an id, no identity files at all
+    expect(harnessReadFiles()).toEqual(systemReadFiles());
+    // and nothing under the identity DIRECTORY is granted as a dir on Linux
+    expect(systemReadPaths()).not.toContain("/etc");
+  });
+
+  test("buildNonoArgs emits --read-file for a single-file read grant", () => {
+    const args = buildNonoArgs("tps-agent-run", { readFiles: ["/x/agent1.key"] }, ["echo"]);
+    expect(args).toContain("--read-file");
+    expect(args[args.indexOf("--read-file") + 1]).toBe("/x/agent1.key");
   });
 });
 

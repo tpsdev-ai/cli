@@ -19,7 +19,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
-import { findNono, runCommandUnderNono, isNonoStrict, harnessReadPaths } from "../utils/nono.js";
+import { findNono, runCommandUnderNono, isNonoStrict, harnessReadPaths, harnessReadFiles } from "../utils/nono.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
@@ -805,6 +805,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 // the macOS roots Kern validated, and their Linux equivalents
                 // (systemReadPaths()).
                 read: harnessReadPaths(),
+                // Exactly this agent's own identity files, not the shared
+                // identity directory (cli#351 r4).
+                readFiles: harnessReadFiles(config.agentId),
                 allow: [mailDir, tmpDir, config.workspace, agentDir],
               },
               [process.execPath, ...process.execArgv, process.argv[1]!, "agent", "start", "--id", config.agentId, "--sandboxed"],

@@ -49,6 +49,13 @@ export interface NonoOptions {
   workdir?: string;
   /** Extra read-only paths to allow */
   read?: string[];
+  /**
+   * Extra read-only FILE paths (nono `--read-file`) — single files, e.g. an
+   * agent's own identity key. Use this rather than a directory read grant so a
+   * sandboxed agent can read exactly its own key, not every sibling's (cli#351
+   * r4; nono's read model is an allow-list, no directory deny is needed).
+   */
+  readFiles?: string[];
   /** Extra read-write paths to allow */
   allow?: string[];
 }
@@ -186,7 +193,19 @@ export function checkProfileLoadable(name: string, bin: string | null = findNono
 export function systemReadPaths(): string[] {
   return process.platform === "darwin"
     ? ["/opt/homebrew", "/usr", "/bin", "/sbin", "/Library"]
-    : ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc", "/opt"];
+    : // NOTE: /etc is deliberately NOT granted on Linux: the tps-base profile
+      // denies /etc/shadow, /etc/sudoers, /etc/ssh, and Landlock cannot express
+      // deny-within-allow, so nono refuses to start with both. The few /etc
+      // files resolution/TLS need are granted individually (systemReadFiles).
+      ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt"];
+}
+
+/** System FILES the harness reads (nono `--read-file`), where /etc as a whole
+ * cannot be granted on Linux (see above). */
+export function systemReadFiles(): string[] {
+  return process.platform === "darwin"
+    ? ["/etc/hosts", "/etc/resolv.conf"]
+    : ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf"];
 }
 
 /**
@@ -195,12 +214,25 @@ export function systemReadPaths(): string[] {
  * definition so `agent start` and `mail watch` cannot drift apart (cli#341 S1b).
  */
 export function harnessReadPaths(): string[] {
-  return [
-    join(homedir(), ".tps", "identity"),
-    join(homedir(), ".bun"),
-    dirname(process.execPath),
-    ...systemReadPaths(),
-  ];
+  // NOTE: no identity directory here. The identity dir holds every agent's key
+  // on a shared-UID host; granting it read would let one agent read all others.
+  // The launch grants exactly the launching agent's own key via
+  // harnessReadFiles(agentId) → --read-file (cli#351 r4).
+  return [join(homedir(), ".bun"), dirname(process.execPath), ...systemReadPaths()];
+}
+
+/**
+ * The launching agent's OWN identity files (read-only): its signing key, and
+ * the public key beside it (the runtime resolves `~/.tps/identity/<id>.key`;
+ * the `.pub` is granted too since it is the same agent's own material).
+ */
+export function harnessReadFiles(agentId?: string): string[] {
+  const files = [...systemReadFiles()];
+  if (agentId) {
+    const idDir = join(homedir(), ".tps", "identity");
+    files.push(join(idDir, `${agentId}.key`), join(idDir, `${agentId}.pub`));
+  }
+  return files;
 }
 
 /**
@@ -227,6 +259,10 @@ export function buildNonoArgs(
 
   for (const p of options.read ?? []) {
     args.push("--read", p);
+  }
+
+  for (const p of options.readFiles ?? []) {
+    args.push("--read-file", p);
   }
 
   for (const p of options.allow ?? []) {
