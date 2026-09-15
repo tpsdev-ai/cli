@@ -20,7 +20,10 @@ FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
 RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
-RUN apt-get update && apt-get install -y --no-install-recommends git curl jq ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
+# No fetch tool in the runtime image: the shipped binary is the pinned build, and
+# a stage with no curl/wget capability cannot repull bytes into /usr/local/bin
+# (cli#341 S4). jq stays — docker/tps-office-supervisor.sh uses it.
+RUN apt-get update && apt-get install -y --no-install-recommends git jq ca-certificates libdbus-1-3 && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 WORKDIR /workspace

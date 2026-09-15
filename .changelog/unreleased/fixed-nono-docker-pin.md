@@ -1,1 +1,2 @@
 - Pin the Docker image's nono install to the immutable commit behind tag v0.74.0 (`commit=` in `.nono-version`, verified via `git rev-parse HEAD`), replacing the unpinned default-branch clone (cli#341).
+- Runtime image no longer carries a fetch tool: `curl` is dropped (it had no caller; `jq` stays for `tps-office-supervisor.sh`), so bytes cannot be repulled into the shipped `nono` path even by a `RUN` (cli#341).
