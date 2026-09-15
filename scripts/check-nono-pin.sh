@@ -50,8 +50,19 @@
 #      write `/usr/local/bin/nono` only via the pinned `COPY --from=nono-builder`,
 #      and its LAST instruction must assert the shipped binary's sha256 equals the
 #      recorded one. A rewrite by any primitive, spelling, variable or interpreter
-#      changes the bytes and fails the *build*. Rule 8 asserts this invariant is
-#      present and last; it does not try to enumerate how the path might be spelled.
+#      changes the bytes and fails the *build*.
+#      Rule 8 further asserts two things the earlier shape left open:
+#        (a) HASH-FILE IMMUTABILITY — within `base`, `nono.sha256` may be named
+#            ONLY by the pinned `COPY --from=nono-builder` that brings it in and
+#            by the final assertion that reads it. Any other instruction naming it
+#            (spelling-normalised) is refused: otherwise a `RUN` could recompute
+#            the hash of the tampered bytes back into the file and the assertion
+#            would compare evil to evil.
+#        (b) the final assertion names its tools by ABSOLUTE PATH
+#            (`/usr/bin/sha256sum`, `/usr/bin/cut`, `/bin/cat`) and the stage sets
+#            no `ENV PATH`, so an earlier PATH shadow cannot substitute them.
+#      Rule 8 asserts the invariant is present and last; it does not try to
+#      enumerate how the shipped path might be spelled.
 #
 # SCOPE: this gate governs IMAGE BUILD time — what the image is built from and
 # what it asserts before it is saved. Runtime provenance (a container fetching
@@ -322,6 +333,8 @@ else
     hash_copied=0
     pinned_copy=0
     other_path=0
+    hash_other=0
+    env_path=0
     idx=0
     for bl in "${base_lines[@]}"; do
       idx=$((idx + 1))
@@ -342,6 +355,27 @@ else
           fi
           ;;
       esac
+      # Hash-file immutability (rule 8a): nono.sha256 may be named ONLY by the
+      # pinned COPY that brings it in and by the final assertion. Anywhere else a
+      # RUN could recompute the hash of tampered bytes back into it, making the
+      # assertion vacuous (evil hash == evil hash). Normalised like rule 7.
+      case "$bn" in
+        *nono.sha256*)
+          if [ "$is_copy" = 1 ] && [ "$is_pinned" = 1 ]; then
+            : # permitted: the pinned COPY that brings the baseline in
+          elif [ "$idx" = "$nbase" ]; then
+            : # permitted: the final assertion that reads it
+          else
+            hash_other=$((hash_other + 1))
+          fi
+          ;;
+      esac
+      # No PATH shadow (rule 8b): an ENV PATH in base could put a sha256sum/cat
+      # shim ahead of the absolute paths the assertion is required to use.
+      if printf '%s' "$bl" | grep -qiE '^[[:space:]]*[Ee][Nn][Vv]([[:space:]]|$)' \
+         && printf '%s' "$bn" | grep -qiE '(^|[^A-Za-z0-9_])PATH([^A-Za-z0-9_]|$)'; then
+        env_path=$((env_path + 1))
+      fi
     done
     [ "$hash_copied" = 1 ] \
       || err "docker/Dockerfile base does not COPY the pinned stage's sha256 (nono.sha256) — nothing verifies the shipped artifact"
@@ -349,6 +383,10 @@ else
       || err "docker/Dockerfile base must contain exactly one COPY --from=nono-builder onto /usr/local/bin/nono (found $pinned_copy)"
     [ "$other_path" = 0 ] \
       || err "docker/Dockerfile base names /usr/local/bin/nono on $other_path instruction(s) other than the pinned COPY and the final hash assertion — the shipped path may be written only by the pinned copy (matched with //, /./ and quotes normalised)"
+    [ "$hash_other" = 0 ] \
+      || err "docker/Dockerfile base names nono.sha256 on $hash_other instruction(s) other than the pinned COPY and the final assertion — the baseline hash would be rewritable"
+    [ "$env_path" = 0 ] \
+      || err "docker/Dockerfile base sets ENV PATH — a PATH shadow could substitute the assertion's tools, so the final instruction must call them by absolute path"
 
     lastn="$(nrm "$last_line")"
     if ! printf '%s' "$last_line" | grep -qE '^[[:space:]]*[Rr][Uu][Nn]([[:space:]]|$)'; then
@@ -360,6 +398,12 @@ else
       || err "docker/Dockerfile: the last instruction of base does not read the shipped path /usr/local/bin/nono"
     printf '%s' "$lastn" | grep -qF 'nono.sha256' \
       || err "docker/Dockerfile: the last instruction of base does not compare against the pinned sha256 (nono.sha256)"
+    printf '%s' "$lastn" | grep -qF '/usr/bin/sha256sum' \
+      || err "docker/Dockerfile: the last instruction of base does not call /usr/bin/sha256sum by absolute path — a PATH shadow could substitute the hash tool"
+    printf '%s' "$lastn" | grep -qF '/usr/bin/cut' \
+      || err "docker/Dockerfile: the last instruction of base does not call /usr/bin/cut by absolute path — a PATH shadow could substitute the field extractor"
+    printf '%s' "$lastn" | grep -qF '/bin/cat' \
+      || err "docker/Dockerfile: the last instruction of base does not call /bin/cat by absolute path — a PATH shadow could substitute the reader"
   fi
 fi
 
