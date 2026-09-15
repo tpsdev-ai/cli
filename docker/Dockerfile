@@ -1,15 +1,16 @@
 FROM rust:bookworm AS nono-builder
-RUN apt-get update && apt-get install -y libdbus-1-dev pkg-config curl
-# nono version + checksum live in .nono-version at the repo root (the single
-# source of truth; cli#341 S1's CI gate reads the same file). Fetch the tagged
-# release tarball, verify its sha256, then build — no unpinned branch clone.
+RUN apt-get update && apt-get install -y libdbus-1-dev pkg-config git ca-certificates
+# The nono pin lives in .nono-version at the repo root (single source of truth;
+# cli#341 S1's CI gate reads the same file). Clone the canonical repo, check out
+# the pinned commit, assert we got exactly it, then build. The commit id is the
+# content hash; no branch, tag or generated-archive URL is ever fetched.
 COPY .nono-version /tmp/.nono-version
 RUN set -eux; \
     . /tmp/.nono-version; \
-    curl -fsSL -o /tmp/nono.tar.gz "https://github.com/nolabs-ai/nono/archive/refs/tags/v${version}.tar.gz"; \
-    printf '%s  %s\n' "${sha256}" /tmp/nono.tar.gz | sha256sum -c -; \
-    tar -xzf /tmp/nono.tar.gz -C /tmp; \
-    cd "/tmp/nono-${version}"; \
+    git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono; \
+    git -C /tmp/nono checkout "${commit}"; \
+    test "$(git -C /tmp/nono rev-parse HEAD)" = "${commit}"; \
+    cd /tmp/nono; \
     cargo build --release -p nono-cli; \
     cp target/release/nono /usr/local/bin/nono
 

@@ -1,1 +1,1 @@
-- Pin the Docker image's nono install to a tagged release verified by sha256 (`.nono-version`), replacing the unpinned default-branch clone (cli#341).
+- Pin the Docker image's nono install to the immutable commit behind tag v0.74.0 (`commit=` in `.nono-version`, verified via `git rev-parse HEAD`), replacing the unpinned default-branch clone (cli#341).
