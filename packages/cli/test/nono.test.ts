@@ -30,12 +30,12 @@ import {
   buildNonoArgs,
   runCommandUnderNono,
   isNonoStrict,
+  sandboxChildEnv,
   type NonoProfile,
 } from "../src/utils/nono.js";
 
 // Path to the fake nono binary bundled with TPS for CI
-const FAKE_NONO_BIN_DIR = join(import.meta.dir, "fakes/nono/bin");
-const FAKE_NONO_BIN = join(FAKE_NONO_BIN_DIR, "nono");
+const FAKE_NONO_BIN_DIR = join(import.meta.dir, "fakes/nono/bin");const FAKE_NONO_BIN = join(FAKE_NONO_BIN_DIR, "nono");
 const FAKE_PROFILES_DIR = join(import.meta.dir, "fakes/nono/profiles");
 
 // Verify fake exists before running tests
@@ -420,5 +420,29 @@ describe("profile policy: tps-review", () => {
     expect(args).not.toContain(siblingWs);
     // Target workspace is the workdir
     expect(args[args.indexOf("--workdir") + 1]).toBe(targetWs);
+  });
+});
+
+describe("sandboxChildEnv() — the env every sandboxed child (and its git) gets (cli#351 r5c)", () => {
+  test("sets GIT_CONFIG_GLOBAL=/dev/null so git never reads the agent's $HOME/.gitconfig", () => {
+    const env = sandboxChildEnv({ HOME: "/home/agent", PATH: "/usr/bin" });
+    // The finding: under a real launch git reads ~/.gitconfig from $HOME, which
+    // nothing grants, and an unreadable one is FATAL (exit 128).
+    expect(env.GIT_CONFIG_GLOBAL).toBe("/dev/null");
+    // ... /dev/null is granted read-write by tps-base, so the target is readable.
+    const base = JSON.parse(
+      readFileSync(join(import.meta.dir, "..", "nono-profiles", "tps-base.json"), "utf-8")
+    );
+    expect(base.filesystem.allow_file).toContain("/dev/null");
+    // GIT_CONFIG_SYSTEM is deliberately NOT overridden — /etc/gitconfig is
+    // granted read by name instead (cli#351 r5b, keeps system config semantics).
+    expect(env.GIT_CONFIG_SYSTEM).toBeUndefined();
+  });
+
+  test("keeps the double-wrap guard and the rest of the environment", () => {
+    const env = sandboxChildEnv({ HOME: "/home/agent", PATH: "/usr/bin" });
+    expect(env.TPS_NONO_ACTIVE).toBe("1");
+    expect(env.HOME).toBe("/home/agent");
+    expect(env.PATH).toBe("/usr/bin");
   });
 });

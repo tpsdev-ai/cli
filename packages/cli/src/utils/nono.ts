@@ -387,10 +387,40 @@ export function runCommandUnderNono(
     stdio: "inherit",
     encoding: "utf-8",
     // TPS_NONO_ACTIVE is the double-wrap guard the CLI UIs read; setting it on
-    // every nono child keeps one launch path (cli#351 r2).
-    env: { ...process.env, TPS_NONO_ACTIVE: "1" },
+    // every nono child keeps one launch path (cli#351 r2). GIT_CONFIG_GLOBAL is
+    // set for the same reason: one launch path, no $HOME/.gitconfig read
+    // (cli#351 r5c) — see sandboxChildEnv().
+    env: sandboxChildEnv(),
   });
   return result.status ?? 1;
+}
+
+/**
+ * Environment every nono-sandboxed child gets — and therefore every tool the
+ * agent shells out to (git, bun, sh) inherits it.
+ *
+ * `GIT_CONFIG_GLOBAL=/dev/null` (cli#351 r5c): under a REAL launch git reads
+ * its USER config from $HOME, and the sandbox deliberately does NOT grant the
+ * agent's HOME (it holds ~/.tps/secrets, ~/.tps/identity, keys). An existing
+ * but unreadable `~/.gitconfig` is FATAL to git, not ignorable —
+ * `fatal: unable to access '~/.gitconfig': Operation not permitted` (macOS) /
+ * `Permission denied` (Linux), exit 128, so `git ls-remote` and friends died
+ * inside the sandbox the moment the agent's HOME had a git config. Point git's
+ * global config at /dev/null (granted read-write by tps-base) instead of
+ * exposing HOME.
+ *
+ * `GIT_CONFIG_SYSTEM` is deliberately NOT overridden: where `/etc/gitconfig`
+ * exists it is granted read by name (cli#351 r5b), which keeps the system
+ * config's semantics instead of silently discarding it.
+ */
+export function sandboxChildEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...base,
+    // TPS_NONO_ACTIVE is the double-wrap guard the CLI UIs read (cli#351 r2).
+    TPS_NONO_ACTIVE: "1",
+    // Never let the sandboxed child read (or write) $HOME/.gitconfig.
+    GIT_CONFIG_GLOBAL: "/dev/null",
+  };
 }
 
 function findBundledProfilesDir(): string {

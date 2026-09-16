@@ -178,16 +178,33 @@ else
   LAUNCH=()
   while IFS= read -r _arg; do LAUNCH+=("$_arg"); done < <(WS="${PROBE_WS}" ID=probeagent PROF="${AGENT_PROFILE}" \
     bun -e 'import { harnessReadPaths, harnessReadFiles } from "./packages/cli/src/utils/nono.ts"; const a=["run","--profile",process.env.PROF,"--allow-cwd","--workdir",process.env.WS,"--allow",process.env.WS]; for(const p of harnessReadPaths()) a.push("--read",p); for(const p of harnessReadFiles(process.env.ID)) a.push("--read-file",p); for(const x of a) console.log(x);')
+
+  # The child ENV, from the same source of truth as the launch (sandboxChildEnv
+  # in packages/cli/src/utils/nono.ts) — cli#351 r5c: GIT_CONFIG_GLOBAL=/dev/null
+  # is what keeps git from reading the agent's $HOME/.gitconfig.
+  SBOX_ENV=()
+  while IFS= read -r _kv; do [[ -n "${_kv}" ]] && SBOX_ENV+=("${_kv}"); done < <(bun -e 'import { sandboxChildEnv } from "./packages/cli/src/utils/nono.ts"; for (const [k, v] of Object.entries(sandboxChildEnv({}))) console.log(`${k}=${v}`);')
+  [[ ${#SBOX_ENV[@]} -gt 0 ]] || fail "could not read sandboxChildEnv() — the launch env is the thing under test"
+  echo "  · launch child env: ${SBOX_ENV[*]}"
+
+  # A REAL launch HOME has a ~/.gitconfig (r5b's fixture HOME did not, which is
+  # exactly why the $HOME/.gitconfig fatal went unnoticed). Put one there BEFORE
+  # the workloads, so the git workload below is the "after" for r5c.
+  printf '[user]\n\tname = fixture\n' >"${TMP}/home/.gitconfig"
+
   smoke() { # <label> <cmd...>
     local label="$1"; shift
-    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >"${TMP}/smoke.log" 2>&1; then
+    if env "${SBOX_ENV[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >"${TMP}/smoke.log" 2>&1; then
       ok "workload: ${label}"
     else
       # Show the COMMAND's own error line (git's "fatal: …"), not just the exit
-      # code: the lane log must make the cause readable (cli#351 r5b). Fall back
-      # to nono's report tail when the command itself said nothing.
+      # code: the lane log must make the cause readable (cli#351 r5b). A denial
+      # usually prints a `warning: unable to access '…': Permission denied`
+      # FIRST and the fatal line after it, so look for the fatal line ahead of
+      # the denial, and fall back to nono's report tail.
       local detail
-      detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):|denied|Permission denied|Name or service not known' "${TMP}/smoke.log" 2>/dev/null || true)"
+      detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):' "${TMP}/smoke.log" 2>/dev/null || true)"
+      [[ -n "${detail}" ]] || detail="$(grep -m1 -E 'denied|Permission denied|Operation not permitted|Name or service not known' "${TMP}/smoke.log" 2>/dev/null || true)"
       [[ -n "${detail}" ]] || detail="$(tail -n 3 "${TMP}/smoke.log" | tr '\n' ' ')"
       fail "workload FAILED under the launch args: ${label} — ${detail}"
     fi
@@ -229,6 +246,12 @@ else
   if sym_read; then echo "  · symlink with NO grant: readable (unexpected — fixture dir is inside a grant?)"; else echo "  · symlink with NO grant: DENIED (control: the fixture dir is outside every grant)"; fi
   if sym_read --read-file "${SYM_DIR}/resolv.conf"; then echo "  · symlink-only --read-file: ALLOWED (nono resolves the grant's symlink itself)"; else echo "  · symlink-only --read-file: DENIED (the target needs granting too)"; fi
 
+no_gitcfg_detail() { # <log> → the fatal line, plus the denial that explains it
+  printf '%s [%s]' \
+    "$(grep -m1 -E 'fatal:|error:' "$1" 2>/dev/null | tr '\n' ' ' || true)" \
+    "$(grep -m1 -E 'unable to access|Permission denied|Operation not permitted' "$1" 2>/dev/null | tr '\n' ' ' || true)"
+}
+
   # ── 5d. fails-first: the gitconfig grant is what saves git (cli#351 r5b) ─────
   # On a host WITH /etc/gitconfig, git reads it as part of "reading the
   # configuration files" — drop the grant and git dies (exit 128); the workload
@@ -239,11 +262,11 @@ else
       if [[ "${LAUNCH[$_i]}" == "--read-file" && "${LAUNCH[$((_i + 1))]}" == "/etc/gitconfig" ]]; then _i=$((_i + 2)); continue; fi
       NO_GC+=("${LAUNCH[$_i]}"); _i=$((_i + 1))
     done
-    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${NO_GC[@]}" -- \
+    if env "${SBOX_ENV[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${NO_GC[@]}" -- \
       sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1' >"${TMP}/nogitcfg.log" 2>&1; then
       echo "  · fails-first: gitconfig grant removed but git still succeeded (unexpected on this host)"
     else
-      echo "  · fails-first: gitconfig grant removed → $(grep -m1 -E 'fatal:|Permission denied' "${TMP}/nogitcfg.log" | tr '\n' ' ')"
+      ok "fails-first: gitconfig grant removed → $(no_gitcfg_detail "${TMP}/nogitcfg.log")"
     fi
   else
     # No /etc/gitconfig on this host: reproduce the SAME mechanism portably by
@@ -253,18 +276,35 @@ else
     GC_DIR="${TMP}/gitcfg"; mkdir -p "${GC_DIR}"
     printf '[core]\n\tautocrlf = false\n' >"${GC_DIR}/gitconfig"
     gc_run() { # <extra launch flags...>
-      HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 GIT_CONFIG_SYSTEM="${GC_DIR}/gitconfig" \
+      env "${SBOX_ENV[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 GIT_CONFIG_SYSTEM="${GC_DIR}/gitconfig" \
         "${NONO_BIN}" "${LAUNCH[@]}" "$@" -- sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1'
     }
     if gc_run >"${TMP}/gc-no.log" 2>&1; then
       fail "fails-first: git SUCCEEDED with an ungranted system config (mechanism not reproduced)"
     else
-      ok "fails-first: ungranted system config → $(grep -m1 -E 'fatal:|Permission denied' "${TMP}/gc-no.log" | tr '\n' ' ')"
+      ok "fails-first: ungranted system config → $(no_gitcfg_detail "${TMP}/gc-no.log")"
     fi
     gc_run --read-file "${GC_DIR}/gitconfig" >"${TMP}/gc-yes.log" 2>&1 \
       && ok "the system-config --read-file grant clears it (git ls-remote succeeds)" \
       || fail "granted system config still failed: $(tail -n 1 "${TMP}/gc-yes.log")"
   fi
+
+  # ── 5e. fails-first: the child ENV is what saves git from the agent's HOME ──
+  # The git workload above ran with the launch's env (GIT_CONFIG_GLOBAL=/dev/null)
+  # and a HOME that HAS ~/.gitconfig → green. Drop just that one var: git then
+  # tries the agent's own config, which nothing grants, and dies (exit 128).
+  NO_GCE=(); for _kv in "${SBOX_ENV[@]}"; do [[ "${_kv}" == GIT_CONFIG_GLOBAL=* ]] || NO_GCE+=("${_kv}"); done
+  if env "${NO_GCE[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- \
+    sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1' >"${TMP}/gc-home-no.log" 2>&1; then
+    fail "fails-first: git read \$HOME/.gitconfig with GIT_CONFIG_GLOBAL unset (fixture did not reproduce)"
+  else
+    ok "fails-first: no GIT_CONFIG_GLOBAL with ~/.gitconfig present → $(no_gitcfg_detail "${TMP}/gc-home-no.log")"
+  fi
+  # and the same command WITH the launch env is the "after" (the git workload above).
+  env "${SBOX_ENV[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- \
+    sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1' >"${TMP}/gc-home-yes.log" 2>&1 \
+    && ok "GIT_CONFIG_GLOBAL=/dev/null clears it (git ls-remote succeeds with ~/.gitconfig present)" \
+    || fail "git still failed with the launch env: $(tail -n 1 "${TMP}/gc-home-yes.log")"
 fi
 
 echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement + workload verified)"
