@@ -256,15 +256,38 @@ else
   # names the cause rather than nono's (benign) denial summary.
   smoke "fetch https://registry.npmjs.org/-/ping" bun -e '
     const url = "https://registry.npmjs.org/-/ping";
-    try {
-      const r = await fetch(url);
-      const body = (await r.text()).replace(/\s+/g, " ").slice(0, 60);
-      console.log(`fetch status ${r.status} ${r.statusText} body=${body}`);
-      process.exit(r.ok ? 0 : 1);
-    } catch (e) {
-      console.log(`fetch error ${e.name}: ${e.message}`);
-      process.exit(1);
+    // cli#352 r5 — a DNS/TLS/CDN/5xx BLIP must not red the gate, but a sandbox
+    // denial (EPERM/EACCES) must fail IMMEDIATELY, never retry. The status/error
+    // is printed on EVERY attempt so a red lane still names what it saw. bun
+    // reports network failures with a generic message plus a short code (e.g.
+    // ConnectionRefused), so classify on code+message together.
+    const transient = /ConnectionRefused|ConnectionClosed|FailedToOpenSocket|DNSError|DNS|TLS|Timeout|timed out|timeout|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EPIPE|EHOSTUNREACH|ENETUNREACH|socket hang up|network/i;
+    const denial = /EPERM|EACCES|[Pp]ermission denied|[Oo]peration not permitted|denied/i;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const r = await fetch(url);
+        const body = (await r.text()).replace(/\s+/g, " ").slice(0, 60);
+        console.log(`fetch status ${r.status} ${r.statusText} body=${body}`);
+        if (r.ok) process.exit(0);
+        // Any non-5xx status is a real answer, not a blip (e.g. a 4xx).
+        if (r.status < 500) process.exit(1);
+      } catch (e) {
+        const code = e && e.code ? String(e.code) : "";
+        console.log(`fetch error ${e.name}: ${e.message}${code ? " [" + code + "]" : ""}`);
+        if (
+          denial.test(`${code} ${e.message}`) ||
+          !(transient.test(code) || transient.test(e.message))
+        ) {
+          process.exit(1);
+        }
+      }
+      if (attempt < 3) {
+        const wait = 250 * attempt;
+        console.log(`fetch retry ${attempt}/3 after ${wait}ms (transient; a sandbox denial never reaches here)`);
+        await new Promise((s) => setTimeout(s, wait));
+      }
     }
+    process.exit(1);
   '
 
   # ── 5c. mechanism probe: does nono resolve a symlinked --read-file? ────────

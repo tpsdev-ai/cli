@@ -60,7 +60,11 @@ describe("security properties regression checks", () => {
     expect(sh).toContain('^[a-zA-Z0-9._-]{1,64}$');
     expect(sh).toContain('"$id" == *..*');
     // The grant path is derived from the roster state root + roster id...
-    expect(sh).toContain('STATE_ROOT="${TPS_STATE_ROOT:-"$(dirname "$TEAM_FILE")"}"');
+    // ...where the state root is the roster FILE's own directory, with NO
+    // override (cli#352 r5, CWE-668): a value diverging from TEAM_FILE could
+    // grant another state tree's key for the same id.
+    expect(sh).not.toContain("TPS_STATE_ROOT");
+    expect(sh).toContain('STATE_ROOT="$(dirname "$TEAM_FILE")"');
     expect(sh).toContain('for k in "$STATE_ROOT/identity/$id.key" "$STATE_ROOT/identity/$id.pub"');
     // ...never read from the config: the supervisor never extracts agentId
     // itself (the rule lives in the runtime, reached via `tps-agent check`).

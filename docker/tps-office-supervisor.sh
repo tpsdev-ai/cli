@@ -25,7 +25,12 @@ PIDS_FILE="/workspace/.tps/pids.json"
 #    Landlock probe fail for the WRONG reason (profile not found) and
 #    fail-closed then refused every office agent. A profile that resolves
 #    nowhere is a named refusal before anything is launched.
-STATE_ROOT="${TPS_STATE_ROOT:-"$(dirname "$TEAM_FILE")"}"
+# cli#352 r5 — the identity grants derive from the ROSTER FILE's own directory
+# only. There is no state-root override: a value that diverges from TEAM_FILE
+# (fixed at /workspace/.tps/team.json) could grant an agent another state tree's
+# key for the same id (CWE-668). A harness that needs a different root points
+# TEAM_FILE's directory, never an env override.
+STATE_ROOT="$(dirname "$TEAM_FILE")"
 readonly SBOX_ENV=("TPS_NONO_ACTIVE=1" "GIT_CONFIG_GLOBAL=/dev/null")
 
 # System read files the launch must add by name (Linux cannot grant /etc
