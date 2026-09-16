@@ -285,23 +285,32 @@ for ((i=0; i<count; i++)); do
   id=$(echo "$agents_json" | jq -r ".[$i].id")
   config_path=$(echo "$agents_json" | jq -r ".[$i].configPath")
 
+  # cli#352 r7 — these roster-shape checks fire INSIDE the loop too, so at i>0
+  # agents from earlier iterations are already backgrounded. They obey the same
+  # all-or-nothing rule as the launch refusals below: stop the children before
+  # exiting, never leave a partial team. (Bounded by the Part A source control
+  # "every exit in the seating loop is preceded by shutdown_children".)
   if [[ -z "$id" || "$id" == "null" ]]; then
     echo "Agent missing id at index $i" >&2
+    shutdown_children TERM
     exit 1
   fi
 
   if [[ ! "$id" =~ ^[a-zA-Z0-9._-]{1,64}$ || "$id" == *..* ]]; then
     echo "Invalid agent id at index $i: $id — must match ^[a-zA-Z0-9._-]{1,64}$ and contain no traversal" >&2
+    shutdown_children TERM
     exit 1
   fi
 
   if [[ -z "$config_path" || "$config_path" == "null" ]]; then
     echo "Agent missing configPath at index $i" >&2
+    shutdown_children TERM
     exit 1
   fi
 
   if [[ ! "$config_path" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
     echo "Invalid configPath for agent '$id': $config_path" >&2
+    shutdown_children TERM
     exit 1
   fi
 
@@ -324,6 +333,11 @@ for ((i=0; i<count; i++)); do
   if ! id "$user" >/dev/null 2>&1; then
     uid="$(first_free_id user)" || {
       echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
+      # All-or-nothing, exactly like the two sibling refusals in this loop: this
+      # fires mid-loop, so stop the agents launched in earlier iterations before
+      # exiting (pids.json is written only after the loop, and the EXIT trap just
+      # removes it — nothing durable would reap them).
+      shutdown_children TERM
       exit 1
     }
     useradd -u "$uid" -g tps -m -s /bin/bash "$user"

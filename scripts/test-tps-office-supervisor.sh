@@ -94,6 +94,42 @@ else
   bad "test.yml does not invoke scripts/test-tps-office-supervisor.sh"
 fi
 
+# cli#352 r7 (Sherlock): every refusal that fires INSIDE the agent seating loop
+# must stop the agents already launched before it exits — a team is either whole
+# or absent, never partial. `write_pids_file` runs only AFTER the loop and the
+# EXIT trap only removes the file, so an exit that skips `shutdown_children`
+# orphans earlier sandboxed agents with nothing durable to reap them. Asserted
+# over the SOURCE (not a fixture for one branch) so a new exit cannot
+# reintroduce the class.
+loop_start="$(grep -n 'for ((i=0; i<count; i++)); do' "$sup" | head -n1 | cut -d: -f1)"
+loop_end=""
+[ -n "$loop_start" ] && loop_end="$(awk -v s="$loop_start" 'NR>s && /^done$/ { print NR; exit }' "$sup")"
+if [ -z "$loop_start" ] || [ -z "$loop_end" ]; then
+  bad "could not bound the agent seating loop in $sup — cannot assert the all-or-nothing refusal invariant"
+else
+  unguarded="$(awk -v s="$loop_start" -v e="$loop_end" '
+    { L[NR]=$0 }
+    END {
+      for (j=s; j<e; j++) {
+        if (L[j] !~ /^[[:space:]]*exit[[:space:]]+1[[:space:]]*$/) continue
+        guarded=0
+        for (k=j-1; k>=s; k--) {
+          l=L[k]
+          if (index(l,"shutdown_children")>0) { guarded=1; break }
+          if (l ~ /^[[:space:]]*(fi|else|done|exit|[}])/) break
+          if (l ~ /^[[:space:]]*(if|elif)[[:space:]]/) break
+          if (l ~ /\|[[:space:]]*\{[[:space:]]*$/) break
+        }
+        if (!guarded) print j
+      }
+    }' "$sup")"
+  if [ -z "$unguarded" ]; then
+    ok "every exit in the agent seating loop stops the launched agents first (all-or-nothing)"
+  else
+    bad "seating-loop refusal(s) exit without shutdown_children TERM, orphaning earlier agents: line(s) $(printf '%s' "$unguarded" | tr '\n' ' ')"
+  fi
+fi
+
 # ── Part B — behavioural, fake nono ──────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
   printf 'SKIP  behavioural runs (needs root; run inside the image — see header)\n'
