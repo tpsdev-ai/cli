@@ -205,7 +205,10 @@ else
       local detail
       detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):' "${TMP}/smoke.log" 2>/dev/null || true)"
       [[ -n "${detail}" ]] || detail="$(grep -m1 -E 'denied|Permission denied|Operation not permitted|Name or service not known' "${TMP}/smoke.log" 2>/dev/null || true)"
-      [[ -n "${detail}" ]] || detail="$(tail -n 3 "${TMP}/smoke.log" | tr '\n' ' ')"
+      # nono names the BLOCKED PATH only in its denial block — quote it, or a red
+      # lane is unreadable (cli#351 r5c: the macOS fetch failure hid its path).
+      [[ -n "${detail}" ]] || detail="$(grep -A4 -m1 'Sandbox denial' "${TMP}/smoke.log" 2>/dev/null | tr '\n' ' ')"
+      [[ -n "${detail}" ]] || detail="$(tail -n 14 "${TMP}/smoke.log" | tr '\n' ' ')"
       fail "workload FAILED under the launch args: ${label} — ${detail}"
     fi
   }
