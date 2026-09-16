@@ -16,6 +16,15 @@ PIDS_FILE="/workspace/.tps/pids.json"
 #    `packages/cli/src/utils/nono.ts` are two launch points for the same
 #    workload; test/security-properties.test.ts asserts these pairs EQUAL
 #    sandboxChildEnv() so the two cannot drift.
+# 3. The profile is passed to nono as the RESOLVED ABSOLUTE PATH, never a bare
+#    name (cli#352 r3) — same two candidates, same order, as the CLI path's
+#    resolveProfilePath() in packages/cli/src/utils/nono.ts. nono resolves a
+#    bare name against its OWN search dir (~/.config/nono/profiles), which the
+#    office image never populates (installNonoProfiles() runs only from `tps
+#    identity init`, which the container never runs), so a bare name made the
+#    Landlock probe fail for the WRONG reason (profile not found) and
+#    fail-closed then refused every office agent. A profile that resolves
+#    nowhere is a named refusal before anything is launched.
 STATE_ROOT="${TPS_STATE_ROOT:-"$(dirname "$TEAM_FILE")"}"
 readonly SBOX_ENV=("TPS_NONO_ACTIVE=1" "GIT_CONFIG_GLOBAL=/dev/null")
 
@@ -30,6 +39,33 @@ if [[ ! -f "$TEAM_FILE" ]]; then
 fi
 
 mkdir -p /workspace/.tps
+
+# cli#352 r3 — resolve the TPS profile to an absolute path BEFORE any launch.
+# Candidates, in the CLI path's order: the operator's nono config dir, then the
+# directory the image ships the profiles in. TPS_NONO_PROFILES_DIR only moves
+# the bundled candidate (the harness points it at a fixture copy or at a
+# nonexistent directory); the shipped default is the image's COPY destination.
+PROFILE_NAME="tps-office"
+BUNDLED_PROFILES_DIR="${TPS_NONO_PROFILES_DIR:-/usr/local/share/tps/nono-profiles}"
+
+resolve_profile_path() { # <name> -> absolute path on stdout; empty when unresolved
+  local name="$1" candidate
+  for candidate in "${HOME:-/root}/.config/nono/profiles/$name.json" "$BUNDLED_PROFILES_DIR/$name.json"; do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+NONO_PROFILE="$(resolve_profile_path "$PROFILE_NAME" || true)"
+if [[ -z "$NONO_PROFILE" ]]; then
+  # Named refusal: name the paths that were searched. A bare name is never
+  # passed to nono — that is the failure this resolution deletes.
+  echo "❌ profile file not found at $BUNDLED_PROFILES_DIR/$PROFILE_NAME.json (not in ${HOME:-/root}/.config/nono/profiles/ either) — refusing to launch: nono is never given a bare profile name" >&2
+  exit 1
+fi
 
 # S33B-I: Proxy socket integrity check (if mounted).
 # If path exists, it must be a UNIX domain socket (not regular file/symlink).
@@ -186,7 +222,7 @@ supports_landlock_for_agent() {
     return 1
   fi
 
-  su -s /bin/bash "$user" -c "exec nono run --profile tps-office --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
+  su -s /bin/bash "$user" -c "exec nono run --profile \"$NONO_PROFILE\" --allow '$workdir' --allow '$tmpdir' -- bash -lc 'cat \"$probe_file\" >/dev/null'" >/dev/null 2>&1
   local rc=$?
   su -s /bin/bash "$user" -c "rm -f '$probe_file'" >/dev/null 2>&1 || true
   set -e
@@ -259,7 +295,7 @@ for ((i=0; i<count; i++)); do
   # write its own agent.yaml name someone else's key (cli#351 r5, one launch
   # point later). Missing files are skipped (nono refuses to load a profile
   # whose grant list names a path that does not exist).
-  launch_args=(run --profile tps-office --name "tps-agent-$id"
+  launch_args=(run --profile "$NONO_PROFILE" --name "tps-agent-$id"
     --allow "$workdir" --allow "$tmpdir" --allow /var/run/tps-proxy.sock)
   for f in "${SBOX_SYSTEM_READ_FILES[@]}"; do
     [[ -e "$f" ]] && launch_args+=(--read-file "$f")
@@ -268,7 +304,15 @@ for ((i=0; i<count; i++)); do
     if [[ -f "$k" ]]; then
       launch_args+=(--read-file "$k")
     else
-      echo "ℹ️  agent '$id': no identity file at $k (agent cannot sign as '$id')" >&2
+      # cli#352 r3 (4a) — the office never writes this file: office.ts writes
+      # only team.json under the mount root, and the key-creating paths (`tps
+      # agent create`, `tps branch`, `tps identity init`) write into the
+      # operator's own $HOME/.tps/identity on the HOST — not into this bind
+      # mount. The runtime resolves $HOME/.tps/identity/<agentId>.key, so name
+      # the path this grant expects AND where it lives on the host.
+      echo "ℹ️  agent '$id': no identity file at $k — the office does not create it;" \
+        "place the agent's Ed25519 key there (host side: <branch-office>/<team id>/<state root>/.tps/identity/$id.key," \
+        "the same mount that holds team.json) or the agent cannot sign as '$id'" >&2
     fi
   done
 
@@ -284,7 +328,7 @@ for ((i=0; i<count; i++)); do
     # in earlier iterations are already backgrounded. Stop them before exiting so
     # a refusal leaves NO agent running — a team is either whole or absent,
     # never partial. (The EXIT trap only removes pids.json.)
-    echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the tps-office profile) — refusing to launch the agent without isolation" >&2
+    echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the profile at $NONO_PROFILE) — refusing to launch the agent without isolation" >&2
     shutdown_children TERM
     exit 1
   fi

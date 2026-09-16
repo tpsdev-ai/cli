@@ -20,13 +20,24 @@
 #      both, before anything runs.
 #
 # Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
-#   1. POSITIVE: under the real nono the Landlock probe passes, the office agent
-#      launches under `tps-office`, `nono ps` shows the session bound to the
-#      supervisor's child, and inside that agent `git ls-remote` over https exits
-#      0 (what cli#351's /dev/null + /etc/gitconfig + GIT_CONFIG_GLOBAL fixed on
-#      the CLI path) and the child env carries sandboxChildEnv()'s exports;
+#   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
+#      supervisor resolves the profile from the BUNDLED dir the image ships,
+#      passes the ABSOLUTE PATH to nono, the Landlock probe passes, the office
+#      agent launches under `tps-office`, `nono ps` shows the session bound to
+#      the supervisor's child, and inside that agent `git ls-remote` over https
+#      exits 0 (what cli#351's /dev/null + /etc/gitconfig + GIT_CONFIG_GLOBAL
+#      fixed on the CLI path) and the child env carries sandboxChildEnv()'s
+#      exports;
 #   2. FAILS-FIRST: with tps-base's `/dev/null` allow reverted in a private
-#      profile copy the probe fails and the supervisor refuses EVERYTHING.
+#      bundled copy — same empty XDG — the probe fails and the supervisor
+#      refuses EVERYTHING (this used to be masked by supplying the profiles
+#      through XDG_CONFIG_HOME, which is why the image shipped profile-less);
+#   3. FAILS-FIRST: no profile reachable at all (empty XDG + a bundled dir that
+#      does not exist) → the NAMED refusal fires before anything is launched;
+#   4. FAILS-FIRST: the resolver reverted to the BARE name (the pre-r3 shape) →
+#      the same setup that launches in C.1 refuses, because nono can only report
+#      "Profile not found" (the wrong reason) for a bare name against an empty
+#      config dir. A Dockerfile that forgets the COPY turns these red.
 #
 #   docker run --rm -v "$PWD":/repo -w /repo --entrypoint bash <image> \
 #     scripts/test-tps-office-supervisor.sh
@@ -44,8 +55,20 @@ ok()  { printf 'PASS  %s\n' "$1"; npass=$((npass + 1)); }
 bad() { printf 'FAIL  %s\n' "$1" >&2; nfail=$((nfail + 1)); }
 
 # ── Part A — static shape ────────────────────────────────────────────────────
-profiles="$(grep -c -- '--profile tps-office' "$sup" || true)"
-if [ "$profiles" -ge 2 ]; then ok "$profiles launch points carry --profile tps-office"; else bad "expected >=2 '--profile tps-office', found $profiles"; fi
+profiles="$(grep -cE -- '--profile \\?"?\$NONO_PROFILE' "$sup" || true)"
+if [ "$profiles" -ge 2 ]; then ok "$profiles launch points pass the RESOLVED profile path (probe + agent launch)"; else bad "expected >=2 '--profile \"\$NONO_PROFILE\"', found $profiles"; fi
+# cli#352 r3 (Sherlock's blocker): the bare name is what nono could not resolve
+# in the image. Nothing may pass it any more, at build time or at runtime.
+bare="$(grep -c -- '--profile tps-office' "$sup" || true)"
+if [ "$bare" -eq 0 ]; then ok "no launch point passes the bare name 'tps-office'"; else bad "$bare launch point(s) still pass the bare profile name"; fi
+if grep -q 'resolve_profile_path()' "$sup" && grep -q 'TPS_NONO_PROFILES_DIR:-/usr/local/share/tps/nono-profiles' "$sup"; then ok "the supervisor resolves tps-office to an absolute path (bundled default /usr/local/share/tps/nono-profiles)"; else bad "the supervisor does not resolve the profile (or the bundled default moved)"; fi
+if grep -qF 'profile file not found at' "$sup"; then ok "an unresolvable profile is a named refusal"; else bad "no named refusal for an unresolvable profile"; fi
+# The ship-red half (Harness green, ship red — cli#341 S1b/S4 class): the image
+# must actually carry the profiles at the path the resolver defaults to, and a
+# CI lane must launch the built image so a Dockerfile that forgets the COPY
+# cannot stay green.
+if grep -qF 'COPY packages/cli/nono-profiles/ /usr/local/share/tps/nono-profiles' "$repo_root/docker/Dockerfile"; then ok "docker/Dockerfile ships the profiles at the resolved default path"; else bad "docker/Dockerfile does not COPY the profiles to /usr/local/share/tps/nono-profiles"; fi
+if grep -q 'usr/local/share/tps/nono-profiles/tps-office.json' "$repo_root/.github/workflows/docker.yml"; then ok "docker.yml asserts the bundled profile (and a launch) inside the built image"; else bad "docker.yml never runs the built image against the bundled profile"; fi
 
 if grep -q 'exec nono ${launch_args\[\*\]}' "$sup"; then ok "the agent launch goes through nono"; else bad "the agent launch does not go through \${launch_args[@]}"; fi
 
@@ -171,6 +194,10 @@ SH
     p="$(command -v "$t" 2>/dev/null || true)"; [ -n "$p" ] && ln -sf "$p" "$basetools/$t"
   done
   cleanpath="$basetools:$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '^/usr/local/bin$' | paste -sd: -)"
+  # cli#352 r3: the supervisor resolves the profile itself, so the behavioural
+  # cases hand it the bundled dir the way the image does (the fake nono only
+  # logs argv; resolution never reaches nono).
+  export TPS_NONO_PROFILES_DIR="$profiles_src"
 
   # (1) nono present (fake, logs argv) — roster id == config id → match launches
   seed
@@ -183,9 +210,9 @@ SH
   bad1=0
   while IFS= read -r l; do
     [ -z "$l" ] && continue
-    case "$l" in *"--profile tps-office"*) ;; *) bad1=$((bad1 + 1)) ;; esac
+    case "$l" in *"--profile $profiles_src/tps-office.json"*) ;; *) bad1=$((bad1 + 1)) ;; esac
   done < <(grep 'nono run' "$NONO_ARGV_LOG" || true)
-  if [ "$bad1" -eq 0 ]; then ok "both invocations carried --profile tps-office at runtime"; else bad "$bad1 runtime invocation(s) lacked --profile tps-office"; fi
+  if [ "$bad1" -eq 0 ]; then ok "both invocations carried the RESOLVED profile path at runtime"; else bad "$bad1 runtime invocation(s) lacked the resolved profile path"; fi
   if grep -q 'tps-agent start --id probe --config /workspace/probe/agent.yaml' "$NONO_ARGV_LOG"; then ok "the agent launch went through nono with the roster id"; else bad "no 'tps-agent start --id probe' launch seen under nono"; fi
   if grep -q -- '--read-file /workspace/.tps/identity/probe.key' "$NONO_ARGV_LOG"; then ok "the roster identity key was granted by name"; else bad "the identity key grant is missing from the launch argv"; fi
 
@@ -197,7 +224,9 @@ SH
   if [ "$rc2" -ne 0 ]; then ok "run with nono absent exits non-zero ($rc2)"; else bad "run with nono absent exited 0 (should fail closed)"; fi
   case "$out2" in *nono*) ok "refusal names nono" ;; *) bad "refusal does not name nono" ;; esac
   if [ ! -s "$NONO_ARGV_LOG" ]; then ok "no nono invocation (no agent started)"; else bad "an agent was launched despite nono being absent"; fi
-  if command -v pgrep >/dev/null 2>&1 && pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "a 'tps-agent start' process is running after the nono-absent run"; else ok "no 'tps-agent start' process running after the nono-absent run"; fi
+  if ! command -v pgrep >/dev/null 2>&1; then bad "pgrep missing; cannot assert no orphan"
+  elif pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "a 'tps-agent start' process is running after the nono-absent run"
+  else ok "no 'tps-agent start' process running after the nono-absent run"; fi
 
   # (3) orphan-on-refusal: agent 1 launches, agent 2 refuses → agent 1 must be stopped.
   mkdir -p /workspace/.tps /run/secrets
@@ -251,13 +280,21 @@ SH
     # it; the test image does not).
     getent group tps >/dev/null 2>&1 || groupadd tps
 
-    # A private profile set: Part C.2 tampers with a copy of it.
-    xdg="$tmp/xdg"; mkdir -p "$xdg/nono/profiles"
-    cp "$profiles_src"/*.json "$xdg/nono/profiles/"
-    bad_xdg="$tmp/xdg-reverted"; mkdir -p "$bad_xdg/nono/profiles"
-    cp "$profiles_src"/*.json "$bad_xdg/nono/profiles/"
-    jq '(.filesystem.allow_file) -= ["/dev/null"]' "$bad_xdg/nono/profiles/tps-base.json" >"$bad_xdg/tps-base.json" &&
-      mv "$bad_xdg/tps-base.json" "$bad_xdg/nono/profiles/tps-base.json"
+    # cli#352 r3: the supervisor resolves the profile itself and hands nono an
+    # absolute path, so XDG_CONFIG_HOME is EMPTY in every Part C case — the
+    # profile can only come from the BUNDLED dir the image ships (here: the
+    # repo's copy in this test image; docker.yml asserts the SHIPPED image's own
+    # default path). Supplying the profiles through XDG_CONFIG_HOME is exactly
+    # the masking Sherlock flagged, so that crutch is gone.
+    empty_xdg="$tmp/xdg-empty"; mkdir -p "$empty_xdg"
+    # A private bundled copy for C.2: tps-base's /dev/null allow reverted.
+    bad_bundled="$tmp/bundled-reverted"; mkdir -p "$bad_bundled"
+    cp "$profiles_src"/*.json "$bad_bundled/"
+    jq '(.filesystem.allow_file) -= ["/dev/null"]' "$bad_bundled/tps-base.json" >"$bad_bundled/tps-base.reverted.json" &&
+      mv "$bad_bundled/tps-base.reverted.json" "$bad_bundled/tps-base.json"
+    # C.4: a copy of the supervisor with the resolver reverted to the bare name.
+    bare_sup="$tmp/tps-office-supervisor-bare-name"
+    sed -E 's|--profile \\?"\$NONO_PROFILE\\?"|--profile tps-office|g' "$sup" >"$bare_sup"
 
     # The sandboxed nono runs as the agent user: give it a HOME it can write
     # (its session registry lives there). It must NOT live under /tmp or
@@ -269,10 +306,11 @@ SH
     export AGENT_MARKER="$real/marker" AGENT_GIT_LOG="$real/git.log" AGENT_SLEEP="${AGENT_SLEEP:-6}"
     chmod -R 777 "$tmp"
 
-    # C.1 — positive: probe passes, agent launches, the session binds, git works.
+    # C.1 — positive: empty XDG_CONFIG_HOME, profile from the bundled dir →
+    # probe passes, agent launches, the session binds, git works.
     seed
     rm -f "$AGENT_MARKER" "$AGENT_GIT_LOG"
-    XDG_CONFIG_HOME="$xdg" PATH="$real/bin:$PATH" timeout 60 bash "$sup" >"$real/out1.log" 2>&1 &
+    XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$profiles_src" PATH="$real/bin:$PATH" timeout 60 bash "$sup" >"$real/out1.log" 2>&1 &
     sup_pid=$!
     up=0
     for _ in $(seq 1 60); do
@@ -300,7 +338,9 @@ SH
     fi
     # nono ps must show the session bound to the supervisor's child.  The
     # sandboxed nono runs as the per-agent user, and nono refuses to read a
-    # session registry owned by another uid — so ask as that same user.
+    # session registry owned by another uid — so ask as that same user.  nono
+    # records the profile as the path it was HANDED (cli#352 r3), so the filter
+    # accepts the bare name or the resolved path under test.
     ps_as_agent() { su -m -s /bin/bash "agent-probe" -c "exec '$real_nono' ps --json"; }
     for _ in $(seq 1 20); do
       [ -s /workspace/.tps/pids.json ] && break
@@ -309,13 +349,14 @@ SH
     done
     sess=""
     for _ in $(seq 1 20); do
-      sess="$(ps_as_agent 2>"$real/ps.err" | jq -c '[.[] | select(.profile == "tps-office" and .status == "running")]' 2>/dev/null || true)"
+      sess="$(ps_as_agent 2>"$real/ps.err" | jq -c '[.[] | select((.profile == "tps-office" or (.profile // "" | endswith("/tps-office.json"))) and .status == "running")]' 2>/dev/null || true)"
       [ -n "$sess" ] && [ "$sess" != "[]" ] && break
       kill -0 "$sup_pid" 2>/dev/null || break
       sleep 0.5
     done
     n_sess="$(printf '%s' "$sess" | jq 'length' 2>/dev/null || echo 0)"
-    if [ "${n_sess:-0}" -ge 1 ]; then ok "nono ps shows the running tps-office session ($(printf '%s' "$sess" | jq -r '.[0].name + " pid=" + (.[0].child_pid|tostring)' 2>/dev/null))"; else bad "nono ps shows no running tps-office session (raw: '$sess' err: $(tr '\n' ' ' <"$real/ps.err" 2>/dev/null | head -c 200))"; fi
+    if [ "${n_sess:-0}" -ge 1 ]; then ok "nono ps shows the running tps-office session ($(printf '%s' "$sess" | jq -r '.[0].name + " pid=" + (.[0].child_pid|tostring) + " profile=" + (.[0].profile|tostring)' 2>/dev/null))"; else bad "nono ps shows no running tps-office session (raw: '$sess' err: $(tr '\n' ' ' <"$real/ps.err" 2>/dev/null | head -c 200))"; fi
+    if [ "${n_sess:-0}" -ge 1 ] && [ "$(printf '%s' "$sess" | jq -r '.[0].profile')" = "$profiles_src/tps-office.json" ]; then ok "the session records the RESOLVED profile path the supervisor passed"; else bad "the session does not record $profiles_src/tps-office.json ($(printf '%s' "$sess" | jq -r '.[0].profile // "none"' 2>/dev/null))"; fi
     sup_child="$(jq -r 'to_entries[0].value' /workspace/.tps/pids.json 2>/dev/null || true)"
     ppid_of() { sed -E 's/^[0-9]+ \(.*\) [A-Z] ([0-9]+).*/\1/' "/proc/$1/stat" 2>/dev/null; }
     is_descendant_of() { # <pid> <ancestor>
@@ -341,14 +382,40 @@ SH
     if [ "$rc1r" -eq 0 ]; then ok "real nono: the supervisor exits 0 with the agent green"; else bad "real nono: supervisor exited $rc1r — $(tail -n 30 "$real/out1.log" | tr '\n' ' ')"; fi
     grep -q 'AGENT-EXITED' "$AGENT_MARKER" 2>/dev/null || true
 
-    # C.2 — fails-first: revert tps-base's /dev/null allow in a private copy.
+    # C.2 — fails-first: revert tps-base's /dev/null allow in a private bundled copy.
     seed
     rm -f "$AGENT_MARKER"
-    XDG_CONFIG_HOME="$bad_xdg" PATH="$real/bin:$PATH" timeout 60 bash "$sup" >"$real/out2.log" 2>&1; rc2r=$?
+    XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$bad_bundled" PATH="$real/bin:$PATH" timeout 60 bash "$sup" >"$real/out2.log" 2>&1; rc2r=$?
     if [ "$rc2r" -ne 0 ]; then ok "fails-first: /dev/null allow reverted → supervisor refuses (exit $rc2r)"; else bad "fails-first: supervisor exited 0 with /dev/null not granted"; fi
     if grep -q 'refusing to launch the agent without isolation' "$real/out2.log"; then ok "the refusal names the nono/Landlock cause"; else bad "refusal message missing: $(tail -n 5 "$real/out2.log" | tr '\n' ' ')"; fi
     if [ ! -e "$AGENT_MARKER" ]; then ok "nothing launched when the probe failed (fail closed, all-or-nothing)"; else bad "an agent launched (or touched the marker) despite the probe failing: $(cat "$AGENT_MARKER" | tr '\n' ' ')"; fi
-    if pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "an agent process survived the refusal"; else ok "no agent process left after the refusal"; fi
+    if ! command -v pgrep >/dev/null 2>&1; then bad "pgrep missing; cannot assert no orphan"
+    elif pgrep -f 'tps-agent start' >/dev/null 2>&1; then bad "an agent process survived the refusal"
+    else ok "no agent process left after the refusal"; fi
+
+    # C.3 — fails-first: NO profile reachable (empty XDG_CONFIG_HOME and no
+    # bundled dir) → the named refusal fires before anything is launched.
+    seed
+    rm -f "$AGENT_MARKER"
+    XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$tmp/no-such-bundled-dir" \
+      PATH="$real/bin:$PATH" timeout 60 bash "$sup" >"$real/out3.log" 2>&1; rc3r=$?
+    if [ "$rc3r" -ne 0 ]; then ok "fails-first: no profile anywhere → supervisor refuses (exit $rc3r)"; else bad "supervisor exited 0 with no profile reachable"; fi
+    if grep -q 'profile file not found at' "$real/out3.log"; then ok "the refusal names the missing profile path"; else bad "refusal does not name the profile path: $(tail -n 5 "$real/out3.log" | tr '\n' ' ')"; fi
+    if grep -qF "$tmp/no-such-bundled-dir" "$real/out3.log"; then ok "the refusal names the searched bundled dir"; else bad "the refusal omits the searched path"; fi
+    if [ ! -e "$AGENT_MARKER" ]; then ok "nothing launched with no profile reachable (fail closed)"; else bad "an agent launched with no profile reachable"; fi
+
+    # C.4 — fails-first: the resolver reverted to the BARE name (the pre-r3
+    # shape). nono then has no profile in its own (empty) config dir and can
+    # only report "Profile not found" — and the probe fails, so the supervisor
+    # refuses although the profile IS present in the bundled dir.
+    seed
+    bare_out="$(XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$profiles_src" PATH="$real/bin:$PATH" "$real_nono" run --profile tps-office -- true 2>&1 || true)"
+    case "$bare_out" in *'Profile not found'*) ok "a bare name is unresolvable for nono (empty config dir): $(printf '%s' "$bare_out" | head -c 60)" ;; *) bad "a bare name still resolved — C.4 would prove nothing: $bare_out" ;; esac
+    rm -f "$AGENT_MARKER"
+    XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$profiles_src" \
+      PATH="$real/bin:$PATH" timeout 60 bash "$bare_sup" >"$real/out4.log" 2>&1; rc4r=$?
+    if [ "$rc4r" -ne 0 ]; then ok "fails-first: resolver reverted to the bare name → the C.1 setup now refuses (exit $rc4r)"; else bad "the bare-name supervisor still launched — the resolver control is untested"; fi
+    if [ ! -e "$AGENT_MARKER" ]; then ok "nothing launched with the resolver reverted"; else bad "an agent launched with the bare-name resolver"; fi
   fi
 fi
 

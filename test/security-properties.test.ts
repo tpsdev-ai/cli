@@ -44,8 +44,10 @@ describe("security properties regression checks", () => {
     const sh = src("docker/tps-office-supervisor.sh");
     expect(sh).toContain('user="agent-$id"');
     expect(sh).toContain('useradd -u "$uid" -g tps -m -s /bin/bash "$user"');
-    // Every agent launch goes through nono with the tps-office profile...
-    expect(sh).toContain("launch_args=(run --profile tps-office --name");
+    // Every agent launch goes through nono with the tps-office profile — since
+    // cli#352 r3 as the RESOLVED ABSOLUTE PATH (a bare name is unresolvable in
+    // the shipped image; see the profile-resolution tests below)...
+    expect(sh).toContain('launch_args=(run --profile "$NONO_PROFILE" --name');
     expect(sh).toContain("-- tps-agent start --id '$id' --config '$config_path'");
     // ...and the UID-only fallback (nono-less agent launch) is gone — fail closed.
     expect(sh).not.toContain("exec tps-agent start");
@@ -151,5 +153,57 @@ describe("supervisor ↔ CLI launch-path parity (cli#352 r)", () => {
     expect(sh).toContain('STATE_ROOT/identity/$id.key');
     expect(sh).toContain('STATE_ROOT/identity/$id.pub');
     expect(sh).toContain("launch_args+=(--read-file \"$k\")");
+  });
+});
+
+/**
+ * cli#352 r3 — Sherlock's blocker: the office image shipped no `tps-office`
+ * profile and the supervisor passed the BARE NAME, which nono resolves against
+ * its own config dir (never populated in the container), so the probe failed
+ * for the wrong reason and fail-closed refused every agent. These assertions
+ * are the coupling for the fix: the profile is resolved to an absolute path at
+ * both launch sites, the image ships it where the resolver looks, and docker.yml
+ * launches the BUILT image so a forgotten COPY cannot stay green.
+ */
+describe("supervisor profile resolution (cli#352 r3)", () => {
+  const sh = src("docker/tps-office-supervisor.sh");
+
+  test("no launch point passes a bare profile name", () => {
+    expect(sh).not.toContain("--profile tps-office");
+  });
+
+  test("both launch sites pass the resolved profile path", () => {
+    // One text form in the launch argv, one in the probe's su -c string.
+    const matches = sh.match(/--profile \\?"\$NONO_PROFILE\\?"/g) ?? [];
+    expect(matches.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("an unresolvable profile is a named refusal, never a bare name", () => {
+    expect(sh).toContain("profile file not found at");
+    expect(sh).toContain("nono is never given a bare profile name");
+  });
+
+  test("the resolver searches the user dir then the bundled dir (resolveProfilePath's order)", () => {
+    const userIdx = sh.indexOf("/.config/nono/profiles/$name.json");
+    const bundledIdx = sh.indexOf("$BUNDLED_PROFILES_DIR/$name.json");
+    expect(userIdx).toBeGreaterThan(-1);
+    expect(bundledIdx).toBeGreaterThan(-1);
+    expect(userIdx).toBeLessThan(bundledIdx);
+  });
+
+  test("the bundled candidate defaults to the image's COPY destination", () => {
+    expect(sh).toContain('BUNDLED_PROFILES_DIR="${TPS_NONO_PROFILES_DIR:-/usr/local/share/tps/nono-profiles}"');
+  });
+
+  test("the office image ships the profiles at that path", () => {
+    expect(src("docker/Dockerfile")).toContain(
+      "COPY packages/cli/nono-profiles/ /usr/local/share/tps/nono-profiles",
+    );
+  });
+
+  test("docker.yml runs the built image against the bundled profile", () => {
+    const yml = src(".github/workflows/docker.yml");
+    expect(yml).toContain("/usr/local/share/tps/nono-profiles/tps-office.json");
+    expect(yml).toContain("tps-office-supervisor");
   });
 });

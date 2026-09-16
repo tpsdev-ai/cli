@@ -42,6 +42,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
+# The TPS nono profiles, at the path docker/tps-office-supervisor.sh resolves the
+# BUNDLED candidate from (cli#352 r3). Without them the image ships a bare-name
+# launch nono cannot resolve — installNonoProfiles() runs only from `tps identity
+# init`, which this container never runs — so the Landlock probe failed for the
+# wrong reason (profile not found) and fail-closed refused EVERY office agent.
+# The supervisor passes this absolute path to nono at both launch sites; the
+# agent uid reads the file, so the COPY modes (644/755) must stay world-readable.
+COPY packages/cli/nono-profiles/ /usr/local/share/tps/nono-profiles
 WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
 # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint

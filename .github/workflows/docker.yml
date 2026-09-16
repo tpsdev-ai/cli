@@ -89,6 +89,61 @@ jobs:
           docker run --rm --entrypoint sh tps-office-verify:latest -c 'test -f /usr/local/bin/nono && test ! -L /usr/local/bin/nono'
           rm -f ./nono-from-image
 
+      # cli#352 r3 — the ship-red control (S1b/S4 "harness green, ship red"
+      # class). The byte smoke above proves the binary's BYTES; this proves the
+      # IMAGE can actually run an office agent. It runs the built image itself
+      # with a one-agent fixture roster and asserts: (1) the bundled profiles
+      # exist in the image at the path the supervisor resolves (a Dockerfile
+      # that forgets the COPY is red), (2) nono loads tps-office BY PATH there
+      # and the sandbox engages (exit 0), (3) the supervisor's Landlock probe
+      # passes end to end — the fixture agent is really launched under nono and
+      # leaves its marker. No profile override is passed, so the assertion
+      # cannot be satisfied by the harness supplying the profiles.
+      - name: Launch control — the built image resolves its profile and launches an agent
+        run: |
+          set -eux
+          fx="$RUNNER_TEMP/office-smoke"
+          rm -rf "$fx"; mkdir -p "$fx/.tps/identity" "$fx/smoke/bin"
+          printf '[{"id":"smoke","configPath":"/workspace/smoke/agent.yaml"}]\n' >"$fx/.tps/team.json"
+          printf 'agentId: smoke\nname: smoke\nworkspace: /workspace/smoke\nmailDir: /workspace/smoke/mail\nllm:\n  provider: ollama\n  model: x\n' >"$fx/smoke/agent.yaml"
+          printf 'KEY' >"$fx/.tps/identity/smoke.key"
+          printf 'PUB' >"$fx/.tps/identity/smoke.pub"
+          # Stand-in for tps-agent: the npm-published agent predates the `check`
+          # pre-flight the supervisor calls, and what is under test here is the
+          # supervisor's launch path, not the published agent. `start` leaves a
+          # marker the in-container script waits for.
+          cat >"$fx/smoke/bin/tps-agent" <<'AGENT'
+          #!/usr/bin/env bash
+          case "${1:-}" in
+            check) exit 0 ;;
+            start) printf 'AGENT-UP\n' >>/workspace/smoke/.marker; sleep 5 ;;
+            *) echo "fixture tps-agent: unsupported $1" >&2; exit 2 ;;
+          esac
+          AGENT
+          chmod +x "$fx/smoke/bin/tps-agent"
+          cat >"$fx/.smoke.sh" <<'SMOKE'
+          set -eux
+          # (1) the profiles the supervisor resolves are IN the image
+          test -f /usr/local/share/tps/nono-profiles/tps-office.json
+          test -f /usr/local/share/tps/nono-profiles/tps-base.json
+          # (2) nono loads tps-office BY PATH and the sandbox engages
+          nono run --profile /usr/local/share/tps/nono-profiles/tps-office.json -- true
+          # (3) the supervisor resolves its own default bundled path and its
+          #     Landlock probe passes: the fixture agent launches under nono
+          mkdir -p /run/secrets && touch /run/secrets/.ready
+          PATH=/workspace/smoke/bin:$PATH tps-office-supervisor >/tmp/sup.log 2>&1 &
+          sup=$!
+          for _ in $(seq 1 60); do
+            [ -f /workspace/smoke/.marker ] && break
+            kill -0 "$sup" 2>/dev/null || break
+            sleep 1
+          done
+          if [ ! -f /workspace/smoke/.marker ]; then cat /tmp/sup.log; exit 1; fi
+          echo "✅ office image: profile resolved by path, nono engaged, supervisor probe launched the agent"
+          SMOKE
+          chmod +x "$fx/.smoke.sh"
+          docker run --rm -v "$fx:/workspace" --entrypoint /bin/bash tps-office-verify:latest /workspace/.smoke.sh
+
       - name: Build and push
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
