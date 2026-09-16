@@ -193,11 +193,22 @@ async function enforceLaunchControlOrExit(): Promise<void> {
   // bounded — for `CONFINED <session> <this pid>`), while the gate stays pure.
   // Nothing this process can observe about itself is proof; the launcher's view
   // from OUTSIDE the sandbox is.
+  //
+  // cli#350 r4f — attest whenever a LAUNCHER launched this process, keyed on the
+  // locator (set by the launcher and only by it), NEVER on the TTY: the launcher
+  // requires the release on every launch, so a TTY child that skipped the
+  // handshake made every interactive `tps agent start` refuse with
+  // `no released child within …`. A human who types `--sandboxed` at a terminal
+  // carries no locator, so confinement stays undefined and rule 1b refuses it.
   let confinement: { released: boolean; reason?: string } | undefined;
-  if (process.argv.includes(SANDBOXED_FLAG) && !isInteractiveTty()) {
-    const { attestConfinement } = await import("../src/utils/launch-attestation.js");
-    const attestation = await attestConfinement();
-    confinement = { released: attestation.ok, reason: attestation.reason };
+  if (process.argv.includes(SANDBOXED_FLAG)) {
+    const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
+      "../src/utils/launch-attestation.js"
+    );
+    if (process.env[LAUNCH_SOCK_ENV]) {
+      const attestation = await attestConfinement();
+      confinement = { released: attestation.ok, reason: attestation.reason };
+    }
   }
   enforceLaunchControl({ command, rest, argv: process.argv, confinement });
   if (process.argv.includes(NO_SANDBOX_FLAG) && isInteractiveTty()) {

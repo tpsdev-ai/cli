@@ -468,7 +468,9 @@ describe("4e fixtures — `--sandboxed` without a launcher socket", () => {
       const text = out(r);
       expect(text).toContain(SANDBOXED_FLAG);
       expect(text).toContain("no launcher released this process");
-      expect(text).toContain(LAUNCH_SOCK_ENV);
+      // r4f: the child no longer calls attestConfinement without a locator, so
+      // the refusal is the gate's (it still names the launcher).
+      expect(text).toContain("no launcher socket is in reach");
       expect(r.status).toBe(78);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
@@ -917,6 +919,191 @@ describe("4e — the private dir is removed on every path", () => {
       expect(existsSync(dir.stateDir)).toBe(true);
       removePrivateLaunchDir(dir);
       expect(existsSync(dir.root)).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli#350 r4f — the TTY changes nothing: the child attests whenever a LAUNCHER
+// started it (keyed on the locator), and an un-released `--sandboxed` is refused
+// at a TTY too. Before r4f the child skipped the handshake at a TTY while the
+// launcher always waited for it, so every interactive `tps agent start` refused
+// with `no released child within …` — green only because every fixture was
+// non-TTY. These fixtures give the parent a real PTY.
+// ---------------------------------------------------------------------------
+
+/** `script(1)` — util-linux (Linux) or BSD (macOS). Absent ⇒ the TTY fixtures
+ * skip; they are coverage for the shape, not the control itself. */
+function hasScript(): boolean {
+  return Boolean(
+    spawnSync("sh", ["-c", "command -v script"], { encoding: "utf-8" }).stdout?.trim()
+  );
+}
+
+/** The `script` argv for a command string, per platform. */
+function scriptArgv(cmd: string): string[] {
+  return process.platform === "darwin"
+    ? ["-q", "/dev/null", "sh", "-c", cmd]
+    : ["-qec", cmd, "/dev/null"];
+}
+
+const shq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
+/** Run the WHOLE CLI under a PTY. The launcher spawns nono with inherited stdio,
+ * so the re-exec child keeps the terminal — exactly the shape Sherlock
+ * reproduced (`isInteractiveTty=true => wouldSkipAttestation=true` before r4f). */
+function runLauncherTty(
+  sb: Sandbox,
+  args: string[],
+  extra: Record<string, string | undefined> = {}
+) {
+  const cmd = [NODE, TPS_BIN, ...args].map(shq).join(" ");
+  return spawnSync("script", scriptArgv(cmd), {
+    encoding: "utf-8",
+    cwd: sb.ws,
+    timeout: 30_000,
+    env: cliEnv(sb, extra),
+  });
+}
+
+/** A fake nono that "confines": it denies the child the OUTSIDE canary the way
+ * the profile does (chmod — the launcher read it BEFORE the spawn), keeps the
+ * child's STDIN on the terminal (a bare `&` sends it to /dev/null, hiding the
+ * TTY this fixture exists to exercise), and serves a `ps` store bound to the
+ * pids it really spawned. */
+const CONFINING_FAKE_NONO = `#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+log="\${FAKE_NONO_LOG:?}"
+printf '%s\\n' "ARGV $*" >> "$log"
+if [ "\${1:-}" = "ps" ]; then
+  if [ -n "\${FAKE_NONO_PS_JSON:-}" ] && [ -f "\${FAKE_NONO_PS_JSON}" ]; then cat "\${FAKE_NONO_PS_JSON}"; else echo "[]"; fi
+  exit 0
+fi
+if [ "\${1:-}" = "run" ]; then
+  cmd=(); seen=0
+  for a in "$@"; do if [ "$seen" = 1 ]; then cmd+=("$a"); fi; if [ "$a" = "--" ]; then seen=1; fi; done
+  if [ -n "\${TPS_LAUNCH_SOCK:-}" ]; then
+    priv="$(dirname "$(dirname "$TPS_LAUNCH_SOCK")")"
+    [ -f "$priv/canary-outside" ] && chmod 000 "$priv/canary-outside"
+  fi
+  if [ -e /dev/tty ]; then "\${cmd[@]}" </dev/tty & else "\${cmd[@]}" & fi
+  child=$!
+  echo "CHILD $child SUP $$" >> "$log"
+  prof=""; args=("$@"); i=0
+  for ((i=0; i<\${#args[@]}; i++)); do [ "\${args[$i]}" = "--profile" ] && prof="\${args[$((i+1))]}"; done
+  printf '[{"session_id":"ttyfixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n' "$$" "$child" "$prof" > "\${FAKE_NONO_PS_JSON:?}"
+  if [ -n "\${FAKE_NONO_STOP:-}" ]; then
+    while [ ! -f "\$FAKE_NONO_STOP" ]; do sleep 0.05; done
+    kill -TERM "$child" 2>/dev/null || true
+  fi
+  wait "$child"; exit $?
+fi
+exit 0
+`;
+
+const tty = hasScript() ? describe : describe.skip;
+
+tty("4e+r4f — a TTY parent changes nothing", () => {
+  test("a TTY-parent launch is RELEASED: the child attests on the locator, not the TTY", () => {
+    const sb = makeSandbox("tty-release");
+    const toucher = spawn(
+      process.execPath,
+      [
+        "-e",
+        `setTimeout(() => { try { require("node:fs").writeFileSync(${JSON.stringify(
+          join(sb.root, "stop")
+        )}, "x"); } catch {} }, 4000);`,
+      ],
+      { stdio: "ignore" }
+    );
+    try {
+      const bin = writeFakeNono(sb, CONFINING_FAKE_NONO);
+      const r = runLauncherTty(sb, ["agent", "start", "--id", "probe", SANDBOX_REQUIRED_FLAG], {
+        [NONO_BIN_ENV]: bin,
+        FAKE_NONO_PS_JSON: join(sb.root, "ps.json"),
+        FAKE_NONO_STOP: join(sb.root, "stop"),
+      });
+      const text = out(r);
+      // The pre-r4f child would have skipped the handshake here and the
+      // launcher would have refused at its window. It must instead be released.
+      expect(text).toContain("released under nono session");
+      expect(text).not.toContain("no released child within");
+      expect(text).not.toContain("READ the OUTSIDE canary");
+    } finally {
+      toucher.kill();
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a TTY caller with --sandboxed and NO launcher socket is refused (exit 78)", () => {
+    const sb = makeSandbox("tty-refuse");
+    try {
+      const r = runLauncherTty(sb, [
+        "agent",
+        "start",
+        "--id",
+        "probe",
+        SANDBOX_REQUIRED_FLAG,
+        SANDBOXED_FLAG,
+      ]);
+      const text = out(r);
+      expect(text).toContain(SANDBOXED_FLAG);
+      expect(text).toContain("no launcher released this process");
+      expect(text).toContain("no launcher socket is in reach");
+      expect(r.status).toBe(78);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});
+
+tty("4e+r4f FAILS-FIRST — the pre-r4f child shape times out under a TTY parent", () => {
+  test("attest-only-when-non-TTY → `no released child within` (the exact symptom)", () => {
+    const sb = makeSandbox("fails-first-tty");
+    try {
+      const bin = writeFakeNono(sb, CONFINING_FAKE_NONO);
+      // A stand-in for the PRE-r4f child (bin/tps.ts:197 before the fix): it
+      // attests only when NOT a TTY, and stays alive like the runtime would.
+      const standin = join(sb.root, "standin-child.mjs");
+      writeFileSync(
+        standin,
+        `const { isInteractiveTty } = await import(${JSON.stringify(
+          resolve(import.meta.dir, "../dist/src/utils/nono.js")
+        )});\n` +
+          "if (isInteractiveTty()) { await new Promise((r) => setTimeout(r, 9000)); process.exit(0); }\n" +
+          "process.exit(3);\n"
+      );
+      // A driver that plays the launcher IN PROCESS (under the PTY) against the
+      // stand-in child, so the TTY reaches the child through nono's inherited
+      // stdio exactly as it does for the shipped launcher.
+      const driver = join(sb.root, "driver.mjs");
+      writeFileSync(
+        driver,
+        `import { launchAttested } from ${JSON.stringify(
+          resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js")
+        )};\n` +
+          "const ws = process.env.DRIVER_WS;\n" +
+          'const code = await launchAttested("tps-agent-run", { workdir: ws, read: [], readFiles: [], allow: [ws] }, [process.execPath, process.env.DRIVER_CHILD]);\n' +
+          "process.exit(typeof code === \"number\" ? code : 1);\n"
+      );
+      const r = spawnSync("script", scriptArgv(`${shq(NODE)} ${shq(driver)}`), {
+        encoding: "utf-8",
+        cwd: sb.ws,
+        timeout: 20_000,
+        env: cliEnv(sb, {
+          [NONO_BIN_ENV]: bin,
+          [TIMEOUT_ENV]: "1500",
+          FAKE_NONO_PS_JSON: join(sb.root, "ps.json"),
+          DRIVER_WS: sb.ws,
+          DRIVER_CHILD: standin,
+        }),
+      });
+      const text = out(r);
+      console.error("[fails-first TTY stderr]", text.trim().split("\n").slice(-3).join(" | "));
+      expect(text).toContain("no released child within");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

@@ -230,3 +230,77 @@ describe("4e positive — the fake-path fixtures never run here", () => {
     expect(typeof NONO === "string" || NONO === null).toBe(true);
   });
 });
+
+/** `script(1)` — util-linux (Linux) or BSD (macOS). The Docker lane is Linux;
+ * this file skips entirely in the unit lane without a pinned nono. */
+function hasScript(): boolean {
+  return Boolean(
+    spawnSync("sh", ["-c", "command -v script"], { encoding: "utf-8" }).stdout?.trim()
+  );
+}
+
+real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
+  test("script(1) gives the launch a PTY; real nono keeps it and the child attests anyway", async () => {
+    if (!hasScript()) {
+      console.error("[skip] no script(1) on this host");
+      return;
+    }
+    const sb = sandbox();
+    const shq = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
+    const cmd = [NODE, TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED]
+      .map(shq)
+      .join(" ");
+    const argv =
+      process.platform === "darwin"
+        ? ["-q", "/dev/null", "sh", "-c", cmd]
+        : ["-qec", cmd, "/dev/null"];
+    const child = spawn("script", argv, {
+      cwd: sb.ws,
+      env: {
+        ...process.env,
+        HOME: sb.home,
+        NONO_BIN: NONO!,
+        TPS_LAUNCH_TIMEOUT_MS: "20000",
+      },
+    });
+    let text = "";
+    const released = await new Promise<boolean>((resolvePromise) => {
+      const timer = setTimeout(() => resolvePromise(false), 60_000);
+      const onData = (chunk: Buffer) => {
+        text += chunk.toString("utf-8");
+        if (text.includes("released under nono session")) {
+          clearTimeout(timer);
+          resolvePromise(true);
+        }
+      };
+      child.stdout?.on("data", onData);
+      child.stderr?.on("data", onData);
+      child.on("exit", () => {
+        clearTimeout(timer);
+        resolvePromise(text.includes("released under nono session"));
+      });
+    });
+    // Stop the tree: the released agent is long-lived.
+    const pidFile = join(sb.ws, ".tps-agent.pid");
+    if (existsSync(pidFile)) {
+      try {
+        process.kill(Number.parseInt(readFileSync(pidFile, "utf-8").trim(), 10), "SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    }
+    child.kill("SIGTERM");
+    await new Promise((r) => setTimeout(r, 500));
+    child.kill("SIGKILL");
+    try {
+      // Pre-r4f the child skipped the handshake at a TTY and the launcher
+      // refused at its window; with the locator keyed instead of the TTY, the
+      // interactive path is RELEASED like the piped one.
+      expect(released).toBe(true);
+      expect(text).toContain("released under nono session");
+      expect(text).not.toContain("no released child within");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});

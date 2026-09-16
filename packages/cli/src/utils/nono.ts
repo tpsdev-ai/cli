@@ -23,7 +23,10 @@
  *     silently running unsandboxed. See `evaluateLaunchControl`.
  *   - Under `--sandboxed` the child must hold the launcher's release for a live
  *     nono session bound to its own pid (cli#350 round 4e): see
- *     `launch-attestation.ts`.
+ *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
+ *     never "trust me": it is refused everywhere without that release, TTY or
+ *     not (cli#350 r4f). The interactive opt-out stays `--no-sandbox` (with its
+ *     warning).
  *
  * Profile locations (searched in order):
  *   1. ~/.config/nono/profiles/<name>.json
@@ -551,8 +554,10 @@ export const NO_SANDBOX_FLAG = "--no-sandbox";
  * The launcher's private "I am already inside a nono session the launcher
  * started" assertion. Honoured only when the process HOLDS THE LAUNCHER'S
  * RELEASE for a live nono session bound to its own pid (`launch-attestation.ts`,
- * cli#350 round 4e); a non-TTY caller that types the flag — or plants a marker,
- * shadows `ps`, or names itself `nono` — is refused like `--no-sandbox`. The
+ * cli#350 round 4e); a caller that types the flag — TTY or not — or plants a
+ * marker, shadows `ps`, or names itself `nono`, is refused like `--no-sandbox`.
+ * It is an INTERNAL flag: it means "I was released by my launcher", never
+ * "trust me" (cli#350 r4f); the interactive opt-out stays `--no-sandbox`. The
  * marker / parent check are HINTS only, never proof.
  */
 export const SANDBOXED_FLAG = "--sandboxed";
@@ -695,8 +700,10 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
 
   // (1b) --sandboxed claims "already inside nono". Honour it only when the
   // LAUNCHER released this process (a live nono session bound to the pid it
-  // spawned and to this pid, with enforcement verified behaviourally).
-  if (argv.includes(SANDBOXED_FLAG) && !tty && !(input.confinement?.released ?? false)) {
+  // spawned and to this pid, with enforcement verified behaviourally). The TTY
+  // is irrelevant (cli#350 r4f): an un-released `--sandboxed` is refused
+  // everywhere, because the interactive opt-out is `--no-sandbox`.
+  if (argv.includes(SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
     const hint = nonoLaunchHint();
     return deny(
       `${SANDBOXED_FLAG} is refused: no launcher released this process` +
