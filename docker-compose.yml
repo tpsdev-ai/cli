@@ -21,6 +21,25 @@ services:
     tmpfs:
       - /tmp:exec,size=64M
 
+  # cli#350 round 4e — the POSITIVE, as a NON-ROOT user, against the real
+  # S4-pinned nono that CI mounts at /usr/local/bin/nono (NONO_BIN). The fixture
+  # skips itself when no real nono is reachable, so this service is only
+  # meaningful with the mount — which is exactly how the Docker Integration job
+  # runs it.
+  attested:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: bun test packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts
+    user: tps
+    working_dir: /app
+    environment:
+      - HOME=/home/tps
+      - NONO_BIN=/usr/local/bin/nono
+      - TPS_TEST_MODE=docker
+    tmpfs:
+      - /tmp:exec,size=64M
+
   office:
     build:
       context: .

@@ -13,6 +13,21 @@
  * FAILURE — the run stops (EX_CONFIG). There is no warn-and-continue path for
  * an unloadable sandbox.
  *
+ * Launch-path control (cli#341 S1a) — fail-closed, no env escape hatch:
+ *   - The old `TPS_FORCE_NO_NONO` environment bypass is GONE. No environment
+ *     variable can make the launcher forget that nono exists.
+ *   - `--no-sandbox` (the only human escape hatch) is honoured ONLY from an
+ *     interactive TTY (stdin AND stdout). Anywhere else it is refused.
+ *   - A non-interactive invocation that launches an agent MUST carry
+ *     `--sandbox-required`; a launcher that dropped it is refused rather than
+ *     silently running unsandboxed. See `evaluateLaunchControl`.
+ *   - Under `--sandboxed` the child must hold the launcher's release for a live
+ *     nono session bound to its own pid (cli#350 round 4e): see
+ *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
+ *     never "trust me": it is refused everywhere without that release, TTY or
+ *     not (cli#350 r4f). The interactive opt-out stays `--no-sandbox` (with its
+ *     warning).
+ *
  * Profile locations (searched in order):
  *   1. ~/.config/nono/profiles/<name>.json
  *   2. <tps-install-dir>/nono-profiles/<name>.json
@@ -25,7 +40,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -64,7 +79,6 @@ export interface NonoOptions {
  * Find the nono binary on PATH. Returns the resolved path or null.
  */
 export function findNono(): string | null {
-  if (process.env.TPS_FORCE_NO_NONO === "1") return null;
   const result = spawnSync("which", ["nono"], {
     encoding: "utf-8",
     env: process.env, // explicitly pass so PATH mutations in tests are respected
@@ -97,8 +111,8 @@ export const EX_CONFIG = 78;
  * Resolve a profile name to a JSON file on disk, or null.
  * Searches ~/.config/nono/profiles/ then the bundled nono-profiles/ directory.
  */
-export function resolveProfilePath(name: string): string | null {
-  const home = process.env.HOME || homedir() || "/tmp";
+export function resolveProfilePath(name: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const home = env.HOME || homedir() || "/tmp";
   const candidates = [
     join(home, ".config", "nono", "profiles", `${name}.json`),
     join(findBundledProfilesDir(), `${name}.json`),
@@ -145,8 +159,12 @@ export interface ProfileCheck {
  * `bin` is injectable for tests; pass null to check existence only (used when
  * nono is absent and the caller's nono policy handles that separately).
  */
-export function checkProfileLoadable(name: string, bin: string | null = findNono()): ProfileCheck {
-  const path = resolveProfilePath(name);
+export function checkProfileLoadable(
+  name: string,
+  bin: string | null = findNono(),
+  env: NodeJS.ProcessEnv = process.env
+): ProfileCheck {
+  const path = resolveProfilePath(name, env);
   if (!path) {
     return {
       ok: false,
@@ -168,7 +186,7 @@ export function checkProfileLoadable(name: string, bin: string | null = findNono
 
   const validate = spawnSync(bin, ["profile", "validate", "--strict", path], {
     encoding: "utf-8",
-    env: process.env,
+    env,
   });
   if (validate.status !== 0) {
     const detail = `${validate.stdout ?? ""}${validate.stderr ?? ""}`
@@ -258,14 +276,15 @@ export function harnessReadFiles(agentId?: string): string[] {
 export function buildNonoArgs(
   profile: NonoProfile,
   options: NonoOptions,
-  cmd: string[]
+  cmd: string[],
+  env: NodeJS.ProcessEnv = process.env
 ): string[] {
   // Pass the RESOLVED path, not the bare name (cli#351 r2, MEDIUM 3).
   // checkProfileLoadable validates resolveProfilePath(name) (user dir, then
   // bundled), but nono resolves a bare name against its own search path
   // (the user dir). Passing the path makes what we validate the artifact that
   // actually runs.
-  const profilePath = resolveProfilePath(profile) ?? profile;
+  const profilePath = resolveProfilePath(profile, env) ?? profile;
   const args = ["run", "--profile", profilePath, "--allow-cwd"];
 
   if (options.workdir) {
@@ -515,4 +534,213 @@ export function installNonoProfiles(targetDir?: string, silent?: boolean): void 
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Launch-path sandbox control (cli#341 S1a)
+// ---------------------------------------------------------------------------
+//
+// This is the control that decides whether a *launcher* is allowed to start an
+// agent, and under what isolation. It is deliberately small and dependency-free
+// so it can be unit tested with injected TTY/supervisor state.
+
+/** Asserted by every generated unit that launches an agent. */
+export const SANDBOX_REQUIRED_FLAG = "--sandbox-required";
+
+/** The only human escape hatch. Interactive TTY only. */
+export const NO_SANDBOX_FLAG = "--no-sandbox";
+
+/**
+ * The launcher's private "I am already inside a nono session the launcher
+ * started" assertion. Honoured only when the process HOLDS THE LAUNCHER'S
+ * RELEASE for a live nono session bound to its own pid (`launch-attestation.ts`,
+ * cli#350 round 4e); a caller that types the flag — TTY or not — or plants a
+ * marker, shadows `ps`, or names itself `nono`, is refused like `--no-sandbox`.
+ * It is an INTERNAL flag: it means "I was released by my launcher", never
+ * "trust me" (cli#350 r4f); the interactive opt-out stays `--no-sandbox`. The
+ * marker / parent check are HINTS only, never proof.
+ */
+export const SANDBOXED_FLAG = "--sandboxed";
+
+/** Hint nono sets for its own child (nono >= 0.7x). Never used as proof. */
+export const NONO_CHILD_ENV = "NONO_CAP_FILE";
+
+/**
+ * Set by generated units (launchd/systemd) in their environment. A refusal then
+ * exits 0 instead of 78 — see the KeepAlive coupling note below.
+ */
+export const SUPERVISED_ENV = "TPS_SUPERVISED";
+
+/** Exit code for a refusal when NOT running under a supervisor (sysexits: EX_CONFIG). */
+export const REFUSAL_EXIT_CODE = 78;
+
+/**
+ * KeepAlive coupling (measured, Sherlock):
+ *   - `{Crashed:true}` restarts only on *signal* death — `exit 78` gives 1 launch.
+ *   - `{SuccessfulExit:false}` + `exit 78` gives 13 relaunches in 12 s.
+ * Generated agent units therefore pair `{SuccessfulExit:false}` with "the
+ * launcher logs the refusal and exits 0" (`${SUPERVISED_ENV}=1`). A refusal is a
+ * clean exit 0 → no relaunch storm; a genuine crash is non-zero/signal → relaunch.
+ */
+export const SUPERVISED_REFUSAL_EXIT_CODE = 0;
+
+/** `--quiet-nono-check` (renamed from `--nonono`): only skips the loud check. */
+export const QUIET_NONO_CHECK_FLAG = "--quiet-nono-check";
+/** Deprecated hidden alias, kept for one release. */
+export const LEGACY_NONONO_FLAG = "--nonono";
+
+export function isInteractiveTty(
+  stdin: { isTTY?: boolean } = process.stdin,
+  stdout: { isTTY?: boolean } = process.stdout
+): boolean {
+  // Both ends must be a terminal: a piped stdin with a TTY stdout (or vice
+  // versa) is scripted, not a human at the keyboard.
+  return Boolean(stdin?.isTTY && stdout?.isTTY);
+}
+
+export function isSupervised(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[SUPERVISED_ENV] === "1";
+}
+
+/**
+ * HINT ONLY — never proof. The marker nono sets (any non-empty value is
+ * forgeable by the caller) or a parent literally named nono (also forgeable:
+ * `exec -a nono …`, or a shadowed `ps`). Used only for refusal wording.
+ * Hardened where cheap: absolute `/bin/ps` and an exact comm match (no PATH
+ * resolution, no substring).
+ */
+export function nonoLaunchHint(
+  env: NodeJS.ProcessEnv = process.env,
+  ppid: number = process.ppid
+): boolean {
+  if (env[NONO_CHILD_ENV]) return true;
+  try {
+    if (readFileSync(`/proc/${ppid}/comm`, "utf-8").trim() === "nono") return true;
+  } catch {
+    // not Linux, or /proc unreadable — fall back to ps
+  }
+  const ps = spawnSync("/bin/ps", ["-o", "comm=", "-p", String(ppid)], { encoding: "utf-8" });
+  return (ps.stdout ?? "").trim() === "nono";
+}
+
+/**
+ * PROOF OF CONFINEMENT is the LAUNCHER's, verified from outside the sandbox
+ * (cli#350 round 4e). The child cannot attest its own confinement: nono 0.74.0
+ * exposes no in-sandbox validation and strips inherited fds, and every
+ * in-process signal (a marker, a parent's name, a denied filesystem write) is
+ * either forgeable or absent on the plain launch. Under `--sandboxed` the
+ * child therefore holds the launcher's release, over a launcher-owned unix
+ * socket, for a LIVE nono session bound to the pid the launcher spawned AND to
+ * the pid this process reports. `attestConfinement()` in
+ * `launch-attestation.ts` performs that handshake; the gate only consumes the
+ * verdict.
+ */
+export interface ConfinementVerdict {
+  released: boolean;
+  /** Why the release is absent (used in the refusal wording). */
+  reason?: string;
+}
+
+/**
+ * Commands that hand control to an agent. These are exactly the commands that
+ * generated units invoke, and the ones that must assert `--sandbox-required`
+ * when there is no TTY to ask.
+ */
+export function launchesAgent(command: string | undefined, rest: readonly string[] = []): boolean {
+  const sub = rest[0];
+  if (command === "agent") return sub === "start";
+  if (command === "mail") return sub === "watch";
+  if (command === "office") return sub === "connect";
+  return false;
+}
+
+export interface LaunchControlInput {
+  /** Top-level command word (argv[2]). */
+  command?: string;
+  /** Remaining words after the command. */
+  rest?: readonly string[];
+  /** Full argv (defaults to process.argv). */
+  argv?: readonly string[];
+  /** Override TTY detection (tests). */
+  interactiveTty?: boolean;
+  /** Override supervisor detection (tests). */
+  supervised?: boolean;
+  /** The launcher's release verdict (see `launch-attestation.ts`). Absent when
+   * this process never asked — anything but a release is a refusal. */
+  confinement?: ConfinementVerdict;
+}
+
+export interface LaunchControlResult {
+  allowed: boolean;
+  /** Human-readable refusal naming the flag and the reason. */
+  refusal?: string;
+  /** Process exit code to use for the refusal (0 when supervised). */
+  refusalExitCode: number;
+}
+
+/**
+ * Pure decision function for the launch-path control. Never touches the
+ * process; the caller applies the result.
+ */
+export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchControlResult {
+  const argv = input.argv ?? process.argv;
+  const tty = input.interactiveTty ?? isInteractiveTty();
+  const supervised = input.supervised ?? isSupervised();
+  const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
+  const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
+
+  // (1) --no-sandbox is honoured only from an interactive TTY.
+  if (argv.includes(NO_SANDBOX_FLAG) && !tty) {
+    return deny(
+      `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
+        "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
+        "so the agent must launch under nono. Remove the flag, or run it yourself in a terminal.",
+    );
+  }
+
+  // (1b) --sandboxed claims "already inside nono". Honour it only when the
+  // LAUNCHER released this process (a live nono session bound to the pid it
+  // spawned and to this pid, with enforcement verified behaviourally). The TTY
+  // is irrelevant (cli#350 r4f): an un-released `--sandboxed` is refused
+  // everywhere, because the interactive opt-out is `--no-sandbox`.
+  if (argv.includes(SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
+    const hint = nonoLaunchHint();
+    return deny(
+      `${SANDBOXED_FLAG} is refused: no launcher released this process` +
+        (input.confinement?.reason ? ` (${input.confinement.reason})` : "") +
+        ". `" +
+        SANDBOXED_FLAG +
+        "` is a claim that a launcher holds a live nono session bound to this pid; nothing " +
+        "in this process can establish that for itself, and " +
+        (hint
+          ? "the nono marker/parent hint is present but is not proof. "
+          : "no launcher socket is in reach. ") +
+        "Only a launch through the launcher — which starts nono itself, verifies it from " +
+        "outside, and releases the child over its own socket — may assert it.",
+    );
+  }
+
+  // (2) Non-interactive agent launch must assert --sandbox-required.
+  if (launchesAgent(input.command, input.rest) && !tty && !argv.includes(SANDBOX_REQUIRED_FLAG)) {
+    const sub = input.rest?.[0] ?? "";
+    return deny(
+      `${SANDBOX_REQUIRED_FLAG} is required: this non-interactive context is launching an agent ` +
+        `(\`${input.command} ${sub}\`) and the launcher did not assert it. A hand-edited plist, ` +
+        `a stale wrapper or a dropped argument would otherwise run the agent unsandboxed. ` +
+        `Refusing to launch.`,
+    );
+  }
+
+  return { allowed: true, refusalExitCode: 0 };
+}
+
+/**
+ * Apply `evaluateLaunchControl` to the current process: log and exit on refusal.
+ * Safe to call unconditionally at the top of the launcher.
+ */
+export function enforceLaunchControl(input: LaunchControlInput = {}): void {
+  const result = evaluateLaunchControl(input);
+  if (result.allowed || !result.refusal) return;
+  console.error(`❌ ${result.refusal}`);
+  process.exit(result.refusalExitCode);
 }

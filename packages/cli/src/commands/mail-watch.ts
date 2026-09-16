@@ -21,6 +21,7 @@ import { execSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getInbox } from "../utils/mail.js";
 import type { MailMessage } from "../utils/mail.js";
+import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -282,12 +283,17 @@ export function buildPlist(agent: string, tpsBin: string, extraHookArgs: string[
   const hookArgs = extraHookArgs.map((a) => `    <string>${xmlEscape(a)}</string>`).join("\n");
 
   // Build ProgramArguments array — escape paths too (handles spaces, &, etc.)
+  // `${SANDBOX_REQUIRED_FLAG}` is asserted here (cli#341 S1a): this unit launches
+  // an agent in a non-interactive context, so the launcher must be told — and a
+  // hand-edited plist that drops it is refused by the launcher instead of
+  // silently running the agent unsandboxed.
   const progArgs = [
     `    <string>${xmlEscape(process.execPath)}</string>`,
     `    <string>${xmlEscape(tpsBin)}</string>`,
     `    <string>mail</string>`,
     `    <string>watch</string>`,
     `    <string>${xmlEscape(agent)}</string>`,
+    `    <string>${SANDBOX_REQUIRED_FLAG}</string>`,
     ...(extraHookArgs.length ? [`    <string>--exec</string>`, hookArgs] : []),
   ].join("\n");
 
@@ -309,16 +315,28 @@ ${progArgs}
 
   <key>KeepAlive</key>
   <dict>
-    <key>Crashed</key>
-    <true/>
+    <key>SuccessfulExit</key>
+    <false/>
   </dict>
+
+  <!--
+    KEEPALIVE COUPLING (cli#341 S1a) — {SuccessfulExit:false} is load-bearing and
+    is ONLY correct together with "the launcher logs the refusal and exits 0":
+      * {Crashed:true} restarts only on *signal* death (a refusal's exit 78
+        gives ONE launch — measured).
+      * {SuccessfulExit:false} + exit 78 gives 13 relaunches in 12 s.
+    So the launcher exits 0 on a refusal (TPS_SUPERVISED=1 in EnvironmentVariables
+    below) → a refused unit goes quiet, while a genuine crash (non-zero/signal)
+    still relaunches. Do not change this key without changing that path.
+  -->
 
   <!--
     ProcessType=Background tells launchd this is a long-lived background daemon.
     Without it, the watcher's idle poll timer (waking every ~15s) gets the job
     power-classified as "inefficient" and macOS reaps it with a clean exit 0 —
-    which KeepAlive(Crashed:true) does NOT restart, so the agent goes silently
-    deaf. Background processing type opts the job out of that idle-reap. (ops-bayh)
+    which KeepAlive(SuccessfulExit:false) does NOT restart (exit 0 is "successful"),
+    so the agent goes silently deaf. Background processing type opts the job out of
+    that idle-reap. (ops-bayh)
   -->
   <key>ProcessType</key>
   <string>Background</string>
@@ -338,6 +356,9 @@ ${progArgs}
     <string>${xmlEscape(homedir())}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <!-- TPS_SUPERVISED=1 → a refusal logs and exits 0 (see KEEPALIVE COUPLING). -->
+    <key>TPS_SUPERVISED</key>
+    <string>1</string>
   </dict>
 </dict>
 </plist>

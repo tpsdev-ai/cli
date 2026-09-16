@@ -307,9 +307,15 @@ describe("buildPlist", () => {
     expect(xml).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>10<\/integer>/);
   });
 
-  it("keeps KeepAlive(Crashed:true) so a real crash still restarts", () => {
+  it("uses KeepAlive(SuccessfulExit:false) so a genuine crash still relaunches (cli#341 S1a)", () => {
     const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
-    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>\s*<key>Crashed<\/key>\s*<true\/>/);
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>\s*<key>SuccessfulExit<\/key>\s*<false\/>/);
+  });
+
+  it("asserts --sandbox-required and TPS_SUPERVISED on the agent-launching unit (cli#341 S1a)", () => {
+    const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
+    expect(xml).toContain("<string>--sandbox-required</string>");
+    expect(xml).toMatch(/<key>TPS_SUPERVISED<\/key>\s*<string>1<\/string>/);
   });
 
   it("generates plist that passes plutil -lint (valid XML, macOS only)", () => {
