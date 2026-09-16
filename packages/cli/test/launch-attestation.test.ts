@@ -1008,6 +1008,15 @@ const tty = hasScript() ? describe : describe.skip;
 
 tty("4e+r4f — a TTY parent changes nothing", () => {
   test("a TTY-parent launch is RELEASED: the child attests on the locator, not the TTY", () => {
+    if (process.getuid?.() === 0) {
+      // This fixture "confines" by chmod'ing the OUTSIDE canary, which root
+      // ignores — so it cannot run in the ROOT `docker compose run test`
+      // service. The Docker Integration lane runs this file as the NON-ROOT
+      // `tps` user in the `attested` service, which is where this case (and the
+      // real-nono TTY positive) is exercised in a container.
+      console.error("[skip] running as root: chmod cannot deny the fixture's OUTSIDE canary");
+      return;
+    }
     const sb = makeSandbox("tty-release");
     const toucher = spawn(
       process.execPath,
