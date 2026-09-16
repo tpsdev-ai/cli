@@ -102,8 +102,12 @@ jobs:
       - name: Launch control — the built image resolves its profile and launches an agent
         run: |
           set -eux
-          fx="$RUNNER_TEMP/office-smoke"
-          rm -rf "$fx"; mkdir -p "$fx/.tps/identity" "$fx/smoke/bin"
+          fx="$(mktemp -d "${RUNNER_TEMP:-/tmp}/office-smoke.XXXXXX")"
+          # mktemp makes the dir 0700; the sandboxed agent runs as its own uid and
+          # must still be able to traverse into its workspace, so widen the mount
+          # root (nothing secret lives here — it is a smoke fixture).
+          chmod 755 "$fx"
+          mkdir -p "$fx/.tps/identity" "$fx/smoke/bin"
           printf '[{"id":"smoke","configPath":"/workspace/smoke/agent.yaml"}]\n' >"$fx/.tps/team.json"
           printf 'agentId: smoke\nname: smoke\nworkspace: /workspace/smoke\nmailDir: /workspace/smoke/mail\nllm:\n  provider: ollama\n  model: x\n' >"$fx/smoke/agent.yaml"
           printf 'KEY' >"$fx/.tps/identity/smoke.key"

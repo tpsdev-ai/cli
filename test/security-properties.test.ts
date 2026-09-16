@@ -195,6 +195,14 @@ describe("supervisor profile resolution (cli#352 r3)", () => {
     expect(sh).toContain('BUNDLED_PROFILES_DIR="${TPS_NONO_PROFILES_DIR:-/usr/local/share/tps/nono-profiles}"');
   });
 
+  test("the launch runs the agent with a HOME the agent owns", () => {
+    // `su -m` preserves the environment we need (PATH, SBOX_ENV) but must not
+    // hand the agent the supervisor's HOME: /root in the image, where nono cannot
+    // create its session/audit state root.
+    expect(sh).toContain('AGENT_HOME="/home/$user"');
+    expect(sh).toContain("HOME='$AGENT_HOME' exec nono");
+  });
+
   test("the office image ships the profiles at that path", () => {
     expect(src("docker/Dockerfile")).toContain(
       "COPY packages/cli/nono-profiles/ /usr/local/share/tps/nono-profiles",

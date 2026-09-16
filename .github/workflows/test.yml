@@ -114,11 +114,14 @@ jobs:
         # Builds the image once (above), then runs the behavioural halves — fake
         # nono logging argv; nono-absent → exit non-zero, no agent started;
         # refusal with an earlier agent running → no orphan; traversal/mismatch
-        # roster ids refused; and under the REAL pinned nono: the probe passes,
-        # an agent launches with sandboxChildEnv()'s exports, its git ls-remote
-        # exits 0, `nono ps` binds the session to the supervisor's child, and
-        # reverting tps-base's /dev/null allow makes the supervisor refuse
-        # everything (cli#352 r).
+        # roster ids refused; and under the REAL pinned nono: the profile is
+        # resolved from the bundled dir with XDG_CONFIG_HOME empty, the probe
+        # passes, an agent launches with sandboxChildEnv()'s exports and a HOME it
+        # owns, its git ls-remote exits 0, `nono ps` binds the session to the
+        # supervisor's child and records the resolved profile path, reverting
+        # tps-base's /dev/null allow makes the supervisor refuse everything, no
+        # profile at all is a named refusal, and a bare-name resolver refuses the
+        # same setup that otherwise launches (cli#352 r2/r3).
         run: docker compose run --rm -v "$HOME/.local/nono-pin-bookworm/nono:/usr/local/bin/nono:ro" test bash scripts/test-tps-office-supervisor.sh
 
   binary-smoke:

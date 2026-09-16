@@ -289,6 +289,21 @@ for ((i=0; i<count; i++)); do
   chown -R "$user":tps "$tmpdir"
   chmod 700 "$tmpdir"
 
+  # cli#352 r3 — the sandboxed child needs a HOME it can WRITE: nono's session
+  # and audit state live there, and nono refuses to start when that root sits
+  # inside a granted path (never /tmp or /workspace). `su -m` below preserves
+  # the ENVIRONMENT (PATH, SBOX_ENV) but would also preserve the supervisor's
+  # HOME — /root in the shipped image, which the agent uid cannot write — so the
+  # launch died with "Failed to create session directory
+  # /root/.local/state/nono/audit/…: Permission denied" while the probe (which
+  # runs without -m) passed: every office agent silently failed to start. The
+  # account's own home is the writable, ungranted HOME the harness already
+  # gives nono one level down (/home/harness-home).
+  AGENT_HOME="/home/$user"
+  mkdir -p "$AGENT_HOME"
+  chown "$user":tps "$AGENT_HOME"
+  chmod 700 "$AGENT_HOME"
+
   # The sandbox grant list. Only the roster id feeds the identity path: the key
   # it derives is the ONE thing the launched runtime must read outside its
   # workspace, and deriving it from `config.agentId` would let an agent that can
@@ -317,7 +332,11 @@ for ((i=0; i<count; i++)); do
   done
 
   if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
-    su -m -s /bin/bash "$user" -c "exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
+    # HOME is set EXPLICITLY: `su -m` preserves the environment we need (PATH to
+    # reach the agent binary, SBOX_ENV) but must not hand the agent the
+    # supervisor's HOME (see AGENT_HOME above). The probe one call earlier runs
+    # with the passwd HOME for the same user, so both sites agree.
+    su -m -s /bin/bash "$user" -c "HOME='$AGENT_HOME' exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
   else
     # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
     # with NO nono isolation; that path is deleted. If nono cannot engage (it is

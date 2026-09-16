@@ -23,11 +23,12 @@
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
 #      supervisor resolves the profile from the BUNDLED dir the image ships,
 #      passes the ABSOLUTE PATH to nono, the Landlock probe passes, the office
-#      agent launches under `tps-office`, `nono ps` shows the session bound to
-#      the supervisor's child, and inside that agent `git ls-remote` over https
-#      exits 0 (what cli#351's /dev/null + /etc/gitconfig + GIT_CONFIG_GLOBAL
-#      fixed on the CLI path) and the child env carries sandboxChildEnv()'s
-#      exports;
+#      agent launches under `tps-office` with a HOME it owns (nono's state root
+#      cannot live in the supervisor's HOME — /root in the image — nor inside a
+#      granted path), `nono ps` shows the session bound to the supervisor's
+#      child, and inside that agent `git ls-remote` over https exits 0 (what
+#      cli#351's /dev/null + /etc/gitconfig + GIT_CONFIG_GLOBAL fixed on the CLI
+#      path) and the child env carries sandboxChildEnv()'s exports;
 #   2. FAILS-FIRST: with tps-base's `/dev/null` allow reverted in a private
 #      bundled copy — same empty XDG — the probe fails and the supervisor
 #      refuses EVERYTHING (this used to be masked by supplying the profiles
@@ -63,6 +64,7 @@ bare="$(grep -c -- '--profile tps-office' "$sup" || true)"
 if [ "$bare" -eq 0 ]; then ok "no launch point passes the bare name 'tps-office'"; else bad "$bare launch point(s) still pass the bare profile name"; fi
 if grep -q 'resolve_profile_path()' "$sup" && grep -q 'TPS_NONO_PROFILES_DIR:-/usr/local/share/tps/nono-profiles' "$sup"; then ok "the supervisor resolves tps-office to an absolute path (bundled default /usr/local/share/tps/nono-profiles)"; else bad "the supervisor does not resolve the profile (or the bundled default moved)"; fi
 if grep -qF 'profile file not found at' "$sup"; then ok "an unresolvable profile is a named refusal"; else bad "no named refusal for an unresolvable profile"; fi
+if grep -q 'AGENT_HOME="/home/\$user"' "$sup" && grep -q "HOME='\$AGENT_HOME' exec nono" "$sup"; then ok "the launch runs the agent with a HOME the agent owns (not the supervisor's)"; else bad "the launch hands the agent the supervisor's HOME — nono cannot write its state root there"; fi
 # The ship-red half (Harness green, ship red — cli#341 S1b/S4 class): the image
 # must actually carry the profiles at the path the resolver defaults to, and a
 # CI lane must launch the built image so a Dockerfile that forgets the COPY
@@ -110,7 +112,7 @@ else
 case "\${1:-}" in
   check) exec bun "$agent_bin" check "\${@:2}" ;;
   start)
-    printf 'AGENT-UP pid=%s %s\n' "\$\$" "\$(env | grep -E '^(TPS_NONO_ACTIVE|GIT_CONFIG_GLOBAL)=' | sort | tr '\n' ' ')" >>"\${AGENT_MARKER:?}"
+    printf 'AGENT-UP pid=%s %s\n' "\$\$" "\$(env | grep -E '^(HOME|TPS_NONO_ACTIVE|GIT_CONFIG_GLOBAL)=' | sort | tr '\n' ' ')" >>"\${AGENT_MARKER:?}"
     git ls-remote https://github.com/tpsdev-ai/cli HEAD >"\${AGENT_GIT_LOG:?}" 2>&1
     printf 'AGENT-GIT-RC %s\n' "\$?" >>"\${AGENT_MARKER:?}"
     printf 'AGENT-DONE\n' >>"\${AGENT_MARKER:?}"
@@ -296,10 +298,12 @@ SH
     bare_sup="$tmp/tps-office-supervisor-bare-name"
     sed -E 's|--profile \\?"\$NONO_PROFILE\\?"|--profile tps-office|g' "$sup" >"$bare_sup"
 
-    # The sandboxed nono runs as the agent user: give it a HOME it can write
-    # (its session registry lives there). It must NOT live under /tmp or
-    # /workspace — tps-office grants those, and nono refuses to start when its
-    # protected state root overlaps a granted path.
+    # The sandboxed child must run with a HOME it can WRITE (nono's session
+    # registry lives there) and that is NOT inside a granted path. The supervisor
+    # sets that HOME itself (the account's own home) — the harness's own HOME is
+    # only for the direct nono runs below, so a `su -m` that preserved it would
+    # mask a regression there. Both are asserted through the shim's AGENT-UP line
+    # and by asking nono ps as the agent user with the passwd HOME (no -m).
     home="/home/harness-home"; mkdir -p "$home/.local/state"
     chmod -R 777 "$home"
     export HOME="$home"
@@ -331,6 +335,11 @@ SH
     else
       bad "the launched agent's env is missing the CLI-path exports: $(grep -m1 'AGENT-UP' "$AGENT_MARKER" 2>/dev/null)"
     fi
+    if grep -q 'HOME=/home/agent-probe' "$AGENT_MARKER" 2>/dev/null; then
+      ok "the launched agent's HOME is the agent's own writable home, not the supervisor's"
+    else
+      bad "the launched agent's HOME is not /home/agent-probe: $(grep -m1 'AGENT-UP' "$AGENT_MARKER" 2>/dev/null)"
+    fi
     if [ "$git_done" -eq 1 ] && grep -q 'AGENT-GIT-RC 0' "$AGENT_MARKER" 2>/dev/null; then
       ok "git ls-remote https://github.com/tpsdev-ai/cli exits 0 inside the launched agent ($(tr -d '\n' <"$AGENT_GIT_LOG" | head -c 60))"
     else
@@ -338,10 +347,12 @@ SH
     fi
     # nono ps must show the session bound to the supervisor's child.  The
     # sandboxed nono runs as the per-agent user, and nono refuses to read a
-    # session registry owned by another uid — so ask as that same user.  nono
-    # records the profile as the path it was HANDED (cli#352 r3), so the filter
-    # accepts the bare name or the resolved path under test.
-    ps_as_agent() { su -m -s /bin/bash "agent-probe" -c "exec '$real_nono' ps --json"; }
+    # session registry owned by another uid — so ask as that same user, with the
+    # passwd HOME the launch used (no -m: the registry lives under
+    # /home/<agent user>/.local/state).  nono records the profile as the path it
+    # was HANDED (cli#352 r3), so the filter accepts the bare name or the
+    # resolved path under test.
+    ps_as_agent() { su -s /bin/bash "agent-probe" -c "exec '$real_nono' ps --json"; }
     for _ in $(seq 1 20); do
       [ -s /workspace/.tps/pids.json ] && break
       kill -0 "$sup_pid" 2>/dev/null || break
