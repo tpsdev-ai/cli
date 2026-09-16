@@ -38,6 +38,34 @@ readonly SBOX_ENV=("TPS_NONO_ACTIVE=1" "GIT_CONFIG_GLOBAL=/dev/null")
 # systemReadFiles(); test/security-properties.test.ts asserts the equality.
 SBOX_SYSTEM_READ_FILES=("/etc/hosts" "/etc/resolv.conf" "/etc/nsswitch.conf" "/etc/gitconfig")
 
+# cli#352 r6 — office agent identity allocation.
+#
+# uid 1000 is conventionally the first human login and 1001 the second, so a
+# supervisor that seated office agents from 1001 collided with the second real
+# account on essentially every host it would ever run on. main's cli#350 `tps`
+# user (uid 1001) did not create that bug — it exposed one that was already there
+# and would have reached a real machine. Seat agents from a base well clear of
+# the human range, and — more important than the base — never ASSUME an id is
+# free. Probe it and take the next free one, bounded, failing loudly rather than
+# reusing a colliding id.
+AGENT_UID_BASE=20000
+AGENT_ID_SCAN_MAX=500   # candidates to scan from the base; far past any office
+
+# first_free_id <user|group> -> the first free numeric id at/after the base on
+# stdout, or a non-zero return when the whole bounded range is taken (never a
+# silent collision, never a reused account).
+first_free_id() {
+  local kind="$1" id
+  for ((id=AGENT_UID_BASE; id<AGENT_UID_BASE+AGENT_ID_SCAN_MAX; id++)); do
+    if [[ "$kind" == group ]]; then
+      getent group "$id" >/dev/null 2>&1 || { printf '%s\n' "$id"; return 0; }
+    else
+      getent passwd "$id" >/dev/null 2>&1 || { printf '%s\n' "$id"; return 0; }
+    fi
+  done
+  return 1
+}
+
 if [[ ! -f "$TEAM_FILE" ]]; then
   echo "Missing team file: $TEAM_FILE" >&2
   exit 1
@@ -210,6 +238,18 @@ if [[ "$count" -eq 0 ]]; then
   exit 1
 fi
 
+# The agent accounts take `tps` as their primary group (the office image ships
+# it; a bare host image may not). Never assume it is present — and never assume a
+# gid is free either: create it at the first free gid, bounded, or refuse. Same
+# rule as the agent uids below.
+if ! getent group tps >/dev/null 2>&1; then
+  gid="$(first_free_id group)" || {
+    echo "❌ cannot seat office agents: no free gid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) for group 'tps' — refusing to launch (never reusing a colliding id)" >&2
+    exit 1
+  }
+  groupadd -g "$gid" tps
+fi
+
 if ! id tps-supervisor >/dev/null 2>&1; then
   useradd -r -g tps -M -s /usr/sbin/nologin tps-supervisor
 fi
@@ -234,8 +274,6 @@ supports_landlock_for_agent() {
 
   [[ $rc -eq 0 ]]
 }
-
-uid=1001
 
 # cli#352 r (b) — the launched agent inherits the SAME exports the CLI path's
 # sandboxChildEnv() sets, from one list (asserted equal by
@@ -284,6 +322,10 @@ for ((i=0; i<count; i++)); do
   fi
 
   if ! id "$user" >/dev/null 2>&1; then
+    uid="$(first_free_id user)" || {
+      echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
+      exit 1
+    }
     useradd -u "$uid" -g tps -m -s /bin/bash "$user"
   fi
 
@@ -360,8 +402,6 @@ for ((i=0; i<count; i++)); do
   pid=$!
   AGENT_IDS+=("$id")
   AGENT_PIDS+=("$pid")
-
-  uid=$((uid + 1))
 done
 
 write_pids_file

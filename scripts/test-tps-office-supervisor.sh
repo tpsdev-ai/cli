@@ -17,7 +17,11 @@
 #   3. a refusal mid-run stops the agents launched earlier (no orphan);
 #   4. a traversal-shaped roster id is refused before anything runs;
 #   5. a config whose agentId disagrees with the roster id is refused, naming
-#      both, before anything runs.
+#      both, before anything runs;
+#   6. cli#352 r6: the allocation base uid is ALREADY TAKEN (a decoy account) →
+#      the supervisor steps over it and still seats every agent. This fails
+#      against the pre-r6 code, which seats from a hardcoded uid=1001 and never
+#      probes.
 #
 # Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
@@ -268,6 +272,43 @@ SH
   case "$out5" in *other*) case "$out5" in *probe*) ok "the refusal names both ids (config 'other' vs roster 'probe')";; *) bad "refusal names only one id: $out5";; esac ;; *) bad "refusal does not name the config id: $out5" ;; esac
   if [ ! -s "$NONO_ARGV_LOG" ]; then ok "mismatch refusal happens before any launch"; else bad "something was launched despite a mismatching config"; fi
 
+  # (6) cli#352 r6 — never ASSUME a uid is free. Occupy the supervisor's
+  # allocation base with a decoy account and assert it steps over it and seats
+  # EVERY agent. Against the pre-r6 code (a hardcoded uid=1001 with no probe)
+  # the agent is seated at the colliding id, so this fails.
+  base="$(sed -n 's/^AGENT_UID_BASE=\([0-9][0-9]*\)$/\1/p' "$sup" | head -n1)"
+  if [ -z "$base" ]; then
+    bad "supervisor defines no AGENT_UID_BASE — uid allocation has no named base to probe"
+  else
+    useradd -u "$base" -M -g 0 -s /usr/sbin/nologin decoy-uidbase 2>/dev/null || true
+    decoy_uid="$(id -u decoy-uidbase 2>/dev/null || echo '')"
+    if [ "$decoy_uid" = "$base" ]; then ok "fixture: a decoy account occupies the base uid $base"; else bad "fixture: could not occupy $base (uid='$decoy_uid')"; fi
+    mkdir -p /workspace/.tps/identity /run/secrets /workspace/seat1 /workspace/seat2
+    printf '[{"id":"seat1","configPath":"/workspace/seat1/agent.yaml"},{"id":"seat2","configPath":"/workspace/seat2/agent.yaml"}]\n' >/workspace/.tps/team.json
+    printf 'agentId: seat1\nname: seat1\nworkspace: /workspace/seat1\nllm:\n  provider: ollama\n  model: x\n' >/workspace/seat1/agent.yaml
+    printf 'agentId: seat2\nname: seat2\nworkspace: /workspace/seat2\nllm:\n  provider: ollama\n  model: x\n' >/workspace/seat2/agent.yaml
+    printf 'KEY' >/workspace/.tps/identity/seat1.key; printf 'PUB' >/workspace/.tps/identity/seat1.pub
+    printf 'KEY' >/workspace/.tps/identity/seat2.key; printf 'PUB' >/workspace/.tps/identity/seat2.pub
+    printf 'x' >/run/secrets/.ready
+    rm -f /workspace/.tps/pids.json
+    # A shim dir carrying ONLY the tps-agent stand-in and a fake nono: the
+    # seating path must use the REAL account code, so the assigned uids are
+    # observable (no id/useradd/chown shadowing).
+    onlynono="$tmp/bin-real-seat"; mkdir -p "$onlynono"
+    write_agent_shim "$onlynono"
+    printf '#!/usr/bin/env bash\nprintf "NONO-ARGV nono %%s\\n" "$*" >> "${NONO_ARGV_LOG:?}"\nexit 0\n' >"$onlynono/nono"
+    chmod +x "$onlynono"/*
+    export NONO_ARGV_LOG="$tmp/argv6.log"; : >"$NONO_ARGV_LOG"
+    PATH="$onlynono:$cleanpath" timeout 30 bash "$sup" >"$tmp/out6.log" 2>&1; rc6=$?
+    if [ "$rc6" -eq 0 ]; then ok "uid stepping: a 2-agent team seats over a taken base uid (exit 0)"; else bad "uid stepping: supervisor exited $rc6: $(tail -n 5 "$tmp/out6.log" | tr '\n' ' ')"; fi
+    u1="$(id -u agent-seat1 2>/dev/null || echo '')"; u2="$(id -u agent-seat2 2>/dev/null || echo '')"
+    if [ -n "$u1" ] && [ -n "$u2" ] && [ "$u1" -gt "$base" ] && [ "$u2" -gt "$base" ] && [ "$u1" != "$u2" ]; then
+      ok "uid stepping: every agent seated above the taken base (base $base taken; seat1=$u1 seat2=$u2)"
+    else
+      bad "uid stepping: agents not seated above a taken base uid (base=$base seat1='$u1' seat2='$u2')"
+    fi
+  fi
+
   # ── Part C — behavioural, REAL nono ────────────────────────────────────────
   real_nono="${NONO_BIN:-$(command -v nono 2>/dev/null || true)}"
   if [ -z "$real_nono" ] || [ ! -x "$real_nono" ]; then
@@ -278,9 +319,9 @@ SH
     real="$tmp/real"; mkdir -p "$real/bin"
     write_agent_shim "$real/bin"
 
-    # The supervisor launches agents under the `tps` group (the office image has
-    # it; the test image does not).
-    getent group tps >/dev/null 2>&1 || groupadd tps
+    # cli#352 r6: the supervisor provisions the `tps` group (and the agent uids)
+    # itself, with a bounded probe — that is not the harness's business, and the
+    # harness must pass whether or not a tps user/group already exists here.
 
     # cli#352 r3: the supervisor resolves the profile itself and hands nono an
     # absolute path, so XDG_CONFIG_HOME is EMPTY in every Part C case — the
