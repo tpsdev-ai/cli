@@ -4,6 +4,26 @@ set -euo pipefail
 TEAM_FILE="/workspace/.tps/team.json"
 PIDS_FILE="/workspace/.tps/pids.json"
 
+# cli#352 r — supervisor-path parity with cli#351 (S1b).
+#
+# 1. STATE_ROOT is the roster's OWN state root — the directory that holds the
+#    team.json this supervisor was handed. The identity grant and the key path
+#    derive from THAT plus the roster entry's `id`, never from a field inside the
+#    agent's writable config (the agent can rewrite its own agent.yaml, so a
+#    config-derived grant would let one agent name another agent's key).
+# 2. SBOX_ENV is the same child environment cli#351 r5c's sandboxChildEnv()
+#    exports on the CLI path. `docker/tps-office-supervisor.sh` and
+#    `packages/cli/src/utils/nono.ts` are two launch points for the same
+#    workload; test/security-properties.test.ts asserts these pairs EQUAL
+#    sandboxChildEnv() so the two cannot drift.
+STATE_ROOT="${TPS_STATE_ROOT:-"$(dirname "$TEAM_FILE")"}"
+readonly SBOX_ENV=("TPS_NONO_ACTIVE=1" "GIT_CONFIG_GLOBAL=/dev/null")
+
+# System read files the launch must add by name (Linux cannot grant /etc
+# wholesale — Landlock deny-within-allow; cli#351 r5b). Same list as the CLI's
+# systemReadFiles(); test/security-properties.test.ts asserts the equality.
+SBOX_SYSTEM_READ_FILES=("/etc/hosts" "/etc/resolv.conf" "/etc/nsswitch.conf" "/etc/gitconfig")
+
 if [[ ! -f "$TEAM_FILE" ]]; then
   echo "Missing team file: $TEAM_FILE" >&2
   exit 1
@@ -175,6 +195,13 @@ supports_landlock_for_agent() {
 }
 
 uid=1001
+
+# cli#352 r (b) — the launched agent inherits the SAME exports the CLI path's
+# sandboxChildEnv() sets, from one list (asserted equal by
+# test/security-properties.test.ts). `su -m` preserves the environment into the
+# nono child, so exporting here reaches the sandboxed agent.
+export "${SBOX_ENV[@]}"
+
 for ((i=0; i<count; i++)); do
   id=$(echo "$agents_json" | jq -r ".[$i].id")
   config_path=$(echo "$agents_json" | jq -r ".[$i].configPath")
@@ -184,8 +211,8 @@ for ((i=0; i<count; i++)); do
     exit 1
   fi
 
-  if [[ ! "$id" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    echo "Invalid agent id at index $i: $id" >&2
+  if [[ ! "$id" =~ ^[a-zA-Z0-9._-]{1,64}$ || "$id" == *..* ]]; then
+    echo "Invalid agent id at index $i: $id — must match ^[a-zA-Z0-9._-]{1,64}$ and contain no traversal" >&2
     exit 1
   fi
 
@@ -203,6 +230,18 @@ for ((i=0; i<count; i++)); do
   workdir="/workspace/$id"
   tmpdir="/tmp/agent-$id"
 
+  # cli#352 r (a) — the launch id is the ROSTER entry's (validated above). The
+  # agent's config can be rewritten by the agent itself, so it may only VETO:
+  # `tps-agent check` applies the same rule the launch does (charset, traversal,
+  # and config.agentId must agree — refusing names both) and refuses BEFORE
+  # anything is launched, so a refusal cannot leave a partial team running.
+  # Fail closed when tps-agent is missing too (the launch would 127 anyway).
+  if ! check_out="$(tps-agent check --id "$id" --config "$config_path" 2>&1)"; then
+    echo "❌ agent '$id': refusing to launch — ${check_out:-tps-agent check failed}" >&2
+    shutdown_children TERM
+    exit 1
+  fi
+
   if ! id "$user" >/dev/null 2>&1; then
     useradd -u "$uid" -g tps -m -s /bin/bash "$user"
   fi
@@ -214,8 +253,27 @@ for ((i=0; i<count; i++)); do
   chown -R "$user":tps "$tmpdir"
   chmod 700 "$tmpdir"
 
+  # The sandbox grant list. Only the roster id feeds the identity path: the key
+  # it derives is the ONE thing the launched runtime must read outside its
+  # workspace, and deriving it from `config.agentId` would let an agent that can
+  # write its own agent.yaml name someone else's key (cli#351 r5, one launch
+  # point later). Missing files are skipped (nono refuses to load a profile
+  # whose grant list names a path that does not exist).
+  launch_args=(run --profile tps-office --name "tps-agent-$id"
+    --allow "$workdir" --allow "$tmpdir" --allow /var/run/tps-proxy.sock)
+  for f in "${SBOX_SYSTEM_READ_FILES[@]}"; do
+    [[ -e "$f" ]] && launch_args+=(--read-file "$f")
+  done
+  for k in "$STATE_ROOT/identity/$id.key" "$STATE_ROOT/identity/$id.pub"; do
+    if [[ -f "$k" ]]; then
+      launch_args+=(--read-file "$k")
+    else
+      echo "ℹ️  agent '$id': no identity file at $k (agent cannot sign as '$id')" >&2
+    fi
+  done
+
   if supports_landlock_for_agent "$user" "$workdir" "$tmpdir"; then
-    su -m -s /bin/bash "$user" -c "exec nono run --profile tps-office --allow '$workdir' --allow '$tmpdir' --allow /var/run/tps-proxy.sock -- tps-agent start --config '$config_path'" &
+    su -m -s /bin/bash "$user" -c "exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
   else
     # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
     # with NO nono isolation; that path is deleted. If nono cannot engage (it is
