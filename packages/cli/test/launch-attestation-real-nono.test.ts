@@ -15,7 +15,7 @@
  *      bound to the pid the launcher spawned and to the pid the child reported,
  *      and the child could not read the canary planted outside every grant.
  */
-import { describe, test, expect, beforeAll } from "bun:test";
+import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -29,6 +29,11 @@ const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
 const SANDBOX_REQUIRED = "--sandbox-required";
+
+// cli#350 r4g — these tests wait on a real release window (up to 45s / 60s);
+// raise the file default well above the waits so the per-test 5s default cannot
+// stop the process (and its cleanup) mid-flight.
+setDefaultTimeout(90_000);
 
 /** The real pinned nono, or null (→ skip). */
 function realNono(): string | null {

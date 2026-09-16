@@ -35,10 +35,11 @@
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   buildNonoArgs,
   checkProfileLoadable,
@@ -157,13 +158,24 @@ export function resolveNonoBinary(env: NodeJS.ProcessEnv = process.env): NonoRes
   return { bin: found };
 }
 
+/** This module's directory, decoded (`fileURLToPath`, not `URL.pathname` —
+ * pathname keeps `%20`/`%23`, which breaks filesystem lookups on a checkout path
+ * containing a space or `#`). Exported so a fixture can prove the decoding. */
+export function moduleDir(url: string | URL = import.meta.url): string {
+  return dirname(fileURLToPath(url));
+}
+
 /** Candidate pin records, most specific first: beside the binary, up to six
  * levels above this module (a checkout's repo root, whether the module is run
  * from src/ or from dist/), then $HOME. "Where present": no record is not an
  * error — an unsourced pin simply cannot be checked at runtime. */
 export function pinRecordCandidates(bin: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const out: string[] = [join(dirname(bin), PIN_RECORD_NAME)];
-  let here = dirname(new URL(import.meta.url).pathname);
+  // cli#350 r4g — fileURLToPath, not `new URL(...).pathname`: pathname keeps
+  // percent-escapes, so a checkout under a path with a space or `#` would yield
+  // `%20`/`%23` here, `findPinRecord` would miss the present .nono-version, and
+  // the pin check would be SKIPPED (fail open).
+  let here = moduleDir();
   for (let i = 0; i < 6; i++) {
     out.push(join(here, PIN_RECORD_NAME));
     const up = dirname(here);
@@ -306,6 +318,37 @@ function nonce(): string {
   return randomBytes(16).toString("hex");
 }
 
+/** The platform's `sun_path` size in bytes, INCLUDING the trailing NUL (macOS
+ * 104, Linux 108). A unix socket path must fit in `sun_path - 1` bytes. */
+export const SUN_PATH_MAX = process.platform === "darwin" ? 104 : 108;
+export const SUN_PATH_BUDGET = SUN_PATH_MAX - 1;
+
+/**
+ * The private-dir label, BOUNDED so that
+ * `<home>/.tps/launch/<label>/sock/launch.sock` fits in `sun_path` (cli#350 r4g,
+ * CWE-20/CWE-400 — an over-long path makes `listen` fail, and under supervision
+ * the refusal exits 0 silently). The full `<id>-<nonce8>` label is used when it
+ * fits; otherwise a deterministic `<id[0:16]>-<hash8>` (hash of id+nonce, so two
+ * concurrent launches of the same id stay distinct). When even that cannot fit
+ * (a $HOME too long to hold a unix socket at all) it THROWS, naming the byte
+ * length, and the caller refuses loudly — never a silent failure.
+ */
+export function launchDirLabel(home: string, agentId: string, nonceHex: string): string {
+  const parent = join(home, ".tps", "launch");
+  const sockPathOf = (label: string) => join(parent, label, SOCK_DIR_NAME, SOCK_NAME);
+  const full = `${agentId}-${nonceHex.slice(0, 8)}`;
+  if (Buffer.byteLength(sockPathOf(full)) <= SUN_PATH_BUDGET) return full;
+  const hash = createHash("sha256").update(`${agentId}-${nonceHex}`).digest("hex").slice(0, 8);
+  const short = `${agentId.slice(0, 16)}-${hash}`;
+  const shortPath = sockPathOf(short);
+  if (Buffer.byteLength(shortPath) <= SUN_PATH_BUDGET) return short;
+  throw new Error(
+    `the launcher's unix socket path cannot fit in sun_path: ${shortPath} is ` +
+      `${Buffer.byteLength(shortPath)} bytes and the limit is ${SUN_PATH_BUDGET} ` +
+      `(sun_path ${SUN_PATH_MAX} incl. NUL) — shorten $HOME or the agent id`,
+  );
+}
+
 /**
  * Create <home>/.tps/launch/<agentId>-<nonce>/{sock,state} with the canaries.
  *
@@ -316,9 +359,10 @@ function nonce(): string {
  * and the workspace are), so a fresh subdir beside them is outside every grant —
  * and the overlap assert below proves it rather than assuming it.
  *
- * NOTE on the unix socket path length: <priv>/sock/launch.sock must stay under
- * the platform's sun_path limit (~104 bytes). $HOME plus a short agent id keeps
- * it there.
+ * NOTE on the unix socket path length: `<priv>/sock/launch.sock` must stay under
+ * the platform's sun_path limit (104 macOS / 108 Linux). The label is bounded
+ * for that (see `launchDirLabel`): the full `<id>-<nonce8>` when it fits, else a
+ * deterministic `<id[0:16]>-<hash8>`, else a loud throw naming the byte length.
  */
 export function createPrivateLaunchDir(opts: {
   home?: string;
@@ -327,8 +371,9 @@ export function createPrivateLaunchDir(opts: {
 }): PrivateLaunchDir {
   const home = opts.home ?? opts.env?.HOME ?? homedir() ?? "/tmp";
   const parent = join(home, ".tps", "launch");
+  const label = launchDirLabel(home, opts.agentId, nonce());
   mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const root = join(parent, `${opts.agentId}-${nonce().slice(0, 8)}`);
+  const root = join(parent, label);
   const sockDir = join(root, SOCK_DIR_NAME);
   const stateDir = join(root, STATE_DIR_NAME);
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -736,11 +781,17 @@ export async function launchAttested(
 
   // (3) the private dir: a root covered by NO grant this launch passes.
   const agentId = optionValue(cmd, "--id") ?? `launch-${process.pid}`;
-  const priv = createPrivateLaunchDir({ home: opts.home ?? env.HOME, agentId, env });
+  let priv: PrivateLaunchDir;
+  try {
+    priv = createPrivateLaunchDir({ home: opts.home ?? env.HOME, agentId, env });
+  } catch (err) {
+    // e.g. a $HOME too long to hold a unix socket — refused loudly, naming the
+    // byte length (cli#350 r4g), never a silent listen failure.
+    return refuse((err as Error).message);
+  }
   log.push(`priv=${priv.root}`);
   let server: Server | null = null;
   let child: ChildProcess | null = null;
-  let reportedPid = 0;
   let sessionId: string | undefined;
   let childPid = 0;
 
@@ -826,7 +877,6 @@ export async function launchAttested(
             failFirstSeam: opts.failFirstSeam,
           }).then((v) => {
             clearTimeout(timer);
-            if (v.pid !== undefined) reportedPid = v.pid;
             if (v.ok && v.session && v.pid !== undefined) {
               // THE RELEASE. Written only here, only for a bound live session,
               // and it names the pid the child reported — the child requires
@@ -855,7 +905,11 @@ export async function launchAttested(
     if (!verdict.ok || !verdict.session || verdict.pid === undefined) {
       // Nothing is written; the child's bounded wait expires; the session and
       // the child are stopped; the private dir is removed in the finally block.
-      killQuietly(verdict.pid ?? reportedPid);
+      //
+      // Signal ONLY P, the nono supervisor the launcher spawned (cli#350 r4g,
+      // CWE-20): the child-REPORTED pid is unverified here — a peer may report
+      // any pid — so signalling it would let a planted peer aim SIGTERM at an
+      // unrelated process. Killing P stops the session and its child.
       killQuietly(P);
       return refuse(`${verdict.reason} — refusing to release the agent`);
     }

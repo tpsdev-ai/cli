@@ -41,7 +41,7 @@ import {
 } from "node:fs";
 import { connect } from "node:net";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   attestConfinement,
   childCanaries,
@@ -56,6 +56,9 @@ import {
   removePrivateLaunchDir,
   resolveNonoBinary,
   checkNonoPin,
+  pinRecordCandidates,
+  moduleDir,
+  SUN_PATH_BUDGET,
   LAUNCH_SOCK_ENV,
 } from "../src/utils/launch-attestation.js";
 import { SANDBOX_REQUIRED_FLAG, SANDBOXED_FLAG } from "../src/utils/nono.js";
@@ -134,7 +137,11 @@ function seedHome(home: string, ws: string, seedProfiles = true): void {
  * tmpdir (the fixture sets TMPDIR to a sibling) — a private dir inside a granted
  * root is what the overlap assert refuses, and that gets its own fixture. */
 function makeSandbox(name: string, seedProfiles = true): Sandbox {
-  const root = mkdtempSync(join(tmpdir(), `tps-attest-${name}-`));
+  // OUTSIDE /tmp: the launch grants /tmp unconditionally (cli#350 r4g), so a
+  // HOME under /tmp would put the private dir inside that grant and the overlap
+  // assert would (correctly) refuse. /var/tmp keeps HOME and every grant disjoint.
+  const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+  const root = mkdtempSync(join(base, `tps-attest-${name}-`));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
   const ws = join(root, "ws");
@@ -226,6 +233,26 @@ function runLauncher(sb: Sandbox, args: string[], extra: Record<string, string |
 
 function out(r: { stdout?: string | null; stderr?: string | null }): string {
   return `${r.stdout ?? ""}${r.stderr ?? ""}`;
+}
+
+/** A fixture toucher: writes `TOUCH_FILE` after `TOUCH_AFTER_MS`. Written as a
+ * SCRIPT FILE with no value interpolated into code (CodeQL js/code-injection,
+ * cli#350 r4g): paths travel through the environment, never through source. */
+const TOUCHER_SRC = `
+const { writeFileSync } = require("node:fs");
+const delay = Number(process.env.TOUCH_AFTER_MS || "10000");
+setTimeout(() => {
+  try { writeFileSync(process.env.TOUCH_FILE, "released"); } catch {}
+}, delay);
+`;
+
+function startToucher(sb: Sandbox, file: string, afterMs: number): ChildProcess {
+  const script = join(sb.root, "toucher.cjs");
+  writeFileSync(script, TOUCHER_SRC);
+  return spawn(process.execPath, [script], {
+    stdio: "ignore",
+    env: { ...process.env, TOUCH_FILE: file, TOUCH_AFTER_MS: String(afterMs) },
+  });
 }
 
 /** ARGV lines the fake nono logged for a `run` (the launcher's spawn). Other
@@ -618,6 +645,7 @@ async function runLauncherInProcess(opts: {
   peer: "confined" | "unconfined" | "blind-denied" | "wrong-pid" | "none";
   publishStore?: boolean;
   storeSessions?: unknown;
+  peerEnv?: Record<string, string | undefined>;
   failFirst?: { disableCanaryCheck?: boolean; disablePidBinding?: boolean };
 }): Promise<LauncherRun> {
   const sb = opts.sb;
@@ -675,18 +703,12 @@ exit 0
     FAKE_NONO_PUBLISH: opts.publishStore === false ? "0" : "1",
     FAKE_NONO_STOP: stopFile,
     FAKE_NONO_CHILD_FILE: childFile,
+    ...(opts.peerEnv ?? {}),
   });
   // A released launch ends when the wrapped command's nono exits; the fake nono
   // waits for the stop file, so release it shortly after the handshake window
   // opens. Refusal paths kill the session before this fires.
-  const toucher = spawn(
-    process.execPath,
-    [
-      "-e",
-      `setTimeout(() => { try { require("node:fs").writeFileSync(${JSON.stringify(stopFile)}, "released"); } catch {} }, 10000);`,
-    ],
-    { stdio: "ignore" }
-  );
+  const toucher = startToucher(sb, stopFile, 10_000);
   try {
     const captured: string[] = [];
     const original = console.error;
@@ -753,6 +775,12 @@ function attempt() {
   let dir = null;
   try { dir = readdirSync(root).map((d) => join(root, d)).find((d) => existsSync(join(d, "sock", "launch.sock"))); } catch {}
   if (!dir) return setTimeout(attempt, 50);
+  // The fake nono writes the wrapped child's pid only once it has spawned it;
+  // reading it before then throws in the connect handler and the report never
+  // arrives (the launcher then times out). Wait for BOTH the store and the pid.
+  if (process.env.FAKE_NONO_CHILD_FILE && !existsSync(process.env.FAKE_NONO_CHILD_FILE)) {
+    return setTimeout(attempt, 50);
+  }
   if (process.env.FAKE_NONO_PUBLISH === "1" && process.env.FAKE_NONO_PS_JSON && !existsSync(process.env.FAKE_NONO_PS_JSON)) {
     return setTimeout(attempt, 50);
   }
@@ -764,6 +792,7 @@ function attempt() {
     // The pid a REAL child reports: the wrapped command's pid, which the fake
     // nono logged. "wrong-pid" reports a different one.
     let pid = Number(readFileSync(process.env.FAKE_NONO_CHILD_FILE, "utf-8").trim());
+    if (process.env.PEER_REPORT_PID) pid = Number(process.env.PEER_REPORT_PID);
     if (mode === "wrong-pid") pid += 1000;
     sock.write("PID " + pid + "\\n");
     if (mode === "unconfined") {
@@ -1018,16 +1047,7 @@ tty("4e+r4f — a TTY parent changes nothing", () => {
       return;
     }
     const sb = makeSandbox("tty-release");
-    const toucher = spawn(
-      process.execPath,
-      [
-        "-e",
-        `setTimeout(() => { try { require("node:fs").writeFileSync(${JSON.stringify(
-          join(sb.root, "stop")
-        )}, "x"); } catch {} }, 4000);`,
-      ],
-      { stdio: "ignore" }
-    );
+    const toucher = startToucher(sb, join(sb.root, "stop"), 4000);
     try {
       const bin = writeFakeNono(sb, CONFINING_FAKE_NONO);
       const r = runLauncherTty(sb, ["agent", "start", "--id", "probe", SANDBOX_REQUIRED_FLAG], {
@@ -1045,7 +1065,7 @@ tty("4e+r4f — a TTY parent changes nothing", () => {
       toucher.kill();
       rmSync(sb.root, { recursive: true, force: true });
     }
-  });
+  }, 40_000);
 
   test("a TTY caller with --sandboxed and NO launcher socket is refused (exit 78)", () => {
     const sb = makeSandbox("tty-refuse");
@@ -1116,5 +1136,75 @@ tty("4e+r4f FAILS-FIRST — the pre-r4f child shape times out under a TTY parent
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// cli#350 r4g — review round: a refusal signals only P; the socket path is
+// bounded to sun_path; the pin record survives a checkout path with a space.
+// ---------------------------------------------------------------------------
+
+describe("4g — a refusal signals ONLY the nono supervisor, never the reported pid", () => {
+  test("a peer reporting an UNRELATED live pid cannot get it killed by the refusal", async () => {
+    const sb = makeSandbox("refusal-p-only");
+    const victim = spawn("sleep", ["60"], { stdio: "ignore" });
+    try {
+      const run = await runLauncherInProcess({
+        sb,
+        peer: "unconfined", // forces a refusal: the peer READ the OUTSIDE canary
+        peerEnv: { PEER_REPORT_PID: String(victim.pid) },
+      });
+      expect(run.exitCode).toBe(78);
+      await new Promise((r) => setTimeout(r, 300));
+      // The old code signalled `verdict.pid ?? reportedPid` — the peer's forged
+      // pid — so the victim would be dead. Only P may be signalled.
+      expect(pidAlive(victim.pid!)).toBe(true);
+    } finally {
+      victim.kill("SIGKILL");
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
+describe("4g — the launch socket path is bounded to sun_path", () => {
+  const base = () => (existsSync("/var/tmp") ? "/var/tmp" : homedir());
+
+  test("a 64-char id under a long HOME still yields a within-limit socket path", () => {
+    const root = mkdtempSync(join(base(), "tps-socklen-"));
+    try {
+      const home = join(root, "h".repeat(20));
+      mkdirSync(home, { recursive: true });
+      const dir = createPrivateLaunchDir({ home, agentId: "a".repeat(64) });
+      expect(Buffer.byteLength(dir.sockPath)).toBeLessThanOrEqual(SUN_PATH_BUDGET);
+      expect(dir.root).toContain("a".repeat(16)); // the shortened label
+      expect(existsSync(dir.root)).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a HOME too long for even the shortened label refuses LOUDLY, naming the length", () => {
+    const root = mkdtempSync(join(base(), "tps-socklen2-"));
+    try {
+      const home = join(root, "h".repeat(120));
+      mkdirSync(home, { recursive: true });
+      expect(() => createPrivateLaunchDir({ home, agentId: "a".repeat(64) })).toThrow(
+        /sun_path.*bytes/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("4g — the pin record survives a checkout path with a space", () => {
+  test("moduleDir DECODES %20/%23 (URL.pathname would keep them and skip the pin)", () => {
+    expect(moduleDir("file:///tmp/My%20Projects/dist/launch-attestation.js")).toBe(
+      "/tmp/My Projects/dist",
+    );
+    expect(moduleDir("file:///tmp/a%23b/dist/x.js")).toBe("/tmp/a#b/dist");
+    // ...and the real candidates never carry a percent-escape.
+    const candidates = pinRecordCandidates("/usr/local/bin/nono", {} as NodeJS.ProcessEnv);
+    expect(candidates.some((c) => c.includes("%2"))).toBe(false);
   });
 });

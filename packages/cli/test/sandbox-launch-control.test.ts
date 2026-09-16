@@ -28,7 +28,7 @@ import {
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
@@ -70,6 +70,19 @@ describe("T2 — env bypass gone / --no-sandbox is TTY-only", () => {
     expect(out).toContain("interactive tty");
     expect(r.status).toBe(78);
   });
+
+  test("TPS_FORCE_NO_NONO=1 cannot rescue a sandbox-required launch (no --no-sandbox masking it)", () => {
+    // cli#350 r4g — without --no-sandbox the previous T2 only proved the flag
+    // refusal; this proves the env bypass is gone for a plain sandbox-required
+    // launch: the control does not refuse for a flag reason, the env var does
+    // not disable it, and the launch proceeds to the config check (exit 1).
+    const r = runLauncher(["agent", "start", "--id", "ghost", SANDBOX_REQUIRED], {
+      TPS_FORCE_NO_NONO: "1",
+    });
+    const out = output(r);
+    expect(out).not.toContain(`${SANDBOX_REQUIRED} is required`);
+    expect(r.status).toBe(1); // reached the config check → not refused by the control
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -102,7 +115,10 @@ describe("T3 — missing --sandbox-required is refused in non-TTY", () => {
 
 describe("T5 — the pinned-path launch spawns nono and the child argv asserts the flags", () => {
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
-    const home = mkdtempSync(join(tmpdir(), "tps-reexec-argv-"));
+    // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
+    // sit inside that grant and the overlap assert would refuse before spawning.
+    const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+    const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");
       const profileDir = join(home, ".config", "nono", "profiles");
@@ -142,7 +158,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
         "#!/usr/bin/env bash",
         'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
         'if [ "${1:-}" = "profile" ]; then exit 0; fi',
-        `echo "NONO-ARGV $*" >> ${JSON.stringify(logPath)}`,
+        'echo "NONO-ARGV $*" >> "${NONO_ARGV_LOG:?}"',
         "exit 0",
         "",
       ].join("\n");
@@ -159,6 +175,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
           HOME: home,
           TMPDIR: join(home, "tmp"),
           NONO_BIN: shimPath,
+          NONO_ARGV_LOG: logPath,
           TPS_LAUNCH_TIMEOUT_MS: "1500",
         },
       });
@@ -168,6 +185,10 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       expect(log).toContain("--sandboxed");
       expect(log).toContain(SANDBOX_REQUIRED);
       expect(log).toContain("agent start --id probe");
+      // cli#350 r4g — /tmp is granted IN ADDITION to the configured TMPDIR
+      // (bun's temp dir is /tmp regardless of TMPDIR).
+      expect(log).toContain(`--allow ${join(home, "tmp")}`);
+      expect(log).toContain("--allow /tmp");
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

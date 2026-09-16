@@ -20,7 +20,6 @@ import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFil
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
 import {
-  findNono,
   runCommandUnderNono,
   isNonoStrict,
   isInteractiveTty,
@@ -817,8 +816,11 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
         // The pinned ABSOLUTE path (never PATH) — the same resolution the
         // launcher performs, so the decision to launch and the launch itself
-        // cannot disagree about which nono is in play (cli#350 round 4e).
-        const nonoAvailable = resolveNonoBinary().bin ?? findNono();
+        // cannot disagree about which nono is in play (cli#350 round 4e). Using
+        // the pinned resolution here too (cli#350 r4g) means a PATH-only nono
+        // cannot make this look available and then skip the actionable
+        // "Install nono >= 0.70 or set NONO_BIN" refusal below.
+        const nonoAvailable = resolveNonoBinary().bin;
 
         if (sandboxed) {
           // Already inside the launcher's nono session — skip re-exec, proceed
@@ -885,7 +887,12 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 // Exactly this agent's own identity files, not the shared
                 // identity directory (cli#351 r4).
                 readFiles: harnessReadFiles(launchId),
-                allow: [mailDir, tmpDir, config.workspace, agentDir],
+                // Bun's own temp dir is /tmp regardless of TMPDIR, and an
+                // unreadable temp dir is fatal to it — grant BOTH /tmp and the
+                // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
+                // to /var/folders/…, so /tmp would otherwise not be granted at
+                // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
+                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir])],
               },
               relaunch,
             );
