@@ -46,7 +46,6 @@ let origPath: string;
 let origHome: string | undefined;
 let origNonoStrict: string | undefined;
 let origNonoActive: string | undefined;
-let origForceNoNono: string | undefined;
 
 /** Spawn tps with fake nono on PATH and our env overrides. */
 function runTps(
@@ -71,14 +70,26 @@ function runTps(
 }
 
 /**
- * PATH without the fake nono dir — node and system tools still available,
- * but `which nono` returns nothing, simulating nono not installed.
+ * PATH with a `which` shim that reports nono as absent — simulates "nono not
+ * installed" without any env escape hatch. The old `TPS_FORCE_NO_NONO` bypass
+ * was removed in cli#341 S1a, so tests can no longer flip an env var; they hide
+ * nono from `which` instead (node/bun resolve `which` via the passed PATH).
  */
 function pathWithoutNono(): string {
-  // Rather than trying to mangle PATH (which fails because the real nono
-  // or other binaries might still be found), we use the escape hatch.
-  process.env.TPS_FORCE_NO_NONO = "1";
-  return process.env.PATH ?? "";
+  const shimDir = join(tmpDir, "no-nono-shim");
+  mkdirSync(shimDir, { recursive: true });
+  const whichShim = join(shimDir, "which");
+  writeFileSync(
+    whichShim,
+    [
+      "#!/bin/sh",
+      'for a in "$@"; do [ "$a" = "nono" ] && exit 1; done',
+      'exec /usr/bin/which "$@"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 }
+  );
+  return `${shimDir}:${process.env.PATH ?? ""}`;
 }
 
 function readLog(): string {
@@ -93,7 +104,6 @@ beforeEach(() => {
   origHome = process.env.HOME;
   origNonoStrict = process.env.TPS_NONO_STRICT;
   origNonoActive = process.env.TPS_NONO_ACTIVE;
-  origForceNoNono = process.env.TPS_FORCE_NO_NONO;
   process.env.HOME = tmpDir; // prevent cross-test HOME pollution
 });
 
@@ -105,8 +115,6 @@ afterEach(() => {
   else delete process.env.TPS_NONO_STRICT;
   if (origNonoActive !== undefined) process.env.TPS_NONO_ACTIVE = origNonoActive;
   else delete process.env.TPS_NONO_ACTIVE;
-  if (origForceNoNono !== undefined) process.env.TPS_FORCE_NO_NONO = origForceNoNono;
-  else delete process.env.TPS_FORCE_NO_NONO;
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -174,7 +182,6 @@ describe("hire: re-exec guard", () => {
     const r = runTps(["hire", "developer"], {
       PATH: pathWithoutNono(),
       TPS_NONO_STRICT: "1",
-      TPS_FORCE_NO_NONO: "1",
     });
     expect(r.status).not.toBe(0);
     expect(r.stderr ?? "").toContain("TPS_NONO_STRICT");
@@ -183,7 +190,6 @@ describe("hire: re-exec guard", () => {
   test("warns and continues when nono unavailable (non-strict)", () => {
     const r = runTps(["hire", "developer", "--dry-run"], {
       PATH: pathWithoutNono(),
-      TPS_FORCE_NO_NONO: "1",
     });
     // Should warn but proceed; stderr has the nono warning
     expect(r.stderr ?? "").toContain("nono not found");
@@ -226,7 +232,6 @@ describe("roster: re-exec guard", () => {
     const r = runTps(["roster"], {
       PATH: pathWithoutNono(),
       TPS_NONO_STRICT: "1",
-      TPS_FORCE_NO_NONO: "1",
     });
     expect(r.status).not.toBe(0);
     expect(r.stderr ?? "").toContain("TPS_NONO_STRICT");
@@ -311,7 +316,6 @@ describe("review: re-exec guard", () => {
     const r = runTps(["review", "testbot", "--config", configPath], {
       PATH: pathWithoutNono(),
       TPS_NONO_STRICT: "1",
-      TPS_FORCE_NO_NONO: "1",
     });
     expect(r.status).not.toBe(0);
     expect(r.stderr ?? "").toContain("TPS_NONO_STRICT");

@@ -21,6 +21,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---- Port scanning ----
 
@@ -177,6 +178,7 @@ export function generateOfficePlist(params: OfficePlistParams): string {
     <string>office</string>
     <string>connect</string>
     <string>${params.name}</string>
+    <string>${SANDBOX_REQUIRED_FLAG}</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -185,14 +187,30 @@ export function generateOfficePlist(params: OfficePlistParams): string {
   <key>RunAtLoad</key>
   <true/>
 
+  <!--
+    KEEPALIVE COUPLING (cli#341 S1a): {SuccessfulExit:false} is ONLY safe with
+    "the launcher logs the refusal and exits 0". {SuccessfulExit:false} restarts on
+    a non-zero exit — a refusal's exit 78 would give 13 relaunches in 12 s — so
+    the launcher exits 0 on a refusal when TPS_SUPERVISED=1 (below). A genuine
+    crash (non-zero/signal) still relaunches; a refused unit goes quiet.
+  -->
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
 
   <key>StandardOutPath</key>
   <string>${join(logDir, `office-${params.name}.log`)}</string>
 
   <key>StandardErrorPath</key>
   <string>${join(logDir, `office-${params.name}.error.log`)}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TPS_SUPERVISED</key>
+    <string>1</string>
+  </dict>
 </dict>
 </plist>
 `;

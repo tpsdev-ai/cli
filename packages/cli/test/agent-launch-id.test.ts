@@ -33,7 +33,10 @@ function setup(configAgentId: string): { home: string; configPath: string; clean
 }
 
 function runStart(args: string[], home: string) {
-  return spawnSync("bun", [TPS_BIN, "agent", "start", ...args], {
+  // `--sandbox-required`: every non-TTY launch through `agent start` must assert
+  // it (cli#341 S1a) — the launch-path control refuses the invocation outright
+  // otherwise, before the id checks below ever run.
+  return spawnSync("bun", [TPS_BIN, "agent", "start", "--sandbox-required", ...args], {
     encoding: "utf-8",
     timeout: 4000,
     killSignal: "SIGKILL",
