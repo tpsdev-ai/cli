@@ -1,13 +1,12 @@
 import React, { useState, useEffect } from "react";
 import { render, Text, Box } from "ink";
-import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { parseTPSReport } from "../schema/report.js";
 import { getGenerator, type Runtime, VALID_RUNTIMES } from "../generators/registry.js";
 import { randomQuip, resolveReportPath } from "../utils/output.js";
-import { findNono, isNonoStrict, buildNonoArgs } from "../utils/nono.js";
+import { findNono, isNonoStrict, runCommandUnderNono } from "../utils/nono.js";
 import { injectAgent } from "../utils/config-inject.js";
 import { findOpenClawConfig } from "../utils/config.js";
 import { sendMessage } from "../utils/mail.js";
@@ -262,12 +261,9 @@ export function runHire(args: HireProps) {
     const nono = findNono();
     if (nono) {
       const workdir = args.workspace ? resolve(args.workspace) : undefined;
-      const nonoArgs = buildNonoArgs("tps-hire", { workdir }, process.argv);
-      const result = spawnSync(nono, nonoArgs, {
-        stdio: "inherit",
-        env: { ...process.env, TPS_NONO_ACTIVE: "1" },
-      });
-      process.exit(result.status ?? 1);
+      // One validated launch path: runCommandUnderNono validates the profile
+      // (checkProfileLoadable → EX_CONFIG on missing/invalid) before running.
+      process.exit(runCommandUnderNono("tps-hire", { workdir }, process.argv));
     } else if (isNonoStrict()) {
       console.error(
         "❌ nono is not installed but TPS_NONO_STRICT=1. Install nono: https://nono.sh"

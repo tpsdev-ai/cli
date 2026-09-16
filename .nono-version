@@ -1,0 +1,11 @@
+# nono pin — the single source of truth for docker/Dockerfile.
+#
+# `version` is INFORMATIONAL only: the human-readable release the commit below
+# was tagged as. Nothing is fetched or built from it.
+# `commit` is THE PIN: the full 40-hex commit that tag v0.74.0 points at. A
+# commit id is itself a content hash, so it is the immutable thing the
+# Dockerfile checks out and verifies with `git rev-parse HEAD`.
+#
+# cli#341 S1's CI gate reads `commit` from this same file.
+version=0.74.0
+commit=bc1406e9ceb0b765d303a015502fade11f3858f5

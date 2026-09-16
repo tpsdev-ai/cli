@@ -19,7 +19,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
-import { findNono, runCommandUnderNono, isNonoStrict } from "../utils/nono.js";
+import { findNono, runCommandUnderNono, isNonoStrict, harnessReadPaths, harnessReadFiles } from "../utils/nono.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
@@ -755,6 +755,28 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
+
+      // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
+      // workload can rewrite (`agentDir` is granted r+w, so the agent can edit
+      // its own agent.yaml). Derive it from the validated `--id`, and require
+      // the config to agree (a config that disagrees is tampered or misbuilt).
+      // Charset + traversal check mirrors agentStatus's, via the wire-mail
+      // SAFE_ID shape.
+      const launchId = args.id ?? config.agentId;
+      if (!/^[a-zA-Z0-9._-]{1,64}$/.test(launchId) || launchId.includes("..")) {
+        console.error(
+          `Invalid agent id (${args.id ? "--id" : "config.agentId"}): ${launchId} — must match ^[a-zA-Z0-9._-]{1,64}$ and contain no traversal`,
+        );
+        process.exit(1);
+      }
+      if (args.id && config.agentId !== args.id) {
+        console.error(
+          `❌ agent.yaml agentId '${config.agentId}' does not match the launch id '${args.id}' — refusing to launch (cli#351 r5)`,
+        );
+        process.exit(1);
+      }
+      // The runtime's own key resolution (this same value) is now the validated id.
+      config.agentId = launchId;
       if (config.flair) {
         const flair = createFlairClient(
           config.agentId,
@@ -795,10 +817,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             console.warn("⚠️  nono not found — starting WITHOUT sandbox isolation. Pass --sandbox after installing nono.");
           } else {
             // Re-exec this process under nono with tps-agent-run profile
-            const identityDir = join(homedir(), ".tps", "identity");
             const mailDir = join(homedir(), ".tps", "mail");
-            const agentDir = join(homedir(), ".tps", "agents", config.agentId);
-            const bunDir = join(homedir(), ".bun");
+            const agentDir = join(homedir(), ".tps", "agents", launchId);
             const tmpDir = process.env.TMPDIR ?? "/tmp";
             // Carry the launch-control assertion verbatim into the re-exec child.
             // The child is a non-TTY context too: if it does not carry
@@ -821,8 +841,15 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               "tps-agent-run",
               {
                 workdir: config.workspace,
-                // System-wide read: bun needs macOS dylibs/frameworks, read-only is safe
-                read: [identityDir, bunDir, "/"],
+                // CHANGE (cli#341 S1b): this used to grant a read of the
+                // filesystem root. A root grant is refused outright by nono
+                // 0.70+ (exit 1). Use the explicit toolchain read set instead —
+                // the macOS roots Kern validated, and their Linux equivalents
+                // (systemReadPaths()).
+                read: harnessReadPaths(),
+                // Exactly this agent's own identity files, not the shared
+                // identity directory (cli#351 r4).
+                readFiles: harnessReadFiles(launchId),
                 allow: [mailDir, tmpDir, config.workspace, agentDir],
               },
               relaunch,

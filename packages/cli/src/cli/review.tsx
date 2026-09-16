@@ -1,11 +1,10 @@
 import React from "react";
 import { render, Text, Box } from "ink";
-import { spawnSync } from "node:child_process";
 import { resolveConfigPath, readOpenClawConfig, getAgentList, resolveWorkspace } from "../utils/config.js";
 import { existsSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { formatBytes, randomQuip } from "../utils/output.js";
-import { findNono, isNonoStrict, buildNonoArgs, type NonoProfile } from "../utils/nono.js";
+import { findNono, isNonoStrict, runCommandUnderNono, type NonoProfile } from "../utils/nono.js";
 import { getAgentInfo } from "../utils/agent-info.js";
 
 interface ReviewProps {
@@ -164,12 +163,9 @@ export function runReview(args: ReviewProps) {
     const profile: NonoProfile = args.deep ? "tps-review-deep" : "tps-review-local";
     const nono = findNono();
     if (nono) {
-      const nonoArgs = buildNonoArgs(profile, { workdir: agentWorkspace }, process.argv);
-      const result = spawnSync(nono, nonoArgs, {
-        stdio: "inherit",
-        env: { ...process.env, TPS_NONO_ACTIVE: "1" },
-      });
-      process.exit(result.status ?? 1);
+      // One validated launch path: runCommandUnderNono validates the profile
+      // (checkProfileLoadable → EX_CONFIG on missing/invalid) before running.
+      process.exit(runCommandUnderNono(profile, { workdir: agentWorkspace }, process.argv));
     } else if (isNonoStrict()) {
       console.error(
         "❌ nono is not installed but TPS_NONO_STRICT=1. Install nono: https://nono.sh"

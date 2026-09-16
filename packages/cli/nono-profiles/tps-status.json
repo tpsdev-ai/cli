@@ -1,0 +1,32 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-status",
+    "version": "2.0.0",
+    "description": "Agent status/heartbeat updates and dashboard reads for sandbox-safe host reporting. Narrowing: no system-write groups (roster/status never write outside ~/.tps/status). Linux note: Landlock cannot express deny-within-allow, so a deny nested inside an allowed parent makes nono refuse to start (it will not silently weaken the deny) \u2014 keep every deny at or above the allow roots. Matters for the exe.dev profiles (ops-mxf9). Never grant the state root: ~/.tps/secrets and ~/.tps/identity are siblings of the mailbox and agent state, so a grant or deny at ~/.tps level takes the mailbox and agent state with it."
+  },
+  "groups": {
+    "exclude": [
+      "system_write_macos",
+      "system_write_linux",
+      "user_tools"
+    ]
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": [
+      "/workspace",
+      "~/.tps/status"
+    ]
+  },
+  "network": {
+    "block": false,
+    "allow_domain": [
+      "127.0.0.1",
+      "localhost"
+    ]
+  }
+}

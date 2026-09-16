@@ -1,0 +1,24 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-agent-run",
+    "version": "2.0.0",
+    "description": "TPS agent runtime \u2014 the profile the supervisor and `tps agent start` launch an OpenClaw agent under. Reads the system toolchain, writes only its workspace (workdir) plus the paths the CLI grants at launch, full network (API provider + Discord). Agent-side profile: it carries neither bypass_protection nor read_file. Linux note: Landlock cannot express deny-within-allow, so a deny nested inside an allowed parent makes nono refuse to start (it will not silently weaken the deny) \u2014 keep every deny at or above the allow roots. Matters for the exe.dev profiles (ops-mxf9). Never grant the state root: ~/.tps/secrets and ~/.tps/identity are siblings of the mailbox and agent state, so a grant or deny at ~/.tps level takes the mailbox and agent state with it."
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "read": [
+      "/opt/homebrew",
+      "/usr",
+      "/bin",
+      "/sbin",
+      "/Library"
+    ]
+  },
+  "network": {
+    "block": false
+  }
+}

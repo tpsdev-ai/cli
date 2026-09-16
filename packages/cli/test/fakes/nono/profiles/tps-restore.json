@@ -1,0 +1,19 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-restore",
+    "version": "2.0.0",
+    "description": "Restore agent workspace and run post-restore health check."
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": ["/tmp", "/home"]
+  },
+  "network": {
+    "block": false,
+    "allow_domain": ["127.0.0.1", "localhost"]
+  }
+}

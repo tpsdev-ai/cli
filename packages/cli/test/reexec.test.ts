@@ -125,7 +125,7 @@ describe("hire: re-exec guard", () => {
   test("re-execs under tps-hire profile when nono available", () => {
     const r = runTps(["hire", "developer", "--name", "TestBot"]);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
+    expect(log).toContain("tps-hire.json");
     expect(log).toContain("INVOKE");
   });
 
@@ -141,9 +141,9 @@ describe("hire: re-exec guard", () => {
   test("uses tps-hire profile (not roster or review)", () => {
     runTps(["hire", "developer"]);
     const log = readLog();
-    expect(log).toContain("profile=tps-hire");
-    expect(log).not.toContain("profile=tps-roster");
-    expect(log).not.toContain("profile=tps-review");
+    expect(log).toContain("tps-hire.json");
+    expect(log).not.toContain("tps-roster.json");
+    expect(log).not.toContain("tps-review.json");
   });
 
   test("passes --workdir when --workspace is given (path inside ~/.openclaw/)", () => {
@@ -175,7 +175,7 @@ describe("hire: re-exec guard", () => {
     // 'developer' is a built-in persona — should reach nono even though no file
     runTps(["hire", "developer"]);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
+    expect(log).toContain("tps-hire.json");
   });
 
   test("exits non-zero when nono unavailable and strict mode on", () => {
@@ -203,7 +203,7 @@ describe("roster: re-exec guard", () => {
   test("re-execs under tps-roster profile when nono available", () => {
     runTps(["roster"]);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-roster");
+    expect(log).toContain("tps-roster.json");
     expect(log).toContain("INVOKE");
   });
 
@@ -216,9 +216,9 @@ describe("roster: re-exec guard", () => {
   test("uses tps-roster profile (not hire or review)", () => {
     runTps(["roster"]);
     const log = readLog();
-    expect(log).toContain("profile=tps-roster");
-    expect(log).not.toContain("profile=tps-hire");
-    expect(log).not.toContain("profile=tps-review");
+    expect(log).toContain("tps-roster.json");
+    expect(log).not.toContain("tps-hire.json");
+    expect(log).not.toContain("tps-review.json");
   });
 
   test("passes no --workdir (roster is read-only)", () => {
@@ -267,14 +267,14 @@ describe("review: re-exec guard", () => {
   test("re-execs under tps-review-local profile when nono available", () => {
     runTps(["review", "testbot", "--config", configPath]);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-local");
+    expect(log).toContain("tps-review-local.json");
     expect(log).toContain("INVOKE");
   });
 
   test("re-execs under tps-review-deep when --deep is passed", () => {
     runTps(["review", "testbot", "--deep", "--config", configPath]);
     const log = readLog();
-    expect(log).toContain("PROFILE_LOADED profile=tps-review-deep");
+    expect(log).toContain("tps-review-deep.json");
   });
 
   test("skips re-exec when TPS_NONO_ACTIVE=1", () => {
@@ -308,8 +308,8 @@ describe("review: re-exec guard", () => {
   test("uses local profile by default (not deep)", () => {
     runTps(["review", "testbot", "--config", configPath]);
     const log = readLog();
-    expect(log).toContain("profile=tps-review-local");
-    expect(log).not.toContain("profile=tps-review-deep");
+    expect(log).toContain("tps-review-local.json");
+    expect(log).not.toContain("tps-review-deep.json");
   });
 
   test("exits non-zero when nono unavailable and strict mode on", () => {
@@ -350,7 +350,7 @@ describe("hire: S1.5 — workspace path boundary", () => {
     runTps(["hire", "developer", "--workspace", ws]);
     const log = readLog();
     // Validation passed — nono was invoked
-    expect(log).toContain("PROFILE_LOADED profile=tps-hire");
+    expect(log).toContain("tps-hire.json");
   });
 
   test("rejects --workspace equal to ~/.openclaw itself (root pollution guard)", () => {
