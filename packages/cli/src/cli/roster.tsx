@@ -1,10 +1,9 @@
 import React from "react";
 import { render, Text, Box } from "ink";
-import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { resolveConfigPath, readOpenClawConfig, getAgentList, resolveWorkspace } from "../utils/config.js";
 import { randomQuip } from "../utils/output.js";
-import { findNono, isNonoStrict, buildNonoArgs } from "../utils/nono.js";
+import { findNono, isNonoStrict, runCommandUnderNono } from "../utils/nono.js";
 
 interface RosterProps {
   configPath?: string;
@@ -91,12 +90,9 @@ export function runRoster(args: RosterProps = {}) {
     const nono = findNono();
     if (nono) {
       // roster is read-only; no workdir needed
-      const nonoArgs = buildNonoArgs("tps-roster", {}, process.argv);
-      const result = spawnSync(nono, nonoArgs, {
-        stdio: "inherit",
-        env: { ...process.env, TPS_NONO_ACTIVE: "1" },
-      });
-      process.exit(result.status ?? 1);
+      // One validated launch path: runCommandUnderNono validates the profile
+      // (checkProfileLoadable → EX_CONFIG on missing/invalid) before running.
+      process.exit(runCommandUnderNono("tps-roster", {}, process.argv));
     } else if (isNonoStrict()) {
       console.error(
         "❌ nono is not installed but TPS_NONO_STRICT=1. Install nono: https://nono.sh"

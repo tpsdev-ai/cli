@@ -185,16 +185,21 @@ llm:
 });
 
 describe("ops-36: nono profile exists", () => {
-  test("tps-agent-run.toml is present and well-formed", async () => {
+  test("tps-agent-run.json is present, JSON, extends tps-base", async () => {
     const { readFileSync } = await import("node:fs");
     const { join } = await import("node:path");
-    const profilePath = join(import.meta.dir, "../nono-profiles/tps-agent-run.toml");
-    const content = readFileSync(profilePath, "utf-8");
-    expect(content).toContain("[meta]");
-    expect(content).toContain("tps-agent-run");
-    expect(content).toContain("[network]");
-    expect(content).toContain("127.0.0.1");
-    // Must NOT allow outbound internet
-    expect(content).not.toContain("block = false\nallow = []");
+    const profilePath = join(import.meta.dir, "../nono-profiles/tps-agent-run.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf-8"));
+    expect(profile.meta.name).toBe("tps-agent-run");
+    expect(profile.extends).toBe("tps-base");
+    // The agent-side profile reads the explicit toolchain roots, never the root.
+    expect(profile.filesystem.read).toEqual([
+      "/opt/homebrew",
+      "/usr",
+      "/bin",
+      "/sbin",
+      "/Library",
+    ]);
+    expect(profile.filesystem.read).not.toContain("/");
   });
 });

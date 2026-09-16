@@ -1,0 +1,19 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-review-local",
+    "version": "2.0.0",
+    "description": "tps review (default) — reads the named agent workspace plus ~/.openclaw/openclaw.json as metadata. No LLM, no network, no writes: the workspace path is passed by the CLI as --read, and workdir is read-only."
+  },
+  "workdir": {
+    "access": "read"
+  },
+  "filesystem": {
+    "bypass_protection": ["~/.openclaw/openclaw.json"],
+    "read_file": ["~/.openclaw/openclaw.json"]
+  },
+  "network": {
+    "block": true
+  }
+}

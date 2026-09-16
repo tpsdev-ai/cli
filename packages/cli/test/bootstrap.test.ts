@@ -32,7 +32,6 @@ describe("bootstrap command", () => {
     mkdirSync(fakeBin, { recursive: true });
 
     const fakeNonoSource = join(import.meta.dir, "fakes", "nono", "bin", "nono");
-    const fakeProfileSource = join(import.meta.dir, "..", "nono-profiles", "tps-bootstrap.toml");
     copyFileSync(fakeNonoSource, join(fakeBin, "nono"));
 
     writeFileSync(
@@ -52,7 +51,13 @@ exit 0
 
     const profileDir = join(tempRoot, ".config", "nono", "profiles");
     mkdirSync(profileDir, { recursive: true });
-    copyFileSync(fakeProfileSource, join(profileDir, "tps-bootstrap.toml"));
+    // Install the WHOLE profile set: installNonoProfiles validates the full set
+    // and resolves `extends` by name, so a lone child without its parent would
+    // (correctly) abort (cli#351 r3).
+    const profilesSourceDir = join(import.meta.dir, "..", "nono-profiles");
+    for (const f of readdirSync(profilesSourceDir)) {
+      if (f.endsWith(".json")) copyFileSync(join(profilesSourceDir, f), join(profileDir, f));
+    }
   });
 
   afterEach(() => {

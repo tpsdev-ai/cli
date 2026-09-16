@@ -104,6 +104,53 @@ jobs:
       - name: Smoke test
         run: ./packages/cli/dist/tps-smoke --version
 
+  # cli#341 S1b: the nono profile gate is a durable control — wired into CI on
+  # both Linux and macOS against the S4-pinned nono build. The commit comes from
+  # .nono-version when present (coordinated with cli#345; not duplicated), else
+  # the literal pin. Absent/too-old nono makes the gate fail loudly by design.
+  nono-profile-gate:
+    name: nono profile gate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - name: Resolve the pinned nono commit
+        id: pin
+        run: |
+          commit="$(sed -n 's/^commit=//p' .nono-version 2>/dev/null | head -n1)"
+          [ -n "$commit" ] || commit="bc1406e9ceb0b765d303a015502fade11f3858f5"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Cache the pinned nono build
+        id: nono-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.local/nono-pin
+          key: nono-${{ matrix.os }}-${{ steps.pin.outputs.commit }}
+      - name: Build the pinned nono (cache miss)
+        if: steps.nono-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          commit="${{ steps.pin.outputs.commit }}"
+          mkdir -p "$HOME/.local/nono-pin"
+          rm -rf "$RUNNER_TEMP/nono"
+          git clone --filter=blob:none https://github.com/nolabs-ai/nono "$RUNNER_TEMP/nono"
+          git -C "$RUNNER_TEMP/nono" checkout "$commit"
+          test "$(git -C "$RUNNER_TEMP/nono" rev-parse HEAD)" = "$commit"
+          cd "$RUNNER_TEMP/nono"
+          cargo build --release -p nono-cli
+          cp target/release/nono "$HOME/.local/nono-pin/nono"
+      - name: Run the profile gate against the pinned nono
+        run: NONO_BIN="$HOME/.local/nono-pin/nono" ./scripts/check-nono-profiles.sh
+
   # SAST (Static Application Security Testing) using Semgrep.
   # Semgrep scans the codebase for security vulnerabilities, hardcoded secrets, and bad practices
   # using pattern matching. It is fast and catches common mistakes.

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-hire",
+    "version": "2.0.0",
+    "description": "tps hire — agent workspace scaffolding. Least privilege: writes only the target workspace (workdir). No network: templates are bundled."
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "network": {
+    "block": true
+  }
+}

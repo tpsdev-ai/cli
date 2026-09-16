@@ -1,0 +1,22 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-status",
+    "version": "2.0.0",
+    "description": "Agent status/heartbeat updates and dashboard reads for sandbox-safe host reporting. Narrowing: no system-write groups (roster/status never write outside ~/.tps/status)."
+  },
+  "groups": {
+    "exclude": ["system_write_macos", "system_write_linux", "user_tools"]
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": ["/workspace", "~/.tps/status"]
+  },
+  "network": {
+    "block": false,
+    "allow_domain": ["127.0.0.1", "localhost"]
+  }
+}

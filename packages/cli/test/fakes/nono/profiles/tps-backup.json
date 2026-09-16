@@ -1,0 +1,18 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-base",
+  "meta": {
+    "name": "tps-backup",
+    "version": "2.0.0",
+    "description": "Backup agent workspace for portability and recovery."
+  },
+  "workdir": {
+    "access": "readwrite"
+  },
+  "filesystem": {
+    "allow": ["/workspace", "/tmp", "/home"]
+  },
+  "network": {
+    "block": true
+  }
+}
