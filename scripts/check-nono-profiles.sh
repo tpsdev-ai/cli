@@ -196,6 +196,10 @@ else
     local label="$1"; shift
     if env "${SBOX_ENV[@]}" HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${LAUNCH[@]}" -- "$@" >"${TMP}/smoke.log" 2>&1; then
       ok "workload: ${label}"
+      # Self-documenting green lane: a fetch workload reports the status it saw.
+      local _line
+      _line="$(grep -m1 -E '^fetch (status|error)' "${TMP}/smoke.log" 2>/dev/null || true)"
+      [[ -z "${_line}" ]] || echo "  ·   ${_line}"
     else
       # Show the COMMAND's own error line (git's "fatal: …"), not just the exit
       # code: the lane log must make the cause readable (cli#351 r5b). A denial
@@ -203,8 +207,12 @@ else
       # FIRST and the fatal line after it, so look for the fatal line ahead of
       # the denial, and fall back to nono's report tail.
       local detail
-      detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):' "${TMP}/smoke.log" 2>/dev/null || true)"
-      [[ -n "${detail}" ]] || detail="$(grep -m1 -E 'denied|Permission denied|Operation not permitted|Name or service not known' "${TMP}/smoke.log" 2>/dev/null || true)"
+      # The workload's OWN line first, including the HTTP status a fetch prints
+      # (cli#352 r2): quoting nono's denial block instead hid a 403 from
+      # api.github.com's anonymous per-IP rate limit behind "3 paths blocked",
+      # whose paths are just bun walking up from the cwd (benign, see 5b).
+      detail="$(grep -m1 -E '(^|[[:space:]])(fatal|error):|^fetch (status|error)|^Exception' "${TMP}/smoke.log" 2>/dev/null || true)"
+      [[ -n "${detail}" ]] || detail="$(grep -m1 -E 'denied|Permission denied|Operation not permitted|Name or service not known|Could not resolve' "${TMP}/smoke.log" 2>/dev/null || true)"
       # nono names the BLOCKED PATH only in its denial block — quote it, or a red
       # lane is unreadable (cli#351 r5c: the macOS fetch failure hid its path).
       [[ -n "${detail}" ]] || detail="$(grep -A4 -m1 'Sandbox denial' "${TMP}/smoke.log" 2>/dev/null | tr '\n' ' ')"
@@ -225,6 +233,12 @@ else
   # ── 5b. the workloads ─────────────────────────────────────────────────────
   # The child's stderr is merged into its stdout (2>&1) so git's own "fatal:"
   # line survives into the log the ❌ message quotes.
+  #
+  # EXPECTED, BENIGN: bun walks up from the cwd looking for bunfig.toml /
+  # package.json, so nono's summary can list the cwd's PARENT dirs as blocked
+  # reads (/Users, /Users/runner, the probe dir on macOS). Those are not
+  # sandbox failures — each workload above is judged by its OWN exit status.
+  echo "  · expected (benign) denials: parent-dir reads while bun walks up from the cwd (/Users, the probe dir) — never a failure by itself"
   smoke "shell redirect to /dev/null" sh -c ': >/dev/null'
   # `getent` is Linux-only (macOS has no getent); fall back to the resolver
   # itself so the SAME check runs on both lanes (cli#351 r5b).
@@ -234,7 +248,24 @@ else
     smoke "dns lookup github.com (no getent on macOS)" bun -e 'require("node:dns").lookup("github.com",(e)=>process.exit(e?1:0))'
   fi
   smoke "git ls-remote over https" sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1'
-  smoke "fetch https://api.github.com/zen" bun -e 'fetch("https://api.github.com/zen").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))'
+  # The egress workload must be able to fail ONLY for sandbox reasons. It used
+  # to hit api.github.com, whose anonymous per-IP limit (60/h, and runner IPs
+  # are shared) answers 403 → r.ok false → the workload exited 1 while the
+  # sandbox was fine (cli#352 r2: the macOS lane). Ping an endpoint with no
+  # anonymous rate limit instead, and PRINT the status/error so a red lane
+  # names the cause rather than nono's (benign) denial summary.
+  smoke "fetch https://registry.npmjs.org/-/ping" bun -e '
+    const url = "https://registry.npmjs.org/-/ping";
+    try {
+      const r = await fetch(url);
+      const body = (await r.text()).replace(/\s+/g, " ").slice(0, 60);
+      console.log(`fetch status ${r.status} ${r.statusText} body=${body}`);
+      process.exit(r.ok ? 0 : 1);
+    } catch (e) {
+      console.log(`fetch error ${e.name}: ${e.message}`);
+      process.exit(1);
+    }
+  '
 
   # ── 5c. mechanism probe: does nono resolve a symlinked --read-file? ────────
   # Informational. Ubuntu's /etc/resolv.conf is a symlink into /run; this shows
