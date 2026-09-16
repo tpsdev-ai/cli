@@ -111,6 +111,17 @@ describe("the read set replaces `--read /`", () => {
     expect(systemReadPaths()).not.toContain("/etc");
   });
 
+  test("systemReadFiles() grants the system git config — unreadable is FATAL to git (cli#351 r5b)", () => {
+    const files = systemReadFiles();
+    // /etc/gitconfig is granted where it exists: git reads it as part of
+    // "reading the configuration files", and an unreadable one exits 128.
+    if (existsSync("/etc/gitconfig")) expect(files).toContain("/etc/gitconfig");
+    // every entry is filtered to a path that exists (no warned-and-skipped grant)
+    for (const f of files) expect(existsSync(f)).toBe(true);
+    expect(files).toContain("/etc/hosts");
+    expect(files).toContain("/etc/resolv.conf");
+  });
+
   test("buildNonoArgs emits --read-file for a single-file read grant", () => {
     const args = buildNonoArgs("tps-agent-run", { readFiles: ["/x/agent1.key"] }, ["echo"]);
     expect(args).toContain("--read-file");

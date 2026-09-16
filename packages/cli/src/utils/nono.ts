@@ -202,11 +202,25 @@ export function systemReadPaths(): string[] {
 }
 
 /** System FILES the harness reads (nono `--read-file`), where /etc as a whole
- * cannot be granted on Linux (see above). */
+ * cannot be granted on Linux (see above), filtered to what exists on this host
+ * (a --read-file on an absent path is skipped by nono with a warning).
+ *
+ * `/etc/gitconfig` is the SYSTEM git config (cli#351 r5b): where it exists,
+ * git reads it as part of "reading the configuration files", and an unreadable
+ * one is FATAL, not ignorable — on the ubuntu CI runner `git ls-remote` died
+ * with `warning: unable to access '/etc/gitconfig': Permission denied` +
+ * `fatal: unknown error occurred while reading the configuration files`
+ * (exit 128) while the same command passed on macOS (no /etc/gitconfig; the
+ * homebrew git's config sits under the granted /opt/homebrew). The probe in
+ * scripts/check-nono-profiles.sh pins this: the resolver is fine inside the
+ * sandbox (resolv.conf's /run/stub target is readable and `getent hosts
+ * github.com` resolves) — the missing grant is this file. */
 export function systemReadFiles(): string[] {
-  return process.platform === "darwin"
-    ? ["/etc/hosts", "/etc/resolv.conf"]
-    : ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf"];
+  const wanted =
+    process.platform === "darwin"
+      ? ["/etc/hosts", "/etc/resolv.conf", "/etc/gitconfig"]
+      : ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/gitconfig"];
+  return wanted.filter((f) => existsSync(f));
 }
 
 /**

@@ -228,6 +228,43 @@ else
   }
   if sym_read; then echo "  · symlink with NO grant: readable (unexpected — fixture dir is inside a grant?)"; else echo "  · symlink with NO grant: DENIED (control: the fixture dir is outside every grant)"; fi
   if sym_read --read-file "${SYM_DIR}/resolv.conf"; then echo "  · symlink-only --read-file: ALLOWED (nono resolves the grant's symlink itself)"; else echo "  · symlink-only --read-file: DENIED (the target needs granting too)"; fi
+
+  # ── 5d. fails-first: the gitconfig grant is what saves git (cli#351 r5b) ─────
+  # On a host WITH /etc/gitconfig, git reads it as part of "reading the
+  # configuration files" — drop the grant and git dies (exit 128); the workload
+  # above is the "after".
+  if [[ -e /etc/gitconfig ]]; then
+    NO_GC=(); _i=0
+    while (( _i < ${#LAUNCH[@]} )); do
+      if [[ "${LAUNCH[$_i]}" == "--read-file" && "${LAUNCH[$((_i + 1))]}" == "/etc/gitconfig" ]]; then _i=$((_i + 2)); continue; fi
+      NO_GC+=("${LAUNCH[$_i]}"); _i=$((_i + 1))
+    done
+    if HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 "${NONO_BIN}" "${NO_GC[@]}" -- \
+      sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1' >"${TMP}/nogitcfg.log" 2>&1; then
+      echo "  · fails-first: gitconfig grant removed but git still succeeded (unexpected on this host)"
+    else
+      echo "  · fails-first: gitconfig grant removed → $(grep -m1 -E 'fatal:|Permission denied' "${TMP}/nogitcfg.log" | tr '\n' ' ')"
+    fi
+  else
+    # No /etc/gitconfig on this host: reproduce the SAME mechanism portably by
+    # pointing GIT_CONFIG_SYSTEM at an ungranted synthetic config — identical
+    # warning + fatal, and the same --read-file grant clears it. This is what
+    # the ubuntu lane hits for real.
+    GC_DIR="${TMP}/gitcfg"; mkdir -p "${GC_DIR}"
+    printf '[core]\n\tautocrlf = false\n' >"${GC_DIR}/gitconfig"
+    gc_run() { # <extra launch flags...>
+      HOME="${TMP}/home" NONO_NO_UPDATE_CHECK=1 GIT_CONFIG_SYSTEM="${GC_DIR}/gitconfig" \
+        "${NONO_BIN}" "${LAUNCH[@]}" "$@" -- sh -c 'git ls-remote https://github.com/tpsdev-ai/cli HEAD 2>&1'
+    }
+    if gc_run >"${TMP}/gc-no.log" 2>&1; then
+      fail "fails-first: git SUCCEEDED with an ungranted system config (mechanism not reproduced)"
+    else
+      ok "fails-first: ungranted system config → $(grep -m1 -E 'fatal:|Permission denied' "${TMP}/gc-no.log" | tr '\n' ' ')"
+    fi
+    gc_run --read-file "${GC_DIR}/gitconfig" >"${TMP}/gc-yes.log" 2>&1 \
+      && ok "the system-config --read-file grant clears it (git ls-remote succeeds)" \
+      || fail "granted system config still failed: $(tail -n 1 "${TMP}/gc-yes.log")"
+  fi
 fi
 
 echo "✅ nono profile gate passed (nono ${VERSION}, ${#json_files[@]} profiles, enforcement + workload verified)"
