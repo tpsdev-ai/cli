@@ -89,16 +89,22 @@ jobs:
           docker run --rm --entrypoint sh tps-office-verify:latest -c 'test -f /usr/local/bin/nono && test ! -L /usr/local/bin/nono'
           rm -f ./nono-from-image
 
-      # cli#352 r3 — the ship-red control (S1b/S4 "harness green, ship red"
+      # cli#352 r3/r4 — the ship-red control (S1b/S4 "harness green, ship red"
       # class). The byte smoke above proves the binary's BYTES; this proves the
       # IMAGE can actually run an office agent. It runs the built image itself
-      # with a one-agent fixture roster and asserts: (1) the bundled profiles
+      # with a one-agent fixture roster and NO stand-in for tps-agent: the
+      # supervisor's `check` pre-flight AND its `start` launch both run the
+      # SHIPPED /usr/local/bin/tps-agent. Assertions: (1) the bundled profiles
       # exist in the image at the path the supervisor resolves (a Dockerfile
       # that forgets the COPY is red), (2) nono loads tps-office BY PATH there
-      # and the sandbox engages (exit 0), (3) the supervisor's Landlock probe
-      # passes end to end — the fixture agent is really launched under nono and
-      # leaves its marker. No profile override is passed, so the assertion
-      # cannot be satisfied by the harness supplying the profiles.
+      # and the sandbox engages (exit 0), (3) the supervisor's pre-flight passes
+      # against the shipped agent and the fixture agent really runs under nono —
+      # readiness is the agent's OWN signal, the pid file `tps-agent start`
+      # writes — and (4) the supervisor exits 0. An image whose agent predates
+      # `check` (the published 0.5.4) goes red on (3): the supervisor refuses
+      # with its named pre-flight message, printed from /tmp/sup.log. No profile
+      # override is passed, so (1)-(3) cannot be satisfied by the harness
+      # supplying the profiles.
       - name: Launch control — the built image resolves its profile and launches an agent
         run: |
           set -eux
@@ -107,24 +113,14 @@ jobs:
           # must still be able to traverse into its workspace, so widen the mount
           # root (nothing secret lives here — it is a smoke fixture).
           chmod 755 "$fx"
-          mkdir -p "$fx/.tps/identity" "$fx/smoke/bin"
+          mkdir -p "$fx/.tps/identity" "$fx/smoke"
           printf '[{"id":"smoke","configPath":"/workspace/smoke/agent.yaml"}]\n' >"$fx/.tps/team.json"
           printf 'agentId: smoke\nname: smoke\nworkspace: /workspace/smoke\nmailDir: /workspace/smoke/mail\nllm:\n  provider: ollama\n  model: x\n' >"$fx/smoke/agent.yaml"
           printf 'KEY' >"$fx/.tps/identity/smoke.key"
           printf 'PUB' >"$fx/.tps/identity/smoke.pub"
-          # Stand-in for tps-agent: the npm-published agent predates the `check`
-          # pre-flight the supervisor calls, and what is under test here is the
-          # supervisor's launch path, not the published agent. `start` leaves a
-          # marker the in-container script waits for.
-          cat >"$fx/smoke/bin/tps-agent" <<'AGENT'
-          #!/usr/bin/env bash
-          case "${1:-}" in
-            check) exit 0 ;;
-            start) printf 'AGENT-UP\n' >>/workspace/smoke/.marker; sleep 5 ;;
-            *) echo "fixture tps-agent: unsupported $1" >&2; exit 2 ;;
-          esac
-          AGENT
-          chmod +x "$fx/smoke/bin/tps-agent"
+          # NO tps-agent shim: the supervisor calls the SHIPPED binary for both
+          # `check` and `start`, and readiness is the pid file the real agent
+          # writes (see (3)).
           cat >"$fx/.smoke.sh" <<'SMOKE'
           set -eux
           # (1) the profiles the supervisor resolves are IN the image
@@ -132,18 +128,33 @@ jobs:
           test -f /usr/local/share/tps/nono-profiles/tps-base.json
           # (2) nono loads tps-office BY PATH and the sandbox engages
           nono run --profile /usr/local/share/tps/nono-profiles/tps-office.json -- true
-          # (3) the supervisor resolves its own default bundled path and its
-          #     Landlock probe passes: the fixture agent launches under nono
+          # (3) the supervisor resolves its own default bundled path, its
+          #     Landlock probe passes, and the SHIPPED tps-agent passes the
+          #     pre-flight and launches under nono. Readiness is the agent's OWN
+          #     signal — the pid file `tps-agent start` writes
+          #     (<workspace>/.tps-agent.pid). An agent without the `check`
+          #     subcommand never reaches this point; the supervisor's named
+          #     refusal is printed from /tmp/sup.log below.
           mkdir -p /run/secrets && touch /run/secrets/.ready
-          PATH=/workspace/smoke/bin:$PATH tps-office-supervisor >/tmp/sup.log 2>&1 &
+          tps-office-supervisor >/tmp/sup.log 2>&1 &
           sup=$!
+          ready=0
           for _ in $(seq 1 60); do
-            [ -f /workspace/smoke/.marker ] && break
+            [ -f /workspace/smoke/.tps-agent.pid ] && { ready=1; break; }
             kill -0 "$sup" 2>/dev/null || break
             sleep 1
           done
-          if [ ! -f /workspace/smoke/.marker ]; then cat /tmp/sup.log; exit 1; fi
-          echo "✅ office image: profile resolved by path, nono engaged, supervisor probe launched the agent"
+          if [ "$ready" -ne 1 ]; then
+            echo "❌ the real agent never signalled readiness — supervisor log:"
+            cat /tmp/sup.log
+            exit 1
+          fi
+          echo "✅ the shipped tps-agent passed check and started (pid $(cat /workspace/smoke/.tps-agent.pid))"
+          # (4) the supervisor's exit status is asserted, not just readiness.
+          kill -TERM "$sup" 2>/dev/null || true
+          if wait "$sup"; then sup_rc=0; else sup_rc=$?; fi
+          if [ "$sup_rc" -ne 0 ]; then cat /tmp/sup.log; exit 1; fi
+          echo "✅ office image: profile resolved by path, nono engaged, supervisor launched the real agent and exited 0"
           SMOKE
           chmod +x "$fx/.smoke.sh"
           docker run --rm -v "$fx:/workspace" --entrypoint /bin/bash tps-office-verify:latest /workspace/.smoke.sh

@@ -215,3 +215,64 @@ describe("supervisor profile resolution (cli#352 r3)", () => {
     expect(yml).toContain("tps-office-supervisor");
   });
 });
+
+/**
+ * cli#352 r4 — the supervisor's pre-flight calls `tps-agent check`, which only
+ * the WORKSPACE agent has (the published 0.5.4's bin has no `check`). The office
+ * image installs the PUBLISHED agent, so the launch control must exercise the
+ * SHIPPED binary instead of substituting a stand-in, and packages/agent must be
+ * at least the version that introduced `check` — otherwise the image is dead on
+ * arrival and the smoke must say so, not paper over it. These assertions are the
+ * coupling (Kern's item): delete the subcommand, drop the version, or reintroduce
+ * a `tps-agent` shim in the smoke, and CI fails here.
+ */
+describe("office image ships an agent that answers `check` (cli#352 r4)", () => {
+  const CHECK_INTRODUCED_IN = "0.5.5";
+
+  function semver(v: string): [number, number, number] {
+    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(v);
+    if (!m) throw new Error(`not a semver version: ${v}`);
+    return [Number(m[1]), Number(m[2]), Number(m[3])];
+  }
+  function gte(a: string, b: string): boolean {
+    const x = semver(a);
+    const y = semver(b);
+    for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+    return true;
+  }
+
+  test("packages/agent is at least the version that introduced `check`", () => {
+    const { version } = JSON.parse(src("packages/agent/package.json")) as { version: string };
+    expect(gte(version, CHECK_INTRODUCED_IN)).toBe(true);
+    // ...and the subcommand is really in the shipped bin, not just the version.
+    expect(src("packages/agent/src/bin.ts")).toContain('command === "check"');
+  });
+
+  test("the image smoke runs the SHIPPED tps-agent — no stand-in is written", () => {
+    const yml = src(".github/workflows/docker.yml");
+    // The deleted stand-in wrote a `tps-agent` file into the fixture whose
+    // `check` exited 0 unconditionally — the "harness supplies what ship lacks"
+    // shape this round closes. Neither shape may come back.
+    expect(yml).not.toContain("smoke/bin/tps-agent");
+    expect(yml).not.toContain("check) exit 0");
+    // The supervisor is what runs the SHIPPED `check` pre-flight and `start`.
+    expect(yml).toContain("tps-office-supervisor >/tmp/sup.log");
+  });
+
+  test("the smoke asserts the real agent's readiness AND the supervisor's exit", () => {
+    const yml = src(".github/workflows/docker.yml");
+    // readiness is the agent's OWN signal: the pid file `start` writes.
+    expect(yml).toContain("/workspace/smoke/.tps-agent.pid");
+    // ...and the supervisor's exit status is asserted, not only readiness.
+    expect(yml).toContain('wait "$sup"');
+  });
+
+  test("docker/Dockerfile keeps the published install and gates the tarball", () => {
+    const df = src("docker/Dockerfile");
+    // the SHIPPED path installs the published package at the tag version...
+    expect(df).toContain('npm install -g "@tpsdev-ai/agent@${TPS_VERSION}"');
+    // ...and the workspace tarball is the verification-only override.
+    expect(df).toContain('ARG TPS_AGENT_TARBALL=""');
+    expect(df).toContain("/tmp/agent.tgz");
+  });
+});

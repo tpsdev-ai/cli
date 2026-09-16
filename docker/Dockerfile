@@ -22,7 +22,26 @@ RUN set -eux; \
 
 FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
-RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
+# The shipped path: the PUBLISHED agent at the tag version. docker.yml reads
+# TPS_VERSION from packages/cli/package.json, and the release train publishes
+# @tpsdev-ai/agent at that same tag version (release.yml), so the image installs
+# the agent that carries the supervisor's `check` pre-flight (cli#352 r4).
+#
+# TPS_AGENT_TARBALL is VERIFICATION-ONLY — the release build never sets it. Its
+# value is the path (relative to the build context) of an `npm pack` of
+# packages/agent; when set, that tarball is installed INSTEAD of the published
+# package, so an image can be built and smoked from the WORKSPACE agent before
+# the release publishes it (docker.yml's launch control and this PR's local
+# both-direction runs).
+ARG TPS_AGENT_TARBALL=""
+RUN --mount=type=bind,target=/ctx,ro set -eux; \
+    if [ -n "$TPS_AGENT_TARBALL" ]; then \
+      cp "/ctx/$TPS_AGENT_TARBALL" /tmp/agent.tgz; \
+      npm install -g /tmp/agent.tgz; \
+      rm -f /tmp/agent.tgz; \
+    else \
+      npm install -g "@tpsdev-ai/agent@${TPS_VERSION}"; \
+    fi
 # The shipped binary comes only from the pinned stage. The baseline sha256 is
 # NOT copied in — it is read from a read-only bind mount of the builder stage by
 # the assertion below, so no instruction in this stage can rewrite it.
