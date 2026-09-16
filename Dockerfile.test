@@ -2,11 +2,21 @@ FROM oven/bun:1-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# nodejs: the SHIPPED CLI is a node script (`#!/usr/bin/env node`) and the
+# attested-launch positive must run it the way a unit does. bun cannot stand in:
+# bun inside a nono sandbox sees an EMPTY environment (measured — see
+# packages/cli/test/launch-attestation-real-nono.test.ts), so the launcher's
+# socket locator never reaches a bun child.
+RUN apt-get update && apt-get install -y git nodejs && rm -rf /var/lib/apt/lists/*
 
 # Create fake home directory with OpenClaw structure
 RUN mkdir -p /home/tps/.openclaw/workspace-test \
     && mkdir -p /home/tps/.openclaw/agents
+
+# A NON-ROOT user for the attested-launch lane (cli#350 round 4e: the Linux run
+# of the positive happens as a non-root Docker lane user). HOME stays /home/tps.
+RUN useradd -m -s /bin/bash -u 1001 tps 2>/dev/null || useradd -m -s /bin/bash tps; \
+    chown -R tps:tps /home/tps
 
 ENV HOME=/home/tps
 

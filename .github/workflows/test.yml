@@ -81,6 +81,46 @@ jobs:
       - name: Run tests in Docker
         run: docker compose run --rm test
 
+      # cli#350 round 4e — the attested-launch POSITIVE, as a NON-ROOT lane user,
+      # against the S4-pinned nono built from .nono-version (same cache key as the
+      # profile gate, so the build is usually a cache hit). The fixture skips
+      # itself when the pin is absent, so wiring the mount is what makes this lane
+      # meaningful — and without it the release path would be untested here.
+      - name: Resolve the pinned nono commit
+        id: pin
+        run: |
+          commit="$(sed -n 's/^commit=//p' .nono-version 2>/dev/null | head -n1)"
+          [ -n "$commit" ] || commit="bc1406e9ceb0b765d303a015502fade11f3858f5"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - name: Cache the pinned nono build
+        id: nono-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.local/nono-pin
+          key: nono-Linux-${{ steps.pin.outputs.commit }}
+      - name: Build the pinned nono (cache miss)
+        if: steps.nono-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          commit="${{ steps.pin.outputs.commit }}"
+          sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+          mkdir -p "$HOME/.local/nono-pin"
+          rm -rf "$RUNNER_TEMP/nono"
+          git clone --filter=blob:none https://github.com/nolabs-ai/nono "$RUNNER_TEMP/nono"
+          git -C "$RUNNER_TEMP/nono" checkout "$commit"
+          test "$(git -C "$RUNNER_TEMP/nono" rev-parse HEAD)" = "$commit"
+          cd "$RUNNER_TEMP/nono"
+          cargo build --release -p nono-cli
+          cp target/release/nono "$HOME/.local/nono-pin/nono"
+      - name: Run the attested-launch positive against the pinned nono (non-root user)
+        run: |
+          n="$HOME/.local/nono-pin/nono"
+          test -x "$n"
+          docker compose run --rm \
+            -v "$n:/usr/local/bin/nono:ro" \
+            -e NONO_BIN=/usr/local/bin/nono \
+            attested
+
   binary-smoke:
     name: Binary Smoke Test
     runs-on: ubuntu-latest

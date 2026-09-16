@@ -19,7 +19,18 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
-import { findNono, runCommandUnderNono, isNonoStrict, harnessReadPaths, harnessReadFiles } from "../utils/nono.js";
+import {
+  findNono,
+  runCommandUnderNono,
+  isNonoStrict,
+  isInteractiveTty,
+  isSupervised,
+  harnessReadPaths,
+  harnessReadFiles,
+  REFUSAL_EXIT_CODE,
+  SUPERVISED_REFUSAL_EXIT_CODE,
+} from "../utils/nono.js";
+import { launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
@@ -804,15 +815,34 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         const sandbox = (args as any).sandbox ?? true; // default ON — nono is the required isolation layer
         const sandboxed = (args as any).sandboxed ?? false;
         const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
-        const nonoAvailable = findNono();
+        // The pinned ABSOLUTE path (never PATH) — the same resolution the
+        // launcher performs, so the decision to launch and the launch itself
+        // cannot disagree about which nono is in play (cli#350 round 4e).
+        const nonoAvailable = resolveNonoBinary().bin ?? findNono();
 
         if (sandboxed) {
-          // Already running inside nono — skip re-exec, proceed to runtime
+          // Already inside the launcher's nono session — skip re-exec, proceed
+          // to runtime. Whether that claim is TRUE was settled by the gate: this
+          // process only reaches here holding the launcher's release
+          // (cli#350 round 4e).
         } else if (sandbox || isNonoStrict()) {
           if (!nonoAvailable) {
-            if (isNonoStrict()) {
-              console.error("❌ --sandbox requires nono (TPS_NONO_STRICT=1). Install from https://nono.sh");
-              process.exit(1);
+            // Fail closed, in every context the launch control governs. A
+            // non-interactive launch MUST NOT fall back to running the agent
+            // unsandboxed: that is the silent no-op the unit cannot see (under
+            // TPS_SUPERVISED the refusal exits 0 and KeepAlive never
+            // relaunches). An interactive human keeps the old warning — they
+            // can see it and decide.
+            if (isNonoStrict() || sandboxRequired || !isInteractiveTty()) {
+              const why = isNonoStrict()
+                ? "TPS_NONO_STRICT=1"
+                : "this launch is not interactive";
+              console.error(
+                `❌ refusing to launch the agent: no nono at the pinned absolute path ` +
+                  `(${resolveNonoBinary().reason ?? "unknown"}) — ${why}, so the agent cannot ` +
+                  `run without isolation. Install nono >= 0.70 or set NONO_BIN.`
+              );
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             console.warn("⚠️  nono not found — starting WITHOUT sandbox isolation. Pass --sandbox after installing nono.");
           } else {
@@ -837,7 +867,12 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               "--sandboxed",
             ];
             if (sandboxRequired) relaunch.push("--sandbox-required");
-            const exitCode = runCommandUnderNono(
+            // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
+            // private dir, plants the canaries, spawns nono by absolute path,
+            // and releases the child over its own socket only after `nono ps`
+            // binds a live session to the pid it spawned and to the pid the
+            // child reports, with the OUTSIDE canary still unreadable to it.
+            const exitCode = await launchAttested(
               "tps-agent-run",
               {
                 workdir: config.workspace,

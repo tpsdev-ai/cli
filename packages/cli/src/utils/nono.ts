@@ -108,8 +108,8 @@ export const EX_CONFIG = 78;
  * Resolve a profile name to a JSON file on disk, or null.
  * Searches ~/.config/nono/profiles/ then the bundled nono-profiles/ directory.
  */
-export function resolveProfilePath(name: string): string | null {
-  const home = process.env.HOME || homedir() || "/tmp";
+export function resolveProfilePath(name: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const home = env.HOME || homedir() || "/tmp";
   const candidates = [
     join(home, ".config", "nono", "profiles", `${name}.json`),
     join(findBundledProfilesDir(), `${name}.json`),
@@ -156,8 +156,12 @@ export interface ProfileCheck {
  * `bin` is injectable for tests; pass null to check existence only (used when
  * nono is absent and the caller's nono policy handles that separately).
  */
-export function checkProfileLoadable(name: string, bin: string | null = findNono()): ProfileCheck {
-  const path = resolveProfilePath(name);
+export function checkProfileLoadable(
+  name: string,
+  bin: string | null = findNono(),
+  env: NodeJS.ProcessEnv = process.env
+): ProfileCheck {
+  const path = resolveProfilePath(name, env);
   if (!path) {
     return {
       ok: false,
@@ -179,7 +183,7 @@ export function checkProfileLoadable(name: string, bin: string | null = findNono
 
   const validate = spawnSync(bin, ["profile", "validate", "--strict", path], {
     encoding: "utf-8",
-    env: process.env,
+    env,
   });
   if (validate.status !== 0) {
     const detail = `${validate.stdout ?? ""}${validate.stderr ?? ""}`
@@ -269,14 +273,15 @@ export function harnessReadFiles(agentId?: string): string[] {
 export function buildNonoArgs(
   profile: NonoProfile,
   options: NonoOptions,
-  cmd: string[]
+  cmd: string[],
+  env: NodeJS.ProcessEnv = process.env
 ): string[] {
   // Pass the RESOLVED path, not the bare name (cli#351 r2, MEDIUM 3).
   // checkProfileLoadable validates resolveProfilePath(name) (user dir, then
   // bundled), but nono resolves a bare name against its own search path
   // (the user dir). Passing the path makes what we validate the artifact that
   // actually runs.
-  const profilePath = resolveProfilePath(profile) ?? profile;
+  const profilePath = resolveProfilePath(profile, env) ?? profile;
   const args = ["run", "--profile", profilePath, "--allow-cwd"];
 
   if (options.workdir) {
@@ -543,11 +548,12 @@ export const SANDBOX_REQUIRED_FLAG = "--sandbox-required";
 export const NO_SANDBOX_FLAG = "--no-sandbox";
 
 /**
- * The launcher's private "I am already inside nono" assertion. Honoured only
- * when the process PROVES confinement by capability (`confinedByCapability`);
- * a user-typed `--sandboxed` from a non-TTY caller is refused like `--no-sandbox`.
- * The nono marker / parent check are HINTS only, never proof (both are forgeable
- * by the same caller: an env var, or a shadowed `ps` / self-named argv).
+ * The launcher's private "I am already inside a nono session the launcher
+ * started" assertion. Honoured only when the process HOLDS THE LAUNCHER'S
+ * RELEASE for a live nono session bound to its own pid (`launch-attestation.ts`,
+ * cli#350 round 4e); a non-TTY caller that types the flag — or plants a marker,
+ * shadows `ps`, or names itself `nono` — is refused like `--no-sandbox`. The
+ * marker / parent check are HINTS only, never proof.
  */
 export const SANDBOXED_FLAG = "--sandboxed";
 
@@ -613,29 +619,21 @@ export function nonoLaunchHint(
 }
 
 /**
- * PROVE confinement by CAPABILITY, not by a marker. Before honouring
- * `--sandboxed` this process attempts an operation the tps policy must deny —
- * creating a file under the agent's own denied state dir (`~/.tps/secrets`,
- * denied by `tps-base`). A sandboxed process is refused the write (EPERM /
- * EACCES / EROFS); an unsandboxed process SUCCEEDS, which proves the "already
- * inside nono" claim is false. Nothing a caller can plant changes the answer.
+ * PROOF OF CONFINEMENT is the LAUNCHER's, verified from outside the sandbox
+ * (cli#350 round 4e). The child cannot attest its own confinement: nono 0.74.0
+ * exposes no in-sandbox validation and strips inherited fds, and every
+ * in-process signal (a marker, a parent's name, a denied filesystem write) is
+ * either forgeable or absent on the plain launch. Under `--sandboxed` the
+ * child therefore holds the launcher's release, over a launcher-owned unix
+ * socket, for a LIVE nono session bound to the pid the launcher spawned AND to
+ * the pid this process reports. `attestConfinement()` in
+ * `launch-attestation.ts` performs that handshake; the gate only consumes the
+ * verdict.
  */
-export function confinedByCapability(env: NodeJS.ProcessEnv = process.env): boolean {
-  const home = env.HOME || homedir() || "/tmp";
-  const probe = join(home, ".tps", "secrets", ".tps-nono-probe");
-  try {
-    writeFileSync(probe, String(process.pid));
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    return code === "EPERM" || code === "EACCES" || code === "EROFS";
-  }
-  // The write SUCCEEDED — this process is not confined by the tps policy.
-  try {
-    unlinkSync(probe);
-  } catch {
-    /* best-effort cleanup */
-  }
-  return false;
+export interface ConfinementVerdict {
+  released: boolean;
+  /** Why the release is absent (used in the refusal wording). */
+  reason?: string;
 }
 
 /**
@@ -662,8 +660,9 @@ export interface LaunchControlInput {
   interactiveTty?: boolean;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
-  /** Override capability-confinement detection (tests). */
-  insideNono?: boolean;
+  /** The launcher's release verdict (see `launch-attestation.ts`). Absent when
+   * this process never asked — anything but a release is a refusal. */
+  confinement?: ConfinementVerdict;
 }
 
 export interface LaunchControlResult {
@@ -682,8 +681,6 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
   const supervised = input.supervised ?? isSupervised();
-  // Proof is BY CAPABILITY, never by the (forgeable) marker/parent hint.
-  const inside = input.insideNono ?? confinedByCapability();
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
@@ -697,18 +694,22 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   }
 
   // (1b) --sandboxed claims "already inside nono". Honour it only when the
-  // process PROVES confinement by capability; otherwise a non-TTY caller could
-  // skip the sandbox by typing it (or by planting the marker / shadowing ps).
-  if (argv.includes(SANDBOXED_FLAG) && !tty && !inside) {
+  // LAUNCHER released this process (a live nono session bound to the pid it
+  // spawned and to this pid, with enforcement verified behaviourally).
+  if (argv.includes(SANDBOXED_FLAG) && !tty && !(input.confinement?.released ?? false)) {
     const hint = nonoLaunchHint();
     return deny(
-      `${SANDBOXED_FLAG} is refused: it asserts this process is already inside nono, but it is ` +
-        "not confined — a write under ~/.tps/secrets (denied by tps-base) SUCCEEDED, and " +
+      `${SANDBOXED_FLAG} is refused: no launcher released this process` +
+        (input.confinement?.reason ? ` (${input.confinement.reason})` : "") +
+        ". `" +
+        SANDBOXED_FLAG +
+        "` is a claim that a launcher holds a live nono session bound to this pid; nothing " +
+        "in this process can establish that for itself, and " +
         (hint
           ? "the nono marker/parent hint is present but is not proof. "
-          : "no nono confinement is in effect. ") +
-        "From a non-interactive caller that is an unsandboxed launch — only the launcher's " +
-        "own re-exec, which runs confined, may assert it.",
+          : "no launcher socket is in reach. ") +
+        "Only a launch through the launcher — which starts nono itself, verifies it from " +
+        "outside, and releases the child over its own socket — may assert it.",
     );
   }
 

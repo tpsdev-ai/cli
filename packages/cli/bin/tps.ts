@@ -184,10 +184,22 @@ const [command, ...rest] = cli.input;
  * assert `--sandbox-required`. Implementation lives in src/utils/nono.ts.
  */
 async function enforceLaunchControlOrExit(): Promise<void> {
-  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG } = await import(
+  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG, SANDBOXED_FLAG } = await import(
     "../src/utils/nono.js"
   );
-  enforceLaunchControl({ command, rest, argv: process.argv });
+  // Under `--sandboxed` this process must HOLD THE LAUNCHER'S RELEASE before the
+  // gate may honour the flag (cli#350 round 4e). The handshake lives here, not
+  // in the gate: it is I/O (connect, report the pid, prove the canaries, wait —
+  // bounded — for `CONFINED <session> <this pid>`), while the gate stays pure.
+  // Nothing this process can observe about itself is proof; the launcher's view
+  // from OUTSIDE the sandbox is.
+  let confinement: { released: boolean; reason?: string } | undefined;
+  if (process.argv.includes(SANDBOXED_FLAG) && !isInteractiveTty()) {
+    const { attestConfinement } = await import("../src/utils/launch-attestation.js");
+    const attestation = await attestConfinement();
+    confinement = { released: attestation.ok, reason: attestation.reason };
+  }
+  enforceLaunchControl({ command, rest, argv: process.argv, confinement });
   if (process.argv.includes(NO_SANDBOX_FLAG) && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
