@@ -78,16 +78,59 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - name: Resolve the pinned nono commit
+        id: pin
+        run: |
+          commit="$(sed -n 's/^commit=//p' .nono-version 2>/dev/null | head -n1)"
+          [ -n "$commit" ] || commit="bc1406e9ceb0b765d303a015502fade11f3858f5"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      # cli#352 r: Part C runs the supervisor under a REAL nono. The image's
+      # distro is bookworm, so the binary is built from the S4 pin (the same
+      # .nono-version commit the profile gate builds) inside a bookworm toolchain
+      # — a runner-built glibc binary is not guaranteed to run in the container.
+      - name: Cache the pinned nono build (container distro)
+        id: nono-cache
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: ~/.local/nono-pin-bookworm
+          key: nono-bookworm-${{ steps.pin.outputs.commit }}
+      - name: Build the pinned nono for the container (cache miss)
+        if: steps.nono-cache.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          mkdir -p "$HOME/.local/nono-pin-bookworm"
+          docker run --rm -v "$HOME/.local/nono-pin-bookworm:/out" -e COMMIT="${{ steps.pin.outputs.commit }}" rust:bookworm bash -c '
+            set -eux
+            apt-get update && apt-get install -y git libdbus-1-dev pkg-config
+            git clone --filter=blob:none https://github.com/nolabs-ai/nono /tmp/nono
+            git -C /tmp/nono checkout "$COMMIT"
+            test "$(git -C /tmp/nono rev-parse HEAD)" = "$COMMIT"
+            cd /tmp/nono && cargo build --release -p nono-cli
+            cp target/release/nono /out/nono'
+          "$HOME/.local/nono-pin-bookworm/nono" --version
       - name: Run tests in Docker
         run: docker compose run --rm test
+      - name: Supervisor harness (Part B fake nono + Part C real nono) in the container
+        # Builds the image once (above), then runs the behavioural halves — fake
+        # nono logging argv; nono-absent → exit non-zero, no agent started;
+        # refusal with an earlier agent running → no orphan; traversal/mismatch
+        # roster ids refused; and under the REAL pinned nono: the profile is
+        # resolved from the bundled dir with XDG_CONFIG_HOME empty, the probe
+        # passes, an agent launches with sandboxChildEnv()'s exports and a HOME it
+        # owns, its git ls-remote exits 0, `nono ps` binds the session to the
+        # supervisor's child and records the resolved profile path, reverting
+        # tps-base's /dev/null allow makes the supervisor refuse everything, no
+        # profile at all is a named refusal, and a bare-name resolver refuses the
+        # same setup that otherwise launches (cli#352 r2/r3).
+        run: docker compose run --rm -v "$HOME/.local/nono-pin-bookworm/nono:/usr/local/bin/nono:ro" test bash scripts/test-tps-office-supervisor.sh
 
       # cli#350 round 4e — the attested-launch POSITIVE, as a NON-ROOT lane user,
       # against the S4-pinned nono built from .nono-version (same cache key as the
       # profile gate, so the build is usually a cache hit). The fixture skips
       # itself when the pin is absent, so wiring the mount is what makes this lane
       # meaningful — and without it the release path would be untested here.
-      - name: Resolve the pinned nono commit
-        id: pin
+      - name: Resolve the pinned nono commit (attested lane)
+        id: pin-attested
         run: |
           commit="$(sed -n 's/^commit=//p' .nono-version 2>/dev/null | head -n1)"
           [ -n "$commit" ] || commit="bc1406e9ceb0b765d303a015502fade11f3858f5"
@@ -99,15 +142,15 @@ jobs:
           }
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - name: Cache the pinned nono build
-        id: nono-cache
+        id: nono-cache-attested
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
         with:
           path: ~/.local/nono-pin
-          key: nono-Linux-${{ steps.pin.outputs.commit }}
+          key: nono-Linux-${{ steps.pin-attested.outputs.commit }}
       - name: Build the pinned nono (cache miss)
-        if: steps.nono-cache.outputs.cache-hit != 'true'
+        if: steps.nono-cache-attested.outputs.cache-hit != 'true'
         env:
-          NONO_COMMIT: ${{ steps.pin.outputs.commit }}
+          NONO_COMMIT: ${{ steps.pin-attested.outputs.commit }}
         run: |
           set -eux
           commit="$NONO_COMMIT"

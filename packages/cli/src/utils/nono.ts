@@ -233,12 +233,23 @@ export function systemReadPaths(): string[] {
  * scripts/check-nono-profiles.sh pins this: the resolver is fine inside the
  * sandbox (resolv.conf's /run/stub target is readable and `getent hosts
  * github.com` resolves) — the missing grant is this file. */
+/**
+ * The candidate system read files for a platform, before the exists-filter.
+ * Exported so the supervisor launch path (a shell script that cannot import
+ * this module) can be asserted EQUAL to it by a test — the two launch points
+ * must not drift (cli#352 r).
+ */
+export function systemReadFileCandidates(platform: NodeJS.Platform = process.platform): string[] {
+  return platform === "darwin"
+    ? ["/etc/hosts", "/etc/resolv.conf", "/etc/gitconfig"]
+    : ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/gitconfig"];
+}
+
+/**
+ * The system read files that exist on this host, granted by name at launch.
+ */
 export function systemReadFiles(): string[] {
-  const wanted =
-    process.platform === "darwin"
-      ? ["/etc/hosts", "/etc/resolv.conf", "/etc/gitconfig"]
-      : ["/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf", "/etc/gitconfig"];
-  return wanted.filter((f) => existsSync(f));
+  return systemReadFileCandidates().filter((f) => existsSync(f));
 }
 
 /**

@@ -22,7 +22,26 @@ RUN set -eux; \
 
 FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
-RUN npm install -g @tpsdev-ai/agent@${TPS_VERSION}
+# The shipped path: the PUBLISHED agent at the tag version. docker.yml reads
+# TPS_VERSION from packages/cli/package.json, and the release train publishes
+# @tpsdev-ai/agent at that same tag version (release.yml), so the image installs
+# the agent that carries the supervisor's `check` pre-flight (cli#352 r4).
+#
+# TPS_AGENT_TARBALL is VERIFICATION-ONLY — the release build never sets it. Its
+# value is the path (relative to the build context) of an `npm pack` of
+# packages/agent; when set, that tarball is installed INSTEAD of the published
+# package, so an image can be built and smoked from the WORKSPACE agent before
+# the release publishes it (docker.yml's launch control and this PR's local
+# both-direction runs).
+ARG TPS_AGENT_TARBALL=""
+RUN --mount=type=bind,target=/ctx,ro set -eux; \
+    if [ -n "$TPS_AGENT_TARBALL" ]; then \
+      cp "/ctx/$TPS_AGENT_TARBALL" /tmp/agent.tgz; \
+      npm install -g /tmp/agent.tgz; \
+      rm -f /tmp/agent.tgz; \
+    else \
+      npm install -g "@tpsdev-ai/agent@${TPS_VERSION}"; \
+    fi
 # The shipped binary comes only from the pinned stage. The baseline sha256 is
 # NOT copied in — it is read from a read-only bind mount of the builder stage by
 # the assertion below, so no instruction in this stage can rewrite it.
@@ -42,6 +61,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r tps && useradd -r -g tps -m -s /bin/bash tps
 COPY docker/tps-office-supervisor.sh /usr/local/bin/tps-office-supervisor
+# The TPS nono profiles, at the path docker/tps-office-supervisor.sh resolves the
+# BUNDLED candidate from (cli#352 r3). Without them the image ships a bare-name
+# launch nono cannot resolve — installNonoProfiles() runs only from `tps identity
+# init`, which this container never runs — so the Landlock probe failed for the
+# wrong reason (profile not found) and fail-closed refused EVERY office agent.
+# The supervisor passes this absolute path to nono at both launch sites; the
+# agent uid reads the file, so the COPY modes (644/755) must stay world-readable.
+COPY packages/cli/nono-profiles/ /usr/local/share/tps/nono-profiles
 WORKDIR /workspace
 # Supervisor starts as root only for setup, then drops to tps-supervisor.
 # nosemgrep: dockerfile.security.missing-user-entrypoint.missing-user-entrypoint

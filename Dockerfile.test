@@ -7,11 +7,12 @@ WORKDIR /app
 # bun inside a nono sandbox sees an EMPTY environment (measured — see
 # packages/cli/test/launch-attestation-real-nono.test.ts), so the launcher's
 # socket locator never reaches a bun child.
-RUN apt-get update && apt-get install -y git nodejs && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git jq procps nodejs && rm -rf /var/lib/apt/lists/*
 
 # Create fake home directory with OpenClaw structure
 RUN mkdir -p /home/tps/.openclaw/workspace-test \
-    && mkdir -p /home/tps/.openclaw/agents
+    && mkdir -p /home/tps/.openclaw/agents \
+    && mkdir -p /workspace
 
 # A NON-ROOT user for the attested-launch lane (cli#350 round 4e: the Linux run
 # of the positive happens as a non-root Docker lane user). HOME stays /home/tps.
