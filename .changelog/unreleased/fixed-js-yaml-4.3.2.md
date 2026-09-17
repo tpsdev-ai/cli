@@ -1,1 +1,0 @@
-- Bump `js-yaml` to `4.3.2` in `@tpsdev-ai/agent` and `@tpsdev-ai/cli` to clear GHSA-2883-xcg3-v3hh; `bun audit` reports no vulnerabilities again (cli#348).
