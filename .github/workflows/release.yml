@@ -422,15 +422,20 @@ jobs:
               else
                 # No diagnosis for this code. Say so rather than asserting the
                 # stage-collision cause, which is what the first real run proved wrong.
-                # Still disclose any pending packages: that fact is cause-independent,
-                # and withholding it here — the catch-all branch — is what hides a
-                # partial stage. Only the COLLISION DIAGNOSIS is withheld.
+                # Disclose any pending packages AND hand over the recovery procedure:
+                # both are cause-independent. Only the COLLISION DIAGNOSIS is withheld —
+                # we have not established a collision and must not claim one.
                 disclose_pending
                 echo "::error::stage publish failed for $nm@$VERSION and it is not published."
                 echo "::error::npm error code(s): ${codes:-none reported in npm output}"
                 echo "::error::The cause is UNCLASSIFIED — this workflow has no diagnosis for this"
                 echo "::error::code. Read the npm output above and diagnose from it; do not assume a"
-                echo "::error::staged collision. The staging recovery block deliberately does not run."
+                echo "::error::staged collision. The collision diagnosis deliberately does not run."
+                echo "::error::"
+                if [ "${#STAGED[@]}" -gt 0 ]; then
+                  stage_recovery
+                  echo "::error::"
+                fi
                 exit 1
               fi
             fi
