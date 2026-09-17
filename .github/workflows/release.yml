@@ -187,7 +187,18 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-          registry-url: https://registry.npmjs.org/
+          # NO registry-url. It makes setup-node write an .npmrc containing
+          # _authToken=${NODE_AUTH_TOKEN} + always-auth, so with no token set npm
+          # tries the EMPTY token and fails rather than falling through to OIDC.
+          # That is exactly how the v0.6.0 publish failed: E404 on PUT, which is
+          # npm's unauthorized response, not a missing package. OIDC needs no token
+          # config at all; npm defaults to registry.npmjs.org.
+      - name: Upgrade npm to an OIDC/staging-capable version
+        # OIDC trusted publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
+        # The bundled npm is older, so upgrade explicitly rather than hoping.
+        run: |
+          npm install -g npm@^11.15.0
+          echo "npm $(npm --version)"
       - name: Restore binary payloads into workspace
         run: |
           cp -R /tmp/release/cli-darwin-arm64/. packages/cli-darwin-arm64/
@@ -203,50 +214,71 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - name: Build agent package
         run: bun run --filter @tpsdev-ai/agent build
-      - name: Publish agent package
+      - name: Verify ALL workspace versions match the tag
+        # The release preflight checks packages/cli only. That is how main ended up
+        # with cli/agent at 0.5.5 and the four platform packages still at 0.5.4 —
+        # a split that would have published a 0.6.0 CLI whose exact
+        # optionalDependencies pins resolve to 0.5.4 binaries. Check all six.
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          npm publish --access public --workspace @tpsdev-ai/agent || {
-            if npm view "@tpsdev-ai/agent@$VERSION" version 2>/dev/null; then
-              echo "⏭️ @tpsdev-ai/agent@$VERSION already published, skipping"
-            else
-              echo "❌ Failed to publish @tpsdev-ai/agent" && exit 1
-            fi
-          }
-      - name: Publish platform packages
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64; do
-            npm publish --access public --workspace "@tpsdev-ai/$pkg" || {
-              if npm view "@tpsdev-ai/$pkg@$VERSION" version 2>/dev/null; then
-                echo "⏭️ @tpsdev-ai/$pkg@$VERSION already published, skipping"
-              else
-                echo "❌ Failed to publish @tpsdev-ai/$pkg" && exit 1
-              fi
-            }
-          done
-      - name: Publish meta package
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          npm publish --access public --workspace @tpsdev-ai/cli || {
-            if npm view "@tpsdev-ai/cli@$VERSION" version 2>/dev/null; then
-              echo "⏭️ @tpsdev-ai/cli@$VERSION already published, skipping"
-            else
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKGS=(cli agent cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64)
+          for p in "${PKGS[@]}"; do
+            pv="$(node -p "require('./packages/$p/package.json').version")"
+            nm="$(node -p "require('./packages/$p/package.json').name")"
+            if [ "$pv" != "$VERSION" ]; then
+              echo "::error::$nm is at $pv, expected $VERSION (tag ${GITHUB_REF_NAME})."
               exit 1
             fi
-          }
+            echo "  ok $nm @ $pv"
+          done
+          # The optionalDependencies pins are exact and must move with them.
+          for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64; do
+            pin="$(node -p "require('./packages/cli/package.json').optionalDependencies['@tpsdev-ai/$p']")"
+            if [ "$pin" != "$VERSION" ]; then
+              echo "::error::packages/cli pins @tpsdev-ai/$p at $pin, expected $VERSION."
+              exit 1
+            fi
+            echo "  ok pin @tpsdev-ai/$p @ $pin"
+          done
+
+      - name: Stage-publish all packages (OIDC trusted publishing)
+        # Was: three steps of `npm publish` authenticated by secrets.NPM_TOKEN.
+        # Two changes, both deliberate:
+        #
+        # 1. OIDC instead of a token. No long-lived credential lives in this repo.
+        #    The February token expired silently and nobody learned that until the
+        #    next release attempt — seven months later.
+        #
+        # 2. `npm stage publish` instead of `npm publish`. The token path went LIVE
+        #    immediately, so the CLI had no human gate at all. Staging makes the
+        #    npm approval (2FA) the gate, matching flair. Nothing goes live until a
+        #    maintainer approves it.
+        #
+        # Dependency order: the platform binaries first, then agent, then cli last —
+        # cli pins the platform packages at exact versions.
+        run: |
+          set -euo pipefail
+          for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli; do
+            nm="$(node -p "require('./packages/$p/package.json').name")"
+            echo "::group::npm stage publish — $nm (packages/$p)"
+            ( cd "packages/$p" && npm stage publish --tag staged )
+            echo "::endgroup::"
+          done
+
+      - name: Summary
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "### 📦 v$VERSION staged (tag: staged)"
+            echo ""
+            echo "Six packages staged via OIDC trusted publishing. **Nothing is live yet.**"
+            echo "A maintainer must approve the staged release in npm (2FA) to publish."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
     name: GitHub release checksums
