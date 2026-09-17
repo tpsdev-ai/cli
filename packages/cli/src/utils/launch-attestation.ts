@@ -2,10 +2,21 @@
  * cli#350 round 4e — the launcher's confinement attestation.
  *
  * INVARIANT (CLI launch point only; in the Docker lane the container is the
- * boundary): every launch through `tps agent start` runs its workload inside a
- * nono session that the LAUNCHER started, bound to the pid the launcher spawned
+ * boundary): every launch that reaches `runAgent({action:"start"})` runs its
+ * workload inside a nono session that the LAUNCHER started, bound to the pid the launcher spawned
  * AND to the pid the child reports, with enforcement verified BEHAVIOURALLY from
  * outside the sandbox — or the child is never released.
+ *
+ * KNOWN EXEMPTION, stated here so this comment does not overstate its own reach
+ * (found in review of the v0.6.0 release, 2026-09-17): `tps agent start
+ * --runtime claude-code|codex|gemini` branches in `bin/tps.ts` BEFORE reaching
+ * `runAgent`, and spawns the runtime directly — so it never arrives here and is
+ * NOT confined by nono. Worse, `launchesAgent()` (`nono.ts`) returns true for
+ * `agent start`, so `--sandbox-required` passes the launch gate and the process
+ * then runs unconfined: the flag currently gives assurance it cannot deliver on
+ * that path. Do not read "every launch through `tps agent start`" anywhere in
+ * this file or the release notes as covering those three runtimes. Routing them
+ * through this attestation is tracked in cli#363.
  *
  * Why behavioural, not a nono audit record (round 4e): nono 0.74.0 writes its
  * per-session `sandbox_runtime` audit record ONLY when tool-sandbox is active
