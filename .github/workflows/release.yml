@@ -273,8 +273,28 @@ jobs:
         #    one fewer piece of repo config to keep in sync — and it is weaker.
         #    Tightening it is a follow-up, and needs the environment created first.
         #
-        #    Note also that approval is unconstrained: approving with the default
-        #    promotes the staged version to `latest`. The gate is a human decision,
+        #    WHAT APPROVAL ACTUALLY DOES — stated correctly because an earlier
+        #    draft of this comment had it backwards, and this comment is what tells
+        #    the approving human what their approval means.
+        #
+        #    `--tag` is an IMMUTABLE property of a staged package and
+        #    `npm stage approve` has no tag flag (npm 11.19.0: it accepts only
+        #    --otp and --registry). We stage with `--tag staged`, so approval
+        #    publishes the version PUBLICLY UNDER `staged` — it does NOT move
+        #    `latest`. Our own flair pipeline documents the same behaviour from
+        #    production (flair#1686): "After a maintainer approves, the version is
+        #    public but NOT latest".
+        #
+        #    So `npm install -g @tpsdev-ai/cli` keeps serving the previous version
+        #    until a maintainer explicitly runs:
+        #
+        #        npm dist-tag add @tpsdev-ai/cli@<version> latest
+        #
+        #    That promote is BY HAND for now. flair automates it with a sha-bound
+        #    promote after a canary; this repo deliberately ships without that
+        #    tooling, tracked in cli#366. Anyone approving a release here must know
+        #    the promote is a separate, manual step, or they will approve, see the
+        #    old version still installing, and conclude the pipeline failed. The gate is a human decision,
         #    not a policy.
         #
         # Dependency order: the platform binaries first, then agent, then cli last —
@@ -315,7 +335,14 @@ jobs:
             echo "### 📦 v$VERSION staged (tag: staged)"
             echo ""
             echo "Six packages staged via OIDC trusted publishing. **Nothing is live yet.**"
-            echo "A maintainer must approve the staged release in npm (2FA) to publish."
+            echo ""
+            echo "Two steps remain, and they are separate:"
+            echo "1. A maintainer approves the staged release in npm (2FA). The version then"
+            echo "   becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
+            echo "2. To make \`npm install\` serve it, a maintainer runs:"
+            echo "   \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\` (per package)."
+            echo ""
+            echo "Until step 2, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
           } >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
