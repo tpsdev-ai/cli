@@ -311,6 +311,23 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           STAGED=()
           SKIPPED=()
+          # A partial stage can be produced by EITHER a later package's auth failure OR an
+          # E409 collision, so both failure branches hand the operator the same recovery
+          # procedure. Keeping it in one place stops the two paths drifting apart.
+          stage_recovery() {
+            echo "::error::RECOVERY, from a machine logged in to npm:"
+            echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
+            echo "::error::  npm stage view <stage-id>              # confirm version + contents"
+            echo "::error::then EITHER reject every pending stage for this version and re-run"
+            echo "::error::the tag clean:"
+            echo "::error::  npm stage reject <stage-id>            # for each staged package"
+            echo "::error::OR approve the ones already staged and let this re-run stage only"
+            echo "::error::the remainder — the already-PUBLISHED branch above will skip them."
+            echo "::error::"
+            echo "::error::Do NOT leave a partial stage pending: packages/cli pins the platform"
+            echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
+            echo "::error::whose dependencies do not exist. All six go together."
+          }
           for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli; do
             nm="$(node -p "require('./packages/$p/package.json').name")"
             echo "::group::npm stage publish — $nm (packages/$p)"
@@ -336,18 +353,30 @@ jobs:
             else
               codes="$(printf '%s\n' "$out" | awk '/npm error code /{print $4}' | sort -u | paste -sd, -)"
               if printf '%s\n' "$out" | grep -qE 'ENEEDAUTH|E401|E403'; then
-                # Authentication failure. This is NOT a staging-area problem: npm never
-                # got far enough to look at the stage index. OIDC did not authenticate,
-                # so do NOT point the operator at the staging area — nothing may ever
-                # have been staged. The remedy is the trust relationship itself.
+                # Authentication failure for THIS package: npm never got far enough to
+                # look at the stage index, so the remedy is the trust relationship, not
+                # the staging area. But npm trust is PER PACKAGE, so earlier packages can
+                # already be staged. If any are, say so and hand over the recovery
+                # procedure first: otherwise a re-run collides at the first staged
+                # package (E409) and the operator gets a message about the wrong problem.
                 echo "::error::stage publish failed for $nm@$VERSION and it is not published."
                 echo "::error::npm reported an authentication failure (${codes:-no error code parsed}) — OIDC"
-                echo "::error::did not authenticate. This is not about the staging area, and nothing"
-                echo "::error::here may ever have been staged."
+                echo "::error::did not authenticate for this package."
                 echo "::error::"
+                if [ "${#STAGED[@]}" -gt 0 ]; then
+                  echo "::error::PARTIAL STAGE: ${#STAGED[@]} package(s) were staged before this failure and"
+                  echo "::error::are still pending:"
+                  echo "::error::  ${STAGED[*]}"
+                  echo "::error::Clear or approve them BEFORE re-running, or the re-run fails at the first"
+                  echo "::error::already-staged package with an E409 collision, never reaching this one."
+                  echo "::error::"
+                  stage_recovery
+                  echo "::error::"
+                fi
                 echo "::error::Check, for THIS exact package name ($nm):"
                 echo "::error::  - a Trusted Publisher registration exists for $nm on npmjs.com,"
-                echo "::error::    with repository + workflow filename matching this job"
+                echo "::error::    with repository + workflow filename matching this job (trust is"
+                echo "::error::    per package, so a missing registration affects only $nm)"
                 echo "::error::  - this job declares permissions: id-token: write (it mints the"
                 echo "::error::    OIDC token npm swaps for a short-lived publish credential)"
                 echo "::error::  - npm is new enough — OIDC trusted publishing needs >= 11.5.1 and"
@@ -377,18 +406,7 @@ jobs:
                 echo "::error::reject a staged package from CI. (2FA is not the reason: list and view"
                 echo "::error::need no proof-of-presence; only approve and reject do.)"
                 echo "::error::"
-                echo "::error::RECOVERY, from a machine logged in to npm:"
-                echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
-                echo "::error::  npm stage view <stage-id>              # confirm version + contents"
-                echo "::error::then EITHER reject every pending stage for this version and re-run"
-                echo "::error::the tag clean:"
-                echo "::error::  npm stage reject <stage-id>            # for each staged package"
-                echo "::error::OR approve the ones already staged and let this re-run stage only"
-                echo "::error::the remainder — the already-PUBLISHED branch above will skip them."
-                echo "::error::"
-                echo "::error::Do NOT leave a partial stage pending: packages/cli pins the platform"
-                echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
-                echo "::error::whose dependencies do not exist. All six go together."
+                stage_recovery
                 exit 1
               else
                 # No diagnosis for this code. Say so rather than asserting the
@@ -431,15 +449,22 @@ jobs:
               echo ""
               echo "The $SKIPPED_COUNT skipped packages were already published — those are live."
             fi
+            # Approval only applies when something was staged. Promotion, however, is
+            # the remaining step whenever ANY package exists for this version — including
+            # the re-run where all six were already published (STAGED=0, SKIPPED=6) and
+            # `latest` still points at the previous version. The two instructions have
+            # different preconditions, so they must not share one condition.
             if [ "$STAGED_COUNT" -gt 0 ]; then
               echo ""
-              echo "Two steps remain, and they are separate:"
-              echo "1. A maintainer approves the staged release in npm (2FA). The version then"
-              echo "   becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
-              echo "2. To make \`npm install\` serve it, a maintainer runs:"
-              echo "   \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\` (per package)."
+              echo "**Approve:** a maintainer approves the staged release in npm (2FA). The version"
+              echo "then becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
+            fi
+            if [ "$STAGED_COUNT" -gt 0 ] || [ "$SKIPPED_COUNT" -gt 0 ]; then
               echo ""
-              echo "Until step 2, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
+              echo "**Promote:** to make \`npm install\` serve this version, a maintainer runs, per package:"
+              echo "  \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\`"
+              echo ""
+              echo "Until that promote, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
