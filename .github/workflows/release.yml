@@ -257,6 +257,7 @@ jobs:
           done
 
       - name: Stage-publish all packages (OIDC trusted publishing)
+        id: stage
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         # Was: three steps of `npm publish` authenticated by secrets.NPM_TOKEN.
@@ -308,65 +309,138 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          STAGED=()
+          SKIPPED=()
           for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli; do
             nm="$(node -p "require('./packages/$p/package.json').name")"
             echo "::group::npm stage publish — $nm (packages/$p)"
-            if ( cd "packages/$p" && npm stage publish --tag staged --access public ); then
+            # Capture npm's OWN output, so the failure branch below can branch on the
+            # error CODE npm reports rather than on the exit status alone. Exit status
+            # cannot tell an auth failure from a stage collision, and naming the wrong
+            # cause sends an operator hunting for a pending stage that does not exist.
+            set +e
+            out="$( cd "packages/$p" && npm stage publish --tag staged --access public 2>&1 )"
+            rc=$?
+            set -e
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 0 ]; then
               echo "  staged $nm@$VERSION"
+              STAGED+=("$nm")
             elif npm view "$nm@$VERSION" version >/dev/null 2>&1; then
               # Already live. The old token path had this skip and the first draft of
               # this step dropped it, which would have made a re-run after a partial
               # failure die at the first package — the exact situation this workflow
               # has to survive, since v0.6.0 failed mid-flight.
               echo "  already PUBLISHED $nm@$VERSION — skipping"
+              SKIPPED+=("$nm")
             else
-              # It may already be STAGED. npm-stage(1): staged versions share the
-              # semver unique index with published ones, so re-staging errors. We
-              # cannot confirm it from CI — `npm stage list` needs interactive
-              # proof-of-presence and cannot use OIDC — so name the ambiguity
-              # instead of guessing at it.
-              echo "::error::stage publish failed for $nm@$VERSION and it is not published."
-              echo "::error::Most likely it is ALREADY STAGED from a previous run of this tag."
-              echo "::error::"
-              echo "::error::Why CI cannot resolve this itself: npm-stage(1) shares the semver"
-              echo "::error::unique index between staged and published versions, and the stage"
-              echo "::error::subcommands (list/view/reject/approve) need interactive"
-              echo "::error::proof-of-presence — a trusted-publisher token cannot run them."
-              echo "::error::"
-              echo "::error::RECOVERY, from a machine logged in to npm:"
-              echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
-              echo "::error::  npm stage view <stage-id>              # confirm version + contents"
-              echo "::error::then EITHER reject every pending stage for this version and re-run"
-              echo "::error::the tag clean:"
-              echo "::error::  npm stage reject <stage-id>            # for each staged package"
-              echo "::error::OR approve the ones already staged and let this re-run stage only"
-              echo "::error::the remainder — the already-PUBLISHED branch above will skip them."
-              echo "::error::"
-              echo "::error::Do NOT leave a partial stage pending: packages/cli pins the platform"
-              echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
-              echo "::error::whose dependencies do not exist. All six go together."
-              exit 1
+              codes="$(printf '%s\n' "$out" | awk '/npm error code /{print $4}' | sort -u | paste -sd, -)"
+              if printf '%s\n' "$out" | grep -qE 'ENEEDAUTH|E401|E403'; then
+                # Authentication failure. This is NOT a staging-area problem: npm never
+                # got far enough to look at the stage index. OIDC did not authenticate,
+                # so do NOT point the operator at the staging area — nothing may ever
+                # have been staged. The remedy is the trust relationship itself.
+                echo "::error::stage publish failed for $nm@$VERSION and it is not published."
+                echo "::error::npm reported an authentication failure (${codes:-no error code parsed}) — OIDC"
+                echo "::error::did not authenticate. This is not about the staging area, and nothing"
+                echo "::error::here may ever have been staged."
+                echo "::error::"
+                echo "::error::Check, for THIS exact package name ($nm):"
+                echo "::error::  - a Trusted Publisher registration exists for $nm on npmjs.com,"
+                echo "::error::    with repository + workflow filename matching this job"
+                echo "::error::  - this job declares permissions: id-token: write (it mints the"
+                echo "::error::    OIDC token npm swaps for a short-lived publish credential)"
+                echo "::error::  - npm is new enough — OIDC trusted publishing needs >= 11.5.1 and"
+                echo "::error::    the stage subcommands need >= 11.15.0 (the upgrade step pins"
+                echo "::error::    ^11.15.0)"
+                echo "::error::"
+                echo "::error::Fix the registration or the OIDC claim, then re-run this tag."
+                exit 1
+              elif printf '%s\n' "$out" | grep -qE 'E409|EPUBLISHCONFLICT|already exists|already staged'; then
+                # A stage collision — the case this recovery block is written for.
+                # npm-stage(1): staged versions share the semver unique index with
+                # published ones, so re-staging errors. CI cannot resolve it itself
+                # because a token issued through a trust relationship cannot run the
+                # `npm stage` subcommands (list/view/reject/approve) AT ALL. That is a
+                # separate rule from 2FA — per npm-stage(1) only approve and reject
+                # need interactive proof-of-presence; list and view do not — but the
+                # trust-relationship rule covers all four, so CI cannot inspect or
+                # reject a stage. Name the ambiguity instead of guessing at it.
+                echo "::error::stage publish failed for $nm@$VERSION and it is not published."
+                echo "::error::npm reported ${codes:-a conflict} — most likely it is ALREADY STAGED from"
+                echo "::error::a previous run of this tag."
+                echo "::error::"
+                echo "::error::Why CI cannot resolve this itself: npm-stage(1) shares the semver"
+                echo "::error::unique index between staged and published versions, and a token issued"
+                echo "::error::through a trust relationship cannot run the stage subcommands"
+                echo "::error::(list/view/reject/approve) at all — so this workflow cannot inspect or"
+                echo "::error::reject a staged package from CI. (2FA is not the reason: list and view"
+                echo "::error::need no proof-of-presence; only approve and reject do.)"
+                echo "::error::"
+                echo "::error::RECOVERY, from a machine logged in to npm:"
+                echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
+                echo "::error::  npm stage view <stage-id>              # confirm version + contents"
+                echo "::error::then EITHER reject every pending stage for this version and re-run"
+                echo "::error::the tag clean:"
+                echo "::error::  npm stage reject <stage-id>            # for each staged package"
+                echo "::error::OR approve the ones already staged and let this re-run stage only"
+                echo "::error::the remainder — the already-PUBLISHED branch above will skip them."
+                echo "::error::"
+                echo "::error::Do NOT leave a partial stage pending: packages/cli pins the platform"
+                echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
+                echo "::error::whose dependencies do not exist. All six go together."
+                exit 1
+              else
+                # No diagnosis for this code. Say so rather than asserting the
+                # stage-collision cause, which is what the first real run proved wrong.
+                echo "::error::stage publish failed for $nm@$VERSION and it is not published."
+                echo "::error::npm error code(s): ${codes:-none reported in npm output}"
+                echo "::error::The cause is UNCLASSIFIED — this workflow has no diagnosis for this"
+                echo "::error::code. Read the npm output above and diagnose from it; do not assume a"
+                echo "::error::staged collision. The staging recovery block deliberately does not run."
+                exit 1
+              fi
             fi
             echo "::endgroup::"
           done
+          {
+            echo "staged_count=${#STAGED[@]}"
+            echo "skipped_count=${#SKIPPED[@]}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Summary
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
+          # Counts accumulated by the stage step. Reported separately so a partial run
+          # neither claims all six were staged nor claims nothing is live when some
+          # packages were skipped as already published.
+          STAGED_COUNT: ${{ steps.stage.outputs.staged_count }}
+          SKIPPED_COUNT: ${{ steps.stage.outputs.skipped_count }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
+          STAGED_COUNT="${STAGED_COUNT:-0}"
+          SKIPPED_COUNT="${SKIPPED_COUNT:-0}"
           {
             echo "### 📦 v$VERSION staged (tag: staged)"
             echo ""
-            echo "Six packages staged via OIDC trusted publishing. **Nothing is live yet.**"
-            echo ""
-            echo "Two steps remain, and they are separate:"
-            echo "1. A maintainer approves the staged release in npm (2FA). The version then"
-            echo "   becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
-            echo "2. To make \`npm install\` serve it, a maintainer runs:"
-            echo "   \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\` (per package)."
-            echo ""
-            echo "Until step 2, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
+            echo "**$STAGED_COUNT staged**, **$SKIPPED_COUNT skipped** (six packages attempted)."
+            if [ "$SKIPPED_COUNT" -eq 0 ]; then
+              echo ""
+              echo "**Nothing is live yet.**"
+            else
+              echo ""
+              echo "The $SKIPPED_COUNT skipped packages were already published — those are live."
+            fi
+            if [ "$STAGED_COUNT" -gt 0 ]; then
+              echo ""
+              echo "Two steps remain, and they are separate:"
+              echo "1. A maintainer approves the staged release in npm (2FA). The version then"
+              echo "   becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
+              echo "2. To make \`npm install\` serve it, a maintainer runs:"
+              echo "   \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\` (per package)."
+              echo ""
+              echo "Until step 2, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
