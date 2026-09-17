@@ -316,7 +316,7 @@ jobs:
           # procedure. Keeping it in one place stops the two paths drifting apart.
           stage_recovery() {
             echo "::error::RECOVERY, from a machine logged in to npm:"
-            echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
+            echo "::error::  npm stage list                        # see what is pending"
             echo "::error::  npm stage view <stage-id>              # confirm version + contents"
             echo "::error::then EITHER reject every pending stage for this version and re-run"
             echo "::error::the tag clean:"
