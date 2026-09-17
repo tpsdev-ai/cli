@@ -328,6 +328,22 @@ jobs:
             echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
             echo "::error::whose dependencies do not exist. All six go together."
           }
+          # Discloses, for ANY terminal failure, the packages this run already staged.
+          # That fact is cause-independent, so every terminal branch calls this FIRST and
+          # the collision DIAGNOSIS stays confined to the collision branch. Printing
+          # nothing when STAGED is empty keeps it silent on the clean cases. A terminal
+          # branch added later cannot forget it by accident — forgetting it means
+          # deleting a call, not failing to add one.
+          disclose_pending() {
+            if [ "${#STAGED[@]}" -gt 0 ]; then
+              echo "::error::PARTIAL STAGE: ${#STAGED[@]} package(s) were staged before this failure and"
+              echo "::error::are still pending:"
+              echo "::error::  ${STAGED[*]}"
+              echo "::error::Clear or approve them BEFORE re-running, or the re-run fails at the first"
+              echo "::error::already-staged package with an E409 collision, never reaching this one."
+              echo "::error::"
+            fi
+          }
           for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli; do
             nm="$(node -p "require('./packages/$p/package.json').name")"
             echo "::group::npm stage publish — $nm (packages/$p)"
@@ -355,21 +371,15 @@ jobs:
               if printf '%s\n' "$out" | grep -qE 'ENEEDAUTH|E401|E403'; then
                 # Authentication failure for THIS package: npm never got far enough to
                 # look at the stage index, so the remedy is the trust relationship, not
-                # the staging area. But npm trust is PER PACKAGE, so earlier packages can
-                # already be staged. If any are, say so and hand over the recovery
-                # procedure first: otherwise a re-run collides at the first staged
-                # package (E409) and the operator gets a message about the wrong problem.
+                # the staging area. Disclosure comes first (pending packages are
+                # cause-independent); then the recovery procedure, then the per-package
+                # registration checklist.
+                disclose_pending
                 echo "::error::stage publish failed for $nm@$VERSION and it is not published."
                 echo "::error::npm reported an authentication failure (${codes:-no error code parsed}) — OIDC"
                 echo "::error::did not authenticate for this package."
                 echo "::error::"
                 if [ "${#STAGED[@]}" -gt 0 ]; then
-                  echo "::error::PARTIAL STAGE: ${#STAGED[@]} package(s) were staged before this failure and"
-                  echo "::error::are still pending:"
-                  echo "::error::  ${STAGED[*]}"
-                  echo "::error::Clear or approve them BEFORE re-running, or the re-run fails at the first"
-                  echo "::error::already-staged package with an E409 collision, never reaching this one."
-                  echo "::error::"
                   stage_recovery
                   echo "::error::"
                 fi
@@ -395,6 +405,7 @@ jobs:
                 # need interactive proof-of-presence; list and view do not — but the
                 # trust-relationship rule covers all four, so CI cannot inspect or
                 # reject a stage. Name the ambiguity instead of guessing at it.
+                disclose_pending
                 echo "::error::stage publish failed for $nm@$VERSION and it is not published."
                 echo "::error::npm reported ${codes:-a conflict} — most likely it is ALREADY STAGED from"
                 echo "::error::a previous run of this tag."
@@ -411,6 +422,10 @@ jobs:
               else
                 # No diagnosis for this code. Say so rather than asserting the
                 # stage-collision cause, which is what the first real run proved wrong.
+                # Still disclose any pending packages: that fact is cause-independent,
+                # and withholding it here — the catch-all branch — is what hides a
+                # partial stage. Only the COLLISION DIAGNOSIS is withheld.
+                disclose_pending
                 echo "::error::stage publish failed for $nm@$VERSION and it is not published."
                 echo "::error::npm error code(s): ${codes:-none reported in npm output}"
                 echo "::error::The cause is UNCLASSIFIED — this workflow has no diagnosis for this"
