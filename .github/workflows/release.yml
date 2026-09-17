@@ -81,9 +81,17 @@ jobs:
           ART: ${{ matrix.artifact }}
         run: |
           bun run --filter @tpsdev-ai/cli build:binary:${TARGET#bun-}
-          # The build script outputs to dist/tps-<platform>, copy to artifact name
-          cp packages/cli/dist/tps-${TARGET#bun-} packages/cli/dist/${ART}
-          sha256sum packages/cli/dist/${ART} > packages/cli/dist/${ART}.sha256
+          # build-portable.ts writes dist/tps-<platform> (the target minus its "bun-"
+          # prefix). Every matrix row sets artifact to exactly that name, so SRC and DST
+          # are the SAME FILE and an unconditional cp fails with "are the same file",
+          # exit 1. That is what broke the v0.6.0 run — and it would have broken every
+          # release since the output path settled, had one been cut. Copy only when the
+          # paths genuinely differ, so a future matrix row that names them apart works.
+          SRC="packages/cli/dist/tps-${TARGET#bun-}"
+          DST="packages/cli/dist/${ART}"
+          [ "$SRC" = "$DST" ] || cp "$SRC" "$DST"
+          test -f "$DST" || { echo "::error::expected binary missing at $DST"; exit 1; }
+          sha256sum "$DST" > "$DST.sha256"
       - name: Stage binary
         env:
           PKG: ${{ matrix.pkg }}
