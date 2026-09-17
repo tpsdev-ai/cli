@@ -187,7 +187,18 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24'
-          registry-url: https://registry.npmjs.org/
+          # NO registry-url. It makes setup-node write an .npmrc containing
+          # _authToken=${NODE_AUTH_TOKEN} + always-auth, so with no token set npm
+          # tries the EMPTY token and fails rather than falling through to OIDC.
+          # That is exactly how the v0.6.0 publish failed: E404 on PUT, which is
+          # npm's unauthorized response, not a missing package. OIDC needs no token
+          # config at all; npm defaults to registry.npmjs.org.
+      - name: Upgrade npm to an OIDC/staging-capable version
+        # OIDC trusted publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
+        # The bundled npm is older, so upgrade explicitly rather than hoping.
+        run: |
+          npm install -g npm@^11.15.0
+          echo "npm $(npm --version)"
       - name: Restore binary payloads into workspace
         run: |
           cp -R /tmp/release/cli-darwin-arm64/. packages/cli-darwin-arm64/
@@ -203,53 +214,173 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - name: Build agent package
         run: bun run --filter @tpsdev-ai/agent build
-      - name: Publish agent package
+      - name: Verify ALL workspace versions match the tag
+        # The release preflight checks packages/cli only. That is how main ended up
+        # with cli/agent at 0.5.5 and the four platform packages still at 0.5.4 —
+        # a split that would have published a 0.6.0 CLI whose exact
+        # optionalDependencies pins resolve to 0.5.4 binaries. Check all six.
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          npm publish --access public --workspace @tpsdev-ai/agent || {
-            if npm view "@tpsdev-ai/agent@$VERSION" version 2>/dev/null; then
-              echo "⏭️ @tpsdev-ai/agent@$VERSION already published, skipping"
-            else
-              echo "❌ Failed to publish @tpsdev-ai/agent" && exit 1
-            fi
-          }
-      - name: Publish platform packages
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          for pkg in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64; do
-            npm publish --access public --workspace "@tpsdev-ai/$pkg" || {
-              if npm view "@tpsdev-ai/$pkg@$VERSION" version 2>/dev/null; then
-                echo "⏭️ @tpsdev-ai/$pkg@$VERSION already published, skipping"
-              else
-                echo "❌ Failed to publish @tpsdev-ai/$pkg" && exit 1
-              fi
-            }
-          done
-      - name: Publish meta package
-        env:
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          VERSION="$GITHUB_REF_NAME"
-          VERSION="${VERSION#v}"
-          npm publish --access public --workspace @tpsdev-ai/cli || {
-            if npm view "@tpsdev-ai/cli@$VERSION" version 2>/dev/null; then
-              echo "⏭️ @tpsdev-ai/cli@$VERSION already published, skipping"
-            else
+          # PARTIAL STAGE IS POSSIBLE AND IS NOT SELF-HEALING. If package 4 of 6
+          # fails, packages 1-3 stay staged; npm offers no cleanup, no resume and
+          # no idempotency, and CI cannot inspect or reject stages over OIDC. The
+          # error path below therefore carries the operator recovery procedure
+          # rather than telling someone to "inspect the staging area" and leaving
+          # them to work out how. Automating it is tracked in cli#366.
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKGS=(cli agent cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64)
+          for p in "${PKGS[@]}"; do
+            pv="$(node -p "require('./packages/$p/package.json').version")"
+            nm="$(node -p "require('./packages/$p/package.json').name")"
+            if [ "$pv" != "$VERSION" ]; then
+              echo "::error::$nm is at $pv, expected $VERSION (tag ${GITHUB_REF_NAME})."
               exit 1
             fi
-          }
+            echo "  ok $nm @ $pv"
+          done
+          # The optionalDependencies pins are exact and must move with them.
+          for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64; do
+            # `?? ''` matters: a bare lookup on an absent key throws TypeError under
+            # set -e, turning the intended ::error:: into a stack trace.
+            pin="$(node -p "require('./packages/cli/package.json').optionalDependencies?.['@tpsdev-ai/$p'] ?? ''")"
+            if [ -z "$pin" ]; then
+              echo "::error::packages/cli has no optionalDependencies pin for @tpsdev-ai/$p."
+              exit 1
+            fi
+            if [ "$pin" != "$VERSION" ]; then
+              echo "::error::packages/cli pins @tpsdev-ai/$p at $pin, expected $VERSION."
+              exit 1
+            fi
+            echo "  ok pin @tpsdev-ai/$p @ $pin"
+          done
+
+      - name: Stage-publish all packages (OIDC trusted publishing)
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        # Was: three steps of `npm publish` authenticated by secrets.NPM_TOKEN.
+        # Two changes, both deliberate:
+        #
+        # 1. OIDC instead of a token. No long-lived credential lives in this repo.
+        #    The February token expired silently and nobody learned that until the
+        #    next release attempt — seven months later.
+        #
+        # 2. `npm stage publish` instead of `npm publish`. The token path went LIVE
+        #    immediately, so the CLI had no human gate at all. Staging adds one:
+        #    `--tag staged` leaves `latest` unmoved and nothing ships until a
+        #    maintainer approves in npm.
+        #
+        #    NOT full parity with flair, and the difference is worth stating rather
+        #    than glossing. flair pins `environment: release`, which scopes its
+        #    trusted-publisher trust to that environment. This job has no
+        #    environment, so the trust scope is broader: any run of this workflow on
+        #    this repo can mint a publishing token. That is a deliberate trade —
+        #    one fewer piece of repo config to keep in sync — and it is weaker.
+        #    Tightening it is a follow-up, and needs the environment created first.
+        #
+        #    WHAT APPROVAL ACTUALLY DOES — stated correctly because an earlier
+        #    draft of this comment had it backwards, and this comment is what tells
+        #    the approving human what their approval means.
+        #
+        #    `--tag` is an IMMUTABLE property of a staged package and
+        #    `npm stage approve` has no tag flag (npm 11.19.0: it accepts only
+        #    --otp and --registry). We stage with `--tag staged`, so approval
+        #    publishes the version PUBLICLY UNDER `staged` — it does NOT move
+        #    `latest`. Our own flair pipeline documents the same behaviour from
+        #    production (flair#1686): "After a maintainer approves, the version is
+        #    public but NOT latest".
+        #
+        #    So `npm install -g @tpsdev-ai/cli` keeps serving the previous version
+        #    until a maintainer explicitly runs:
+        #
+        #        npm dist-tag add @tpsdev-ai/cli@<version> latest
+        #
+        #    That promote is BY HAND for now. flair automates it with a sha-bound
+        #    promote after a canary; this repo deliberately ships without that
+        #    tooling, tracked in cli#366. Anyone approving a release here must know
+        #    the promote is a separate, manual step, or they will approve, see the
+        #    old version still installing, and conclude the pipeline failed. The gate is a human decision,
+        #    not a policy.
+        #
+        # Dependency order: the platform binaries first, then agent, then cli last —
+        # cli pins the platform packages at exact versions.
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          for p in cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli; do
+            nm="$(node -p "require('./packages/$p/package.json').name")"
+            echo "::group::npm stage publish — $nm (packages/$p)"
+            if ( cd "packages/$p" && npm stage publish --tag staged --access public ); then
+              echo "  staged $nm@$VERSION"
+            elif npm view "$nm@$VERSION" version >/dev/null 2>&1; then
+              # Already live. The old token path had this skip and the first draft of
+              # this step dropped it, which would have made a re-run after a partial
+              # failure die at the first package — the exact situation this workflow
+              # has to survive, since v0.6.0 failed mid-flight.
+              echo "  already PUBLISHED $nm@$VERSION — skipping"
+            else
+              # It may already be STAGED. npm-stage(1): staged versions share the
+              # semver unique index with published ones, so re-staging errors. We
+              # cannot confirm it from CI — `npm stage list` needs interactive
+              # proof-of-presence and cannot use OIDC — so name the ambiguity
+              # instead of guessing at it.
+              echo "::error::stage publish failed for $nm@$VERSION and it is not published."
+              echo "::error::Most likely it is ALREADY STAGED from a previous run of this tag."
+              echo "::error::"
+              echo "::error::Why CI cannot resolve this itself: npm-stage(1) shares the semver"
+              echo "::error::unique index between staged and published versions, and the stage"
+              echo "::error::subcommands (list/view/reject/approve) need interactive"
+              echo "::error::proof-of-presence — a trusted-publisher token cannot run them."
+              echo "::error::"
+              echo "::error::RECOVERY, from a machine logged in to npm:"
+              echo "::error::  npm stage list @tpsdev-ai/cli          # see what is pending"
+              echo "::error::  npm stage view <stage-id>              # confirm version + contents"
+              echo "::error::then EITHER reject every pending stage for this version and re-run"
+              echo "::error::the tag clean:"
+              echo "::error::  npm stage reject <stage-id>            # for each staged package"
+              echo "::error::OR approve the ones already staged and let this re-run stage only"
+              echo "::error::the remainder — the already-PUBLISHED branch above will skip them."
+              echo "::error::"
+              echo "::error::Do NOT leave a partial stage pending: packages/cli pins the platform"
+              echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
+              echo "::error::whose dependencies do not exist. All six go together."
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: Summary
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          {
+            echo "### 📦 v$VERSION staged (tag: staged)"
+            echo ""
+            echo "Six packages staged via OIDC trusted publishing. **Nothing is live yet.**"
+            echo ""
+            echo "Two steps remain, and they are separate:"
+            echo "1. A maintainer approves the staged release in npm (2FA). The version then"
+            echo "   becomes public **under the \`staged\` dist-tag** — \`latest\` does NOT move."
+            echo "2. To make \`npm install\` serve it, a maintainer runs:"
+            echo "   \`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\` (per package)."
+            echo ""
+            echo "Until step 2, \`npm install -g @tpsdev-ai/cli\` keeps serving the previous version."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
     name: GitHub release checksums
+    # ORDERING, decided explicitly (raised in review of #365): this fires as soon
+    # as staging succeeds, so a GitHub release exists while npm still serves the
+    # previous version. That is intended. The binaries it publishes are real
+    # artifacts built and smoke-tested in this run; their existence does not
+    # depend on the npm approval. Gating it on approval is not possible from here
+    # anyway — approval happens out-of-band in npm and this workflow has no way to
+    # observe it without polling.
+    #
+    # The consequence to be aware of: between staging and approval, the GitHub
+    # release advertises a version `npm install` will not yet give you.
     needs: [build-binaries, publish-packages]
     runs-on: ubuntu-latest
     steps:
