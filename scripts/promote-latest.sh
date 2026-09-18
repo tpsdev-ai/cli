@@ -3,6 +3,11 @@
 # promote-latest.sh — move the `latest` dist-tag of all six @tpsdev-ai packages
 # to one released version, together, and prove the registry actually moved.
 #
+# Runs under bash 3.2 — the bash shipped on the machine that drives releases
+# (macOS still ships 3.2.57). No bash-4 constructs: no `declare -A`, no `mapfile`,
+# no `${var^^}`. The version guard below states the floor explicitly so a future
+# bash-4 construct fails with a sentence here, not with a parse error mid-release.
+#
 # WHY THIS EXISTS (cli#366)
 #
 # After a tag push, release.yml stage-publishes six packages under the `staged`
@@ -61,7 +66,7 @@
 # EXIT CODES
 #
 #     0  every package's `latest` is the target (moved, or already there)
-#     1  usage error
+#     1  usage error, or an unsupported bash
 #     2  refused before acting (a package is not published at the target, or its
 #        current `latest` could not be read)
 #     3  the operator did not confirm
@@ -69,12 +74,23 @@
 #     5  the promote failed AND a rollback did not restore the registry
 set -euo pipefail
 
+# ── bash version guard ───────────────────────────────────────────────────────
+# Fail with a sentence rather than a raw parse error. This script must run on the
+# release driver, where bash is 3.2.
+BASH_MAJOR="${BASH_VERSINFO[0]:-0}"
+BASH_MINOR="${BASH_VERSINFO[1]:-0}"
+if [ "$BASH_MAJOR" -lt 3 ] || { [ "$BASH_MAJOR" -eq 3 ] && [ "$BASH_MINOR" -lt 2 ]; }; then
+  printf 'promote-latest: bash %s.%s found, but bash 3.2 or newer is required.\n' "$BASH_MAJOR" "$BASH_MINOR" >&2
+  exit 1
+fi
+
 NPM_BIN="${NPM_BIN:-npm}"
 root="${PROMOTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # The six published packages, in dependency order: the four platform binaries
 # first, then the agent runtime, then the CLI last (it pins the platform packages).
 PKG_DIRS=(cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli)
+NPKG="${#PKG_DIRS[@]}"
 
 EXIT_USAGE=1
 EXIT_REFUSED=2
@@ -144,27 +160,36 @@ if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$ ]]; then
   die "invalid version: $version"
 fi
 
-declare -A name_of=()
-for d in "${PKG_DIRS[@]}"; do
+# Parallel indexed arrays, one slot per package (bash 3.2 has no associative
+# arrays). `i` is the package index throughout.
+names=()
+prev_latest=()
+new_latest=()
+view_out=()
+moved=()
+for ((i = 0; i < NPKG; i++)); do
+  d="${PKG_DIRS[i]}"
   f="$root/packages/$d/package.json"
   [ -f "$f" ] || die "missing $f — this script promotes the six @tpsdev-ai packages"
-  name_of[$d]="$(node -p "require(process.argv[1]).name" "$f")"
+  names[i]="$(node -p "require(process.argv[1]).name" "$f")"
+  prev_latest[i]=""
+  new_latest[i]=""
+  view_out[i]=""
+  moved[i]=0
 done
 
 printf 'Promoting the "latest" dist-tag to %s\n' "$version"
 
 # ── 1. verify BEFORE acting: all six exist at this version ───────────────────
 missing=()
-declare -A view_out=()
-for d in "${PKG_DIRS[@]}"; do
-  name="${name_of[$d]}"
+for ((i = 0; i < NPKG; i++)); do
   set +e
-  out="$("$NPM_BIN" view "${name}@${version}" version 2>&1)"
+  out="$("$NPM_BIN" view "${names[i]}@${version}" version 2>&1)"
   rc=$?
   set -e
-  view_out[$d]="$out"
+  view_out[i]="$out"
   if [ "$rc" -ne 0 ] || [ "$(trim "$out")" != "$version" ]; then
-    missing+=("$d")
+    missing+=("$i")
   fi
 done
 
@@ -172,18 +197,18 @@ if [ "${#missing[@]}" -gt 0 ]; then
   {
     printf 'promote-latest: REFUSED — not all six packages are published at %s.\n' "$version"
     printf '\nMissing at %s:\n' "$version"
-    for d in "${missing[@]}"; do
-      printf '  - %s\n' "${name_of[$d]}"
+    for i in "${missing[@]}"; do
+      printf '  - %s\n' "${names[i]}"
     done
     printf '\nA promote moves "latest" for every package, and packages/cli pins the four\n'
     printf 'platform packages at exact versions — promoting a version that is missing\n'
     printf 'anywhere would publish a "latest" CLI whose pinned dependencies do not resolve.\n'
     printf 'All six must exist first. Nothing was changed.\n'
     printf '\nRegistry output for the missing packages:\n'
-    for d in "${missing[@]}"; do
-      printf '  %s@%s:\n' "${name_of[$d]}" "$version"
-      if [ -n "${view_out[$d]}" ]; then
-        printf '%s\n' "${view_out[$d]}" | sed 's/^/    /'
+    for i in "${missing[@]}"; do
+      printf '  %s@%s:\n' "${names[i]}" "$version"
+      if [ -n "${view_out[i]}" ]; then
+        printf '%s\n' "${view_out[i]}" | sed 's/^/    /'
       else
         printf '    (npm produced no output)\n'
       fi
@@ -193,32 +218,28 @@ if [ "${#missing[@]}" -gt 0 ]; then
 fi
 
 # ── 2. read the current `latest` for each, and build the plan ────────────────
-declare -A prev_latest=()
 plan_moves=0
-for d in "${PKG_DIRS[@]}"; do
-  name="${name_of[$d]}"
+for ((i = 0; i < NPKG; i++)); do
   set +e
-  cur="$("$NPM_BIN" view "$name" dist-tags.latest 2>&1)"
+  cur="$("$NPM_BIN" view "${names[i]}" dist-tags.latest 2>&1)"
   rc=$?
   set -e
   cur="$(trim "$cur")"
   if [ "$rc" -ne 0 ] || [ -z "$cur" ]; then
-    die "cannot read the current \`latest\` dist-tag for $name (needed to plan the move and to roll it back): $cur" "$EXIT_REFUSED"
+    die "cannot read the current \`latest\` dist-tag for ${names[i]} (needed to plan the move and to roll it back): $cur" "$EXIT_REFUSED"
   fi
-  prev_latest[$d]="$cur"
+  prev_latest[i]="$cur"
   [ "$cur" = "$version" ] || plan_moves=$((plan_moves + 1))
 done
 
 printf '\n%-30s %-10s %-10s %s\n' "PACKAGE" "LATEST" "TARGET" "ACTION"
-for d in "${PKG_DIRS[@]}"; do
-  name="${name_of[$d]}"
-  cur="${prev_latest[$d]}"
-  if [ "$cur" = "$version" ]; then
+for ((i = 0; i < NPKG; i++)); do
+  if [ "${prev_latest[i]}" = "$version" ]; then
     action="already latest"
   else
     action="move"
   fi
-  printf '%-30s %-10s %-10s %s\n' "$name" "$cur" "$version" "$action"
+  printf '%-30s %-10s %-10s %s\n' "${names[i]}" "${prev_latest[i]}" "$version" "$action"
 done
 
 if [ "$dry_run" -eq 1 ]; then
@@ -251,42 +272,34 @@ if [ "$assume_yes" -ne 1 ]; then
 fi
 
 # ── 4. move, re-reading the registry after each package ──────────────────────
-declare -A new_latest=()
-declare -A moved=()
-for d in "${PKG_DIRS[@]}"; do
-  new_latest[$d]="${prev_latest[$d]}"
-done
-
 failure=0
-for d in "${PKG_DIRS[@]}"; do
-  name="${name_of[$d]}"
-  cur="${prev_latest[$d]}"
-  if [ "$cur" = "$version" ]; then
-    new_latest[$d]="$version"
-    printf '\n-> %s: already latest (%s), no move needed\n' "$name" "$version"
+for ((i = 0; i < NPKG; i++)); do
+  if [ "${prev_latest[i]}" = "$version" ]; then
+    new_latest[i]="$version"
+    printf '\n-> %s: already latest (%s), no move needed\n' "${names[i]}" "$version"
     continue
   fi
 
-  printf '\n-> %s: npm dist-tag add %s@%s latest\n' "$name" "$name" "$version"
+  printf '\n-> %s: npm dist-tag add %s@%s latest\n' "${names[i]}" "${names[i]}" "$version"
   set +e
-  out="$("$NPM_BIN" dist-tag add "${name}@${version}" latest 2>&1)"
+  out="$("$NPM_BIN" dist-tag add "${names[i]}@${version}" latest 2>&1)"
   rc=$?
   set -e
   [ -z "$out" ] || printf '%s\n' "$out"
-  moved[$d]=1
+  moved[i]=1
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
-  post="$("$NPM_BIN" view "$name" dist-tags.latest 2>&1)"
+  post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest 2>&1)"
   prc=$?
   set -e
   post="$(trim "$post")"
-  new_latest[$d]="$post"
+  new_latest[i]="$post"
 
   if [ "$rc" -ne 0 ] || [ "$prc" -ne 0 ] || [ "$post" != "$version" ]; then
     failure=1
     printf 'promote-latest: %s did NOT move to %s (dist-tag add exited %s; registry now reports %s).\n' \
-      "$name" "$version" "$rc" "${post:-<unreadable>}" >&2
+      "${names[i]}" "$version" "$rc" "${post:-<unreadable>}" >&2
     break
   fi
 done
@@ -295,39 +308,34 @@ done
 rollback_failed=0
 if [ "$failure" -ne 0 ]; then
   printf '\npromote-latest: the promote did not complete — rolling back so the end state is all-six or none.\n' >&2
-  for d in "${PKG_DIRS[@]}"; do
-    [ "${moved[$d]:-0}" = 1 ] || continue
-    name="${name_of[$d]}"
-    prev="${prev_latest[$d]}"
+  for ((i = 0; i < NPKG; i++)); do
+    [ "${moved[i]}" = 1 ] || continue
     set +e
-    rb_out="$("$NPM_BIN" dist-tag add "${name}@${prev}" latest 2>&1)"
+    rb_out="$("$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest 2>&1)"
     rb_rc=$?
     set -e
     [ -z "$rb_out" ] || printf '%s\n' "$rb_out" >&2
     set +e
-    back="$("$NPM_BIN" view "$name" dist-tags.latest 2>&1)"
+    back="$("$NPM_BIN" view "${names[i]}" dist-tags.latest 2>&1)"
     brc=$?
     set -e
     back="$(trim "$back")"
-    new_latest[$d]="$back"
-    if [ "$rb_rc" -ne 0 ] || [ "$brc" -ne 0 ] || [ "$back" != "$prev" ]; then
+    new_latest[i]="$back"
+    if [ "$rb_rc" -ne 0 ] || [ "$brc" -ne 0 ] || [ "$back" != "${prev_latest[i]}" ]; then
       rollback_failed=1
       printf 'promote-latest: ROLLBACK FAILED for %s — it reports %s, expected %s. Restore it by hand: npm dist-tag add %s@%s latest\n' \
-        "$name" "${back:-<unreadable>}" "$prev" "$name" "$prev" >&2
+        "${names[i]}" "${back:-<unreadable>}" "${prev_latest[i]}" "${names[i]}" "${prev_latest[i]}" >&2
     else
-      printf 'promote-latest: rolled back %s to %s\n' "$name" "$prev" >&2
+      printf 'promote-latest: rolled back %s to %s\n' "${names[i]}" "${prev_latest[i]}" >&2
     fi
   done
 fi
 
 # ── 6. final table ───────────────────────────────────────────────────────────
 printf '\n%-30s %-10s %-10s %s\n' "PACKAGE" "PREVIOUS" "NEW" "VERIFIED MOVED"
-for d in "${PKG_DIRS[@]}"; do
-  name="${name_of[$d]}"
-  prev="${prev_latest[$d]}"
-  new="${new_latest[$d]}"
-  if [ "$new" = "$version" ]; then
-    if [ "$prev" = "$version" ]; then
+for ((i = 0; i < NPKG; i++)); do
+  if [ "${new_latest[i]}" = "$version" ]; then
+    if [ "${prev_latest[i]}" = "$version" ]; then
       verified="already latest"
     else
       verified="yes"
@@ -335,12 +343,12 @@ for d in "${PKG_DIRS[@]}"; do
   else
     verified="NO"
   fi
-  printf '%-30s %-10s %-10s %s\n' "$name" "$prev" "${new:-<unreadable>}" "$verified"
+  printf '%-30s %-10s %-10s %s\n' "${names[i]}" "${prev_latest[i]}" "${new_latest[i]:-<unreadable>}" "$verified"
 done
 
 all_ok=1
-for d in "${PKG_DIRS[@]}"; do
-  [ "${new_latest[$d]}" = "$version" ] || all_ok=0
+for ((i = 0; i < NPKG; i++)); do
+  [ "${new_latest[i]}" = "$version" ] || all_ok=0
 done
 
 if [ "$failure" -eq 0 ] && [ "$all_ok" -eq 1 ]; then

@@ -31,6 +31,13 @@ tool="$here/promote-latest.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# BASH_BIN is the bash the tool under test must run under. On the machine that
+# drives releases that is bash 3.2 (macOS ships 3.2.57), so the CI job pins it;
+# locally, `BASH_BIN=/path/to/bash32 ./scripts/test-promote-latest.sh` proves it.
+BASH_BIN="${BASH_BIN:-bash}"
+printf 'test-promote-latest: harness under bash %s; tool under %s\n' \
+  "$BASH_VERSION" "$("$BASH_BIN" --version | head -n1)"
+
 six_dirs=(cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cli)
 
 npass=0
@@ -183,7 +190,7 @@ invoke() { # [TOOL=...] <fixture-dir> [args...]
   LOG="$d/log.txt"
   : >"$LOG"
   OUT="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
-    bash "$t" "$@" 2>"$d/err.txt")"
+    "$BASH_BIN" "$t" "$@" 2>"$d/err.txt")"
   RC=$?
   ERR="$(cat "$d/err.txt")"
 }
@@ -195,7 +202,7 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...]
   LOG="$d/log.txt"
   : >"$LOG"
   OUT="$(printf '%s\n' "$reply" | FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
-    bash "$t" "$@" 2>"$d/err.txt")"
+    "$BASH_BIN" "$t" "$@" 2>"$d/err.txt")"
   RC=$?
   ERR="$(cat "$d/err.txt")"
 }
@@ -308,6 +315,18 @@ if node "$work/mutate.mjs" "$tool" "$mut2" verify; then
   TOOL=""
 else
   bad "M2 mutation: re-read break caught" "could not build the mutant"
+fi
+
+# ── regression guard: the tool must stay bash 3.2-clean ───────────────────────
+# The real proof is running the whole harness under bash 3.2 (the macOS CI leg);
+# this is a cheap cross-platform companion that fails fast on the exact construct
+# that broke it. Comments are stripped first, so prose ABOUT a construct is fine.
+grep -vE '^[[:space:]]*#' "$tool" >"$work/tool-code.txt"
+if grep -nF -e 'declare -A' -e 'mapfile' -e 'readarray' -e ';;&' -e '&>>' -e '^^' "$work/tool-code.txt" >"$work/b4.txt"; then
+  bad "tool has no bash-4 constructs" "bash-4-only syntax found:"
+  sed 's/^/      /' "$work/b4.txt"
+else
+  ok "tool has no bash-4 constructs" "bash 3.2-clean"
 fi
 
 # ── regression guard: the CI workflow must still invoke this harness ──────────
