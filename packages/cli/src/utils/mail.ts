@@ -28,6 +28,13 @@ export interface MailMessage {
   location?: "new" | "cur" | "dlq";
   /** The verified envelope's messageId, persisted so replay is detectable. */
   envelopeId?: string;
+  /**
+   * The full SIGNED envelope, persisted at promotion so a later cur/ re-read
+   * (crash recovery / lease sweep) can re-verify it. Binds "verified at
+   * promote" to "presented at dispatch": a local tamper of the record between
+   * the two either breaks this envelope's signature or fails the field match.
+   */
+  envelope?: Envelope;
   /** Set by listMessages() for dlq records: the sidecar reason class. */
   rejectClass?: string;
   rejectReason?: string;
@@ -104,7 +111,9 @@ export function getInbox(agent: string): { root: string; tmp: string; fresh: str
 function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur" | "dlq"): MailMessage[] {
   if (!existsSync(dir)) return [];
   const messages: MailMessage[] = [];
-  for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
+  for (const f of readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".json"))
+    .map((e) => e.name)) {
     try {
       const raw = readFileSync(join(dir, f), "utf-8");
       const msg = JSON.parse(raw) as MailMessage;
@@ -127,7 +136,11 @@ function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur"
 
 function listMessageFiles(dir: string): string[] {
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".json"));
+  // Files only — a directory named `*.json` (e.g. a fault injection or a
+  // stray artifact) must never be handed to a reader and throw EISDIR.
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isFile() && e.name.endsWith(".json"))
+    .map((e) => e.name);
 }
 
 function readMessageFile(path: string): MailMessage {
@@ -311,7 +324,8 @@ export type PromoteRejectClass =
   | "wrong-recipient"
   | "replay"
   | "verify-unavailable"
-  | "storage-unavailable";
+  | "storage-unavailable"
+  | "unverified";
 
 /**
  * Reject classes a later check will re-drive. `verify-unavailable` (a Flair
@@ -464,18 +478,17 @@ function consumedLedgerPath(root: string): string {
  * a replay.
  */
 function recordConsumedMessageId(root: string, messageId: string): void {
-  try {
-    mkdirSync(root, { recursive: true });
-    appendFileSync(
-      consumedLedgerPath(root),
-      `${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`,
-      "utf-8",
-    );
-  } catch (err: any) {
-    // Losing the ledger write reopens the window for THIS id. It must not be
-    // silent; it also must not crash delivery of an already-verified message.
-    console.error(`[mail] failed to record consumed messageId ${messageId}: ${err?.message ?? err}`);
-  }
+  // THROWS on failure. The ledger write is part of the promotion COMMIT: if it
+  // fails, the id is not recorded and is silently replayable, so promote()
+  // rolls the move back and dead-letters as retryable rather than claiming
+  // success. (Log-and-continue here was fail-open — delivery succeeding
+  // silently was the bug.)
+  mkdirSync(root, { recursive: true });
+  appendFileSync(
+    consumedLedgerPath(root),
+    `${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`,
+    "utf-8",
+  );
 }
 
 /**
@@ -504,15 +517,32 @@ function readConsumedLedger(root: string): Set<string> {
     try {
       entry = JSON.parse(line);
     } catch {
-      pruned++; // torn/partial line from an interrupted append — drop it
+      // Torn/partial line from an interrupted append. Do NOT drop it — salvage
+      // the id and keep the line. Dropping was fail-open: a consumed id became
+      // forgotten. We cannot date it, so it is never pruned.
+      const m = line.match(/"id"\s*:\s*"([^"]+)"/);
+      if (m) ids.add(m[1]!);
+      kept.push(line);
+      continue;
+    }
+    const id = entry.id;
+    if (typeof id !== "string" || id === "") {
+      kept.push(line); // unknown shape — keep, never prune what we cannot read
       continue;
     }
     const at = typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
-    if (typeof entry.id !== "string" || Number.isNaN(at) || at < cutoff) {
-      pruned++;
+    if (Number.isNaN(at)) {
+      // Corrupt/absent timestamp (torn append, clock skew). Keep the id — a
+      // consumed id must never be forgotten because we could not date it.
+      ids.add(id);
+      kept.push(line);
       continue;
     }
-    ids.add(entry.id);
+    if (at < cutoff) {
+      pruned++; // genuinely older than the retention — the intended age bound
+      continue;
+    }
+    ids.add(id);
     kept.push(line);
   }
 
@@ -664,13 +694,12 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
   // Step 6: atomic → cur/ with verified metadata.
   //
   // The promoted record is composed in a SCRATCH file FIRST, and the source is
-  // only touched once the full promoted payload is on disk. A failure in this
-  // block is a STORAGE fault, NOT a verification verdict: the original bytes are
-  // intact (a failed scratch write never touches the source), so we preserve
-  // them, class it RETRYABLE, and a later check re-drives it — the same shape as
-  // verify-unavailable. The previous order rewrote the source in tmp/ in place,
-  // so a partial write dead-lettered a corrupted record as "invalid" AND lost
-  // the original envelope.
+  // only removed once the promoted record is in cur/ AND the consumed id is
+  // durably recorded. A failure in this block is a STORAGE fault, NOT a
+  // verification verdict: the ORIGINAL bytes are never overwritten (a failed
+  // scratch write never touches the source), so we preserve them, class it
+  // RETRYABLE, and a later check re-drives it. The `envelope` is persisted so a
+  // later cur/ re-read can re-verify (see recoverPromoted).
   const promoted: MailMessage = {
     ...msg,
     from: envelope.from,
@@ -679,22 +708,29 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     timestamp: envelope.timestamp || msg.timestamp,
     read: false,
     envelopeId: envelope.messageId,
+    envelope,
     checkedOutAt: new Date().toISOString(),
     checkedOutBy: msg.checkedOutBy ?? agent,
     deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
   };
   const curPath = join(dirs.cur, filename);
   const scratchPath = join(dirs.tmp, `${filename}.promote`);
+  let movedToCur = false;
   try {
     mkdirSync(dirs.tmp, { recursive: true });
     mkdirSync(dirs.cur, { recursive: true });
     writeMessageFile(scratchPath, promoted);
-    // Atomic into cur/ — from here the record is the promoted one. Crash later
-    // in this window leaves a consumed cur/ record that the startup sweep
-    // re-dispatches (at-least-once), never a lost message.
+    // Atomic into cur/.
     renameSync(scratchPath, curPath);
-    // Only now drop the source, so a crash before this point leaves the record
-    // in its original directory rather than nowhere.
+    movedToCur = true;
+    // Record the consumed id durably as PART OF THE COMMIT. If this throws, the
+    // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
+    // promotion that can't be recorded must not silently succeed (its id would
+    // be replayable with no retry and no quarantine).
+    recordConsumedMessageId(dirs.root, envelope.messageId);
+    // Drop the source LAST, so a crash before here leaves the record in its
+    // original directory (re-promoted, and caught by the replay gate) rather
+    // than nowhere.
     rmSync(filePath, { force: true });
   } catch (err: any) {
     // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
@@ -705,18 +741,21 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     } catch {
       /* fault persists — re-drivable */
     }
-    // The ORIGINAL bytes are never overwritten — the source is still at
-    // filePath (scratch-write/rename-source failures) — so dead-letter the
-    // ORIGINAL, not the half-written promoted payload.
+    if (movedToCur) {
+      // Roll the commit back so the source (still intact) is the single copy.
+      try {
+        rmSync(curPath, { force: true });
+      } catch {
+        /* best effort */
+      }
+    }
     const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
     rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
     return { ok: false, class: "storage-unavailable", reason };
   }
 
-  // Success: record the consumed id durably (survives maildir GC), then clear
-  // any stale sidecar from a prior quarantine. Both are best-effort cleanup
-  // outside the critical rename; neither can undo the promotion above.
-  recordConsumedMessageId(dirs.root, envelope.messageId);
+  // Success: clear any stale sidecar from a prior quarantine (best-effort
+  // cleanup; cannot undo the promotion above).
   try {
     const staleReason = join(dirs.dlq, `${filename}.reason`);
     if (existsSync(staleReason)) rmSync(staleReason, { force: true });
@@ -726,6 +765,103 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
 
   logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
   return { ok: true, message: promoted, path: curPath };
+}
+
+/**
+ * Remove stranded `tmp/<name>.json.promote` scratch files.
+ *
+ * A crash between composing the scratch and renaming it into cur/ leaves one
+ * behind. The promote catch only runs on a THROWN error, not a kill, and
+ * `listMessageFiles` filters `.endsWith(".json")`, so `.promote` orphans are
+ * invisible to every sweep. They are always safe to remove: the rename into
+ * cur/ deletes the scratch, so any surviving scratch is either incomplete or
+ * still has its untouched source, which a later check re-promotes.
+ */
+export function sweepStrandedPromoteScratch(tmpDir: string): number {
+  if (!existsSync(tmpDir)) return 0;
+  let removed = 0;
+  for (const name of readdirSync(tmpDir)) {
+    if (!name.endsWith(".promote")) continue;
+    try {
+      rmSync(join(tmpDir, name), { force: true, recursive: true });
+      removed++;
+    } catch {
+      /* best effort — retried on the next sweep */
+    }
+  }
+  return removed;
+}
+
+/**
+ * Re-verify a `cur/` record that is about to be RE-PRESENTED (crash recovery or
+ * the lease sweep).
+ *
+ * `cur/` is a DESTINATION directory; the enforcement point runs on the SOURCE.
+ * Re-presenting from `cur/` therefore bypasses promotion unless the record
+ * proves provenance AND re-verifies. Proof is `envelopeId` plus the stored
+ * signed `envelope` — both set ONLY by `promote()`. A record that cannot prove
+ * it was promoted, or that fails re-verification through the same
+ * always-constructed Flair client, is QUARANTINED, not presented. Grandfathering
+ * stays for history (cur/ and archive are never swept as mail); LIVE
+ * re-delivery is held to the same bar as first delivery.
+ *
+ * Throws only when Flair is unreachable — the caller should leave the record in
+ * `cur/` and retry later (a transient outage is not a verdict about the mail).
+ */
+export async function recoverPromoted(agent: string, curPath: string): Promise<PromoteResult> {
+  assertValidAgentId(agent);
+  const dirs = dirsForRecordPath(curPath);
+  const filename = curPath.split("/").pop()!;
+
+  let msg: MailMessage;
+  try {
+    msg = readMessageFile(curPath);
+  } catch (err: any) {
+    const reason = `corrupt cur/ record: ${err?.message ?? String(err)}`;
+    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    return { ok: false, class: "unverified", reason };
+  }
+
+  // Provenance: only promote() stamps envelopeId. A cur/ record without it did
+  // not come through the enforcement point — never present it.
+  if (typeof msg.envelopeId !== "string" || msg.envelopeId.trim() === "") {
+    const reason = "cur/ record has no envelopeId (did not come through promotion)";
+    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    return { ok: false, class: "unverified", reason };
+  }
+
+  // Binding: the envelope stored at promote() time must still describe THIS
+  // record. Tampering with the record fails this match; tampering with the
+  // envelope fails the signature check below.
+  const env = msg.envelope as Envelope | undefined;
+  if (
+    !env || typeof env !== "object" ||
+    env.messageId !== msg.envelopeId ||
+    env.from !== msg.from || env.to !== msg.to || env.body !== msg.body
+  ) {
+    const reason = "cur/ record does not match its verified envelope (missing or tampered after promotion)";
+    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    return { ok: false, class: "unverified", reason };
+  }
+
+  // Re-verify through the SAME always-constructed client promote() uses.
+  const client = await createMailVerifyClient(agent);
+  const verified = await verifyEnvelope(env, client);
+  if (!verified.ok) {
+    const reason = `re-verification failed for recovered cur/ record: ${verified.reason}`;
+    rejectToDlq(dirs, filename, curPath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  // Present the fields from the VERIFIED envelope, not the mutable record.
+  const presented: MailMessage = {
+    ...msg,
+    from: env.from,
+    to: env.to,
+    body: env.body,
+    envelopeId: env.messageId,
+  };
+  return { ok: true, message: presented, path: curPath };
 }
 
 /**
@@ -752,6 +888,15 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
     console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
   }
 
+  // Reap stranded `tmp/*.promote` scratch from an interrupted promote — the
+  // catch only runs on a thrown error, so a kill leaves orphans no other sweep
+  // can see.
+  try {
+    sweepStrandedPromoteScratch(inbox.tmp);
+  } catch {
+    /* best effort */
+  }
+
   const messages: MailMessage[] = [];
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
@@ -772,18 +917,29 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
     if (result.ok) messages.push(result.message);
   }
 
-  // 3. Lease sweep over cur/ (messages already promoted are skipped: their
-  //    lease is fresh).
+  // 3. Lease sweep over cur/ — re-present un-acked records past their lease.
+  //    cur/ is a DESTINATION, so this is LIVE delivery and goes through the same
+  //    bar as promotion: require proof of promotion (envelopeId) AND re-verify
+  //    before presenting. A record that cannot prove provenance, or fails
+  //    re-verification, is quarantined, not shown. Acked history never reaches
+  //    this branch.
   for (const f of listMessageFiles(inbox.cur)) {
     const full = join(inbox.cur, f);
     const msg = readMessageFile(full);
     if (msg.read || msg.nackedAt) continue;
     if (msg.retryAfter && Date.parse(msg.retryAfter) > nowMs) continue;
     if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
-    msg.checkedOutAt = nowIso;
-    msg.checkedOutBy = checkedOutBy;
-    writeMessageFile(full, msg);
-    messages.push(msg);
+    let recovered: PromoteResult;
+    try {
+      recovered = await recoverPromoted(agent, full);
+    } catch {
+      // Flair unreachable — leave the record in cur/ and retry on a later check.
+      continue;
+    }
+    if (!recovered.ok) continue; // quarantined
+    const present: MailMessage = { ...recovered.message, checkedOutAt: nowIso, checkedOutBy };
+    writeMessageFile(full, present);
+    messages.push(present);
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check

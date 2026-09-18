@@ -86,6 +86,18 @@ function buildSignedBody(from: string, to: string, body: string): string {
   return JSON.stringify(env);
 }
 
+/** The signed envelope OBJECT (not its JSON) — for building a promoted cur/ record. */
+function buildEnvelopeObj(from: string, to: string, body: string, messageId: string): Envelope {
+  const chain: ChainEntry[] = [
+    { agent: "system", kind: "human", timestamp: new Date().toISOString(), rationale: "originates", signature: null },
+    { agent: from, kind: "agent", timestamp: new Date().toISOString(), rationale: `agent ${from} dispatches`, signature: null },
+  ];
+  return signEnvelope(
+    { v: 1, from, to, body, messageId, timestamp: new Date().toISOString(), delegationChain: chain },
+    { [from]: FLINT_SEED },
+  );
+}
+
 describe("openclaw-tps-mail: seenFiles startup behavior", () => {
   let tempMailDir: string;
   let abortController: AbortController;
@@ -263,21 +275,33 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     try { await startPromise; } catch { /* expected on abort */ }
   });
 
-  // ── Major 3: crash between promote() and ack must not lose the message ────
-  it("re-dispatches an unacked cur/ record left by a crash between promote and ack", async () => {
+  // ── crash between promote() and ack must not lose the message ─────────────
+  it("re-dispatches a genuine unacked cur/ record left by a crash (and re-verifies it)", async () => {
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => ({
+        async getAgent(name: string) {
+          if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
+          return null;
+        },
+      }),
+    }));
+
     const agentId = "test-agent";
     const curDir = resolve(tempMailDir, agentId, "cur");
     mkdirSync(curDir, { recursive: true });
 
-    // A promoted cur/ record: the body is the verified INNER payload, and it
-    // was never acked (no ackedAt/nackedAt) — exactly the crash window.
+    // A GENUINE promoted cur/ record: it carries the envelopeId and the signed
+    // envelope that promote() stamps, was never acked, and its inner body.
+    const env = buildEnvelopeObj("flint", agentId, "recovered after crash", "msg-crash-001");
     const record = {
       id: "msg-crash-001",
       from: "flint",
       to: agentId,
-      body: "recovered after crash",
-      timestamp: new Date().toISOString(),
+      body: env.body,
+      timestamp: env.timestamp,
       read: false,
+      envelopeId: env.messageId,
+      envelope: env,
       deliveryAttempts: 1,
     };
     const filename = `2026-04-27T00-00-00-${record.id}.json`;
@@ -382,6 +406,61 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
 
     await new Promise((r) => setTimeout(r, 300));
     expect(dispatchCount).toBe(0);
+
+    abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
+  });
+
+  it("quarantines a forged cur/ record with no envelopeId — never delivered", async () => {
+    const agentId = "test-agent";
+    const curDir = resolve(tempMailDir, agentId, "cur");
+    mkdirSync(curDir, { recursive: true });
+
+    // A same-host writer drops unverified content straight into cur/ — no
+    // envelopeId, so it did not come through promote(). The sweep must refuse
+    // and quarantine it, not present it to the agent.
+    const record = {
+      id: "msg-forged-001",
+      from: "flint",
+      to: agentId,
+      body: "forged instruction",
+      timestamp: new Date().toISOString(),
+      read: false,
+    };
+    const filename = `2026-04-27T00-00-00-${record.id}.json`;
+    writeFileSync(resolve(curDir, filename), JSON.stringify(record, null, 2), "utf-8");
+
+    let dispatchCount = 0;
+    const channelRuntime = {
+      routing: {
+        buildAgentSessionKey: (params: any) =>
+          `agent:${params.agentId}:tps-mail:default:${params.peer.id}`,
+      },
+      reply: {
+        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        dispatchReplyWithBufferedBlockDispatcher: async () => { dispatchCount++; },
+      },
+    };
+    const cfg = {
+      bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
+    };
+    const ctx = {
+      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
+      cfg,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      channelRuntime,
+      abortSignal: abortController.signal,
+    };
+
+    const startPromise = capturedPlugin.gateway.startAccount(ctx);
+
+    await pollUntil(() => readdirSync(curDir).filter((f) => f.endsWith(".json")).length === 0, 2000);
+    expect(dispatchCount).toBe(0);
+    expect(readdirSync(curDir).filter((f) => f.endsWith(".json")).length).toBe(0);
+    const dlqDir = resolve(tempMailDir, agentId, "dlq");
+    expect(readdirSync(dlqDir).filter((f) => f.endsWith(".json")).length).toBe(1);
+    const reason = readFileSync(resolve(dlqDir, `${filename}.reason`), "utf-8");
+    expect(reason).toContain("class: unverified");
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }

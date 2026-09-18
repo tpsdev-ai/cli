@@ -41,7 +41,7 @@ import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
-import { promote } from "@tpsdev-ai/cli/utils/mail";
+import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   ChannelGatewayAdapter,
@@ -437,25 +437,48 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     }
 
     /**
+     * Crash-recovery re-dispatch of a cur/ record, gated on proof-of-promotion
+     * and re-verification. cur/ is a DESTINATION directory: presenting from it
+     * would bypass the new/ → cur/ enforcement point unless the record proves it
+     * came through promote() (envelopeId + stored signed envelope) and still
+     * verifies. recoverPromoted() enforces that and quarantines anything that
+     * cannot prove provenance; a Flair outage leaves the record in cur/ for the
+     * next start.
+     */
+    async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
+      try {
+        const recovered = await recoverPromoted(recipient, curPath);
+        if (!recovered.ok) {
+          log?.warn?.(
+            `tps-mail: cur/ recovery refused ${record.id} (${recovered.class}): ${recovered.reason}`,
+          );
+          return;
+        }
+        await deliverPromoted(recipient, recovered.message, curPath);
+      } catch (err: any) {
+        log?.warn?.(`tps-mail: cur/ recovery deferred for ${record.id}: ${err?.message ?? err}`);
+      }
+    }
+
+    /**
      * Deliver an already-promoted (cur/) record.
      *
-     * Shared by the new/ path (after promote()) and the startup recovery sweep.
+     * Shared by the new/ path (after promote()) and the startup recovery sweep
+     * (after recoverPromoted() has re-established provenance and re-verified).
      * promote() moves a record to cur/ BEFORE dispatch, and ackedAt is written
      * only AFTER the turn returns; a gateway that exits in that window would
      * otherwise strand an unacked, undelivered record in cur/ forever, breaking
-     * at-least-once. Startup therefore re-dispatches cur/ records with neither
-     * ackedAt nor nackedAt.
+     * at-least-once.
      *
-     * Re-dispatch deliberately does NOT re-enter promote(): the record is already
-     * verified and its id is already in the consumed ledger, so running the
-     * enforcement point again would dead-letter it as a replay.
+     * This does not re-enter promote(): the id is already consumed and promote()
+     * would dead-letter it as a replay. The recovery path calls recoverPromoted()
+     * for the re-check instead.
      */
     async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
       if (seenFiles.has(curPath)) return;
       seenFiles.add(curPath);
 
       log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
-
       // Session key: one conversation per (channel, sender) pair.
       // Using `dmScope: "per-channel-peer"` isolates each tps-mail sender
       // into their own session, so conversations build context over time
@@ -624,11 +647,13 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         } catch { /* ignore */ }
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
-        // promoted but never acked/nacked. Without this, a gateway exit between
-        // promote() (new/ → cur/) and the post-turn ack would strand the record
-        // in cur/ forever — startup only scanned new/. Records that already
-        // carry ackedAt/nackedAt are terminal and skipped; re-dispatch bypasses
-        // the replay gate (see deliverPromoted).
+        // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
+        // must PROVE it came through promote() (envelopeId + stored signed
+        // envelope) and re-verify before it may be presented — otherwise the
+        // sweep would bypass the enforcement point simply by reading from the
+        // other directory. recoverPromoted() enforces that and quarantines a
+        // record that cannot prove provenance; a Flair outage defers to the next
+        // start.
         const curDir = resolve(account.mailDir, agentId, "cur");
         try {
           if (existsSync(curDir)) {
@@ -638,10 +663,16 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               if (seenFiles.has(curPath)) continue;
               const record = readMailFile(curPath);
               if (!record || record.ackedAt || record.nackedAt) continue;
-              log?.info?.(`tps-mail: recovering unacked cur/ record ${record.id} for ${agentId}`);
-              void deliverPromoted(agentId, record, curPath);
+              void recoverUnackedCurRecord(agentId, curPath, record);
             }
           }
+        } catch { /* ignore */ }
+
+        // Reap stranded tmp/*.promote scratch from an interrupted promote (the
+        // catch only runs on a thrown error, so a kill leaves orphans no other
+        // sweep can see).
+        try {
+          sweepStrandedPromoteScratch(resolve(account.mailDir, agentId, "tmp"));
         } catch { /* ignore */ }
       } catch (err: any) {
         log?.warn?.(

@@ -238,17 +238,15 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const inbox = getInbox("kern");
     const [file] = newJsonFiles(inbox.fresh);
 
-    // Force the promoted write to fail: plant a DIRECTORY where the scratch
-    // payload must be written (a transient storage fault, not a verdict).
-    const scratch = join(inbox.tmp, `${file}.promote`);
-    mkdirSync(scratch, { recursive: true });
+    // Force the final rename into cur/ to fail: plant a DIRECTORY where the
+    // promoted record must land (a transient storage fault, not a verdict).
+    mkdirSync(join(inbox.cur, file!), { recursive: true });
 
     const during = await checkMessages("kern");
     expect(during.length).toBe(0);
-    expect(newJsonFiles(inbox.cur).length).toBe(0); // nothing promoted
+    expect(jsonFiles(inbox.cur).length).toBe(0); // nothing promoted
     expect(newJsonFiles(inbox.dlq).length).toBe(1);
     expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: storage-unavailable");
-    expect(existsSync(scratch)).toBe(true); // the fault persists until cleared
 
     // The ORIGINAL bytes are preserved: the dead-lettered record still carries
     // the signed-envelope wrapper, not a half-written promoted payload (whose
@@ -260,11 +258,11 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(dead.body).not.toBe("storage-fault");
 
     // Clear any remaining fault and re-drive: the quarantine self-heals.
-    rmSync(scratch, { recursive: true, force: true });
+    rmSync(join(inbox.cur, file!), { recursive: true, force: true });
     const after = await checkMessages("kern");
     expect(after.length).toBe(1);
     expect(after[0]!.body).toBe("storage-fault");
-    expect(newJsonFiles(inbox.cur).length).toBe(1);
+    expect(jsonFiles(inbox.cur).length).toBe(1);
     expect(newJsonFiles(inbox.dlq).length).toBe(0); // sidecar + record gone
   });
 
@@ -296,5 +294,107 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!);
     expect(reason).toContain("class: invalid");
     expect(reason).toMatch(/messageId/i);
+  });
+
+  // ── Major: cur/ re-presentation must NOT bypass the enforcement point ─────
+  test("a forged cur/ record with no envelopeId is quarantined, not presented", async () => {
+    const inbox = getInbox("kern");
+    mkdirSync(inbox.cur, { recursive: true });
+    // A same-host writer drops an unverified record straight into cur/ — no
+    // ackedAt/nackedAt, no envelopeId. Re-presenting it would deliver forged
+    // content (routing trusts msg.from), so it must be quarantined.
+    writeFileSync(
+      join(inbox.cur, "forged.json"),
+      JSON.stringify({ id: "forged-1", from: "flint", to: "kern", body: "forged instruction", timestamp: new Date().toISOString(), read: false }),
+      "utf-8",
+    );
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(0); // never presented
+    expect(jsonFiles(inbox.cur).length).toBe(0); // removed from cur/
+    expect(newJsonFiles(inbox.dlq).length).toBe(1);
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", "forged.json")).toContain("class: unverified");
+  });
+
+  test("a cur/ record tampered after promotion is quarantined (verification binding)", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "bind me", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    await checkMessages("kern"); // promote
+    const [curFile] = jsonFiles(inbox.cur);
+    expect(curFile).toBeTruthy();
+
+    // Local tamper AFTER promotion, with the stored envelope left intact. Also
+    // backdate the lease so the sweep would otherwise re-present it.
+    const rec = JSON.parse(readFileSync(join(inbox.cur, curFile!), "utf-8"));
+    rec.body = "forged instruction";
+    rec.checkedOutAt = new Date(Date.now() - 31 * 60 * 1000).toISOString();
+    writeFileSync(join(inbox.cur, curFile!), JSON.stringify(rec, null, 2), "utf-8");
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(0); // the tampered body never lands
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", curFile!)).toContain("class: unverified");
+  });
+
+  // ── State 1: a ledger append failure must not silently succeed ────────────
+  test("a ledger append failure rolls the promotion back and retries (not silent)", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "ledger-fault", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const [file] = newJsonFiles(inbox.fresh);
+
+    // Force the ledger append to fail: a DIRECTORY at the ledger path.
+    const ledger = join(inbox.root, "consumed.jsonl");
+    mkdirSync(ledger, { recursive: true });
+
+    const during = await checkMessages("kern");
+    expect(during.length).toBe(0); // NOT silently delivered
+    expect(jsonFiles(inbox.cur).length).toBe(0); // the move was rolled back
+    expect(newJsonFiles(inbox.dlq).length).toBe(1);
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: storage-unavailable");
+
+    // Clear the fault; the quarantined record self-heals.
+    rmSync(ledger, { recursive: true, force: true });
+    const after = await checkMessages("kern");
+    expect(after.length).toBe(1);
+    expect(after[0]!.body).toBe("ledger-fault");
+    expect(jsonFiles(inbox.cur).length).toBe(1);
+  });
+
+  // ── State 2: a corrupt ledger timestamp must not forget a consumed id ─────
+  test("a consumed id with a corrupt ledger timestamp is still gated (fail-closed)", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "torn-ledger", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const first = await checkMessages("kern");
+    expect(first.length).toBe(1);
+
+    // Simulate a torn/clock-skewed append: a well-formed id with an
+    // unparseable `at`. Remove the cur/ record too, so ONLY the ledger can gate
+    // the replay (the maildir fallback cannot see it).
+    writeFileSync(
+      join(inbox.root, "consumed.jsonl"),
+      `${JSON.stringify({ id: env.messageId, at: "not-a-timestamp" })}\n`,
+      "utf-8",
+    );
+    rmSync(inbox.cur, { recursive: true, force: true });
+    mkdirSync(inbox.cur, { recursive: true });
+
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const [file] = newJsonFiles(inbox.fresh);
+    const second = await checkMessages("kern");
+    expect(second.length).toBe(0);
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: replay");
+  });
+
+  // ── State 3: stranded tmp/*.promote scratch must not be invisible forever ──
+  test("a stranded tmp/*.promote scratch is reaped on check", async () => {
+    const inbox = getInbox("kern");
+    mkdirSync(inbox.tmp, { recursive: true });
+    const orphan = join(inbox.tmp, "9999-stranded.json.promote");
+    writeFileSync(orphan, '{"half":', "utf-8");
+
+    await checkMessages("kern");
+    expect(existsSync(orphan)).toBe(false);
   });
 });
