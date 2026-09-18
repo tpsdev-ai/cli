@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -306,7 +306,24 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
 // ONE convention (the CLI used to write `.reject`, which the daily surfacing
 // never saw).
 
-export type PromoteRejectClass = "invalid" | "wrong-recipient" | "replay" | "verify-unavailable";
+export type PromoteRejectClass =
+  | "invalid"
+  | "wrong-recipient"
+  | "replay"
+  | "verify-unavailable"
+  | "storage-unavailable";
+
+/**
+ * Reject classes a later check will re-drive. `verify-unavailable` (a Flair
+ * outage) and `storage-unavailable` (a transient disk/write fault) are both
+ * RETRYABLE: the inbound is quarantined rather than dropped, and the next
+ * `mail check` re-drives it until the fault clears. Everything else is
+ * terminal and is never retried.
+ */
+const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set([
+  "verify-unavailable",
+  "storage-unavailable",
+]);
 
 export interface PromoteOk {
   ok: true;
@@ -411,13 +428,119 @@ function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-e
   return obj;
 }
 
+// ─── Durable consumed-id ledger (replay gate that survives maildir GC) ───────
+//
+// The replay gate must NOT be the maildir. cur/ is mutable — ackMessage unlinks
+// the record, gcMessages purges it, and archiveOldCur rotates cur/ into
+// archive/ — so a gate built on those reopens the moment a record ages out. A
+// defence that expires is not a defence (CWE-294, replay).
+//
+// Consumed ids are therefore recorded in an append-only ledger at the mailbox
+// root — OUTSIDE every directory the maildir maintenance touches — and consulted
+// BEFORE promotion. The ledger is bounded by AGE, not by the maildir's
+// contents, so it outlives the record it stands in for rather than ageing out
+// with it.
+//
+// Retention (CONSUMED_LEDGER_RETENTION_MS): 180 days. This is deliberately many
+// multiples of the longest maildir lifetime — cur/ holds ~30 days before
+// archiveOldCur rotates it, and gcMessages purges acked records after 24h and
+// everything after 48h — so a replay must now wait out the LEDGER's window, not
+// the maildir's. The fix converts the pre-fix window (which reopened as soon as
+// the record was acked or GC'd — hours) into one bounded by this retention. The
+// residual exposure past the retention is acknowledged; it is strictly larger
+// than the window it replaced, and it is a knob, not an accident.
+const CONSUMED_LEDGER_FILE = "consumed.jsonl";
+const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
+
+function consumedLedgerPath(root: string): string {
+  return join(root, CONSUMED_LEDGER_FILE);
+}
+
 /**
- * Has this envelope messageId already been consumed? Scans cur/ and the archive
- * (recursively). Counts both the persisted `envelopeId` and — for legacy cur/
- * records written before promotion set that field — a body that is itself a
+ * Append a consumed envelope messageId to the durable ledger.
+ *
+ * Called ONLY after the record is safely in cur/ — never before — so a failed
+ * promotion cannot mark an id consumed and then reject the legitimate retry as
+ * a replay.
+ */
+function recordConsumedMessageId(root: string, messageId: string): void {
+  try {
+    mkdirSync(root, { recursive: true });
+    appendFileSync(
+      consumedLedgerPath(root),
+      `${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`,
+      "utf-8",
+    );
+  } catch (err: any) {
+    // Losing the ledger write reopens the window for THIS id. It must not be
+    // silent; it also must not crash delivery of an already-verified message.
+    console.error(`[mail] failed to record consumed messageId ${messageId}: ${err?.message ?? err}`);
+  }
+}
+
+/**
+ * Read the durable ledger, dropping entries older than the retention. Returns
+ * the live id set. When pruning actually removed something the ledger is
+ * rewritten in place (atomic replace) so the file stays bounded by age.
+ */
+function readConsumedLedger(root: string): Set<string> {
+  const path = consumedLedgerPath(root);
+  const ids = new Set<string>();
+  if (!existsSync(path)) return ids;
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return ids;
+  }
+
+  const cutoff = Date.now() - CONSUMED_LEDGER_RETENTION_MS;
+  const kept: string[] = [];
+  let pruned = 0;
+  for (const line of raw.split("\n")) {
+    if (!line) continue;
+    let entry: { id?: unknown; at?: unknown };
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      pruned++; // torn/partial line from an interrupted append — drop it
+      continue;
+    }
+    const at = typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
+    if (typeof entry.id !== "string" || Number.isNaN(at) || at < cutoff) {
+      pruned++;
+      continue;
+    }
+    ids.add(entry.id);
+    kept.push(line);
+  }
+
+  if (pruned > 0) {
+    try {
+      const tmp = `${path}.tmp`;
+      writeFileSync(tmp, kept.length > 0 ? `${kept.join("\n")}\n` : "", "utf-8");
+      renameSync(tmp, path);
+    } catch {
+      // Pruning is housekeeping — non-fatal, retried on the next read.
+    }
+  }
+  return ids;
+}
+
+/**
+ * Has this envelope messageId already been consumed?
+ *
+ * The durable ledger is the authority (it survives maildir GC). The maildir
+ * scan (cur/ + archive/, recursively) is kept as a MIGRATION fallback for
+ * records consumed before this ledger existed — or by an older build — so an
+ * upgrade does not open a window for records already on disk. Counts both the
+ * persisted `envelopeId` and, for legacy records, a body that is itself a
  * signed envelope. This is the gate on replay of consumed history.
  */
 function isConsumedMessageId(root: string, messageId: string): boolean {
+  if (readConsumedLedger(root).has(messageId)) return true;
+
   const stack = [join(root, "cur"), join(root, "archive")];
   while (stack.length > 0) {
     const dir = stack.pop()!;
@@ -516,14 +639,38 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     return { ok: false, class: "wrong-recipient", reason };
   }
 
-  // Step 4: replay — a re-planted consumed envelope must dead-letter.
+  // Step 4: the replay gate keys on messageId, so validate its shape FIRST.
+  // verifyEnvelope checks the signature but does not enforce that messageId is a
+  // present, non-empty string (and signEnvelope does not validate it at runtime
+  // either). A signature-valid envelope with an absent/empty/non-string
+  // messageId must never reach isConsumedMessageId — an undefined key silently
+  // misses and can never match, so the gate would report "not consumed". A
+  // malformed messageId is a terminal (invalid) reject, not an undefined lookup.
+  if (typeof envelope.messageId !== "string" || envelope.messageId.trim() === "") {
+    const shown = typeof envelope.messageId === "string" ? JSON.stringify(envelope.messageId) : String(envelope.messageId);
+    const reason = `invalid messageId (must be a non-empty string, got ${shown})`;
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  // Step 5: replay — a re-planted consumed envelope must dead-letter. Consulted
+  // against the DURABLE ledger (and the maildir fallback), not cur/ alone.
   if (isConsumedMessageId(dirs.root, envelope.messageId)) {
     const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
     rejectToDlq(dirs, filename, filePath, "replay", reason);
     return { ok: false, class: "replay", reason };
   }
 
-  // Step 5: atomic new/ → tmp/ → cur/ with verified metadata.
+  // Step 6: atomic → cur/ with verified metadata.
+  //
+  // The promoted record is composed in a SCRATCH file FIRST, and the source is
+  // only touched once the full promoted payload is on disk. A failure in this
+  // block is a STORAGE fault, NOT a verification verdict: the original bytes are
+  // intact (a failed scratch write never touches the source), so we preserve
+  // them, class it RETRYABLE, and a later check re-drives it — the same shape as
+  // verify-unavailable. The previous order rewrote the source in tmp/ in place,
+  // so a partial write dead-lettered a corrupted record as "invalid" AND lost
+  // the original envelope.
   const promoted: MailMessage = {
     ...msg,
     from: envelope.from,
@@ -537,21 +684,44 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
   };
   const curPath = join(dirs.cur, filename);
-  const tmpPath = join(dirs.tmp, filename);
+  const scratchPath = join(dirs.tmp, `${filename}.promote`);
   try {
     mkdirSync(dirs.tmp, { recursive: true });
     mkdirSync(dirs.cur, { recursive: true });
-    // Atomic out of new/ (or dlq/): a crash after this leaves the record in
-    // tmp/ — never back in new/, so it cannot be re-presented as mail.
-    renameSync(filePath, tmpPath);
-    writeMessageFile(tmpPath, promoted);
-    renameSync(tmpPath, curPath);
+    writeMessageFile(scratchPath, promoted);
+    // Atomic into cur/ — from here the record is the promoted one. Crash later
+    // in this window leaves a consumed cur/ record that the startup sweep
+    // re-dispatches (at-least-once), never a lost message.
+    renameSync(scratchPath, curPath);
+    // Only now drop the source, so a crash before this point leaves the record
+    // in its original directory rather than nowhere.
+    rmSync(filePath, { force: true });
+  } catch (err: any) {
+    // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
+    // non-file entry at the scratch path) is expected to persist so a later
+    // check can re-drive it; a transient one is cleared here and self-heals.
+    try {
+      rmSync(scratchPath, { force: true });
+    } catch {
+      /* fault persists — re-drivable */
+    }
+    // The ORIGINAL bytes are never overwritten — the source is still at
+    // filePath (scratch-write/rename-source failures) — so dead-letter the
+    // ORIGINAL, not the half-written promoted payload.
+    const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
+    rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+    return { ok: false, class: "storage-unavailable", reason };
+  }
+
+  // Success: record the consumed id durably (survives maildir GC), then clear
+  // any stale sidecar from a prior quarantine. Both are best-effort cleanup
+  // outside the critical rename; neither can undo the promotion above.
+  recordConsumedMessageId(dirs.root, envelope.messageId);
+  try {
     const staleReason = join(dirs.dlq, `${filename}.reason`);
     if (existsSync(staleReason)) rmSync(staleReason, { force: true });
-  } catch (err: any) {
-    const reason = `promote write failed: ${err?.message ?? String(err)}`;
-    rejectToDlq(dirs, filename, existsSync(tmpPath) ? tmpPath : filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
+  } catch {
+    // best effort
   }
 
   logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
@@ -592,11 +762,12 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
     if (result.ok) messages.push(result.message);
   }
 
-  // 2. Self-heal: re-drive quarantined verify-unavailable entries. Terminal
-  //    rejects (invalid/wrong-recipient/replay) are NOT retried.
+  // 2. Self-heal: re-drive quarantined RETRYABLE entries (a Flair outage or a
+  //    transient storage fault). Terminal rejects (invalid/wrong-recipient/
+  //    replay) are NOT retried.
   for (const f of listMessageFiles(inbox.dlq)) {
     const side = readReasonSidecar(inbox.dlq, f);
-    if (!side || side.cls !== "verify-unavailable") continue;
+    if (!side || !RETRYABLE_REJECT_CLASSES.has(side.cls)) continue;
     const result = await promote(agent, join(inbox.dlq, f));
     if (result.ok) messages.push(result.message);
   }

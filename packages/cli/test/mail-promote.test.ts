@@ -10,10 +10,10 @@
  */
 
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { sendMessage, checkMessages, getInbox } from "../src/utils/mail.js";
+import { sendMessage, checkMessages, getInbox, ackMessage } from "../src/utils/mail.js";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
@@ -55,6 +55,14 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
 
   function newJsonFiles(dir: string): string[] {
     return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
+  }
+  /** Files (not the planted-directory fault injections) in a dir. */
+  function jsonFiles(dir: string): string[] {
+    return existsSync(dir)
+      ? readdirSync(dir, { withFileTypes: true })
+          .filter((e) => e.isFile() && e.name.endsWith(".json"))
+          .map((e) => e.name)
+      : [];
   }
   function reasonFor(mailDir: string, agent: string, filename: string): string | null {
     try {
@@ -192,5 +200,101 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const after = await checkMessages("kern");
     expect(after.length).toBe(0);
     expect(newJsonFiles(inbox.dlq).length).toBe(1); // still one, not re-promoted
+  });
+
+  // ── Major 1: the replay gate must survive maildir GC (durable ledger) ──────
+  test("a consumed id is still gated after its cur/ record is acked and GC'd", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "durable-ledger", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+
+    const first = await checkMessages("kern");
+    expect(first.length).toBe(1);
+
+    // Simulate the maildir forgetting the record: ackMessage unlinks it from
+    // cur/, then cur/ and archive/ are wiped. The gate used to read exactly
+    // those mutable directories, so the consumed id became unknown again.
+    expect(ackMessage("kern", first[0]!.id)).not.toBeNull();
+    rmSync(inbox.cur, { recursive: true, force: true });
+    rmSync(join(inbox.root, "archive"), { recursive: true, force: true });
+    mkdirSync(inbox.cur, { recursive: true });
+    expect(jsonFiles(inbox.cur).length).toBe(0);
+
+    // Re-plant the SAME signed envelope (same messageId).
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const [file] = newJsonFiles(inbox.fresh);
+
+    const second = await checkMessages("kern");
+    expect(second.length).toBe(0);
+    expect(jsonFiles(inbox.cur).length).toBe(0);
+    const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!);
+    expect(reason).toContain("class: replay");
+  });
+
+  // ── Major 2: a STORAGE fault is retryable and preserves the original ───────
+  test("a storage failure dead-letters retryable, preserves the original envelope, and self-heals", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "storage-fault", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const [file] = newJsonFiles(inbox.fresh);
+
+    // Force the promoted write to fail: plant a DIRECTORY where the scratch
+    // payload must be written (a transient storage fault, not a verdict).
+    const scratch = join(inbox.tmp, `${file}.promote`);
+    mkdirSync(scratch, { recursive: true });
+
+    const during = await checkMessages("kern");
+    expect(during.length).toBe(0);
+    expect(newJsonFiles(inbox.cur).length).toBe(0); // nothing promoted
+    expect(newJsonFiles(inbox.dlq).length).toBe(1);
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: storage-unavailable");
+    expect(existsSync(scratch)).toBe(true); // the fault persists until cleared
+
+    // The ORIGINAL bytes are preserved: the dead-lettered record still carries
+    // the signed-envelope wrapper, not a half-written promoted payload (whose
+    // body would be the bare inner string). This is the whole point — a
+    // storage fault must not consume the envelope.
+    const dead = JSON.parse(readFileSync(join(inbox.dlq, file!), "utf-8"));
+    expect(typeof dead.body).toBe("string");
+    expect(dead.body).toContain('"signature"');
+    expect(dead.body).not.toBe("storage-fault");
+
+    // Clear any remaining fault and re-drive: the quarantine self-heals.
+    rmSync(scratch, { recursive: true, force: true });
+    const after = await checkMessages("kern");
+    expect(after.length).toBe(1);
+    expect(after[0]!.body).toBe("storage-fault");
+    expect(newJsonFiles(inbox.cur).length).toBe(1);
+    expect(newJsonFiles(inbox.dlq).length).toBe(0); // sidecar + record gone
+  });
+
+  // ── Minor 4: messageId shape is validated BEFORE the replay gate ──────────
+  test("a signature-valid envelope with an empty messageId dead-letters invalid", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "no id", { flint: FLINT_SEED }, { messageId: "" });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const [file] = newJsonFiles(inbox.fresh);
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(0);
+    expect(jsonFiles(inbox.cur).length).toBe(0);
+    const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!);
+    expect(reason).toContain("class: invalid");
+    expect(reason).toMatch(/messageId/i);
+  });
+
+  test("a signature-valid envelope with a non-string messageId dead-letters invalid", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "numeric id", { flint: FLINT_SEED }, {
+      messageId: 12345 as unknown as string,
+    });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const [file] = newJsonFiles(inbox.fresh);
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(0);
+    const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!);
+    expect(reason).toContain("class: invalid");
+    expect(reason).toMatch(/messageId/i);
   });
 });

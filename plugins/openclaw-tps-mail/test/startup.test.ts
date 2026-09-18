@@ -13,7 +13,7 @@
  * Tests use hermetic mock verify client via module mocking.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -258,6 +258,130 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
 
     // Assert: dispatch was called exactly once (no double-processing)
     expect(dispatchCount).toBe(1);
+
+    abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
+  });
+
+  // ── Major 3: crash between promote() and ack must not lose the message ────
+  it("re-dispatches an unacked cur/ record left by a crash between promote and ack", async () => {
+    const agentId = "test-agent";
+    const curDir = resolve(tempMailDir, agentId, "cur");
+    mkdirSync(curDir, { recursive: true });
+
+    // A promoted cur/ record: the body is the verified INNER payload, and it
+    // was never acked (no ackedAt/nackedAt) — exactly the crash window.
+    const record = {
+      id: "msg-crash-001",
+      from: "flint",
+      to: agentId,
+      body: "recovered after crash",
+      timestamp: new Date().toISOString(),
+      read: false,
+      deliveryAttempts: 1,
+    };
+    const filename = `2026-04-27T00-00-00-${record.id}.json`;
+    writeFileSync(resolve(curDir, filename), JSON.stringify(record, null, 2), "utf-8");
+
+    let dispatchResolve: (val: any) => void;
+    const dispatchPromise = new Promise<any>((res) => { dispatchResolve = res; });
+
+    const channelRuntime = {
+      routing: {
+        buildAgentSessionKey: (params: any) =>
+          `agent:${params.agentId}:tps-mail:default:${params.peer.id}`,
+      },
+      reply: {
+        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
+          dispatchResolve(args);
+        },
+      },
+    };
+
+    const cfg = {
+      bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
+    };
+
+    const ctx = {
+      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
+      cfg,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      channelRuntime,
+      abortSignal: abortController.signal,
+    };
+
+    const startPromise = capturedPlugin.gateway.startAccount(ctx);
+
+    const result = await Promise.race([
+      dispatchPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for recovery dispatch")), 5000)),
+    ]);
+
+    expect(result.ctx.MessageSid).toBe("msg-crash-001");
+    expect(result.ctx.Body).toBe("recovered after crash");
+
+    // The turn completed → ackedAt is written, closing the crash window.
+    const acked = await pollUntil(() => {
+      try {
+        return !!JSON.parse(readFileSync(resolve(curDir, filename), "utf-8")).ackedAt;
+      } catch {
+        return false;
+      }
+    }, 2000);
+    expect(acked).toBe(true);
+
+    abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
+  });
+
+  it("does not re-dispatch a cur/ record that is already acked", async () => {
+    const agentId = "test-agent";
+    const curDir = resolve(tempMailDir, agentId, "cur");
+    mkdirSync(curDir, { recursive: true });
+
+    const record = {
+      id: "msg-acked-001",
+      from: "flint",
+      to: agentId,
+      body: "already done",
+      timestamp: new Date().toISOString(),
+      read: true,
+      ackedAt: new Date().toISOString(),
+    };
+    const filename = `2026-04-27T00-00-00-${record.id}.json`;
+    writeFileSync(resolve(curDir, filename), JSON.stringify(record, null, 2), "utf-8");
+
+    let dispatchCount = 0;
+    const channelRuntime = {
+      routing: {
+        buildAgentSessionKey: (params: any) =>
+          `agent:${params.agentId}:tps-mail:default:${params.peer.id}`,
+      },
+      reply: {
+        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        dispatchReplyWithBufferedBlockDispatcher: async () => {
+          dispatchCount++;
+        },
+      },
+    };
+
+    const cfg = {
+      bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
+    };
+
+    const ctx = {
+      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
+      cfg,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      channelRuntime,
+      abortSignal: abortController.signal,
+    };
+
+    const startPromise = capturedPlugin.gateway.startAccount(ctx);
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(dispatchCount).toBe(0);
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }

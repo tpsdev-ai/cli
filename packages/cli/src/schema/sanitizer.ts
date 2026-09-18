@@ -12,8 +12,13 @@ export function sanitizeIdentifier(value: string, maxLength = 64): string {
   let sanitized = value.replace(/[^a-zA-Z0-9_-]/g, "-");
   // Collapse multiple hyphens
   sanitized = sanitized.replace(/-+/g, "-");
-  // Trim leading/trailing hyphens
-  sanitized = sanitized.replace(/^-+|-+$/g, "");
+  // Trim leading/trailing hyphens. The previous alternation
+  // `/^-+|-+$/g` is a polynomial-ReDoS sink (CodeQL js/polynomial-redos): the
+  // `-+$` branch is a trailing-anchored repetition that is retried at every
+  // offset on a long hyphen run with no trailing hyphen. Runs were already
+  // collapsed to a single hyphen on the line above, so trimming one hyphen at
+  // each end is exact — and leaves no quantifier for the analyser to pump.
+  sanitized = sanitized.replace(/^-/, "").replace(/-$/, "");
   // Default if empty after trim
   if (!sanitized) return "unknown";
   // Truncate

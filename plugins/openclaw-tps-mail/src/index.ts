@@ -433,8 +433,26 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         );
         return;
       }
-      const msg = promoted.message;
-      const curPath = promoted.path;
+      await deliverPromoted(recipient, promoted.message, promoted.path);
+    }
+
+    /**
+     * Deliver an already-promoted (cur/) record.
+     *
+     * Shared by the new/ path (after promote()) and the startup recovery sweep.
+     * promote() moves a record to cur/ BEFORE dispatch, and ackedAt is written
+     * only AFTER the turn returns; a gateway that exits in that window would
+     * otherwise strand an unacked, undelivered record in cur/ forever, breaking
+     * at-least-once. Startup therefore re-dispatches cur/ records with neither
+     * ackedAt nor nackedAt.
+     *
+     * Re-dispatch deliberately does NOT re-enter promote(): the record is already
+     * verified and its id is already in the consumed ledger, so running the
+     * enforcement point again would dead-letter it as a replay.
+     */
+    async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
+      if (seenFiles.has(curPath)) return;
+      seenFiles.add(curPath);
 
       log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
 
@@ -601,6 +619,27 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             const filePath = resolve(newDir, filename);
             if (!seenFiles.has(filePath)) {
               void processNewFile(agentId, filePath);
+            }
+          }
+        } catch { /* ignore */ }
+
+        // Crash recovery (at-least-once): re-dispatch cur/ records that were
+        // promoted but never acked/nacked. Without this, a gateway exit between
+        // promote() (new/ → cur/) and the post-turn ack would strand the record
+        // in cur/ forever — startup only scanned new/. Records that already
+        // carry ackedAt/nackedAt are terminal and skipped; re-dispatch bypasses
+        // the replay gate (see deliverPromoted).
+        const curDir = resolve(account.mailDir, agentId, "cur");
+        try {
+          if (existsSync(curDir)) {
+            for (const filename of readdirSync(curDir)) {
+              if (!filename.endsWith(".json")) continue;
+              const curPath = resolve(curDir, filename);
+              if (seenFiles.has(curPath)) continue;
+              const record = readMailFile(curPath);
+              if (!record || record.ackedAt || record.nackedAt) continue;
+              log?.info?.(`tps-mail: recovering unacked cur/ record ${record.id} for ${agentId}`);
+              void deliverPromoted(agentId, record, curPath);
             }
           }
         } catch { /* ignore */ }

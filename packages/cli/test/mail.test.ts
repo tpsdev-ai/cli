@@ -399,18 +399,21 @@ describe("mail command", () => {
     // stderr may contain nono warnings in CI — only assert stdout
   });
 
-  test("mail list withholds bodies from new/ and dlq/", async () => {
+  test("mail list withholds bodies from new/ and dlq/ — even when the record forges a location", async () => {
     const mailDir = join(tempRoot, "mail");
     mkdirSync(join(mailDir, "kern", "new"), { recursive: true });
     mkdirSync(join(mailDir, "kern", "dlq"), { recursive: true });
+    // Each fixture forges `location: "cur"` — the reader must not trust a
+    // record's self-declared location; it derives it from the directory it
+    // actually read. Without the forgery nothing exercised that defence.
     writeFileSync(
       join(mailDir, "kern", "new", "a.json"),
-      JSON.stringify({ id: "aaaaaaaa", from: "flint", to: "kern", body: "SECRET-BODY-NEW", timestamp: new Date().toISOString(), read: false }),
+      JSON.stringify({ id: "aaaaaaaa", from: "flint", to: "kern", body: "SECRET-BODY-NEW", timestamp: new Date().toISOString(), read: false, location: "cur" }),
       "utf-8",
     );
     writeFileSync(
       join(mailDir, "kern", "dlq", "b.json"),
-      JSON.stringify({ id: "bbbbbbbb", from: "flint", to: "kern", body: "SECRET-BODY-DLQ", timestamp: new Date().toISOString(), read: true }),
+      JSON.stringify({ id: "bbbbbbbb", from: "flint", to: "kern", body: "SECRET-BODY-DLQ", timestamp: new Date().toISOString(), read: true, location: "cur" }),
       "utf-8",
     );
     writeFileSync(join(mailDir, "kern", "dlq", "b.json.reason"), "class: invalid\nReason: nope\n", "utf-8");
