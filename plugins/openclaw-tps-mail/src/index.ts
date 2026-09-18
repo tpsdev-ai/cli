@@ -35,13 +35,13 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
-import { signEnvelope, verifyEnvelope } from "@tpsdev-ai/agent";
+import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
-import { createVerifyClient } from "./verify-adapter.js";
+import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   ChannelGatewayAdapter,
@@ -114,37 +114,6 @@ function readMailFile(filePath: string): TpsMailBody | null {
     return JSON.parse(raw) as TpsMailBody;
   } catch {
     return null;
-  }
-}
-
-/**
- * Move a file from new/ to dlq/ (dead-letter queue) when it can't be parsed.
- *
- * Kern's 2026-04-09 review finding: without this, malformed files in new/
- * get added to `seenFiles` once, then readMailFile returns null, then
- * processNewFile returns early — but the file stays in new/ forever,
- * re-populated into seenFiles on every gateway restart. Silent garbage
- * accumulation.
- *
- * The fix: on parse failure, move the file to a sibling dlq/ folder so
- * it's out of the way for live processing but preserved for diagnosis.
- */
-function moveToDlq(filePath: string, reason: string): void {
-  try {
-    const dlqDir = resolve(filePath, "..", "..", "dlq");
-    if (!existsSync(dlqDir)) mkdirSync(dlqDir, { recursive: true });
-    const name = basename(filePath);
-    const target = resolve(dlqDir, name);
-    // renameSync works across sibling directories on the same filesystem.
-    renameSync(filePath, target);
-    // Write a companion .reason file so operators know why it failed.
-    writeFileSync(
-      target + ".reason",
-      `Moved to dlq by openclaw-tps-mail at ${new Date().toISOString()}\nReason: ${reason}\n`,
-      "utf-8",
-    );
-  } catch {
-    // best effort — don't crash the watcher on dlq move errors
   }
 }
 
@@ -296,40 +265,16 @@ function isLocalRecipient(
 }
 
 /**
- * Move a mail file from <inbox>/new/ to <inbox>/cur/ with the given state
- * patch applied (typically `ackedAt` on success or `nackedAt` on failure).
- *
- * Atomicity: uses renameSync to move the file from new/ → tmp/ first
- * (atomic on same filesystem), then writes the enriched version to cur/.
- * If the process crashes between rename and write, the file is in tmp/
- * (not new/), so it won't be re-processed on restart — preventing replay.
- * Sherlock's 2026-04-09 security review finding #5.
- *
- * Best-effort: the watcher should not crash if the filesystem transition
- * fails for some reason. Logs via caller.
+ * Patch a mail record in place. Used to ack/nack a message that the shared
+ * promote() enforcement point has already moved new/ → cur/. The promotion
+ * itself is atomic inside promote() (new/ → tmp/ → cur/); this only enriches
+ * the cur/ record after dispatch, so a crash here cannot replay a message.
  */
-function moveToCur(filePath: string, patch: Partial<TpsMailBody>): void {
+function patchMailFile(path: string, patch: Partial<TpsMailBody>): void {
   try {
-    const current = readMailFile(filePath);
+    const current = readMailFile(path);
     if (!current) return;
-    const updated = { ...current, ...patch };
-
-    const agentDir = resolve(filePath, "..", "..");
-    const tmpDir = resolve(agentDir, "tmp");
-    const curDir = resolve(agentDir, "cur");
-    if (!existsSync(tmpDir)) mkdirSync(tmpDir, { recursive: true });
-    if (!existsSync(curDir)) mkdirSync(curDir, { recursive: true });
-
-    const name = basename(filePath);
-    const tmpPath = resolve(tmpDir, name);
-    const curPath = resolve(curDir, name);
-
-    // Step 1: atomic remove from new/ — prevents replay on crash.
-    renameSync(filePath, tmpPath);
-    // Step 2: write enriched version to cur/.
-    writeFileSync(curPath, JSON.stringify(updated, null, 2), "utf-8");
-    // Step 3: clean up tmp staging file.
-    try { unlinkSync(tmpPath); } catch { /* best effort */ }
+    writeFileSync(path, JSON.stringify({ ...current, ...patch }, null, 2), "utf-8");
   } catch {
     // best effort — don't crash the watcher on state-transition errors
   }
@@ -477,62 +422,63 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       if (seenFiles.has(filePath)) return;
       seenFiles.add(filePath);
 
-      const msg = readMailFile(filePath);
-      if (!msg) {
-        // Malformed file — move to dlq/ so it doesn't accumulate in new/.
-        // Kern's 2026-04-09 review finding: without this the file sits
-        // permanently in new/, re-populated into seenFiles on every restart.
+      // ONE enforcement point, shared with the CLI: parse wrapper → envelope,
+      // verify through an always-constructed Flair client, check recipient and
+      // replay, and move new/ → cur/ (or dlq/ with a `.reason` sidecar). The
+      // plugin carries no verification implementation of its own.
+      const promoted = await promote(recipient, filePath);
+      if (!promoted.ok) {
         log?.warn?.(
-          `tps-mail: file in ${recipient}/new/ failed to parse; moving to dlq: ${basename(filePath)}`,
+          `tps-mail: not promoted (${promoted.class}) for ${recipient}: ${promoted.reason}`,
         );
-        moveToDlq(filePath, "JSON parse failed or file was not a valid TPS mail envelope");
         return;
       }
+      await deliverPromoted(recipient, promoted.message, promoted.path);
+    }
 
-      log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
-
-      // ─── Strict signed-envelope verification (ops-ibw8) ────────────────
-      // Sherlock-mandated strict-day-1: every inbound message must be a valid
-      // signed envelope. Anything that can't be verified → dlq with .reason.
-      // The verified inner body replaces msg.body so the agent sees the
-      // actual payload, not the JSON wrapper.
-      let signedEnvelope: Envelope;
+    /**
+     * Crash-recovery re-dispatch of a cur/ record, gated on proof-of-promotion
+     * and re-verification. cur/ is a DESTINATION directory: presenting from it
+     * would bypass the new/ → cur/ enforcement point unless the record proves it
+     * came through promote() (envelopeId + stored signed envelope) and still
+     * verifies. recoverPromoted() enforces that and quarantines anything that
+     * cannot prove provenance; a Flair outage leaves the record in cur/ for the
+     * next start.
+     */
+    async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
       try {
-        signedEnvelope = JSON.parse(msg.body) as Envelope;
-      } catch {
-        moveToDlq(filePath, "body is not JSON (signed envelope required, strict day-1)");
-        return;
-      }
-
-      if (
-        signedEnvelope.v !== 1 ||
-        !Array.isArray(signedEnvelope.delegationChain) ||
-        typeof signedEnvelope.signature !== "string"
-      ) {
-        moveToDlq(filePath, "body is not a v1 signed envelope (strict day-1)");
-        return;
-      }
-
-      try {
-        const verifyClient = await createVerifyClient(recipient);
-        const vr = await verifyEnvelope(signedEnvelope, verifyClient);
-        if (!vr.ok) {
-          moveToDlq(filePath, `signed envelope verification failed: ${vr.reason}`);
+        const recovered = await recoverPromoted(recipient, curPath);
+        if (!recovered.ok) {
+          log?.warn?.(
+            `tps-mail: cur/ recovery refused ${record.id} (${recovered.class}): ${recovered.reason}`,
+          );
           return;
         }
+        await deliverPromoted(recipient, recovered.message, curPath);
       } catch (err: any) {
-        // Never swallow verify errors — false security if we fall through.
-        moveToDlq(
-          filePath,
-          `signed envelope verification error: ${err?.message ?? String(err)}`,
-        );
-        return;
+        log?.warn?.(`tps-mail: cur/ recovery deferred for ${record.id}: ${err?.message ?? err}`);
       }
+    }
 
-      // Verified — replace msg.body with the inner envelope body so the agent
-      // sees the actual payload, not the JSON wrapper.
-      msg.body = signedEnvelope.body;
+    /**
+     * Deliver an already-promoted (cur/) record.
+     *
+     * Shared by the new/ path (after promote()) and the startup recovery sweep
+     * (after recoverPromoted() has re-established provenance and re-verified).
+     * promote() moves a record to cur/ BEFORE dispatch, and ackedAt is written
+     * only AFTER the turn returns; a gateway that exits in that window would
+     * otherwise strand an unacked, undelivered record in cur/ forever, breaking
+     * at-least-once.
+     *
+     * This does not re-enter promote(): the id is already consumed and promote()
+     * would dead-letter it as a replay. The recovery path calls recoverPromoted()
+     * for the re-check instead.
+     */
+    async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
+      if (seenFiles.has(curPath)) return;
+      seenFiles.add(curPath);
 
+      log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
       // Session key: one conversation per (channel, sender) pair.
       // Using `dmScope: "per-channel-peer"` isolates each tps-mail sender
       // into their own session, so conversations build context over time
@@ -655,14 +601,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           },
         });
 
-        // Turn completed — mark original as acked and move to cur/
-        moveToCur(filePath, { ackedAt: new Date().toISOString(), read: true });
+        // Turn completed — mark original as acked in cur/.
+        patchMailFile(curPath, { ackedAt: new Date().toISOString(), read: true });
         log?.info?.(`tps-mail: acked ${msg.id}`);
       } catch (err: any) {
         log?.warn?.(
           `tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`,
         );
-        moveToCur(filePath, {
+        patchMailFile(curPath, {
           nackedAt: new Date().toISOString(),
           nackReason: `dispatch failed: ${err?.message ?? String(err)}`,
         });
@@ -698,6 +644,35 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               void processNewFile(agentId, filePath);
             }
           }
+        } catch { /* ignore */ }
+
+        // Crash recovery (at-least-once): re-dispatch cur/ records that were
+        // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
+        // must PROVE it came through promote() (envelopeId + stored signed
+        // envelope) and re-verify before it may be presented — otherwise the
+        // sweep would bypass the enforcement point simply by reading from the
+        // other directory. recoverPromoted() enforces that and quarantines a
+        // record that cannot prove provenance; a Flair outage defers to the next
+        // start.
+        const curDir = resolve(account.mailDir, agentId, "cur");
+        try {
+          if (existsSync(curDir)) {
+            for (const filename of readdirSync(curDir)) {
+              if (!filename.endsWith(".json")) continue;
+              const curPath = resolve(curDir, filename);
+              if (seenFiles.has(curPath)) continue;
+              const record = readMailFile(curPath);
+              if (!record || record.ackedAt || record.nackedAt) continue;
+              void recoverUnackedCurRecord(agentId, curPath, record);
+            }
+          }
+        } catch { /* ignore */ }
+
+        // Reap stranded tmp/*.promote scratch from an interrupted promote (the
+        // catch only runs on a thrown error, so a kill leaves orphans no other
+        // sweep can see).
+        try {
+          await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
       } catch (err: any) {
         log?.warn?.(

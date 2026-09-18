@@ -21,6 +21,24 @@ describe("sanitizer", () => {
     expect(sanitizeIdentifier("multi---dashes")).toBe("multi-dashes");
   });
 
+  test("sanitizeIdentifier trims a long hyphen run promptly (polynomial-ReDoS regression)", () => {
+    // The old trim `/^-+|-+$/g` is a CodeQL js/polynomial-redos sink: on a long
+    // hyphen run with no trailing hyphen the `-+$` branch is retried at every
+    // offset. Since runs are collapsed to one hyphen first, the trim is exact as
+    // a single-hyphen replace at each end, which has no quantifier to pump.
+    // The change is semantics-preserving, so assert both the value and that it
+    // returns promptly.
+    const longRun = "-".repeat(200_000) + "x";
+    const start = performance.now();
+    const out = sanitizeIdentifier(longRun);
+    const elapsedMs = performance.now() - start;
+    expect(out).toBe("x");
+    expect(elapsedMs).toBeLessThan(1000);
+
+    // An all-hyphen run collapses then trims to empty → the documented default.
+    expect(sanitizeIdentifier("-".repeat(200_000))).toBe("unknown");
+  });
+
   test("sanitizeModelIdentifier allows slash/colon/dot", () => {
     expect(sanitizeModelIdentifier("anthropic/claude-sonnet")).toBe("anthropic/claude-sonnet");
     expect(sanitizeModelIdentifier("ollama/qwen:7b")).toBe("ollama/qwen:7b");
