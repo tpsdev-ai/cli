@@ -14,6 +14,7 @@ import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSyn
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { sendMessage, checkMessages, getInbox, ackMessage, promote, recoverPromoted, ENVELOPE_BINDINGS } from "../src/utils/mail.js";
+import { processStartToken } from "../src/utils/mail-lock.js";
 import { spawnSync } from "node:child_process";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
@@ -550,5 +551,35 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const msgs = await checkMessages("kern");
     expect(msgs.length).toBe(1); // recovered, not wedged forever
     expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
+  });
+
+  test("a lock whose live owner's start token mismatches is broken (pid reuse)", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "pid-reuse", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const lockDir = plantLock(inbox.root, process.pid, "a-start-token-that-cannot-match");
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(1);
+    expect(existsSync(lockDir)).toBe(false);
+  });
+
+  test("a lock whose live owner's start token matches is respected", async () => {
+    // The birth token must be readable on this host (portable: /proc, else ps).
+    const token = processStartToken(process.pid);
+    expect(token).not.toBeNull();
+
+    const env = buildSignedEnvelope("flint", "kern", "token-match", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const lockDir = plantLock(inbox.root, process.pid, token);
+
+    const during = await checkMessages("kern");
+    expect(during.length).toBe(0); // a live owner with a matching token is respected
+    expect(existsSync(lockDir)).toBe(true);
+
+    rmSync(lockDir, { recursive: true, force: true });
+    const after = await checkMessages("kern");
+    expect(after.length).toBe(1);
   });
 });

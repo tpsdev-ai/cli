@@ -36,6 +36,7 @@
  */
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 
@@ -59,20 +60,42 @@ export function mailLockPath(root: string): string {
 /** Roots currently held by THIS process (reentrancy guard). */
 const heldByThisProcess = new Set<string>();
 
-/** A stable per-process identity token: its kernel start time, or null if unreadable. */
+/**
+ * A stable per-process identity token — its kernel birth time — or null only
+ * when it cannot be read at all.
+ *
+ * Two sources, so it is portable: `/proc/<pid>/stat` (Linux; field 22 is
+ * starttime), and `ps -o lstart= -p <pid>` (Darwin and Linux). Without the
+ * fallback the token is always null on Darwin, and owner identity degrades to
+ * pid alone — exactly the pid-reuse confusion this token exists to prevent.
+ */
 export function processStartToken(pid: number): string | null {
+  // /proc/<pid>/stat: the `comm` field (2) may contain spaces and parentheses,
+  // so split after the LAST ')'. fields[0] is field 3 (state); starttime is
+  // field 22 → fields[19].
   try {
-    // /proc/<pid>/stat: field 22 is starttime (clock ticks). The `comm` field
-    // (2) may contain spaces and parentheses, so split after the LAST ')'.
     const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
     const rparen = stat.lastIndexOf(")");
-    if (rparen === -1) return null;
-    const fields = stat.slice(rparen + 2).split(" ");
-    // fields[0] is field 3 (state); starttime is field 22 → fields[19].
-    return fields[19] ?? null;
+    if (rparen !== -1) {
+      const token = stat.slice(rparen + 2).split(" ")[19];
+      if (token) return `proc:${token}`;
+    }
   } catch {
-    return null;
+    /* fall through to ps */
   }
+  // Portable fallback — `lstart` is a stable per-process birth time string.
+  try {
+    const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 2000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const token = out.trim();
+    if (token) return `ps:${token}`;
+  } catch {
+    /* unreadable */
+  }
+  return null;
 }
 
 function isPidAlive(pid: number): boolean {

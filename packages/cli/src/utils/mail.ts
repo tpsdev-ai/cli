@@ -922,7 +922,9 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
   // a scratch being composed right now cannot be eaten (an age guard is cleanup
   // policy, not the safety property — a paused promoter outlives any threshold,
   // and stat-then-delete still races with replacement of the same pathname). If
-  // the lock is busy, a promoter is active, so nothing is stranded: skip.
+  // the lock is busy, a promoter is active, so nothing is stranded: skip. The
+  // short timeout is deliberate — this is a second acquisition per check that
+  // competes with promotion, so it skips rather than waits and never delays mail.
   let lock: MailLock | null;
   try {
     lock = await acquireMailLock(root, { timeoutMs: 250 });
@@ -1031,12 +1033,14 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
   }
   const env = decision.envelope;
 
-  // Present the fields from the VERIFIED envelope, not the mutable record.
+  // Present the fields from the VERIFIED envelope, not the mutable record —
+  // the same fields the first-delivery path presents.
   const presented: MailMessage = {
     ...msg,
     from: env.from,
     to: env.to,
     body: env.body,
+    timestamp: env.timestamp,
     envelopeId: env.messageId,
   };
   return { ok: true, message: presented, path: curPath };
