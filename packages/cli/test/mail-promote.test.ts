@@ -13,8 +13,9 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { sendMessage, checkMessages, getInbox, ackMessage, promote } from "../src/utils/mail.js";
+import { sendMessage, checkMessages, getInbox, ackMessage, promote, recoverPromoted, ENVELOPE_BINDINGS } from "../src/utils/mail.js";
 import { spawnSync } from "node:child_process";
+import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
@@ -501,5 +502,39 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     rmSync(lockDir, { recursive: true, force: true });
     await checkMessages("kern");
     expect(existsSync(orphan)).toBe(false);
+  });
+
+  // ── Binding table: every bound field is enforced, driven by the table ─────
+  test("every bound envelope field is enforced (driven by ENVELOPE_BINDINGS)", async () => {
+    const boundKeys = (Object.keys(ENVELOPE_BINDINGS) as Array<keyof Envelope>).filter(
+      (k) => ENVELOPE_BINDINGS[k].kind === "bind",
+    );
+    expect(boundKeys.length).toBeGreaterThanOrEqual(4); // from, to, body, timestamp (+messageId)
+
+    for (const key of boundKeys) {
+      const rule = ENVELOPE_BINDINGS[key];
+      if (rule.kind !== "bind") continue;
+
+      const env = buildSignedEnvelope("flint", "kern", `bind ${String(key)}`, { flint: FLINT_SEED });
+      sendMessage("kern", JSON.stringify(env), "flint");
+      const inbox = getInbox("kern");
+      const [file] = jsonFiles(inbox.fresh);
+      const promoted = await promote("kern", join(inbox.fresh, file!));
+      expect(promoted.ok).toBe(true);
+
+      const curPath = join(inbox.cur, jsonFiles(inbox.cur)[0]!);
+      const rec = JSON.parse(readFileSync(curPath, "utf-8"));
+      rec[rule.recordField] = `${rec[rule.recordField]}-tampered`;
+      writeFileSync(curPath, JSON.stringify(rec, null, 2), "utf-8");
+
+      const check = await recoverPromoted("kern", curPath);
+      expect(check.ok).toBe(false);
+      expect(check.class).toBe("unverified");
+
+      // Reset cur/ + dlq for the next binding.
+      rmSync(inbox.cur, { recursive: true, force: true });
+      mkdirSync(inbox.cur, { recursive: true });
+      for (const f of readdirSync(inbox.dlq)) rmSync(join(inbox.dlq, f), { force: true });
+    }
   });
 });

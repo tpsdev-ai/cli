@@ -600,6 +600,56 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
   return false;
 }
 
+type EnvelopeBinding =
+  | { kind: "bind"; recordField: keyof MailMessage }
+  | { kind: "exclude"; reason: string };
+
+/**
+ * How each `Envelope` field binds to the outer mail record — the ONE list, so a
+ * field cannot be left unbound by oversight. `satisfies Record<keyof Envelope,
+ * EnvelopeBinding>` makes adding a field to `Envelope` a BUILD failure until
+ * someone decides what it binds to (the CLI tsconfig typechecks src/, not tests,
+ * so this lives in production code on purpose).
+ *
+ * It is a MAPPING, not same-name equality: `messageId` binds to the record's
+ * `envelopeId`.
+ */
+export const ENVELOPE_BINDINGS = {
+  v: { kind: "exclude", reason: "version is validated (verifyEnvelope requires v === 1)" },
+  from: { kind: "bind", recordField: "from" },
+  to: { kind: "bind", recordField: "to" },
+  subject: { kind: "exclude", reason: "not carried on the outer record" },
+  body: { kind: "bind", recordField: "body" },
+  messageId: { kind: "bind", recordField: "envelopeId" },
+  timestamp: { kind: "bind", recordField: "timestamp" },
+  delegationChain: { kind: "exclude", reason: "signed as part of the envelope and verified" },
+  signature: { kind: "exclude", reason: "verified by decideEnvelopeForMailbox" },
+} satisfies Record<keyof Envelope, EnvelopeBinding>;
+
+/**
+ * Check the record↔envelope binding using the table above. Returns the first
+ * mismatch (or ok). Both recovery paths call this, so the bound set is defined
+ * once.
+ */
+function recordMatchesEnvelope(
+  record: MailMessage,
+  envelope: Envelope,
+): { ok: true } | { ok: false; reason: string } {
+  for (const key of Object.keys(ENVELOPE_BINDINGS) as Array<keyof Envelope>) {
+    const rule = ENVELOPE_BINDINGS[key];
+    if (rule.kind !== "bind") continue;
+    const envValue = (envelope as unknown as Record<string, unknown>)[key as string];
+    const recValue = (record as unknown as Record<string, unknown>)[rule.recordField as string];
+    if (envValue !== recValue) {
+      return {
+        ok: false,
+        reason: `binding mismatch on envelope.${String(key)} (record.${String(rule.recordField)})`,
+      };
+    }
+  }
+  return { ok: true };
+}
+
 type EnvelopePolicyResult =
   | { ok: true; envelope: Envelope }
   | { ok: false; class: PromoteRejectClass; reason: string };
@@ -661,6 +711,18 @@ async function decideEnvelopeForMailbox(
       ok: false,
       class: "invalid",
       reason: `invalid messageId (must be a non-empty string, got ${shown})`,
+    };
+  }
+
+  // 5. `timestamp` shape — a malformed/absent timestamp is rejected, never
+  //    silently replaced by the wrapper's unsigned value (that fallback would
+  //    let an unsigned field stand in for a signed one).
+  if (typeof envelope.timestamp !== "string" || Number.isNaN(Date.parse(envelope.timestamp))) {
+    const shown = typeof envelope.timestamp === "string" ? JSON.stringify(envelope.timestamp) : String(envelope.timestamp);
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `invalid timestamp (must be an ISO-8601 string, got ${shown})`,
     };
   }
 
@@ -924,16 +986,16 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
   }
 
   // Binding: the envelope stored at promote() time must still describe THIS
-  // record. Tampering with the record fails this match; tampering with the
-  // envelope fails the signature check in the shared policy below. (The
-  // wrapper→envelope `from` binding is part of the shared policy.)
+  // record, field by field, via the ONE binding table (ENVELOPE_BINDINGS).
   const env = msg.envelope as Envelope | undefined;
-  if (
-    !env || typeof env !== "object" ||
-    env.messageId !== msg.envelopeId ||
-    env.to !== msg.to || env.body !== msg.body
-  ) {
-    const reason = "cur/ record does not match its verified envelope (missing or tampered after promotion)";
+  if (!env || typeof env !== "object") {
+    const reason = "cur/ record is missing its stored signed envelope";
+    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    return { ok: false, class: "unverified", reason };
+  }
+  const binding = recordMatchesEnvelope(msg, env);
+  if (!binding.ok) {
+    const reason = `cur/ record does not match its verified envelope: ${binding.reason}`;
     rejectToDlq(dirs, filename, curPath, "unverified", reason);
     return { ok: false, class: "unverified", reason };
   }
