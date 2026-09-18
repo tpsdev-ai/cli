@@ -20,6 +20,8 @@
  *  - an owner is identified by pid AND process start time, never pid alone:
  *    pids are reused, so a pid-only stamp eventually mistakes a live process for
  *    a dead one, or the reverse;
+ *  - a lock with no USABLE owner (owner.json missing, unreadable, unparseable,
+ *    or without a numeric pid) may be broken — there is no owner to protect;
  *  - a lock whose owner is provably gone may be broken; a lock whose owner
  *    cannot be verified may NOT be broken on age alone;
  *  - release is guaranteed by the caller (finally) and is ownership-checked, so
@@ -35,7 +37,7 @@
  * populated and mistake concurrency for nesting.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
@@ -113,6 +115,14 @@ interface LockOwner {
   startToken?: unknown;
 }
 
+type OwnerState = "alive" | "dead" | "unverifiable" | "unowned";
+
+/** The source component of a birth token (`proc:` / `ps:`), or the whole string. */
+function tokenSource(token: string): string {
+  const i = token.indexOf(":");
+  return i === -1 ? token : token.slice(0, i);
+}
+
 function readOwner(lockDir: string): LockOwner | null {
   try {
     return JSON.parse(readFileSync(join(lockDir, OWNER_FILE), "utf-8")) as LockOwner;
@@ -122,19 +132,34 @@ function readOwner(lockDir: string): LockOwner | null {
 }
 
 /**
- * Classify a lock's owner: "dead" only when provably gone (pid gone, or pid
- * alive with a DIFFERENT start time = a reused pid). Everything unverifiable is
- * "unknown" and must not be broken on age alone.
+ * Classify a lock's owner.
+ *
+ * "unowned" — the lock carries no USABLE owner: owner.json missing, unreadable,
+ * unparseable, or without a numeric pid. Classify by usability, not by which
+ * corruption shape it is: a file that parses but has no pid is as unowned as a
+ * truncated one. Anything but a numeric pid is unusable.
+ *
+ * "dead" — pid gone, or pid alive with a DIFFERENT token FROM THE SAME SOURCE.
+ * A token from a different source (`proc:` vs `ps:`) for the same live process
+ * is "unverifiable", NOT dead — treating it as dead would break a live owner's
+ * lock (two owners), the race this lock exists to prevent. Everything
+ * unverifiable is neither broken on age nor mistaken for dead.
  */
-function ownerState(owner: LockOwner | null): "alive" | "dead" | "unknown" {
-  if (!owner || typeof owner.pid !== "number") return "unknown";
+function ownerState(
+  owner: LockOwner | null,
+  resolveToken: (pid: number) => string | null = processStartToken,
+): OwnerState {
+  if (!owner || typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
+    return "unowned";
+  }
   if (!isPidAlive(owner.pid)) return "dead";
-  const token = processStartToken(owner.pid);
+  const token = resolveToken(owner.pid);
   if (token !== null && typeof owner.startToken === "string") {
+    if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";
     return token === owner.startToken ? "alive" : "dead";
   }
   // pid is alive and we cannot disprove it — never break.
-  return "alive";
+  return "unverifiable";
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -182,6 +207,16 @@ export async function acquireMailLock(
   const deadline = Date.now() + timeoutMs;
   const myToken = processStartToken(process.pid);
 
+  // Resolve an owner's birth token ONCE per pid per attempt — processStartToken
+  // may fork `ps`, and polling every 25 ms must not fork it repeatedly. A pid's
+  // birth time is constant for its lifetime, so caching within an attempt is
+  // sound.
+  const tokenCache = new Map<number, string | null>();
+  const resolveToken = (pid: number): string | null => {
+    if (!tokenCache.has(pid)) tokenCache.set(pid, processStartToken(pid));
+    return tokenCache.get(pid)!;
+  };
+
   const makeLock = (): MailLock => {
     let released = false;
     return {
@@ -223,11 +258,14 @@ export async function acquireMailLock(
       }
     }
 
-    // Held. An UNOWNED lock (no owner.json) is a legacy artifact of the previous
-    // mkdir-then-stamp code and is unreachable after this change; break it so an
-    // upgrade cannot inherit a permanent wedge. Otherwise break only a
-    // provably-dead owner.
-    if (!existsSync(join(lockDir, OWNER_FILE)) || ownerState(readOwner(lockDir)) === "dead") {
+    // Break ONLY a lock with no owner to protect — an UNOWNED lock (owner.json
+    // missing, unreadable, unparseable, or without a numeric pid) or a
+    // provably-dead owner. After the atomic acquire, this code creates a lock
+    // only by renaming a fully-populated temp dir, so a corrupt owner.json
+    // cannot be produced by this code: it is legacy or external, and neither is
+    // an owner to protect. A live or unverifiable owner is waited on.
+    const state = ownerState(readOwner(lockDir), resolveToken);
+    if (state === "unowned" || state === "dead") {
       try {
         rmSync(lockDir, { recursive: true, force: true });
       } catch {

@@ -74,6 +74,13 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     writeFileSync(join(dir, "owner.json"), JSON.stringify({ pid, startToken }), "utf-8");
     return dir;
   }
+  /** Plant a lock directory with RAW owner.json content (corruption shapes). */
+  function plantLockRaw(root: string, content: string): string {
+    const dir = join(root, ".mail-lock");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "owner.json"), content, "utf-8");
+    return dir;
+  }
   function reasonFor(mailDir: string, agent: string, filename: string): string | null {
     try {
       return readFileSync(join(mailDir, agent, "dlq", `${filename}.reason`), "utf-8");
@@ -553,15 +560,39 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
   });
 
-  test("a lock whose live owner's start token mismatches is broken (pid reuse)", async () => {
+  test("a lock whose live owner's start token mismatches (same source) is broken (pid reuse)", async () => {
+    const real = processStartToken(process.pid);
+    expect(real).not.toBeNull();
+    // Same source prefix, different value → provably a reused pid → broken.
+    const sameSourceMismatch = real!.replace(/:.*$/, ":0");
     const env = buildSignedEnvelope("flint", "kern", "pid-reuse", { flint: FLINT_SEED });
     sendMessage("kern", JSON.stringify(env), "flint");
     const inbox = getInbox("kern");
-    const lockDir = plantLock(inbox.root, process.pid, "a-start-token-that-cannot-match");
+    const lockDir = plantLock(inbox.root, process.pid, sameSourceMismatch);
 
     const msgs = await checkMessages("kern");
     expect(msgs.length).toBe(1);
     expect(existsSync(lockDir)).toBe(false);
+  });
+
+  test("a token from a DIFFERENT source prefix on a live owner is unverifiable, not broken", async () => {
+    const real = processStartToken(process.pid);
+    expect(real).not.toBeNull();
+    const otherPrefix = real!.startsWith("proc:") ? "ps:" : "proc:";
+    const env = buildSignedEnvelope("flint", "kern", "cross-source", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    // A lock stamped by the other source for the SAME live pid must NOT be read
+    // as dead — that would break a running owner's lock (two owners).
+    const lockDir = plantLock(inbox.root, process.pid, `${otherPrefix}whatever`);
+
+    const during = await checkMessages("kern");
+    expect(during.length).toBe(0); // unverifiable → not broken
+    expect(existsSync(lockDir)).toBe(true);
+
+    rmSync(lockDir, { recursive: true, force: true });
+    const after = await checkMessages("kern");
+    expect(after.length).toBe(1);
   });
 
   test("a lock whose live owner's start token matches is respected", async () => {
@@ -582,4 +613,23 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const after = await checkMessages("kern");
     expect(after.length).toBe(1);
   });
+
+  // ── Unowned locks: classified by USABLE owner, not by corruption shape ─────
+  const unownedShapes: Array<[string, string]> = [
+    ["a truncated owner.json", '{"pid":'],
+    ["an empty owner.json", ""],
+    ["an owner.json with no numeric pid", JSON.stringify({ startToken: "x" })],
+  ];
+  for (const [label, content] of unownedShapes) {
+    test(`a .mail-lock with ${label} is unowned and broken, not a wedge`, async () => {
+      const env = buildSignedEnvelope("flint", "kern", `unowned-${label}`, { flint: FLINT_SEED });
+      sendMessage("kern", JSON.stringify(env), "flint");
+      const inbox = getInbox("kern");
+      plantLockRaw(inbox.root, content);
+
+      const msgs = await checkMessages("kern");
+      expect(msgs.length).toBe(1); // recovered, not timed out
+      expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
+    });
+  }
 });
