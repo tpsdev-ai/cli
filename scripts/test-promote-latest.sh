@@ -17,6 +17,9 @@
 #     by the post-move re-read, and the packages already moved are rolled back
 #   * an INTERRUPT (SIGTERM) during the move loop rolls back the packages already
 #     moved, including the in-flight one — the all-six-or-none guarantee holds
+#   * a signal DURING the rollback, and a SECOND signal during it, do not strand a
+#     partial promote — the second must not abandon the remaining restorations
+#   * build metadata (1.2.3+build-abc) is not misread as a pre-release
 #   * the confirmation gate aborts on anything but "yes"
 #   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
 #     which --yes does NOT satisfy
@@ -114,12 +117,16 @@ if (cmd === 'view') {
   if ((s.failAdd || []).includes(spec.pkg)) fail('npm error code E401\nnpm error Unable to authenticate');
   // `noopAdd`: a command that exits 0 but never moves the tag.
   if (!((s.noopAdd || []).includes(spec.pkg))) { s.latest[spec.pkg] = spec.ver; persist(s); }
-  // Hold the FIRST add of FAKE_NPM_HOLD_PKG in flight (after the tag moved) so a
-  // signal from the harness lands inside the in-flight window.
+  // Hold matching adds in flight (after the tag moved) so a signal from the
+  // harness lands inside the in-flight window. The counter file records how many
+  // holds have happened, so the harness can time a second signal.
   const holdPkg = process.env.FAKE_NPM_HOLD_PKG;
-  const marker = process.env.FAKE_NPM_MARKER;
-  if (holdPkg && marker && spec.pkg === holdPkg && !fs.existsSync(marker)) {
-    fs.writeFileSync(marker, 'moved');
+  const holdVer = process.env.FAKE_NPM_HOLD_VER || '';
+  const counter = process.env.FAKE_NPM_MARKER;
+  if (holdPkg && counter && spec.pkg === holdPkg && (!holdVer || spec.ver === holdVer)) {
+    let n = 0;
+    try { n = parseInt(fs.readFileSync(counter, 'utf8'), 10) || 0; } catch (e) { n = 0; }
+    fs.writeFileSync(counter, String(n + 1));
     const t0 = Date.now();
     while (Date.now() - t0 < 1200) { /* hold */ }
   }
@@ -169,6 +176,10 @@ const targets = {
     '  if [ "$rc" -ne 0 ]; then\n',
   ],
   interrupt: ["trap 'on_signal TERM' TERM\n", ': # MUTATED: no TERM trap\n'],
+  trapclear: [
+    "if [ \"$failure\" -ne 0 ]; then\n  trap '' TERM INT HUP\n  rollback_moved\nelse\n  trap - TERM INT HUP\nfi\n",
+    "trap - TERM INT HUP\nif [ \"$failure\" -ne 0 ]; then\n  rollback_moved\nfi\n",
+  ],
   reorder: [
     "  moved[i]=1\n  printf '\\n-> %s: npm dist-tag add %s@%s latest\\n' \"${names[i]}\" \"${names[i]}\" \"$version\"\n  set +e\n  out=\"$(\"$NPM_BIN\" dist-tag add \"${names[i]}@${version}\" latest --registry \"$NPM_REGISTRY\" 2>&1)\"\n  rc=$?\n  set -e\n",
     "  printf '\\n-> %s: npm dist-tag add %s@%s latest\\n' \"${names[i]}\" \"${names[i]}\" \"$version\"\n  set +e\n  out=\"$(\"$NPM_BIN\" dist-tag add \"${names[i]}@${version}\" latest --registry \"$NPM_REGISTRY\" 2>&1)\"\n  rc=$?\n  set -e\n  moved[i]=1\n",
@@ -231,27 +242,69 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...]
   RC=$?
   ERR="$(cat "$d/err.txt")"
 }
-run_interrupt() { # [TOOL=...] <fixture-dir> <hold-pkg-short> <signal> [args...]
+wait_count() { # <counter-file> <n> -> 0 if the file reached n within ~15s
+  local f="$1" want="$2" n=0 cur=0
+  while [ "$n" -lt 300 ]; do
+    cur=0
+    [ -f "$f" ] && cur="$(cat "$f")"
+    case "$cur" in '' | *[!0-9]*) cur=0 ;; esac
+    [ "$cur" -ge "$want" ] && return 0
+    sleep 0.05
+    n=$((n + 1))
+  done
+  return 1
+}
+
+HCOUNTER=""
+HPID=""
+start_held() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> [args...]
   local d="$1"
   local hold="$2"
-  local sig="$3"
+  local holdver="$3"
   shift 3
   local t="${TOOL:-$tool}"
   LOG="$d/log.txt"
   : >"$LOG"
-  local marker="$d/moved.marker"
-  rm -f "$marker"
+  HCOUNTER="$d/hold.count"
+  rm -f "$HCOUNTER"
+  local hv="$holdver"
+  [ "$holdver" = "-" ] && hv=""
   FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
-    FAKE_NPM_HOLD_PKG="@tpsdev-ai/$hold" FAKE_NPM_MARKER="$marker" \
+    FAKE_NPM_HOLD_PKG="@tpsdev-ai/$hold" FAKE_NPM_HOLD_VER="$hv" FAKE_NPM_MARKER="$HCOUNTER" \
     "$BASH_BIN" "$t" "$@" >"$d/out.txt" 2>"$d/err.txt" &
-  local pid=$!
-  local n=0
-  while [ ! -f "$marker" ] && [ "$n" -lt 300 ]; do sleep 0.05; n=$((n + 1)); done
-  kill -"$sig" "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  HPID=$!
+}
+finish_held() { # <dir>
+  local d="$1"
+  wait "$HPID" 2>/dev/null
   IRC=$?
   OUT="$(cat "$d/out.txt")"
   ERR="$(cat "$d/err.txt")"
+}
+run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [args...]
+  local d="$1"
+  local hold="$2"
+  local holdver="$3"
+  local sig="$4"
+  shift 4
+  start_held "$d" "$hold" "$holdver" "$@"
+  wait_count "$HCOUNTER" 1
+  kill -"$sig" "$HPID" 2>/dev/null
+  finish_held "$d"
+}
+run_interrupt2() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <sig1> <sig2> [args...]
+  local d="$1"
+  local hold="$2"
+  local holdver="$3"
+  local sig1="$4"
+  local sig2="$5"
+  shift 5
+  start_held "$d" "$hold" "$holdver" "$@"
+  wait_count "$HCOUNTER" 1
+  kill -"$sig1" "$HPID" 2>/dev/null
+  wait_count "$HCOUNTER" 2
+  kill -"$sig2" "$HPID" 2>/dev/null
+  finish_held "$d"
 }
 adds_count() {
   local n
@@ -335,11 +388,44 @@ assert_contains "J default-version: used package.json version" "$OUT" 'Promoting
 # partial promote — this fixture is the control for that.
 d="$(new_fixture interrupt)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
-run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
 assert_eq "K interrupt: exit" 4 "$IRC"
 assert_contains "K interrupt: reports the rollback" "$ERR" "rolling back"
 assert_contains "K interrupt: names the signal" "$ERR" "SIGTERM"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "K interrupt: registry restored" "latest=0.5.3 for all six"; else bad "K interrupt: registry restored" "a partial promote was left behind"; fi
+
+# ── O. a signal DURING the failure-path rollback must not strand a partial ────
+# Drive a failing move (a noop add for the CLI) so the failure branch is taken,
+# and hold the rollback of the in-flight platform package. The signal lands while
+# rollback_moved is running. A script that clears its traps before this branch is
+# killed mid-rollback and strands a partial promote — this fixture is its control.
+d="$(new_fixture interrupt-rollback)"
+write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
+run_interrupt "$d" "cli-linux-arm64" "0.5.3" TERM 0.5.4 --yes
+assert_eq "O interrupt-during-rollback: exit" 4 "$IRC"
+assert_contains "O interrupt-during-rollback: reports rollback" "$ERR" "rolling back"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "O interrupt-during-rollback: restored" "latest=0.5.3 for all six"; else bad "O interrupt-during-rollback: restored" "a partial promote was stranded"; fi
+
+# ── P. a SECOND signal during rollback must not abandon it ────────────────────
+# Hold every add of the platform package, so signal #1 starts the handler's
+# rollback and signal #2 lands during that rollback. The handler must IGNORE the
+# second signal, not exit (which would abandon the remaining restorations).
+d="$(new_fixture interrupt-second)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+run_interrupt2 "$d" "cli-linux-arm64" "-" TERM TERM 0.5.4 --yes
+assert_contains "P second-signal: reports rollback" "$ERR" "rolling back"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "P second-signal: all six restored" "latest=0.5.3 for all six"; else bad "P second-signal: all six restored" "the second signal abandoned part of the rollback"; fi
+
+# ── Q. build metadata is NOT a pre-release ────────────────────────────────────
+# SemVer permits hyphens in build metadata; 1.2.3+build-abc is a stable release
+# and must not be mistaken for a pre-release (which would demand --allow-downgrade).
+d="$(new_fixture build-metadata)"
+write_state "$d/state.json" "1.2.3+build-abc" "0.5.4"
+invoke "$d" "1.2.3+build-abc" --yes
+assert_eq "Q build-metadata: exit" 0 "$RC"
+if printf '%s' "$ERR" | grep -qF 'PRE-RELEASE'; then bad "Q build-metadata: not a pre-release" "flagged a stable build as a pre-release"; else ok "Q build-metadata: not a pre-release" "treated as stable"; fi
+assert_eq "Q build-metadata: six dist-tag adds" 6 "$(adds_count)"
+if all_latest_eq "$d/state.json" "1.2.3+build-abc"; then ok "Q build-metadata: moved" "latest=1.2.3+build-abc for all six"; else bad "Q build-metadata: moved" "not all moved to 1.2.3+build-abc"; fi
 
 # ── L. a DOWNGRADE is allowed but needs --allow-downgrade, not --yes ──────────
 d="$(new_fixture downgrade)"
@@ -406,7 +492,7 @@ mut="$work/tool-no-trap.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" interrupt; then
   d="$(new_fixture mut-trap)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
-  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
   if all_latest_eq "$d/state.json" "0.5.3"; then bad "M3 mutation: missing TERM trap caught" "mutant restored the registry — fixture K is blind to it"; else ok "M3 mutation: missing TERM trap caught" "mutant left a partial promote (fixture K catches it)"; fi
   TOOL=""
 else
@@ -418,8 +504,20 @@ mut="$work/tool-reorder.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" reorder; then
   d="$(new_fixture mut-reorder)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
-  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
   if all_latest_eq "$d/state.json" "0.5.3"; then bad "M4 mutation: late attempt flag caught" "mutant restored the registry — fixture K is blind to it"; else ok "M4 mutation: late attempt flag caught" "mutant left the in-flight package moved (fixture K catches it)"; fi
+  TOOL=""
+else
+  bad "M4 mutation: late attempt flag caught" "could not build the mutant"
+fi
+
+# ── M5. mutation: clear the traps before the failure branch; O must catch it ──
+mut="$work/tool-trapclear.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" trapclear; then
+  d="$(new_fixture mut-trapclear)"
+  write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
+  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" "0.5.3" TERM 0.5.4 --yes
+  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M5 mutation: early trap clear caught" "mutant restored the registry — fixture O is blind to it"; else ok "M5 mutation: early trap clear caught" "mutant stranded a partial promote (fixture O catches it)"; fi
   TOOL=""
 else
   bad "M4 mutation: late attempt flag caught" "could not build the mutant"

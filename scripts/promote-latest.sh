@@ -155,7 +155,8 @@ core_num() { printf '%s' "$1" | awk -F. '{printf "%04d%04d%04d", $1 + 0, $2 + 0,
 
 # 1 if the version has a pre-release part (a '-' before any '+'), else 0.
 is_prerelease() {
-  case "$1" in
+  local v="${1%%+*}" # strip build metadata first: SemVer allows hyphens there
+  case "$v" in
     *-*) printf '1' ;;
     *) printf '0' ;;
   esac
@@ -200,7 +201,7 @@ if [ -z "$version" ]; then
 fi
 
 # Reject anything that is not a plausible semver, so a typo cannot reach npm.
-if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$ ]]; then
+if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
   die "invalid version: $version"
 fi
 
@@ -274,6 +275,7 @@ for ((i = 0; i < NPKG; i++)); do
     die "cannot read the current \`latest\` dist-tag for ${names[i]} (needed to plan the move and to roll it back): $cur" "$EXIT_REFUSED"
   fi
   prev_latest[i]="$cur"
+  new_latest[i]="$cur"
   [ "$cur" = "$version" ] || plan_moves=$((plan_moves + 1))
   if [ "$(core_num "$version")" \< "$(core_num "$cur")" ]; then
     downgrades+=("$i")
@@ -398,12 +400,13 @@ print_final_table() {
 # Installed only now: before this point nothing has moved, so the default signal
 # action is harmless. A signal during the move loop must roll back, not leave a
 # partial promote — the exact failure this tool exists to remove.
-interrupted=""
 # shellcheck disable=SC2317  # on_signal is invoked indirectly, from the traps below
 on_signal() {
   sig="$1"
-  [ -z "$interrupted" ] || exit "$EXIT_INCOMPLETE" # re-entrancy guard
-  interrupted="$sig"
+  # Ignore further termination signals at once. A second signal must NOT abandon
+  # the rollback (which is what an `exit` here did), and ignoring makes re-entry
+  # impossible, so no separate guard is needed.
+  trap '' TERM INT HUP
   failure=1
   printf '\npromote-latest: received SIG%s — rolling back so the end state is all-six or none.\n' "$sig" >&2
   rollback_moved
@@ -455,13 +458,17 @@ for ((i = 0; i < NPKG; i++)); do
   fi
 done
 
-# All packages are done (moved or not); stop trapping so a late signal cannot roll
-# back a promote that actually succeeded.
-trap - TERM INT HUP
-
-# ── 6. all-six-or-none: roll back if the promote did not complete ────────────
+# ── 6. all-six-or-none: select the branch, THEN stop handling termination ─────
+# The handlers are still active here. Clearing them BEFORE this branch is what
+# left a window in which a signal killed the script mid-rollback. Select the
+# branch first: on failure, IGNORE further signals while the rollback runs (a
+# second signal must never abandon the remaining restorations); on success, clear
+# the handlers so a late signal cannot roll back a promote that did succeed.
 if [ "$failure" -ne 0 ]; then
+  trap '' TERM INT HUP
   rollback_moved
+else
+  trap - TERM INT HUP
 fi
 
 print_final_table
