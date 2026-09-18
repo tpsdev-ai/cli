@@ -537,4 +537,18 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
       for (const f of readdirSync(inbox.dlq)) rmSync(join(inbox.dlq, f), { force: true });
     }
   });
+
+  // ── Lock: crash mid-acquire must not wedge; birth token must be portable ──
+  test("an unowned .mail-lock (crash between claim and stamp) is broken, not a permanent wedge", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "wedge-recovery", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    // The state the OLD mkdir-then-stamp code could leave on a crash between the
+    // two: a lock directory with no owner.json.
+    mkdirSync(join(inbox.root, ".mail-lock"), { recursive: true });
+
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(1); // recovered, not wedged forever
+    expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
+  });
 });
