@@ -123,8 +123,8 @@ describe("openclaw-tps-mail: dispatcher single-reply (cli#338)", () => {
     sender: string,
     opts: { senderHasMaildir?: boolean; warnCalls?: string[] } = {},
   ) {
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async () => ({
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => ({
         async getAgent(name: string) {
           if (name === sender) return { publicKey: pubkeyFromSeed(FLINT_SEED) };
           return null;

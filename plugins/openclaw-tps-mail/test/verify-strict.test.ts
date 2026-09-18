@@ -166,8 +166,8 @@ describe("verify-strict: signed envelope verification", () => {
     flairMock: { getAgent(name: string): Promise<{ publicKey: Buffer } | null> },
   ): Promise<{ dispatched: any | null; dlqReason: string | null }> {
     // Mock the verify-adapter to inject hermetic Flair mock
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async (_agentId: string) => flairMock,
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async (_agentId: string) => flairMock,
     }));
 
     const newDir = resolve(tempMailDir, agentId, "new");
@@ -443,8 +443,8 @@ describe("verify-strict: signed envelope verification", () => {
     const filename = `2026-05-26T00-00-00-${msg.id}.json`;
     writeFileSync(resolve(newDir, filename), JSON.stringify(msg, null, 2), "utf-8");
 
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
     }));
 
     const channelRuntime = {
@@ -510,8 +510,8 @@ describe("verify-strict: signed envelope verification", () => {
     const filename = `2026-05-26T00-00-00-${msg.id}.json`;
     writeFileSync(resolve(newDir, filename), JSON.stringify(msg, null, 2), "utf-8");
 
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
     }));
 
     const channelRuntime = {

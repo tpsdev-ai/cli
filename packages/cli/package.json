@@ -1,7 +1,7 @@
 {
   "name": "@tpsdev-ai/cli",
   "version": "0.6.0",
-  "description": "TPS Report CLI — because every agent needs the proper paperwork.",
+  "description": "TPS Report CLI \u2014 because every agent needs the proper paperwork.",
   "type": "module",
   "bin": {
     "tps": "./bin/tps.cjs"
@@ -11,7 +11,9 @@
     ".": "./dist/src/index.js",
     "./lib/signEnvelope": "./dist/src/lib/signEnvelope.js",
     "./utils/agent-keys": "./dist/src/utils/agent-keys.js",
-    "./utils/flair-client": "./dist/src/utils/flair-client.js"
+    "./utils/flair-client": "./dist/src/utils/flair-client.js",
+    "./utils/mail": "./dist/src/utils/mail.js",
+    "./utils/mail-verify": "./dist/src/utils/mail-verify.js"
   },
   "optionalDependencies": {
     "@tpsdev-ai/cli-darwin-arm64": "0.6.0",

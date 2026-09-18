@@ -106,8 +106,8 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
 
   it("processes mail file present in new/ at startup", async () => {
     // Mock the verify-adapter to return a hermetic Flair mock
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async () => ({
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => ({
         async getAgent(name: string) {
           if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
           return null;
@@ -191,8 +191,8 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
   });
 
   it("does not double-process a file (dedup via seenFiles)", async () => {
-    mock.module("../src/verify-adapter.js", () => ({
-      createVerifyClient: async () => ({
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => ({
         async getAgent(name: string) {
           if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
           return null;

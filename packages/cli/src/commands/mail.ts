@@ -321,7 +321,12 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (args.count) {
         console.log(messages.length);
       } else if (args.json) {
-        console.log(JSON.stringify(messages, null, 2));
+        // Bodies from new/ and dlq/ are withheld: new/ is unverified and dlq/ is
+        // quarantined, so neither is presentable mail.
+        const redacted = messages.map((m) =>
+          m.location === "new" || m.location === "dlq" ? { ...m, body: "" } : m,
+        );
+        console.log(JSON.stringify(redacted, null, 2));
       } else {
         const limit = Math.max(0, Math.floor(args.limit ?? 20));
         const visible = messages.slice(0, limit);
@@ -329,6 +334,20 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log("No messages.");
         } else {
           for (const m of visible) {
+            const id8 = `[${m.id.slice(0, 8)}]`;
+            if (m.location === "new") {
+              // Unverified: that it exists and who it claims to be from, but never
+              // its body — `new/` is not mail.
+              console.log(`⏳ [pending verify] ${id8} ${m.from} → ${m.to}  ${m.timestamp}`);
+              continue;
+            }
+            if (m.location === "dlq") {
+              console.log(`⛔ [dlq${m.rejectClass ? `: ${m.rejectClass}` : ""}] ${id8} ${m.from} → ${m.to}  ${m.timestamp}`);
+              if (m.rejectReason) {
+                for (const line of m.rejectReason.split("\n")) console.log(`    ${line}`);
+              }
+              continue;
+            }
             const marker = m.read ? "📖" : "📬";
             const taskEnv = parseTaskEnvelope(m.body);
             const summary = taskEnv
@@ -336,7 +355,7 @@ export async function runMail(args: MailArgs): Promise<void> {
               : m.body
                 ? `  ${m.body.slice(0, 60)}${m.body.length > 60 ? "…" : ""}`
                 : "";
-            console.log(`${marker} [${m.id.slice(0, 8)}] ${m.from} → ${m.to}  ${m.timestamp}${summary}`);
+            console.log(`${marker} ${id8} ${m.from} → ${m.to}  ${m.timestamp}${summary}`);
           }
         }
       }
@@ -372,15 +391,16 @@ export async function runMail(args: MailArgs): Promise<void> {
         process.exit(1);
       }
       const inbox = getInbox(agent);
-      const dirs = [inbox.fresh, inbox.cur];
+      const dirs: Array<[string, "new" | "cur"]> = [[inbox.fresh, "new"], [inbox.cur, "cur"]];
       let found: MailMessage | null = null;
-      for (const dir of dirs) {
+      let foundLoc: "new" | "cur" = "cur";
+      for (const [dir, loc] of dirs) {
         if (!existsSync(dir)) continue;
         const files = readdirSync(dir).filter(f => f.endsWith(".json"));
         for (const f of files) {
           try {
             const msg = JSON.parse(readFileSync(join(dir, f), "utf-8")) as MailMessage;
-            if (msg.id === id || msg.id.startsWith(id)) { found = msg; break; }
+            if (msg.id === id || msg.id.startsWith(id)) { found = msg; foundLoc = loc; break; }
           } catch { /* skip corrupt files */ }
         }
         if (found) break;
@@ -390,8 +410,16 @@ export async function runMail(args: MailArgs): Promise<void> {
         process.exit(1);
       }
       if (args.json) {
-        console.log(JSON.stringify(found, null, 2));
+        const out = foundLoc === "new" ? { ...found, body: "" } : found;
+        console.log(JSON.stringify(out, null, 2));
       } else {
+        if (foundLoc === "new") {
+          // `new/` is unverified — never present its body.
+          console.log(`⏳ [pending verify] ${found.from} → ${found.to}  ${found.timestamp}`);
+          console.log(`ID: ${found.id}`);
+          console.log("(body withheld until the envelope is verified)");
+          return;
+        }
         const marker = found.read ? "📖" : "📬";
         console.log(`${marker} ${found.from} → ${found.to}  ${found.timestamp}`);
         console.log(`ID: ${found.id}`);

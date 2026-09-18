@@ -2,17 +2,32 @@ import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
 import { checkMessages, getInbox, inboxExists, listMessages, sendMessage, ackMessage, countInboxMessages } from "../src/utils/mail.js";
+import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 
+const FLINT_SEED = Buffer.alloc(32, 0x01);
+const KERN_SEED = Buffer.alloc(32, 0x02);
+const ANVIL_SEED = Buffer.alloc(32, 0x04);
+const SHERLOCK_SEED = Buffer.alloc(32, 0x03);
+const SEEDS = { flint: FLINT_SEED, kern: KERN_SEED, anvil: ANVIL_SEED, sherlock: SHERLOCK_SEED };
+
+// `new/` is never mail; only `cur/` is presentable. Verification is mandatory,
+// so any test that drives new/ → cur/ sends a genuinely SIGNED envelope and
+// points the always-constructed Flair client at a stub server.
+
 describe("mail utils", () => {
   let tempRoot: string;
+  let keysDir: string;
+  let stub: StubFlair;
   let savedHome: string | undefined;
 
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-mail-test-"));
+    keysDir = join(tempRoot, "keys");
+    stub = startStubFlair(SEEDS);
+    writeKeyFile(keysDir, "kern", KERN_SEED);
     // Override HOME alongside TPS_MAIL_DIR — getInbox() prefers
     // ~/.tps/branch-office/<agent>/mail when it exists, which would
     // otherwise leak the test into the real on-host kern/anvil inboxes.
@@ -20,15 +35,25 @@ describe("mail utils", () => {
     process.env.HOME = tempRoot;
     process.env.TPS_MAIL_DIR = join(tempRoot, "mail");
     process.env.TPS_AGENT_ID = "anvil";
+    process.env.FLAIR_URL = stub.url;
+    process.env.FLAIR_KEY_PATH = join(keysDir, "kern.key");
   });
 
   afterEach(() => {
+    stub.stop();
     delete process.env.TPS_MAIL_DIR;
     delete process.env.TPS_AGENT_ID;
+    delete process.env.FLAIR_URL;
+    delete process.env.FLAIR_KEY_PATH;
     if (savedHome !== undefined) process.env.HOME = savedHome;
     else delete process.env.HOME;
     rmSync(tempRoot, { recursive: true, force: true });
   });
+
+  /** A signed envelope from `from` to `to`, as the wrapper body string. */
+  function signedBody(from: string, to: string, body: string): string {
+    return JSON.stringify(buildSignedEnvelope(from, to, body, { [from]: SEEDS[from as keyof typeof SEEDS]! }));
+  }
 
   test("atomic send writes via tmp then new", () => {
     const m = sendMessage("kern", "hello", "anvil");
@@ -41,7 +66,7 @@ describe("mail utils", () => {
   });
 
   test("check moves messages new -> cur", async () => {
-    sendMessage("kern", "one", "anvil");
+    sendMessage("kern", signedBody("flint", "kern", "one"), "flint");
     const inbox = getInbox("kern");
     expect(readdirSync(inbox.fresh).length).toBe(1);
 
@@ -50,6 +75,7 @@ describe("mail utils", () => {
     expect(read[0]!.read).toBe(false);
     expect(read[0]!.checkedOutAt).toBeTruthy();
     expect(read[0]!.checkedOutBy).toBe("kern");
+    expect(read[0]!.body).toBe("one"); // inner payload, not the envelope JSON
     expect(readdirSync(inbox.fresh).length).toBe(0);
     expect(readdirSync(inbox.cur).length).toBe(1);
   });
@@ -123,17 +149,17 @@ describe("mail utils", () => {
   });
 
   test("ackMessage removes the file from cur/", async () => {
-    const m = sendMessage("kern", "ack-test", "anvil");
+    const m = sendMessage("kern", signedBody("flint", "kern", "ack-test"), "flint");
     expect(m.to).toBe("kern");
     const inbox = getInbox("kern");
 
     // Move from new -> cur via check
-    checkMessages("kern");
+    await checkMessages("kern");
 
     const curFilesBefore = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
     expect(curFilesBefore.length).toBe(1);
 
-    // Ack removes it
+    // Ack removes it — the wrapper id, which is what ackMessage matches on.
     const acked = ackMessage("kern", m.id);
     expect(acked).not.toBeNull();
 
@@ -147,7 +173,7 @@ describe("mail utils", () => {
     // mail. New semantic: cap is back-pressure for "agent isn't processing,"
     // so checkMessages (new -> cur) should drop the count to zero.
     for (let i = 0; i < 5; i++) {
-      sendMessage("kern", `msg-${i}`, "anvil");
+      sendMessage("kern", signedBody("flint", "kern", `msg-${i}`), "flint");
     }
     expect(countInboxMessages("kern")).toBe(5);
 
@@ -220,8 +246,8 @@ describe("mail utils", () => {
     const sixtyDaysAgo = new Date(Date.now() - 60 * 86_400_000);
     utimesSync(oldFile, sixtyDaysAgo, sixtyDaysAgo);
 
-    // Send a new msg + check — should trigger auto-archive
-    sendMessage("kern", "fresh", "anvil");
+    // Send a new signed msg + check — should trigger auto-archive
+    sendMessage("kern", signedBody("flint", "kern", "fresh"), "flint");
     await checkMessages("kern");
 
     // Ancient should be archived, fresh should be in cur/
@@ -233,49 +259,78 @@ describe("mail utils", () => {
 
 describe("mail command", () => {
   let tempRoot: string;
+  let keysDir: string;
+  let stub: StubFlair;
+
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-mail-cmd-"));
+    keysDir = join(tempRoot, "keys");
+    stub = startStubFlair(SEEDS);
+    writeKeyFile(keysDir, "kern", KERN_SEED);
+    writeKeyFile(keysDir, "anvil", ANVIL_SEED);
+    writeKeyFile(keysDir, "sherlock", SHERLOCK_SEED);
   });
   afterEach(() => {
+    stub.stop();
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  function run(args: string[], env: Record<string, string>) {
+  async function run(args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
     const home = env.HOME ?? join(tempRoot, "home");
     mkdirSync(home, { recursive: true });
-    return spawnSync("bun", [TPS_BIN, ...args], {
-      encoding: "utf-8",
+    // Async spawn (NOT spawnSync): the stub Flair lives in THIS process, so the
+    // event loop must stay free to answer the child's verification request.
+    const proc = Bun.spawn(["bun", TPS_BIN, ...args], {
       cwd: tempRoot,
-      env: { ...process.env, HOME: home, ...env },
+      env: {
+        ...process.env,
+        HOME: home,
+        FLAIR_URL: stub.url,
+        TPS_TEST_KEYS_DIR: keysDir, // lets `mail send` sign the envelope
+        ...env,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
     });
+    const [stdout, stderr, status] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { status, stdout, stderr };
   }
 
-  test("send/check/list works end-to-end", () => {
-    const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "anvil" };
-    const sent = run(["mail", "send", "kern", "hello", "kern"], env);
+  test("send/check/list works end-to-end (signed envelope delivers exactly once)", async () => {
+    const mailDir = join(tempRoot, "mail");
+    const sent = await run(["mail", "send", "kern", "hello", "kern"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil", FLAIR_KEY_PATH: join(keysDir, "anvil.key") });
     expect(sent.status).toBe(0);
 
-    const checkAsKern = run(["mail", "check", "--json"], { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "kern" });
+    const kernEnv = { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern", FLAIR_KEY_PATH: join(keysDir, "kern.key") };
+    const checkAsKern = await run(["mail", "check", "--json"], kernEnv);
     expect(checkAsKern.status).toBe(0);
     const rows = JSON.parse(checkAsKern.stdout);
     expect(rows.length).toBe(1);
-    expect(rows[0].body).toBe("hello kern");
+    expect(rows[0].body).toBe("hello kern"); // verified inner payload
 
-    const listAsKern = run(["mail", "list", "--json"], { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "kern" });
+    // Exactly once: a second check does not re-present it.
+    const checkAgain = await run(["mail", "check", "--json"], kernEnv);
+    expect(JSON.parse(checkAgain.stdout).length).toBe(0);
+
+    const listAsKern = await run(["mail", "list", "--json"], kernEnv);
     expect(listAsKern.status).toBe(0);
     const all = JSON.parse(listAsKern.stdout);
     expect(all.length).toBe(1);
     expect(all[0].read).toBe(true);
   });
 
-  test("send queues to outbox in branch mode", () => {
+  test("send queues to outbox in branch mode", async () => {
     const home = join(tempRoot, "home");
     const fs = require("node:fs");
     fs.mkdirSync(join(home, ".tps", "identity"), { recursive: true });
     fs.writeFileSync(join(home, ".tps", "identity", "host.json"), JSON.stringify({ hostId: "host" }));
 
     const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), HOME: home, TPS_AGENT_ID: "austin" };
-    const sent = run(["mail", "send", "host", "reply from branch"], env);
+    const sent = await run(["mail", "send", "host", "reply from branch"], env);
     expect(sent.status).toBe(0);
     expect(sent.stdout).toContain("Queued for delivery to host");
 
@@ -284,35 +339,36 @@ describe("mail command", () => {
     expect(files.length).toBe(1);
   });
 
-  test("check/list accept agent positional arg (overrides TPS_AGENT_ID)", () => {
-    const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "anvil" };
-    const sent = run(["mail", "send", "sherlock", "positional test"], env);
+  test("check/list accept agent positional arg (overrides TPS_AGENT_ID)", async () => {
+    const mailDir = join(tempRoot, "mail");
+    const sent = await run(["mail", "send", "sherlock", "positional test"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil", FLAIR_KEY_PATH: join(keysDir, "anvil.key") });
     expect(sent.status).toBe(0);
 
-    const checked = run(["mail", "check", "sherlock", "--json"], env);
+    const env = { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil", FLAIR_KEY_PATH: join(keysDir, "sherlock.key") };
+    const checked = await run(["mail", "check", "sherlock", "--json"], env);
     expect(checked.status).toBe(0);
     const msgs = JSON.parse(checked.stdout);
     expect(msgs.length).toBe(1);
     expect(msgs[0].body).toBe("positional test");
 
-    const listed = run(["mail", "list", "sherlock", "--json"], env);
+    const listed = await run(["mail", "list", "sherlock", "--json"], env);
     expect(listed.status).toBe(0);
     const all = JSON.parse(listed.stdout);
     expect(all.length).toBe(1);
     expect(all[0].read).toBe(true);
   });
 
-  test("stats reports inbox count and latest received/sent timestamps", () => {
+  test("stats reports inbox count and latest received/sent timestamps", async () => {
     const mailDir = join(tempRoot, "mail");
     const env = { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil" };
-    const sent = run(["mail", "send", "sherlock", "stats test"], env);
+    const sent = await run(["mail", "send", "sherlock", "stats test"], env);
     expect(sent.status).toBe(0);
 
     const sentDir = join(mailDir, "sherlock", "sent");
     mkdirSync(sentDir, { recursive: true });
     writeFileSync(join(sentDir, "sent-message.json"), JSON.stringify({ id: "1" }), "utf-8");
 
-    const stats = run(["mail", "stats", "sherlock", "--json"], env);
+    const stats = await run(["mail", "stats", "sherlock", "--json"], env);
     expect(stats.status).toBe(0);
     const payload = JSON.parse(stats.stdout);
     expect(payload.agent).toBe("sherlock");
@@ -321,41 +377,74 @@ describe("mail command", () => {
     expect(payload.lastSent).toBeTruthy();
   });
 
-  test("stats defaults agent from TPS_AGENT_ID", () => {
+  test("stats defaults agent from TPS_AGENT_ID", async () => {
     const mailDir = join(tempRoot, "mail");
-    run(["mail", "send", "kern", "default agent"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil" });
+    await run(["mail", "send", "kern", "default agent"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "anvil" });
 
-    const stats = run(["mail", "stats", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    const stats = await run(["mail", "stats", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
     expect(stats.status).toBe(0);
     const payload = JSON.parse(stats.stdout);
     expect(payload.agent).toBe("kern");
     expect(payload.inboxCount).toBe(1);
   });
 
-  test("list --count prints only the total message count", () => {
+  test("list --count prints only the total message count", async () => {
     const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), TPS_AGENT_ID: "anvil" };
-    expect(run(["mail", "send", "kern", "first"], env).status).toBe(0);
-    expect(run(["mail", "send", "kern", "second"], env).status).toBe(0);
+    expect((await run(["mail", "send", "kern", "first"], env)).status).toBe(0);
+    expect((await run(["mail", "send", "kern", "second"], env)).status).toBe(0);
 
-    const counted = run(["mail", "list", "kern", "--count"], env);
+    const counted = await run(["mail", "list", "kern", "--count"], env);
     expect(counted.status).toBe(0);
     expect(counted.stdout.trim()).toBe("2");
     // stderr may contain nono warnings in CI — only assert stdout
   });
 
-  test("check reads branch-office inbox when present", () => {
+  test("mail list withholds bodies from new/ and dlq/", async () => {
+    const mailDir = join(tempRoot, "mail");
+    mkdirSync(join(mailDir, "kern", "new"), { recursive: true });
+    mkdirSync(join(mailDir, "kern", "dlq"), { recursive: true });
+    writeFileSync(
+      join(mailDir, "kern", "new", "a.json"),
+      JSON.stringify({ id: "aaaaaaaa", from: "flint", to: "kern", body: "SECRET-BODY-NEW", timestamp: new Date().toISOString(), read: false }),
+      "utf-8",
+    );
+    writeFileSync(
+      join(mailDir, "kern", "dlq", "b.json"),
+      JSON.stringify({ id: "bbbbbbbb", from: "flint", to: "kern", body: "SECRET-BODY-DLQ", timestamp: new Date().toISOString(), read: true }),
+      "utf-8",
+    );
+    writeFileSync(join(mailDir, "kern", "dlq", "b.json.reason"), "class: invalid\nReason: nope\n", "utf-8");
+
+    const listed = await run(["mail", "list", "kern"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    expect(listed.status).toBe(0);
+    expect(listed.stdout).not.toContain("SECRET-BODY-NEW");
+    expect(listed.stdout).not.toContain("SECRET-BODY-DLQ");
+    expect(listed.stdout).toContain("[pending verify]");
+    expect(listed.stdout).toContain("[dlq: invalid]");
+
+    const json = await run(["mail", "list", "kern", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    const rows = JSON.parse(json.stdout);
+    expect(rows.length).toBe(2);
+    for (const r of rows) expect(r.body).toBe("");
+  });
+
+  test("check reads branch-office inbox when present", async () => {
     const home = join(tempRoot, "home-branch");
     mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "new"), { recursive: true });
     mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "tmp"), { recursive: true });
     mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "cur"), { recursive: true });
     mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "dlq"), { recursive: true });
+    const env0 = buildSignedEnvelope("flint", "tps-anvil", "branch mail", { flint: FLINT_SEED });
     writeFileSync(
       join(home, ".tps", "branch-office", "tps-anvil", "mail", "new", "msg.json"),
-      JSON.stringify({ id: "m1", from: "flint", to: "tps-anvil", body: "branch mail", timestamp: new Date().toISOString(), read: false }),
+      JSON.stringify({ id: "m1", from: "flint", to: "tps-anvil", body: JSON.stringify(env0), timestamp: new Date().toISOString(), read: false }),
       "utf-8",
     );
+    writeKeyFile(keysDir, "tps-anvil", Buffer.alloc(32, 0x0a));
+    stub.stop();
+    stub = startStubFlair({ ...SEEDS, "tps-anvil": Buffer.alloc(32, 0x0a) });
 
-    const checked = run(["mail", "check", "tps-anvil", "--json"], { HOME: home, TPS_AGENT_ID: "tps-anvil" });
+    const checked = await run(["mail", "check", "tps-anvil", "--json"], { HOME: home, TPS_AGENT_ID: "tps-anvil", FLAIR_KEY_PATH: join(keysDir, "tps-anvil.key") });
     expect(checked.status).toBe(0);
     const msgs = JSON.parse(checked.stdout);
     expect(msgs.length).toBe(1);

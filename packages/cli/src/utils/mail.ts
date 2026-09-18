@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { verifyEnvelope, type FlairClient } from "@tpsdev-ai/agent";
+import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
+import { createMailVerifyClient } from "./mail-verify.js";
 
 export interface MailMessage {
   id: string;
@@ -23,6 +24,13 @@ export interface MailMessage {
   retryAfter?: string;
   prNumber?: number;
   headers?: Record<string, string>;
+  /** Set by listMessages(): which maildir the record came from. */
+  location?: "new" | "cur" | "dlq";
+  /** The verified envelope's messageId, persisted so replay is detectable. */
+  envelopeId?: string;
+  /** Set by listMessages() for dlq records: the sidecar reason class. */
+  rejectClass?: string;
+  rejectReason?: string;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -93,7 +101,7 @@ export function getInbox(agent: string): { root: string; tmp: string; fresh: str
   return { root, tmp, fresh, cur, dlq };
 }
 
-function readMessagesFromDir(dir: string, read: boolean): MailMessage[] {
+function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur" | "dlq"): MailMessage[] {
   if (!existsSync(dir)) return [];
   const messages: MailMessage[] = [];
   for (const f of readdirSync(dir).filter((f) => f.endsWith(".json"))) {
@@ -101,6 +109,14 @@ function readMessagesFromDir(dir: string, read: boolean): MailMessage[] {
       const raw = readFileSync(join(dir, f), "utf-8");
       const msg = JSON.parse(raw) as MailMessage;
       msg.read = read;
+      msg.location = location;
+      if (location === "dlq") {
+        const side = readReasonSidecar(dir, f);
+        if (side) {
+          msg.rejectClass = side.cls;
+          msg.rejectReason = side.reason;
+        }
+      }
       messages.push(msg);
     } catch (err: any) {
       console.error(`[mail] skipping corrupt message ${f}: ${err.message}`);
@@ -277,38 +293,99 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   return { ...message, filePath: newPath };
 }
 
+// ─── Promotion: the ONE enforcement point (new/ → cur/) ──────────────────────
+//
+// `new/` is never mail; only `cur/` is presentable. Verification is NOT
+// optional: there is no FlairClient parameter anywhere on this path — optional
+// verification is exactly how it rotted (the shipped verifier was dead because
+// the only live caller passed two arguments and the client was the third).
+//
+// Reject classes: `verify-unavailable` is RETRYABLE (a Flair outage quarantines
+// inbound until Flair returns, then self-heals on a later check); the rest are
+// terminal. All rejections dead-letter to dlq/ with a `<file>.reason` sidecar —
+// ONE convention (the CLI used to write `.reject`, which the daily surfacing
+// never saw).
+
+export type PromoteRejectClass = "invalid" | "wrong-recipient" | "replay" | "verify-unavailable";
+
+export interface PromoteOk {
+  ok: true;
+  message: MailMessage;
+  path: string;
+}
+export interface PromoteReject {
+  ok: false;
+  class: PromoteRejectClass;
+  reason: string;
+}
+export type PromoteResult = PromoteOk | PromoteReject;
+
+const REASON_CLASS_RE = /^class:\s*(\S+)/m;
+
 /**
- * Check inbox: promote new messages from fresh/ to cur/, verifying signed
- * envelopes when a FlairClient is provided.
- *
- * Verification (strict — rejects unsigned envelopes to dlq):
- *   1. Parse message body as JSON.
- *   2. If the body looks like a v1 envelope (has v, delegationChain, signature),
- *      call verifyEnvelope().
- *   3. On pass → promote to cur/ as normal.
- *   4. On fail → move to dlq/ with a <filename>.reject sidecar.
- *   5. If body cannot be parsed as JSON → move to dlq/ with .reject sidecar.
- *   6. If body is JSON but missing envelope fields → move to dlq/ with .reject.
- *
- * When no FlairClient is available, legacy plain-text messages pass through
- * unchanged (backward compat until all consumers have Flair wired).
+ * Write the dlq sidecar. First line is `class: <class>` so a retry pass can
+ * find retryable (`verify-unavailable`) entries without re-verifying.
  */
+function writeReasonSidecar(dlqDir: string, filename: string, cls: PromoteRejectClass, reason: string): void {
+  writeFileSync(
+    join(dlqDir, `${filename}.reason`),
+    `class: ${cls}\nPromote rejected at ${new Date().toISOString()}\nReason: ${reason}\n`,
+    "utf-8",
+  );
+}
+
+/** Read the class + reason from a dlq sidecar, if present. */
+function readReasonSidecar(dlqDir: string, filename: string): { cls: PromoteRejectClass; reason: string } | null {
+  try {
+    const raw = readFileSync(join(dlqDir, `${filename}.reason`), "utf-8");
+    const m = raw.match(REASON_CLASS_RE);
+    const cls = (m ? m[1] : "invalid") as PromoteRejectClass;
+    return { cls, reason: raw.trim() };
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Write a .reject sidecar file in the dlq/ directory.
- * Format: plain text. File: <original-filename>.reject
+ * Dead-letter a record to dlq/ with a `.reason` sidecar. Works from new/, tmp/
+ * or dlq/ (re-rejection updates the sidecar in place). Derives the sibling
+ * directories from the record's own path, so promotion is correct for ANY mail
+ * root (the plugin passes its own configured mailDir, not TPS_MAIL_DIR).
  */
-function writeRejectSidecar(dlqDir: string, filename: string, reason: string): void {
-  const sidecar = join(dlqDir, `${filename}.reject`);
-  writeFileSync(sidecar, reason, "utf-8");
+function rejectToDlq(
+  dirs: { fresh: string; tmp: string; cur: string; dlq: string },
+  filename: string,
+  sourcePath: string,
+  cls: PromoteRejectClass,
+  reason: string,
+): void {
+  try {
+    mkdirSync(dirs.dlq, { recursive: true });
+    const target = join(dirs.dlq, filename);
+    if (sourcePath !== target && existsSync(sourcePath)) renameSync(sourcePath, target);
+    writeReasonSidecar(dirs.dlq, filename, cls, reason);
+  } catch (err: any) {
+    console.error(`[mail] failed to dead-letter ${filename}: ${err?.message ?? err}`);
+  }
+}
+
+/** The new/tmp/cur/dlq siblings of a record at <root>/<dir>/<file>. */
+function dirsForRecordPath(filePath: string): { root: string; fresh: string; tmp: string; cur: string; dlq: string } {
+  const root = dirname(dirname(filePath));
+  return {
+    root,
+    fresh: join(root, "new"),
+    tmp: join(root, "tmp"),
+    cur: join(root, "cur"),
+    dlq: join(root, "dlq"),
+  };
 }
 
 /**
  * Try to parse a message body as a TPS v1 signed envelope.
  *
- * Returns:
- *   - An Envelope object if the body is a valid v1 envelope (has v + delegationChain + signature)
- *   - "json-parse-error" if the body is not valid JSON
- *   - "missing-fields" if the body is JSON but missing required envelope fields
+ * Returns the envelope object, or the string "json-parse-error" (not JSON) or
+ * "missing-fields" (JSON but not a v1 envelope).
  */
 function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-error" | "missing-fields" {
   let parsed: unknown;
@@ -334,7 +411,161 @@ function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-e
   return obj;
 }
 
-export async function checkMessages(agent: string, checkedOutBy = agent, flairClient?: FlairClient): Promise<MailMessage[]> {
+/**
+ * Has this envelope messageId already been consumed? Scans cur/ and the archive
+ * (recursively). Counts both the persisted `envelopeId` and — for legacy cur/
+ * records written before promotion set that field — a body that is itself a
+ * signed envelope. This is the gate on replay of consumed history.
+ */
+function isConsumedMessageId(root: string, messageId: string): boolean {
+  const stack = [join(root, "cur"), join(root, "archive")];
+  while (stack.length > 0) {
+    const dir = stack.pop()!;
+    if (!existsSync(dir)) continue;
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".json")) continue;
+      try {
+        const msg = JSON.parse(readFileSync(full, "utf-8")) as MailMessage;
+        if (msg.envelopeId === messageId) return true;
+        const parsed = tryParseEnvelope(msg.body);
+        if (parsed !== "json-parse-error" && parsed !== "missing-fields") {
+          if ((parsed as { messageId?: unknown }).messageId === messageId) return true;
+        }
+      } catch {
+        // skip corrupt records
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * THE enforcer. Move one record to cur/ ONLY if its envelope verifies AND is
+ * addressed to this mailbox AND has not already been consumed. Otherwise
+ * dead-letter it to dlq/ with a `.reason` sidecar.
+ *
+ * Accepts a source path in new/, tmp/ or dlq/ (so a quarantined
+ * verify-unavailable entry can be re-driven through the same function).
+ *
+ * Deliberately does NOT retro-verify cur/ or the archive.
+ */
+export async function promote(agent: string, filePath: string): Promise<PromoteResult> {
+  assertValidAgentId(agent);
+  const dirs = dirsForRecordPath(filePath);
+  const filename = filePath.split("/").pop()!;
+
+  // Step 0: read the wrapper.
+  let msg: MailMessage;
+  try {
+    msg = readMessageFile(filePath);
+  } catch (err: any) {
+    const reason = `json parse error: ${err?.message ?? String(err)}`;
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  // Step 1: parse wrapper → parse envelope.
+  const parsed = tryParseEnvelope(msg.body);
+  if (parsed === "json-parse-error") {
+    const reason = "body is not JSON (signed envelope required)";
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+  if (parsed === "missing-fields") {
+    const reason = "body is not a v1 signed envelope";
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+  const envelope = parsed as unknown as Envelope;
+
+  // Step 2: verify through an ALWAYS-constructed Flair client.
+  let verified: Awaited<ReturnType<typeof verifyEnvelope>>;
+  try {
+    const client = await createMailVerifyClient(agent);
+    verified = await verifyEnvelope(envelope, client);
+  } catch (err: any) {
+    // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
+    // later check re-drive it, so an outage self-heals when Flair returns.
+    const reason = `verification unavailable: ${err?.message ?? String(err)}`;
+    rejectToDlq(dirs, filename, filePath, "verify-unavailable", reason);
+    return { ok: false, class: "verify-unavailable", reason };
+  }
+  if (!verified.ok) {
+    const reason = `signature verification failed: ${verified.reason}`;
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  // The wrapper `from` is what consumers used to route by, and it is unverified.
+  // A pre-existing wrapper/envelope mismatch is itself a reject.
+  if (msg.from !== envelope.from) {
+    const reason = `wrapper/envelope from mismatch (wrapper.from=${msg.from}, envelope.from=${envelope.from})`;
+    rejectToDlq(dirs, filename, filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  // Step 3: the verified recipient must be this mailbox's owner.
+  if (envelope.to !== agent) {
+    const reason = `wrong-recipient (envelope.to=${envelope.to}, mailbox=${agent})`;
+    rejectToDlq(dirs, filename, filePath, "wrong-recipient", reason);
+    return { ok: false, class: "wrong-recipient", reason };
+  }
+
+  // Step 4: replay — a re-planted consumed envelope must dead-letter.
+  if (isConsumedMessageId(dirs.root, envelope.messageId)) {
+    const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+    rejectToDlq(dirs, filename, filePath, "replay", reason);
+    return { ok: false, class: "replay", reason };
+  }
+
+  // Step 5: atomic new/ → tmp/ → cur/ with verified metadata.
+  const promoted: MailMessage = {
+    ...msg,
+    from: envelope.from,
+    to: envelope.to,
+    body: envelope.body,
+    timestamp: envelope.timestamp || msg.timestamp,
+    read: false,
+    envelopeId: envelope.messageId,
+    checkedOutAt: new Date().toISOString(),
+    checkedOutBy: msg.checkedOutBy ?? agent,
+    deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
+  };
+  const curPath = join(dirs.cur, filename);
+  const tmpPath = join(dirs.tmp, filename);
+  try {
+    mkdirSync(dirs.tmp, { recursive: true });
+    mkdirSync(dirs.cur, { recursive: true });
+    // Atomic out of new/ (or dlq/): a crash after this leaves the record in
+    // tmp/ — never back in new/, so it cannot be re-presented as mail.
+    renameSync(filePath, tmpPath);
+    writeMessageFile(tmpPath, promoted);
+    renameSync(tmpPath, curPath);
+    const staleReason = join(dirs.dlq, `${filename}.reason`);
+    if (existsSync(staleReason)) rmSync(staleReason, { force: true });
+  } catch (err: any) {
+    const reason = `promote write failed: ${err?.message ?? String(err)}`;
+    rejectToDlq(dirs, filename, existsSync(tmpPath) ? tmpPath : filePath, "invalid", reason);
+    return { ok: false, class: "invalid", reason };
+  }
+
+  logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
+  return { ok: true, message: promoted, path: curPath };
+}
+
+/**
+ * Check inbox: promote every new/ message through promote() (the one
+ * enforcement point), re-drive quarantined verify-unavailable entries so an
+ * outage self-heals, then lease-sweep cur/.
+ *
+ * Verification is mandatory — there is NO client parameter.
+ */
+export async function checkMessages(agent: string, checkedOutBy = agent): Promise<MailMessage[]> {
   assertValidAgentId(agent);
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
@@ -355,71 +586,23 @@ export async function checkMessages(agent: string, checkedOutBy = agent, flairCl
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
 
+  // 1. Promote new/ → cur/ through the single enforcement point.
   for (const f of listMessageFiles(inbox.fresh)) {
-    const fromPath = join(inbox.fresh, f);
-
-    // Read the message before promoting so we can verify it.
-    let msg: MailMessage;
-    try {
-      msg = readMessageFile(fromPath);
-    } catch (err: any) {
-      // Corrupt file (JSON parse error inside readMessageFile).
-      // Move to dlq with sidecar instead of crashing the consumer.
-      const dlqFile = join(inbox.dlq, f);
-      renameSync(fromPath, dlqFile);
-      writeRejectSidecar(inbox.dlq, f, `json parse error: ${err?.message ?? String(err)}`);
-      console.warn(`[mail] checkMessages(${agent}): dlq ${f} — json parse error`);
-      continue;
-    }
-
-    // Envelope verification (strict when FlairClient is available).
-    let verified = false;
-    if (flairClient) {
-      const parseResult = tryParseEnvelope(msg.body);
-      if (parseResult === "json-parse-error") {
-        const dlqFile = join(inbox.dlq, f);
-        renameSync(fromPath, dlqFile);
-        writeRejectSidecar(inbox.dlq, f, "json parse error: invalid JSON body");
-        console.warn(`[mail] checkMessages(${agent}): dlq ${f} — json parse error (invalid JSON body)`);
-        continue;
-      }
-      if (parseResult === "missing-fields") {
-        const dlqFile = join(inbox.dlq, f);
-        renameSync(fromPath, dlqFile);
-        writeRejectSidecar(inbox.dlq, f, "unsigned envelope (v1 required)");
-        console.warn(`[mail] checkMessages(${agent}): dlq ${f} — unsigned envelope (v1 required)`);
-        continue;
-      }
-      // parseResult is the Envelope — verify it
-      try {
-        const vr = await verifyEnvelope(parseResult as any, flairClient);
-        if (!vr.ok) {
-          const dlqFile = join(inbox.dlq, f);
-          renameSync(fromPath, dlqFile);
-          writeRejectSidecar(inbox.dlq, f, vr.reason);
-          console.warn(`[mail] checkMessages(${agent}): dlq ${f} — ${vr.reason}`);
-          continue;
-        }
-        verified = true;
-      } catch (err: any) {
-        // verifyEnvelope threw (e.g. Flair network error).
-        // Don't drop the message — promote and log the error.
-        console.warn(`[mail] verifyEnvelope failed for ${f}: ${err?.message ?? err}`);
-      }
-    }
-
-    // Promote to cur/
-    const to = join(inbox.cur, f);
-    renameSync(fromPath, to);
-    msg.read = false;
-    msg.checkedOutAt = nowIso;
-    msg.checkedOutBy = checkedOutBy;
-    msg.deliveryAttempts = (msg.deliveryAttempts ?? 0) + 1;
-    writeMessageFile(to, msg);
-    messages.push(msg);
-    logEvent({ event: "read", from: msg.from, to: agent, messageId: msg.id }, msg.body);
+    const result = await promote(agent, join(inbox.fresh, f));
+    if (result.ok) messages.push(result.message);
   }
 
+  // 2. Self-heal: re-drive quarantined verify-unavailable entries. Terminal
+  //    rejects (invalid/wrong-recipient/replay) are NOT retried.
+  for (const f of listMessageFiles(inbox.dlq)) {
+    const side = readReasonSidecar(inbox.dlq, f);
+    if (!side || side.cls !== "verify-unavailable") continue;
+    const result = await promote(agent, join(inbox.dlq, f));
+    if (result.ok) messages.push(result.message);
+  }
+
+  // 3. Lease sweep over cur/ (messages already promoted are skipped: their
+  //    lease is fresh).
   for (const f of listMessageFiles(inbox.cur)) {
     const full = join(inbox.cur, f);
     const msg = readMessageFile(full);
@@ -441,9 +624,9 @@ export async function checkMessages(agent: string, checkedOutBy = agent, flairCl
 export function listMessages(agent: string): MailMessage[] {
   assertValidAgentId(agent);
   const inbox = getInbox(agent);
-  const unread = readMessagesFromDir(inbox.fresh, false);
-  const cur = readMessagesFromDir(inbox.cur, true);
-  const dlq = readMessagesFromDir(inbox.dlq, true);
+  const unread = readMessagesFromDir(inbox.fresh, false, "new");
+  const cur = readMessagesFromDir(inbox.cur, true, "cur");
+  const dlq = readMessagesFromDir(inbox.dlq, true, "dlq");
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }
 
