@@ -39,6 +39,31 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint:ci
 
+  # cli#366 — the promote script must run under bash 3.2, which is the bash on the
+  # machine that drives releases (macOS still ships 3.2.57). Fixtures that only ever
+  # run on Linux cannot protect it, so this runs on macOS too, with BASH_BIN pinned
+  # to the runner's own bash so a PATH change cannot silently substitute bash 4/5
+  # and hide a 3.2 regression.
+  promote-latest-fixtures:
+    name: promote-latest fixtures (${{ matrix.os }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - name: Run the promote-latest fixtures under this runner's bash
+        env:
+          BASH_BIN: ${{ runner.os == 'macOS' && '/bin/bash' || 'bash' }}
+        run: |
+          "$BASH_BIN" --version | head -n1
+          "$BASH_BIN" ./scripts/test-promote-latest.sh
+
   test:
     name: Unit & Integration Tests
     needs: build
