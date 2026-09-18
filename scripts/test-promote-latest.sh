@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # test-promote-latest.sh — fails-first fixtures for scripts/promote-latest.sh (cli#366).
 #
-# The promote script's value is its REFUSALS and its verification, so this harness
-# pins both against a FAKE registry: no network, no real npm, and no real dist-tag
-# is ever moved. Each fixture builds a fake repo tree plus a fake `npm` (injected via
-# NPM_BIN) whose registry state is a JSON file the test controls, then drives
-# scripts/promote-latest.sh and asserts its exit code, its text, and the resulting
-# registry state.
+# The promote script's value is its REFUSALS, its verification, and its rollback,
+# so this harness pins all three against a FAKE registry: no network, no real npm,
+# and no real dist-tag is ever moved. Each fixture builds a fake repo tree plus a
+# fake `npm` (injected via NPM_BIN) whose registry state is a JSON file the test
+# controls, then drives scripts/promote-latest.sh and asserts its exit code, its
+# text, and the resulting registry state.
 #
 # Covered:
 #   * refuse when the target version is not published for all six — and name them
@@ -15,11 +15,21 @@
 #   * "already latest" is reported as such, not proposed as a no-op move
 #   * a move that does not land (npm exits 0, the registry never changes) is caught
 #     by the post-move re-read, and the packages already moved are rolled back
+#   * an INTERRUPT (SIGTERM) during the move loop rolls back the packages already
+#     moved, including the in-flight one — the all-six-or-none guarantee holds
 #   * the confirmation gate aborts on anything but "yes"
-#   * MUTATION CHECKS: break the existence check and the re-read, confirm a fixture
-#     catches each — a test that passes on both the fixed and the broken script is
-#     not a test. This harness runs its own mutants and asserts it catches them.
-#   * the CI workflow still invokes this harness, so a later edit cannot orphan it
+#   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
+#     which --yes does NOT satisfy
+#   * every npm call is pinned with --registry
+#   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
+#     trap, and the pre-add attempt flag; confirm a fixture catches each — a test
+#     that passes on both the fixed and the broken script is not a test.
+#   * the fixtures run under bash 3.2 too (BASH_BIN; the macos-14 CI leg pins it),
+#     and the workflow still invokes this harness
+#
+# The bash-4 denylist below is a cheap companion, NOT coverage: it catches only the
+# constructs that have already bitten. The real control for the bash-3.2 class is
+# the `macos-14` CI leg, which runs this whole harness under /bin/bash (3.2.57).
 #
 # The fixtures are generated at run time, not committed, so no fake registry state
 # or mutant script lives in the tree for scanners to read as real.
@@ -42,8 +52,8 @@ six_dirs=(cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64 agent cl
 
 npass=0
 nfail=0
-ok() { printf 'PASS  %-38s %s\n' "$1" "$2"; npass=$((npass + 1)); }
-bad() { printf 'FAIL  %-38s %s\n' "$1" "$2"; nfail=$((nfail + 1)); }
+ok() { printf 'PASS  %-42s %s\n' "$1" "$2"; npass=$((npass + 1)); }
+bad() { printf 'FAIL  %-42s %s\n' "$1" "$2"; nfail=$((nfail + 1)); }
 
 assert_eq() { # <name> <expected> <actual>
   if [ "$2" = "$3" ]; then ok "$1" "== $2"; else bad "$1" "expected [$2], got [$3]"; fi
@@ -51,6 +61,7 @@ assert_eq() { # <name> <expected> <actual>
 assert_contains() { # <name> <haystack> <needle>
   if printf '%s' "$2" | grep -qF -- "$3"; then ok "$1" "found: $3"; else bad "$1" "not found: $3"; fi
 }
+
 # ── the fake `npm` ───────────────────────────────────────────────────────────
 fake_npm="$work/fake-npm"
 cat >"$fake_npm" <<'FAKE_NPM'
@@ -101,9 +112,17 @@ if (cmd === 'view') {
   if (tag !== 'latest') fail('npm error only the latest tag is supported');
   const s = read();
   if ((s.failAdd || []).includes(spec.pkg)) fail('npm error code E401\nnpm error Unable to authenticate');
-  // `noopAdd`: simulate a command that exits 0 but never moves the tag — the exact
-  // failure prompt 3 exists to catch.
+  // `noopAdd`: a command that exits 0 but never moves the tag.
   if (!((s.noopAdd || []).includes(spec.pkg))) { s.latest[spec.pkg] = spec.ver; persist(s); }
+  // Hold the FIRST add of FAKE_NPM_HOLD_PKG in flight (after the tag moved) so a
+  // signal from the harness lands inside the in-flight window.
+  const holdPkg = process.env.FAKE_NPM_HOLD_PKG;
+  const marker = process.env.FAKE_NPM_MARKER;
+  if (holdPkg && marker && spec.pkg === holdPkg && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker, 'moved');
+    const t0 = Date.now();
+    while (Date.now() - t0 < 1200) { /* hold */ }
+  }
   process.stdout.write('+latest: ' + spec.pkg + '@' + spec.ver + '\n');
   process.exit(0);
 } else {
@@ -149,6 +168,11 @@ const targets = {
     '  if [ "$rc" -ne 0 ] || [ "$prc" -ne 0 ] || [ "$post" != "$version" ]; then\n',
     '  if [ "$rc" -ne 0 ]; then\n',
   ],
+  interrupt: ["trap 'on_signal TERM' TERM\n", ': # MUTATED: no TERM trap\n'],
+  reorder: [
+    "  moved[i]=1\n  printf '\\n-> %s: npm dist-tag add %s@%s latest\\n' \"${names[i]}\" \"${names[i]}\" \"$version\"\n  set +e\n  out=\"$(\"$NPM_BIN\" dist-tag add \"${names[i]}@${version}\" latest --registry \"$NPM_REGISTRY\" 2>&1)\"\n  rc=$?\n  set -e\n",
+    "  printf '\\n-> %s: npm dist-tag add %s@%s latest\\n' \"${names[i]}\" \"${names[i]}\" \"$version\"\n  set +e\n  out=\"$(\"$NPM_BIN\" dist-tag add \"${names[i]}@${version}\" latest --registry \"$NPM_REGISTRY\" 2>&1)\"\n  rc=$?\n  set -e\n  moved[i]=1\n",
+  ],
 };
 const t = targets[which];
 if (!t) { console.error('unknown mutation: ' + which); process.exit(2); }
@@ -183,6 +207,7 @@ RC=0
 OUT=""
 ERR=""
 LOG=""
+IRC=0
 invoke() { # [TOOL=...] <fixture-dir> [args...]
   local d="$1"
   shift
@@ -204,6 +229,28 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...]
   OUT="$(printf '%s\n' "$reply" | FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
     "$BASH_BIN" "$t" "$@" 2>"$d/err.txt")"
   RC=$?
+  ERR="$(cat "$d/err.txt")"
+}
+run_interrupt() { # [TOOL=...] <fixture-dir> <hold-pkg-short> <signal> [args...]
+  local d="$1"
+  local hold="$2"
+  local sig="$3"
+  shift 3
+  local t="${TOOL:-$tool}"
+  LOG="$d/log.txt"
+  : >"$LOG"
+  local marker="$d/moved.marker"
+  rm -f "$marker"
+  FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+    FAKE_NPM_HOLD_PKG="@tpsdev-ai/$hold" FAKE_NPM_MARKER="$marker" \
+    "$BASH_BIN" "$t" "$@" >"$d/out.txt" 2>"$d/err.txt" &
+  local pid=$!
+  local n=0
+  while [ ! -f "$marker" ] && [ "$n" -lt 300 ]; do sleep 0.05; n=$((n + 1)); done
+  kill -"$sig" "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
+  IRC=$?
+  OUT="$(cat "$d/out.txt")"
   ERR="$(cat "$d/err.txt")"
 }
 adds_count() {
@@ -281,52 +328,112 @@ invoke "$d" --dry-run
 assert_eq "J default-version: exit" 0 "$RC"
 assert_contains "J default-version: used package.json version" "$OUT" 'Promoting the "latest" dist-tag to 0.5.4'
 
-# ── M1. mutation check: break the existence check, the fixture must catch it ──
-mut1="$work/tool-no-existence.sh"
-if node "$work/mutate.mjs" "$tool" "$mut1" existence; then
+# ── K. SIGTERM mid-move rolls back, including the in-flight package ───────────
+# The in-flight package (cli-linux-arm64, index 2) has already had its tag moved
+# by the fake npm when the signal lands; the attempt flag is set BEFORE the add, so
+# the rollback must restore it too. A script with no trap dies here and leaves a
+# partial promote — this fixture is the control for that.
+d="$(new_fixture interrupt)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+assert_eq "K interrupt: exit" 4 "$IRC"
+assert_contains "K interrupt: reports the rollback" "$ERR" "rolling back"
+assert_contains "K interrupt: names the signal" "$ERR" "SIGTERM"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "K interrupt: registry restored" "latest=0.5.3 for all six"; else bad "K interrupt: registry restored" "a partial promote was left behind"; fi
+
+# ── L. a DOWNGRADE is allowed but needs --allow-downgrade, not --yes ──────────
+d="$(new_fixture downgrade)"
+write_state "$d/state.json" "0.5.3,0.5.4" "0.5.4"
+invoke "$d" 0.5.3 --yes
+assert_eq "L downgrade: --yes alone aborts" 3 "$RC"
+assert_contains "L downgrade: says DOWNGRADE" "$ERR" "DOWNGRADE"
+assert_eq "L downgrade: no dist-tag add attempted" 0 "$(adds_count)"
+if all_latest_eq "$d/state.json" "0.5.4"; then ok "L downgrade: registry untouched" "latest=0.5.4 for all six"; else bad "L downgrade: registry untouched" "registry changed"; fi
+invoke "$d" 0.5.3 --yes --allow-downgrade
+assert_eq "L downgrade: --allow-downgrade proceeds" 0 "$RC"
+assert_eq "L downgrade: six dist-tag adds" 6 "$(adds_count)"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "L downgrade: moved to 0.5.3" "latest=0.5.3 for all six"; else bad "L downgrade: moved to 0.5.3" "not all 0.5.3"; fi
+
+# ── M. a PRE-RELEASE target gets the same loud confirm ────────────────────────
+d="$(new_fixture prerelease)"
+write_state "$d/state.json" "0.6.0-rc.1" "0.5.4"
+invoke "$d" 0.6.0-rc.1 --yes
+assert_eq "M prerelease: --yes alone aborts" 3 "$RC"
+assert_contains "M prerelease: says PRE-RELEASE" "$ERR" "PRE-RELEASE"
+assert_eq "M prerelease: no dist-tag add attempted" 0 "$(adds_count)"
+invoke "$d" 0.6.0-rc.1 --yes --allow-downgrade
+assert_eq "M prerelease: --allow-downgrade proceeds" 0 "$RC"
+assert_eq "M prerelease: six dist-tag adds" 6 "$(adds_count)"
+
+# ── N. every npm call is pinned to a registry ────────────────────────────────
+d="$(new_fixture registry-pin)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+invoke "$d" 0.5.4 --yes
+total_lines="$(wc -l <"$LOG")"
+unpinned="$(grep -vF -- '--registry https://registry.npmjs.org' "$LOG" | grep -c .)"
+if [ "$total_lines" -gt 0 ] && [ "$unpinned" -eq 0 ]; then
+  ok "N registry pin: every npm call pinned" "$total_lines calls, 0 unpinned"
+else
+  bad "N registry pin: every npm call pinned" "$total_lines calls, $unpinned unpinned"
+fi
+
+# ── M1. mutation: break the existence check; fixture A must catch it ──────────
+mut="$work/tool-no-existence.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" existence; then
   d="$(new_fixture mut-existence)"
   write_state "$d/state.json" "0.5.4" "0.5.4"
-  TOOL="$mut1" invoke "$d" 0.6.0 --dry-run
-  # Fixture A expects exit 2 here. A mutant that no longer refuses must NOT exit 2,
-  # or the fixture is blind to the break.
-  if [ "$RC" -eq 2 ]; then
-    bad "M1 mutation: existence break caught" "mutant still exited 2 — fixture A is blind to it"
-  else
-    ok "M1 mutation: existence break caught" "mutant exited $RC (fixture A expects 2)"
-  fi
+  TOOL="$mut" invoke "$d" 0.6.0 --dry-run
+  if [ "$RC" -eq 2 ]; then bad "M1 mutation: existence break caught" "mutant still exited 2 — fixture A is blind to it"; else ok "M1 mutation: existence break caught" "mutant exited $RC (fixture A expects 2)"; fi
   TOOL=""
 else
   bad "M1 mutation: existence break caught" "could not build the mutant"
 fi
 
-# ── M2. mutation check: break the post-move re-read, the fixture must catch it ─
-mut2="$work/tool-no-verify.sh"
-if node "$work/mutate.mjs" "$tool" "$mut2" verify; then
+# ── M2. mutation: break the post-move re-read; fixture G must catch it ────────
+mut="$work/tool-no-verify.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" verify; then
   d="$(new_fixture mut-verify)"
   write_state "$d/state.json" "0.5.4" "0.5.3" "cli-linux-arm64"
-  TOOL="$mut2" invoke "$d" 0.5.4 --yes
-  # Fixture G asserts the registry is restored to none-moved. A mutant that trusts
-  # the exit code never triggers the rollback, so the partial promote survives.
-  if all_latest_eq "$d/state.json" "0.5.3"; then
-    bad "M2 mutation: re-read break caught" "mutant restored the registry — fixture G is blind to it"
-  else
-    ok "M2 mutation: re-read break caught" "mutant left a partial promote (fixture G catches it)"
-  fi
+  TOOL="$mut" invoke "$d" 0.5.4 --yes
+  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M2 mutation: re-read break caught" "mutant restored the registry — fixture G is blind to it"; else ok "M2 mutation: re-read break caught" "mutant left a partial promote (fixture G catches it)"; fi
   TOOL=""
 else
   bad "M2 mutation: re-read break caught" "could not build the mutant"
 fi
 
-# ── regression guard: the tool must stay bash 3.2-clean ───────────────────────
-# The real proof is running the whole harness under bash 3.2 (the macOS CI leg);
-# this is a cheap cross-platform companion that fails fast on the exact construct
-# that broke it. Comments are stripped first, so prose ABOUT a construct is fine.
+# ── M3. mutation: remove the TERM trap; fixture K must catch it ───────────────
+mut="$work/tool-no-trap.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" interrupt; then
+  d="$(new_fixture mut-trap)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M3 mutation: missing TERM trap caught" "mutant restored the registry — fixture K is blind to it"; else ok "M3 mutation: missing TERM trap caught" "mutant left a partial promote (fixture K catches it)"; fi
+  TOOL=""
+else
+  bad "M3 mutation: missing TERM trap caught" "could not build the mutant"
+fi
+
+# ── M4. mutation: flag the attempt AFTER the add; fixture K must catch it ─────
+mut="$work/tool-reorder.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" reorder; then
+  d="$(new_fixture mut-reorder)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" TERM 0.5.4 --yes
+  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M4 mutation: late attempt flag caught" "mutant restored the registry — fixture K is blind to it"; else ok "M4 mutation: late attempt flag caught" "mutant left the in-flight package moved (fixture K catches it)"; fi
+  TOOL=""
+else
+  bad "M4 mutation: late attempt flag caught" "could not build the mutant"
+fi
+
+# ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
+# Companion only, NOT coverage — see the header. The real control is the macos-14
+# CI leg running this harness under bash 3.2.
 grep -vE '^[[:space:]]*#' "$tool" >"$work/tool-code.txt"
 if grep -nF -e 'declare -A' -e 'mapfile' -e 'readarray' -e ';;&' -e '&>>' -e '^^' "$work/tool-code.txt" >"$work/b4.txt"; then
-  bad "tool has no bash-4 constructs" "bash-4-only syntax found:"
+  bad "bash-4 denylist (companion only)" "known bash-4-only syntax found:"
   sed 's/^/      /' "$work/b4.txt"
 else
-  ok "tool has no bash-4 constructs" "bash 3.2-clean"
+  ok "bash-4 denylist (companion only)" "no known bash-4-only syntax"
 fi
 
 # ── regression guard: the CI workflow must still invoke this harness ──────────
@@ -341,14 +448,14 @@ if [ -x "$tool" ]; then ok "promote-latest.sh is executable" ""; else bad "promo
 
 # ── shellcheck the scripts (warning+), when available ────────────────────────
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -S warning "$tool" "$here/test-promote-latest.sh" >"$work/sc.txt" 2>&1; then
+  if shellcheck -S warning -s bash "$tool" "$here/test-promote-latest.sh" >"$work/sc.txt" 2>&1; then
     ok "shellcheck (warning+)" "clean"
   else
     bad "shellcheck (warning+)" "findings:"
     sed 's/^/      /' "$work/sc.txt"
   fi
 else
-  printf 'SKIP  %-38s shellcheck not installed\n' "shellcheck (warning+)"
+  printf 'SKIP  %-42s shellcheck not installed\n' "shellcheck (warning+)"
 fi
 
 printf '\ntest-promote-latest: %d passed, %d failed\n' "$npass" "$nfail"

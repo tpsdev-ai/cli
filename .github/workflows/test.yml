@@ -46,6 +46,8 @@ jobs:
   # and hide a 3.2 regression.
   promote-latest-fixtures:
     name: promote-latest fixtures (${{ matrix.os }})
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +55,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
       - name: Run the promote-latest fixtures under this runner's bash
         env:
           BASH_BIN: ${{ runner.os == 'macOS' && '/bin/bash' || 'bash' }}
