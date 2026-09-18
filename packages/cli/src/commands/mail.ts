@@ -409,12 +409,15 @@ export async function runMail(args: MailArgs): Promise<void> {
         console.error(`Message not found: ${id}`);
         process.exit(1);
       }
+      // A `cur/` record is only presentable with its promotion proof; without
+      // an `envelopeId` it is withheld exactly like `new/`.
+      const unverified = foundLoc === "new" || !found.envelopeId;
       if (args.json) {
-        const out = foundLoc === "new" ? { ...found, body: "" } : found;
+        const out = unverified ? { ...found, body: "" } : found;
         console.log(JSON.stringify(out, null, 2));
       } else {
-        if (foundLoc === "new") {
-          // `new/` is unverified — never present its body.
+        if (unverified) {
+          // New/cur content without a verified envelope — never present its body.
           console.log(`⏳ [pending verify] ${found.from} → ${found.to}  ${found.timestamp}`);
           console.log(`ID: ${found.id}`);
           console.log("(body withheld until the envelope is verified)");

@@ -597,6 +597,73 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
   return false;
 }
 
+type EnvelopePolicyResult =
+  | { ok: true; envelope: Envelope }
+  | { ok: false; class: PromoteRejectClass; reason: string };
+
+/**
+ * The ONE mailbox decision for an enveloped record — the shared policy that BOTH
+ * first delivery (`promote`) and re-presentation (`recoverPromoted`) run, so the
+ * check set cannot diverge. Add a check here and both paths get it; there is no
+ * second list to keep in sync.
+ *
+ * The checks, in order:
+ *   1. signature, through an ALWAYS-constructed Flair client;
+ *   2. wrapper/envelope `from` binding;
+ *   3. recipient binding (`envelope.to === agent`);
+ *   4. `messageId` shape (present, non-empty string).
+ *
+ * Callers add only their path-specific step: `promote` adds the replay gate
+ * (first delivery only); `recoverPromoted` requires provenance (recovery only).
+ *
+ * Throws only when Flair is unreachable — a retryable outage, not a verdict.
+ */
+async function decideEnvelopeForMailbox(
+  agent: string,
+  envelope: Envelope,
+  wrapperFrom: string,
+): Promise<EnvelopePolicyResult> {
+  // 1. Signature, through an ALWAYS-constructed client.
+  const client = await createMailVerifyClient(agent);
+  const verified = await verifyEnvelope(envelope, client);
+  if (!verified.ok) {
+    return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
+  }
+
+  // 2. The wrapper `from` is what consumers route by, and it is unverified; a
+  //    wrapper/envelope mismatch is itself a reject.
+  if (wrapperFrom !== envelope.from) {
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `wrapper/envelope from mismatch (wrapper.from=${wrapperFrom}, envelope.from=${envelope.from})`,
+    };
+  }
+
+  // 3. The verified recipient must be this mailbox's owner.
+  if (envelope.to !== agent) {
+    return {
+      ok: false,
+      class: "wrong-recipient",
+      reason: `wrong-recipient (envelope.to=${envelope.to}, mailbox=${agent})`,
+    };
+  }
+
+  // 4. `messageId` shape — the replay gate keys on it, and verifyEnvelope does
+  //    not enforce it. A malformed id is a terminal reject, not an undefined key
+  //    that silently never matches.
+  if (typeof envelope.messageId !== "string" || envelope.messageId.trim() === "") {
+    const shown = typeof envelope.messageId === "string" ? JSON.stringify(envelope.messageId) : String(envelope.messageId);
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `invalid messageId (must be a non-empty string, got ${shown})`,
+    };
+  }
+
+  return { ok: true, envelope };
+}
+
 /**
  * THE enforcer. Move one record to cur/ ONLY if its envelope verifies AND is
  * addressed to this mailbox AND has not already been consumed. Otherwise
@@ -636,11 +703,12 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
   }
   const envelope = parsed as unknown as Envelope;
 
-  // Step 2: verify through an ALWAYS-constructed Flair client.
-  let verified: Awaited<ReturnType<typeof verifyEnvelope>>;
+  // Step 2: run the SHARED mailbox policy (signature, wrapper→envelope from
+  // binding, recipient binding, messageId shape). This is the SAME list
+  // recoverPromoted runs, so the two paths cannot diverge.
+  let decision: EnvelopePolicyResult;
   try {
-    const client = await createMailVerifyClient(agent);
-    verified = await verifyEnvelope(envelope, client);
+    decision = await decideEnvelopeForMailbox(agent, envelope, msg.from);
   } catch (err: any) {
     // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
     // later check re-drive it, so an outage self-heals when Flair returns.
@@ -648,43 +716,14 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     rejectToDlq(dirs, filename, filePath, "verify-unavailable", reason);
     return { ok: false, class: "verify-unavailable", reason };
   }
-  if (!verified.ok) {
-    const reason = `signature verification failed: ${verified.reason}`;
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
+  if (!decision.ok) {
+    rejectToDlq(dirs, filename, filePath, decision.class, decision.reason);
+    return { ok: false, class: decision.class, reason: decision.reason };
   }
 
-  // The wrapper `from` is what consumers used to route by, and it is unverified.
-  // A pre-existing wrapper/envelope mismatch is itself a reject.
-  if (msg.from !== envelope.from) {
-    const reason = `wrapper/envelope from mismatch (wrapper.from=${msg.from}, envelope.from=${envelope.from})`;
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-
-  // Step 3: the verified recipient must be this mailbox's owner.
-  if (envelope.to !== agent) {
-    const reason = `wrong-recipient (envelope.to=${envelope.to}, mailbox=${agent})`;
-    rejectToDlq(dirs, filename, filePath, "wrong-recipient", reason);
-    return { ok: false, class: "wrong-recipient", reason };
-  }
-
-  // Step 4: the replay gate keys on messageId, so validate its shape FIRST.
-  // verifyEnvelope checks the signature but does not enforce that messageId is a
-  // present, non-empty string (and signEnvelope does not validate it at runtime
-  // either). A signature-valid envelope with an absent/empty/non-string
-  // messageId must never reach isConsumedMessageId — an undefined key silently
-  // misses and can never match, so the gate would report "not consumed". A
-  // malformed messageId is a terminal (invalid) reject, not an undefined lookup.
-  if (typeof envelope.messageId !== "string" || envelope.messageId.trim() === "") {
-    const shown = typeof envelope.messageId === "string" ? JSON.stringify(envelope.messageId) : String(envelope.messageId);
-    const reason = `invalid messageId (must be a non-empty string, got ${shown})`;
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-
-  // Step 5: replay — a re-planted consumed envelope must dead-letter. Consulted
-  // against the DURABLE ledger (and the maildir fallback), not cur/ alone.
+  // Step 3 (first-delivery only): replay — a re-planted consumed envelope must
+  // dead-letter. Consulted against the DURABLE ledger (and the maildir
+  // fallback), not cur/ alone.
   if (isConsumedMessageId(dirs.root, envelope.messageId)) {
     const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
     rejectToDlq(dirs, filename, filePath, "replay", reason);
@@ -832,25 +871,27 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
 
   // Binding: the envelope stored at promote() time must still describe THIS
   // record. Tampering with the record fails this match; tampering with the
-  // envelope fails the signature check below.
+  // envelope fails the signature check in the shared policy below. (The
+  // wrapper→envelope `from` binding is part of the shared policy.)
   const env = msg.envelope as Envelope | undefined;
   if (
     !env || typeof env !== "object" ||
     env.messageId !== msg.envelopeId ||
-    env.from !== msg.from || env.to !== msg.to || env.body !== msg.body
+    env.to !== msg.to || env.body !== msg.body
   ) {
     const reason = "cur/ record does not match its verified envelope (missing or tampered after promotion)";
     rejectToDlq(dirs, filename, curPath, "unverified", reason);
     return { ok: false, class: "unverified", reason };
   }
 
-  // Re-verify through the SAME always-constructed client promote() uses.
-  const client = await createMailVerifyClient(agent);
-  const verified = await verifyEnvelope(env, client);
-  if (!verified.ok) {
-    const reason = `re-verification failed for recovered cur/ record: ${verified.reason}`;
-    rejectToDlq(dirs, filename, curPath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
+  // The SAME policy first delivery runs — recipient binding INCLUDED, so a
+  // record carrying another mailbox's genuine envelope cannot be presented
+  // here. The recovery-only extra (provenance) is above; the first-delivery
+  // extra (replay gate) is unnecessary: this id is already consumed.
+  const decision = await decideEnvelopeForMailbox(agent, env, msg.from);
+  if (!decision.ok) {
+    rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
+    return { ok: false, class: decision.class, reason: decision.reason };
   }
 
   // Present the fields from the VERIFIED envelope, not the mutable record.
@@ -954,6 +995,12 @@ export function listMessages(agent: string): MailMessage[] {
   const unread = readMessagesFromDir(inbox.fresh, false, "new");
   const cur = readMessagesFromDir(inbox.cur, true, "cur");
   const dlq = readMessagesFromDir(inbox.dlq, true, "dlq");
+  // Only a record that proves it came through promotion is presentable from
+  // cur/. A forged cur/ record (no envelopeId) is treated like new/ and dlq/:
+  // its body is withheld.
+  for (const m of cur) {
+    if (typeof m.envelopeId !== "string" || m.envelopeId === "") m.body = "";
+  }
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }
 

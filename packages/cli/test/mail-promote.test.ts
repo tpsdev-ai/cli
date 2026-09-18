@@ -397,4 +397,34 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     await checkMessages("kern");
     expect(existsSync(orphan)).toBe(false);
   });
+
+  // ── Major: recovery must apply the SAME recipient bar as promotion ────────
+  test("a genuine envelope addressed to ANOTHER mailbox, planted in cur/, dead-letters wrong-recipient", async () => {
+    // kern's genuine signed envelope — the envelopeId, the record↔envelope
+    // binding and the signature all check out; only the RECIPIENT is wrong.
+    const env = buildSignedEnvelope("flint", "kern", "for kern only", { flint: FLINT_SEED });
+    const inbox = getInbox("sherlock");
+    mkdirSync(inbox.cur, { recursive: true });
+    writeFileSync(
+      join(inbox.cur, "planted.json"),
+      JSON.stringify({
+        id: "planted-1",
+        from: "flint",
+        to: "kern",
+        body: env.body,
+        timestamp: env.timestamp,
+        read: false,
+        envelopeId: env.messageId,
+        envelope: env,
+        checkedOutAt: new Date(Date.now() - 31 * 60 * 1000).toISOString(),
+        checkedOutBy: "sherlock",
+      }),
+      "utf-8",
+    );
+
+    process.env.FLAIR_KEY_PATH = join(keysDir, "sherlock.key");
+    const msgs = await checkMessages("sherlock");
+    expect(msgs.length).toBe(0); // never presented to the wrong mailbox
+    expect(reasonFor(process.env.TPS_MAIL_DIR!, "sherlock", "planted.json")).toContain("class: wrong-recipient");
+  });
 });

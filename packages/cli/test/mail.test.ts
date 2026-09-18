@@ -431,6 +431,38 @@ describe("mail command", () => {
     for (const r of rows) expect(r.body).toBe("");
   });
 
+  test("mail list/read withhold the body of a cur/ record with no envelopeId", async () => {
+    const mailDir = join(tempRoot, "mail");
+    mkdirSync(join(mailDir, "kern", "cur"), { recursive: true });
+    writeFileSync(
+      join(mailDir, "kern", "cur", "forged.json"),
+      JSON.stringify({ id: "forged", from: "flint", to: "kern", body: "SECRET-FORGED", timestamp: new Date().toISOString(), read: true }),
+      "utf-8",
+    );
+    // A genuine promoted record (envelopeId present) stays presentable.
+    const env = buildSignedEnvelope("flint", "kern", "legit body", { flint: FLINT_SEED });
+    writeFileSync(
+      join(mailDir, "kern", "cur", "legit.json"),
+      JSON.stringify({ id: "legit", from: "flint", to: "kern", body: env.body, timestamp: new Date().toISOString(), read: true, envelopeId: env.messageId }),
+      "utf-8",
+    );
+
+    const json = await run(["mail", "list", "kern", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    expect(json.status).toBe(0);
+    const rows = JSON.parse(json.stdout);
+    const forged = rows.find((r: any) => r.id === "forged");
+    const legit = rows.find((r: any) => r.id === "legit");
+    expect(forged.body).toBe(""); // no promotion proof → withheld
+    expect(legit.body).toBe("legit body"); // genuine promoted record → presentable
+
+    const human = await run(["mail", "list", "kern"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    expect(human.stdout).not.toContain("SECRET-FORGED");
+
+    const read = await run(["mail", "read", "kern", "forged", "--json"], { TPS_MAIL_DIR: mailDir, TPS_AGENT_ID: "kern" });
+    expect(read.status).toBe(0);
+    expect(JSON.parse(read.stdout).body).toBe("");
+  });
+
   test("check reads branch-office inbox when present", async () => {
     const home = join(tempRoot, "home-branch");
     mkdirSync(join(home, ".tps", "branch-office", "tps-anvil", "mail", "new"), { recursive: true });
