@@ -319,9 +319,20 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
 // terminal. All rejections dead-letter to dlq/ with a `<file>.reason` sidecar —
 // ONE convention (the CLI used to write `.reject`, which the daily surfacing
 // never saw).
+//
+// `unresolvable-principal` is the topology verdict, distinct from forgery: an
+// agent-kind chain entry or `envelope.from` that this mailbox's LOCAL Flair does
+// not hold. It is TERMINAL and — enforced, not merely intended — it carries the
+// SAME severity as `invalid`: it is not in RETRYABLE_REJECT_CLASSES and it
+// surfaces on the same dlq path, so an alert wired to `class == "invalid"` cannot
+// be silently bypassed by it (see the no-downgrade drill). Keep the two names
+// distinct and keep this one terminal: a retryable that cannot heal locally is
+// fail-stuck, and any expected-but-not-yet-synced class (Option 1) is a SEPARATE,
+// retryable name — never this one (cli#383).
 
 export type PromoteRejectClass =
   | "invalid"
+  | "unresolvable-principal"
   | "wrong-recipient"
   | "replay"
   | "verify-unavailable"
@@ -336,11 +347,27 @@ export type PromoteRejectClass =
  * `mail check` re-drives it until the fault clears. Everything else is
  * terminal and is never retried.
  */
-const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set([
+// Exported so the no-downgrade drill can assert membership DIRECTLY: the pin is
+// that `unresolvable-principal` is absent here (i.e. it can never be re-driven),
+// exactly as `invalid` is. Adding it to this set is the downgrade the drill exists
+// to fail on.
+export const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set([
   "verify-unavailable",
   "storage-unavailable",
   "busy",
 ]);
+
+/**
+ * The stable reason string `verifyEnvelope` returns when an agent-kind chain
+ * entry or `envelope.from` cannot be resolved from the LOCAL Flair. It is a
+ * presence failure, not a signature failure: the principal is simply not
+ * registered here. Pinned to `signEnvelope.ts` (`agent ${agent} not found in
+ * Flair`), unchanged since #336, and captured here so the class boundary is a
+ * named, testable predicate rather than a substring check scattered at call
+ * sites. (A structured reason enum belongs to the Option 1 follow-up, not this
+ * gate — no library change here.)
+ */
+const UNRESOLVABLE_PRINCIPAL_REASON_RE = /^agent (.+) not found in Flair$/;
 
 export interface PromoteOk {
   ok: true;
@@ -680,6 +707,25 @@ async function decideEnvelopeForMailbox(
   const client = await createMailVerifyClient(agent);
   const verified = await verifyEnvelope(envelope, client);
   if (!verified.ok) {
+    // 1a. Topology, not forgery. `verifyEnvelope` resolves every agent-kind
+    //     chain entry PLUS `envelope.from`; an unresolvable principal is a
+    //     presence failure (Flair is UP — an outage throws above and becomes the
+    //     retryable `verify-unavailable`), which on a spoke is the normal shape
+    //     of any cross-office envelope. Classify it as its own TERMINAL class so
+    //     `invalid` once again means a resolvable principal whose signature is
+    //     bad — a trustworthy forgery signal — instead of firing on every
+    //     legitimate hub-origin message.
+    const missing = UNRESOLVABLE_PRINCIPAL_REASON_RE.exec(verified.reason);
+    if (missing) {
+      const entry = missing[1]!;
+      const reason =
+        `unresolvable-principal: ${entry} is not registered in the local Flair ` +
+        `(agent-kind delegation-chain entry or sender this mailbox cannot resolve). ` +
+        `Spoke-topology condition: a spoke holds only its own principal and hub ` +
+        `principals are not distributed downward (see cli#383). Not a signature or ` +
+        `forgery verdict. Terminal — message DEAD-LETTERED, NOT delivered.`;
+      return { ok: false, class: "unresolvable-principal", reason };
+    }
     return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
   }
 
