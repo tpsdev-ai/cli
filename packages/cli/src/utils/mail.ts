@@ -948,6 +948,48 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
 }
 
 /**
+ * Read-only provenance + policy check for a record already in `cur/`.
+ *
+ * This is the SAME bar the first-delivery path sets, reused so presentation,
+ * crash recovery and the lease sweep cannot diverge: the record must carry the
+ * `envelopeId` AND the signed `envelope` that `promote()` stamps (a self-asserted
+ * id is not proof — a forger sets it), the record must match the envelope per
+ * the binding table, and the envelope must verify through the shared policy
+ * (signature, wrapper->envelope from, recipient, messageId, timestamp).
+ *
+ * No side effects. Throws only when Flair is unreachable; callers decide (an
+ * outage withholds presentation and leaves recovery to retry).
+ */
+async function checkPromotedRecord(agent: string, record: MailMessage): Promise<EnvelopePolicyResult> {
+  // Provenance: only promote() stamps envelopeId + the signed envelope.
+  if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
+    return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
+  }
+  const env = record.envelope as Envelope | undefined;
+  if (!env || typeof env !== "object") {
+    return { ok: false, class: "unverified", reason: "record is missing its stored signed envelope" };
+  }
+  const binding = recordMatchesEnvelope(record, env);
+  if (!binding.ok) {
+    return { ok: false, class: "unverified", reason: `record does not match its verified envelope: ${binding.reason}` };
+  }
+  return decideEnvelopeForMailbox(agent, env, record.from);
+}
+
+/**
+ * May a `cur/` record's body be presented? True only when it proves promotion
+ * and re-verifies (see checkPromotedRecord). Any failure — including a Flair
+ * outage — withholds the body (fail-closed).
+ */
+export async function isPresentableCurRecord(agent: string, record: MailMessage): Promise<boolean> {
+  try {
+    return (await checkPromotedRecord(agent, record)).ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Re-verify a `cur/` record that is about to be RE-PRESENTED (crash recovery or
  * the lease sweep).
  *
@@ -977,38 +1019,17 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
     return { ok: false, class: "unverified", reason };
   }
 
-  // Provenance: only promote() stamps envelopeId. A cur/ record without it did
-  // not come through the enforcement point — never present it.
-  if (typeof msg.envelopeId !== "string" || msg.envelopeId.trim() === "") {
-    const reason = "cur/ record has no envelopeId (did not come through promotion)";
-    rejectToDlq(dirs, filename, curPath, "unverified", reason);
-    return { ok: false, class: "unverified", reason };
-  }
-
-  // Binding: the envelope stored at promote() time must still describe THIS
-  // record, field by field, via the ONE binding table (ENVELOPE_BINDINGS).
-  const env = msg.envelope as Envelope | undefined;
-  if (!env || typeof env !== "object") {
-    const reason = "cur/ record is missing its stored signed envelope";
-    rejectToDlq(dirs, filename, curPath, "unverified", reason);
-    return { ok: false, class: "unverified", reason };
-  }
-  const binding = recordMatchesEnvelope(msg, env);
-  if (!binding.ok) {
-    const reason = `cur/ record does not match its verified envelope: ${binding.reason}`;
-    rejectToDlq(dirs, filename, curPath, "unverified", reason);
-    return { ok: false, class: "unverified", reason };
-  }
-
-  // The SAME policy first delivery runs — recipient binding INCLUDED, so a
-  // record carrying another mailbox's genuine envelope cannot be presented
-  // here. The recovery-only extra (provenance) is above; the first-delivery
-  // extra (replay gate) is unnecessary: this id is already consumed.
-  const decision = await decideEnvelopeForMailbox(agent, env, msg.from);
+  // Provenance + binding + policy, via the ONE shared check — so a record that
+  // cannot prove promotion, or that does not re-verify, is not presented. This
+  // includes the recipient binding, so a record carrying another mailbox's
+  // genuine envelope cannot be presented here. (The first-delivery-only replay
+  // gate is unnecessary: this id is already consumed.)
+  const decision = await checkPromotedRecord(agent, msg);
   if (!decision.ok) {
     rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
     return { ok: false, class: decision.class, reason: decision.reason };
   }
+  const env = decision.envelope;
 
   // Present the fields from the VERIFIED envelope, not the mutable record.
   const presented: MailMessage = {
@@ -1105,17 +1126,18 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
   return messages.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }
 
-export function listMessages(agent: string): MailMessage[] {
+export async function listMessages(agent: string): Promise<MailMessage[]> {
   assertValidAgentId(agent);
   const inbox = getInbox(agent);
   const unread = readMessagesFromDir(inbox.fresh, false, "new");
   const cur = readMessagesFromDir(inbox.cur, true, "cur");
   const dlq = readMessagesFromDir(inbox.dlq, true, "dlq");
-  // Only a record that proves it came through promotion is presentable from
-  // cur/. A forged cur/ record (no envelopeId) is treated like new/ and dlq/:
-  // its body is withheld.
+  // Only a record that PROVES its promotion and re-verifies is presentable from
+  // cur/. A self-asserted `envelopeId` is not proof — a forger sets it — so the
+  // stored signed envelope is re-checked through the shared policy. Any failure
+  // (including an outage) withholds the body, like new/ and dlq/.
   for (const m of cur) {
-    if (typeof m.envelopeId !== "string" || m.envelopeId === "") m.body = "";
+    if (!(await isPresentableCurRecord(agent, m))) m.body = "";
   }
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }

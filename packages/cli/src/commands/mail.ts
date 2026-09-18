@@ -1,4 +1,4 @@
-import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
+import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -307,7 +307,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "list": {
       const agent = await resolveAgentId(args.agent);
-      let messages = listMessages(agent)
+      let messages = (await listMessages(agent))
         .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
       if (args.status && args.status !== "all") {
         messages = messages.filter((m) => {
@@ -409,9 +409,9 @@ export async function runMail(args: MailArgs): Promise<void> {
         console.error(`Message not found: ${id}`);
         process.exit(1);
       }
-      // A `cur/` record is only presentable with its promotion proof; without
-      // an `envelopeId` it is withheld exactly like `new/`.
-      const unverified = foundLoc === "new" || !found.envelopeId;
+      // A `cur/` record is only presentable with verified provenance; one that
+      // cannot prove (and re-verify) its promotion is withheld, exactly like new/.
+      const unverified = foundLoc === "new" || !(await isPresentableCurRecord(agent, found));
       if (args.json) {
         const out = unverified ? { ...found, body: "" } : found;
         console.log(JSON.stringify(out, null, 2));
