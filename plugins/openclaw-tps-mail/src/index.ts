@@ -672,7 +672,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // catch only runs on a thrown error, so a kill leaves orphans no other
         // sweep can see).
         try {
-          sweepStrandedPromoteScratch(resolve(account.mailDir, agentId, "tmp"));
+          await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
       } catch (err: any) {
         log?.warn?.(

@@ -6,6 +6,7 @@ import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
 import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { createMailVerifyClient } from "./mail-verify.js";
+import { acquireMailLock, type MailLock } from "./mail-lock.js";
 
 export interface MailMessage {
   id: string;
@@ -325,7 +326,8 @@ export type PromoteRejectClass =
   | "replay"
   | "verify-unavailable"
   | "storage-unavailable"
-  | "unverified";
+  | "unverified"
+  | "busy";
 
 /**
  * Reject classes a later check will re-drive. `verify-unavailable` (a Flair
@@ -337,6 +339,7 @@ export type PromoteRejectClass =
 const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set([
   "verify-unavailable",
   "storage-unavailable",
+  "busy",
 ]);
 
 export interface PromoteOk {
@@ -721,89 +724,123 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
     return { ok: false, class: decision.class, reason: decision.reason };
   }
 
-  // Step 3 (first-delivery only): replay — a re-planted consumed envelope must
-  // dead-letter. Consulted against the DURABLE ledger (and the maildir
-  // fallback), not cur/ alone.
-  if (isConsumedMessageId(dirs.root, envelope.messageId)) {
-    const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
-    rejectToDlq(dirs, filename, filePath, "replay", reason);
-    return { ok: false, class: "replay", reason };
-  }
-
-  // Step 6: atomic → cur/ with verified metadata.
-  //
-  // The promoted record is composed in a SCRATCH file FIRST, and the source is
-  // only removed once the promoted record is in cur/ AND the consumed id is
-  // durably recorded. A failure in this block is a STORAGE fault, NOT a
-  // verification verdict: the ORIGINAL bytes are never overwritten (a failed
-  // scratch write never touches the source), so we preserve them, class it
-  // RETRYABLE, and a later check re-drives it. The `envelope` is persisted so a
-  // later cur/ re-read can re-verify (see recoverPromoted).
-  const promoted: MailMessage = {
-    ...msg,
-    from: envelope.from,
-    to: envelope.to,
-    body: envelope.body,
-    timestamp: envelope.timestamp || msg.timestamp,
-    read: false,
-    envelopeId: envelope.messageId,
-    envelope,
-    checkedOutAt: new Date().toISOString(),
-    checkedOutBy: msg.checkedOutBy ?? agent,
-    deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
-  };
-  const curPath = join(dirs.cur, filename);
-  const scratchPath = join(dirs.tmp, `${filename}.promote`);
-  let movedToCur = false;
+  // Step 3: acquire the per-mailbox lock. It spans the replay check AND the
+  // promotion commit/rollback (the ledger prune and append included): two
+  // concurrent promotions must not both pass the replay gate before either
+  // records the id, and a prune must not lose a concurrent append. The network
+  // verification above deliberately ran BEFORE the lock.
+  let lock: MailLock | null;
   try {
-    mkdirSync(dirs.tmp, { recursive: true });
-    mkdirSync(dirs.cur, { recursive: true });
-    writeMessageFile(scratchPath, promoted);
-    // Atomic into cur/.
-    renameSync(scratchPath, curPath);
-    movedToCur = true;
-    // Record the consumed id durably as PART OF THE COMMIT. If this throws, the
-    // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
-    // promotion that can't be recorded must not silently succeed (its id would
-    // be replayable with no retry and no quarantine).
-    recordConsumedMessageId(dirs.root, envelope.messageId);
-    // Drop the source LAST, so a crash before here leaves the record in its
-    // original directory (re-promoted, and caught by the replay gate) rather
-    // than nowhere.
-    rmSync(filePath, { force: true });
+    lock = await acquireMailLock(dirs.root);
   } catch (err: any) {
-    // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
-    // non-file entry at the scratch path) is expected to persist so a later
-    // check can re-drive it; a transient one is cleared here and self-heals.
-    try {
-      rmSync(scratchPath, { force: true });
-    } catch {
-      /* fault persists — re-drivable */
-    }
-    if (movedToCur) {
-      // Roll the commit back so the source (still intact) is the single copy.
-      try {
-        rmSync(curPath, { force: true });
-      } catch {
-        /* best effort */
-      }
-    }
-    const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
-    rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
-    return { ok: false, class: "storage-unavailable", reason };
+    // Nested acquisition is a programming error, not a delivery decision.
+    return { ok: false, class: "busy", reason: `mail lock error: ${err?.message ?? String(err)}` };
+  }
+  if (!lock) {
+    // Could not acquire within the bound. Fail-closed: do NOT deliver; the
+    // source stays in place for the next check.
+    return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
   }
 
-  // Success: clear any stale sidecar from a prior quarantine (best-effort
-  // cleanup; cannot undo the promotion above).
   try {
-    const staleReason = join(dirs.dlq, `${filename}.reason`);
-    if (existsSync(staleReason)) rmSync(staleReason, { force: true });
-  } catch {
-    // best effort
-  }
+    // Revalidate the source under the lock: a concurrent checker may have
+    // promoted or replaced it between our verification and our acquisition.
+    let current: MailMessage;
+    try {
+      current = readMessageFile(filePath);
+    } catch {
+      return { ok: false, class: "busy", reason: "source became unreadable during promotion; retry" };
+    }
+    if (current.body !== msg.body || current.from !== msg.from || current.timestamp !== msg.timestamp) {
+      return { ok: false, class: "busy", reason: "source changed during promotion; retry" };
+    }
 
-  logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
-  return { ok: true, message: promoted, path: curPath };
+    // Step 4 (first-delivery only): replay — a re-planted consumed envelope must
+    // dead-letter. Consulted against the DURABLE ledger (and the maildir
+    // fallback), not cur/ alone. The ledger prune runs here, under the lock.
+    if (isConsumedMessageId(dirs.root, envelope.messageId)) {
+      const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+      rejectToDlq(dirs, filename, filePath, "replay", reason);
+      return { ok: false, class: "replay", reason };
+    }
+
+    // Step 5: atomic → cur/ with verified metadata.
+    //
+    // The promoted record is composed in a SCRATCH file FIRST, and the source is
+    // only removed once the promoted record is in cur/ AND the consumed id is
+    // durably recorded. A failure in this block is a STORAGE fault, NOT a
+    // verification verdict: the ORIGINAL bytes are never overwritten (a failed
+    // scratch write never touches the source), so we preserve them, class it
+    // RETRYABLE, and a later check re-drives it. The `envelope` is persisted so a
+    // later cur/ re-read can re-verify (see recoverPromoted).
+    const promoted: MailMessage = {
+      ...msg,
+      from: envelope.from,
+      to: envelope.to,
+      body: envelope.body,
+      timestamp: envelope.timestamp,
+      read: false,
+      envelopeId: envelope.messageId,
+      envelope,
+      checkedOutAt: new Date().toISOString(),
+      checkedOutBy: msg.checkedOutBy ?? agent,
+      deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
+    };
+    const curPath = join(dirs.cur, filename);
+    const scratchPath = join(dirs.tmp, `${filename}.promote`);
+    let movedToCur = false;
+    try {
+      mkdirSync(dirs.tmp, { recursive: true });
+      mkdirSync(dirs.cur, { recursive: true });
+      writeMessageFile(scratchPath, promoted);
+      // Atomic into cur/.
+      renameSync(scratchPath, curPath);
+      movedToCur = true;
+      // Record the consumed id durably as PART OF THE COMMIT. If this throws, the
+      // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
+      // promotion that can't be recorded must not silently succeed (its id would
+      // be replayable with no retry and no quarantine).
+      recordConsumedMessageId(dirs.root, envelope.messageId);
+      // Drop the source LAST, so a crash before here leaves the record in its
+      // original directory (re-promoted, and caught by the replay gate) rather
+      // than nowhere.
+      rmSync(filePath, { force: true });
+    } catch (err: any) {
+      // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
+      // non-file entry at the scratch path) is expected to persist so a later
+      // check can re-drive it; a transient one is cleared here and self-heals.
+      try {
+        rmSync(scratchPath, { force: true });
+      } catch {
+        /* fault persists — re-drivable */
+      }
+      if (movedToCur) {
+        // Roll the commit back so the source (still intact) is the single copy.
+        try {
+          rmSync(curPath, { force: true });
+        } catch {
+          /* best effort */
+        }
+      }
+      const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
+      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+      return { ok: false, class: "storage-unavailable", reason };
+    }
+
+    // Success: clear any stale sidecar from a prior quarantine (best-effort
+    // cleanup; cannot undo the promotion above).
+    try {
+      const staleReason = join(dirs.dlq, `${filename}.reason`);
+      if (existsSync(staleReason)) rmSync(staleReason, { force: true });
+    } catch {
+      // best effort
+    }
+
+    logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
+    return { ok: true, message: promoted, path: curPath };
+  } finally {
+    lock.release();
+  }
 }
 
 /**
@@ -816,19 +853,36 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
  * cur/ deletes the scratch, so any surviving scratch is either incomplete or
  * still has its untouched source, which a later check re-promotes.
  */
-export function sweepStrandedPromoteScratch(tmpDir: string): number {
+export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
+  const tmpDir = join(root, "tmp");
   if (!existsSync(tmpDir)) return 0;
-  let removed = 0;
-  for (const name of readdirSync(tmpDir)) {
-    if (!name.endsWith(".promote")) continue;
-    try {
-      rmSync(join(tmpDir, name), { force: true, recursive: true });
-      removed++;
-    } catch {
-      /* best effort — retried on the next sweep */
-    }
+  // Coordinate with in-flight promotions: hold the SAME lock promote() holds, so
+  // a scratch being composed right now cannot be eaten (an age guard is cleanup
+  // policy, not the safety property — a paused promoter outlives any threshold,
+  // and stat-then-delete still races with replacement of the same pathname). If
+  // the lock is busy, a promoter is active, so nothing is stranded: skip.
+  let lock: MailLock | null;
+  try {
+    lock = await acquireMailLock(root, { timeoutMs: 250 });
+  } catch {
+    return 0;
   }
-  return removed;
+  if (!lock) return 0;
+  try {
+    let removed = 0;
+    for (const name of readdirSync(tmpDir)) {
+      if (!name.endsWith(".promote")) continue;
+      try {
+        rmSync(join(tmpDir, name), { force: true, recursive: true });
+        removed++;
+      } catch {
+        /* best effort — retried on the next sweep */
+      }
+    }
+    return removed;
+  } finally {
+    lock.release();
+  }
 }
 
 /**
@@ -933,7 +987,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
   // catch only runs on a thrown error, so a kill leaves orphans no other sweep
   // can see.
   try {
-    sweepStrandedPromoteScratch(inbox.tmp);
+    await sweepStrandedPromoteScratch(inbox.root);
   } catch {
     /* best effort */
   }

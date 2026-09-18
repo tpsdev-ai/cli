@@ -13,7 +13,8 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { sendMessage, checkMessages, getInbox, ackMessage } from "../src/utils/mail.js";
+import { sendMessage, checkMessages, getInbox, ackMessage, promote } from "../src/utils/mail.js";
+import { spawnSync } from "node:child_process";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
@@ -63,6 +64,13 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
           .filter((e) => e.isFile() && e.name.endsWith(".json"))
           .map((e) => e.name)
       : [];
+  }
+  /** Plant a lock directory with a given owner (bypassing acquireMailLock). */
+  function plantLock(root: string, pid: number, startToken: string | null): string {
+    const dir = join(root, ".mail-lock");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "owner.json"), JSON.stringify({ pid, startToken }), "utf-8");
+    return dir;
   }
   function reasonFor(mailDir: string, agent: string, filename: string): string | null {
     try {
@@ -426,5 +434,72 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const msgs = await checkMessages("sherlock");
     expect(msgs.length).toBe(0); // never presented to the wrong mailbox
     expect(reasonFor(process.env.TPS_MAIL_DIR!, "sherlock", "planted.json")).toContain("class: wrong-recipient");
+  });
+
+  // ── Lock: bounded, fail-closed, crash-recoverable, no duplicate delivery ──
+  test("a held mailbox lock prevents delivery (fail-closed), then clears", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "locked", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+
+    // A live owner (this process) holds the lock → promote must NOT deliver.
+    const lockDir = plantLock(inbox.root, process.pid, null);
+    const during = await checkMessages("kern");
+    expect(during.length).toBe(0);
+    expect(jsonFiles(inbox.fresh).length).toBe(1); // source left in place
+    expect(jsonFiles(inbox.cur).length).toBe(0);
+
+    rmSync(lockDir, { recursive: true, force: true });
+    const after = await checkMessages("kern");
+    expect(after.length).toBe(1);
+    expect(after[0]!.body).toBe("locked");
+  });
+
+  test("two concurrent promotions of the same envelope deliver exactly once", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "once", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+    const [file] = jsonFiles(inbox.fresh);
+    const path = join(inbox.fresh, file!);
+
+    const results = await Promise.all([promote("kern", path), promote("kern", path)]);
+    expect(results.filter((r) => r.ok).length).toBe(1);
+    expect(jsonFiles(inbox.cur).length).toBe(1);
+    const ledger = readFileSync(join(inbox.root, "consumed.jsonl"), "utf-8")
+      .split("\n")
+      .filter(Boolean);
+    expect(ledger.filter((l) => l.includes(env.messageId)).length).toBe(1);
+  });
+
+  test("a lock whose owner is provably gone is broken and promotion proceeds", async () => {
+    const env = buildSignedEnvelope("flint", "kern", "recovered-lock", { flint: FLINT_SEED });
+    sendMessage("kern", JSON.stringify(env), "flint");
+    const inbox = getInbox("kern");
+
+    // A provably-dead owner: an exited child's pid, with a start token that
+    // cannot match, so a reused pid still classifies as dead.
+    const deadPid = spawnSync("true").pid ?? 2147483000;
+    const lockDir = plantLock(inbox.root, deadPid, "stale-start-token");
+    const msgs = await checkMessages("kern");
+    expect(msgs.length).toBe(1);
+    expect(msgs[0]!.body).toBe("recovered-lock");
+    expect(existsSync(lockDir)).toBe(false);
+  });
+
+  test("the scratch reaper will not eat scratch while a promoter holds the lock", async () => {
+    const inbox = getInbox("kern");
+    mkdirSync(inbox.tmp, { recursive: true });
+    const orphan = join(inbox.tmp, "9999-live.json.promote");
+    writeFileSync(orphan, '{"half":', "utf-8");
+
+    // A live owner holds the lock → the sweep must skip (the scratch could be
+    // in flight), not delete it.
+    const lockDir = plantLock(inbox.root, process.pid, null);
+    await checkMessages("kern");
+    expect(existsSync(orphan)).toBe(true);
+
+    rmSync(lockDir, { recursive: true, force: true });
+    await checkMessages("kern");
+    expect(existsSync(orphan)).toBe(false);
   });
 });
