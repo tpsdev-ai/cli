@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
 import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
-import { createMailVerifyClient } from "./mail-verify.js";
+import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
 
 export interface MailMessage {
@@ -702,9 +702,10 @@ async function decideEnvelopeForMailbox(
   agent: string,
   envelope: Envelope,
   wrapperFrom: string,
+  verify: MailVerifyConfig = {},
 ): Promise<EnvelopePolicyResult> {
   // 1. Signature, through an ALWAYS-constructed client.
-  const client = await createMailVerifyClient(agent);
+  const client = await createMailVerifyClient(agent, verify);
   const verified = await verifyEnvelope(envelope, client);
   if (!verified.ok) {
     // 1a. Topology, not forgery. `verifyEnvelope` resolves every agent-kind
@@ -785,7 +786,7 @@ async function decideEnvelopeForMailbox(
  *
  * Deliberately does NOT retro-verify cur/ or the archive.
  */
-export async function promote(agent: string, filePath: string): Promise<PromoteResult> {
+export async function promote(agent: string, filePath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(filePath);
   const filename = filePath.split("/").pop()!;
@@ -819,7 +820,7 @@ export async function promote(agent: string, filePath: string): Promise<PromoteR
   // recoverPromoted runs, so the two paths cannot diverge.
   let decision: EnvelopePolicyResult;
   try {
-    decision = await decideEnvelopeForMailbox(agent, envelope, msg.from);
+    decision = await decideEnvelopeForMailbox(agent, envelope, msg.from, verify);
   } catch (err: any) {
     // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
     // later check re-drive it, so an outage self-heals when Flair returns.
@@ -1008,7 +1009,7 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
  * No side effects. Throws only when Flair is unreachable; callers decide (an
  * outage withholds presentation and leaves recovery to retry).
  */
-async function checkPromotedRecord(agent: string, record: MailMessage): Promise<EnvelopePolicyResult> {
+async function checkPromotedRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<EnvelopePolicyResult> {
   // Provenance: only promote() stamps envelopeId + the signed envelope.
   if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
     return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
@@ -1021,7 +1022,7 @@ async function checkPromotedRecord(agent: string, record: MailMessage): Promise<
   if (!binding.ok) {
     return { ok: false, class: "unverified", reason: `record does not match its verified envelope: ${binding.reason}` };
   }
-  return decideEnvelopeForMailbox(agent, env, record.from);
+  return decideEnvelopeForMailbox(agent, env, record.from, verify);
 }
 
 /**
@@ -1029,9 +1030,9 @@ async function checkPromotedRecord(agent: string, record: MailMessage): Promise<
  * and re-verifies (see checkPromotedRecord). Any failure — including a Flair
  * outage — withholds the body (fail-closed).
  */
-export async function isPresentableCurRecord(agent: string, record: MailMessage): Promise<boolean> {
+export async function isPresentableCurRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<boolean> {
   try {
-    return (await checkPromotedRecord(agent, record)).ok;
+    return (await checkPromotedRecord(agent, record, verify)).ok;
   } catch {
     return false;
   }
@@ -1053,7 +1054,7 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage)
  * Throws only when Flair is unreachable — the caller should leave the record in
  * `cur/` and retry later (a transient outage is not a verdict about the mail).
  */
-export async function recoverPromoted(agent: string, curPath: string): Promise<PromoteResult> {
+export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
   const filename = curPath.split("/").pop()!;
@@ -1072,7 +1073,7 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
   // includes the recipient binding, so a record carrying another mailbox's
   // genuine envelope cannot be presented here. (The first-delivery-only replay
   // gate is unnecessary: this id is already consumed.)
-  const decision = await checkPromotedRecord(agent, msg);
+  const decision = await checkPromotedRecord(agent, msg, verify);
   if (!decision.ok) {
     rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
     return { ok: false, class: decision.class, reason: decision.reason };
@@ -1099,7 +1100,7 @@ export async function recoverPromoted(agent: string, curPath: string): Promise<P
  *
  * Verification is mandatory — there is NO client parameter.
  */
-export async function checkMessages(agent: string, checkedOutBy = agent): Promise<MailMessage[]> {
+export async function checkMessages(agent: string, checkedOutBy = agent, verify: MailVerifyConfig = {}): Promise<MailMessage[]> {
   assertValidAgentId(agent);
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
@@ -1131,7 +1132,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
 
   // 1. Promote new/ → cur/ through the single enforcement point.
   for (const f of listMessageFiles(inbox.fresh)) {
-    const result = await promote(agent, join(inbox.fresh, f));
+    const result = await promote(agent, join(inbox.fresh, f), verify);
     if (result.ok) messages.push(result.message);
   }
 
@@ -1141,7 +1142,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
   for (const f of listMessageFiles(inbox.dlq)) {
     const side = readReasonSidecar(inbox.dlq, f);
     if (!side || !RETRYABLE_REJECT_CLASSES.has(side.cls)) continue;
-    const result = await promote(agent, join(inbox.dlq, f));
+    const result = await promote(agent, join(inbox.dlq, f), verify);
     if (result.ok) messages.push(result.message);
   }
 
@@ -1159,7 +1160,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent): Promis
     if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
     let recovered: PromoteResult;
     try {
-      recovered = await recoverPromoted(agent, full);
+      recovered = await recoverPromoted(agent, full, verify);
     } catch {
       // Flair unreachable — leave the record in cur/ and retry on a later check.
       continue;

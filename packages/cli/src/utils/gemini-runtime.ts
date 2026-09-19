@@ -5,17 +5,16 @@
 
 import { spawn } from "node:child_process";
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, writeFileSync, appendFileSync, createWriteStream,
+  readFileSync, existsSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk, bootContext, searchPastExperience,
   catchUpTopics, onBoot, onTaskStart, onTaskComplete, onTaskFailure,
 } from "./agent-lifecycle.js";
+import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
 
@@ -41,40 +40,6 @@ export interface GeminiConfig {
 }
 
 interface MailMessage { id: string; from: string; to: string; body: string; timestamp: string; }
-
-function getMailPaths(mailDir: string, agentId: string) {
-  const base = join(mailDir, agentId);
-  const fresh = join(base, "new");
-  const cur = join(base, "cur");
-  const tmp = join(base, "tmp");
-  const outbox = join(base, "outbox");
-  for (const d of [fresh, cur, tmp, outbox]) mkdirSync(d, { recursive: true });
-  return { fresh, cur, tmp, outbox };
-}
-
-function checkNewMail(mailDir: string, agentId: string): MailMessage[] {
-  const { fresh, cur } = getMailPaths(mailDir, agentId);
-  const files = readdirSync(fresh).filter(f => f.endsWith(".json") && !f.startsWith("."));
-  const messages: MailMessage[] = [];
-  for (const file of files) {
-    try {
-      const msg = JSON.parse(readFileSync(join(fresh, file), "utf-8")) as MailMessage;
-      renameSync(join(fresh, file), join(cur, file));
-      messages.push(msg);
-    } catch {}
-  }
-  return messages;
-}
-
-function sendMail(mailDir: string, from: string, to: string, body: string): void {
-  const { fresh, tmp } = getMailPaths(mailDir, to);
-  const id = randomUUID();
-  const ts = new Date().toISOString();
-  const filename = `${ts.replace(/[:.]/g, "-")}-${id}.json`;
-  const msg: MailMessage = { id, from, to, body, timestamp: ts };
-  writeFileSync(join(tmp, filename), JSON.stringify(msg, null, 2));
-  renameSync(join(tmp, filename), join(fresh, filename));
-}
 
 function getFallbackSoulPath(agentId: string): string {
   return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
@@ -177,33 +142,48 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
 }
 
 export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
-  const { agentId, mailDir, workspaceProvider, flairUrl, flairKeyPath, pollIntervalMs = 5000, taskTimeoutMs = 30 * 60 * 1000 } = config;
-  slog(`Gemini runtime started. Polling ${mailDir}/${agentId}/new`);
+  const { agentId, workspaceProvider, flairUrl, flairKeyPath, pollIntervalMs = 5000, taskTimeoutMs = 30 * 60 * 1000 } = config;
+  slog(`Gemini runtime started. Polling the ${agentId} mailbox`);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath };
 
-  // Boot lifecycle — skip Flair snapshot on first boot (agent may not be registered)
-  slog("Boot: skipping Flair snapshot (use disk fallback)");
+  // Boot preflight — one Flair check, LOUD on failure. Reachability is
+  // necessary but not sufficient (bad credentials still reject terminal).
+  await runtimeBootPreflight(flair, agentId);
 
   let lastSnapshot = Date.now();
 
   while (true) {
-    for (const msg of checkNewMail(mailDir, agentId)) {
+    for (const msg of await pollRuntimeMail(mailCfg)) {
       slog(`Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
       try {
         let preState: import("./workspace-provider.js").WorkspaceState | undefined;
         if (workspaceProvider) preState = await onTaskStart(workspaceProvider, flair, msg.id).catch(() => undefined);
         const result = await runGemini(msg, config, taskTimeoutMs);
         slog(`Task complete. Result: ${result.length} chars`);
-        sendMail(mailDir, agentId, msg.from, result);
+        try {
+          sendRuntimeMail(mailCfg, msg.from, result);
+        } catch (replyErr: unknown) {
+          // The task RAN. Re-running it to retry the reply would duplicate its
+          // side effects, so the completion boundary still closes (ack below)
+          // and the reply failure is reported loudly rather than silently.
+          serror(`Reply could not be signed/sent for ${msg.id}: ${(replyErr as Error).message}`);
+        }
         if (workspaceProvider && preState) await onTaskComplete(workspaceProvider, flair, msg.id, preState, result).catch(() => {});
       } catch (err: unknown) {
         serror(`Task failed: ${(err as Error).message}`);
-        sendMail(mailDir, agentId, msg.from, `Error: ${(err as Error).message}`);
+        try { sendRuntimeMail(mailCfg, msg.from, `Error: ${(err as Error).message}`); } catch { /* best effort */ }
         if (workspaceProvider) {
           const preState = await onTaskStart(workspaceProvider, flair, msg.id).catch(() => undefined);
           if (preState) await onTaskFailure(workspaceProvider, flair, msg.id, preState, (err as Error).message).catch(() => {});
         }
+      } finally {
+        // Completion boundary end: the reply is persisted (or its failure
+        // logged) and the lifecycle hooks are done. Acking here is what stops
+        // cli#377's lease sweep re-presenting — and re-dispatching — a finished
+        // task every LEASE_TIMEOUT_MS forever.
+        completeRuntimeMail(mailCfg, msg.id);
       }
     }
     if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS) {

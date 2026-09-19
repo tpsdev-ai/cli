@@ -40,6 +40,18 @@ export function readAgentPrivateKey(agentName: string): Buffer | null {
 }
 
 /**
+ * Read an Ed25519 private key from an EXPLICIT path, normalized to the 32-byte
+ * seed. The agent runtimes are configured with `flairKeyPath` (which need not be
+ * `~/.flair/keys/<agent>.key`), so outbound signing must honor it rather than
+ * silently resolving a different key than the runtime authenticates with.
+ * Returns null if the file does not exist; throws on an unrecognized format.
+ */
+export function readPrivateKeyAtPath(path: string): Buffer | null {
+  if (!existsSync(path)) return null;
+  return toEd25519Seed(readFileSync(path));
+}
+
+/**
  * Normalize a stored Ed25519 private key to its raw 32-byte seed.
  * Exported for unit tests.
  */

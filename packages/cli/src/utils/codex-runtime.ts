@@ -6,12 +6,10 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, writeFileSync, appendFileSync, createWriteStream,
+  readFileSync, existsSync, writeFileSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
@@ -32,6 +30,7 @@ import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js"
 import { startTaskLoop } from "./flair-task-loop.js";
 import { handlePrOpened } from "./pr-review-trigger.js";
 import { formatTaskCompleteMailBody } from "./task-result-mail.js";
+import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 
 /** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
 const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
@@ -127,45 +126,6 @@ interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
-}
-
-function getMailPaths(mailDir: string, agentId: string) {
-  const root = join(mailDir, agentId);
-  const fresh = join(root, "new");
-  const cur = join(root, "cur");
-  const tmp = join(root, "tmp");
-  const outbox = join(root, "outbox");
-  for (const d of [fresh, cur, tmp, outbox]) mkdirSync(d, { recursive: true });
-  return { fresh, cur, tmp, outbox };
-}
-
-function checkNewMail(mailDir: string, agentId: string): MailMessage[] {
-  const { fresh, cur } = getMailPaths(mailDir, agentId);
-  const files = readdirSync(fresh).filter(f => f.endsWith(".json") && !f.startsWith("."));
-  const messages: MailMessage[] = [];
-  for (const file of files) {
-    const src = join(fresh, file);
-    const dst = join(cur, file);
-    try {
-      const msg = JSON.parse(readFileSync(src, "utf-8")) as MailMessage;
-      renameSync(src, dst);
-      messages.push(msg);
-    } catch {}
-  }
-  return messages;
-}
-
-function sendMail(mailDir: string, from: string, to: string, body: string): void {
-  const { fresh: recipientFresh, tmp: recipientTmp } = getMailPaths(mailDir, to);
-  const id = randomUUID();
-  const ts = new Date().toISOString();
-  const safeTs = ts.replace(/[:.]/g, "-");
-  const filename = `${safeTs}-${id}.json`;
-  const msg: MailMessage = { id, from, to, body, timestamp: ts };
-  const tmpPath = join(recipientTmp, filename);
-  const newPath = join(recipientFresh, filename);
-  writeFileSync(tmpPath, JSON.stringify(msg, null, 2), "utf-8");
-  renameSync(tmpPath, newPath);
 }
 
 export function composeSystemPrompt(
@@ -326,8 +286,12 @@ export interface AutoCommitOptions {
   prTitle?: string;
   prBody?: string;
   reviewNotify?: string[];
-  /** Mail directory for reviewer notifications (required for reviewNotify) */
-  mailDir?: string;
+  /**
+   * Runtime mail identity used to SIGN reviewer notifications (cli#380 defect 8).
+   * `sendMessage()` alone ships an unsigned body, which a promote()-reading
+   * recipient dead-letters; reviewer notifications go through the signed path.
+   */
+  signCfg?: RuntimeMailConfig;
 }
 
 export interface AutoCommitDeps {
@@ -434,7 +398,6 @@ function openPullRequest(
     ghAgent,
     prTitle,
     prBody,
-    authorName,
   } = options;
 
   return (async () => {
@@ -460,11 +423,11 @@ function openPullRequest(
     if ((prResult.status ?? 1) === 0) {
       const prUrl = prStdout2.trim();
       const prNumber = prUrl.match(/\/pull\/(\d+)/)?.[1] ?? "?";
-      if (options.reviewNotify?.length && options.mailDir) {
+      if (options.reviewNotify?.length && options.signCfg) {
         for (const reviewer of options.reviewNotify) {
           try {
-            const { sendMessage } = await import("../utils/mail.js");
-            sendMessage(reviewer, `PR #${prNumber} for review: ${prUrl}`, authorName.toLowerCase());
+            const { sendRuntimeMail } = await import("./runtime-mail.js");
+            sendRuntimeMail(options.signCfg, reviewer, `PR #${prNumber} for review: ${prUrl}`);
             console.log(`[autoCommit] Notified reviewer: ${reviewer} (PR #${prNumber})`);
           } catch (notifyErr: any) {
             console.warn(`[autoCommit] Failed to notify ${reviewer}: ${notifyErr.message}`);
@@ -601,7 +564,7 @@ async function _runAutoCommitLegacy(
   flair: AutoCommitFlair,
   taskSubject?: string,
   taskBody?: string,
-  mailDir?: string,
+  mailCfg?: RuntimeMailConfig,
 ): Promise<string | null> {
   const branchPrefix = cfg.branchPrefix ?? "task/";
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
@@ -631,7 +594,7 @@ async function _runAutoCommitLegacy(
         prTitle: cfg.prTitle ?? taskSubject ?? `task: ${taskId}`,
         prBody: taskBody ? taskBody.split('\n\n')[0].slice(0, 500) : undefined,
         reviewNotify: cfg.reviewNotify,
-        mailDir: mailDir,
+        signCfg: mailCfg,
       },
       { tpsCommand },
     );
@@ -647,13 +610,22 @@ async function _runAutoCommitLegacy(
 
 
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
-  const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
+  const { agentId, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
-  console.log(`[${agentId}] Codex runtime started. Polling ${mailDir}/${agentId}/new`);
+  console.log(`[${agentId}] Codex runtime started. Polling the ${agentId} mailbox`);
 
   await ensureFreshOpenAIToken(agentId);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath };
+
+  // All runtime outbound mail goes through the SIGNED path; a send failure must
+  // not abort a task that otherwise completed (the completion boundary closes
+  // regardless — see completeRuntimeMail below).
+  const notify = (to: string, body: string) => {
+    try { sendRuntimeMail(mailCfg, to, body); }
+    catch (e: any) { console.warn(`[${agentId}] outbound mail to ${to} failed: ${e.message}`); }
+  };
 
   // Mark offline on clean shutdown
   const markOffline = () => {
@@ -662,13 +634,12 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   process.once("SIGINT", () => { markOffline(); process.exit(0); });
   process.once("SIGTERM", () => { markOffline(); process.exit(0); });
 
-  const flairOnline = await flair.ping();
+  const flairOnline = await runtimeBootPreflight(flair, agentId);
   if (flairOnline) {
-    console.log(`[${agentId}] Flair online — snapshotting soul to disk`);
     await snapshotSoulToDisk(flair, agentId);
   } else {
     const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
-    console.warn(`[${agentId}] ⚠️  Flair offline. Fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
+    console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
   }
 
   try {
@@ -713,12 +684,12 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       }};
       const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
         flairPublisher: flairPub1,
-        onStall: () => { sendMail(mailDir, agentId, event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+        onStall: () => { notify(event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
       });
       const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
       console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
       if (shouldSendTaskCompletion(event.authorId, config.autoCommit?.reviewNotify)) {
-        sendMail(mailDir, agentId, event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
+        notify(event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
       }
       try {
         await (flair as any).request("POST", "/OrgEvent", {
@@ -738,7 +709,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, config.mailDir);
+        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
         if (branchRef && config.autoCommit.push) {
           try {
             await (flair as any).request("POST", "/OrgEvent", {
@@ -752,7 +723,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     } catch (e) {
       const err = e as Error;
       console.error(`[${agentId}] Flair task failed:`, err.message);
-      sendMail(mailDir, agentId, event.authorId, `Task failed (via Flair): ${err.message}`);
+      notify(event.authorId, `Task failed (via Flair): ${err.message}`);
       await publishTaskOutcomeEvent(flair, agentId, {
         kind: "task.failed",
         summary: `Task ${taskId} failed: ${err.message.slice(0, 200)}`,
@@ -801,7 +772,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       lastHeartbeat = Date.now();
     }
 
-    for (const msg of checkNewMail(mailDir, agentId)) {
+    for (const msg of await pollRuntimeMail(mailCfg)) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
       let preTaskState;
       if (workspaceProvider) {
@@ -816,12 +787,12 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
         const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
           flairPublisher: flairPub2,
-          onStall: () => { sendMail(mailDir, agentId, msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+          onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
         });
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
         console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
         if (shouldSendTaskCompletion(msg.from, config.autoCommit?.reviewNotify)) {
-          sendMail(mailDir, agentId, msg.from, formatTaskCompleteMailBody(summary));
+          notify(msg.from, formatTaskCompleteMailBody(summary));
         }
         await publishTaskOutcomeEvent(flair, agentId, {
           kind: "task.completed",
@@ -870,17 +841,17 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
           if (!hasChanges) {
             console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
-            sendMail(mailDir, agentId, msg.from,
+            notify(msg.from,
               `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
             );
           } else {
             const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-            await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, config.mailDir);
+            await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
           }
         }
       } catch (err: any) {
         console.error(`[${agentId}] Task failed:`, err.message);
-        sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+        notify(msg.from, `Task failed: ${err.message}`);
         await publishTaskOutcomeEvent(flair, agentId, {
           kind: "task.failed",
           summary: `Task ${msg.id} failed: ${String(err.message ?? err).slice(0, 200)}`,
@@ -891,6 +862,12 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         } else {
           await writeTaskMemory(flair, agentId, "failure", { task: msg.body, error: err.message });
         }
+      } finally {
+        // Completion boundary end — AFTER the reply is persisted and the
+        // auto-commit (above, which reads the newest cur/ body for its scope
+        // guard) has finished. Acking here is what stops cli#377's lease sweep
+        // re-presenting — and re-dispatching — a finished task forever.
+        completeRuntimeMail(mailCfg, msg.id);
       }
     }
 

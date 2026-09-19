@@ -32,12 +32,10 @@
 
 import { spawn } from "node:child_process";
 import {
-  readFileSync, existsSync, mkdirSync, readdirSync,
-  renameSync, writeFileSync, appendFileSync, createWriteStream,
+  existsSync, writeFileSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
@@ -50,6 +48,7 @@ import {
   onTaskComplete,
   onTaskFailure,
 } from "./agent-lifecycle.js";
+import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:agent");
@@ -87,47 +86,6 @@ interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
-}
-
-// ─── Mail helpers ───────────────────────────────────────────────────────────
-
-function getMailPaths(mailDir: string, agentId: string) {
-  const root = join(mailDir, agentId);
-  const fresh = join(root, "new");
-  const cur = join(root, "cur");
-  const tmp = join(root, "tmp");
-  const outbox = join(root, "outbox");
-  for (const d of [fresh, cur, tmp, outbox]) mkdirSync(d, { recursive: true });
-  return { fresh, cur, tmp, outbox };
-}
-
-function checkNewMail(mailDir: string, agentId: string): MailMessage[] {
-  const { fresh, cur } = getMailPaths(mailDir, agentId);
-  const files = readdirSync(fresh).filter(f => f.endsWith(".json") && !f.startsWith("."));
-  const messages: MailMessage[] = [];
-  for (const file of files) {
-    const src = join(fresh, file);
-    const dst = join(cur, file);
-    try {
-      const msg = JSON.parse(readFileSync(src, "utf-8")) as MailMessage;
-      renameSync(src, dst);
-      messages.push(msg);
-    } catch {}
-  }
-  return messages;
-}
-
-function sendMail(mailDir: string, from: string, to: string, body: string): void {
-  const { fresh: recipientFresh, tmp: recipientTmp } = getMailPaths(mailDir, to);
-  const id = randomUUID();
-  const ts = new Date().toISOString();
-  const safeTs = ts.replace(/[:.]/g, "-");
-  const filename = `${safeTs}-${id}.json`;
-  const msg: MailMessage = { id, from, to, body, timestamp: ts };
-  const tmpPath = join(recipientTmp, filename);
-  const newPath = join(recipientFresh, filename);
-  writeFileSync(tmpPath, JSON.stringify(msg, null, 2), "utf-8");
-  renameSync(tmpPath, newPath);
 }
 
 // ─── System prompt (delegates to agent-lifecycle) ────────────────────────────
@@ -274,24 +232,24 @@ async function runClaudeCode(
 // ─── Main loop ───────────────────────────────────────────────────────────────
 
 export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<void> {
-  const { agentId, mailDir, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
+  const { agentId, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
 
   // Write PID file
   const pidPath = join(workspace, ".tps-agent.pid");
   writeFileSync(pidPath, `${process.pid}\n`, "utf-8");
 
-  slog(`[${agentId}] Claude Code runtime started. Polling ${mailDir}/${agentId}/new`);
+  slog(`[${agentId}] Claude Code runtime started. Polling the ${agentId} mailbox`);
 
   const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath };
 
-  // Initial Flair health check + snapshot
-  const flairOnline = await flair.ping();
+  // Boot preflight — one Flair check, LOUD on failure; snapshot the soul when up.
+  const flairOnline = await runtimeBootPreflight(flair, agentId);
   if (flairOnline) {
-    slog(`[${agentId}] Flair online — snapshotting soul to disk`);
     await snapshotSoulToDisk(flair, agentId);
   } else {
     const fallback = getFallbackSoulPath(agentId);
-    swarn(`[${agentId}] ⚠️  Flair offline at startup. Fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
+    swarn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE — will fail on first task"}`);
   }
 
   // Boot: catch up on any topic messages missed while offline
@@ -339,7 +297,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
       }
     }
 
-    const messages = checkNewMail(mailDir, agentId);
+    const messages = await pollRuntimeMail(mailCfg);
 
     for (const msg of messages) {
       slog(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
@@ -359,7 +317,13 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         const result = await runClaudeCode(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000);
         slog(`[${agentId}] Task complete. Result length: ${result.length}`);
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
-        sendMail(mailDir, agentId, msg.from, `Task complete:\n\n${summary}`);
+        try {
+          sendRuntimeMail(mailCfg, msg.from, `Task complete:\n\n${summary}`);
+        } catch (replyErr: any) {
+          // The task RAN; re-running to retry the reply would duplicate side
+          // effects, so close the boundary (ack below) and report loudly.
+          serror(`[${agentId}] Reply could not be signed/sent for ${taskId}: ${replyErr.message}`);
+        }
 
         // Task complete: checkpoint + structured memory via lifecycle hook (OPS-47 Phase 2)
         if (workspaceProvider && preTaskState) {
@@ -379,11 +343,13 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
         // Hard fail: no system prompt available → notify supervisor
         if (err.message.startsWith("No system prompt available")) {
           serror(`[${agentId}] FATAL: ${err.message}`);
-          sendMail(mailDir, agentId, config.supervisorId ?? msg.from,
-            `Agent ${agentId} cannot start task: ${err.message}`);
+          try {
+            sendRuntimeMail(mailCfg, config.supervisorId ?? msg.from,
+              `Agent ${agentId} cannot start task: ${err.message}`);
+          } catch { /* best effort */ }
         } else {
           serror(`[${agentId}] Task failed:`, err.message);
-          sendMail(mailDir, agentId, msg.from, `Task failed: ${err.message}`);
+          try { sendRuntimeMail(mailCfg, msg.from, `Task failed: ${err.message}`); } catch { /* best effort */ }
 
           // Task failure: checkpoint + failure record via lifecycle hook (OPS-47 Phase 2)
           if (workspaceProvider && preTaskState) {
@@ -399,6 +365,10 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
             });
           }
         }
+      } finally {
+        // Completion boundary end — ack so cli#377's lease sweep cannot
+        // re-present (and re-dispatch) this finished task forever.
+        completeRuntimeMail(mailCfg, taskId);
       }
     }
 
