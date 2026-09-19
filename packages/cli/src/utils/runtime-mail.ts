@@ -86,7 +86,10 @@ export function sendRuntimeMail(cfg: RuntimeMailConfig, to: string, body: string
  * leaves the record to be re-presented (and the task re-run) every lease period
  * forever.
  *
- * Acking removes the `cur/` record; the audit trail is in `log/`.
+ * Acking removes the `cur/` record; nothing records the ack itself (the
+ * mailbox archive has no ack event and does not bind a row to the record's
+ * verification verdict or envelopeId), so re-presentation — not an audit trail
+ * — is what ack prevents.
  */
 export function completeRuntimeMail(cfg: RuntimeMailConfig, id: string): void {
   const acked = ackMessage(cfg.agentId, id);

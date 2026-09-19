@@ -1206,7 +1206,15 @@ export function ackMessage(agent: string, id: string): MailMessage | null {
   delete msg.checkedOutBy;
   delete msg.retryAfter;
   writeMessageFile(path, msg);
-  // Remove the file from cur/ now that it's acked — audit trail is in log/
+  // Remove the file from cur/ now that it's acked. There is NO ack audit trail
+  // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
+  // whose event set is only "sent" | "read" | "listed" — there is no "ack"
+  // event — and `logEvent` swallows every error. An ack is therefore not
+  // recorded anywhere, and nothing binds an archive row to the record's
+  // verification verdict or `envelopeId`. (Logging an event before the unlink
+  // would be better, but it would not be an ack trail without an ack event type
+  // and that binding — so the comment says what is true rather than claiming a
+  // trail we do not have.)
   try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
   return msg;
 }

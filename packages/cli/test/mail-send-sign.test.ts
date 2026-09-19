@@ -16,6 +16,7 @@ import {
   type Envelope,
   type ChainEntry,
 } from "@tpsdev-ai/agent";
+import { signOutboundBody } from "../src/utils/mail-sign.js";
 
 // Wire sha512 for sync sign operations.
 import { hashes } from "@noble/ed25519";
@@ -171,6 +172,30 @@ describe("tps mail send with signed envelopes", () => {
     // All sigs verify
     const vr = await verifyEnvelope(env!, mockFlair({ flint: FLINT_SEED, sherlock: SHERLOCK_SEED }));
     expect(vr).toEqual({ ok: true });
+  });
+
+  // ── Test: the caller's priorChain is not mutated ───────────────────────
+
+  test("signOutboundBody does not mutate the caller's priorChain array", () => {
+    writeFileSync(join(keysDir, "flint.key"), FLINT_SEED);
+
+    const priorChain: ChainEntry[] = [
+      { agent: "nathan", kind: "human", timestamp: "2026-05-24T11:00:00.000Z", rationale: "Originates", signature: null },
+      { agent: "flint", kind: "agent", timestamp: "2026-05-24T11:05:00.000Z", rationale: "Dispatches", signature: null },
+    ];
+    const before = JSON.parse(JSON.stringify(priorChain));
+
+    const out = signOutboundBody("flint", "sherlock", "hi", {
+      keyPath: join(keysDir, "flint.key"),
+      priorChain,
+    });
+    const env = JSON.parse(out) as Envelope;
+
+    // The envelope's OWN chain gained the new hop...
+    expect(env.delegationChain.length).toBe(3);
+    // ...but the caller's array must be untouched (it aliased caller state).
+    expect(priorChain.length).toBe(2);
+    expect(priorChain).toEqual(before);
   });
 
   // ── Test 3: Custom rationale ──────────────────────────────────────────

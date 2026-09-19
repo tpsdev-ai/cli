@@ -64,14 +64,19 @@ export function signOutboundBody(
   }
 
   const now = new Date().toISOString();
-  const chain: ChainEntry[] = opts.priorChain ?? [
-    {
-      agent: "system",
-      kind: "human" as const,
-      timestamp: now,
-      rationale: "tps mail send (no inbound chain)",
-      signature: null,
-    },
+  // Shallow-copy the caller's chain before extending it. `opts.priorChain` is the
+  // CALLER's array and `chain.push(...)` below must not append to it (it aliased
+  // caller state — no current caller is affected, but it is still wrong).
+  const chain: ChainEntry[] = [
+    ...(opts.priorChain ?? [
+      {
+        agent: "system",
+        kind: "human" as const,
+        timestamp: now,
+        rationale: "tps mail send (no inbound chain)",
+        signature: null,
+      },
+    ]),
   ];
   chain.push({
     agent: from,
