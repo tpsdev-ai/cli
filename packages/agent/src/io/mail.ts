@@ -15,26 +15,42 @@ export interface MailMessage {
 }
 
 /**
+ * The mailbox reject classes this path can emit. It uses the SHARED class NAMES
+ * (`invalid`, `unresolvable-principal`, `wrong-recipient`) so a dlq sidecar it
+ * writes is readable by the shared tooling. It is NOT the full shared class set:
+ * this path emits only TERMINAL classes — an outage is refused, not
+ * dead-lettered (the record stays in `new/`), so no retryable class is written
+ * here.
+ */
+type MailboxRejectClass = "invalid" | "unresolvable-principal" | "wrong-recipient";
+
+type VerifyOutcome =
+  | { pass: true }
+  | { pass: false; class: MailboxRejectClass; reason: string; from?: string };
+
+/**
  * The stable reason string `verifyEnvelope` returns when an agent-kind chain
- * entry or `envelope.from` cannot be resolved from the LOCAL Flair. Mirrors the
- * shared promote() reject-class boundary (packages/cli/src/utils/mail.ts): a
- * principal that is merely ABSENT is a topology condition, not a forgery
- * verdict, so the dlq sidecar must not label it `invalid`. Duplicated here
- * because `@tpsdev-ai/agent` cannot import `packages/cli` (the dependency runs
- * the other way: cli → agent).
+ * entry or `envelope.from` cannot be resolved from the LOCAL Flair. An ABSENT
+ * principal is a topology condition, not a forgery verdict, so it is labelled
+ * `unresolvable-principal` rather than `invalid`. Duplicated from the shared
+ * promotion boundary because `@tpsdev-ai/agent` cannot import `packages/cli`
+ * (the dependency runs the other way: cli → agent).
  */
 const UNRESOLVABLE_PRINCIPAL_REASON_RE = /^agent (.+) not found in Flair$/;
 
 /**
- * Write the dlq sidecar for a rejected record in the SHARED convention: first
- * line `class: <class>`, then the reason (the same file name and shape the
- * shared re-drive's `readReasonSidecar` parses, so a `tps mail check <agent>`
- * over the same mailbox root can classify a record this path quarantined).
- * (This path previously wrote `${file}.reject` with a bare reason, which no
- * shared reader scans.)
+ * Write the dlq sidecar for a TERMINAL rejection.
+ *
+ * It mirrors the shared mail convention's FORMAT — file name `<record>.reason`
+ * and a first line `class: <class>`, the shape the shared re-drive's
+ * `readReasonSidecar` parses — and reuses the shared class NAMES. It does NOT
+ * reproduce the shared reject boundary: only the terminal classes above are
+ * emitted, and a retryable outcome (Flair unreachable) writes NO sidecar at all
+ * (the record is left in `new/`). So it is "format + the terminal class names
+ * this path emits", not the full boundary. (This path previously wrote
+ * `${file}.reject` with a bare reason, which no shared reader scans.)
  */
-function writeRejectSidecar(dlqDir: string, filename: string, reason: string): void {
-  const cls = UNRESOLVABLE_PRINCIPAL_REASON_RE.test(reason) ? "unresolvable-principal" : "invalid";
+function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxRejectClass, reason: string): void {
   writeFileSync(
     join(dlqDir, `${filename}.reason`),
     `class: ${cls}\nPromote rejected at ${new Date().toISOString()}\nReason: ${reason}\n`,
@@ -133,7 +149,7 @@ export class MailClient {
 
       // Verify. A THROW is a refusal, not a pass: leave the record in new/ for a
       // later check (a Flair outage self-heals) and never promote it.
-      let verifyResult: { pass: true } | { pass: false; reason: string; from?: string };
+      let verifyResult: VerifyOutcome;
       try {
         verifyResult = await this.verifyMailBody(body);
       } catch (err) {
@@ -154,7 +170,7 @@ export class MailClient {
         const dlqPath = join(this.inboxDlq, file);
         try {
           if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
-          writeRejectSidecar(this.inboxDlq, file, verifyResult.reason);
+          writeRejectSidecar(this.inboxDlq, file, verifyResult.class, verifyResult.reason);
         } catch (err) {
           console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`);
         }
@@ -257,14 +273,17 @@ export class MailClient {
   }
 
   /**
-   * Verify a mail body against the v1 signed envelope spec.
-   * Returns { pass: true } if verified, or { pass: false, reason: "..." } on a
-   * deterministic rejection. Called ONLY when a verifier is configured; a THROW
-   * (e.g. Flair unreachable) is a refusal the caller acts on, never a pass.
+   * Verify a mail body against the v1 signed envelope spec AND this mailbox's
+   * policy: signature, wrapper→envelope `from` binding, recipient binding
+   * (`envelope.to` must be this mailbox's agent), and `messageId`/`timestamp`
+   * shape. These are the checks the shared `promote()` applies, so this path
+   * cannot present mail the shared path would reject.
+   *
+   * Returns a terminal `{ pass: false, class, reason }` on a deterministic
+   * rejection. Called ONLY when a verifier is configured; a THROW (Flair
+   * unreachable) is a refusal the caller acts on, never a pass.
    */
-  private async verifyMailBody(
-    body: string,
-  ): Promise<{ pass: true } | { pass: false; reason: string; from?: string }> {
+  private async verifyMailBody(body: string): Promise<VerifyOutcome> {
     const client = this.flairClient!;
 
     // 1. Parse the mail file as JSON
@@ -272,11 +291,11 @@ export class MailClient {
     try {
       mailMsg = JSON.parse(body);
     } catch {
-      return { pass: false, reason: "json parse error: invalid JSON" };
+      return { pass: false, class: "invalid", reason: "json parse error: invalid JSON" };
     }
 
     if (!mailMsg.body || typeof mailMsg.body !== "string") {
-      return { pass: false, reason: "json parse error: missing body field" };
+      return { pass: false, class: "invalid", reason: "json parse error: missing body field" };
     }
 
     // 2. Parse the body field as an envelope
@@ -284,11 +303,11 @@ export class MailClient {
     try {
       envelope = JSON.parse(mailMsg.body);
     } catch {
-      return { pass: false, reason: "json parse error: invalid envelope body", from: mailMsg.from };
+      return { pass: false, class: "invalid", reason: "json parse error: invalid envelope body", from: mailMsg.from };
     }
 
     if (envelope == null || typeof envelope !== "object" || Array.isArray(envelope)) {
-      return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
+      return { pass: false, class: "invalid", reason: "unsigned envelope (v1 required)", from: mailMsg.from };
     }
 
     const env = envelope as Record<string, unknown>;
@@ -297,18 +316,63 @@ export class MailClient {
       !Array.isArray(env.delegationChain) ||
       typeof env.signature !== "string"
     ) {
-      return { pass: false, reason: "unsigned envelope (v1 required)", from: mailMsg.from };
+      return { pass: false, class: "invalid", reason: "unsigned envelope (v1 required)", from: mailMsg.from };
     }
 
-    // 3. Verify the envelope using the canonical verifyEnvelope.
-    //    A THROW here (e.g. Flair unreachable) is NOT a pass — it propagates to
-    //    checkNewMail(), which refuses to promote. Swallowing it and returning
-    //    { pass: true } was fail-OPEN: a deliberate "don't drop the message"
-    //    that promoted unverified mail straight into the model during a Flair
-    //    outage. Verification must be a refusal when it cannot run.
+    // 3. Verify the signature. A THROW here (Flair unreachable) is NOT a pass —
+    //    it propagates to checkNewMail(), which refuses to promote and leaves
+    //    the record in new/ for a later check. The verifier adapter throws on an
+    //    outage, so an outage is RETRYABLE rather than a terminal "not found".
     const vr = await verifyEnvelope(env as any, client);
     if (!vr.ok) {
-      return { pass: false, reason: vr.reason, from: mailMsg.from };
+      const cls: MailboxRejectClass = UNRESOLVABLE_PRINCIPAL_REASON_RE.test(vr.reason)
+        ? "unresolvable-principal"
+        : "invalid";
+      return { pass: false, class: cls, reason: vr.reason, from: mailMsg.from };
+    }
+
+    // 4. The wrapper `from` is what consumers route by, and it is unverified; a
+    //    wrapper/envelope mismatch is itself a reject.
+    if (mailMsg.from !== env.from) {
+      return {
+        pass: false,
+        class: "invalid",
+        reason: `wrapper/envelope from mismatch (wrapper.from=${String(mailMsg.from)}, envelope.from=${String(env.from)})`,
+        from: mailMsg.from,
+      };
+    }
+
+    // 5. Recipient binding. A signature is NOT recipient-bound, so a correctly
+    //    signed envelope addressed to another principal must not be presented
+    //    here (deliverOutbox writes into any recipient's new/).
+    if (env.to !== this.agentId) {
+      return {
+        pass: false,
+        class: "wrong-recipient",
+        reason: `wrong-recipient (envelope.to=${String(env.to)}, mailbox=${this.agentId})`,
+        from: mailMsg.from,
+      };
+    }
+
+    // 6. `messageId` shape.
+    if (typeof env.messageId !== "string" || env.messageId.trim() === "") {
+      return {
+        pass: false,
+        class: "invalid",
+        reason: `invalid messageId (must be a non-empty string, got ${JSON.stringify(env.messageId)})`,
+        from: mailMsg.from,
+      };
+    }
+
+    // 7. `timestamp` shape — a malformed/absent timestamp must not be silently
+    //    accepted (the shared path rejects it too).
+    if (typeof env.timestamp !== "string" || Number.isNaN(Date.parse(env.timestamp))) {
+      return {
+        pass: false,
+        class: "invalid",
+        reason: `invalid timestamp (must be an ISO-8601 string, got ${JSON.stringify(env.timestamp)})`,
+        from: mailMsg.from,
+      };
     }
 
     return { pass: true };

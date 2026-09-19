@@ -23,6 +23,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "../src/lib/signEnvelope.js";
+import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
 
 const AGENT = "mailbox";
@@ -51,16 +52,44 @@ const throwingFlair: FlairClient = {
   },
 };
 
-function signedEnvelope(from: string, to: string, body: string, seeds: Record<string, Buffer>): Envelope {
+/**
+ * The FlairClient adapter AgentRuntime builds for envelope verification
+ * (a thin wrapper over the provider). Mirrored here so the outage drill
+ * exercises the REAL provider, not a stub.
+ */
+function providerVerifier(provider: FlairContextProvider): FlairClient {
+  return {
+    async getAgent(name: string) {
+      const a = await provider.getAgent(name);
+      if (!a) return null;
+      return { publicKey: Buffer.from(a.publicKey, "hex") };
+    },
+  };
+}
+
+function signedEnvelope(
+  from: string,
+  to: string,
+  body: string,
+  seeds: Record<string, Buffer>,
+  overrides: Partial<Envelope> = {},
+): Envelope {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
     { agent: from, kind: "agent", timestamp: now, rationale: "sends", signature: null },
   ];
-  return signEnvelope(
-    { v: 1, from, to, body, messageId: randomUUID(), timestamp: now, delegationChain: chain },
-    { [from]: seeds[from]! },
-  );
+  const envelope: Envelope = {
+    v: 1,
+    from,
+    to,
+    body,
+    messageId: randomUUID(),
+    timestamp: now,
+    delegationChain: chain,
+    ...overrides,
+  };
+  return signEnvelope(envelope, { [from]: seeds[from]! });
 }
 
 describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
@@ -191,5 +220,106 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     const healed = await withVerifier.checkNewMail();
     expect(healed.length).toBe(1);
     expect(files("cur")).toContain("m1.json");
+  });
+
+  // ── Finding 1: an outage is RETRYABLE, not a terminal dead-letter ───────────
+
+  test("an UNREACHABLE Flair is a RETRYABLE refusal (stays in new/), not a terminal dead-letter", async () => {
+    const env = signedEnvelope("flint", AGENT, "during outage", { flint: FLINT });
+    plant(wrapper("flint", env));
+
+    // Real provider against a dead endpoint. getAgent() swallows the connection
+    // error to null; the verifier must probe /Health to tell "absent" from "down".
+    const provider = new FlairContextProvider(AGENT, {
+      url: "http://127.0.0.1:1",
+      keyPath: join(tmpDir, "no-key"),
+    });
+    const client = new MailClient(tmpDir, undefined, AGENT, providerVerifier(provider));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("dlq").length).toBe(0); // NOT dead-lettered
+    expect(files("new")).toContain("m1.json"); // left for a later check (retryable)
+  });
+
+  test("a REACHABLE Flair that does not know the principal IS terminal (unresolvable-principal)", async () => {
+    // Control for the disambiguation: the SAME null from getAgent, but /Health is up.
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const p = new URL(req.url).pathname;
+        if (p === "/Health") return new Response("ok", { status: 200 });
+        return new Response("not found", { status: 404 });
+      },
+    });
+    try {
+      const env = signedEnvelope("flint", AGENT, "absent", { flint: FLINT });
+      plant(wrapper("flint", env));
+      const provider = new FlairContextProvider(AGENT, {
+        url: server.url.href,
+        keyPath: join(tmpDir, "no-key"),
+      });
+      const client = new MailClient(tmpDir, undefined, AGENT, providerVerifier(provider));
+      const msgs = await client.checkNewMail();
+
+      expect(msgs.length).toBe(0);
+      expect(files("dlq")).toContain("m1.json");
+      expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain(
+        "class: unresolvable-principal",
+      );
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  // ── Finding 2: the guard checks WHO FOR, and the wrapper binding ────────────
+
+  test("a correctly-signed envelope addressed to ANOTHER principal is not presented (wrong-recipient)", async () => {
+    const env = signedEnvelope("flint", "someone-else", "not for me", { flint: FLINT });
+    plant({ from: "flint", to: "someone-else", body: JSON.stringify(env) });
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("cur").length).toBe(0);
+    expect(files("dlq")).toContain("m1.json");
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: wrong-recipient");
+  });
+
+  test("a wrapper whose from disagrees with the envelope is rejected (invalid)", async () => {
+    const env = signedEnvelope("flint", AGENT, "spoofed wrapper", { flint: FLINT });
+    plant({ from: "nathan", to: AGENT, body: JSON.stringify(env) });
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("dlq")).toContain("m1.json");
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
+  });
+
+  test("an envelope with a malformed messageId is rejected (invalid)", async () => {
+    const env = signedEnvelope("flint", AGENT, "bad id", { flint: FLINT }, { messageId: "" });
+    plant(wrapper("flint", env));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("dlq")).toContain("m1.json");
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
+  });
+
+  test("an envelope with a malformed timestamp is rejected (invalid)", async () => {
+    const env = signedEnvelope("flint", AGENT, "bad ts", { flint: FLINT }, { timestamp: "not-a-date" });
+    plant(wrapper("flint", env));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("dlq")).toContain("m1.json");
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
   });
 });

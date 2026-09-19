@@ -93,10 +93,24 @@ export class FlairContextProvider {
     }
   }
 
+  /**
+   * Resolve an agent from Flair.
+   *
+   * Distinguishes "Flair says this principal does not exist" (return null) from
+   * "Flair could not be reached" (THROW). The signature verifier built on this
+   * would otherwise see null for BOTH and dead-letter every message as a
+   * terminal "principal not found" for the duration of a Flair outage. The
+   * shared mail-verify client applies the same null→ping→throw rule; the two
+   * must not diverge.
+   */
   async getAgent(name: string): Promise<FlairAgent | null> {
     try {
       return await this.req<FlairAgent>("GET", `/Agent/${name}`);
     } catch {
+      // Either the agent is absent (a reachable 404) or Flair is unreachable.
+      if (!(await this.ping())) {
+        throw new Error(`Flair unreachable at ${this.url} while resolving agent "${name}"`);
+      }
       return null;
     }
   }
