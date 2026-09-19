@@ -31,17 +31,16 @@ describe("MailClient", () => {
     expect(msgs).toEqual([]);
   });
 
-  test("checkNewMail returns and moves messages from new to cur", async () => {
-    const { writeFileSync } = await import("node:fs");
+  test("checkNewMail refuses to promote when no verifier is configured (cli#380 F1)", async () => {
+    const { writeFileSync, existsSync } = await import("node:fs");
     writeFileSync(join(tmpDir, "testagent", "new", "test-1.json"), "hello world", "utf-8");
 
+    // No FlairClient → verification cannot run. An absent verifier must never
+    // mean "promote without verifying": the record is NOT moved.
     const msgs = await client.checkNewMail();
-    expect(msgs.length).toBe(1);
-    expect(msgs[0]!.body).toBe("hello world");
-
-    const { existsSync } = await import("node:fs");
-    expect(existsSync(join(tmpDir, "testagent", "new", "test-1.json"))).toBe(false);
-    expect(existsSync(join(tmpDir, "testagent", "cur", "test-1.json"))).toBe(true);
+    expect(msgs.length).toBe(0);
+    expect(existsSync(join(tmpDir, "testagent", "new", "test-1.json"))).toBe(true);
+    expect(existsSync(join(tmpDir, "testagent", "cur", "test-1.json"))).toBe(false);
   });
 
   test("sendMail writes a file to outbox/new", async () => {

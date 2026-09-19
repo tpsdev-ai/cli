@@ -25,7 +25,10 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Build FlairClient adapter for envelope verification
+    // Build FlairClient adapter for envelope verification. The provider's
+    // getAgent() disambiguates a Flair outage (throws → retryable) from an
+    // absent principal (null → terminal), so a signature verifier built on it
+    // does not dead-letter every message while Flair is down.
     let flairClient: FlairClient | undefined;
     if (this.flair) {
       flairClient = {
