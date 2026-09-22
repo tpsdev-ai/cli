@@ -26,9 +26,11 @@
  *   F-S2d  multiple final payloads → exactly one post.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, watch as fsWatch } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
@@ -314,6 +316,128 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     const files = readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(1);
+
+    h.settle();
+    abortController.abort();
+    try { await h.startPromise; } catch { /* expected */ }
+  });
+
+  // ── atomic outbox write (the branch relay drains on every dir event) ──────
+  //
+  // writeOutboxFile stages to a DOT-PREFIXED temp in the same directory and
+  // renames into place. The relay (`branch.ts`) watches outbox/new and calls
+  // drainOutbox() on EVERY directory event — including the create event that
+  // precedes the bytes — and drainOutbox() quarantines (never retries) a
+  // non-dot `.json` that fails JSON.parse. A record written straight to its
+  // final name can therefore be read mid-write and LOST. The reader below runs
+  // in a SEPARATE process because the write is synchronous and a JS loop in the
+  // same process cannot interleave with it.
+
+  /** Spawn a reader that JSON.parses every non-dot `.json` in `dir` for `ms`. */
+  function startReader(dir: string, ms: number) {
+    const script = join(tmpdir(), `tps-outbox-reader-${randomUUID()}.mjs`);
+    writeFileSync(
+      script,
+      [
+        'import { readdirSync, readFileSync } from "node:fs";',
+        'import { join } from "node:path";',
+        "const dir = process.argv[2];",
+        "const deadline = Date.now() + Number(process.argv[3]);",
+        "let reads = 0; const bad = []; let sawDot = 0;",
+        "while (Date.now() < deadline) {",
+        "  let files = [];",
+        "  try { files = readdirSync(dir); } catch {}",
+        "  for (const f of files) { if (!f.endsWith(\".json\")) continue;",
+        "    if (f.startsWith(\".\")) { sawDot = 1; continue; }",
+        '    try { JSON.parse(readFileSync(join(dir, f), "utf-8")); reads++; }',
+        "    catch { bad.push(f); } }",
+        "}",
+        'console.log("READS=" + reads + " BAD=" + JSON.stringify(bad) + " DOT=" + sawDot);',
+      ].join("\n"),
+      "utf-8",
+    );
+    const child = spawn(process.execPath, [script, dir, String(ms)], { stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    child.stdout.on("data", (d) => { out += d.toString(); });
+    let done = false;
+    const exited = new Promise<void>((res) => { child.on("exit", () => { done = true; res(); }); });
+    return {
+      exited,
+      out: () => out,
+      stop: async () => {
+        if (!done) {
+          // Deadline: never leave the reader (or its child) hanging.
+          await Promise.race([exited, new Promise((r) => setTimeout(r, 6000))]);
+          try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
+        }
+        try { rmSync(script, { force: true }); } catch { /* best effort */ }
+      },
+    };
+  }
+
+  it("S0 atomic outbox write: a concurrent reader NEVER sees a torn file, and the final name is never written in place", async () => {
+    const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
+    mkdirSync(outboxNew, { recursive: true });
+    const h = await startDispatcher("anvil", "flint", { localSender: false });
+    expect(h.dispatched).not.toBeNull();
+
+    // (i) reader processes: a 32 MiB record is written in chunks, so pollers
+    // make a torn read observable if it is possible at all.
+    const readers = [startReader(outboxNew, 4000), startReader(outboxNew, 4000), startReader(outboxNew, 4000)];
+    // (ii) a directory watcher: the DETERMINISTIC check. An in-place write to
+    // the final name emits a `change` event for it; staging to a dot temp and
+    // renaming never does (the `change` events land on the temp, and the final
+    // name appears only via `rename`). That is exactly the property that makes
+    // a concurrent drain unable to read a half-written non-dot record.
+    const events: string[] = [];
+    const watcher = fsWatch(outboxNew, (_t, f) => { if (f) events.push(`${_t}:${f}`); });
+    const isFinalJson = (name: string) => name.endsWith(".json") && !name.startsWith(".");
+    try {
+      await new Promise((r) => setTimeout(r, 150)); // let the pollers/watcher start
+      const big = "x".repeat(32 * 1024 * 1024);
+      await h.deliver({ text: big }, { kind: "final" });
+      await new Promise((r) => setTimeout(r, 250)); // let watcher events flush
+      watcher.close();
+      for (const rd of readers) await rd.stop();
+
+      const outs = readers.map((rd) => rd.out());
+      for (const out of outs) expect(out).toMatch(/READS=[1-9][0-9]*/); // observed the file
+      for (const out of outs) expect(out).toContain("BAD=[]"); // never unparseable
+
+      // The final record appeared (via rename)…
+      expect(events.some((e) => e.startsWith("rename:") && isFinalJson(e.slice("rename:".length)))).toBe(true);
+      // …and was NEVER changed in place (no `change:` on a non-dot .json).
+      const inPlace = events.filter((e) => e.startsWith("change:") && isFinalJson(e.slice("change:".length)));
+      expect(inPlace).toEqual([]);
+    } finally {
+      try { watcher.close(); } catch { /* already closed */ }
+      for (const rd of readers) await rd.stop();
+      h.settle();
+      abortController.abort();
+      try { await h.startPromise; } catch { /* expected */ }
+    }
+  });
+
+  it("S0 positive control: the final outbox file parses, keeps replyToId + headers, no dot file remains", async () => {
+    const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
+    const h = await startDispatcher("anvil", "flint", { localSender: false });
+
+    await h.deliver({ text: "final verdict" }, { kind: "final" });
+
+    const names = readdirSafe(outboxNew);
+    const json = names.filter((f) => f.endsWith(".json") && !f.startsWith("."));
+    expect(json.length).toBe(1);
+    // No staging temp survives the rename.
+    expect(names.filter((f) => f.startsWith(".")).length).toBe(0);
+
+    const record = JSON.parse(readFileSync(resolve(outboxNew, json[0]!), "utf-8"));
+    expect(record.to).toBe("flint");
+    expect(record.from).toBe("anvil");
+    expect(record.replyToId).toBeDefined();
+    expect(record.headers["X-TPS-InReplyTo"]).toBeDefined();
+    const env: Envelope = JSON.parse(record.body);
+    expect(env.body).toBe("final verdict");
 
     h.settle();
     abortController.abort();

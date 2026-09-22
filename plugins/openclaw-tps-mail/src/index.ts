@@ -35,7 +35,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
@@ -140,26 +140,36 @@ function writeOutboxFile(message: TpsMailBody): string {
   const tsSlug = message.timestamp.replace(/[:.]/g, "-");
   const filename = `${tsSlug}-${message.id}.json`;
   const target = resolve(outboxNew, filename);
-  writeFileSync(
-    target,
-    JSON.stringify(
-      {
-        id: message.id,
-        to: message.to,
-        from: message.from,
-        body: message.body,
-        timestamp: message.timestamp,
-        // The reply reference and marker headers MUST ride with the envelope:
-        // for a remote recipient the outbox copy is the only record a later
-        // scan (receipt/ack, S2) or the sender's own tooling can key on.
-        ...(message.replyToId ? { replyToId: message.replyToId } : {}),
-        ...(message.headers ? { headers: message.headers } : {}),
-      },
-      null,
-      2,
-    ),
-    "utf-8",
+  const content = JSON.stringify(
+    {
+      id: message.id,
+      to: message.to,
+      from: message.from,
+      body: message.body,
+      timestamp: message.timestamp,
+      // The reply reference and marker headers MUST ride with the envelope:
+      // for a remote recipient the outbox copy is the only record a later
+      // scan (receipt/ack, S2) or the sender's own tooling can key on.
+      ...(message.replyToId ? { replyToId: message.replyToId } : {}),
+      ...(message.headers ? { headers: message.headers } : {}),
+    },
+    null,
+    2,
   );
+  // Atomic write: stage to a DOT-PREFIXED temp in the SAME directory, then
+  // rename into place. This is the canonical pattern from the CLI's own outbox
+  // writer (packages/cli/src/utils/outbox.ts `queueOutboxMessage`): the branch
+  // relay watches outbox/new and calls drainOutbox() on EVERY directory event,
+  // including the create event that precedes the bytes — a record written
+  // straight to its final name can be read mid-write, fail JSON.parse, and be
+  // QUARANTINED to sent/.malformed-* with no retry, losing the reply forever.
+  // drainOutbox filters dot-prefixed names by design, so a concurrent reader
+  // never sees a half-written record, and rename(2) within one filesystem is
+  // atomic. (This is replicated here rather than calling queueOutboxMessage
+  // because @tpsdev-ai/cli/utils/outbox is not in the CLI package's exports map.)
+  const tmp = resolve(outboxNew, `.${filename}.tmp`);
+  writeFileSync(tmp, content, "utf-8");
+  renameSync(tmp, target);
   return target;
 }
 
