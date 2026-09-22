@@ -89,17 +89,17 @@ jobs:
         # `bun test` aborts by name in the test preload before any module loads.
         working-directory: plugins/openclaw-tps-mail
         run: |
-          bun install
-          bun run test
+          npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
+          npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
+          bun run test              # the isolated launcher (see scripts/run-tests.mjs)
 
   # cli#394 — the openclaw-tps-mail plugin is otherwise outside CI (#393), so a
   # `bun:` import reachable from the CLI's archive util could break the gateway's
   # (node) plugin load with every test still green under `bun test`. This job
   # builds the workspace + plugin and imports the BUILT plugin entry under real
   # `node` — the one assertion that reproduces the failure that took reviewer
-  # mail down. The plugin's tsc is red pre-#393 (missing openclaw/plugin-sdk type
-  # declarations); tsc still EMITS dist, so the step tolerates the red and the
-  # node import below is what actually gates.
+  # mail down. The plugin's tsc is GREEN after cli#393, so its build is
+  # mandatory here (a compile failure must fail the job, never be swallowed).
   node-plugin-load:
     name: Node plugin load (openclaw-tps-mail)
     runs-on: ubuntu-latest
@@ -117,11 +117,11 @@ jobs:
       - run: bun run build
       - name: Show the node that the gateway analog runs under
         run: node --version
-      - name: Install + build the plugin (tsc is red pre-#393; dist is still emitted)
+      - name: Install + build the plugin
         working-directory: plugins/openclaw-tps-mail
         run: |
-          npm install --ignore-scripts # deps are file: links + the SDK; no lifecycle scripts needed, and none run on PR-controlled code
-          npm run build || true
+          npm ci --ignore-scripts # frozen, from the plugin's own package-lock.json; deps are file: links + the SDK; no lifecycle scripts on PR-controlled code
+          npm run build           # tsc is GREEN after cli#393 — a compile failure MUST fail the job, never be swallowed
           test -f dist/src/index.js
       - name: Import the built plugin under node
         run: |
