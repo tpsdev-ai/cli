@@ -290,6 +290,13 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const curDir = resolve(tempMailDir, agentId, "cur");
     mkdirSync(curDir, { recursive: true });
 
+    // A signing key for the AGENT: under S2 an ack requires a committed, signed
+    // receipt, and a missing key is a NAMED failure (never an ack).
+    const keysDir = mkdtempSync(join(tmpdir(), "tps-startup-keys-"));
+    writeFileSync(join(keysDir, `${agentId}.key`), FLINT_SEED);
+    const origKeysDir = process.env.TPS_TEST_KEYS_DIR;
+    process.env.TPS_TEST_KEYS_DIR = keysDir;
+
     // A GENUINE promoted cur/ record: it carries the envelopeId and the signed
     // envelope that promote() stamps, was never acked, and its inner body.
     const env = buildEnvelopeObj("flint", agentId, "recovered after crash", "msg-crash-001");
@@ -307,8 +314,8 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const filename = `2026-04-27T00-00-00-${record.id}.json`;
     writeFileSync(resolve(curDir, filename), JSON.stringify(record, null, 2), "utf-8");
 
-    let dispatchResolve: (val: any) => void;
-    const dispatchPromise = new Promise<any>((res) => { dispatchResolve = res; });
+    let capturedArgs: any = null;
+    let settleFn: () => void = () => {};
 
     const channelRuntime = {
       routing: {
@@ -317,8 +324,12 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
       },
       reply: {
         finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        // Post-before-ack ordering (S2): the dispatch does NOT settle until the
+        // test drives the final `deliver` and then calls settleFn(), so the
+        // receipt exists before the ack transition runs.
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
-          dispatchResolve(args);
+          capturedArgs = args;
+          await new Promise<void>((res) => { settleFn = res; });
         },
       },
     };
@@ -337,15 +348,15 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
 
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
 
-    const result = await Promise.race([
-      dispatchPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("timed out waiting for recovery dispatch")), 5000)),
-    ]);
+    await pollUntil(() => capturedArgs !== null, 5000);
+    expect(capturedArgs.ctx.MessageSid).toBe("msg-crash-001");
+    expect(capturedArgs.ctx.Body).toBe("recovered after crash");
 
-    expect(result.ctx.MessageSid).toBe("msg-crash-001");
-    expect(result.ctx.Body).toBe("recovered after crash");
+    // The test posts the FINAL reply, then settles. The ack is gated on the
+    // receipt that post creates, so it lands only after the file exists.
+    await capturedArgs.dispatcherOptions.deliver({ text: "final verdict" }, { kind: "final" });
+    settleFn();
 
-    // The turn completed → ackedAt is written, closing the crash window.
     const acked = await pollUntil(() => {
       try {
         return !!JSON.parse(readFileSync(resolve(curDir, filename), "utf-8")).ackedAt;
@@ -354,6 +365,10 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
       }
     }, 2000);
     expect(acked).toBe(true);
+
+    if (origKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+    else process.env.TPS_TEST_KEYS_DIR = origKeysDir;
+    rmSync(keysDir, { recursive: true, force: true });
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }

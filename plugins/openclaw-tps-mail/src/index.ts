@@ -9,11 +9,19 @@
  * Inbound flow:
  *   fs.watch(~/.tps/mail/<agent>/new/) →
  *   parse TPS mail envelope →
+ *   promote() (verify + new/→cur/, cli#377) →
  *   build MsgContext →
  *   dispatchReplyWithBufferedBlockDispatcher via channelRuntime →
  *   agent turn runs with standard gateway budgets/tooling →
- *   deliver callback writes reply back to sender's inbox →
- *   move original file new/ → cur/ with ackedAt set
+ *   deliver callback writes the final reply with X-TPS-Obligation →
+ *   a RECEIPT SCAN of the reply's destination finds that marker →
+ *   stamp ackedAt on the cur/ record (S2)
+ *
+ * INVARIANT (I1). A success ack requires a committed final-reply receipt for
+ * THIS inbound; yield is pending; failure is durably named with an explicit
+ * disposition; exactly one obligation-discharging post per inbound (an agent's
+ * own explicit mails may coincide — they never discharge). The ack is never
+ * taken from the fact that a dispatch settled: it is taken from the receipt.
  *
  * Outbound flow:
  *   outbound.sendText(ctx) →
@@ -42,6 +50,15 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import {
+  TERMINAL_STATES,
+  createObligation,
+  listObligations,
+  newestSessionTranscript,
+  readObligation,
+  scanForReceipt,
+  transitionObligation,
+} from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import type {
   ChannelGatewayAdapter,
@@ -67,6 +84,10 @@ interface TpsMailBody {
   body: string;
   timestamp: string;
   read?: boolean;
+  /** The account that owns this mail — carried so a receipt scan can reject a
+   *  cross-account match (two accounts resolving to one mailDir is refused at
+   *  startAccount). */
+  accountId?: string;
   headers?: Record<string, string>;
   replyToId?: string;
   ackedAt?: string;
@@ -86,6 +107,24 @@ function resolveMailDir(cfg: any, accountId: string): string {
   const accounts = cfg?.channels?.[CHANNEL_ID]?.accounts ?? {};
   const account = accounts[accountId] ?? accounts.default ?? {};
   return expandHome(account.mailDir ?? DEFAULT_MAIL_DIR);
+}
+
+/**
+ * STARTUP GUARD: two accounts resolving to the same mailDir would let one
+ * account's receipt scan satisfy another's obligation (and one account's
+ * watcher ack another's mail). Refuse by name. Returns the refusal line, or
+ * null when there is no conflict.
+ */
+function mailDirConflict(cfg: any, accountId: string): string | null {
+  const accounts = cfg?.channels?.[CHANNEL_ID]?.accounts ?? {};
+  const mine = resolveMailDir(cfg, accountId);
+  for (const id of Object.keys(accounts)) {
+    if (id === accountId) continue;
+    if (resolveMailDir(cfg, id) === mine) {
+      return `accounts "${id}" and "${accountId}" resolve to the same mail directory (${mine})`;
+    }
+  }
+  return null;
 }
 
 // ─── Agent binding discovery ─────────────────────────────────────────────────
@@ -147,9 +186,10 @@ function writeOutboxFile(message: TpsMailBody): string {
       from: message.from,
       body: message.body,
       timestamp: message.timestamp,
-      // The reply reference and marker headers MUST ride with the envelope:
-      // for a remote recipient the outbox copy is the only record a later
-      // scan (receipt/ack, S2) or the sender's own tooling can key on.
+      // The account id and the reply reference / marker headers MUST ride with
+      // the envelope: for a remote recipient the outbox copy is the only record
+      // a later receipt scan (S2) can key on.
+      ...(message.accountId ? { accountId: message.accountId } : {}),
       ...(message.replyToId ? { replyToId: message.replyToId } : {}),
       ...(message.headers ? { headers: message.headers } : {}),
     },
@@ -300,6 +340,205 @@ function buildEnvelope(msg: TpsMailBody): string {
   ].join("\n");
 }
 
+// ─── Reply-obligation plumbing (S2) ─────────────────────────────────────────
+
+const OBLIGATION_DEFAULT_DEADLINE_MS = 60 * 60 * 1000;
+
+/** The yield→deadline window. Test-only override via env; production is 60 min. */
+function obligationDeadlineMs(): number {
+  const v = Number(process.env.TPS_OBLIGATION_DEADLINE_MS);
+  return Number.isFinite(v) && v > 0 ? v : OBLIGATION_DEFAULT_DEADLINE_MS;
+}
+
+interface YieldContext {
+  mailDir: string;
+  agent: string;
+  sender: string;
+  accountId: string;
+  curPath: string;
+  inboundId: string;
+  cfg: any;
+  log: any;
+}
+
+/** obligationId → the context needed to ack/nack it after the dispatch is gone. */
+const yieldContexts = new Map<string, YieldContext>();
+const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
+
+let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
+
+function receiptDirs(ctx: YieldContext): string[] {
+  if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
+    return [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")];
+  }
+  const outbox = resolve(process.env.HOME ?? homedir(), ".tps", "outbox");
+  // The branch drain moves the record new/ → sent/ keeping replyToId+headers,
+  // so a REMOTE receipt is either file; .malformed-* in either is a FAILURE.
+  return [resolve(outbox, "new"), resolve(outbox, "sent")];
+}
+
+function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
+  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
+  patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
+  ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
+}
+
+function failObligation(ctx: YieldContext, reason: string): void {
+  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: reason }, ctx.log);
+  patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: reason });
+  ctx.log?.warn?.(`tps-mail: obligation for ${ctx.inboundId} FAILED: ${reason} — nacked, never acked`);
+}
+
+/** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
+function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
+  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
+  const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
+  if (rec.state !== "yielded") {
+    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "yielded", { deadlineAt: at }, ctx.log);
+  }
+  const remaining = Math.max(0, Date.parse(at) - Date.now());
+  const prev = armedDeadlines.get(obligationId);
+  if (prev) clearTimeout(prev);
+  const timer = setTimeout(() => {
+    armedDeadlines.delete(obligationId);
+    onDeadline(ctx, obligationId);
+  }, remaining);
+  if (typeof (timer as any).unref === "function") (timer as any).unref();
+  armedDeadlines.set(obligationId, timer);
+}
+
+function onDeadline(ctx: YieldContext, obligationId: string): void {
+  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after failed/acked: no-op
+  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.agent, ctx.accountId);
+  if (receipt.status === "found") {
+    ackObligation(ctx, obligationId, "receipt present at the deadline");
+    return;
+  }
+  const reason = "yielded-without-resumption";
+  failObligation(ctx, reason);
+  sendNackMail(ctx, reason);
+}
+
+function makeYieldCtx(
+  mailDir: string,
+  agent: string,
+  sender: string,
+  accountId: string,
+  curPath: string,
+  inboundId: string,
+  cfg: any,
+  log: any,
+): YieldContext {
+  return { mailDir, agent, sender, accountId, curPath, inboundId, cfg, log };
+}
+
+/**
+ * Derive an obligation's truth from the maildir/outbox: a nacked cur/ record is
+ * a failure; a posted marker is an ack; otherwise the work is outstanding and
+ * the deadline is (re-)armed. Used by restart recovery and by a re-dispatch of
+ * an inbound that already has an obligation — neither may post a second final.
+ */
+function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string }): void {
+  const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
+  if (curRec?.nackedAt) {
+    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", {
+      failure: curRec.nackReason ?? "nacked",
+    }, ctx.log);
+    return;
+  }
+  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, ctx.agent, ctx.accountId);
+  if (receipt.status === "found") {
+    ackObligation(ctx, rec.obligationId, "recovered: receipt already posted");
+    return;
+  }
+  armDeadline(ctx, rec.obligationId, rec.deadlineAt);
+}
+
+function sendNackMail(ctx: YieldContext, reason: string): void {
+  const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
+  const detail = transcript
+    ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
+    : `${reason}; no session transcript was found under the agent's sessions dir`;
+  const signedBody = signReplyEnvelope(ctx.agent, ctx.sender, detail);
+  const message: TpsMailBody = {
+    id: randomUUID(),
+    from: ctx.agent,
+    to: ctx.sender,
+    body: signedBody ?? detail,
+    timestamp: new Date().toISOString(),
+    replyToId: ctx.inboundId,
+    accountId: ctx.accountId,
+    headers: {
+      "X-TPS-Trust": "agent",
+      "X-TPS-Surface": CHANNEL_ID,
+      "X-TPS-InReplyTo": ctx.inboundId,
+      "X-TPS-Nack": reason,
+    },
+    deliveryAttempts: 0,
+  };
+  try {
+    // Route like the dispatcher reply: a LOCAL recipient (a maildir on this
+    // host, or a binding) gets the nack in their maildir; a REMOTE one gets it
+    // in the outbox for the branch relay. Never dropped.
+    if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
+      writeMailFile(ctx.mailDir, ctx.sender, message);
+    } else {
+      writeOutboxFile(message);
+    }
+    ctx.log?.warn?.(`tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}`);
+  } catch (err: any) {
+    ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+  }
+}
+
+/**
+ * YIELD DETECTION (primary): the run's lifecycle end event carries
+ * `yielded: true` (verified on the pinned SDK's agent-event payload shape: a
+ * `lifecycle`-stream event with `data` as an open record). The first turn's
+ * events are keyed by `replyOptions.runId = obligationId`, so a yielded end
+ * maps straight back to the obligation. If the subscription API is missing or
+ * throws, the plugin falls back to SETTLEMENT-INFERENCE (see deliverPromoted).
+ */
+function installYieldSubscription(api: any): boolean {
+  if (typeof api?.registerAgentEventSubscription !== "function") return false;
+  api.registerAgentEventSubscription({
+    id: "openclaw-tps-mail:yield-obligations",
+    description: "Mark a tps-mail reply obligation yielded when its run ends without a posted final",
+    streams: ["lifecycle"],
+    handle: (event: any) => {
+      const data = event?.data ?? {};
+      const yielded = data.yielded === true || event?.yielded === true;
+      if (!yielded) return;
+      const runId = event?.runId;
+      if (typeof runId !== "string") return;
+      const ctx = yieldContexts.get(runId);
+      if (!ctx) return;
+      const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+      if (!rec || TERMINAL_STATES.has(rec.state)) return;
+      armDeadline(ctx, rec.obligationId);
+    },
+  });
+  return true;
+}
+
+/** The cur/ path for an inbound id (cur filenames are timestamp-id, not the id). */
+function findCurPath(mailDir: string, agent: string, inboundId: string): string | null {
+  const curDir = resolve(mailDir, agent, "cur");
+  try {
+    for (const name of readdirSync(curDir)) {
+      if (!name.endsWith(".json")) continue;
+      const p = resolve(curDir, name);
+      const rec = readMailFile(p);
+      if (rec?.id === inboundId) return p;
+    }
+  } catch {
+    // no cur dir yet
+  }
+  return null;
+}
+
 // ─── Channel Plugin ──────────────────────────────────────────────────────────
 
 const config: ChannelConfigAdapter<TpsMailAccount> = {
@@ -379,6 +618,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
     if (!existsSync(account.mailDir)) {
       log?.warn?.(`tps-mail: mail directory does not exist: ${account.mailDir}`);
+      return;
+    }
+
+    // STARTUP GUARD (S2): two accounts resolving to the SAME mailDir would let
+    // one account's receipt scan satisfy the other's obligation. Refuse by name.
+    const conflict = mailDirConflict(cfg as any, account.accountId);
+    if (conflict) {
+      log?.warn?.(`tps-mail: refusing account ${account.accountId} — ${conflict}; two accounts on one mailDir is a misconfiguration`);
       return;
     }
 
@@ -519,23 +766,58 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         ? await channelRuntime.reply.finalizeInboundContext(rawMsgCtx)
         : { ...rawMsgCtx, CommandAuthorized: false };
 
-      // One reply per inbound, at most (cli#338). The dispatcher's deliver
-      // callback receives blocks in order; we emit only the FINAL message,
-      // once. There is deliberately NO suppression by "the agent already sent
-      // something": the dispatcher's final is ALWAYS posted and is the only
-      // obligation-discharging post. (The CLI envelope carries no reply
-      // reference today, so an explicit send cannot be told apart from a
-      // progress note; suppression returns only as a later CLI slice.)
-      let delivered = false;
+      // ONE obligation-discharging post per inbound (cli#338 + S2). The
+      // dispatcher's deliver callback receives blocks in order; we emit only
+      // the FINAL message, once. There is deliberately NO suppression by "the
+      // agent already sent something": the dispatcher's final is ALWAYS posted
+      // and is the only obligation-discharging post.
+      //
+      // The obligation record is created HERE, keyed on the inbound id — a
+      // replayed inbound finds its record and opens NO second obligation.
+      const obligationId = randomUUID();
+      const created = createObligation(
+        account.mailDir,
+        recipient,
+        () => ({
+          obligationId,
+          inboundId: msg.id,
+          inboundTimestamp: msg.timestamp,
+          from: msg.from,
+          to: recipient,
+          accountId: account.accountId,
+          state: "pending",
+          deadlineAt: null,
+          attempts: 1,
+        }),
+        log,
+      );
+      const obId = created.record.obligationId;
+      const yieldCtx = makeYieldCtx(account.mailDir, recipient, msg.from, account.accountId, curPath, msg.id, cfg, log);
+      yieldContexts.set(obId, yieldCtx);
+
+      // A replayed inbound (or a re-dispatch) must NOT open a SECOND obligation
+      // and must NOT post a SECOND final: reconcile the existing record instead
+      // (receipt → ack; nacked → failed; otherwise re-arm the deadline).
+      if (!created.created) {
+        log?.info?.(`tps-mail: inbound ${msg.id} already has obligation ${obId}; reconciling, not re-dispatching`);
+        reconcileObligation(yieldCtx, created.record);
+        return;
+      }
+
+      let posted = false;
+      let postFailure: string | null = null;
       try {
-        await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
+        const dispatchResult: any = await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
           ctx: msgCtx,
           cfg,
+          // Key THIS turn's agent events by the obligation, so a yielded
+          // lifecycle end maps straight back to it.
+          replyOptions: { runId: obId },
           dispatcherOptions: {
             deliver: async (payload: any, info: any) => {
               // Requirement 1: only the final message, once.
               if (info?.kind !== "final") return;
-              if (delivered) return;
+              if (posted) return;
 
               const replyText: string =
                 (typeof payload?.text === "string" ? payload.text : "") ||
@@ -546,11 +828,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                       .join("\n")
                   : "") ||
                 "";
-              if (!replyText.trim()) return;
+              // Hardening: an empty final is a NAMED failure, never a silent
+              // return that leaves the obligation to be acked later.
+              if (!replyText.trim()) {
+                postFailure = postFailure ?? "empty-final-text";
+                return;
+              }
 
               // Requirement 4: sign the reply (Ed25519 + messageId).
               const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
               if (!signedBody) {
+                postFailure = postFailure ?? `missing-signing-key:${recipient}`;
                 log?.warn?.(
                   `tps-mail: no signing key for ${recipient}; cannot sign dispatcher reply to ${msg.from}`,
                 );
@@ -564,41 +852,74 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 body: signedBody,
                 timestamp: new Date().toISOString(),
                 replyToId: msg.id,
+                accountId: account.accountId,
                 headers: {
                   "X-TPS-Trust": "agent",
                   "X-TPS-Surface": CHANNEL_ID,
                   "X-TPS-InReplyTo": msg.id,
+                  // THE RECEIPT: the marker the ack scan keys on.
+                  "X-TPS-Obligation": obId,
                 },
                 deliveryAttempts: 0,
               };
 
               // Requirement 3 + 5: a local recipient's reply goes to their
               // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
-              // for the branch service to relay — never dropped.
-              if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
-                writeMailFile(account.mailDir, msg.from, reply);
-                delivered = true;
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
-                );
-              } else {
-                const path = writeOutboxFile(reply);
-                delivered = true;
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
-                );
+              // for the branch service to relay — never dropped. `posted` is
+              // set ONLY after the write returns; a throw is a NAMED failure.
+              try {
+                if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
+                  writeMailFile(account.mailDir, msg.from, reply);
+                  log?.info?.(
+                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
+                  );
+                } else {
+                  const path = writeOutboxFile(reply);
+                  log?.info?.(
+                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
+                  );
+                }
+              } catch (err: any) {
+                postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
+                return;
               }
+              posted = true;
+              transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
             },
           },
         });
 
-        // Turn completed — mark original as acked in cur/.
-        patchMailFile(curPath, { ackedAt: new Date().toISOString(), read: true });
-        log?.info?.(`tps-mail: acked ${msg.id}`);
+        // Read the runtime's failedCounts (diagnostic — a non-zero count with
+        // no posted final is exactly the shape that used to ack silently).
+        const failedCounts = dispatchResult?.failedCounts;
+        if (failedCounts !== undefined) {
+          log?.warn?.(`tps-mail: runtime failedCounts for ${msg.id}: ${JSON.stringify(failedCounts)}`);
+        }
+
+        // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
+        const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, recipient, account.accountId);
+        if (receipt.status === "found") {
+          ackObligation(yieldCtx, obId, "receipt found");
+        } else if (receipt.status === "malformed") {
+          failObligation(yieldCtx, "receipt-malformed");
+        } else if (postFailure) {
+          failObligation(yieldCtx, postFailure);
+        } else {
+          // No final posted and no post failure: the run yielded without
+          // resumption (subscription event, or settlement-inference). Stay
+          // UNACKED in cur/ and arm the deadline.
+          armDeadline(yieldCtx, obId);
+          log?.warn?.(
+            `tps-mail: obligation for ${msg.id} is YIELDED (no final posted yet); deadline armed`,
+          );
+        }
       } catch (err: any) {
         log?.warn?.(
           `tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`,
         );
+        transitionObligation(account.mailDir, recipient, msg.id, "failed", {
+          failure: `dispatch failed: ${err?.message ?? String(err)}`,
+        }, log);
         patchMailFile(curPath, {
           nackedAt: new Date().toISOString(),
           nackReason: `dispatch failed: ${err?.message ?? String(err)}`,
@@ -665,6 +986,26 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         try {
           await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
+
+        // RESTART RECOVERY (S2): in-memory timers die with the process, so
+        // reconcile every durable obligation record against the maildir/outbox
+        // and RE-ARM the deadline where work is still outstanding.
+        for (const rec of listObligations(account.mailDir, agentId)) {
+          if (TERMINAL_STATES.has(rec.state)) continue;
+          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
+          const ctx = makeYieldCtx(
+            account.mailDir,
+            agentId,
+            rec.from,
+            account.accountId,
+            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
+            rec.inboundId,
+            cfg,
+            log,
+          );
+          yieldContexts.set(rec.obligationId, ctx);
+          reconcileObligation(ctx, rec);
+        }
       } catch (err: any) {
         log?.warn?.(
           `tps-mail: failed to watch ${newDir}: ${err?.message ?? String(err)}`,
@@ -747,6 +1088,30 @@ export default {
         `openclaw-tps-mail: failed to register channel: ${err?.message ?? err}`,
       );
       throw err;
+    }
+
+    // YIELD DETECTION: subscribe to the run lifecycle so a yielded run with no
+    // posted final arms the obligation deadline instead of being acked. If the
+    // subscription API is unavailable or throws, fall back to
+    // settlement-inference (a settle with no posted final and no post failure is
+    // treated as yielded).
+    try {
+      if (installYieldSubscription(api as any)) {
+        yieldDetection = "subscription";
+        api.logger.info(
+          "openclaw-tps-mail: yield detection via registerAgentEventSubscription",
+        );
+      } else {
+        yieldDetection = "settlement-inference";
+        api.logger.info(
+          "openclaw-tps-mail: registerAgentEventSubscription unavailable; yield detection via settlement-inference",
+        );
+      }
+    } catch (err: any) {
+      yieldDetection = "settlement-inference";
+      api.logger.error(
+        `openclaw-tps-mail: yield subscription failed (${err?.message ?? err}); yield detection via settlement-inference`,
+      );
     }
   },
 };
