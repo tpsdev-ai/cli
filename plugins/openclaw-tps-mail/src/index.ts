@@ -35,7 +35,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
@@ -140,21 +140,36 @@ function writeOutboxFile(message: TpsMailBody): string {
   const tsSlug = message.timestamp.replace(/[:.]/g, "-");
   const filename = `${tsSlug}-${message.id}.json`;
   const target = resolve(outboxNew, filename);
-  writeFileSync(
-    target,
-    JSON.stringify(
-      {
-        id: message.id,
-        to: message.to,
-        from: message.from,
-        body: message.body,
-        timestamp: message.timestamp,
-      },
-      null,
-      2,
-    ),
-    "utf-8",
+  const content = JSON.stringify(
+    {
+      id: message.id,
+      to: message.to,
+      from: message.from,
+      body: message.body,
+      timestamp: message.timestamp,
+      // The reply reference and marker headers MUST ride with the envelope:
+      // for a remote recipient the outbox copy is the only record a later
+      // scan (receipt/ack, S2) or the sender's own tooling can key on.
+      ...(message.replyToId ? { replyToId: message.replyToId } : {}),
+      ...(message.headers ? { headers: message.headers } : {}),
+    },
+    null,
+    2,
   );
+  // Atomic write: stage to a DOT-PREFIXED temp in the SAME directory, then
+  // rename into place. This is the canonical pattern from the CLI's own outbox
+  // writer (packages/cli/src/utils/outbox.ts `queueOutboxMessage`): the branch
+  // relay watches outbox/new and calls drainOutbox() on EVERY directory event,
+  // including the create event that precedes the bytes — a record written
+  // straight to its final name can be read mid-write, fail JSON.parse, and be
+  // QUARANTINED to sent/.malformed-* with no retry, losing the reply forever.
+  // drainOutbox filters dot-prefixed names by design, so a concurrent reader
+  // never sees a half-written record, and rename(2) within one filesystem is
+  // atomic. (This is replicated here rather than calling queueOutboxMessage
+  // because @tpsdev-ai/cli/utils/outbox is not in the CLI package's exports map.)
+  const tmp = resolve(outboxNew, `.${filename}.tmp`);
+  writeFileSync(tmp, content, "utf-8");
+  renameSync(tmp, target);
   return target;
 }
 
@@ -225,34 +240,11 @@ function signReplyEnvelope(from: string, to: string, body: string): string | nul
 }
 
 /**
- * Idempotency check (cli#338 requirement 2): has this agent already sent an
- * explicit reply to `sender` since the inbound was delivered? Scans the
- * sender's new/ and cur/ maildirs for a mail whose `from == fromAgent` and
- * `timestamp >= sinceTs` — the signed envelope `tps mail send` writes.
- */
-function hasExplicitReply(
-  mailDir: string,
-  sender: string,
-  fromAgent: string,
-  sinceTs: string,
-): boolean {
-  for (const sub of ["new", "cur"]) {
-    const dir = resolve(mailDir, sender, sub);
-    if (!existsSync(dir)) continue;
-    for (const f of readdirSync(dir)) {
-      if (!f.endsWith(".json")) continue;
-      const m = readMailFile(resolve(dir, f));
-      if (!m) continue;
-      if (m.from === fromAgent && m.timestamp >= sinceTs) return true;
-    }
-  }
-  return false;
-}
-
-/**
  * Is `to` a local recipient? True when it has a maildir under `mailDir` on
- * this host, or when it is bound to this gateway. Local recipients are
- * delivered to their maildir — never to ~/.tps/outbox (cli#338 requirement 3).
+ * this host, or when it is bound to this gateway. A LOCAL recipient's reply is
+ * delivered to their maildir and never goes to ~/.tps/outbox (cli#338
+ * requirement 3). A recipient that is neither is REMOTE: its reply goes to
+ * ~/.tps/outbox/new/ for the branch service to relay, never dropped.
  */
 function isLocalRecipient(
   mailDir: string,
@@ -529,8 +521,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
       // One reply per inbound, at most (cli#338). The dispatcher's deliver
       // callback receives blocks in order; we emit only the FINAL message,
-      // once, and only if the agent did not already send an explicit reply
-      // via `tps mail send` during the turn.
+      // once. There is deliberately NO suppression by "the agent already sent
+      // something": the dispatcher's final is ALWAYS posted and is the only
+      // obligation-discharging post. (The CLI envelope carries no reply
+      // reference today, so an explicit send cannot be told apart from a
+      // progress note; suppression returns only as a later CLI slice.)
       let delivered = false;
       try {
         await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -541,7 +536,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               // Requirement 1: only the final message, once.
               if (info?.kind !== "final") return;
               if (delivered) return;
-              delivered = true;
 
               const replyText: string =
                 (typeof payload?.text === "string" ? payload.text : "") ||
@@ -554,15 +548,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 "";
               if (!replyText.trim()) return;
 
-              // Requirement 2: idempotent with explicit sends — if the agent
-              // already ran `tps mail send <sender>`, write nothing.
-              if (hasExplicitReply(account.mailDir, msg.from, recipient, msg.timestamp)) {
-                log?.info?.(
-                  `tps-mail: explicit reply already sent to ${msg.from}; dispatcher skipping`,
-                );
-                return;
-              }
-
               // Requirement 4: sign the reply (Ed25519 + messageId).
               const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
               if (!signedBody) {
@@ -572,29 +557,35 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 return;
               }
 
-              // Requirement 3 + 5: local recipient → maildir (signed); else warn.
+              const reply: TpsMailBody = {
+                id: randomUUID(),
+                from: recipient,
+                to: msg.from,
+                body: signedBody,
+                timestamp: new Date().toISOString(),
+                replyToId: msg.id,
+                headers: {
+                  "X-TPS-Trust": "agent",
+                  "X-TPS-Surface": CHANNEL_ID,
+                  "X-TPS-InReplyTo": msg.id,
+                },
+                deliveryAttempts: 0,
+              };
+
+              // Requirement 3 + 5: a local recipient's reply goes to their
+              // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
+              // for the branch service to relay — never dropped.
               if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
-                const reply: TpsMailBody = {
-                  id: randomUUID(),
-                  from: recipient,
-                  to: msg.from,
-                  body: signedBody,
-                  timestamp: new Date().toISOString(),
-                  replyToId: msg.id,
-                  headers: {
-                    "X-TPS-Trust": "agent",
-                    "X-TPS-Surface": CHANNEL_ID,
-                    "X-TPS-InReplyTo": msg.id,
-                  },
-                  deliveryAttempts: 0,
-                };
                 writeMailFile(account.mailDir, msg.from, reply);
+                delivered = true;
                 log?.info?.(
                   `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
                 );
               } else {
-                log?.warn?.(
-                  `tps-mail: cannot deliver reply to ${msg.from}: no local maildir or binding`,
+                const path = writeOutboxFile(reply);
+                delivered = true;
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
                 );
               }
             },
