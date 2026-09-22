@@ -361,12 +361,17 @@ function extractFinalText(payload: any): string {
 }
 
 /**
- * The control tokens OpenClaw suppresses as "silent". OpenClaw already drops an
- * EXACT one of these before `deliver` (normalizeReplyPayload → onSkip, enforced
- * in the reply dispatcher's enqueue), so on the tps-mail surface this guard is
- * belt-and-braces: it is here so a silent reply can NEVER become the posted
- * text if a surface is ever configured to deliver it. This matches the runtime
- * TOKENS, not OpenClaw's rewritten canned phrases.
+ * The control tokens OpenClaw treats as "silent". This guard matches the raw
+ * TOKENS only — it cannot catch a REWRITTEN silent reply.
+ *
+ * 2026.5.22 suppresses an exact `NO_REPLY` BEFORE `deliver` (normalizeReplyPayload
+ * → onSkip, enforced in the reply dispatcher's enqueue), so the guard is
+ * belt-and-braces there. Older hosts rewrite instead: a tps-mail session key
+ * (`agent:<id>:tps-mail:direct:<sender>`) classifies "direct", whose defaults are
+ * policy "disallow" WITH rewrite ON, so an exact `NO_REPLY` becomes a canned
+ * phrase (e.g. "Nothing to add right now.") BEFORE `deliver` — which this guard
+ * cannot tell from a real reply. Such a host needs
+ * `surfaces["tps-mail"].silentReplyRewrite.direct = false`.
  */
 const SUPPRESSED_FINAL_TOKENS = new Set(["NO_REPLY", "ANNOUNCE_SKIP", "REPLY_SKIP"]);
 
@@ -874,7 +879,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           replyOptions: { runId: obId },
           dispatcherOptions: {
             // REMEMBER, do not post: posting here would keep the FIRST final.
-            // Real text only — a silent reply never becomes the posted text.
+            // Real text only — and only the RAW silent tokens are caught here;
+            // a host that rewrites NO_REPLY to a canned phrase is not filtered
+            // (see SUPPRESSED_FINAL_TOKENS).
             deliver: async (payload: any, info: any) => {
               if (info?.kind !== "final") return;
               const text = extractFinalText(payload);
