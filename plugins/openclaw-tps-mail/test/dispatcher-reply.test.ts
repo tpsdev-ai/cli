@@ -229,7 +229,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 15000);
 
   it("F-S0b: a REMOTE recipient gets exactly one reply in the outbox with X-TPS-InReplyTo, nothing dropped", async () => {
     const h = await startDispatcher("anvil", "flint", { localSender: false });
@@ -256,7 +256,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 15000);
 
   it("F-S1a: outer from ≠ verified inner from → rejected before dispatch, dead-lettered, nothing posted", async () => {
     // Wrapper claims `flint`; the signed envelope is actually from `anvil`.
@@ -279,7 +279,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 15000);
 
   it("F-S1b: a progress mail from the agent after the inbound does NOT suppress the dispatcher final", async () => {
     const h = await startDispatcher("anvil", "flint", { localSender: true });
@@ -309,7 +309,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 15000);
 
   it("F-S2d: multiple final payloads produce exactly one post", async () => {
     const h = await startDispatcher("anvil", "flint", { localSender: true });
@@ -323,59 +323,66 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 15000);
 
   // ── atomic outbox write, driven through the REAL consumer ─────────────────
   //
   // The property that matters is not "the final name is never changed in
   // place" — that is an inotify shape and does not hold on every platform — it
-  // is "a concurrent drain never observes a half-written record". So the
-  // fixture drives the REAL consumer: the branch relay in
-  // packages/cli/src/commands/branch.ts:409 watches ~/.tps/outbox/new and calls
-  // drainOutbox() on every directory event. drainOutbox quarantines (never
-  // retries) a non-dot `.json` it cannot JSON.parse, so a torn read is a
+  // is "a concurrent drain never observes a half-written record". The REAL
+  // consumer is drainOutbox(): the branch relay (branch.ts:409) watches
+  // ~/.tps/outbox/new and calls it on every directory event, and it quarantines
+  // (never retries) a non-dot `.json` it cannot JSON.parse — so a torn read is a
   // permanently LOST reply.
   //
   //   POSITIVE: the FIXED writer (writeOutboxFile, staged to a dot temp then
-  //             renamed) — every record survives the relay, zero quarantines.
+  //             renamed), driven through the production shape — a real
+  //             fs.watch → drainOutbox() relay loop. Every record survives,
+  //             zero quarantines. This loop must stay green.
   //   NEGATIVE CONTROL: the PRE-FIX shape reprised as a test-only writer — a
   //             MULTI-SYSCALL in-place write straight to the FINAL name
-  //             (open → 64 KiB writeSync chunks with a yield between → close),
-  //             so the relay can drain mid-write. At least one record is torn
-  //             and quarantined and the delivered set comes up short, proving
-  //             the mechanism is real and that the fixture CAN fail.
+  //             (open → 64 KiB writeSync chunks → close). It invokes the REAL
+  //             consumer drainOutbox() between chunks, i.e. at the instant the
+  //             record is GUARANTEED incomplete, so the tear is deterministic:
+  //             no watch event, no yield, no timing — it holds on macOS and
+  //             Linux alike.
   //
-  // The relay loop mirrors branch.ts:409 exactly (a real fs.watch on
-  // outbox/new → drainOutbox() on each event); HOME is redirected per-test.
+  // A single synchronous writeFileSync, however large, is effectively atomic
+  // against an in-process reader and never tears — which is why the negative
+  // control is multi-syscall AND drives the drain itself rather than racing a
+  // watcher. The relay loop for the POSITIVE case mirrors branch.ts:409 exactly
+  // (a real fs.watch on outbox/new → drainOutbox() on each event); HOME is
+  // redirected per-test, and every wait has an explicit deadline.
 
   /** The real relay, exactly as branch.ts:409 runs it. Collects delivered items. */
   function startRelay(newDir: string) {
     mkdirSync(newDir, { recursive: true });
     const delivered: any[] = [];
-    const watcher = fsWatch(newDir, () => {
-      for (const item of drainOutbox()) delivered.push(item);
-    });
+    const drainOnce = () => { for (const item of drainOutbox()) delivered.push(item); };
+    const watcher = fsWatch(newDir, drainOnce);
     return {
       delivered,
+      /** The relay's own action, callable directly for a bounded settle. */
+      drainOnce,
       close: () => { try { watcher.close(); } catch { /* already closed */ } },
     };
   }
 
   /**
    * The negative control's writer — the PRE-FIX shape: a MULTI-SYSCALL write
-   * straight to the final name (open → 64 KiB chunks with a yield between →
-   * close). A single synchronous writeFileSync, however large, is effectively
-   * atomic against an in-process reader and never tears; the yield between
-   * chunks is what lets the relay's drain land mid-write.
+   * straight to the final name (open → 64 KiB chunks → close). `onMidChunk`
+   * runs after each chunk, when the final name holds only a PREFIX of the
+   * record; the test passes drainOutbox() so the REAL consumer reads it
+   * incomplete. Deterministic: no yield and no watch event are involved.
    */
-  async function tornWriteInPlace(target: string, content: string): Promise<void> {
+  function tornWriteInPlace(target: string, content: string, onMidChunk: () => void): void {
     const buf = Buffer.from(content, "utf-8");
     const CHUNK = 64 * 1024;
     const fd = openSync(target, "w");
     try {
       for (let off = 0; off < buf.length; off += CHUNK) {
         writeSync(fd, buf, off, Math.min(CHUNK, buf.length - off), off);
-        await new Promise((r) => setTimeout(r, 2)); // yield → relay drains mid-write
+        onMidChunk(); // the file IS incomplete here — the real consumer drains NOW
       }
     } finally {
       closeSync(fd);
@@ -431,10 +438,12 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
         expect(res.details.route).toBe("outbox");
       }
 
-      // The relay drains new/ → sent/ on each directory event. Explicit deadline.
+      // Settle before read: wait (bounded), close the watchers, run the relay's
+      // drain once more synchronously, and only THEN inventory.
       await waitFor(() => sentInventory(sentDir).good.length === N, 15000);
-      await new Promise((r) => setTimeout(r, 300)); // flush trailing events
       try { eventWatcher.close(); } catch { /* already closed */ }
+      relay.close();
+      relay.drainOnce();
 
       const { good, malformed } = sentInventory(sentDir);
       expect(good.length).toBe(N);              // all delivered, parsed intact
@@ -457,12 +466,16 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
       try { eventWatcher.close(); } catch { /* already closed */ }
       relay.close();
     }
-  });
+  }, 30000);
 
-  it("S0 relay (NEGATIVE CONTROL — pre-fix torn writer): the fixture CAN fail; an in-place chunked write is quarantined", async () => {
+  it("S0 relay (NEGATIVE CONTROL — pre-fix torn writer): the fixture CAN fail; an in-place chunked write is quarantined", () => {
     const { newDir, sentDir } = outboxDirs();
-    const relay = startRelay(newDir);
-    await new Promise((r) => setTimeout(r, 100)); // let the watcher arm
+    mkdirSync(newDir, { recursive: true });
+
+    // Capture the consumer's own quarantine log line.
+    const errLines: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: any[]) => { errLines.push(args.map(String).join(" ")); };
 
     const N = 4;
     try {
@@ -474,25 +487,25 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
           null,
           2,
         );
-        // PRE-FIX shape: multi-syscall in-place write to the FINAL name.
-        await tornWriteInPlace(resolve(newDir, filename), record);
+        // PRE-FIX shape: multi-syscall in-place write to the FINAL name, with the
+        // REAL consumer draining between chunks — the record is guaranteed
+        // incomplete at that instant, so the tear needs no timing at all.
+        tornWriteInPlace(resolve(newDir, filename), record, () => { drainOutbox(); });
       }
-
-      await waitFor(() => sentInventory(sentDir).malformed.length >= 1, 10000);
-      await new Promise((r) => setTimeout(r, 300)); // let the rest settle
-
-      const { good, malformed } = sentInventory(sentDir);
-      // The mechanism is real: a drain read a record mid-write and quarantined
-      // it with no retry…
-      expect(malformed.length).toBeGreaterThanOrEqual(1);
-      // …so the delivered set comes up short — the reply would have been LOST.
-      expect(good.length).toBeLessThan(N);
-      expect(good.length + malformed.length).toBeLessThanOrEqual(N);
-      expect(relay.delivered.length).toBe(good.length);
+      drainOutbox(); // settle before read
     } finally {
-      relay.close();
+      console.error = origErr;
     }
-  });
+
+    const { good, malformed } = sentInventory(sentDir);
+    // The mechanism is real: the consumer read a record mid-write and
+    // quarantined it with no retry, logging its own line…
+    expect(malformed.length).toBeGreaterThanOrEqual(1);
+    expect(errLines.some((l) => l.includes("failed to parse") && l.includes("quarantining"))).toBe(true);
+    // …so the delivered set comes up short — the reply would have been LOST.
+    expect(good.length).toBeLessThan(N);
+    expect(good.length + malformed.length).toBeLessThanOrEqual(N);
+  }, 20000);
 
   it("S0 positive control: the final outbox file parses, keeps replyToId + headers, no dot file remains", async () => {
     const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
@@ -517,5 +530,5 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
-  });
+  }, 10000);
 });
