@@ -81,6 +81,16 @@ jobs:
       - run: |
           chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
       - run: bun run test
+      - name: openclaw-tps-mail plugin tests (isolated HOME launcher)
+        # cli#398: the plugin's outbox/archive writers resolve ~/.tps and the CLI
+        # mail dirs from the process HOME, so the suite MUST run through its
+        # launcher (plugins/openclaw-tps-mail/scripts/run-tests.mjs), which sets a
+        # throwaway HOME/TPS_MAIL_DIR/TPS_TEST_KEYS_DIR at launch time. A bare
+        # `bun test` aborts by name in the test preload before any module loads.
+        working-directory: plugins/openclaw-tps-mail
+        run: |
+          bun install
+          bun run test
 
   audit:
     name: Dependency Audit
