@@ -12,10 +12,10 @@
 import { describe, expect, it } from "bun:test";
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { resolve, sep } from "node:path";
 
 const ROOT = realpathSync(process.env.TPS_TEST_ROOT ?? "");
-const inside = (p: string): boolean => p === ROOT || p.startsWith(ROOT + "/");
+const inside = (p: string): boolean => p === ROOT || p.startsWith(ROOT + sep);
 
 /** Realpath a path that the launcher created, so a symlinked tmpdir counts. */
 function realpathOrSelf(p: string): string {
