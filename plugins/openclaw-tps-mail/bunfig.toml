@@ -1,0 +1,14 @@
+# bunfig.toml — openclaw-tps-mail plugin test configuration.
+#
+# The test PRELOAD below is the launch-time isolation precondition for this
+# plugin's suite (cli#398 round 2). It loads before any test module and ABORTS
+# the run unless os.homedir() and TPS_MAIL_DIR both resolve inside the
+# throwaway root the launcher created. Run the suite through the launcher:
+#
+#   bun run --cwd plugins/openclaw-tps-mail test
+#   node plugins/openclaw-tps-mail/scripts/run-tests.mjs
+#
+# A bare `bun test` here aborts by name — that is the point.
+
+[test]
+preload = ["./test/preload-guard.ts"]

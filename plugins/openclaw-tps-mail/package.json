@@ -19,6 +19,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "node scripts/run-tests.mjs",
+    "test:raw": "bun test test/",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
