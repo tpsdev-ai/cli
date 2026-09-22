@@ -48,4 +48,25 @@ describe("node-load (cli#394): the built plugin must load under node", () => {
     },
     DEADLINE_MS + 5_000,
   );
+
+  test(
+    "spawns node REQUIRING the built plugin entry (the gateway loads plugins through a require-style path); exits 0 and prints REQUIRE_OK",
+    () => {
+      // Before this fix: ERR_REQUIRE_ASYNC_MODULE — a top-level await in archive.ts made the
+      // whole graph un-requirable while import() still passed, and the gateway refused it.
+      expect(existsSync(entry)).toBe(true);
+      const script = `try{require(${JSON.stringify(entry)});console.log("REQUIRE_OK")}catch(e){console.error(e.code||"",String(e.message).split("\\n")[0]);process.exit(2)}`;
+      const res = spawnSync("node", ["-e", script], {
+        encoding: "utf8",
+        timeout: DEADLINE_MS,
+        killSignal: "SIGKILL",
+      });
+
+      const combined = `${res.stdout ?? ""}\n${res.stderr ?? ""}`;
+      expect(combined).toContain("REQUIRE_OK");
+      expect(res.signal).toBeNull();
+      expect(res.status).toBe(0);
+    },
+    DEADLINE_MS + 5_000,
+  );
 });

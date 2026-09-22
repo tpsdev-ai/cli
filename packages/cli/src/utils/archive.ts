@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
+import { createRequire } from "node:module";
 
 export interface ArchiveEvent {
   event: "sent" | "read" | "listed";
@@ -38,10 +39,26 @@ export interface ArchiveQuery {
  * dependency at runtime. Under bun nothing changes: same DB path, same schema,
  * same behaviour. Under node the archive degrades to a visible no-op (below).
  */
-let bunSqlite: any | null = null;
-if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
-  // @ts-ignore — `bun:sqlite` has no type declarations outside the bun runtime.
-  bunSqlite = await import("bun:sqlite");
+// Resolved lazily and SYNCHRONOUSLY. A top-level dynamic import of bun:sqlite was
+// tried first and fails in the OpenClaw gateway, which loads plugins through a
+// require-style path: an ESM graph with top-level await cannot be required
+// (ERR_REQUIRE_ASYNC_MODULE / "await is only valid in async functions"). Every
+// importer of this module must stay loadable under BOTH import() and require().
+// `undefined` = not tried yet; `null` = tried, unavailable in this runtime.
+let bunSqlite: any | null | undefined;
+function loadBunSqlite(): any | null {
+  if (bunSqlite !== undefined) return bunSqlite;
+  if (typeof (globalThis as { Bun?: unknown }).Bun === "undefined") {
+    bunSqlite = null;
+    return null;
+  }
+  try {
+    // bun resolves its own `bun:` builtins through require(); node never reaches this.
+    bunSqlite = createRequire(import.meta.url)("bun:sqlite");
+  } catch {
+    bunSqlite = null;
+  }
+  return bunSqlite;
 }
 
 // ONE stderr line per process, however many entry points hit the degraded path:
@@ -57,14 +74,15 @@ function warnArchiveUnavailable(): void {
 }
 
 function getDb(): any | null {
-  if (bunSqlite === null) {
+  const sqlite = loadBunSqlite();
+  if (sqlite === null) {
     warnArchiveUnavailable();
     return null;
   }
   const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
   mkdirSync(dir, { recursive: true });
   const dbPath = join(dir, "archive.db");
-  const db = new bunSqlite.Database(dbPath, { create: true });
+  const db = new sqlite.Database(dbPath, { create: true });
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS archive (
