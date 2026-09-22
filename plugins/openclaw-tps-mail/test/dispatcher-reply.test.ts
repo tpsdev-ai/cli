@@ -199,6 +199,9 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
       warnCalls,
       startPromise,
       deliver: (payload: any, info: any) => dispatched!.dispatcherOptions.deliver(payload, info),
+      // cli#400: the runtime suppresses an empty/silent final BEFORE `deliver`
+      // (onSkip); this drives that path.
+      skip: (reason = "empty") => dispatched!.dispatcherOptions.onSkip?.({ text: "" }, { kind: "final", reason }),
       settle: () => settleFn?.(),
     };
   }
@@ -210,7 +213,12 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     await h.deliver({ text: "intermediate narration" }, { kind: "block" });
     await h.deliver({ text: "final verdict" }, { kind: "final" });
 
+    // cli#400: `deliver` only REMEMBERS the final; the post happens after the
+    // dispatch resolves.
+    h.settle();
+
     const flintNew = resolve(tempMailDir, "flint", "new");
+    await waitFor(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
     const files = readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(1);
 
@@ -226,7 +234,6 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
     expect(readdirSafe(outboxNew).filter((f) => f.endsWith(".json")).length).toBe(0);
 
-    h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
   }, 15000);
@@ -237,8 +244,11 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     await h.deliver({ text: "final verdict" }, { kind: "final" });
 
+    // cli#400: the post happens after the dispatch resolves.
+    h.settle();
     // Not dropped: the reply is in the outbox.
     const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
+    await waitFor(() => readdirSafe(outboxNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
     const outFiles = readdirSafe(outboxNew).filter((f) => f.endsWith(".json"));
     expect(outFiles.length).toBe(1);
 
@@ -253,7 +263,6 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     // And NOT in a local maildir.
     expect(existsSync(resolve(tempMailDir, "flint", "new"))).toBe(false);
 
-    h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
   }, 15000);
@@ -299,6 +308,9 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     await h.deliver({ text: "final verdict" }, { kind: "final" });
 
+    // cli#400: the post happens after the dispatch resolves.
+    h.settle();
+    await waitFor(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 2, 2000);
     // The progress note stands AND the dispatcher final is posted (no suppression).
     const files = readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
     expect(files.length).toBe(2);
@@ -306,7 +318,6 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     expect(bodies.some((b) => JSON.parse(b).body === "final verdict")).toBe(true);
     expect(bodies.some((b) => JSON.parse(b).body === "progress: starting")).toBe(true);
 
-    h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
   }, 15000);
@@ -316,11 +327,19 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     await h.deliver({ text: "final one" }, { kind: "final" });
     await h.deliver({ text: "final two" }, { kind: "final" });
+    await h.deliver({ text: "final three" }, { kind: "final" });
 
-    const files = readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json"));
-    expect(files.length).toBe(1);
-
+    // cli#400: exactly ONE post, and it is the turn's LAST real final (the old
+    // code kept the FIRST and posted "final one").
     h.settle();
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    await waitFor(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
+
+    const files = readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBe(1);
+    const posted = JSON.parse(readFileSync(resolve(flintNew, files[0]!), "utf-8"));
+    expect(JSON.parse(posted.body).body).toBe("final three"); // the LAST one
+
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
   }, 15000);
@@ -513,6 +532,9 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     await h.deliver({ text: "final verdict" }, { kind: "final" });
 
+    // cli#400: the post happens after the dispatch resolves.
+    h.settle();
+    await waitFor(() => readdirSafe(outboxNew).filter((f) => f.endsWith(".json") && !f.startsWith(".")).length === 1, 2000);
     const names = readdirSafe(outboxNew);
     const json = names.filter((f) => f.endsWith(".json") && !f.startsWith("."));
     expect(json.length).toBe(1);
@@ -527,7 +549,6 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     const env: Envelope = JSON.parse(record.body);
     expect(env.body).toBe("final verdict");
 
-    h.settle();
     abortController.abort();
     try { await h.startPromise; } catch { /* expected */ }
   }, 10000);
