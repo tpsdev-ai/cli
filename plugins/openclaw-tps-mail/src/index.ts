@@ -60,14 +60,20 @@ import {
   transitionObligation,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
 import type {
-  ChannelGatewayAdapter,
   ChannelGatewayContext,
   ChannelOutboundAdapter,
   ChannelOutboundContext,
-  ChannelConfigAdapter,
-} from "openclaw/plugin-sdk/channels";
-import type { ChannelPlugin } from "openclaw/plugin-sdk/channels";
+} from "openclaw/plugin-sdk/channel-contract";
+
+// The pinned openclaw (2026.5.22) exports no `plugin-sdk/channels` subpath, and
+// ChannelGatewayAdapter / ChannelConfigAdapter have no public NAMED export at
+// all. Derive both from the public ChannelPlugin contract — its `gateway` and
+// `config` members — so the SDK type stays the source of truth rather than a
+// hand-written structural copy.
+type ChannelGatewayAdapter<TResolvedAccount> = NonNullable<ChannelPlugin<TResolvedAccount>["gateway"]>;
+type ChannelConfigAdapter<TResolvedAccount> = ChannelPlugin<TResolvedAccount>["config"];
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
