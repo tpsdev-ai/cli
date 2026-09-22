@@ -340,6 +340,37 @@ function buildEnvelope(msg: TpsMailBody): string {
   ].join("\n");
 }
 
+// ─── final-reply selection (cli#400) ────────────────────────────────────────
+
+/** The text of a final reply payload: `text`, else the concatenated text blocks. */
+function extractFinalText(payload: any): string {
+  if (typeof payload?.text === "string" && payload.text.length > 0) return payload.text;
+  if (Array.isArray(payload?.content)) {
+    return payload.content
+      .filter((c: any) => c?.type === "text")
+      .map((c: any) => c?.text ?? "")
+      .join("\n");
+  }
+  return "";
+}
+
+/**
+ * The control tokens OpenClaw suppresses as "silent". OpenClaw already drops an
+ * EXACT one of these before `deliver` (normalizeReplyPayload → onSkip, enforced
+ * in the reply dispatcher's enqueue), so on the tps-mail surface this guard is
+ * belt-and-braces: it is here so a silent reply can NEVER become the posted
+ * text if a surface is ever configured to deliver it. This matches the runtime
+ * TOKENS, not OpenClaw's rewritten canned phrases.
+ */
+const SUPPRESSED_FINAL_TOKENS = new Set(["NO_REPLY", "ANNOUNCE_SKIP", "REPLY_SKIP"]);
+
+/** True when a final's text may be posted: non-empty and not a silent token. */
+function isPostableFinalText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  return !SUPPRESSED_FINAL_TOKENS.has(trimmed.toUpperCase());
+}
+
 // ─── Reply-obligation plumbing (S2) ─────────────────────────────────────────
 
 const OBLIGATION_DEFAULT_DEADLINE_MS = 60 * 60 * 1000;
@@ -378,7 +409,18 @@ function receiptDirs(ctx: YieldContext): string[] {
 }
 
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
-  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
+  // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
+  // record (e.g. a deadline that already FAILED the obligation) refuses the
+  // transition (obligations.ts: TERMINAL_STATES is final, never resurrected)
+  // and must not get an ackedAt — otherwise a late final acks the inbound
+  // while the obligation stays failed (cli#400).
+  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
+  if (!updated || updated.state !== "acked") {
+    ctx.log?.warn?.(
+      `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${updated?.state ?? "gone"}; the inbound keeps no ackedAt`,
+    );
+    return;
+  }
   patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
 }
@@ -804,6 +846,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         return;
       }
 
+      // The turn's finals arrive one per OpenClaw `deliver` call, in order
+      // (OpenClaw loops the turn's replies and enqueues each non-reasoning one
+      // as kind "final"). The turn's LAST real final is the one to post —
+      // keeping the FIRST posted the wrong text (cli#400). So: remember the
+      // latest final that carries real text, and post exactly ONCE after the
+      // dispatch resolves.
+      let latestFinalText: string | null = null;
+      // A final that was suppressed before delivery (empty, or the runtime's
+      // silent token) is tracked so "the turn produced no postable final" is a
+      // NAMED failure rather than a silent yield.
+      let sawSuppressedFinal = false;
       let posted = false;
       let postFailure: string | null = null;
       try {
@@ -814,80 +867,75 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // lifecycle end maps straight back to it.
           replyOptions: { runId: obId },
           dispatcherOptions: {
+            // REMEMBER, do not post: posting here would keep the FIRST final.
+            // Real text only — a silent reply never becomes the posted text.
             deliver: async (payload: any, info: any) => {
-              // Requirement 1: only the final message, once.
               if (info?.kind !== "final") return;
-              if (posted) return;
-
-              const replyText: string =
-                (typeof payload?.text === "string" ? payload.text : "") ||
-                (Array.isArray(payload?.content)
-                  ? payload.content
-                      .filter((c: any) => c?.type === "text")
-                      .map((c: any) => c?.text ?? "")
-                      .join("\n")
-                  : "") ||
-                "";
-              // Hardening: an empty final is a NAMED failure, never a silent
-              // return that leaves the obligation to be acked later.
-              if (!replyText.trim()) {
-                postFailure = postFailure ?? "empty-final-text";
-                return;
-              }
-
-              // Requirement 4: sign the reply (Ed25519 + messageId).
-              const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
-              if (!signedBody) {
-                postFailure = postFailure ?? `missing-signing-key:${recipient}`;
-                log?.warn?.(
-                  `tps-mail: no signing key for ${recipient}; cannot sign dispatcher reply to ${msg.from}`,
-                );
-                return;
-              }
-
-              const reply: TpsMailBody = {
-                id: randomUUID(),
-                from: recipient,
-                to: msg.from,
-                body: signedBody,
-                timestamp: new Date().toISOString(),
-                replyToId: msg.id,
-                accountId: account.accountId,
-                headers: {
-                  "X-TPS-Trust": "agent",
-                  "X-TPS-Surface": CHANNEL_ID,
-                  "X-TPS-InReplyTo": msg.id,
-                  // THE RECEIPT: the marker the ack scan keys on.
-                  "X-TPS-Obligation": obId,
-                },
-                deliveryAttempts: 0,
-              };
-
-              // Requirement 3 + 5: a local recipient's reply goes to their
-              // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
-              // for the branch service to relay — never dropped. `posted` is
-              // set ONLY after the write returns; a throw is a NAMED failure.
-              try {
-                if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
-                  writeMailFile(account.mailDir, msg.from, reply);
-                  log?.info?.(
-                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
-                  );
-                } else {
-                  const path = writeOutboxFile(reply);
-                  log?.info?.(
-                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
-                  );
-                }
-              } catch (err: any) {
-                postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
-                return;
-              }
-              posted = true;
-              transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
+              const text = extractFinalText(payload);
+              if (!isPostableFinalText(text)) return;
+              latestFinalText = text;
+            },
+            // The runtime suppresses empty / silent finals BEFORE `deliver`
+            // (normalizeReplyPayload → onSkip); observe the skip so a turn
+            // whose only finals were silent is a NAMED failure.
+            onSkip: (_payload: any, info: any) => {
+              if (info?.kind === "final") sawSuppressedFinal = true;
             },
           },
         });
+
+        // POST EXACTLY ONCE, after the dispatch has resolved.
+        if (latestFinalText !== null) {
+          const replyText = latestFinalText;
+          // Requirement 4: sign the reply (Ed25519 + messageId).
+          const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
+          if (!signedBody) {
+            postFailure = postFailure ?? `missing-signing-key:${recipient}`;
+            log?.warn?.(
+              `tps-mail: no signing key for ${recipient}; cannot sign dispatcher reply to ${msg.from}`,
+            );
+          } else {
+            const reply: TpsMailBody = {
+              id: randomUUID(),
+              from: recipient,
+              to: msg.from,
+              body: signedBody,
+              timestamp: new Date().toISOString(),
+              replyToId: msg.id,
+              accountId: account.accountId,
+              headers: {
+                "X-TPS-Trust": "agent",
+                "X-TPS-Surface": CHANNEL_ID,
+                "X-TPS-InReplyTo": msg.id,
+                // THE RECEIPT: the marker the ack scan keys on.
+                "X-TPS-Obligation": obId,
+              },
+              deliveryAttempts: 0,
+            };
+
+            // Requirement 3 + 5: a local recipient's reply goes to their
+            // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
+            // for the branch service to relay — never dropped. `posted` is set
+            // ONLY after the write returns; a throw is a NAMED failure.
+            try {
+              if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
+                writeMailFile(account.mailDir, msg.from, reply);
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
+                );
+              } else {
+                const path = writeOutboxFile(reply);
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
+                );
+              }
+              posted = true;
+              transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
+            } catch (err: any) {
+              postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
+            }
+          }
+        }
 
         // Read the runtime's failedCounts (diagnostic — a non-zero count with
         // no posted final is exactly the shape that used to ack silently).
@@ -904,6 +952,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           failObligation(yieldCtx, "receipt-malformed");
         } else if (postFailure) {
           failObligation(yieldCtx, postFailure);
+        } else if (sawSuppressedFinal) {
+          // The turn produced finals, but every one was empty or silent — a
+          // NAMED failure with a nack, never a silent yield.
+          failObligation(yieldCtx, "empty-final-text");
         } else {
           // No final posted and no post failure: the run yielded without
           // resumption (subscription event, or settlement-inference). Stay

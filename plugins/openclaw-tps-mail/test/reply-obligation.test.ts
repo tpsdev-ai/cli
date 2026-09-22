@@ -236,6 +236,9 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       get dispatchCount() { return dispatchCount; },
       obligationId: (): string | null => dispatchedArgs?.replyOptions?.runId ?? obligationFile(agentId, inboundId)?.obligationId ?? null,
       deliver: (text: string, kind = "final") => dispatchedArgs!.dispatcherOptions.deliver({ text }, { kind }),
+      // cli#400: the runtime suppresses an empty/silent final BEFORE `deliver`
+      // (onSkip); this drives that path.
+      skip: (reason = "empty") => dispatchedArgs!.dispatcherOptions.onSkip?.({ text: "" }, { kind: "final", reason }),
       settle: () => settleFn?.(),
       stop: async () => { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
     };
@@ -254,12 +257,15 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     await h.deliver("the final answer", "final");
     const flintNew = resolve(tempMailDir, "flint", "new");
     const replies = () => readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
-    expect(replies().length).toBe(1); // exactly one post
+    // cli#400: `deliver` only REMEMBERS the final; nothing is posted yet.
+    expect(replies().length).toBe(0);
 
-    // Still unacked until the dispatch settles and the scan runs.
+    // Still unacked until the dispatch settles, posts, and the scan runs.
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
 
     h.settle();
+    const posted = await pollUntil(() => replies().length === 1, 2000);
+    expect(posted).toBe(true); // exactly one post
     const acked = await pollUntil(() => !!curRecord("anvil")?.ackedAt, 2000);
     expect(acked).toBe(true);
 
@@ -281,7 +287,9 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
   // ── F-S2b ──────────────────────────────────────────────────────────────────
   it("F-S2b: an empty final text is FAILED by name, nacked, never acked", async () => {
     const h = await start("anvil", "flint", { localSender: true });
-    await h.deliver("   ", "final"); // no text
+    // cli#400: OpenClaw suppresses an empty final BEFORE `deliver` (onSkip), so
+    // the plugin observes the skip, not an empty deliver payload.
+    h.skip("empty");
     h.settle();
 
     await pollUntil(() => !!curRecord("anvil")?.nackedAt, 2000);
@@ -313,16 +321,31 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
   // ── F-S2e ──────────────────────────────────────────────────────────────────
   it("F-S2e: crash after post before ack — recovery stamps ackedAt, no second post", async () => {
+    // cli#400: the post now happens AFTER the dispatch resolves, so the
+    // crash window is "posted, then the ack did not run". Drive a normal
+    // post+ack, then reconstruct that exact durable state (drop ackedAt, move
+    // the obligation back to "posted") and prove recovery re-acks without a
+    // second post.
     const h = await start("anvil", "flint", { localSender: true });
     await h.deliver("final answer", "final");
-    // CRASH: the dispatch never settles, so the ack transition never runs.
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
     await h.stop();
 
     const flintNew = resolve(tempMailDir, "flint", "new");
     expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length).toBe(1);
+
+    const curFilePath = resolve(tempMailDir, "anvil", "cur", curFiles("anvil")[0]!);
+    const cur = JSON.parse(readFileSync(curFilePath, "utf-8"));
+    delete cur.ackedAt;
+    writeFileSync(curFilePath, JSON.stringify(cur, null, 2), "utf-8");
+    const ob = obligationFile("anvil", h.inboundId);
+    writeFileSync(
+      resolve(tempMailDir, "anvil", ".obligations", `${h.inboundId}.json`),
+      JSON.stringify({ ...ob, state: "posted" }, null, 2),
+      "utf-8",
+    );
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
-    const obBefore = obligationFile("anvil", h.inboundId);
-    expect(["posted", "pending"]).toContain(obBefore?.state);
 
     // RESTART: a fresh account recovers from the maildir/outbox.
     const h2 = await start("anvil", "flint", { localSender: true, noInbound: true });
@@ -444,8 +467,9 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     // (a) remote happy path: the reply lands in the outbox and the ack proceeds.
     const h = await start("anvil", "flint", { localSender: false });
     await h.deliver("final to a remote peer", "final");
-    expect(outboxFiles("new").length).toBe(1);
     h.settle();
+    const posted = await pollUntil(() => outboxFiles("new").length === 1, 2000);
+    expect(posted).toBe(true);
     const acked = await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
     expect(acked).toBe(true);
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("acked");
