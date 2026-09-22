@@ -170,13 +170,35 @@ export function envelopeFrom(body: string): string | null {
 }
 
 /**
- * THE RECEIPT IS THE POSTED FILE. Scan the reply's destination directories for a
- * record that (a) carries `X-TPS-Obligation === obligationId`, (b) was signed by
- * THIS agent (record.from and the signed envelope's from), and (c) carries the
- * matching accountId. A `.malformed-*` quarantine (drainOutbox's quarantine for
- * an unparseable record) is FAILED, never posted — its marker cannot be read, so
- * a malformed file in the receipt dirs is reported as `malformed` only when no
- * valid receipt was found.
+ * THE RECEIPT IS THE POSTED FILE. Scan the reply's destination directories for
+ * a record that carries ALL of:
+ *   (a) `headers["X-TPS-Obligation"] === obligationId` — the marker this inbound
+ *       minted;
+ *   (b) `accountId === accountId` — the SAME account that owns the obligation;
+ *   (c) `record.from === agent` — the recipient agent wrote it; and
+ *   (d) `envelopeFrom(record.body) === agent` — the wrapped signed envelope's
+ *       `from` also names that agent (so a re-wrapped body cannot attribute the
+ *       reply to someone else).
+ *
+ * WHAT THIS IS NOT: the receipt is NOT signature-verified here, and this scan
+ * does not claim it is. Checking the envelope's signature would not close the
+ * gap on its own, for two reasons:
+ *   1. the `X-TPS-Obligation` marker rides on the mail RECORD's headers, OUTSIDE
+ *      the signed envelope (index.ts sets it when it writes the reply; the
+ *      envelope is signed over `body` alone) — so verifying the envelope would
+ *      authenticate the TEXT but would not bind the receipt to THIS inbound;
+ *   2. where agents share one OS user, another agent can read BOTH the
+ *      obligation record and the signing keys, so no in-band check separates
+ *      them — only an OS-level boundary does (tracked separately). The
+ *      obligation id is not a secret in that model: a same-user reader simply
+ *      reads it, so "unguessable" is not the defence.
+ * So the scan pins IDENTITY (which agent, which account) and REACHABILITY (the
+ * record's destination); the marker is a routing key, not an authority.
+ *
+ * A `.malformed-*` quarantine (drainOutbox's quarantine for an unparseable
+ * record) is FAILED, never posted — its marker cannot be read, so a malformed
+ * file in the receipt dirs is reported as `malformed` only when no valid receipt
+ * was found.
  */
 export function scanForReceipt(
   dirs: string[],
