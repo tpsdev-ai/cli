@@ -885,7 +885,15 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             deliver: async (payload: any, info: any) => {
               if (info?.kind !== "final") return;
               const text = extractFinalText(payload);
-              if (!isPostableFinalText(text)) return;
+              if (!isPostableFinalText(text)) {
+                // A raw silent token reached `deliver` (a host that rewrites
+                // NO_REPLY is not filtered here, and 2026.5.7 with
+                // silentReplyRewrite.direct = false delivers it verbatim):
+                // remember it so the turn is a NAMED empty-final failure rather
+                // than a 60-minute yield (cli#398 T2).
+                sawSuppressedFinal = true;
+                return;
+              }
               latestFinalText = text;
             },
             // The runtime suppresses empty / silent finals BEFORE `deliver`
@@ -970,9 +978,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           failObligation(yieldCtx, "receipt-malformed");
         } else if (postFailure) {
           failObligation(yieldCtx, postFailure);
-        } else if (sawSuppressedFinal) {
+        } else if (sawSuppressedFinal && latestFinalText === null) {
           // The turn produced finals, but every one was empty or silent — a
-          // NAMED failure with a nack, never a silent yield.
+          // NAMED failure with a nack, never a silent yield. `latestFinalText`
+          // must be null: a turn that POSTED a real final whose receipt is
+          // absent is the posted-without-receipt path below, not this one.
           failObligation(yieldCtx, "empty-final-text");
         } else {
           // No final posted and no post failure: the run yielded without

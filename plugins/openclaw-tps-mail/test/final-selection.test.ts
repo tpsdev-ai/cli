@@ -237,6 +237,84 @@ describe("cli#400 — yield / deadline interplay", () => {
   }, 20000);
 });
 
+describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, not a 60-minute yield", () => {
+  it("(a) the only final is a raw NO_REPLY delivered to deliver → immediate empty-final-text + nack, no deadline armed", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // a yield would NOT fail soon
+    const h = await start("anvil", "flint", { localSender: true });
+    await h.deliver("NO_REPLY"); // reaches deliver verbatim (2026.5.7 + silentReplyRewrite.direct = false)
+    h.settle();
+    const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 2000);
+    expect(failed).toBe(true);
+    expect(obligationFile("anvil", h.inboundId)?.failure).toBe("empty-final-text");
+    expect(curRecord("anvil")?.nackedAt).toBeDefined();
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    expect(postedReplies("flint").length).toBe(0);
+    await h.stop();
+  }, 15000);
+
+  it("(b) 'verdict' then a raw NO_REPLY → posts 'verdict' and acks", async () => {
+    const h = await start("anvil", "flint", { localSender: true });
+    await h.deliver("verdict");
+    await h.deliver("NO_REPLY");
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
+    expect(curRecord("anvil")?.ackedAt).toBeDefined();
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("acked");
+    const replies = postedReplies("flint");
+    expect(replies.length).toBe(1);
+    expect(JSON.parse(replies[0]!.body).body).toBe("verdict");
+    await h.stop();
+  }, 15000);
+
+  it("(b2) a raw NO_REPLY then 'verdict' → posts 'verdict' and acks", async () => {
+    const h = await start("anvil", "flint", { localSender: true });
+    await h.deliver("NO_REPLY");
+    await h.deliver("verdict");
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
+    expect(curRecord("anvil")?.ackedAt).toBeDefined();
+    const replies = postedReplies("flint");
+    expect(replies.length).toBe(1);
+    expect(JSON.parse(replies[0]!.body).body).toBe("verdict");
+    await h.stop();
+  }, 15000);
+
+  it("(b3) no finals at all → the yield path (deadline armed)", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const h = await start("anvil", "flint", { localSender: true });
+    h.settle();
+    await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "yielded", 2000);
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
+    expect(obligationFile("anvil", h.inboundId)?.deadlineAt).toBeTruthy();
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    expect(curRecord("anvil")?.nackedAt).toBeUndefined();
+    await h.stop();
+  }, 15000);
+
+  it("(b4) 'verdict' then a raw NO_REPLY with the receipt made ABSENT → NOT empty-final-text (posted-without-receipt → yield)", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const h = await start("anvil", "flint", { localSender: true });
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    // The receipt dir is UNREADABLE: the reply write lands (write+execute) but
+    // the scan cannot list it, so the receipt is absent.
+    chmodSync(flintNew, 0o333);
+    try {
+      await h.deliver("verdict");
+      await h.deliver("NO_REPLY");
+      h.settle();
+      await new Promise((r) => setTimeout(r, 300));
+      expect(obligationFile("anvil", h.inboundId)?.failure).not.toBe("empty-final-text");
+      expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
+      expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    } finally {
+      chmodSync(flintNew, 0o755);
+    }
+    // The write DID land (the reply is there once the dir is readable again).
+    expect(postedReplies("flint").length).toBe(1);
+    await h.stop();
+  }, 15000);
+});
+
 describe("cli#398 T4 — an unrelated quarantined file does not poison later non-posting turns", () => {
   const outbox = (kind: "new" | "sent") => resolve(tempHome, ".tps", "outbox", kind);
   function seedMalformed(kind: "new" | "sent"): void {
