@@ -26,11 +26,14 @@
  *   F-S2d  multiple final payloads → exactly one post.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, watch as fsWatch } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, openSync, writeSync, closeSync, watch as fsWatch } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+// The REAL consumer: the branch relay drains the outbox with this exact
+// function (packages/cli/src/commands/branch.ts imports it from the same
+// module). Imported from the built CLI so we exercise the shipped artifact.
+import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
@@ -322,100 +325,172 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     try { await h.startPromise; } catch { /* expected */ }
   });
 
-  // ── atomic outbox write (the branch relay drains on every dir event) ──────
+  // ── atomic outbox write, driven through the REAL consumer ─────────────────
   //
-  // writeOutboxFile stages to a DOT-PREFIXED temp in the same directory and
-  // renames into place. The relay (`branch.ts`) watches outbox/new and calls
-  // drainOutbox() on EVERY directory event — including the create event that
-  // precedes the bytes — and drainOutbox() quarantines (never retries) a
-  // non-dot `.json` that fails JSON.parse. A record written straight to its
-  // final name can therefore be read mid-write and LOST. The reader below runs
-  // in a SEPARATE process because the write is synchronous and a JS loop in the
-  // same process cannot interleave with it.
+  // The property that matters is not "the final name is never changed in
+  // place" — that is an inotify shape and does not hold on every platform — it
+  // is "a concurrent drain never observes a half-written record". So the
+  // fixture drives the REAL consumer: the branch relay in
+  // packages/cli/src/commands/branch.ts:409 watches ~/.tps/outbox/new and calls
+  // drainOutbox() on every directory event. drainOutbox quarantines (never
+  // retries) a non-dot `.json` it cannot JSON.parse, so a torn read is a
+  // permanently LOST reply.
+  //
+  //   POSITIVE: the FIXED writer (writeOutboxFile, staged to a dot temp then
+  //             renamed) — every record survives the relay, zero quarantines.
+  //   NEGATIVE CONTROL: the PRE-FIX shape reprised as a test-only writer — a
+  //             MULTI-SYSCALL in-place write straight to the FINAL name
+  //             (open → 64 KiB writeSync chunks with a yield between → close),
+  //             so the relay can drain mid-write. At least one record is torn
+  //             and quarantined and the delivered set comes up short, proving
+  //             the mechanism is real and that the fixture CAN fail.
+  //
+  // The relay loop mirrors branch.ts:409 exactly (a real fs.watch on
+  // outbox/new → drainOutbox() on each event); HOME is redirected per-test.
 
-  /** Spawn a reader that JSON.parses every non-dot `.json` in `dir` for `ms`. */
-  function startReader(dir: string, ms: number) {
-    const script = join(tmpdir(), `tps-outbox-reader-${randomUUID()}.mjs`);
-    writeFileSync(
-      script,
-      [
-        'import { readdirSync, readFileSync } from "node:fs";',
-        'import { join } from "node:path";',
-        "const dir = process.argv[2];",
-        "const deadline = Date.now() + Number(process.argv[3]);",
-        "let reads = 0; const bad = []; let sawDot = 0;",
-        "while (Date.now() < deadline) {",
-        "  let files = [];",
-        "  try { files = readdirSync(dir); } catch {}",
-        "  for (const f of files) { if (!f.endsWith(\".json\")) continue;",
-        "    if (f.startsWith(\".\")) { sawDot = 1; continue; }",
-        '    try { JSON.parse(readFileSync(join(dir, f), "utf-8")); reads++; }',
-        "    catch { bad.push(f); } }",
-        "}",
-        'console.log("READS=" + reads + " BAD=" + JSON.stringify(bad) + " DOT=" + sawDot);',
-      ].join("\n"),
-      "utf-8",
-    );
-    const child = spawn(process.execPath, [script, dir, String(ms)], { stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    child.stdout.on("data", (d) => { out += d.toString(); });
-    let done = false;
-    const exited = new Promise<void>((res) => { child.on("exit", () => { done = true; res(); }); });
+  /** The real relay, exactly as branch.ts:409 runs it. Collects delivered items. */
+  function startRelay(newDir: string) {
+    mkdirSync(newDir, { recursive: true });
+    const delivered: any[] = [];
+    const watcher = fsWatch(newDir, () => {
+      for (const item of drainOutbox()) delivered.push(item);
+    });
     return {
-      exited,
-      out: () => out,
-      stop: async () => {
-        if (!done) {
-          // Deadline: never leave the reader (or its child) hanging.
-          await Promise.race([exited, new Promise((r) => setTimeout(r, 6000))]);
-          try { child.kill("SIGKILL"); } catch { /* already gone */ }
-          await Promise.race([exited, new Promise((r) => setTimeout(r, 1000))]);
-        }
-        try { rmSync(script, { force: true }); } catch { /* best effort */ }
-      },
+      delivered,
+      close: () => { try { watcher.close(); } catch { /* already closed */ } },
     };
   }
 
-  it("S0 atomic outbox write: a concurrent reader NEVER sees a torn file, and the final name is never written in place", async () => {
-    const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
-    mkdirSync(outboxNew, { recursive: true });
-    const h = await startDispatcher("anvil", "flint", { localSender: false });
-    expect(h.dispatched).not.toBeNull();
-
-    // (i) reader processes: a 32 MiB record is written in chunks, so pollers
-    // make a torn read observable if it is possible at all.
-    const readers = [startReader(outboxNew, 4000), startReader(outboxNew, 4000), startReader(outboxNew, 4000)];
-    // (ii) a directory watcher: the DETERMINISTIC check. An in-place write to
-    // the final name emits a `change` event for it; staging to a dot temp and
-    // renaming never does (the `change` events land on the temp, and the final
-    // name appears only via `rename`). That is exactly the property that makes
-    // a concurrent drain unable to read a half-written non-dot record.
-    const events: string[] = [];
-    const watcher = fsWatch(outboxNew, (_t, f) => { if (f) events.push(`${_t}:${f}`); });
-    const isFinalJson = (name: string) => name.endsWith(".json") && !name.startsWith(".");
+  /**
+   * The negative control's writer — the PRE-FIX shape: a MULTI-SYSCALL write
+   * straight to the final name (open → 64 KiB chunks with a yield between →
+   * close). A single synchronous writeFileSync, however large, is effectively
+   * atomic against an in-process reader and never tears; the yield between
+   * chunks is what lets the relay's drain land mid-write.
+   */
+  async function tornWriteInPlace(target: string, content: string): Promise<void> {
+    const buf = Buffer.from(content, "utf-8");
+    const CHUNK = 64 * 1024;
+    const fd = openSync(target, "w");
     try {
-      await new Promise((r) => setTimeout(r, 150)); // let the pollers/watcher start
-      const big = "x".repeat(32 * 1024 * 1024);
-      await h.deliver({ text: big }, { kind: "final" });
-      await new Promise((r) => setTimeout(r, 250)); // let watcher events flush
-      watcher.close();
-      for (const rd of readers) await rd.stop();
-
-      const outs = readers.map((rd) => rd.out());
-      for (const out of outs) expect(out).toMatch(/READS=[1-9][0-9]*/); // observed the file
-      for (const out of outs) expect(out).toContain("BAD=[]"); // never unparseable
-
-      // The final record appeared (via rename)…
-      expect(events.some((e) => e.startsWith("rename:") && isFinalJson(e.slice("rename:".length)))).toBe(true);
-      // …and was NEVER changed in place (no `change:` on a non-dot .json).
-      const inPlace = events.filter((e) => e.startsWith("change:") && isFinalJson(e.slice("change:".length)));
-      expect(inPlace).toEqual([]);
+      for (let off = 0; off < buf.length; off += CHUNK) {
+        writeSync(fd, buf, off, Math.min(CHUNK, buf.length - off), off);
+        await new Promise((r) => setTimeout(r, 2)); // yield → relay drains mid-write
+      }
     } finally {
-      try { watcher.close(); } catch { /* already closed */ }
-      for (const rd of readers) await rd.stop();
-      h.settle();
-      abortController.abort();
-      try { await h.startPromise; } catch { /* expected */ }
+      closeSync(fd);
+    }
+  }
+
+  /** A body big enough that a chunked write has several yield points to tear on. */
+  const BIG_BODY = "x".repeat(256 * 1024);
+
+  function outboxDirs() {
+    return {
+      newDir: resolve(tempHome, ".tps", "outbox", "new"),
+      sentDir: resolve(tempHome, ".tps", "outbox", "sent"),
+    };
+  }
+
+  function sentInventory(sentDir: string) {
+    const names = readdirSafe(sentDir);
+    return {
+      good: names.filter((f) => f.endsWith(".json") && !f.startsWith(".")),
+      malformed: names.filter((f) => f.startsWith(".malformed-")),
+    };
+  }
+
+  it("S0 relay (POSITIVE): every record the FIXED writer emits survives the real drainOutbox relay", async () => {
+    const { newDir, sentDir } = outboxDirs();
+    const relay = startRelay(newDir);
+
+    // On Linux, also record raw directory events (supplementary ONLY — the
+    // drainOutbox evidence below is what the test relies on; this pins the
+    // inotify shape where it holds and is skipped elsewhere).
+    const events: string[] = [];
+    const eventWatcher = fsWatch(newDir, (_t, f) => { if (f) events.push(`${_t}:${f}`); });
+
+    // The FIXED writer: writeOutboxFile, reached through the plugin's real
+    // outbound adapter (a REMOTE recipient routes the record to the outbox).
+    const cfg = {
+      channels: { "tps-mail": { accounts: { default: { mailDir: tempMailDir, enabled: true } } } },
+      bindings: [{ agentId: "anvil", match: { channel: "tps-mail", accountId: "default" } }],
+    };
+    const N = 20;
+
+    try {
+      for (let i = 0; i < N; i++) {
+        const res: any = await capturedPlugin.outbound.sendText({
+          cfg,
+          accountId: "default",
+          to: "flint",                       // no maildir, not bound → remote
+          text: `${i}:${BIG_BODY}`,          // ≥256 KiB per record
+          identity: { agentId: "anvil" },
+        });
+        expect(res.ok).toBe(true);
+        expect(res.details.route).toBe("outbox");
+      }
+
+      // The relay drains new/ → sent/ on each directory event. Explicit deadline.
+      await waitFor(() => sentInventory(sentDir).good.length === N, 15000);
+      await new Promise((r) => setTimeout(r, 300)); // flush trailing events
+      try { eventWatcher.close(); } catch { /* already closed */ }
+
+      const { good, malformed } = sentInventory(sentDir);
+      expect(good.length).toBe(N);              // all delivered, parsed intact
+      expect(malformed.length).toBe(0);         // zero quarantines
+      expect(relay.delivered.length).toBe(N);
+      for (const item of relay.delivered) {
+        expect(item.to).toBe("flint");
+        expect(item.from).toBe("anvil");
+        expect(item.body.length).toBeGreaterThanOrEqual(256 * 1024);
+      }
+
+      if (process.platform === "linux") {
+        // Supplementary, Linux-only: the final name appeared via rename and was
+        // never written in place (no `change:` on a non-dot `.json`).
+        const isFinalJson = (n: string) => n.endsWith(".json") && !n.startsWith(".");
+        expect(events.some((e) => e.startsWith("rename:") && isFinalJson(e.slice("rename:".length)))).toBe(true);
+        expect(events.filter((e) => e.startsWith("change:") && isFinalJson(e.slice("change:".length)))).toEqual([]);
+      }
+    } finally {
+      try { eventWatcher.close(); } catch { /* already closed */ }
+      relay.close();
+    }
+  });
+
+  it("S0 relay (NEGATIVE CONTROL — pre-fix torn writer): the fixture CAN fail; an in-place chunked write is quarantined", async () => {
+    const { newDir, sentDir } = outboxDirs();
+    const relay = startRelay(newDir);
+    await new Promise((r) => setTimeout(r, 100)); // let the watcher arm
+
+    const N = 4;
+    try {
+      for (let i = 0; i < N; i++) {
+        const id = randomUUID();
+        const filename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${id}.json`;
+        const record = JSON.stringify(
+          { id, to: "flint", from: "anvil", body: `${i}:${BIG_BODY}`, timestamp: new Date().toISOString() },
+          null,
+          2,
+        );
+        // PRE-FIX shape: multi-syscall in-place write to the FINAL name.
+        await tornWriteInPlace(resolve(newDir, filename), record);
+      }
+
+      await waitFor(() => sentInventory(sentDir).malformed.length >= 1, 10000);
+      await new Promise((r) => setTimeout(r, 300)); // let the rest settle
+
+      const { good, malformed } = sentInventory(sentDir);
+      // The mechanism is real: a drain read a record mid-write and quarantined
+      // it with no retry…
+      expect(malformed.length).toBeGreaterThanOrEqual(1);
+      // …so the delivered set comes up short — the reply would have been LOST.
+      expect(good.length).toBeLessThan(N);
+      expect(good.length + malformed.length).toBeLessThanOrEqual(N);
+      expect(relay.delivered.length).toBe(good.length);
+    } finally {
+      relay.close();
     }
   });
 
