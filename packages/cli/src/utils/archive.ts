@@ -1,8 +1,6 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
-// @ts-ignore
-import { Database } from "bun:sqlite";
 
 export interface ArchiveEvent {
   event: "sent" | "read" | "listed";
@@ -23,12 +21,51 @@ export interface ArchiveQuery {
   limit?: number;
 }
 
-function getDb(): any {
+/**
+ * The mail archive is a best-effort audit log backed by `bun:sqlite`.
+ *
+ * It used to be a STATIC `import { Database } from "bun:sqlite"`. That made the
+ * scheme part of this module's static graph, so any runtime whose ESM loader
+ * does not know `bun:` — i.e. NODE, which is what the OpenClaw gateway runs the
+ * tps-mail plugin under — refused to load this module. Because utils/mail.ts
+ * imports this file eagerly (and the plugin imports utils/mail), a single
+ * unconditional `bun:` import took down every importer: the gateway started
+ * with the plugin missing and reviewer mail was dead. Every test ran under
+ * `bun test`, where `bun:sqlite` resolves, so nothing caught it.
+ *
+ * Resolve the sqlite binding ONLY when a bun runtime is actually present, so
+ * the module graph is portable and the archive is a genuinely optional
+ * dependency at runtime. Under bun nothing changes: same DB path, same schema,
+ * same behaviour. Under node the archive degrades to a visible no-op (below).
+ */
+let bunSqlite: any | null = null;
+if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
+  // @ts-ignore — `bun:sqlite` has no type declarations outside the bun runtime.
+  bunSqlite = await import("bun:sqlite");
+}
+
+// ONE stderr line per process, however many entry points hit the degraded path:
+// the audit gap must be visible, never silent — but it must not flood logs.
+let warnedArchiveUnavailable = false;
+
+function warnArchiveUnavailable(): void {
+  if (warnedArchiveUnavailable) return;
+  warnedArchiveUnavailable = true;
+  console.error(
+    "mail archive unavailable under this runtime (no bun:sqlite); events are not being logged",
+  );
+}
+
+function getDb(): any | null {
+  if (bunSqlite === null) {
+    warnArchiveUnavailable();
+    return null;
+  }
   const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
   mkdirSync(dir, { recursive: true });
   const dbPath = join(dir, "archive.db");
-  const db = new Database(dbPath, { create: true });
-  
+  const db = new bunSqlite.Database(dbPath, { create: true });
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS archive (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +94,7 @@ function getDb(): any {
       INSERT INTO archive_fts(rowid, body) VALUES (new.id, new.body);
     END;
   `);
-  
+
   return db;
 }
 
@@ -65,6 +102,7 @@ export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string):
   let db: any | null = null;
   try {
     db = getDb();
+    if (db === null) return; // archive unavailable under this runtime (note emitted once)
     const stmt = db.prepare(`
       INSERT INTO archive (event, timestamp, sender, recipient, messageId, body)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -81,6 +119,7 @@ export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
   let db: any | null = null;
   try {
     db = getDb();
+    if (db === null) return []; // archive unavailable under this runtime (note emitted once)
     let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.body FROM archive";
     const conditions: string[] = [];
     const params: any[] = [];
@@ -119,7 +158,7 @@ export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
 
     const stmt = db.prepare(sql);
     const results = stmt.all(...params) as any[];
-    
+
     return results.map(r => ({
       ...r,
       bodyPreview: r.body ? (r.body.length > 100 ? r.body.slice(0, 100) + "..." : r.body) : undefined
