@@ -68,4 +68,22 @@ describe("communication archive (SQLite)", () => {
     const limited = queryArchive({ limit: 3 });
     expect(limited).toHaveLength(3);
   });
+
+  // cli#394 — parity: under bun the archive is LIVE, so the degraded-runtime
+  // note must NOT be printed (the note is a node-only signal).
+  test("under bun the 'archive unavailable' note is NOT printed", () => {
+    const original = console.error;
+    const seen: unknown[][] = [];
+    console.error = ((...args: unknown[]) => {
+      seen.push(args);
+    }) as typeof console.error;
+    try {
+      logEvent({ event: "sent", from: "a", to: "b", messageId: "note-check" }, "body");
+      queryArchive();
+    } finally {
+      console.error = original;
+    }
+    const notes = seen.filter((args) => String(args[0]).includes("archive unavailable"));
+    expect(notes).toHaveLength(0);
+  });
 });
