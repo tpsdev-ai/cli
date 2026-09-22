@@ -16,11 +16,11 @@
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { createRequire } from "node:module";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
@@ -235,4 +235,52 @@ describe("cli#400 — yield / deadline interplay", () => {
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     await h.stop();
   }, 20000);
+});
+
+describe("cli#398 T4 — an unrelated quarantined file does not poison later non-posting turns", () => {
+  const outbox = (kind: "new" | "sent") => resolve(tempHome, ".tps", "outbox", kind);
+  function seedMalformed(kind: "new" | "sent"): void {
+    mkdirSync(outbox(kind), { recursive: true });
+    writeFileSync(join(outbox(kind), `.malformed-${randomUUID()}.json`), "{ not json, quarantined");
+  }
+
+  it("(c) unrelated .malformed-* in the remote route + a turn that yields with no final → deadline ARMED, not receipt-malformed", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    seedMalformed("sent");
+    const h = await start("anvil", "flint", { localSender: false });
+    h.settle(); // no final → yield
+    await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "yielded", 2000);
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
+    expect(obligationFile("anvil", h.inboundId)?.deadlineAt).toBeTruthy();
+    expect(obligationFile("anvil", h.inboundId)?.failure).toBeUndefined();
+    expect(curRecord("anvil")?.nackedAt).toBeUndefined();
+    await h.stop();
+  }, 15000);
+
+  it("(d) unrelated .malformed-* present + this turn posts a valid reply → found → ack", async () => {
+    seedMalformed("sent");
+    const h = await start("anvil", "flint", { localSender: false });
+    await h.deliver("verdict");
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("acked");
+    await h.stop();
+  }, 15000);
+
+  it("(e) this turn posts, its own record is quarantined and NO valid receipt is visible → receipt-malformed", async () => {
+    seedMalformed("sent"); // the quarantined record the scan can see
+    mkdirSync(outbox("new"), { recursive: true });
+    chmodSync(outbox("new"), 0o333); // posted reply lands here but is not listable
+    try {
+      const h = await start("anvil", "flint", { localSender: false });
+      await h.deliver("verdict");
+      h.settle();
+      const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
+      expect(failed).toBe(true);
+      expect(obligationFile("anvil", h.inboundId)?.failure).toBe("receipt-malformed");
+      await h.stop();
+    } finally {
+      chmodSync(outbox("new"), 0o755);
+    }
+  }, 15000);
 });

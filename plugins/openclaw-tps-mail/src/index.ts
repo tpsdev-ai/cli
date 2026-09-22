@@ -961,7 +961,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, recipient, account.accountId);
         if (receipt.status === "found") {
           ackObligation(yieldCtx, obId, "receipt found");
-        } else if (receipt.status === "malformed") {
+        } else if (receipt.status === "malformed" && posted) {
+          // ONLY when THIS turn posted: a `.malformed-*` cannot be tied to this
+          // obligation (its marker is unreadable) and quarantined records stay
+          // in the dirs, so an unrelated one must not fail a later non-posting
+          // turn (cli#398 T4). A posted reply the scan cannot find as a valid
+          // receipt is the one case that is ours.
           failObligation(yieldCtx, "receipt-malformed");
         } else if (postFailure) {
           failObligation(yieldCtx, postFailure);
