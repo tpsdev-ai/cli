@@ -60,6 +60,7 @@ import {
   transitionObligation,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
 import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
 import type {
   ChannelGatewayContext,
@@ -1160,6 +1161,22 @@ const tpsMailChannel: ChannelPlugin<TpsMailAccount> = {
 
 export default {
   register(api: OpenClawPluginApi) {
+    // cli#402 runtime floor: WARN (never refuse) when the HOST OpenClaw is old
+    // enough to REWRITE an exact NO_REPLY into a canned phrase the token guard
+    // cannot tell from a real reply — unless the effective config disables the
+    // rewrite for this surface. The version comes from the RUNNING gateway's own
+    // install, never the plugin's dev dependency.
+    try {
+      const hostVersion = detectHostOpenClawVersion();
+      const guard = evaluateHostSilentReplyGuard(hostVersion, (api as any).config);
+      if (guard.warn && guard.message) api.logger.warn(guard.message);
+    } catch (err: any) {
+      api.logger.warn(
+        `openclaw-tps-mail: could not check the host NO_REPLY-rewrite floor (${err?.message ?? err}); ` +
+          `if this host is older than OpenClaw 2026.5.22, set surfaces["tps-mail"].silentReplyRewrite.direct = false.`,
+      );
+    }
+
     try {
       (api as any).registerChannel({ plugin: tpsMailChannel });
       api.logger.info(`openclaw-tps-mail: registered channel "${CHANNEL_ID}"`);
