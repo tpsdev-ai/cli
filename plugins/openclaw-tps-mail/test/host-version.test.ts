@@ -147,6 +147,56 @@ describe("evaluateHostSilentReplyGuard — the four cases", () => {
   });
 });
 
+describe("round 2 — malformed / at-floor-suffix versions fail TOWARD the WARN", () => {
+  it("compareOpenClawVersions rejects a PARTIAL (prefix) match instead of equalling the floor", () => {
+    expect(compareOpenClawVersions("2026.5.22broken", SILENT_REPLY_REWRITE_FLOOR)).toBe(null);
+    expect(compareOpenClawVersions("2026.5.22.1", SILENT_REPLY_REWRITE_FLOOR)).toBe(null);
+    // the real host strings still parse
+    expect(compareOpenClawVersions("2026.5.7", SILENT_REPLY_REWRITE_FLOOR)).toBe(-1);
+    expect(compareOpenClawVersions("2026.5.3-1", SILENT_REPLY_REWRITE_FLOOR)).toBe(-1);
+    expect(compareOpenClawVersions("2026.8.1", SILENT_REPLY_REWRITE_FLOOR)).toBe(1);
+  });
+
+  it("2026.5.22broken → the 'could not check' WARN (never treated as the floor)", () => {
+    const d = evaluateHostSilentReplyGuard("2026.5.22broken", CFG_UNSET);
+    expect(d.warn).toBe(true);
+    expect(d.reason).toBe("unknown-version");
+    expect(d.message).toContain("could not compare");
+    expect(d.message).toContain(SILENT_REPLY_REWRITE_KEY);
+  });
+
+  it("2026.5.22.1 → the 'could not check' WARN", () => {
+    const d = evaluateHostSilentReplyGuard("2026.5.22.1", CFG_UNSET);
+    expect(d.warn).toBe(true);
+    expect(d.reason).toBe("unknown-version");
+    expect(d.message).toContain("could not compare");
+  });
+
+  it("a suffix whose numeric core EQUALS the floor is NOT provably at the floor → WARN", () => {
+    for (const v of ["2026.5.22-1", "2026.5.22-beta.1", "2026.5.22+rev"]) {
+      const d = evaluateHostSilentReplyGuard(v, CFG_UNSET);
+      expect(d.warn, `host ${v}`).toBe(true);
+      expect(d.reason).toBe("rewrite-hazard");
+    }
+  });
+
+  it("... but an explicit false still suppresses it", () => {
+    expect(evaluateHostSilentReplyGuard("2026.5.22-1", CFG_OFF).warn).toBe(false);
+  });
+
+  it("a suffix with a core STRICTLY above the floor → no WARN", () => {
+    for (const v of ["2026.5.23-1", "2026.6.0-rc.1", "2026.8.1+rev"]) {
+      expect(evaluateHostSilentReplyGuard(v, CFG_UNSET).warn, `host ${v}`).toBe(false);
+    }
+  });
+
+  it("the real host strings: 2026.5.7 → WARN, 2026.5.3-1 → WARN, 2026.8.1 → no WARN", () => {
+    expect(evaluateHostSilentReplyGuard("2026.5.7", CFG_UNSET).warn).toBe(true);
+    expect(evaluateHostSilentReplyGuard("2026.5.3-1", CFG_UNSET).warn).toBe(true);
+    expect(evaluateHostSilentReplyGuard("2026.8.1", CFG_UNSET).warn).toBe(false);
+  });
+});
+
 describe("the trap, demonstrated", () => {
   it("resolving openclaw from the plugin's OWN directory is the dev dependency, NOT the host", () => {
     // The dev-dep openclaw (used only for types/tests) is present beside this

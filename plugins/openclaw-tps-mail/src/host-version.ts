@@ -66,24 +66,50 @@ export function detectHostOpenClawVersion(entry: string | undefined = process.ar
   }
 }
 
-/** Parse the numeric `major.minor.patch` core of an OpenClaw version (ignoring
- *  a trailing pre-release/build suffix such as `-1`). Null when unparseable. */
-function versionCore(v: string): [number, number, number] | null {
-  const m = /^\s*(\d+)\.(\d+)\.(\d+)/.exec(v);
+/** Parse an OpenClaw version into its numeric `major.minor.patch` core plus
+ *  whether it carried a pre-release/build suffix. A FULL match is required:
+ *  a malformed string such as `2026.5.22broken` or `2026.5.22.1` must NOT
+ *  parse — a prefix match would compare EQUAL to the floor and SUPPRESS the
+ *  warning, exactly the fail-open this guard exists to avoid. */
+function parseVersion(v: string): { core: [number, number, number]; suffix: boolean } | null {
+  const m = /^\s*(\d+)\.(\d+)\.(\d+)([-+][0-9A-Za-z.-]+)?\s*$/.exec(v);
   if (!m) return null;
-  return [Number(m[1]), Number(m[2]), Number(m[3])];
+  return { core: [Number(m[1]), Number(m[2]), Number(m[3])], suffix: m[4] !== undefined };
+}
+
+function compareCore(a: [number, number, number], b: [number, number, number]): number {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
+  }
+  return 0;
 }
 
 /** Compare two OpenClaw versions by their numeric core. Returns -1/0/1, or
- *  null when either side is unparseable (not comparable). */
+ *  null when either side is not a full, well-formed version. */
 export function compareOpenClawVersions(a: string, b: string): number | null {
-  const ca = versionCore(a);
-  const cb = versionCore(b);
-  if (!ca || !cb) return null;
-  for (let i = 0; i < 3; i++) {
-    if (ca[i] !== cb[i]) return ca[i]! < cb[i]! ? -1 : 1;
-  }
-  return 0;
+  const pa = parseVersion(a);
+  const pb = parseVersion(b);
+  if (!pa || !pb) return null;
+  return compareCore(pa.core, pb.core);
+}
+
+const FLOOR_CORE: [number, number, number] = parseVersion(SILENT_REPLY_REWRITE_FLOOR)!.core;
+
+/**
+ * Classify a host version against the floor, failing TOWARD the warning. A
+ * version that carries a suffix AND whose numeric core EQUALS the floor (e.g.
+ * `2026.5.22-1`, `2026.5.22-beta.1`) is NOT provably at or above the floor — it
+ * could be a pre-release of the fix — so it counts as BELOW. A core strictly
+ * above the floor with any suffix (`2026.5.23-1`) is fine. An unparseable
+ * string is `unparseable` (the caller warns).
+ */
+export function classifyHostAgainstFloor(hostVersion: string): "at-or-above" | "below" | "unparseable" {
+  const p = parseVersion(hostVersion);
+  if (!p) return "unparseable";
+  const cmp = compareCore(p.core, FLOOR_CORE);
+  if (cmp > 0) return "at-or-above";
+  if (cmp < 0) return "below";
+  return p.suffix ? "below" : "at-or-above";
 }
 
 /**
@@ -133,9 +159,11 @@ export function evaluateHostSilentReplyGuard(
     };
   }
 
-  const cmp = compareOpenClawVersions(hostVersion, SILENT_REPLY_REWRITE_FLOOR);
-  if (cmp === null) {
-    // Present but unparseable — treat like "could not check", naming what we saw.
+  const floorClass = classifyHostAgainstFloor(hostVersion);
+  if (floorClass === "unparseable") {
+    // Present but not a full, well-formed version — treat like "could not
+    // check", naming what we saw. (NEVER fall through to "at the floor": a
+    // prefix match on a malformed string would silently suppress the warning.)
     return {
       warn: true,
       reason: "unknown-version",
@@ -148,7 +176,7 @@ export function evaluateHostSilentReplyGuard(
   }
 
   // At or above the floor: NO_REPLY is suppressed natively (no rewrite).
-  if (cmp >= 0) {
+  if (floorClass === "at-or-above") {
     return { warn: false, reason: "host-current", message: null };
   }
 
