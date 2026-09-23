@@ -190,4 +190,64 @@ describe("cli#401 — obligation retention", () => {
     expect(res.disabled).toBe(true);
     expect(existsSync(obligationPath(mailDir, AGENT, "very-old"))).toBe(true);
   });
+
+  it("(d2) the DOCUMENTED config path drives the sweep: plugins.entries[id].config → api.pluginConfig", async () => {
+    // The path a user sets in openclaw.json:
+    const openclawConfig = {
+      plugins: { entries: { "openclaw-tps-mail": { config: { obligationRetentionDays: 1 } } } },
+    };
+    // OpenClaw passes exactly `plugins.entries[id].config` to the plugin as api.pluginConfig:
+    const receivedPluginConfig = openclawConfig.plugins.entries["openclaw-tps-mail"].config;
+    expect(resolveObligationRetentionDays(receivedPluginConfig, undefined)).toBe(1);
+    writeRecord("doc-two-days", "acked", daysAgo(2));
+    await runStartup(receivedPluginConfig, () => !existsSync(obligationPath(mailDir, AGENT, "doc-two-days")));
+    expect(existsSync(obligationPath(mailDir, AGENT, "doc-two-days")), "the documented path must drive the sweep").toBe(false);
+  });
+
+  it("(g) a PRESENT-but-unparseable lastTransitionAt is NOT aged by inboundTimestamp — kept + logged", () => {
+    const p = obligationPath(mailDir, AGENT, "bad-ts");
+    mkdirSync(obligationsDir(mailDir, AGENT), { recursive: true });
+    writeFileSync(p, JSON.stringify({ obligationId: "ob-bad-ts", inboundId: "bad-ts", inboundTimestamp: daysAgo(60), state: "acked", lastTransitionAt: "not-a-date" }), "utf-8");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, { warn: (m) => logs.warn.push(m), info: (m) => logs.info.push(m) });
+    expect(res.removed, "unparseable present timestamp must not fall back").toBe(0);
+    expect(res.unreadable).toBe(1);
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it("(h) a store-dir read failure other than ENOENT is LOGGED (not silently zero)", () => {
+    // Put a FILE where the obligations dir should be → readdirSync → ENOTDIR.
+    mkdirSync(join(mailDir, AGENT), { recursive: true });
+    writeFileSync(obligationsDir(mailDir, AGENT), "not a directory", "utf-8");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, { warn: (m) => logs.warn.push(m), info: (m) => logs.info.push(m) });
+    expect(res.removed).toBe(0);
+    expect(logs.warn.some((m) => m.includes("could not read")), "names the error").toBe(true);
+  });
+
+  it("(i) malformed record SHAPES (null / no state / unknown state) are reported unreadable, not skipped", () => {
+    const dir = obligationsDir(mailDir, AGENT);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "null.json"), "null", "utf-8");
+    writeFileSync(join(dir, "no-state.json"), JSON.stringify({ obligationId: "x", inboundId: "no-state" }), "utf-8");
+    writeFileSync(join(dir, "bad-state.json"), JSON.stringify({ obligationId: "y", inboundId: "bad-state", state: "weird", lastTransitionAt: daysAgo(30) }), "utf-8");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, { warn: (m) => logs.warn.push(m), info: (m) => logs.info.push(m) });
+    expect(res.removed).toBe(0);
+    expect(res.unreadable).toBe(3);
+    expect(logs.warn.filter((m) => m.includes("unreadable/malformed")).length, "logged once").toBe(1);
+    expect(existsSync(join(dir, "null.json")) && existsSync(join(dir, "no-state.json")) && existsSync(join(dir, "bad-state.json"))).toBe(true);
+  });
+
+  it("(j) an aged terminal record whose cur/ record is UNRESOLVED is HELD until recovery resolves it", () => {
+    writeRecord("held-id", "acked", daysAgo(30));
+    const curDir = join(mailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    // promoted but never acked (a crash between the obligation ack and the cur/ ackedAt)
+    writeFileSync(join(curDir, "held-id.json"), JSON.stringify({ id: "held-id" }), "utf-8");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, { info: () => {}, warn: () => {} });
+    expect(res.removed).toBe(0);
+    expect(res.heldForRecovery).toBe(1);
+    expect(existsSync(obligationPath(mailDir, AGENT, "held-id"))).toBe(true);
+    // once recovery resolves the cur/ record, a later sweep removes it normally
+    writeFileSync(join(curDir, "held-id.json"), JSON.stringify({ id: "held-id", ackedAt: new Date().toISOString() }), "utf-8");
+    expect(sweepTerminalObligations(mailDir, AGENT, 7, { info: () => {}, warn: () => {} }).removed).toBe(1);
+  });
 });

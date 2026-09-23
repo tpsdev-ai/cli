@@ -93,12 +93,17 @@ plugin sweeps the store:
   to `inboundTimestamp` for records written before that field existed) — never
   the file mtime.
 - **The window is configurable.** Key `obligationRetentionDays`, in the plugin
-  config (`plugins."openclaw-tps-mail"` in `openclaw.json`) or the channel's
-  config block (`channels."tps-mail"`). Default **7** days; a value `<= 0`
-  disables the sweep.
+  ENTRY's config (`plugins.entries["openclaw-tps-mail"].config` in
+  `openclaw.json` — OpenClaw passes this to the plugin as `api.pluginConfig`) or
+  the channel's config block (`channels."tps-mail"`). Default **7** days; a
+  value `<= 0` disables the sweep.
 
   ```json
-  "plugins": { "openclaw-tps-mail": { "obligationRetentionDays": 14 } }
+  "plugins": {
+    "entries": {
+      "openclaw-tps-mail": { "config": { "obligationRetentionDays": 14 } }
+    }
+  }
   ```
 
 - **Safe + best-effort:** a record that is unreadable/malformed (or has no
