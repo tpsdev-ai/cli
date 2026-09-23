@@ -57,6 +57,7 @@ import {
   newestSessionTranscript,
   readObligation,
   scanForReceipt,
+  sweepTerminalObligations,
   transitionObligation,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -105,6 +106,25 @@ interface TpsMailBody {
 
 const DEFAULT_MAIL_DIR = resolve(homedir(), ".tps", "mail");
 const CHANNEL_ID = "tps-mail";
+
+/** Plugin-level config, captured at register() (the cli#401 retention key). */
+let pluginConfig: Record<string, unknown> = {};
+
+/** The obligation-retention window in days (cli#401). Config key
+ *  `obligationRetentionDays`, read from the PLUGIN config
+ *  (openclaw.plugin.json configSchema) with the channel config
+ *  (`channels["tps-mail"]`) accepted as an alternative. Default 7 when unset or
+ *  invalid; an explicit value <= 0 disables the sweep. */
+export const OBLIGATION_RETENTION_KEY = "obligationRetentionDays";
+export const DEFAULT_OBLIGATION_RETENTION_DAYS = 7;
+export function resolveObligationRetentionDays(pluginCfg: any, channelCfg: any): number {
+  for (const src of [pluginCfg, channelCfg]) {
+    const v = src?.[OBLIGATION_RETENTION_KEY];
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+    if (Number.isFinite(n)) return n;
+  }
+  return DEFAULT_OBLIGATION_RETENTION_DAYS;
+}
 
 function expandHome(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : p;
@@ -1068,6 +1088,23 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
 
+        // OBLIGATION RETENTION (cli#401): delete ONLY terminal records (acked,
+        // failed) whose LAST TRANSITION is older than the window; pending /
+        // posted / yielded are never deletable (recovery reads them).
+        // Best-effort — a failure never blocks startup. A replayed id whose
+        // record was swept opens a FRESH obligation: accepted, since relay
+        // retries arrive within minutes/hours, never the window later.
+        try {
+          sweepTerminalObligations(
+            account.mailDir,
+            agentId,
+            resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]),
+            log,
+          );
+        } catch (err: any) {
+          log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);
+        }
+
         // RESTART RECOVERY (S2): in-memory timers die with the process, so
         // reconcile every durable obligation record against the maildir/outbox
         // and RE-ARM the deadline where work is still outstanding.
@@ -1161,6 +1198,11 @@ const tpsMailChannel: ChannelPlugin<TpsMailAccount> = {
 
 export default {
   register(api: OpenClawPluginApi) {
+    // Capture the PLUGIN-level config (openclaw.plugin.json configSchema), which
+    // the account-level ctx does not carry — the obligation retention reads its
+    // key from here (cli#401).
+    pluginConfig = ((api as any).pluginConfig ?? {}) as Record<string, unknown>;
+
     // cli#402 runtime floor: WARN (never refuse) when the HOST OpenClaw is old
     // enough to REWRITE an exact NO_REPLY into a canned phrase the token guard
     // cannot tell from a real reply — unless the effective config disables the

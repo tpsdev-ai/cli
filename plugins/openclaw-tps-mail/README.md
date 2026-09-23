@@ -78,6 +78,36 @@ packaged install does not.) Raising the floor would break installing the plugin
 on exactly the hosts this warning exists for, so the range stays `>=2026.3.7`
 and the runtime WARN carries the floor instead.
 
+## Obligation record retention (cli#401)
+
+Every inbound opens a durable obligation record at
+`<mailDir>/<agent>/.obligations/<inboundId>.json` (the ack key). Left alone they
+accumulate forever (one ~600 B file per inbound), so at **startup recovery** the
+plugin sweeps the store:
+
+- **Only TERMINAL records** (`acked`, `failed`) are deletable. `pending`,
+  `posted` and `yielded` are NEVER deleted, at any age — restart recovery reads
+  them to re-arm deadlines.
+- A terminal record is deleted when its **last transition** is older than the
+  window. The age is the record's OWN recorded `lastTransitionAt` (falling back
+  to `inboundTimestamp` for records written before that field existed) — never
+  the file mtime.
+- **The window is configurable.** Key `obligationRetentionDays`, in the plugin
+  config (`plugins."openclaw-tps-mail"` in `openclaw.json`) or the channel's
+  config block (`channels."tps-mail"`). Default **7** days; a value `<= 0`
+  disables the sweep.
+
+  ```json
+  "plugins": { "openclaw-tps-mail": { "obligationRetentionDays": 14 } }
+  ```
+
+- **Safe + best-effort:** a record that is unreadable/malformed (or has no
+  parseable timestamp) is LEFT in place and logged once, and a deletion failure
+  never blocks startup.
+- **Replay after a sweep is ACCEPTED:** a replayed inbound id whose record was
+  swept opens a FRESH obligation. Relay retries arrive within minutes or hours,
+  never 7 days later, so the sweep cannot collide with a real retry.
+
 ## Retiring the old hook
 
 Once this plugin is live, retire the shell-hook setup:

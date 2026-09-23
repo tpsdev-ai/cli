@@ -13,6 +13,13 @@
  * scanning the reply's destination for a file whose `X-TPS-Obligation` header
  * equals this obligation's id — never on the fact that a dispatch settled.
  *
+ * RETENTION (cli#401): records are swept at startup recovery. Only TERMINAL
+ * records (acked/failed) whose LAST TRANSITION is older than the window are
+ * deleted; pending/posted/yielded are never touched. A replayed inbound id whose
+ * record was swept opens a FRESH obligation — accepted, because relay retries
+ * arrive within minutes or hours, never the window later. See
+ * sweepTerminalObligations.
+ *
  * This module is deliberately pure of the plugin's runtime plumbing: it reads
  * and writes records and scans directories. The timer/arming and the dispatch
  * wiring live in index.ts.
@@ -24,6 +31,7 @@ import {
   readFileSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
@@ -48,6 +56,11 @@ export interface ObligationRecord {
   attempts: number;
   /** Named failure reason when state === "failed". */
   failure?: string;
+  /** ISO time of the LAST state transition (create counts as the pending
+   *  transition). The retention sweep ages a terminal record by THIS, falling
+   *  back to `inboundTimestamp` for records written before this field existed —
+   *  never the file mtime. See sweepTerminalObligations. */
+  lastTransitionAt?: string;
 }
 
 export interface ObligationLog {
@@ -121,6 +134,7 @@ export function createObligation(
     );
     return { created: false, record: existing };
   }
+  draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
   writeObligation(mailDir, agent, draft);
   return { created: true, record: draft };
 }
@@ -147,9 +161,118 @@ export function transitionObligation(
     );
     return current;
   }
-  const updated: ObligationRecord = { ...current, ...patch, state: next };
+  const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
   writeObligation(mailDir, agent, updated);
   return updated;
+}
+
+// ── retention ────────────────────────────────────────────────────────────────
+
+export interface RetentionResult {
+  removed: number;
+  left: number;
+  unreadable: number;
+  disabled: boolean;
+}
+
+/** The record's OWN recorded last-transition time in ms, falling back to the
+ *  inbound timestamp for records written before `lastTransitionAt` existed.
+ *  Null when neither parses (the record cannot be aged → it is LEFT, never
+ *  deleted). Never the file mtime. */
+export function obligationLastTransitionMs(record: unknown): number | null {
+  const r = record as Record<string, unknown> | null;
+  for (const field of ["lastTransitionAt", "inboundTimestamp"] as const) {
+    const v = r?.[field];
+    if (typeof v === "string") {
+      const t = Date.parse(v);
+      if (Number.isFinite(t)) return t;
+    }
+  }
+  return null;
+}
+
+/**
+ * Sweep the agent's obligation store: DELETE only TERMINAL records (acked,
+ * failed) whose LAST TRANSITION is older than `retentionDays`. NEVER pending /
+ * posted / yielded, at any age — restart recovery reads those.
+ *
+ * Ages a record by its OWN recorded timestamp (`lastTransitionAt`, else
+ * `inboundTimestamp`), never the file mtime. Safe + best-effort: an
+ * unreadable/malformed record (or one whose timestamp cannot be parsed) is LEFT
+ * and logged ONCE; a deletion failure is logged and never blocks startup.
+ * `retentionDays <= 0` disables the sweep.
+ *
+ * REPLAY AFTER A SWEEP (accepted, pinned by a test): a replayed inbound whose
+ * record was swept opens a FRESH obligation — relay retries arrive within
+ * minutes or hours, never `retentionDays` later.
+ */
+export function sweepTerminalObligations(
+  mailDir: string,
+  agent: string,
+  retentionDays: number,
+  log?: ObligationLog,
+  nowMs: number = Date.now(),
+): RetentionResult {
+  const res: RetentionResult = { removed: 0, left: 0, unreadable: 0, disabled: false };
+  if (!(retentionDays > 0)) {
+    res.disabled = true;
+    return res;
+  }
+  const dir = obligationsDir(mailDir, agent);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return res; // no store yet — nothing to sweep
+  }
+  const cutoff = nowMs - retentionDays * 24 * 60 * 60 * 1000;
+  const leftUnreadable: string[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.startsWith(".")) continue;
+    const path = resolve(dir, name);
+    let record: unknown;
+    try {
+      record = JSON.parse(readFileSync(path, "utf-8"));
+    } catch {
+      res.unreadable++;
+      leftUnreadable.push(name);
+      continue;
+    }
+    const state = (record as { state?: ObligationState } | null)?.state;
+    if (!state || !TERMINAL_STATES.has(state)) {
+      res.left++; // pending / posted / yielded are never deletable
+      continue;
+    }
+    const t = obligationLastTransitionMs(record);
+    if (t === null) {
+      res.unreadable++;
+      leftUnreadable.push(name);
+      continue;
+    }
+    if (t >= cutoff) {
+      res.left++;
+      continue;
+    }
+    try {
+      unlinkSync(path);
+      res.removed++;
+    } catch (err) {
+      log?.warn?.(
+        `tps-mail: obligation retention: could not delete ${name}: ${err instanceof Error ? err.message : String(err)}; left in place`,
+      );
+      res.left++;
+    }
+  }
+  // Logged ONCE: a single line for the unreadable/malformed records we left.
+  if (leftUnreadable.length > 0) {
+    log?.warn?.(
+      `tps-mail: obligation retention: left ${leftUnreadable.length} unreadable/malformed record(s) in place (never deleted): ${leftUnreadable.join(", ")}`,
+    );
+  }
+  log?.info?.(
+    `tps-mail: obligation retention: removed ${res.removed} terminal record(s) older than ${retentionDays} day(s); kept ${res.left}`,
+  );
+  return res;
 }
 
 // ── receipt scan ─────────────────────────────────────────────────────────────
