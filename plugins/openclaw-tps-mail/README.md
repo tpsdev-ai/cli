@@ -44,6 +44,40 @@ After this plugin: TPS mail messages route through openclaw-gateway's native mes
    ```
 5. Restart openclaw-gateway (e.g., `openclaw gateway stop && openclaw gateway start`).
 
+## Runtime floor: an exact `NO_REPLY` on an older host (cli#402)
+
+On an OpenClaw host **older than 2026.5.22**, a tps-mail session key
+(`agent:<id>:tps-mail:direct:<sender>`) classifies as the "direct" conversation
+type, whose silent-reply defaults are policy "disallow" **with rewrite ON**. An
+exact `NO_REPLY` final is therefore REWRITTEN into a canned phrase (e.g.
+"Nothing to add right now.") **before** `deliver` runs. This plugin's token guard
+matches the raw tokens only, so it cannot tell that rewritten phrase from a real
+reply — it gets posted and discharges the reply obligation. 2026.5.22 suppresses
+an exact `NO_REPLY` natively; 2026.8.1 removed the rewrite.
+
+At startup the plugin WARNs when the **host** OpenClaw (read from the running
+gateway's own install, never the plugin's dev dependency) is below 2026.5.22 and
+the effective config does not disable the rewrite. The host-side fix:
+
+```json
+"surfaces": {
+  "tps-mail": { "silentReplyRewrite": { "direct": false } }
+}
+```
+
+The plugin WARNs and never refuses — a refusal would take mail down on a gateway
+that otherwise works. It also WARNs when the host version cannot be determined
+rather than staying silent.
+
+**Why `peerDependencies.openclaw` is NOT raised to `>=2026.5.22`.** A peer range
+the host does not meet makes npm (v7+, incl. 10.x) fail the install with
+`ERESOLVE` when the plugin is installed as a resolved package (registry install
+or tarball) — and the hosts we run (openclaw 2026.5.7, 2026.5.3-1) are below that
+floor. (A plain directory/`file:` link install skips peer validation, but a
+packaged install does not.) Raising the floor would break installing the plugin
+on exactly the hosts this warning exists for, so the range stays `>=2026.3.7`
+and the runtime WARN carries the floor instead.
+
 ## Retiring the old hook
 
 Once this plugin is live, retire the shell-hook setup:
