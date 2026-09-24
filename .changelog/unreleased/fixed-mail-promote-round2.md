@@ -1,6 +1,0 @@
-- **Inbound mail promotion is hardened against replay, storage faults, and crash windows (Refs #377).** The `new/` → `cur/` enforcement point (`promote()`, used by `mail check` and the `openclaw-tps-mail` plugin) now:
-  - records consumed envelope ids in an append-only, age-bounded ledger at the mailbox root, so the replay gate survives `cur/` acks and GC instead of reopening the moment a record ages out;
-  - classifies a write/rename failure as the retryable `storage-unavailable` (a later check re-drives it) and preserves the ORIGINAL envelope bytes rather than dead-lettering a half-written payload as `invalid`;
-  - validates `messageId` as a present, non-empty string before the replay lookup, so a malformed id is a `dlq` reason rather than an undefined key that silently never matches;
-  - and the `openclaw-tps-mail` plugin sweeps `cur/` on startup for records promoted but never acked, re-dispatching them so a crash between promotion and ack cannot silently drop a message.
-- **Fixed a polynomial-regular-expression sink on the identifier hyphen trim in `schema/sanitizer.ts`** (pre-existing; surfaced by dataflow re-attribution). Because runs are already collapsed to a single hyphen, the leading/trailing trim is a single-hyphen replace at each end — quantifier-free, and behaviour-preserving.

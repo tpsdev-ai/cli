@@ -1,1 +1,0 @@
-- **`signOutboundBody` no longer aliases the caller's delegation chain (Refs #380).** `opts.priorChain` was used directly as the array to extend, so the outgoing hop was `push()`ed onto the CALLER's array. No current caller was affected, but it mutated caller state; the chain is now shallow-copied before the hop is appended.
