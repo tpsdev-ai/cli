@@ -64,6 +64,7 @@ import {
   transitionObligation,
   writeReceipt,
   type ReceiptRecord,
+  type ReceiptScanDirs,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
@@ -513,35 +514,37 @@ const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
-function receiptDirs(ctx: YieldContext): string[] {
+function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   // TWO receipt forms (cli#389 round 3): the metadata receipt every NON-LOCAL
   // route persists under `~/.tps/receipts` — found by its DIRECT path — and,
-  // for a route that also writes a mail file, the posted record itself. So the
-  // shared receipts dir comes FIRST for every route; the route-specific dirs
-  // follow: a local reply lives in the recipient's maildir, a bridge delivery
-  // in the branch sandbox `deliverToSandbox` wrote to (its reduced record has
-  // no marker — the metadata receipt is the one that closes the obligation),
-  // and every other relayed route in the outbox the branch drains.
+  // for a route that also writes a mail file, the posted record itself.
+  //
+  // SPLIT BY HOW A SCAN MAY READ EACH DIR (cli#389 round 4, item 1): the shared
+  // receipts root is the `direct` input — probed once at `<obligationId>.json`
+  // and NEVER listed (it accumulates a receipt per non-local delivery, so a
+  // listing would parse every retained receipt on every scan). The route's own
+  // posted-record dirs are the `posted` input — the only dirs a scan lists: a
+  // local reply lives in the recipient's maildir, a bridge delivery in the
+  // branch sandbox `deliverToSandbox` wrote to (its reduced record has no
+  // marker — the metadata receipt is the one that closes the obligation), and
+  // every other relayed route in the outbox the branch drains.
   const home = process.env.HOME ?? homedir();
-  const dirs = [receiptsDir(home)];
+  const direct = [receiptsDir(home)];
   const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
   if (route.kind === "local") {
-    dirs.push(resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur"));
-    return dirs;
+    return { direct, posted: [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")] };
   }
   if (route.kind === "remote-branch") {
-    return dirs; // the metadata receipt is the only local evidence of the wire send
+    return { direct, posted: [] }; // the metadata receipt is the only local evidence of the wire send
   }
   if (route.kind === "bridge") {
     const mailRoot = resolveAgentMailRoot(route.branchId);
-    dirs.push(resolve(mailRoot, "new"), resolve(mailRoot, "cur"));
-    return dirs;
+    return { direct, posted: [resolve(mailRoot, "new"), resolve(mailRoot, "cur")] };
   }
   const outbox = resolve(home, ".tps", "outbox");
   // The branch drain moves the record new/ → sent/ keeping replyToId+headers,
   // so a REMOTE receipt is either file; .malformed-* in either is a FAILURE.
-  dirs.push(resolve(outbox, "new"), resolve(outbox, "sent"));
-  return dirs;
+  return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {

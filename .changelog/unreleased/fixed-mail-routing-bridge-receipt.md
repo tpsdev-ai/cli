@@ -8,7 +8,8 @@
   the route, the branch and the timestamp — never the body — is created 0600, and
   is matched on the obligation id AND the inbound, so a reused obligation id can
   never be satisfied by an old receipt. The obligation retention sweep now also
-  removes receipts: a receipt goes when its obligation is terminal or when the
-  receipt itself is older than the retention window.
+  removes receipts from that shared store: a receipt whose obligation is terminal
+  goes, and one that has aged past the retention window goes once its obligation
+  is no longer live.
 
   (Refs #389)

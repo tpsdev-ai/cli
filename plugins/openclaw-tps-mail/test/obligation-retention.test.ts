@@ -287,8 +287,11 @@ describe("cli#389 item 2 — the retention sweep owns the receipts", () => {
   it("a terminal obligation's receipt is REMOVED; a live obligation's receipt is KEPT", () => {
     writeRecord("terminal-inbound", "acked", daysAgo(10));
     writeRecord("live-inbound", "pending", daysAgo(1));
-    const spent = receipt("ob-terminal", "terminal-inbound", new Date().toISOString());
-    const live = receipt("ob-live", "live-inbound", new Date().toISOString());
+    // The receipt must name the obligation's OWN id (a random uuid, NOT the
+    // inbound id) AND the inbound it answers — the pair the sweep matches on
+    // (cli#389 round 4, item 2). `writeRecord` mints `ob-<inboundId>`.
+    const spent = receipt("ob-terminal-inbound", "terminal-inbound", new Date().toISOString());
+    const live = receipt("ob-live-inbound", "live-inbound", new Date().toISOString());
     const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
     expect(res.receiptsRemoved).toBe(1);
     expect(existsSync(spent), "a terminal obligation's receipt is gone").toBe(false);
@@ -308,5 +311,74 @@ describe("cli#389 item 2 — the retention sweep owns the receipts", () => {
     const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
     expect(res.receiptsRemoved).toBe(0);
     expect(existsSync(p)).toBe(true);
+  });
+});
+
+// ── cli#389 round 4, items 2 and 3 ─────────────────────────────────────────
+/**
+ * Receipts live in ONE shared directory, so a sweep that runs for this agent
+ * reads files that other obligations — and other agents — still need.
+ *
+ * item 2: a receipt is attributed to a terminal obligation by the PAIR
+ *   (`obligationId` AND `replyToId`). Matching on the inbound alone lets a
+ *   terminal obligation delete another, LIVE obligation's fresh receipt when
+ *   both answer the same inbound id.
+ *
+ * item 3: the age rule is skipped while the obligation a receipt names is still
+ *   live in this agent's store — a live obligation has not finished with its
+ *   evidence yet.
+ */
+describe("cli#389 round 4 — the sweep reads the SHARED receipts dir safely", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "tps-receipt-home-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const ROOT = (): string => join(home, ".tps", "receipts");
+  const receipt = (obligationId: string, replyToId: string, ts: string): string => {
+    mkdirSync(ROOT(), { recursive: true });
+    const path = join(ROOT(), `${obligationId}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({ replyId: `reply-${obligationId}`, obligationId, replyToId, route: "remote-branch", ts }, null, 2),
+      { encoding: "utf-8", mode: 0o600 },
+    );
+    return path;
+  };
+  const quiet = { info: () => {}, warn: () => {} };
+
+  it("item 2: a receipt is terminal only by the PAIR — a live obligation's fresh receipt survives a same-inbound terminal one", () => {
+    // THIS agent's store holds a TERMINAL obligation for `shared-inbound`
+    // (obligationId `ob-shared-inbound`).
+    writeRecord("shared-inbound", "acked", daysAgo(10));
+    // The shared receipts dir holds TWO receipts that both answer
+    // `shared-inbound`: one for the terminal obligation above, and one for a
+    // DIFFERENT obligation that is still live (another agent's, or a later
+    // obligation for the same inbound) — nothing in this store speaks for it.
+    const terminalReceipt = receipt("ob-shared-inbound", "shared-inbound", new Date().toISOString());
+    const liveReceipt = receipt("ob-still-live", "shared-inbound", new Date().toISOString());
+
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
+
+    expect(existsSync(terminalReceipt), "the terminal obligation's own receipt is swept").toBe(false);
+    expect(existsSync(liveReceipt), "a same-inbound receipt for ANOTHER obligation is not terminal").toBe(true);
+    expect(res.receiptsRemoved, "exactly the terminal one").toBe(1);
+  });
+
+  it("item 3: the age rule keeps a live obligation's receipt — and still sweeps one whose obligation is gone", () => {
+    // LIVE in this store (posted is never deletable, at any age) and past the window.
+    writeRecord("live-long", "posted", daysAgo(30));
+    const live = receipt("ob-live-long", "live-long", daysAgo(30));
+    // No record at all for this one: it aged out with nothing left to protect.
+    const gone = receipt("ob-gone-long", "gone-long", daysAgo(30));
+
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
+
+    expect(existsSync(live), "a live obligation's receipt is kept past the window").toBe(true);
+    expect(existsSync(gone), "an aged receipt whose obligation is gone is still swept").toBe(false);
+    expect(res.receiptsRemoved, "only the unowned one").toBe(1);
   });
 });
