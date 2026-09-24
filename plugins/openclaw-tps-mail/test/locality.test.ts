@@ -349,7 +349,7 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
         /* unreadable → leave both null */
       }
     }
-    const nack = scanFor([...senderNew, ...senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
+    const nack = scanFor([senderNew, senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
       typeof r?.headers?.["X-TPS-Nack"] === "string",
     );
 
