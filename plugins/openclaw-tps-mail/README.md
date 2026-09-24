@@ -113,6 +113,35 @@ plugin sweeps the store:
   swept opens a FRESH obligation. Relay retries arrive within minutes or hours,
   never 7 days later, so the sweep cannot collide with a real retry.
 
+## Metadata receipts and the delivery residual
+
+A reply delivered over a route that leaves **no locally readable mail file** —
+the wire to a remote branch, or the branch-office bridge — is receipted so the
+obligation loop can see that it committed. The receipt is a small metadata-only
+record: the reply id, the obligation id, the inbound it answers, the route and
+the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
+`<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` — inside the
+**replying agent's own** obligation store.
+
+- **The replying agent owns its receipts.** They live beside the obligations
+  that owe them, so a startup sweep sees only its own agent's receipts and keys
+  each one on the obligation id (a unique id): a live obligation keeps its
+  receipt, a terminal obligation's receipt goes, and a receipt with no
+  obligation left in the store goes once it has aged past the retention window
+  (an orphan). A receipt with no readable timestamp is never aged out.
+- **A bridge delivery is readable in the sandbox too.** The bridge's reduced
+  sandbox record carries the obligation, inbound and reply ids when an
+  obligation supplies them, so that delivery stays locally readable evidence
+  even if the receipt above could not be written. A caller that supplies none —
+  an ordinary send — leaves the record exactly as it was.
+- **A receipt failure never fails a delivered reply.** Once a delivery call has
+  returned it has committed, so a receipt that then cannot be written is logged
+  by name (`receipt-write-failed`) and does **not** fail the obligation or nack
+  the inbound. For the wire route the receipt is the only local evidence, so the
+  residual is this: a replying host that cannot write its own receipt (a full
+  disk, for example — the bridge still has its sandbox record, the wire does
+  not) resolves that obligation at its **deadline** instead of immediately.
+
 ## Retiring the old hook
 
 Once this plugin is live, retire the shell-hook setup:

@@ -12,31 +12,40 @@
  * truth behind the ack: the ack transition is keyed on a RECEIPT for THIS
  * obligation — never on the fact that a dispatch settled.
  *
- * RECEIPTS (cli#389 round 3). A receipt is EITHER the posted record that
- * carries this obligation's `X-TPS-Obligation` marker (a local maildir file, or
- * the outbox record the branch drains) OR — for a route that leaves no locally
- * readable mail file — the small metadata-only receipt `index.ts` persists at
- * `~/.tps/receipts/<obligationId>.json`. The metadata receipt names the
- * obligation, the reply and the inbound it answers (`replyId`, `obligationId`,
- * `replyToId`), its `route` (+ `branchId`) and `ts` — never the body. The scan
- * accepts a receipt ONLY when BOTH the obligation id and the inbound it answers
- * match, so a reused obligation id can never be satisfied by an old receipt. It
- * reads the metadata receipt by its direct path and falls back to the marker
- * scan for the posted-file case — and the two are SEPARATE inputs (cli#389
- * round 4): a receipts dir is never listed, only the route's posted-record dirs
- * are.
+ * RECEIPTS (cli#389 round 3; PER-AGENT since round 5). A receipt is EITHER the
+ * posted record that carries this obligation's `X-TPS-Obligation` marker (a
+ * local maildir file, or the outbox record the branch drains) OR — for a route
+ * that leaves no locally readable mail file — the small metadata-only receipt
+ * `index.ts` persists at `<mailDir>/<agent>/.obligations/receipts/
+ * <obligationId>.json`, INSIDE the replying agent's own obligation store. The
+ * metadata receipt names the obligation, the reply and the inbound it answers
+ * (`replyId`, `obligationId`, `replyToId`), its `route` (+ `branchId`) and
+ * `ts` — never the body. The scan accepts a receipt ONLY when BOTH the
+ * obligation id and the inbound it answers match, so a reused obligation id can
+ * never be satisfied by an old receipt. It reads the metadata receipt by its
+ * direct path and falls back to the marker scan for the posted-file case — and
+ * the two are SEPARATE inputs: a receipts dir is never listed, only the route's
+ * posted-record dirs are.
+ *
+ * WHY PER-AGENT (cli#389 round 5). Receipts used to live in ONE host-wide
+ * directory, but obligations live in per-agent stores and a sweep can only see
+ * its own agent's obligations — so no shared-directory rule could be safe: a
+ * rule keyed on the inbound let a terminal obligation delete another agent's
+ * receipt, and a per-agent live guard could hold another agent's aged receipt
+ * forever. A receipt now lives with the obligation that owes it, so the sweep
+ * owns exactly its own receipts and keys them on the obligation id, a unique
+ * UUID (see sweepTerminalObligations).
  *
  * RETENTION (cli#401): records are swept at startup recovery. Only TERMINAL
  * records (acked/failed) whose LAST TRANSITION is older than the window are
  * deleted; pending/posted/yielded are never touched. A replayed inbound id whose
  * record was swept opens a FRESH obligation — accepted, because relay retries
  * arrive within minutes or hours, never the window later. The same sweep owns
- * the metadata receipts (cli#389 round 3): a receipt goes when its obligation is
- * terminal, or when the receipt itself is older than the window. That directory
- * is SHARED across agents, so the terminal rule matches the PAIR (obligation id
- * AND the inbound it answers) and the age rule leaves alone any receipt whose
- * obligation is still live in this store (cli#389 round 4). See
- * sweepTerminalObligations.
+ * the metadata receipts (cli#389 round 3), which since round 5 live in the
+ * agent's OWN store, so every receipt it sees belongs to an obligation it can
+ * look up: a live obligation keeps its receipt, a terminal obligation's receipt
+ * goes, and a receipt with NO obligation left in the store goes once it has
+ * aged past the window (an orphan). See sweepTerminalObligations.
  *
  * This module is deliberately pure of the plugin's runtime plumbing: it reads
  * and writes records and scans directories. The timer/arming and the dispatch
@@ -52,7 +61,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 export type ObligationState = "pending" | "yielded" | "posted" | "acked" | "failed";
@@ -193,7 +201,7 @@ export interface RetentionResult {
   unreadable: number;
   /** Terminal records held back because their cur/ record is still unresolved. */
   heldForRecovery: number;
-  /** Metadata receipts removed (a terminal obligation, or aged past the window). */
+  /** Metadata receipts removed (a terminal obligation, or an aged orphan). */
   receiptsRemoved: number;
   /** Metadata receipts left in place because they could not be read. */
   receiptsUnreadable: number;
@@ -250,14 +258,6 @@ export function obligationLastTransitionMs(record: unknown): number | null {
 }
 
 /**
- * The key a receipt is matched to a terminal obligation by (cli#389 round 4,
- * item 2): the PAIR, never the inbound alone. `\u0000` cannot occur in either id.
- */
-function obligationPairKey(obligationId: string, inboundId: string): string {
-  return `${obligationId}\u0000${inboundId}`;
-}
-
-/**
  * Sweep the agent's obligation store: DELETE only TERMINAL records (acked,
  * failed) whose LAST TRANSITION is older than `retentionDays`. NEVER pending /
  * posted / yielded, at any age — restart recovery reads those.
@@ -267,6 +267,11 @@ function obligationPairKey(obligationId: string, inboundId: string): string {
  * unreadable/malformed record (or one whose timestamp cannot be parsed) is LEFT
  * and logged ONCE; a deletion failure is logged and never blocks startup.
  * `retentionDays <= 0` disables the sweep.
+ *
+ * The same sweep owns the agent's metadata RECEIPTS (cli#389 round 3), which
+ * live in this store as `receipts/<obligationId>.json` (round 5): a live
+ * obligation keeps its receipt, a terminal obligation's receipt goes, and an
+ * orphan (no obligation in the store) goes once it has aged past the window.
  *
  * REPLAY AFTER A SWEEP (accepted, pinned by a test): a replayed inbound whose
  * record was swept opens a FRESH obligation — relay retries arrive within
@@ -278,7 +283,6 @@ export function sweepTerminalObligations(
   retentionDays: number,
   log?: ObligationLog,
   nowMs: number = Date.now(),
-  receiptsDirOverride?: string,
 ): RetentionResult {
   const res: RetentionResult = {
     removed: 0,
@@ -313,19 +317,17 @@ export function sweepTerminalObligations(
   }
   const cutoff = nowMs - retentionDays * 24 * 60 * 60 * 1000;
   const leftUnreadable: string[] = [];
-  // WHICH OBLIGATIONS WERE TERMINAL AT THE START of this sweep. The obligation
-  // loop below DELETES aged terminal records, so "is its obligation terminal?"
-  // for a receipt (below) must be answered from a snapshot taken first — else
-  // the receipt of the very record just swept looks orphaned.
+  // WHICH OBLIGATIONS THE STORE HELD at the START of this sweep, by state. The
+  // obligation loop below DELETES aged terminal records, so "is this receipt's
+  // obligation live, terminal, or gone?" must be answered from a snapshot taken
+  // first — else the receipt of the very record just swept looks orphaned.
   //
-  // cli#389 round 4, item 2: the snapshot is keyed by the PAIR (obligation id,
-  // inbound id). Receipts are shared across agents, so attributing a receipt to
-  // a terminal obligation by the inbound ALONE lets a terminal obligation delete
-  // another, still-live obligation's fresh receipt for the same inbound.
-  const terminalPairs = new Set<string>();
-  // cli#389 round 4, item 3: which inbounds are still LIVE in THIS store, so the
-  // age rule never takes a receipt an unfinished obligation still needs.
-  const liveInboundIds = new Set<string>();
+  // cli#389 round 5: the snapshot is keyed by the OBLIGATION ID, which is a
+  // unique UUID, and the receipts live in this same store — so every receipt is
+  // attributable to an obligation this sweep can see. There is no host-wide dir
+  // to be careful of, and no inbound for two obligations to collide on.
+  const terminalObligationIds = new Set<string>();
+  const liveObligationIds = new Set<string>();
   for (const name of names) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     const path = resolve(dir, name);
@@ -347,16 +349,13 @@ export function sweepTerminalObligations(
       continue;
     }
     if (!TERMINAL_STATES.has(state as ObligationState)) {
-      const liveInbound = (record as { inboundId?: unknown }).inboundId;
-      if (typeof liveInbound === "string") liveInboundIds.add(liveInbound);
+      const liveObligationId = (record as { obligationId?: unknown }).obligationId;
+      if (typeof liveObligationId === "string") liveObligationIds.add(liveObligationId);
       res.left++; // pending / posted / yielded are never deletable
       continue;
     }
-    const snapshotInboundId = (record as { inboundId?: unknown }).inboundId;
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
-    if (typeof snapshotInboundId === "string" && typeof snapshotObligationId === "string") {
-      terminalPairs.add(obligationPairKey(snapshotObligationId, snapshotInboundId));
-    }
+    if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
     // A terminal record whose cur/ record is still unresolved is HELD until
     // startup recovery resolves it (else a re-dispatch would open a fresh
     // obligation and double-post).
@@ -385,17 +384,19 @@ export function sweepTerminalObligations(
       res.left++;
     }
   }
-  // ── the metadata receipts (cli#389 round 3) ────────────────────────────────
-  // Nothing else ever removes a receipt, so this sweep owns them: a receipt
-  // goes when the obligation it names is TERMINAL in this agent's store, or when
-  // the receipt itself has aged past the window. A receipt with no readable
-  // timestamp is left in place (never aged by a missing value), exactly like an
-  // obligation record.
-  //
-  // The receipts dir is SHARED (every agent on this HOME writes into it), so
-  // both rules must be safe against files this store does not own — see the two
-  // cli#389 round 4 marks below.
-  const receiptsRoot = receiptsDirOverride ?? receiptsDir();
+  // ── the metadata receipts (cli#389 round 3; per-agent since round 5) ───────
+  // Nothing else ever removes a receipt, so this sweep owns them. They live in
+  // THIS agent's own store, so each one names an obligation this sweep can look
+  // up, and three rules cover every case:
+  //   - its obligation is LIVE here → keep (an unfinished obligation has not
+  //     finished with the evidence its ack depends on);
+  //   - its obligation is TERMINAL here → delete (it has served its purpose;
+  //     decided from the snapshot above, so the receipt of the record deleted
+  //     moments ago is still attributed);
+  //   - NO obligation here at all → an orphan: delete once it has aged past the
+  //     window, and never before. A receipt with no readable timestamp is never
+  //     aged by a missing value, exactly like an obligation record.
+  const receiptsRoot = receiptsDir(mailDir, agent);
   let receiptNames: string[];
   try {
     receiptNames = readdirSync(receiptsRoot);
@@ -414,25 +415,16 @@ export function sweepTerminalObligations(
       continue;
     }
     const obligationId = (receipt as { obligationId?: unknown } | null)?.obligationId;
-    const replyToId = (receipt as { replyToId?: unknown } | null)?.replyToId;
     const ts = (receipt as { ts?: unknown } | null)?.ts;
-    // (a) its obligation was terminal at the start of this sweep → it has served
-    //     its purpose (the record may have been deleted moments ago, above).
-    //     The PAIR decides (cli#389 round 4, item 2): the obligation id AND the
-    //     inbound it answers, so another obligation's receipt for the same
-    //     inbound is never taken for this terminal one's.
-    const terminal =
-      typeof obligationId === "string" &&
-      typeof replyToId === "string" &&
-      terminalPairs.has(obligationPairKey(obligationId, replyToId));
-    // (b) the receipt itself is older than the window — but NEVER while the
-    //     obligation it names is still live in this store (cli#389 round 4,
-    //     item 3): an unfinished obligation has not finished with its evidence,
-    //     and a later ack must still find it.
+    // The obligation id is the whole key (cli#389 round 5). A receipt that
+    // names no obligation id cannot be attributed to one, so it is left in
+    // place rather than aged out on a guess.
+    if (typeof obligationId !== "string" || obligationId.length === 0) continue;
+    const terminal = terminalObligationIds.has(obligationId);
+    const live = liveObligationIds.has(obligationId);
     const t = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
-    const live = typeof replyToId === "string" && liveInboundIds.has(replyToId);
-    const aged = Number.isFinite(t) && t < cutoff && !live;
-    if (!terminal && !aged) continue;
+    const agedOrphan = !live && Number.isFinite(t) && t < cutoff;
+    if (!terminal && !agedOrphan) continue;
     try {
       unlinkSync(path);
       res.receiptsRemoved++;
@@ -483,24 +475,30 @@ export interface ReceiptRecord {
   ts: string;
 }
 
-/** The receipts root (`~/.tps/receipts`), shared by every agent on this HOME. */
-export function receiptsDir(home: string = process.env.HOME ?? homedir()): string {
-  return resolve(home, ".tps", "receipts");
+/**
+ * The receipts dir INSIDE the agent's own obligation store (cli#389 round 5).
+ * It is the replying agent's, not the host's: only the sweep for THIS agent
+ * reads it, and every receipt in it belongs to an obligation in the store
+ * beside it.
+ */
+export function receiptsDir(mailDir: string, agent: string): string {
+  return resolve(obligationsDir(mailDir, agent), "receipts");
 }
 
 /** One receipt per obligation, keyed by the obligation id. */
-export function receiptPath(obligationId: string, home?: string): string {
-  return resolve(receiptsDir(home), `${obligationId}.json`);
+export function receiptPath(mailDir: string, agent: string, obligationId: string): string {
+  return resolve(receiptsDir(mailDir, agent), `${obligationId}.json`);
 }
 
 /**
  * Persist the metadata receipt for a successful NON-LOCAL delivery (cli#389
- * round 3). Atomic (a dot temp + rename, so a concurrent scan never reads a
- * half-written file) and 0600 AT CREATION — the mode is set on the temp file,
- * so the final name is never once world/group-readable.
+ * round 3) into the replying agent's own store (round 5). Atomic (a dot temp +
+ * rename, so a concurrent scan never reads a half-written file) and 0600 AT
+ * CREATION — the mode is set on the temp file, so the final name is never once
+ * world/group-readable.
  */
-export function writeReceipt(record: ReceiptRecord, home?: string): string {
-  const dir = receiptsDir(home);
+export function writeReceipt(mailDir: string, agent: string, record: ReceiptRecord): string {
+  const dir = receiptsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const target = resolve(dir, `${record.obligationId}.json`);
   const tmp = resolve(dir, `.${record.obligationId}.json.tmp`);
@@ -522,10 +520,10 @@ export type ReceiptScan =
  * them is a SHARED, ever-growing directory that must never be walked:
  *
  *   - `direct` — read ONLY by the direct `<obligationId>.json` path; NEVER
- *     listed. The shared `~/.tps/receipts` root belongs here: it accumulates a
- *     file per non-local delivery and nothing but the retention sweep ever
- *     removes one, so a listing would read and parse every retained receipt on
- *     every scan.
+ *     listed. The agent's own receipts root belongs here: it accumulates a file
+ *     per non-local delivery and nothing but the retention sweep ever removes
+ *     one, so a listing would read and parse every retained receipt on every
+ *     scan.
  *   - `posted` — LISTED for a posted record carrying the obligation marker.
  *     The marker names no path, so these dirs must be walked: the recipient
  *     maildir's `new`/`cur`, the bridge sandbox, the outbox the branch drains.
@@ -566,13 +564,13 @@ export function envelopeFrom(body: string): string | null {
  * TWO receipt forms, ONE rule: a receipt must name THIS obligation AND the
  * inbound it answers.
  *
- *   (1) METADATA (cli#389 round 3) — `~/.tps/receipts/<obligationId>.json`: the
- *       small record `writeReceipt` persists when a NON-LOCAL delivery commits
- *       (outbox, remote-branch, bridge). Read by its DIRECT path — never by
- *       parsing the directory (cli#389 round 4, item 1: it is the `direct`
- *       input, and a `direct` dir is never listed) — and accepted when
- *       `obligationId` matches AND `replyToId` is the inbound this obligation is
- *       keyed on.
+ *   (1) METADATA (cli#389 round 3) — `<mailDir>/<agent>/.obligations/receipts/
+ *       <obligationId>.json` (per-agent since round 5): the small record
+ *       `writeReceipt` persists when a NON-LOCAL delivery commits (outbox,
+ *       remote-branch, bridge). Read by its DIRECT path — never by parsing the
+ *       directory (cli#389 round 4, item 1: it is the `direct` input, and a
+ *       `direct` dir is never listed) — and accepted when `obligationId`
+ *       matches AND `replyToId` is the inbound this obligation is keyed on.
  *   (2) POSTED FILE — the delivered reply record itself, which carries the
  *       marker this inbound minted. Scan the reply's destination directories
  *       (the `posted` input — the only dirs that are ever listed) for a record
@@ -586,6 +584,15 @@ export function envelopeFrom(body: string): string | null {
  *       reply to someone else); and
  *   (e) `record.replyToId === replyToId` — the record ANSWERS this inbound, so a
  *       reused obligation id can never be satisfied by a reply to another one.
+ *   OR (f) — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
+ *       record `deliverToSandbox` writes, which carries the obligation ids when
+ *       the caller supplies them (`record.obligationId === obligationId` and
+ *       `record.replyToId === replyToId`), with the replying agent as `from`
+ *       and its signed envelope as the body. That record is what keeps a bridge
+ *       delivery locally readable evidence when the metadata receipt above
+ *       could not be written (a full disk, a permission error). It carries no
+ *       headers and no `accountId` — so of the pins in (a)-(e) it carries (c),
+ *       (d) and (e), and those are the ones checked.
  *
  * WHAT THIS IS NOT: the receipt is NOT signature-verified here, and this scan
  * does not claim it is. Checking the envelope's signature would not close the
@@ -617,8 +624,8 @@ export function scanForReceipt(
 ): ReceiptScan {
   let malformed: string | null = null;
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
-  //     `~/.tps/receipts` holds a receipt per non-local delivery, so walking it
-  //     would parse every retained receipt on every scan (cli#389 round 4).
+  //     the agent's receipts root holds a receipt per non-local delivery, so
+  //     walking it would parse every retained receipt on every scan (round 4).
   for (const dir of dirs.direct) {
     const direct = resolve(dir, `${obligationId}.json`);
     if (!fs.existsSync(direct)) continue;
@@ -660,12 +667,27 @@ export function scanForReceipt(
       } catch {
         continue; // unparseable but not quarantined yet; not a receipt
       }
-      if (record?.headers?.["X-TPS-Obligation"] !== obligationId) continue;
-      if (record?.accountId !== accountId) continue;
-      if (record?.from !== agent) continue;
-      if (record?.replyToId !== replyToId) continue;
-      if (envelopeFrom(record?.body ?? "") !== agent) continue;
-      return { status: "found", path };
+      if (record?.headers?.["X-TPS-Obligation"] === obligationId) {
+        if (record?.accountId !== accountId) continue;
+        if (record?.from !== agent) continue;
+        if (record?.replyToId !== replyToId) continue;
+        if (envelopeFrom(record?.body ?? "") !== agent) continue;
+        return { status: "found", path };
+      }
+      // (2b) the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
+      //      record `deliverToSandbox` writes, carrying the obligation ids the
+      //      caller supplied. It has no headers and no accountId, so the pins it
+      //      CAN carry are the ones checked — the obligation it names, the
+      //      inbound it answers, the replying agent as `from`, and that agent's
+      //      signed envelope as the body.
+      if (
+        record?.obligationId === obligationId &&
+        record?.replyToId === replyToId &&
+        record?.from === agent &&
+        envelopeFrom(record?.body ?? "") === agent
+      ) {
+        return { status: "found", path };
+      }
     }
   }
   if (malformed) return { status: "malformed", path: malformed };

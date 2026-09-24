@@ -61,8 +61,33 @@ mock.module("@tpsdev-ai/cli/utils/relay", () => ({
     if (relay.failDeliver) throw new Error("relay down");
     relay.deliver.push({ branchId, msg });
   },
+  // Mirrors the REAL deliverToSandbox (packages/cli/src/utils/relay.ts): it
+  // writes the reduced record into the branch mail root's new/, carrying the
+  // obligation ids when the caller supplies them (cli#389 round 5, item 2). So
+  // a bridge delivery is locally readable — and the receipt scan can close the
+  // obligation from the sandbox record even when the metadata receipt cannot be
+  // written.
   deliverToSandbox: (branchId: string, msg: any) => {
     relay.bridge.push({ branchId, msg });
+    const dir = join(process.env.HOME ?? "", ".tps", "branch-office", branchId, "mail", "new");
+    mkdirSync(dir, { recursive: true });
+    const payload: Record<string, unknown> = {
+      id: msg.id ?? `sandbox-${Math.random().toString(36).slice(2, 10)}`,
+      from: msg.from ?? "host",
+      to: msg.to,
+      body: msg.body,
+      timestamp: msg.timestamp ?? new Date().toISOString(),
+      read: false,
+      origin: msg.origin ?? "host",
+    };
+    if (msg.obligationId) payload.obligationId = msg.obligationId;
+    if (msg.replyToId) payload.replyToId = msg.replyToId;
+    if (msg.replyId) payload.replyId = msg.replyId;
+    writeFileSync(
+      join(dir, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}.json`),
+      JSON.stringify(payload, null, 2),
+      "utf-8",
+    );
   },
   resolveAgentMailRoot: (branchId: string) =>
     join(process.env.HOME ?? "", ".tps", "branch-office", branchId, "mail"),
@@ -249,6 +274,10 @@ interface DispatchOutcome {
   obligation: any | null;
   /** A nack record for this inbound, if one was written. */
   nack: string | null;
+  /** The bridge's sandbox record for this inbound, when the bridge was used. */
+  sandboxRecord: any | null;
+  /** Every warn the plugin logged while this route ran. */
+  warns: string[];
 }
 
 /** Route the DISPATCHER reply path and report the full obligation outcome. */
@@ -304,10 +333,15 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       bindings: bound.map((id) => ({ agentId: id, match: { channel: "tps-mail", accountId: "default" } })),
     };
     const abort = new AbortController();
+    const warns: string[] = [];
     const ctx = {
       account: { accountId: "default", mailDir, enabled: true },
       cfg,
-      log: { info: () => {}, warn: () => {}, error: () => {} },
+      log: {
+        info: () => {},
+        warn: (m: string) => warns.push(String(m)),
+        error: () => {},
+      },
       channelRuntime,
       abortSignal: abort.signal,
     };
@@ -328,7 +362,9 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const senderNew = join(mailDir, sender, "new");
     const senderCur = join(mailDir, sender, "cur");
     const outboxDirs = [join(root, ".tps", "outbox", "new"), join(root, ".tps", "outbox", "sent")];
-    const receiptDirsAll = [join(root, ".tps", "receipts")];
+    // cli#389 round 5, item 1: the metadata receipt lives in the REPLYING
+    // agent's own obligation store, not a host-wide directory.
+    const receiptDirsAll = [join(mailDir, agentId, ".obligations", "receipts")];
     const bridgeDirs = [join(root, ".tps", "branch-office", sender, "mail", "new")];
     const isReply = (rec: any) => rec?.headers?.["X-TPS-InReplyTo"] === inboundId;
     // cli#389 round 3: a metadata receipt carries NO headers and NO body, so it
@@ -352,6 +388,9 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const nack = scanFor([senderNew, senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
       typeof r?.headers?.["X-TPS-Nack"] === "string",
     );
+    // cli#389 round 5, item 2: the bridge's sandbox record, carrying the
+    // obligation ids deliverToSandbox was given.
+    const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundId);
 
     let route: DispatchOutcome["route"] = "failure";
     let replyId: string | null = null;
@@ -390,6 +429,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       receiptMode,
       obligation: readJsonSafe(obligationPath) ?? obligation,
       nack: nack[0]?.path ?? null,
+      sandboxRecord: bridgeRecord[0]?.rec ?? null,
+      warns,
     };
   } finally {
     if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
@@ -601,5 +642,89 @@ describe("cli#389 item 1 (round 3) — a bridge reply persists the same receipt"
     // The obligation is DISCHARGED: acked at the receipt, never nacked.
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
+  }, 20000);
+});
+
+// ── item 2 (round 5): a post-commit receipt failure never fails the delivery ──
+
+/**
+ * A delivery that has RETURNED has committed. A receipt write is evidence
+ * upkeep, so when it throws (a full disk, a permission error) the reply must NOT
+ * be reported as failed and the inbound must NOT be nacked. The evidence is not
+ * lost either: `deliverToSandbox` writes the obligation ids into the sandbox
+ * record, so the scan still closes the obligation — even with no receipt file at
+ * all.
+ *
+ * The failure is INJECTED, not mocked away: a FILE is put where the replying
+ * agent's receipts dir must go, so the real writer cannot create it. A mock that
+ * swallowed the error would prove nothing.
+ */
+describe("cli#389 round 5, item 2 — a receipt write that fails AFTER the bridge committed", () => {
+  it("(c) NOT failed, NO nack, and the scan closes it from the SANDBOX record", async () => {
+    const setup = () => {
+      // "ember" has a local branch-office inbox with no remote.json → the bridge.
+      branchInbox("ember");
+      // INJECT the receipt-write failure: put a FILE where the replying agent's
+      // receipts dir must go, so mkdirSync cannot create it (the full-disk
+      // analogue). The host-wide path carries the same injection, so the drill
+      // holds against a tree that still writes THERE too — this test is about
+      // what happens AFTER a commit, not about where the receipt goes.
+      mkdirSync(join(mailDir, "anvil", ".obligations"), { recursive: true });
+      writeFileSync(join(mailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
+      mkdirSync(join(root, ".tps"), { recursive: true });
+      writeFileSync(join(root, ".tps", "receipts"), "not a directory", "utf-8");
+    };
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("ember", ["anvil"]));
+
+    // The delivery committed…
+    expect(outcome.route).toBe("bridge");
+    expect(relay.bridge.length).toBeGreaterThan(0);
+
+    // …the receipt could NOT be written…
+    expect(outcome.receiptRecord, "no metadata receipt exists").toBeNull();
+
+    // …but the send is NOT reported as failed, and the inbound is not nacked.
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.obligation?.state).toBe("acked");
+    expect(outcome.nack).toBeNull();
+
+    // The post-commit error is logged BY NAME — never as a send failure.
+    expect(outcome.warns.some((w) => w.includes("receipt-write-failed")), "logged by name").toBe(true);
+
+    // The scan closed it from the SANDBOX record, which carries the ids the
+    // bridge was given — the reply's own id included.
+    expect(outcome.sandboxRecord, "the sandbox record is the local evidence").not.toBeNull();
+    expect(outcome.sandboxRecord.obligationId).toBe(relay.bridge[0]!.msg.obligationId);
+    expect(outcome.sandboxRecord.obligationId).toBe(outcome.obligation?.obligationId);
+    expect(outcome.sandboxRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    expect(outcome.sandboxRecord.replyId).toBe(relay.bridge[0]!.msg.replyId);
+  }, 20000);
+
+  it("(c2) on the WIRE route the same failure is not a send failure either — the obligation resolves at its DEADLINE (the stated residual)", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+      mkdirSync(join(mailDir, "anvil", ".obligations"), { recursive: true });
+      writeFileSync(join(mailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
+      mkdirSync(join(root, ".tps"), { recursive: true });
+      writeFileSync(join(root, ".tps", "receipts"), "not a directory", "utf-8");
+    };
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    // The wire send committed…
+    expect(outcome.route).toBe("remote-branch");
+    expect(relay.deliver.length).toBeGreaterThan(0);
+    // …its receipt could not be written, and that is the ONLY local evidence
+    // the wire route has…
+    expect(outcome.receiptRecord).toBeNull();
+    // …and the send is neither failed nor nacked: it is YIELDED, with its
+    // deadline armed, where the scan decides. That is the residual the README
+    // states.
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.obligation?.state).toBe("yielded");
+    expect(outcome.nack).toBeNull();
+    expect(typeof outcome.obligation?.deadlineAt, "a deadline is armed").toBe("string");
+    // The post-commit error is logged BY NAME — never as a send failure.
+    expect(outcome.warns.some((w) => w.includes("receipt-write-failed")), "logged by name").toBe(true);
   }, 20000);
 });

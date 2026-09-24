@@ -335,6 +335,10 @@ describe("tps mail send with signed envelopes", () => {
     expect(files.length).toBe(1);
 
     const wrapper = JSON.parse(readFileSync(join(deliveredDir, files[0]!), "utf-8"));
+    // cli#389 round 5, item 2: this caller passes NO obligation ids, so the
+    // record is exactly the reduced shape it has always been — no fields added,
+    // no order changed.
+    expect(Object.keys(wrapper)).toEqual(["id", "from", "to", "body", "timestamp", "read", "origin"]);
     // The wrapper.body is the signed envelope JSON string.
     const env = JSON.parse(wrapper.body) as Envelope;
     expect(env.v).toBe(1);

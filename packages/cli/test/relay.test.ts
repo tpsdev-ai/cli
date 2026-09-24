@@ -123,6 +123,73 @@ describe("relay utils", () => {
     expect(payload.body).toBe("hi from host");
   });
 
+  // ── cli#389 round 5, item 2 ────────────────────────────────────────────
+  // The bridge's sandbox record is the local evidence for a bridge delivery.
+  // A caller that supplies no obligation ids (the CLI's own local send) must be
+  // untouched — byte-for-byte — and a caller that does supply them must have
+  // them written in.
+
+  test("a record for a caller that supplies NO obligation ids is byte-identical to before", () => {
+    const branchMail = join(root, ".tps", "branch-office", "brancha", "mail");
+    mkdirSync(branchMail, { recursive: true });
+
+    deliverToSandbox("brancha", {
+      id: "fixed-id",
+      from: "anvil",
+      to: "ember",
+      body: "hello",
+      timestamp: "2026-01-02T03:04:05.000Z",
+    });
+
+    const files = readdirSync(join(branchMail, "new")).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBe(1);
+    const raw = readFileSync(join(branchMail, "new", files[0]!), "utf-8");
+    // Exactly the reduced shape, in exactly the order it has always had.
+    expect(Object.keys(JSON.parse(raw))).toEqual(["id", "from", "to", "body", "timestamp", "read", "origin"]);
+    expect(raw).toBe(
+      JSON.stringify(
+        { id: "fixed-id", from: "anvil", to: "ember", body: "hello", timestamp: "2026-01-02T03:04:05.000Z", read: false, origin: "host" },
+        null,
+        2,
+      ),
+    );
+  });
+
+  test("the obligation metadata is written into the record WHEN the caller gives it", () => {
+    const branchMail = join(root, ".tps", "branch-office", "brancha", "mail");
+    mkdirSync(branchMail, { recursive: true });
+
+    deliverToSandbox("brancha", {
+      id: "reply-1",
+      from: "anvil",
+      to: "ember",
+      body: "signed envelope",
+      timestamp: "2026-01-02T03:04:05.000Z",
+      obligationId: "ob-1",
+      replyToId: "inbound-1",
+      replyId: "reply-1",
+    });
+
+    const files = readdirSync(join(branchMail, "new")).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBe(1);
+    const rec = JSON.parse(readFileSync(join(branchMail, "new", files[0]!), "utf-8"));
+    expect(Object.keys(rec)).toEqual([
+      "id",
+      "from",
+      "to",
+      "body",
+      "timestamp",
+      "read",
+      "origin",
+      "obligationId",
+      "replyToId",
+      "replyId",
+    ]);
+    expect(rec.obligationId).toBe("ob-1");
+    expect(rec.replyToId).toBe("inbound-1");
+    expect(rec.replyId).toBe("reply-1");
+  });
+
   test("relay ignores forged from field and rewrites to container:<agent>", async () => {
     const out = outboxNew("brancha");
     writeJson(join(out, "forge.json"), {

@@ -251,8 +251,9 @@ function writeOutboxFile(message: TpsMailBody): string {
  * obligation scan could never find a receipt for it and a delivered reply was
  * later marked failed and nacked — the wire case (round 1, item 1) and the
  * bridge case (round 3, item 1) are the same defect. Persist the metadata-only
- * receipt those routes owe, under `~/.tps/receipts/<obligationId>.json`
- * (round 3, item 2): the ids, the route, the branch and the timestamp — NEVER
+ * receipt those routes owe, into the REPLYING agent's own obligation store at
+ * `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` (per-agent since
+ * cli#389 round 5): the ids, the route, the branch and the timestamp — NEVER
  * the body.
  *
  * SCOPE: only a route that leaves NO locally readable mail file needs one. A
@@ -266,7 +267,7 @@ function writeOutboxFile(message: TpsMailBody): string {
  * ordinary outbound send), so nothing is written for it: a receipt is evidence
  * of a discharged obligation, never a mail copy.
  */
-function persistReceipt(message: TpsMailBody, route: "remote-branch" | "bridge", branchId?: string): void {
+function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, route: "remote-branch" | "bridge", branchId?: string): void {
   const obligationId = message.headers?.["X-TPS-Obligation"];
   if (typeof obligationId !== "string" || obligationId.length === 0) return;
   // The receipt must answer a specific inbound: without a replyToId it could
@@ -280,10 +281,59 @@ function persistReceipt(message: TpsMailBody, route: "remote-branch" | "bridge",
     ...(branchId ? { branchId } : {}),
     ts: typeof message.timestamp === "string" && message.timestamp.length > 0 ? message.timestamp : new Date().toISOString(),
   };
-  writeReceipt(record);
+  writeReceipt(mailDir, agent, record);
 }
 
-/** Deliver to a remote branch, then persist the local receipt item 1 requires. */
+/**
+ * cli#389 round 5, item 2: a receipt write is EVIDENCE UPKEEP, never part of the
+ * send. Once a delivery call has RETURNED it has committed, so a receipt that
+ * cannot be written (a full disk, a permission error) must not set a failure —
+ * that reported a delivered reply as failed and nacked its inbound. The error is
+ * logged by name and swallowed, on every route.
+ *
+ * Nothing is lost: the bridge's sandbox record carries the same ids (see
+ * obligationMetadata), so the scan still finds that delivery; for the wire the
+ * receipt is the only local evidence, so that obligation resolves at its
+ * deadline instead of immediately (stated in the README).
+ */
+function persistReceiptAfterCommit(
+  mailDir: string,
+  agent: string,
+  message: TpsMailBody,
+  route: "remote-branch" | "bridge",
+  branchId: string | undefined,
+  log?: any,
+): void {
+  try {
+    persistReceipt(mailDir, agent, message, route, branchId);
+  } catch (err: any) {
+    log?.warn?.(
+      `tps-mail: receipt-write-failed: the ${route} delivery committed, but its receipt was not written ` +
+        `(${err?.message ?? err}); the obligation resolves at its deadline`,
+    );
+  }
+}
+
+/**
+ * The obligation ids the bridge's `deliverToSandbox` record carries when the
+ * caller has them (cli#389 round 5, item 2): the obligation, the inbound the
+ * reply answers, and the reply itself. EMPTY for a message that owes no
+ * obligation (an ordinary outbound send, a nack), so that record stays
+ * byte-identical to the one the CLI's own local send writes.
+ */
+function obligationMetadata(message: TpsMailBody): { obligationId?: string; replyToId?: string; replyId?: string } {
+  const obligationId = message.headers?.["X-TPS-Obligation"];
+  if (typeof obligationId !== "string" || obligationId.length === 0) return {};
+  if (typeof message.replyToId !== "string" || message.replyToId.length === 0) return {};
+  return { obligationId, replyToId: message.replyToId, replyId: message.id };
+}
+
+/**
+ * Deliver to a remote branch — the COMMIT of the wire route. The local receipt
+ * is written by the caller AFTER this returns and under its own guard
+ * (persistReceiptAfterCommit): a receipt that cannot be written must never
+ * report a delivered reply as failed (cli#389 round 5, item 2).
+ */
 async function deliverRemote(reply: TpsMailBody, branchId: string): Promise<void> {
   // Preserve the outbound identity (id + timestamp) so the wire payload — and
   // the branch's ACK correlation — match the record this plugin reports as the
@@ -295,7 +345,6 @@ async function deliverRemote(reply: TpsMailBody, branchId: string): Promise<void
     body: reply.body,
     timestamp: reply.timestamp,
   });
-  persistReceipt(reply, "remote-branch", branchId);
 }
 
 /**
@@ -327,18 +376,25 @@ function deliverOutboundMail(
       return Promise.resolve({ path: writeOutboxFile(message), route: "outbox" });
     case "remote-branch":
       // The wire path, exactly as `tps mail send` sends it, PLUS the local
-      // receipt item 1 requires so a later obligation scan can find it.
-      return deliverRemote(message, route.branchId).then(() => ({
-        path: `remote-branch:${route.branchId}`,
-        route: "remote-branch" as const,
-      }));
+      // receipt item 1 requires so a later obligation scan can find it. The
+      // receipt is written after the send RETURNS and cannot fail it (round 5).
+      return deliverRemote(message, route.branchId).then(() => {
+        persistReceiptAfterCommit(mailDir, message.from, message, "remote-branch", route.branchId);
+        return { path: `remote-branch:${route.branchId}`, route: "remote-branch" as const };
+      });
     case "bridge": {
       // A local branch-office sandbox — the CLI's own bridge, imported. Its
-      // sandbox record is REDUCED (no marker, no reply id), so the obligation
-      // scan can only see this delivery through the metadata receipt
-      // (round 3, item 1: the bridge owes the same receipt as the wire).
-      deliverToSandbox(route.branchId, { to: message.to, from: message.from, body: message.body });
-      persistReceipt(message, "bridge", route.branchId);
+      // sandbox record is REDUCED (no marker, no accountId), so the obligation
+      // scan reads it through the obligation ids `deliverToSandbox` writes into
+      // it when given (round 5, item 2) and/or the metadata receipt the bridge
+      // owes exactly like the wire (round 3, item 1).
+      deliverToSandbox(route.branchId, {
+        to: message.to,
+        from: message.from,
+        body: message.body,
+        ...obligationMetadata(message),
+      });
+      persistReceiptAfterCommit(mailDir, message.from, message, "bridge", route.branchId);
       return Promise.resolve({ path: `bridge:${route.branchId}`, route: "bridge" });
     }
     case "failed":
@@ -516,20 +572,24 @@ let yieldDetection: "subscription" | "settlement-inference" = "settlement-infere
 
 function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   // TWO receipt forms (cli#389 round 3): the metadata receipt every NON-LOCAL
-  // route persists under `~/.tps/receipts` — found by its DIRECT path — and,
-  // for a route that also writes a mail file, the posted record itself.
+  // route persists — found by its DIRECT path — and, for a route that also
+  // writes a mail file, the posted record itself.
   //
-  // SPLIT BY HOW A SCAN MAY READ EACH DIR (cli#389 round 4, item 1): the shared
+  // The receipt lives in the REPLYING agent's OWN obligation store (round 5),
+  // so the agent that owes the obligation is the one whose sweep owns it.
+  //
+  // SPLIT BY HOW A SCAN MAY READ EACH DIR (cli#389 round 4, item 1): the agent's
   // receipts root is the `direct` input — probed once at `<obligationId>.json`
   // and NEVER listed (it accumulates a receipt per non-local delivery, so a
   // listing would parse every retained receipt on every scan). The route's own
   // posted-record dirs are the `posted` input — the only dirs a scan lists: a
   // local reply lives in the recipient's maildir, a bridge delivery in the
-  // branch sandbox `deliverToSandbox` wrote to (its reduced record has no
-  // marker — the metadata receipt is the one that closes the obligation), and
-  // every other relayed route in the outbox the branch drains.
+  // branch sandbox `deliverToSandbox` wrote to (its reduced record carries the
+  // obligation ids when the bridge was given them — round 5, item 2 — and the
+  // metadata receipt is the other way it closes the obligation), and every other
+  // relayed route in the outbox the branch drains.
   const home = process.env.HOME ?? homedir();
-  const direct = [receiptsDir(home)];
+  const direct = [receiptsDir(ctx.mailDir, ctx.agent)];
   const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
   if (route.kind === "local") {
     return { direct, posted: [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")] };
@@ -1096,18 +1156,28 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 );
                 posted = true;
               } else if (route.kind === "remote-branch") {
+                // The COMMIT first; the receipt is written after it returns and
+                // under a guard that cannot fail the send (cli#389 round 5).
                 await deliverRemote(reply, route.branchId);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=remote-branch: ${route.branchId}; receipt persisted)`,
-                );
                 posted = true;
+                persistReceiptAfterCommit(account.mailDir, recipient, reply, "remote-branch", route.branchId, log);
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=remote-branch: ${route.branchId}; delivery committed)`,
+                );
               } else if (route.kind === "bridge") {
-                deliverToSandbox(route.branchId, { to: msg.from, from: recipient, body: reply.body });
-                persistReceipt(reply, "bridge", route.branchId);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=bridge: ${route.branchId}; receipt persisted)`,
-                );
+                // The record carries the obligation ids, so this delivery stays
+                // locally readable even if the receipt write below fails.
+                deliverToSandbox(route.branchId, {
+                  to: msg.from,
+                  from: recipient,
+                  body: reply.body,
+                  ...obligationMetadata(reply),
+                });
                 posted = true;
+                persistReceiptAfterCommit(account.mailDir, recipient, reply, "bridge", route.branchId, log);
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=bridge: ${route.branchId}; delivery committed)`,
+                );
               } else {
                 postFailure = postFailure ?? (route.kind === "failed" ? route.reason : `no-route:${msg.from}`);
                 log?.warn?.(

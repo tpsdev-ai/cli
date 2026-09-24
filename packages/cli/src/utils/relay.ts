@@ -27,6 +27,15 @@ export interface RelayMessage {
   read?: boolean;
   origin?: string;
   error?: string;
+  /**
+   * cli#389 round 5, item 2: the obligation ids a caller discharging a reply
+   * obligation supplies. Written into the delivered record when given (see
+   * deliverToSandbox) so a bridge reply stays locally readable evidence; absent
+   * for every ordinary send.
+   */
+  obligationId?: string;
+  replyToId?: string;
+  replyId?: string;
 }
 
 /** Returns the mail root dir for an agent (branch-office or team workspace). Used by deliverToSandbox and external callers that need to read delivered messages. */
@@ -684,6 +693,15 @@ function migrateOrphanedInboxMessages(mailRoot: string): void {
   }
 }
 
+/**
+ * Deliver a message into a branch-office (or team workspace) sandbox inbox.
+ *
+ * cli#389 round 5, item 2: the optional obligation ids on `message` are written
+ * into the record when given, so a caller discharging a reply obligation leaves
+ * locally readable evidence of which obligation and which inbound the delivery
+ * answers. A caller that supplies none (the local send path) is unaffected: the
+ * record keeps exactly the fields — and the order — it had before.
+ */
 export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   assertAgent(agentId);
 
@@ -696,7 +714,7 @@ export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   // Migrate any orphaned messages from old inbox/new/ path on first delivery
   migrateOrphanedInboxMessages(mailRoot);
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     id: message.id || randomUUID(),
     from: message.from || "host",
     to: message.to,
@@ -705,6 +723,11 @@ export function deliverToSandbox(agentId: string, message: RelayMessage): void {
     read: false,
     origin: message.origin || "host",
   };
+  // Appended ONLY when the caller supplies them, so a record for an ordinary
+  // send serializes exactly as it did before this field existed.
+  if (message.obligationId) payload.obligationId = message.obligationId;
+  if (message.replyToId) payload.replyToId = message.replyToId;
+  if (message.replyId) payload.replyId = message.replyId;
 
   const filename = `${timestampPrefix()}-${randomUUID()}.json`;
   atomicWriteJson(join(freshDir, filename), payload);

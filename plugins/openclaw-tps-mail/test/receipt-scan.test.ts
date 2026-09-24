@@ -5,13 +5,16 @@
  * inbound it answers. Every field either form is checked on is pinned here, so
  * the docblock cannot drift from the code again.
  *
- * (1) METADATA (`~/.tps/receipts/<obligationId>.json`, cli#389 round 3): read by
- *     its DIRECT path — no directory parse — and accepted only when
- *     `obligationId` matches AND `replyToId` is the inbound this obligation is
- *     keyed on. That is what makes a REUSED obligation id safe: a receipt minted
- *     for another inbound (or an older reply) never satisfies it.
+ * (1) METADATA (`<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`,
+ *     cli#389 round 3; per-agent since round 5): read by its DIRECT path — no
+ *     directory parse — and accepted only when `obligationId` matches AND
+ *     `replyToId` is the inbound this obligation is keyed on. That is what makes
+ *     a REUSED obligation id safe: a receipt minted for another inbound (or an
+ *     older reply) never satisfies it.
  * (2) POSTED FILE: matched on the obligation marker, the accountId, the record
- *     `from`, the signed envelope's `from`, and `replyToId`.
+ *     `from`, the signed envelope's `from`, and `replyToId` — OR (cli#389 round
+ *     5, item 2) on the obligation ids `deliverToSandbox` writes into its
+ *     reduced record, the record `from` and the signed envelope's `from`.
  *
  * The `replyToId` rows below are cli#389 round 3, item 3.
  */
@@ -47,7 +50,8 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const receiptsRoot = (): string => join(home, ".tps", "receipts");
+/** The receipts dir for an agent — inside its own obligation store. */
+const receiptsRoot = (): string => join(home, "mail", AGENT, ".obligations", "receipts");
 
 /** A reply record with all five fields right; `over` spoils exactly one. */
 function reply(
@@ -164,21 +168,85 @@ describe("receipt scan — the METADATA receipt, read by its DIRECT path", () =>
   });
 });
 
-// ── cli#389 round 4, item 1 ─────────────────────────────────────────────────
+describe("receipt scan — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2)", () => {
+  /**
+   * The reduced record `deliverToSandbox` writes when the caller gives it the
+   * obligation ids. It has NO headers and NO accountId — so of the posted-file
+   * pins only `from`, the signed envelope's `from` and the ids can be checked.
+   */
+  function sandboxRecord(
+    over: Partial<{ obligationId: string; replyToId: string; from: string; envelopeFrom: string }> = {},
+  ): any {
+    return {
+      id: "sandbox-record-1",
+      from: over.from ?? AGENT,
+      to: "flint",
+      body: JSON.stringify({ v: 1, from: over.envelopeFrom ?? AGENT, to: "flint", body: "the answer" }),
+      timestamp: new Date().toISOString(),
+      read: false,
+      origin: "host",
+      obligationId: over.obligationId ?? OB_ID,
+      replyToId: over.replyToId ?? INBOUND,
+      replyId: "reply-1",
+    };
+  }
+
+  it("the obligation ids + the agent's signed envelope → found (positive control)", () => {
+    writeReply(sandboxRecord());
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("found");
+  });
+
+  it("a WRONG obligationId → NOT found", () => {
+    writeReply(sandboxRecord({ obligationId: "ob-2" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+
+  it("the RIGHT obligation id but ANOTHER inbound (replyToId) → NOT found", () => {
+    writeReply(sandboxRecord({ replyToId: "some-other-inbound" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+
+  it("a WRONG record.from → NOT found", () => {
+    writeReply(sandboxRecord({ from: "someone-else" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+
+  it("a body that is NOT this agent's signed envelope → NOT found", () => {
+    writeReply(sandboxRecord({ envelopeFrom: "someone-else" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+
+  it("the CLI's own local-send record (NO obligation ids) never satisfies an obligation", () => {
+    // The shape deliverToSandbox writes for a caller that supplies none — the
+    // CLI's `tps mail send` bridge: id/from/to/body/timestamp/read/origin only.
+    writeReply({
+      id: "sandbox-record-1",
+      from: AGENT,
+      to: "flint",
+      body: JSON.stringify({ v: 1, from: AGENT, to: "flint", body: "the answer" }),
+      timestamp: new Date().toISOString(),
+      read: false,
+      origin: "host",
+    });
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+});
+
+// ── cli#389 round 4, item 1; per-agent since round 5 ───────────────────────
 /**
- * The shared receipts dir is read by DIRECT PATH ONLY.
+ * The receipts dir is read by DIRECT PATH ONLY.
  *
- * `~/.tps/receipts` grows with every non-local delivery and nothing but the
- * retention sweep ever takes a file out of it, so a scan that LISTS it re-reads
- * every retained receipt on every scan. The scan's dirs are therefore split:
- * `direct` dirs are probed once at `<obligationId>.json` and NEVER listed, and
- * only the route's `posted` dirs are listed.
+ * The agent's receipts root grows with every non-local delivery and nothing but
+ * the retention sweep ever takes a file out of it, so a scan that LISTS it
+ * re-reads every retained receipt on every scan. The scan's dirs are therefore
+ * split: `direct` dirs are probed once at `<obligationId>.json` and NEVER
+ * listed, and only the route's `posted` dirs are listed.
  *
  * These assertions go through an INJECTED fs, never a clock: "the receipts dir
  * was not listed or parsed" is then a fact about the calls a scan makes.
  */
-describe("cli#389 round 4 — the shared receipts dir is read by DIRECT PATH ONLY", () => {
-  /** A receipt for some OTHER obligation — the kind the shared dir accumulates. */
+describe("cli#389 round 4 — the receipts dir is read by DIRECT PATH ONLY", () => {
+  /** A receipt for some OTHER obligation — the kind the receipts dir accumulates. */
   function unrelatedReceipts(n: number, route = "remote-branch"): void {
     for (let i = 0; i < n; i++) {
       writeMetadataReceipt({
@@ -195,7 +263,7 @@ describe("cli#389 round 4 — the shared receipts dir is read by DIRECT PATH ONL
     unrelatedReceipts(1000);
     // ONE unreadable file: it cannot be read as a receipt — the shape
     // drainOutbox quarantines as `.malformed-`, which the posted-file scan
-    // reports as a FAILURE. In the shared receipts dir it must be invisible.
+    // reports as a FAILURE. In the receipts dir it must be invisible.
     writeFileSync(join(receiptsRoot(), ".malformed-cannot-be-read.json"), "{ not json ", "utf-8");
 
     const listed: string[] = [];
