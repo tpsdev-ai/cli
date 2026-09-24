@@ -30,6 +30,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -238,8 +239,12 @@ interface DispatchOutcome {
   replyId: string | null;
   /** The reply record itself (parsed before the temp root is torn down). */
   replyRecord: any | null;
-  /** A receipt record for this inbound (the local wire receipt, item 1). */
+  /** A receipt record for this inbound (the local metadata receipt, item 1). */
   receiptRecord: any | null;
+  /** The receipt file's raw bytes, read BEFORE the throwaway HOME is torn down. */
+  receiptRaw: string | null;
+  /** The receipt file's permission bits (0600 at creation), read with it. */
+  receiptMode: number | null;
   /** The obligation record (state + named failure). */
   obligation: any | null;
   /** A nack record for this inbound, if one was written. */
@@ -326,10 +331,24 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const receiptDirsAll = [join(root, ".tps", "receipts")];
     const bridgeDirs = [join(root, ".tps", "branch-office", sender, "mail", "new")];
     const isReply = (rec: any) => rec?.headers?.["X-TPS-InReplyTo"] === inboundId;
+    // cli#389 round 3: a metadata receipt carries NO headers and NO body, so it
+    // is found by the ids it names — the reply, and the inbound it answers.
+    const isReceipt = (rec: any) => typeof rec?.replyId === "string" && rec?.replyToId === inboundId;
 
     const local = scanFor([senderNew, senderCur], isReply);
     const outbox = scanFor(outboxDirs, isReply);
-    const receipt = scanFor(receiptDirsAll, isReply);
+    const receipt = scanFor(receiptDirsAll, isReceipt);
+    // Read the receipt's BYTES and MODE here: inFreshHome removes this root.
+    let receiptRaw: string | null = null;
+    let receiptMode: number | null = null;
+    if (receipt[0]) {
+      try {
+        receiptRaw = readFileSync(receipt[0].path, "utf-8");
+        receiptMode = statSync(receipt[0].path).mode & 0o777;
+      } catch {
+        /* unreadable → leave both null */
+      }
+    }
     const nack = scanFor([...senderNew, ...senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
       typeof r?.headers?.["X-TPS-Nack"] === "string",
     );
@@ -348,9 +367,11 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     } else if (relay.deliver.length > 0) {
       route = "remote-branch";
       replyRecord = receipt[0]?.rec ?? null;
-      replyId = receipt[0]?.rec.id ?? null;
+      replyId = receipt[0]?.rec.replyId ?? null;
     } else if (relay.bridge.length > 0) {
       route = "bridge";
+      replyRecord = receipt[0]?.rec ?? null;
+      replyId = receipt[0]?.rec.replyId ?? null;
     }
 
     abort.abort();
@@ -365,6 +386,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       replyId,
       replyRecord,
       receiptRecord: receipt[0]?.rec ?? null,
+      receiptRaw,
+      receiptMode,
       obligation: readJsonSafe(obligationPath) ?? obligation,
       nack: nack[0]?.path ?? null,
     };
@@ -524,6 +547,22 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     expect(outcome.receiptRecord.branchId).toBe("tps-rockit");
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
+    // The receipt is METADATA-ONLY (cli#389 round 3, item 2): the ids, the route
+    // and the timestamp — never the body, never the signed envelope.
+    expect(outcome.receiptRaw).toBeTruthy();
+    expect(Object.keys(JSON.parse(outcome.receiptRaw!)).sort()).toEqual([
+      "branchId",
+      "obligationId",
+      "replyId",
+      "replyToId",
+      "route",
+      "ts",
+    ]);
+    expect(outcome.receiptRaw!.includes("final verdict"), "the fixture BODY text must not be in the receipt").toBe(
+      false,
+    );
+    expect(outcome.receiptRaw!.includes("delegationChain"), "nor the signed envelope").toBe(false);
+    expect(outcome.receiptMode, "0600 at creation").toBe(0o600);
   }, 20000);
 
   it("relay fails → a named failure, no receipt", async () => {
@@ -538,5 +577,29 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     expect(outcome.obligation?.state).toBe("failed");
     // The failure is named (the wire error is carried, not a silent yield).
     expect(String(outcome.obligation?.failure)).toMatch(/^write-failed:/);
+  }, 20000);
+});
+
+// ── item 1 (round 3): a BRIDGE reply closes the obligation the same way ───────
+
+describe("cli#389 item 1 (round 3) — a bridge reply persists the same receipt", () => {
+  it("bridge reply → posted → receipt → acked, with NO nack", async () => {
+    // "ember" has a local branch-office inbox with no remote.json → the bridge.
+    const setup = () => branchInbox("ember");
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("ember", ["anvil"]));
+    expect(outcome.route).toBe("bridge");
+    // The CLI's own bridge got the reply (mocked so the write is observable)…
+    expect(relay.bridge.length).toBeGreaterThan(0);
+    expect(relay.bridge[0]!.branchId).toBe("ember");
+    // …and the receipt the bridge owed: the SAME metadata record the wire writes.
+    expect(outcome.receiptRecord).toBeTruthy();
+    expect(outcome.receiptRecord.route).toBe("bridge");
+    expect(outcome.receiptRecord.branchId).toBe("ember");
+    expect(outcome.receiptRecord.obligationId).toBe(outcome.obligation?.obligationId);
+    expect(typeof outcome.receiptRecord.replyId).toBe("string");
+    expect(outcome.receiptRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    // The obligation is DISCHARGED: acked at the receipt, never nacked.
+    expect(outcome.obligation?.state).toBe("acked");
+    expect(outcome.nack).toBeNull();
   }, 20000);
 });

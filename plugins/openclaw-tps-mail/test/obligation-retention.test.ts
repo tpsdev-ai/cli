@@ -251,3 +251,62 @@ describe("cli#401 — obligation retention", () => {
     expect(sweepTerminalObligations(mailDir, AGENT, 7, { info: () => {}, warn: () => {} }).removed).toBe(1);
   });
 });
+
+// ── cli#389 round 3, item 2: the SAME sweep owns the metadata receipts ──────
+
+/**
+ * A receipt is written on every successful delivery that leaves no locally
+ * readable mail file (the wire, the sandbox bridge), so the receipts directory
+ * grows with traffic and NOTHING else ever removes a file from it. The sweep
+ * owns them: a receipt goes when the obligation it names is TERMINAL, or when
+ * the receipt itself has aged past the window — never on a missing timestamp.
+ */
+describe("cli#389 item 2 — the retention sweep owns the receipts", () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "tps-receipt-home-"));
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const ROOT = (): string => join(home, ".tps", "receipts");
+  /** Write a metadata receipt fixture by hand — the shape under test. */
+  const receipt = (obligationId: string, replyToId: string, ts: string): string => {
+    mkdirSync(ROOT(), { recursive: true });
+    const path = join(ROOT(), `${obligationId}.json`);
+    writeFileSync(
+      path,
+      JSON.stringify({ replyId: `reply-${obligationId}`, obligationId, replyToId, route: "remote-branch", ts }, null, 2),
+      { encoding: "utf-8", mode: 0o600 },
+    );
+    return path;
+  };
+  const quiet = { info: () => {}, warn: () => {} };
+
+  it("a terminal obligation's receipt is REMOVED; a live obligation's receipt is KEPT", () => {
+    writeRecord("terminal-inbound", "acked", daysAgo(10));
+    writeRecord("live-inbound", "pending", daysAgo(1));
+    const spent = receipt("ob-terminal", "terminal-inbound", new Date().toISOString());
+    const live = receipt("ob-live", "live-inbound", new Date().toISOString());
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
+    expect(res.receiptsRemoved).toBe(1);
+    expect(existsSync(spent), "a terminal obligation's receipt is gone").toBe(false);
+    expect(existsSync(live), "a live obligation's receipt stays").toBe(true);
+  });
+
+  it("1,000 aged receipts are swept — aged by their OWN ts, never the file mtime", () => {
+    for (let i = 0; i < 1000; i++) receipt(`ob-old-${i}`, `inbound-${i}`, daysAgo(30));
+    expect(readdirSync(ROOT()).filter((f) => f.endsWith(".json")).length, "fixture written").toBe(1000);
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
+    expect(res.receiptsRemoved).toBe(1000);
+    expect(readdirSync(ROOT()).filter((f) => f.endsWith(".json")).length).toBe(0);
+  });
+
+  it("a receipt with NO parseable ts and no terminal obligation is LEFT in place", () => {
+    const p = receipt("ob-no-ts", "inbound-not-here", "not-a-date");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), ROOT());
+    expect(res.receiptsRemoved).toBe(0);
+    expect(existsSync(p)).toBe(true);
+  });
+});

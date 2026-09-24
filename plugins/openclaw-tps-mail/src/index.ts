@@ -58,9 +58,12 @@ import {
   listObligations,
   newestSessionTranscript,
   readObligation,
+  receiptsDir,
   scanForReceipt,
   sweepTerminalObligations,
   transitionObligation,
+  writeReceipt,
+  type ReceiptRecord,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
@@ -243,34 +246,40 @@ function writeOutboxFile(message: TpsMailBody): string {
 }
 
 /**
- * cli#389 item 1: a wire delivery leaves no LOCAL file, so the obligation scan
- * (which only looks at the maildir/outbox) could never find its receipt and a
- * delivered remote reply was later marked failed and nacked. Persist a small
- * local receipt — under `~/.tps/receipts/`, 0600, named by the reply id —
- * carrying the reply's own marker/account/from (so `scanForReceipt` accepts it)
- * plus its `route` and `branchId`.
+ * cli#389: a NON-LOCAL delivery can leave no locally readable mail file, so the
+ * obligation scan could never find a receipt for it and a delivered reply was
+ * later marked failed and nacked — the wire case (round 1, item 1) and the
+ * bridge case (round 3, item 1) are the same defect. Persist the metadata-only
+ * receipt those routes owe, under `~/.tps/receipts/<obligationId>.json`
+ * (round 3, item 2): the ids, the route, the branch and the timestamp — NEVER
+ * the body.
+ *
+ * SCOPE: only a route that leaves NO locally readable mail file needs one. A
+ * LOCAL reply lives in the recipient's maildir and an OUTBOX reply in the file
+ * the branch drain carries, each carrying the obligation marker — those records
+ * ARE their receipts, and the scan still reads them (cli#398 T4 pins that a
+ * posted record the scan cannot see is a NAMED failure, so minting a second,
+ * always-readable receipt for them would change adjudicated behaviour).
+ *
+ * A message with no `X-TPS-Obligation` marker owes no obligation (a nack, or an
+ * ordinary outbound send), so nothing is written for it: a receipt is evidence
+ * of a discharged obligation, never a mail copy.
  */
-function writeRemoteReceipt(reply: TpsMailBody, branchId: string): string {
-  const dir = resolve(process.env.HOME ?? homedir(), ".tps", "receipts");
-  mkdirSync(dir, { recursive: true });
-  const target = resolve(dir, `${reply.id}.json`);
-  const record = {
-    id: reply.id,
-    from: reply.from,
-    to: reply.to,
-    accountId: reply.accountId,
-    body: reply.body,
-    timestamp: reply.timestamp,
-    replyToId: reply.replyToId,
-    headers: reply.headers,
-    route: "remote-branch",
-    branchId,
+function persistReceipt(message: TpsMailBody, route: "remote-branch" | "bridge", branchId?: string): void {
+  const obligationId = message.headers?.["X-TPS-Obligation"];
+  if (typeof obligationId !== "string" || obligationId.length === 0) return;
+  // The receipt must answer a specific inbound: without a replyToId it could
+  // never satisfy the obligation scan, and writing it would only grow the dir.
+  if (typeof message.replyToId !== "string" || message.replyToId.length === 0) return;
+  const record: ReceiptRecord = {
+    replyId: message.id,
+    obligationId,
+    replyToId: message.replyToId,
+    route,
+    ...(branchId ? { branchId } : {}),
+    ts: typeof message.timestamp === "string" && message.timestamp.length > 0 ? message.timestamp : new Date().toISOString(),
   };
-  // Atomic, 0600: a concurrent scan must never read a half-written receipt.
-  const tmp = resolve(dir, `.${reply.id}.tmp`);
-  writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", mode: 0o600 });
-  renameSync(tmp, target);
-  return target;
+  writeReceipt(record);
 }
 
 /** Deliver to a remote branch, then persist the local receipt item 1 requires. */
@@ -285,7 +294,7 @@ async function deliverRemote(reply: TpsMailBody, branchId: string): Promise<void
     body: reply.body,
     timestamp: reply.timestamp,
   });
-  writeRemoteReceipt(reply, branchId);
+  persistReceipt(reply, "remote-branch", branchId);
 }
 
 /**
@@ -310,6 +319,10 @@ function deliverOutboundMail(
     case "local":
       return Promise.resolve({ path: writeMailFile(mailDir, message.to, message), route: "local" });
     case "outbox":
+      // The outbox record IS the receipt for this route: the branch drain keeps
+      // its marker (new/ → sent/), so the obligation scan reads it there. Only a
+      // route that leaves NO locally readable mail file owes a metadata receipt
+      // (the wire, the sandbox bridge) — see persistReceipt.
       return Promise.resolve({ path: writeOutboxFile(message), route: "outbox" });
     case "remote-branch":
       // The wire path, exactly as `tps mail send` sends it, PLUS the local
@@ -318,10 +331,15 @@ function deliverOutboundMail(
         path: `remote-branch:${route.branchId}`,
         route: "remote-branch" as const,
       }));
-    case "bridge":
-      // A local branch-office sandbox — the CLI's own bridge, imported.
+    case "bridge": {
+      // A local branch-office sandbox — the CLI's own bridge, imported. Its
+      // sandbox record is REDUCED (no marker, no reply id), so the obligation
+      // scan can only see this delivery through the metadata receipt
+      // (round 3, item 1: the bridge owes the same receipt as the wire).
       deliverToSandbox(route.branchId, { to: message.to, from: message.from, body: message.body });
+      persistReceipt(message, "bridge", route.branchId);
       return Promise.resolve({ path: `bridge:${route.branchId}`, route: "bridge" });
+    }
     case "failed":
       // A GAL entry naming a branch with no remote registration.
       throw new Error(`refusing to deliver to "${message.to}": ${route.reason} (branch ${route.branchId})`);
@@ -496,27 +514,34 @@ const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
 function receiptDirs(ctx: YieldContext): string[] {
-  // The receipt lives where the reply was WRITTEN, so use the same locality
-  // decision (cli#389). A local route scans the recipient's maildir; a
-  // remote-branch route scans the local receipt we persist on a successful wire
-  // send (item 1); a bridge scans the branch sandbox `deliverToSandbox` wrote
-  // to; every other relayed route scans the outbox the branch drains.
+  // TWO receipt forms (cli#389 round 3): the metadata receipt every NON-LOCAL
+  // route persists under `~/.tps/receipts` — found by its DIRECT path — and,
+  // for a route that also writes a mail file, the posted record itself. So the
+  // shared receipts dir comes FIRST for every route; the route-specific dirs
+  // follow: a local reply lives in the recipient's maildir, a bridge delivery
+  // in the branch sandbox `deliverToSandbox` wrote to (its reduced record has
+  // no marker — the metadata receipt is the one that closes the obligation),
+  // and every other relayed route in the outbox the branch drains.
   const home = process.env.HOME ?? homedir();
+  const dirs = [receiptsDir(home)];
   const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
   if (route.kind === "local") {
-    return [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")];
+    dirs.push(resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur"));
+    return dirs;
   }
   if (route.kind === "remote-branch") {
-    return [resolve(home, ".tps", "receipts")];
+    return dirs; // the metadata receipt is the only local evidence of the wire send
   }
   if (route.kind === "bridge") {
     const mailRoot = resolveAgentMailRoot(route.branchId);
-    return [resolve(mailRoot, "new"), resolve(mailRoot, "cur")];
+    dirs.push(resolve(mailRoot, "new"), resolve(mailRoot, "cur"));
+    return dirs;
   }
   const outbox = resolve(home, ".tps", "outbox");
   // The branch drain moves the record new/ → sent/ keeping replyToId+headers,
   // so a REMOTE receipt is either file; .malformed-* in either is a FAILURE.
-  return [resolve(outbox, "new"), resolve(outbox, "sent")];
+  dirs.push(resolve(outbox, "new"), resolve(outbox, "sent"));
+  return dirs;
 }
 
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
@@ -564,7 +589,7 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 function onDeadline(ctx: YieldContext, obligationId: string): void {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after failed/acked: no-op
-  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.agent, ctx.accountId);
+  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId);
   if (receipt.status === "found") {
     ackObligation(ctx, obligationId, "receipt present at the deadline");
     return;
@@ -601,7 +626,7 @@ function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; dea
     }, ctx.log);
     return;
   }
-  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, ctx.agent, ctx.accountId);
+  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId);
   if (receipt.status === "found") {
     ackObligation(ctx, rec.obligationId, "recovered: receipt already posted");
     return;
@@ -1075,8 +1100,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 posted = true;
               } else if (route.kind === "bridge") {
                 deliverToSandbox(route.branchId, { to: msg.from, from: recipient, body: reply.body });
+                persistReceipt(reply, "bridge", route.branchId);
                 log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=bridge: ${route.branchId})`,
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=bridge: ${route.branchId}; receipt persisted)`,
                 );
                 posted = true;
               } else {
@@ -1103,7 +1129,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         }
 
         // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
-        const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, recipient, account.accountId);
+        const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, msg.id, recipient, account.accountId);
         if (receipt.status === "found") {
           ackObligation(yieldCtx, obId, "receipt found");
         } else if (receipt.status === "malformed" && posted) {

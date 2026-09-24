@@ -2,7 +2,7 @@
 
   Four follow-ups to the one-locality-rule change (cli#389). (1) A reply
   delivered over the wire to a remote branch now persists a local receipt
-  (`~/.tps/receipts/<reply-id>.json`, 0600, carrying `route: "remote-branch"`
+  (`~/.tps/receipts/<obligation-id>.json`, 0600, carrying `route: "remote-branch"`
   and the branch) that the reply-obligation scan finds, so a delivered remote
   reply is acked instead of later marked failed and nacked. (2) A GAL entry that
   names a branch with no remote registration is a misconfiguration: the shared

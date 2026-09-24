@@ -1,8 +1,9 @@
-- **A remote-branch send keeps the reply's identity on the wire.**
+- **A remote-branch REPLY keeps its identity on the wire.**
 
-  `tps mail send`'s remote path (and the openclaw-tps-mail plugin's) now pass the
-  message `id` and `timestamp` to `deliverToRemoteBranch`, so the wire payload
-  and the branch's ACK correlation use the SAME id the caller reports — not a
-  UUID the relay invents.
+  The openclaw-tps-mail plugin's dispatcher reply path passes the reply `id` and
+  `timestamp` to `deliverToRemoteBranch`, so the wire payload and the branch's
+  ACK correlation use the SAME id the plugin reports as the reply id — not a
+  UUID the relay invents. `tps mail send` carries no message id of its own, so
+  its remote path is unchanged and the relay still mints one there.
 
   (Refs #389)
