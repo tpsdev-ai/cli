@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
-import { effectiveBranchId, resolveMailRoute } from "../utils/mail-routing.js";
+import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
@@ -225,13 +225,11 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
-      const effectiveTo = effectiveBranchId(to);
-
-      // Inbound Bridge: check if recipient is a local branch office agent
-      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", effectiveTo, "mail", "inbox");
-      if (existsSync(branchInbox)) {
+      // A local branch-office sandbox (an inbox with no remote.json) → the
+      // CLI's own bridge, shared with the plugin (cli#389).
+      if (route.kind === "bridge") {
         assertValidBody(args.message);
-        deliverToSandbox(effectiveTo, {
+        deliverToSandbox(route.branchId, {
           to,
           from,
           body: args.message,
@@ -244,8 +242,20 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
+      // A GAL entry naming a branch with NO remote registration is a
+      // misconfiguration: refuse with the SAME named failure the plugin uses,
+      // whatever maildirs exist — never a fall-through to the local maildir.
+      if (route.kind === "failed") {
+        console.error(
+          `Refusing to send to '${to}': ${route.reason} — the GAL names branch '${route.branchId}' but it has no remote registration ` +
+            `(~/.tps/branch-office/${route.branchId}/remote.json). Fix the GAL entry or register the branch.`,
+        );
+        process.exit(1);
+      }
+
       // Direct Maildir send: args.message was already signed by
-      // maybeSignEnvelopeBody above.
+      // maybeSignEnvelopeBody above; `route.kind === "local"`, or the CLI's
+      // fallback for an office recipient with no maildir yet.
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
         console.log(JSON.stringify(msg, null, 2));

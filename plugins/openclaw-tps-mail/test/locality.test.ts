@@ -2,24 +2,25 @@
  * locality.test.ts — cli#389: ONE locality decision for outbound mail.
  *
  * The defect: the plugin's `isLocalRecipient` returned true when a directory
- * `~/.tps/mail/<to>/` existed, so a maildir for a REMOTE peer (archiving,
- * inspection, accident) silently reclassified it as local and the reply was
- * written where nothing would ever read it — while `tps mail send` used a
- * different rule and `deliverOutboundMail` a third.
+ * `~/.tps/mail/<to>/` existed, so a maildir for a REMOTE peer silently
+ * reclassified it as local and the reply was written where nothing would read
+ * it — while `tps mail send` used a different rule and `deliverOutboundMail` a
+ * third. Both plugin paths now go through `resolveMailRoute`
+ * (`@tpsdev-ai/cli/utils/mail-routing`), the SAME decision `tps mail send`
+ * makes:
  *
- * The fix routes BOTH plugin paths (the dispatcher reply and the outbound
- * adapter) through `resolveMailRoute` from
- * `@tpsdev-ai/cli/utils/mail-routing`, the SAME decision `tps mail send` makes:
- *   (1) a BRANCH relays every non-bound recipient to ~/.tps/outbox/new/ — a
- *       directory never matters there;
- *   (2) the OFFICE sends a recipient registered remotely (GAL + remote.json)
- *       over the wire and delivers everything else into a local maildir;
- *   (3) an OFFICE recipient with no GAL, no binding and no maildir is a NAMED
- *       failure — never a silent write.
+ *   (a) branch, unbound, maildir exists        → outbox
+ *   (b) branch, bound local agent              → local
+ *   (c) office, unbound with a maildir         → local
+ *   (d) office, GAL + remote.json              → remote-branch
+ *   (e) office, unknown                        → unknown (named failure)
+ *   (f) office, GAL without remote.json        → failed (gal-without-remote)
+ *   (g) office, branch-office inbox (no remote) → bridge (deliverToSandbox)
+ *   (h) office, remote.json under the recipient's OWN name (no GAL) → remote-branch
  *
- * Cases (a)–(e) mirror the dispatch table; (f) asserts both paths agree per
- * case. The relay transport is mocked (no network, no Noise handshake), so a
- * `remote-branch` decision is observable.
+ * Round 2 also covers item 1: a successful wire send persists a local receipt
+ * (route + branch) that the obligation scan finds, so a delivered remote reply
+ * is acked rather than nacked.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import {
@@ -47,14 +48,23 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
   return Buffer.from(ed.getPublicKey(new Uint8Array(seed)));
 }
 
-// ── mock the wire transport so a remote-branch decision is observable ─────────
-// MUST run before the plugin (which imports deliverToRemoteBranch) is loaded.
-const relayCalls: Array<{ branchId: string; msg: any }> = [];
+// ── mock the wire transport + bridge so both are observable ───────────────────
+// MUST run before the plugin (which imports them) is loaded.
+const relay = {
+  deliver: [] as Array<{ branchId: string; msg: any }>,
+  bridge: [] as Array<{ branchId: string; msg: any }>,
+  failDeliver: false,
+};
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   deliverToRemoteBranch: async (branchId: string, msg: any) => {
-    relayCalls.push({ branchId, msg });
+    if (relay.failDeliver) throw new Error("relay down");
+    relay.deliver.push({ branchId, msg });
   },
-  deliverToSandbox: () => {},
+  deliverToSandbox: (branchId: string, msg: any) => {
+    relay.bridge.push({ branchId, msg });
+  },
+  resolveAgentMailRoot: (branchId: string) =>
+    join(process.env.HOME ?? "", ".tps", "branch-office", branchId, "mail"),
 }));
 
 const pluginModule = (await import("../src/index.js")).default;
@@ -89,19 +99,35 @@ function readdirSafe(dir: string): string[] {
     return [];
   }
 }
+function readJsonSafe(path: string): any | null {
+  try {
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+/** All JSON records under `dirs` matching a header predicate. */
+function scanFor(dirs: string[], pred: (rec: any) => boolean): Array<{ path: string; rec: any }> {
+  const out: Array<{ path: string; rec: any }> = [];
+  for (const dir of dirs) {
+    for (const name of readdirSafe(dir)) {
+      if (!name.endsWith(".json") || name.startsWith(".")) continue;
+      const path = resolve(dir, name);
+      const rec = readJsonSafe(path);
+      if (rec && pred(rec)) out.push({ path, rec });
+    }
+  }
+  return out;
+}
 
 async function waitFor(pred: () => boolean, ms = 3000): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < ms) {
-    if (pred()) return;
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  while (!pred() && Date.now() - start < ms) await new Promise((r) => setTimeout(r, 10));
 }
 
 /**
  * Run `fn` against a FRESH HOME. Each path gets its own root so one path's
- * probe mail can never perturb the other's observation (a stray file in a bound
- * agent's new/ is delivered/DLQ'd by the watcher).
+ * probe mail can never perturb the other's observation.
  */
 async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<T> {
   const prevRoot = root;
@@ -111,7 +137,9 @@ async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<
   mailDir = join(root, ".tps", "mail");
   mkdirSync(mailDir, { recursive: true });
   process.env.HOME = root;
-  relayCalls.length = 0;
+  relay.deliver.length = 0;
+  relay.bridge.length = 0;
+  relay.failDeliver = false;
   try {
     setup();
     return await fn();
@@ -140,7 +168,6 @@ beforeEach(() => {
   mkdirSync(mailDir, { recursive: true });
   savedHome = process.env.HOME;
   process.env.HOME = root;
-  relayCalls.length = 0;
 });
 
 afterEach(() => {
@@ -153,7 +180,7 @@ afterEach(() => {
   }
 });
 
-// ── fixture builders ─────────────────────────────────────────────────────────
+// ── fixture builders (operate on the CURRENT root) ────────────────────────────
 
 function branchHost(): void {
   mkdirSync(join(root, ".tps", "identity"), { recursive: true });
@@ -178,15 +205,18 @@ function remoteBranch(branchId: string): void {
     "utf-8",
   );
 }
+function branchInbox(branchId: string): void {
+  mkdirSync(join(root, ".tps", "branch-office", branchId, "mail", "inbox"), { recursive: true });
+}
 
-/** The shared decision, read directly (both plugin paths call exactly this). */
+/** The shared decision, read directly (both callers use exactly this). */
 async function routeViaDecision(to: string, bound: string[] = []): Promise<string> {
   const mod = await import("@tpsdev-ai/cli/utils/mail-routing");
   return mod.resolveMailRoute({ to, mailDir, localAgents: bound }).kind;
 }
 
-/** Route the OUTBOUND adapter path and report the route (or "failure"). */
-async function routeViaOutbound(to: string, bound: string[] = []): Promise<string> {
+/** Route the OUTBOUND adapter path; report the route kind or the failure. */
+async function routeViaOutbound(to: string, bound: string[] = []): Promise<{ ok: boolean; route: string; error?: string }> {
   const cfg = {
     channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
     bindings: bound.map((agentId) => ({ agentId, match: { channel: "tps-mail", accountId: "default" } })),
@@ -198,11 +228,26 @@ async function routeViaOutbound(to: string, bound: string[] = []): Promise<strin
     text: "route probe",
     identity: { agentId: "anvil" },
   });
-  return res?.ok ? res.details.route : "failure";
+  return res?.ok ? { ok: true, route: res.details.route } : { ok: false, route: "failure", error: String(res?.error ?? "") };
 }
 
-/** Route the DISPATCHER reply path and report where the reply landed. */
-async function routeViaDispatcher(sender: string, bound: string[] = []): Promise<string> {
+interface DispatchOutcome {
+  /** Where the reply landed, or "failure" when nothing was delivered. */
+  route: "local" | "outbox" | "remote-branch" | "bridge" | "failure";
+  /** The reply record's id (never the inbound's). */
+  replyId: string | null;
+  /** The reply record itself (parsed before the temp root is torn down). */
+  replyRecord: any | null;
+  /** A receipt record for this inbound (the local wire receipt, item 1). */
+  receiptRecord: any | null;
+  /** The obligation record (state + named failure). */
+  obligation: any | null;
+  /** A nack record for this inbound, if one was written. */
+  nack: string | null;
+}
+
+/** Route the DISPATCHER reply path and report the full obligation outcome. */
+async function routeViaDispatcher(sender: string, bound: string[] = []): Promise<DispatchOutcome> {
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
     createMailVerifyClient: async () => ({
       async getAgent(name: string) {
@@ -214,7 +259,6 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
   }));
 
   const agentId = bound[0]!;
-  // A signing key for the replying agent (a receipt requires a signed reply).
   const keysDir = join(root, "keys");
   mkdirSync(keysDir, { recursive: true });
   writeFileSync(join(keysDir, `${agentId}.key`), ANVIL_SEED);
@@ -265,21 +309,49 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
     await waitFor(() => dispatched !== null || existsSync(join(mailDir, agentId, "dlq")));
 
-    await dispatched!.deliver({ text: "final verdict" }, { kind: "final" });
-    settleFn?.();
+    if (dispatched) {
+      await dispatched.deliver({ text: "final verdict" }, { kind: "final" });
+      settleFn?.();
+    }
 
-    // Observe the destination. A BOUND recipient's maildir is WATCHED, so the
-    // reply may be promoted new/ → cur/ by the time we look — check both.
-    const localDirs = [join(mailDir, sender, "new"), join(mailDir, sender, "cur")];
-    const localHas = () => localDirs.some((d) => readdirSafe(d).filter((f) => f.endsWith(".json")).length > 0);
-    const outbox = join(root, ".tps", "outbox", "new");
-    const outboxHas = () => readdirSafe(outbox).filter((f) => f.endsWith(".json")).length > 0;
-    await waitFor(() => localHas() || outboxHas() || relayCalls.length > 0, 2000);
+    const obligationPath = join(mailDir, agentId, ".obligations", `${inboundId}.json`);
+    await waitFor(() => !!readJsonSafe(obligationPath), 2000);
+    const obligation = readJsonSafe(obligationPath);
+    // A terminal obligation means the post + receipt scan have finished.
+    await waitFor(() => ["acked", "failed"].includes(readJsonSafe(obligationPath)?.state), 2500);
 
-    let route = "failure";
-    if (localHas()) route = "local";
-    else if (outboxHas()) route = "outbox";
-    else if (relayCalls.length > 0) route = "remote-branch";
+    const senderNew = join(mailDir, sender, "new");
+    const senderCur = join(mailDir, sender, "cur");
+    const outboxDirs = [join(root, ".tps", "outbox", "new"), join(root, ".tps", "outbox", "sent")];
+    const receiptDirsAll = [join(root, ".tps", "receipts")];
+    const bridgeDirs = [join(root, ".tps", "branch-office", sender, "mail", "new")];
+    const isReply = (rec: any) => rec?.headers?.["X-TPS-InReplyTo"] === inboundId;
+
+    const local = scanFor([senderNew, senderCur], isReply);
+    const outbox = scanFor(outboxDirs, isReply);
+    const receipt = scanFor(receiptDirsAll, isReply);
+    const nack = scanFor([...senderNew, ...senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
+      typeof r?.headers?.["X-TPS-Nack"] === "string",
+    );
+
+    let route: DispatchOutcome["route"] = "failure";
+    let replyId: string | null = null;
+    let replyRecord: any | null = null;
+    if (local.length > 0) {
+      route = "local";
+      replyRecord = local[0]!.rec;
+      replyId = local[0]!.rec.id ?? null;
+    } else if (outbox.length > 0) {
+      route = "outbox";
+      replyRecord = outbox[0]!.rec;
+      replyId = outbox[0]!.rec.id ?? null;
+    } else if (relay.deliver.length > 0) {
+      route = "remote-branch";
+      replyRecord = receipt[0]?.rec ?? null;
+      replyId = receipt[0]?.rec.id ?? null;
+    } else if (relay.bridge.length > 0) {
+      route = "bridge";
+    }
 
     abort.abort();
     try {
@@ -287,7 +359,15 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     } catch {
       /* expected */
     }
-    return route;
+
+    return {
+      route,
+      replyId,
+      replyRecord,
+      receiptRecord: receipt[0]?.rec ?? null,
+      obligation: readJsonSafe(obligationPath) ?? obligation,
+      nack: nack[0]?.path ?? null,
+    };
   } finally {
     if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
     else process.env.TPS_TEST_KEYS_DIR = origKeys;
@@ -298,7 +378,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
 
 interface Case {
   label: string;
-  expectRoute: string;
+  expectRoute: "local" | "outbox" | "remote-branch" | "bridge" | "unknown" | "failed";
+  expectFailure?: string;
   recipient: string;
   bound: string[];
   setup: () => void;
@@ -306,7 +387,7 @@ interface Case {
 
 const CASES: Case[] = [
   {
-    label: "(a) branch, flint NOT bound, maildir EXISTS → outbox (dir existence must NOT make it local)",
+    label: "(a) branch, flint NOT bound, maildir EXISTS → outbox",
     expectRoute: "outbox",
     recipient: "flint",
     bound: ["anvil"],
@@ -316,7 +397,7 @@ const CASES: Case[] = [
     },
   },
   {
-    label: "(b) branch, bound local agent → local maildir",
+    label: "(b) branch, bound local agent → local maildir (the REPLY file, by id)",
     expectRoute: "local",
     recipient: "anvil",
     bound: ["anvil"],
@@ -334,7 +415,7 @@ const CASES: Case[] = [
     },
   },
   {
-    label: "(d) office, recipient with a GAL entry + remote.json → remote",
+    label: "(d) office, recipient with a GAL entry + remote.json → remote-branch",
     expectRoute: "remote-branch",
     recipient: "rockit",
     bound: ["anvil"],
@@ -344,17 +425,46 @@ const CASES: Case[] = [
     },
   },
   {
-    label: "(e) office, unknown recipient (no GAL, no binding, no maildir) → named failure",
+    label: "(e) office, unknown recipient → named failure (no-route)",
     expectRoute: "unknown",
+    expectFailure: "no-route:stranger",
     recipient: "stranger",
     bound: ["anvil"],
     setup: () => {},
+  },
+  {
+    label: "(f) office, GAL entry with NO remote.json → failed (gal-without-remote)",
+    expectRoute: "failed",
+    expectFailure: "gal-without-remote",
+    recipient: "sherlock",
+    bound: ["anvil"],
+    setup: () => {
+      galEntry("sherlock", "tps-sherlock");
+    },
+  },
+  {
+    label: "(g) office, branch-office inbox with no remote.json → bridge",
+    expectRoute: "bridge",
+    recipient: "ember",
+    bound: ["anvil"],
+    setup: () => {
+      branchInbox("ember");
+    },
+  },
+  {
+    label: "(h) office, remote.json under the recipient's OWN name (no GAL) → remote-branch",
+    expectRoute: "remote-branch",
+    recipient: "tps-rockit",
+    bound: ["anvil"],
+    setup: () => {
+      remoteBranch("tps-rockit");
+    },
   },
 ];
 
 describe("cli#389 — ONE locality decision (shared with `tps mail send`)", () => {
   for (const c of CASES) {
-    it(c.label, async () => {
+    it(`${c.label} [resolver]`, async () => {
       expect(await inFreshHome(c.setup, () => routeViaDecision(c.recipient, c.bound))).toBe(c.expectRoute);
     });
   }
@@ -365,10 +475,65 @@ describe("cli#389 — ONE locality decision (shared with `tps mail send`)", () =
       const outbound = await inFreshHome(c.setup, () => routeViaOutbound(c.recipient, c.bound));
       const dispatcher = await inFreshHome(c.setup, () => routeViaDispatcher(c.recipient, c.bound));
 
-      const normalize = (r: string) => (r === "failure" ? "unknown" : r);
-      expect(normalize(outbound)).toBe(c.expectRoute);
-      expect(normalize(dispatcher)).toBe(c.expectRoute);
-      expect(normalize(outbound)).toBe(normalize(dispatcher));
+      const isFailure = c.expectRoute === "unknown" || c.expectRoute === "failed";
+      if (isFailure) {
+        // A named failure, never a write, on BOTH paths.
+        expect(outbound.ok).toBe(false);
+        expect(outbound.error).toContain(c.expectFailure === "gal-without-remote" ? "gal-without-remote" : "no delivery route");
+        expect(dispatcher.route).toBe("failure");
+        expect(dispatcher.obligation?.failure).toBe(c.expectFailure);
+      } else {
+        expect(outbound.ok).toBe(true);
+        expect(outbound.route).toBe(c.expectRoute);
+        expect(dispatcher.route).toBe(c.expectRoute);
+      }
     }, 15000);
   }
+
+  it("(b) the dispatcher writes the REPLY itself — a file with the reply id and X-TPS-InReplyTo, not the inbound", async () => {
+    const c = CASES.find((x) => x.expectRoute === "local" && x.recipient === "anvil")!;
+    const outcome = await inFreshHome(c.setup, () => routeViaDispatcher(c.recipient, c.bound));
+    expect(outcome.route).toBe("local");
+    expect(outcome.replyId).toBeTruthy();
+    // It is the REPLY record (found by scanning the recipient's maildir), a
+    // distinct record from the inbound, carrying the reply marker.
+    expect(outcome.replyRecord).toBeTruthy();
+    expect(outcome.replyRecord.id).toBe(outcome.replyId);
+    expect(outcome.replyRecord.headers["X-TPS-InReplyTo"]).toBeDefined();
+    expect(String(outcome.replyId).startsWith("msg-")).toBe(false); // NOT the inbound
+  }, 20000);
+});
+
+// ── item 1: the remote-branch receipt closes the obligation loop ──────────────
+
+describe("cli#389 item 1 — a remote-branch reply persists a local receipt", () => {
+  it("posted → receipt found → acked, with NO nack", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+    expect(outcome.route).toBe("remote-branch");
+    expect(relay.deliver.length).toBeGreaterThan(0);
+    // The receipt is persisted (route + branch) and the obligation scan found it.
+    expect(outcome.receiptRecord).toBeTruthy();
+    expect(outcome.receiptRecord.route).toBe("remote-branch");
+    expect(outcome.receiptRecord.branchId).toBe("tps-rockit");
+    expect(outcome.obligation?.state).toBe("acked");
+    expect(outcome.nack).toBeNull();
+  }, 20000);
+
+  it("relay fails → a named failure, no receipt", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+      relay.failDeliver = true;
+    };
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+    expect(outcome.route).toBe("failure");
+    expect(outcome.receiptRecord).toBeNull();
+    expect(outcome.obligation?.state).toBe("failed");
+    // The failure is named (the wire error is carried, not a silent yield).
+    expect(String(outcome.obligation?.failure)).toMatch(/^write-failed:/);
+  }, 20000);
 });
