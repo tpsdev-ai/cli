@@ -275,7 +275,16 @@ function writeRemoteReceipt(reply: TpsMailBody, branchId: string): string {
 
 /** Deliver to a remote branch, then persist the local receipt item 1 requires. */
 async function deliverRemote(reply: TpsMailBody, branchId: string): Promise<void> {
-  await deliverToRemoteBranch(branchId, { to: reply.to, from: reply.from, body: reply.body });
+  // Preserve the outbound identity (id + timestamp) so the wire payload — and
+  // the branch's ACK correlation — match the record this plugin reports as the
+  // reply id, not a UUID the relay invents.
+  await deliverToRemoteBranch(branchId, {
+    id: reply.id,
+    to: reply.to,
+    from: reply.from,
+    body: reply.body,
+    timestamp: reply.timestamp,
+  });
   writeRemoteReceipt(reply, branchId);
 }
 

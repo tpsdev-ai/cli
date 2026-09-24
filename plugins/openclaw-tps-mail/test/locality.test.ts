@@ -515,6 +515,9 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
     expect(outcome.route).toBe("remote-branch");
     expect(relay.deliver.length).toBeGreaterThan(0);
+    // The wire payload keeps the reply's OWN identity (id + timestamp).
+    expect(relay.deliver[0]!.msg.id).toBe(outcome.replyId);
+    expect(typeof relay.deliver[0]!.msg.timestamp).toBe("string");
     // The receipt is persisted (route + branch) and the obligation scan found it.
     expect(outcome.receiptRecord).toBeTruthy();
     expect(outcome.receiptRecord.route).toBe("remote-branch");
