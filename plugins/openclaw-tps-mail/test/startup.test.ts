@@ -289,6 +289,9 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const agentId = "test-agent";
     const curDir = resolve(tempMailDir, agentId, "cur");
     mkdirSync(curDir, { recursive: true });
+    // cli#389: the reply goes to the sender; a local maildir keeps the same
+    // office/maildir → local route the ack path expects.
+    mkdirSync(resolve(tempMailDir, "flint", "new"), { recursive: true });
 
     // A signing key for the AGENT: under S2 an ack requires a committed, signed
     // receipt, and a missing key is a NAMED failure (never an ack).

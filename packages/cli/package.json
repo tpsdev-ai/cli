@@ -13,7 +13,9 @@
     "./utils/agent-keys": "./dist/src/utils/agent-keys.js",
     "./utils/flair-client": "./dist/src/utils/flair-client.js",
     "./utils/mail": "./dist/src/utils/mail.js",
-    "./utils/mail-verify": "./dist/src/utils/mail-verify.js"
+    "./utils/mail-verify": "./dist/src/utils/mail-verify.js",
+    "./utils/mail-routing": "./dist/src/utils/mail-routing.js",
+    "./utils/relay": "./dist/src/utils/relay.js"
   },
   "optionalDependencies": {
     "@tpsdev-ai/cli-darwin-arm64": "0.6.0",

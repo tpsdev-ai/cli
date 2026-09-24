@@ -151,6 +151,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     sender: string,
     opts: {
       localSender?: boolean;
+      branchHost?: boolean;
       bodyFrom?: string;
       bodySeed?: Buffer;
       signAgentKey?: boolean;
@@ -175,6 +176,11 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     }
 
     if (opts.localSender) mkdirSync(resolve(tempMailDir, sender, "new"), { recursive: true });
+    // cli#389: host TYPE decides locality (a branch relays non-bound recipients).
+    if (opts.branchHost) {
+      mkdirSync(resolve(tempHome, ".tps", "identity"), { recursive: true });
+      writeFileSync(resolve(tempHome, ".tps", "identity", "host.json"), "{}\n", "utf-8");
+    }
     const newDir = resolve(tempMailDir, agentId, "new");
     mkdirSync(newDir, { recursive: true });
 
@@ -465,7 +471,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
   // ── F-S2j ──────────────────────────────────────────────────────────────────
   it("F-S2j: a remote recipient's marker is found in the outbox; a cross-account match is rejected", async () => {
     // (a) remote happy path: the reply lands in the outbox and the ack proceeds.
-    const h = await start("anvil", "flint", { localSender: false });
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
     await h.deliver("final to a remote peer", "final");
     h.settle();
     const posted = await pollUntil(() => outboxFiles("new").length === 1, 2000);
@@ -477,7 +483,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
     // (b) cross-account: the ONLY marker-matching file carries a different
     //     accountId, so the scan must NOT ack.
-    const h2 = await start("anvil", "flint", { localSender: false });
+    const h2 = await start("anvil", "flint", { localSender: false, branchHost: true });
     await pollUntil(() => h2.obligationId() !== null, 3000); // wait for THIS inbound's dispatch
     const obId = h2.obligationId();
     expect(obId).not.toBeNull();

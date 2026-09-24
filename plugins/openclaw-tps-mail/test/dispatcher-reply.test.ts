@@ -140,7 +140,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   async function startDispatcher(
     agentId: string,
     sender: string,
-    opts: { localSender?: boolean; bodyFrom?: string; bodySeed?: Buffer; warnCalls?: string[] } = {},
+    opts: { localSender?: boolean; branchHost?: boolean; bodyFrom?: string; bodySeed?: Buffer; warnCalls?: string[] } = {},
   ) {
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
@@ -153,6 +153,14 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     }));
 
     if (opts.localSender) mkdirSync(resolve(tempMailDir, sender, "new"), { recursive: true });
+    // cli#389: host TYPE decides locality. A branch relays non-bound recipients
+    // to the outbox; the office delivers into a maildir. Fixtures default to the
+    // office (a maildir recipient is local); an outbox expectation opts in to a
+    // branch host.
+    if (opts.branchHost) {
+      mkdirSync(resolve(tempHome, ".tps", "identity"), { recursive: true });
+      writeFileSync(resolve(tempHome, ".tps", "identity", "host.json"), "{}\n", "utf-8");
+    }
     const newDir = resolve(tempMailDir, agentId, "new");
     mkdirSync(newDir, { recursive: true });
 
@@ -239,7 +247,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   }, 15000);
 
   it("F-S0b: a REMOTE recipient gets exactly one reply in the outbox with X-TPS-InReplyTo, nothing dropped", async () => {
-    const h = await startDispatcher("anvil", "flint", { localSender: false });
+    const h = await startDispatcher("anvil", "flint", { localSender: false, branchHost: true });
     expect(h.dispatched).not.toBeNull();
 
     await h.deliver({ text: "final verdict" }, { kind: "final" });
@@ -427,6 +435,9 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   }
 
   it("S0 relay (POSITIVE): every record the FIXED writer emits survives the real drainOutbox relay", async () => {
+    // cli#389: a branch host relays a non-bound recipient to the outbox.
+    mkdirSync(resolve(tempHome, ".tps", "identity"), { recursive: true });
+    writeFileSync(resolve(tempHome, ".tps", "identity", "host.json"), "{}\n", "utf-8");
     const { newDir, sentDir } = outboxDirs();
     const relay = startRelay(newDir);
 
@@ -528,7 +539,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
   it("S0 positive control: the final outbox file parses, keeps replyToId + headers, no dot file remains", async () => {
     const outboxNew = resolve(tempHome, ".tps", "outbox", "new");
-    const h = await startDispatcher("anvil", "flint", { localSender: false });
+    const h = await startDispatcher("anvil", "flint", { localSender: false, branchHost: true });
 
     await h.deliver({ text: "final verdict" }, { kind: "final" });
 

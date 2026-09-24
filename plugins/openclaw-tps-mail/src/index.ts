@@ -50,6 +50,8 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
+import { deliverToRemoteBranch } from "@tpsdev-ai/cli/utils/relay";
 import {
   TERMINAL_STATES,
   createObligation,
@@ -256,12 +258,28 @@ function deliverOutboundMail(
   accountId: string,
   mailDir: string,
   message: TpsMailBody,
-): { path: string; route: "local" | "outbox" } {
-  const localAgents = findBoundAgents(cfg, accountId);
-  if (localAgents.includes(message.to)) {
-    return { path: writeMailFile(mailDir, message.to, message), route: "local" };
+): Promise<{ path: string; route: MailRoute["kind"] }> {
+  const route = routeFor(mailDir, cfg, accountId, message.to);
+  switch (route.kind) {
+    case "local":
+      return Promise.resolve({ path: writeMailFile(mailDir, message.to, message), route: "local" });
+    case "outbox":
+      return Promise.resolve({ path: writeOutboxFile(message), route: "outbox" });
+    case "remote-branch":
+      // The wire path, exactly as `tps mail send` sends it. No local file is
+      // written — the branch relays into the recipient's maildir remotely.
+      return deliverToRemoteBranch(route.branchId, {
+        to: message.to,
+        from: message.from,
+        body: message.body,
+      }).then(() => ({ path: `remote-branch:${route.branchId}`, route: "remote-branch" as const }));
+    case "unknown":
+      // (cli#389 rule 3) Never a silent write into a directory nothing reads.
+      throw new Error(
+        `no delivery route for recipient "${message.to}" on this host ` +
+          `(not bound to this gateway, no local maildir, no registered remote branch)`,
+      );
   }
-  return { path: writeOutboxFile(message), route: "outbox" };
 }
 
 /**
@@ -307,20 +325,15 @@ function signReplyEnvelope(from: string, to: string, body: string): string | nul
 }
 
 /**
- * Is `to` a local recipient? True when it has a maildir under `mailDir` on
- * this host, or when it is bound to this gateway. A LOCAL recipient's reply is
- * delivered to their maildir and never goes to ~/.tps/outbox (cli#338
- * requirement 3). A recipient that is neither is REMOTE: its reply goes to
- * ~/.tps/outbox/new/ for the branch service to relay, never dropped.
+ * ONE locality decision for outbound mail (cli#389), shared with `tps mail
+ * send` via `@tpsdev-ai/cli/utils/mail-routing` — the plugin no longer keeps a
+ * second rule. A recipient with a maildir used to be treated as local on ANY
+ * host, so a maildir created for archiving/inspection (or by accident) for a
+ * REMOTE peer silently swallowed the reply. Directory existence now decides
+ * only on the OFFICE; on a BRANCH only a bound recipient is local.
  */
-function isLocalRecipient(
-  mailDir: string,
-  cfg: any,
-  accountId: string,
-  to: string,
-): boolean {
-  if (existsSync(resolve(mailDir, to))) return true;
-  return findBoundAgents(cfg, accountId).includes(to);
+function routeFor(mailDir: string, cfg: any, accountId: string, to: string): MailRoute {
+  return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
 /**
@@ -431,7 +444,12 @@ const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
 function receiptDirs(ctx: YieldContext): string[] {
-  if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
+  // The receipt lives where the reply was WRITTEN, so use the same locality
+  // decision (cli#389). A local route scans the recipient's maildir; every
+  // relayed route scans the outbox the branch drains. (A `remote-branch` reply
+  // is sent over the wire and carries no LOCAL record, so its receipt cannot be
+  // observed here — the obligation then yields and its deadline governs.)
+  if (routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender).kind === "local") {
     return [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")];
   }
   const outbox = resolve(process.env.HOME ?? homedir(), ".tps", "outbox");
@@ -492,7 +510,7 @@ function onDeadline(ctx: YieldContext, obligationId: string): void {
   }
   const reason = "yielded-without-resumption";
   failObligation(ctx, reason);
-  sendNackMail(ctx, reason);
+  void sendNackMail(ctx, reason);
 }
 
 function makeYieldCtx(
@@ -530,7 +548,7 @@ function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; dea
   armDeadline(ctx, rec.obligationId, rec.deadlineAt);
 }
 
-function sendNackMail(ctx: YieldContext, reason: string): void {
+async function sendNackMail(ctx: YieldContext, reason: string): Promise<void> {
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -553,13 +571,19 @@ function sendNackMail(ctx: YieldContext, reason: string): void {
     deliveryAttempts: 0,
   };
   try {
-    // Route like the dispatcher reply: a LOCAL recipient (a maildir on this
-    // host, or a binding) gets the nack in their maildir; a REMOTE one gets it
-    // in the outbox for the branch relay. Never dropped.
-    if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
+    // Route the nack through the SAME locality decision as the reply (cli#389).
+    const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
+    if (route.kind === "local") {
       writeMailFile(ctx.mailDir, ctx.sender, message);
-    } else {
+    } else if (route.kind === "outbox") {
       writeOutboxFile(message);
+    } else if (route.kind === "remote-branch") {
+      await deliverToRemoteBranch(route.branchId, { to: ctx.sender, from: ctx.agent, body: message.body });
+    } else {
+      ctx.log?.warn?.(
+        `tps-mail: no delivery route for the nack to ${ctx.sender} (no binding, no maildir, no remote branch); the obligation record carries the failure`,
+      );
+      return;
     }
     ctx.log?.warn?.(`tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}`);
   } catch (err: any) {
@@ -663,17 +687,23 @@ const outbound: ChannelOutboundAdapter = {
       },
       deliveryAttempts: 0,
     };
-    const { path: filePath, route } = deliverOutboundMail(
-      ctx.cfg as any,
-      ctx.accountId ?? "default",
-      account.mailDir,
-      message,
-    );
+    let delivered: { path: string; route: MailRoute["kind"] };
+    try {
+      delivered = await deliverOutboundMail(
+        ctx.cfg as any,
+        ctx.accountId ?? "default",
+        account.mailDir,
+        message,
+      );
+    } catch (err: any) {
+      // (cli#389 rule 3) No route → a NAMED failure, never a silent write.
+      return { ok: false, error: `tps-mail: ${err?.message ?? err}` } as any;
+    }
     return {
       ok: true,
       id: message.id,
       externalId: message.id,
-      details: { path: filePath, route },
+      details: { path: delivered.path, route: delivered.route },
     } as any;
   },
 };
@@ -955,24 +985,38 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               deliveryAttempts: 0,
             };
 
-            // Requirement 3 + 5: a local recipient's reply goes to their
-            // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
-            // for the branch service to relay — never dropped. `posted` is set
-            // ONLY after the write returns; a throw is a NAMED failure.
+            // (cli#389) Route the reply through the SAME locality decision as
+            // `tps mail send` and the outbound adapter. `posted` is set ONLY
+            // after the delivery returns; a throw, or an unknown recipient on
+            // the office, is a NAMED failure.
             try {
-              if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
+              const route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
+              if (route.kind === "local") {
                 writeMailFile(account.mailDir, msg.from, reply);
                 log?.info?.(
                   `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
                 );
-              } else {
+                posted = true;
+              } else if (route.kind === "outbox") {
                 const path = writeOutboxFile(reply);
                 log?.info?.(
                   `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
                 );
+                posted = true;
+              } else if (route.kind === "remote-branch") {
+                await deliverToRemoteBranch(route.branchId, { to: msg.from, from: recipient, body: reply.body });
+                log?.info?.(
+                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=remote-branch: ${route.branchId})`,
+                );
+                posted = true;
+              } else {
+                postFailure = postFailure ?? `no-route:${msg.from}`;
+                log?.warn?.(
+                  `tps-mail: no delivery route for reply recipient ${msg.from} ` +
+                    `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
+                );
               }
-              posted = true;
-              transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
+              if (posted) transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
             } catch (err: any) {
               postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
             }

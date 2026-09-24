@@ -99,7 +99,7 @@ function postedReplies(recipient: string): any[] {
   return readdirSafe(dir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")));
 }
 
-async function start(agentId: string, sender: string, opts: { localSender?: boolean } = {}) {
+async function start(agentId: string, sender: string, opts: { localSender?: boolean; branchHost?: boolean } = {}) {
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
     createMailVerifyClient: async () => ({
       async getAgent(name: string) {
@@ -110,6 +110,12 @@ async function start(agentId: string, sender: string, opts: { localSender?: bool
     }),
   }));
   if (opts.localSender) mkdirSync(resolve(tempMailDir, sender, "new"), { recursive: true });
+  // cli#389: host TYPE decides locality (a branch relays non-bound recipients
+  // to the outbox; the office delivers into a maildir).
+  if (opts.branchHost) {
+    mkdirSync(resolve(tempHome, ".tps", "identity"), { recursive: true });
+    writeFileSync(resolve(tempHome, ".tps", "identity", "host.json"), "{}\n", "utf-8");
+  }
   const newDir = resolve(tempMailDir, agentId, "new");
   mkdirSync(newDir, { recursive: true });
   const inboundId = `msg-${Math.random().toString(36).slice(2, 10)}`;
@@ -325,7 +331,7 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
   it("(c) unrelated .malformed-* in the remote route + a turn that yields with no final → deadline ARMED, not receipt-malformed", async () => {
     process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
     seedMalformed("sent");
-    const h = await start("anvil", "flint", { localSender: false });
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
     h.settle(); // no final → yield
     await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "yielded", 2000);
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
@@ -337,7 +343,7 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
 
   it("(d) unrelated .malformed-* present + this turn posts a valid reply → found → ack", async () => {
     seedMalformed("sent");
-    const h = await start("anvil", "flint", { localSender: false });
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
     await h.deliver("verdict");
     h.settle();
     await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
@@ -350,7 +356,7 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
     mkdirSync(outbox("new"), { recursive: true });
     chmodSync(outbox("new"), 0o333); // posted reply lands here but is not listable
     try {
-      const h = await start("anvil", "flint", { localSender: false });
+      const h = await start("anvil", "flint", { localSender: false, branchHost: true });
       await h.deliver("verdict");
       h.settle();
       const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
