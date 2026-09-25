@@ -116,18 +116,20 @@ deadline never downgrades a committed record: `delivering` and `posted` keep
 their state and only gain `deadlineAt`.
 
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
-the only writer of `failed` or `nackedAt` — and the only sender of the nack mail,
-so the same verdict reaches the sender whichever path found it. That nack is
+the only writer of `failed` or `nackedAt` — and the only sender of the nack mail:
+every path hands its verdict to that ONE nack path, so the same verdict reaches
+the sender whichever path found it, and with no working route the nack stays owed
+until one exists. That nack is
 carried on the RECORD and is **at-least-once, never exactly-once**: the write
 that sets `failed` also sets `nackPending`, the send is awaited, and a mail that
 reaches a route records `nackSentAt` and clears `nackPending` in one further
-write. So a crash between settling and sending — or a send that could not be
-delivered — is visible on the record, and a later start re-sends for any
+write — WHEN THAT WRITE SUCCEEDS; when it does not, the debt stays and the nack
+may repeat. So a crash between settling and sending — or a send that could not be
+delivered — is visible on the record, and a later start retries delivery for any
 `failed` record carrying `nackPending` with no `nackSentAt`, once the store can
-be written; a crash AFTER the hand-off but before that write re-sends too, so
-the sender may see the nack twice. `nackSentAt` is recorded when that write
-succeeds; when it does not, the record keeps `nackPending` and the nack may
-repeat — the mail is owed until a hand-off is RECORDED. It
+be written; a crash AFTER the hand-off but before that write retries delivery
+too, so the sender may see the nack twice — the mail is owed until a hand-off is
+RECORDED. It
 decides from the record — evidence found → `acked`; committed with no evidence at
 the deadline → `unconfirmed` (no failed state, **no nack mail, no nack stamp**,
 logged by name); a definitive non-delivery verdict → `failed` and a nack, **even
@@ -153,12 +155,17 @@ plugin sweeps the store:
 - **Only TERMINAL records** (`acked`, `unconfirmed`, `failed`) are deletable.
   `pending`, `delivering`, `posted` and `yielded` are NEVER deleted, at any
   age — restart recovery reads them to re-arm deadlines.
-- **A terminal record still OWING its nack mail is HELD, at any age.** A
-  `failed` record with `nackPending` and no `nackSentAt` is never swept:
-  restart recovery re-sends from that record, so deleting it would erase the
-  only durable evidence that the sender is still owed a mail. Startup re-sends
-  owed nacks BEFORE it sweeps, and once the debt is discharged (`nackSentAt`
-  recorded) the record is ordinary and ages out normally.
+- **A terminal record still OWING its nack mail is HELD, while it is inside the
+  hold window.** A `failed` record with `nackPending` and no `nackSentAt` is not
+  swept while its OWN last transition is inside the hold (a configurable multiple
+  of `obligationRetentionDays`, default **4×**): startup retries delivery from
+  that record, so deleting it would erase the only durable evidence that the
+  sender is still owed a mail. Startup retries owed nacks OFF the startup path
+  (one unreachable branch must not stall the start) and the sweep HOLDS a
+  still-owed record whichever of the two runs first; once the debt is discharged
+  (`nackSentAt` recorded) the record is ordinary and ages out normally. **Past the
+  hold the debt is ABANDONED** — logged `nack-abandoned`, once, by name — and
+  normal retention applies to the record.
 - A terminal record is deleted when its **last transition** is older than the
   window. The age is the record's OWN recorded `lastTransitionAt` (falling back
   to `inboundTimestamp` for records written before that field existed) — never
@@ -176,6 +183,11 @@ plugin sweeps the store:
     }
   }
   ```
+
+- **The owed-nack hold is configurable too.** Key `obligationNackHoldMultiple`
+  (same two config locations), a multiple of `obligationRetentionDays`: default
+  **4** (so a 7-day window holds an owed nack for 28 days before abandoning it).
+  A non-positive/invalid value falls back to the default.
 
 - **Safe + best-effort:** a record that is unreadable/malformed (or has no
   parseable timestamp) is LEFT in place and logged once, and a deletion failure

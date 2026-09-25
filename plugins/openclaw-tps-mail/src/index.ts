@@ -144,6 +144,44 @@ export function resolveObligationRetentionDays(pluginCfg: any, channelCfg: any):
   return DEFAULT_OBLIGATION_RETENTION_DAYS;
 }
 
+/** How many `retentionDays` an owed nack is held before it is abandoned
+ *  (cli#389 round 12, item 2). The hold keeps a still-owed record from being
+ *  swept, but must not keep it forever: a sender with no route would otherwise
+ *  pin one record per affected inbound indefinitely. */
+export const OBLIGATION_NACK_HOLD_MULTIPLE_KEY = "obligationNackHoldMultiple";
+export const DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE = 4;
+export function resolveObligationNackHoldMultiple(pluginCfg: any, channelCfg: any): number {
+  for (const src of [pluginCfg, channelCfg]) {
+    const v = src?.[OBLIGATION_NACK_HOLD_MULTIPLE_KEY];
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE;
+}
+
+/** The age bound (in days) for the owed-nack hold: `retentionDays` times the
+ *  configured multiple. `retentionDays <= 0` (the sweep is disabled) disables
+ *  the bound too — the sweep never runs. */
+export function resolveObligationNackHoldDays(retentionDays: number, pluginCfg: any, channelCfg: any): number {
+  return retentionDays * resolveObligationNackHoldMultiple(pluginCfg, channelCfg);
+}
+
+/** The OVERALL bound (ms) for one owed-nack retry — the connection AND the ACK
+ *  wait (cli#389 round 12, item 1). The env override exists so a test can drive
+ *  a hung connect to its timeout quickly; production uses the default. */
+export const DEFAULT_NACK_RETRY_TIMEOUT_MS = 20_000;
+/** How far ABOVE the delivery's own bound the background retry's backstop sits
+ *  (cli#389 round 12, item 1). The relay closes the transport at the overall
+ *  bound and reports that timeout; the backstop only guarantees the retry
+ *  promise cannot hang the process if the delivery does not settle for another
+ *  reason, and ordering it later keeps a single log line. */
+const NACK_RETRY_BACKSTOP_MS = 2_000;
+function resolveNackRetryTimeoutMs(): number {
+  const v = process.env.TPS_NACK_RETRY_TIMEOUT_MS;
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_NACK_RETRY_TIMEOUT_MS;
+}
+
 function expandHome(p: string): string {
   return p.startsWith("~") ? resolve(homedir(), p.slice(2)) : p;
 }
@@ -367,17 +405,23 @@ function obligationMetadata(message: TpsMailBody): { obligationId?: string; repl
  * (persistReceiptAfterCommit): a receipt that cannot be written must never
  * report a delivered reply as failed (cli#389 round 5, item 2).
  */
-async function deliverRemote(reply: TpsMailBody, branchId: string): Promise<void> {
+async function deliverRemote(reply: TpsMailBody, branchId: string, opts: { timeoutMs?: number } = {}): Promise<void> {
   // Preserve the outbound identity (id + timestamp) so the wire payload — and
   // the branch's ACK correlation — match the record this plugin reports as the
-  // reply id, not a UUID the relay invents.
-  await deliverToRemoteBranch(branchId, {
-    id: reply.id,
-    to: reply.to,
-    from: reply.from,
-    body: reply.body,
-    timestamp: reply.timestamp,
-  });
+  // reply id, not a UUID the relay invents. `opts.timeoutMs` bounds the WHOLE
+  // attempt (connect + ACK); the relay CLOSES the transport when it expires
+  // (cli#389 round 12, item 1).
+  await deliverToRemoteBranch(
+    branchId,
+    {
+      id: reply.id,
+      to: reply.to,
+      from: reply.from,
+      body: reply.body,
+      timestamp: reply.timestamp,
+    },
+    { timeoutMs: opts.timeoutMs },
+  );
 }
 
 /**
@@ -696,11 +740,12 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
  * announcement is DURABLE and AT-LEAST-ONCE: the same write that settles the
  * failure records `nackPending`, the send is AWAITED, and a successful hand-off
  * records `nackSentAt` and clears the flag — so a crash between settling and
- * sending, or a send that could not be delivered, is re-sent on a later start
- * (once the store can be written) rather than leaving the sender never told. A
- * crash after the hand-off but before the record is written re-sends, so the
- * sender may see the nack twice; the record keeps the debt until a hand-off is
- * recorded. `alreadyStamped` marks a failure whose cur/ record ALREADY
+ * sending, or a send that could not be delivered, retries delivery on a later
+ * start (once the store can be written) rather than leaving the sender never
+ * told. A crash after the hand-off but before the record is written retries
+ * delivery, so the sender may see the nack twice; the record keeps the debt
+ * until a hand-off is recorded. `alreadyStamped` marks a failure whose cur/
+ * record ALREADY
  * carries the nack (restart recovery of a record settled before the crash): the
  * record is settled and the stamp is not rewritten, but the MAIL is still owed
  * and is sent by the same rule as every other failure.
@@ -788,7 +833,7 @@ async function settleObligation(
   ctx.log?.warn?.(
     `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
       (s.alreadyStamped ? ", the inbound already carried its nack" : "") +
-      (nackHandedOff ? ", sender notified" : ", the nack mail is still OWED (nackPending) — the next start re-sends it") +
+      (nackHandedOff ? ", sender notified" : ", the nack mail is still OWED (nackPending) — the next start retries delivery") +
       ", never acked",
   );
   return "failed";
@@ -803,7 +848,8 @@ async function settleObligation(
  *   handed to a route → `markNackSent`: `nackSentAt` recorded, `nackPending`
  *                       cleared, in one write on the record;
  *   no route, or a route that threw → the record KEEPS `nackPending` and the
- *                       attempt is logged by name, so a later start re-sends
+ *                       attempt is logged by name, so a later start retries
+ *                       delivery
  *                       (at-least-once: a crash between the two writes
  *                       duplicates a mail; it never loses one);
  *   handed, but the record write FAILED → the mail has left and the record
@@ -813,10 +859,10 @@ async function settleObligation(
  * Never throws into the caller. Returns true when the mail reached a route, so
  * the caller can say what actually happened to the sender.
  */
-async function deliverNack(ctx: YieldContext, reason: string): Promise<boolean> {
+async function deliverNack(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
   let handedOff = false;
   try {
-    handedOff = await sendNackMail(ctx, reason);
+    handedOff = await sendNackMail(ctx, reason, opts);
   } catch (err: any) {
     ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
     handedOff = false;
@@ -835,9 +881,78 @@ async function deliverNack(ctx: YieldContext, reason: string): Promise<boolean> 
   }
   ctx.log?.warn?.(
     `tps-mail: nack-pending: the sender was NOT told about the failure of ${ctx.inboundId} (${reason}); ` +
-      `the obligation record keeps nackPending and the next start re-sends`,
+      `the obligation record keeps nackPending and the next start retries delivery`,
   );
   return false;
+}
+
+/**
+ * cli#389 round 12, item 1 (CodeRabbit, Major): retry ONE owed nack OFF the
+ * startup path. Awaited, an unreachable branch — whose connect has no
+ * application-level timeout — stalled recovery for this agent and every later
+ * one. The whole retry (the connection AND the ACK wait) is bounded by an
+ * overall timeout; that timeout is handed to the delivery, which CLOSES the
+ * transport when it expires, and a timeout is logged BY NAME here.
+ *
+ * Never throws into the caller: it is fire-and-forget, so a rejection would
+ * otherwise be unhandled.
+ */
+function retryOwedNackInBackground(
+  mailDir: string,
+  agentId: string,
+  sender: string,
+  inboundId: string,
+  reason: string,
+  accountId: string,
+  cfg: any,
+  log: any,
+): void {
+  const timeoutMs = resolveNackRetryTimeoutMs();
+  // BACKSTOP, deliberately ABOVE the delivery's own bound: the relay closes the
+  // transport at `timeoutMs` and reports the timeout (logged by name in
+  // sendNackMail), so the retry only needs a slightly later net to guarantee
+  // the promise NEVER hangs the process here — e.g. a route that does not
+  // settle for some other reason. Ordering it later keeps a single log line.
+  const backstopMs = timeoutMs + NACK_RETRY_BACKSTOP_MS;
+  const recCurPath = findCurPath(mailDir, agentId, inboundId);
+  const ctx = makeYieldCtx(
+    mailDir,
+    agentId,
+    sender,
+    accountId,
+    recCurPath ?? resolve(mailDir, agentId, "cur", `${inboundId}.json`),
+    inboundId,
+    cfg,
+    log,
+  );
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const expired = new Promise<"expired">((res) => {
+    timer = setTimeout(() => res("expired"), backstopMs);
+    if (timer && typeof (timer as { unref?: () => void }).unref === "function") {
+      (timer as { unref: () => void }).unref();
+    }
+  });
+  void Promise.race([
+    deliverNack(ctx, reason, { timeoutMs }).then(
+      () => "done" as const,
+      () => "done" as const,
+    ),
+    expired,
+  ])
+    .then((outcome) => {
+      if (outcome === "expired") {
+        log?.warn?.(
+          `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not complete within ${backstopMs}ms ` +
+            `(connect + ack); the transport was closed and the record keeps nackPending`,
+        );
+      }
+    })
+    .catch((err: any) => {
+      log?.warn?.(`tps-mail: nack-retry-failed: the owed nack for ${inboundId} to ${sender} threw: ${err?.message ?? err}`);
+    })
+    .finally(() => {
+      if (timer) clearTimeout(timer);
+    });
 }
 
 /**
@@ -916,8 +1031,8 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
   // mail on its own, so the deadline and the turn's own scan give the sender the
   // same outcome. cli#389 round 10, item 1: AWAIT that send here too, so the
   // deadline's own nack has landed (and its outcome is on the record) before
-  // this path finishes; the mail is at-least-once, and a start re-sends anything
-  // still owed.
+  // this path finishes; the mail is at-least-once, and a start retries
+  // delivery of anything still owed.
   await settleObligation(ctx, obligationId, {
     receipt: receipt.status === "found" ? "found" : "none",
     verdict,
@@ -978,11 +1093,16 @@ async function reconcileObligation(ctx: YieldContext, rec: { obligationId: strin
 /**
  * Hand a nack mail to the sender through the SAME locality decision as the
  * reply (cli#389) and report whether it reached a route (cli#389 round 10, item
- * 1 — the verb records that outcome on the obligation record and re-sends when
- * it is missing). `false` means the mail was NOT handed over: either no route
- * exists at all, or the route threw. Never throws.
+ * 1 — the verb records that outcome on the obligation record and retries the
+ * delivery when it is missing). `false` means the mail was NOT handed over:
+ * either no route exists at all, or the route threw. Never throws.
+ *
+ * `opts.timeoutMs` (cli#389 round 12, item 1) is the OVERALL bound for a wire
+ * nack — the connection AND the ACK wait. The relay CLOSES the transport when it
+ * expires; that timeout is logged BY NAME rather than as an ordinary delivery
+ * error, so an operator can tell a dead branch from a refused one.
  */
-async function sendNackMail(ctx: YieldContext, reason: string): Promise<boolean> {
+async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -1012,7 +1132,7 @@ async function sendNackMail(ctx: YieldContext, reason: string): Promise<boolean>
     } else if (route.kind === "outbox") {
       writeOutboxFile(message);
     } else if (route.kind === "remote-branch") {
-      await deliverRemote(message, route.branchId);
+      await deliverRemote(message, route.branchId, { timeoutMs: opts.timeoutMs });
     } else if (route.kind === "bridge") {
       deliverToSandbox(route.branchId, { to: ctx.sender, from: ctx.agent, body: message.body });
     } else {
@@ -1024,9 +1144,27 @@ async function sendNackMail(ctx: YieldContext, reason: string): Promise<boolean>
     }
     return true;
   } catch (err: any) {
-    ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+    if (isRemoteDeliveryTimeout(err)) {
+      // cli#389 round 12, item 1: the connection (or the ACK wait) exceeded the
+      // overall bound and the relay CLOSED the transport. Logged BY NAME so the
+      // branch that could not be reached is identifiable.
+      ctx.log?.warn?.(
+        `tps-mail: nack-retry-timeout: the owed nack for ${ctx.inboundId} to ${ctx.sender} did not complete within ` +
+          `${opts.timeoutMs ?? DEFAULT_NACK_RETRY_TIMEOUT_MS}ms (connect + ack); the delivery was abandoned, the transport closed, ` +
+          `and the record keeps nackPending`,
+      );
+    } else {
+      ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+    }
     return false;
   }
+}
+
+/** True for the relay's bounded-timeout error (cli#389 round 12, item 1).
+ *  Matched BY NAME so a module mock that does not re-export the class still
+ *  classifies correctly. */
+function isRemoteDeliveryTimeout(err: any): boolean {
+  return err?.name === "RemoteDeliveryTimeoutError";
 }
 
 /**
@@ -1711,32 +1849,27 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
         // UNSENT NACKS (cli#389 round 10, item 1): a TERMINAL failure whose nack
         // mail never went out — a crash between settling the failure and sending
-        // its nack, or a send that could not be delivered — is re-sent here. The
+        // its nack, or a send that could not be delivered — is retried here. The
         // RECORD decides (`nackPending` with no `nackSentAt`), never the cur/
         // stamp, so a stamp can no longer stand in for a mail the sender never
         // received. AT-LEAST-ONCE: a crash after the send but before
-        // `nackSentAt` is written re-sends, so the sender may see the nack twice;
-        // the record keeps the debt until a hand-off is recorded.
+        // `nackSentAt` is written retries delivery, so the sender may see the
+        // nack twice; the record keeps the debt until a hand-off is recorded.
         //
-        // cli#389 round 11, item 1: this runs BEFORE the retention sweep below.
-        // The sweep itself also HOLDS any record still owing its nack
-        // (obligations.ts), so an owed mail survives whichever order the two run
-        // in — but recovery goes first, so an owed nack is re-sent (and the debt
-        // discharged) before any retention decision reads the store.
+        // cli#389 round 12, item 1 (CodeRabbit, Major): the retries run in the
+        // BACKGROUND, NOT awaited on the startup path. Awaited, one unreachable
+        // branch (connect has no application-level timeout) stalled recovery for
+        // this agent and every later one. Each retry is bounded by an overall
+        // timeout — the connection AND the ACK wait — that CLOSES the transport
+        // on expiry and logs BY NAME (`nack-retry-timeout`).
+        //
+        // cli#389 round 12, item 1: the ordering dependency is GONE. The sweep
+        // below HOLDS any record still owing its nack (obligations.ts) while it
+        // is inside the bounded hold, so an owed mail survives whether the retry
+        // or the sweep runs first.
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!nackOwed(rec)) continue;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
-          const ctx = makeYieldCtx(
-            account.mailDir,
-            agentId,
-            rec.from,
-            account.accountId,
-            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
-            rec.inboundId,
-            cfg,
-            log,
-          );
-          await deliverNack(ctx, rec.failure ?? "failed");
+          retryOwedNackInBackground(account.mailDir, agentId, rec.from, rec.inboundId, rec.failure ?? "failed", account.accountId, cfg, log);
         }
 
         // OBLIGATION RETENTION (cli#401): delete ONLY terminal records (acked,
@@ -1745,12 +1878,19 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // Best-effort — a failure never blocks startup. A replayed id whose
         // record was swept opens a FRESH obligation: accepted, since relay
         // retries arrive within minutes/hours, never the window later.
+        //
+        // cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age — a
+        // configurable multiple of `retentionDays` — so a sender that NEVER gets
+        // a route cannot pin a record forever.
         try {
+          const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
           sweepTerminalObligations(
             account.mailDir,
             agentId,
-            resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]),
+            retentionDays,
             log,
+            Date.now(),
+            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]),
           );
         } catch (err: any) {
           log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);

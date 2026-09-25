@@ -367,10 +367,27 @@ export async function listenForHost(
 }
 
 export class NoiseIkTransport implements WireTransport {
+  /** The socket of an IN-FLIGHT `connect`, so a caller that bounds the
+   *  connection (cli#389 round 12) can destroy it instead of leaking a
+   *  half-open socket when the attempt is abandoned. */
+  private inFlight: Socket | null = null;
+
   constructor(
     private readonly branchKeyPair: TpsKeyPair,
     private readonly hostKeyPair?: TpsKeyPair
   ) {}
+
+  /** Close/destroy an in-flight connection attempt. Safe to call at any time;
+   *  a no-op once there is nothing in flight. Idempotent. */
+  close(): void {
+    const socket = this.inFlight;
+    this.inFlight = null;
+    try {
+      socket?.destroy();
+    } catch {
+      /* best effort — tearing down a socket must never throw */
+    }
+  }
 
   async listen(port: number): Promise<TransportServer> {
     const host = this.hostKeyPair ?? await loadHostIdentity();
@@ -424,6 +441,11 @@ export class NoiseIkTransport implements WireTransport {
 
   async connect(target: BranchTarget): Promise<TransportChannel> {
     const socket = net.createConnection({ host: target.host, port: target.port });
+    // Track the socket so a bounded caller can destroy it on expiry (cli#389
+    // round 12). Cleared when it closes, so only a PENDING connection is torn
+    // down by `close()`.
+    this.inFlight = socket;
+    socket.once("close", () => { if (this.inFlight === socket) this.inFlight = null; });
     await new Promise<void>((resolve, reject) => {
       socket.once("connect", () => resolve());
       socket.once("error", reject);

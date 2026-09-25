@@ -16,10 +16,12 @@
   **Every transition to `failed` announces the sender, from the verb, and the
   announcement is durable and at-least-once.** An attributable quarantine found
   during the turn used to fail and stamp the obligation silently, because only
-  the deadline caller mailed. The verb now sends the nack mail, so the same
-  verdict gives the same sender-visible outcome wherever it is found, and no
-  caller mails on its own. The nack is owed ON THE RECORD, not proven by the
-  cur/ stamp, and a terminal record refuses later transitions outright.
+  the deadline caller mailed. The verb now sends the nack mail, so every path
+  hands its verdict to that one nack path and the same verdict gives the same
+  sender-visible outcome wherever it is found, and no caller mails on its own;
+  with no working route the nack stays owed until one exists. The nack is owed ON
+  THE RECORD, not proven by the cur/ stamp, and a terminal record refuses later
+  transitions outright.
 
   **Recovery decides from evidence, not from an old stamp.** A `nackedAt` left by
   earlier behaviour no longer promotes to a verdict for a record whose own

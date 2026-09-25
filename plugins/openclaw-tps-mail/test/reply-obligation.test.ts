@@ -955,15 +955,18 @@ describe("cli#389 round 10 — a settled failure's nack mail survives a crash", 
  * recovery, and the sweep deleted an aged `failed` record without ever asking
  * whether its nack mail was still owed — so a record that owed the sender a
  * mail was swept the moment it aged past the window, and recovery then had
- * nothing left to re-send. Two changes: the sweep never removes a record whose
- * nack is owed (`nackPending` with no `nackSentAt`), at any age; and startup
- * re-sends owed nacks before it sweeps.
+ * nothing left to retry. Two changes: the sweep never removes a record whose
+ * nack is owed (`nackPending` with no `nackSentAt`) while it is inside the hold
+ * window; and startup retries owed nacks before it sweeps.
  *
- * The record below is aged past the DEFAULT window (7 days), so age alone is
- * what the sweep acts on, and its cur/ record is stamped — so the older
- * unresolved-cur/ hold does not apply and the DEBT is the only thing that can
- * hold it back. The sweep is therefore driven DIRECTLY first (that is the hold
- * under test), and then a start proves the owed mail is actually re-sent.
+ * cli#389 round 12, item 2 bounds that hold by AGE — a configurable multiple of
+ * `retentionDays` — so the fixture below sits past the 7-day retention window
+ * but WELL INSIDE the hold (the default multiple is 4, i.e. 28 days).
+ *
+ * The record's cur/ record is stamped — so the older unresolved-cur/ hold does
+ * not apply and the DEBT is the only thing that can hold it back. The sweep is
+ * therefore driven DIRECTLY first (that is the hold under test), and then a
+ * start proves the owed mail is actually retried.
  */
 describe("cli#389 round 11 — an owed nack is never swept", () => {
   const R11_OBLIGATION = "ob-round11";
@@ -1019,7 +1022,7 @@ describe("cli#389 round 11 — an owed nack is never swept", () => {
     const agentId = "anvil";
     const inboundId = "msg-r11-aged-nack";
     const reason = "receipt-malformed";
-    seedAgedNackOwed(agentId, inboundId, reason, 30); // 30 days: well past the 7-day default window
+    seedAgedNackOwed(agentId, inboundId, reason, 10); // 10 days: past the 7-day window, inside the 28-day hold
 
     // The SWEEP on its own: age is what it acts on, and the owed mail is the only
     // thing that can hold the record back.
@@ -1028,8 +1031,10 @@ describe("cli#389 round 11 — an owed nack is never swept", () => {
     expect(swept.heldForNack, "and it is counted as held for the mail it owes").toBe(1);
     expect(obligationFile(agentId, inboundId), "so the durable record survives the sweep").toBeTruthy();
 
-    // A start then re-sends the mail the record still owes. Recovery runs BEFORE
-    // the sweep, so the debt is discharged and the record becomes ordinary.
+    // A start then retries delivery of the mail the record still owes. The
+    // retry runs OFF the startup path, and the sweep HOLDS a within-bound owed
+    // record, so the debt is discharged and the record becomes ordinary without
+    // depending on which of the two ran first.
     const h = await start(agentId, "flint", { localSender: true, noInbound: true });
     const flintNew = resolve(tempMailDir, "flint", "new");
     const arrived = await pollUntil(() => nackMailsIn(flintNew, reason).length === 1, 3000);

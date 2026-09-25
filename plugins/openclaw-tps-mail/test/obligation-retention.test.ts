@@ -427,3 +427,71 @@ describe("cli#389 round 5 — two agents answering one inbound own their own rec
     expect(res.receiptsRemoved, "exactly the terminal one").toBe(1);
   });
 });
+
+// ── cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age ──────────
+
+/**
+ * cli#389 round 12, item 2 (CodeRabbit, Minor). The owed-nack hold used to be
+ * UNBOUNDED: a sender with no route kept its `failed` record forever, so startup
+ * work and `nack-pending` log volume grew with those records without limit. The
+ * hold is now bounded by AGE — a configurable multiple of `retentionDays`
+ * (`nackHoldDays`) — after which the debt is abandoned: logged `nack-abandoned`,
+ * ONCE, by name, and normal retention then applies to the record.
+ */
+describe("cli#389 round 12 — the owed-nack hold is bounded by age", () => {
+  /** A `failed` record still owing its nack, aged `ageDays` (nackPending set). */
+  function owedRecord(inboundId: string, ageDays: number): string {
+    const dir = obligationsDir(mailDir, AGENT);
+    mkdirSync(dir, { recursive: true });
+    const ts = daysAgo(ageDays);
+    const p = join(dir, `${inboundId}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          obligationId: `ob-${inboundId}`,
+          inboundId,
+          inboundTimestamp: ts,
+          from: "sender",
+          to: AGENT,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: "no-route",
+          nackPending: true,
+          lastTransitionAt: ts,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    return p;
+  }
+
+  it("an owed record WITHIN the bound is still held; PAST it the debt is abandoned by name and the record is swept", () => {
+    const within = owedRecord("owed-within", 10); // 10d: past the 7d window, inside the 28d hold
+    const past = owedRecord("owed-past", 40); // 40d: past the 28d hold
+    const seen = { info: [] as string[], warn: [] as string[] };
+
+    const res = sweepTerminalObligations(
+      mailDir,
+      AGENT,
+      7,
+      { info: (m) => seen.info.push(m), warn: (m) => seen.warn.push(m) },
+      Date.now(),
+      28,
+    );
+
+    expect(res.heldForNack, "the within-bound owed record is still held for its mail").toBe(1);
+    expect(res.abandonedForNack, "the past-bound owed record is abandoned").toBe(1);
+    expect(res.removed, "and normal retention then sweeps it").toBe(1);
+    expect(existsSync(within), "within-bound: the durable record survives").toBe(true);
+    expect(existsSync(past), "past-bound: the record is gone").toBe(false);
+
+    const abandoned = seen.warn.filter((m) => m.includes("nack-abandoned"));
+    expect(abandoned.length, "logged once").toBe(1);
+    expect(abandoned[0], "and BY NAME").toContain("owed-past");
+  });
+});
