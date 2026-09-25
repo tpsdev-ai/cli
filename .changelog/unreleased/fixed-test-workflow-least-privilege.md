@@ -1,3 +1,3 @@
-- **CI jobs now run with read-only tokens: the workflow grants nothing by default, each job declares only the scope its steps use, and every checkout leaves no token in `.git/config`.**
+- **Each CI job now declares only the scope its steps use, no job inherits a token scope, and every checkout leaves no credentials in `.git/config`; the only write scope is the CodeQL job's SARIF upload.**
 
   (Refs tpsdev-ai/cli#412)
