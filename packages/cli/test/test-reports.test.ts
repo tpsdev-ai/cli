@@ -33,7 +33,7 @@
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -324,6 +324,30 @@ describe("parseJunit", () => {
   test("parseJunit sees nothing in a report bun wrote for a zero-case file", () => {
     const empty = `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n`;
     expect(parseJunit(empty).testsuites).toEqual([]);
+  });
+});
+
+describe("discoverTestFiles — fails closed when it cannot see the tree", () => {
+  // An unreadable directory used to be skipped, so its test files were never
+  // discovered and the guard could pass with them unrun.
+  test.skipIf(process.platform === "win32" || process.getuid?.() === 0)("an unreadable subdirectory throws, naming it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli411-unreadable-"));
+    const locked = join(dir, "locked");
+    try {
+      mkdirSync(locked);
+      writeFileSync(join(locked, "hidden.test.ts"), "// fixture\n");
+      writeFileSync(join(dir, "seen.test.ts"), "// fixture\n");
+      chmodSync(locked, 0o000);
+      expect(() => discoverTestFiles(dir)).toThrow(/could not read locked \(EACCES\)/);
+    } finally {
+      chmodSync(locked, 0o700);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing root throws instead of discovering nothing", () => {
+    const dir = join(tmpdir(), `cli411-missing-root-${process.pid}-${Date.now()}`);
+    expect(() => discoverTestFiles(dir)).toThrow(/could not read \. \(ENOENT\)/);
   });
 });
 

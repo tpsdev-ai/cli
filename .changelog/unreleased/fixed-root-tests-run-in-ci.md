@@ -24,7 +24,9 @@
   on disk (every form bun discovers), and fails naming each discovered file that
   no report shows executed. It fails CLOSED: a required report that is missing,
   unreadable or empty fails the build, so a suite that never ran cannot read as a
-  suite that covered everything.
+  suite that covered everything. Discovery fails closed too: a directory it
+  cannot read, or a missing repository root, fails the guard instead of
+  shrinking the set of test files it checks.
 
   The guard is its own step, and now the LAST step of the job with
   `if: always()`: a suite step that fails does not skip it, and it is not a
