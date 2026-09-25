@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "build": "(cd packages/cli && bun run build || true) && cd packages/agent && bun run build && cd ../cli && rm -rf dist && bun run build && cd ../pi-tps-mail && bun run build",
-    "test": "cd packages/agent && bun test && cd ../cli && bun test && cd ../pi-tps-mail && bun test",
+    "test": "cd packages/agent && node ../../scripts/test-suite.mjs agent && cd ../cli && node ../../scripts/test-suite.mjs cli && cd ../pi-tps-mail && node ../../scripts/test-suite.mjs pi-tps-mail && cd ../.. && node scripts/test-suite.mjs root-test ./test",
     "lint": "cd packages/cli && bun run lint",
     "lint:ci": "cd packages/cli && bun run lint:ci",
     "tps": "node packages/cli/dist/bin/tps.js"
