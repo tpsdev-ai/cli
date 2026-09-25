@@ -12,6 +12,25 @@
  * truth behind the ack: the ack transition is keyed on a RECEIPT for THIS
  * obligation — never on the fact that a dispatch settled.
  *
+ * LIFECYCLE (cli#389 round 8). The record carries what the DELIVERY has done,
+ * durably, so a restart reads the same truth as the turn did:
+ *
+ *   pending ──yield/deadline armed──▶ yielded
+ *   pending/yielded ──write-ahead, BEFORE the delivery call──▶ delivering
+ *   delivering ──the delivery call RETURNED──▶ posted
+ *   posted/delivering ──receipt or sandbox evidence──▶ acked
+ *   delivering/posted ──deadline, no evidence, no verdict──▶ unconfirmed
+ *   any live state ──definitive non-delivery verdict──▶ failed
+ *
+ * `delivering` is a WRITE-AHEAD marker: it is persisted before the delivery call
+ * so a crash mid-delivery is distinguishable from a crash before it, and
+ * `posted` is persisted the moment the call returns. A definitive non-delivery
+ * verdict (an explicit delivery rejection, a failed delivery call, or the drain
+ * quarantining THIS reply's own record) fails the obligation even from
+ * `delivering`/`posted`; with no verdict, a committed record at its deadline
+ * becomes `unconfirmed` — never `failed`, because non-delivery cannot be proven
+ * and the sender is never told a delivered reply failed.
+ *
  * RECEIPTS (cli#389 round 3; PER-AGENT since round 5). A receipt is EITHER the
  * posted record that carries this obligation's `X-TPS-Obligation` marker (a
  * local maildir file, or the outbox record the branch drains) OR — for a route
@@ -37,8 +56,9 @@
  * UUID (see sweepTerminalObligations).
  *
  * RETENTION (cli#401): records are swept at startup recovery. Only TERMINAL
- * records (acked/failed) whose LAST TRANSITION is older than the window are
- * deleted; pending/posted/yielded are never touched. A replayed inbound id whose
+ * records (acked/unconfirmed/failed) whose LAST TRANSITION is older than the
+ * window are deleted; pending/delivering/posted/yielded are never touched. A
+ * replayed inbound id whose
  * record was swept opens a FRESH obligation — accepted, because relay retries
  * arrive within minutes or hours, never the window later. The same sweep owns
  * the metadata receipts (cli#389 round 3), which since round 5 live in the
@@ -63,9 +83,21 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 
-export type ObligationState = "pending" | "yielded" | "posted" | "acked" | "failed";
+export type ObligationState =
+  | "pending"
+  | "yielded"
+  | "delivering"
+  | "posted"
+  | "acked"
+  | "unconfirmed"
+  | "failed";
 
-export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "failed"]);
+/**
+ * Final states: nothing after them, never resurrected. `unconfirmed` is terminal
+ * too (cli#389 round 8): a committed obligation whose evidence never arrived is
+ * DONE — it is not failed (non-delivery cannot be proven), and it is not acked.
+ */
+export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "unconfirmed", "failed"]);
 
 export interface ObligationRecord {
   obligationId: string;
@@ -81,7 +113,9 @@ export interface ObligationRecord {
   /** ISO deadline armed at the yield transition; null while pending. */
   deadlineAt: string | null;
   attempts: number;
-  /** Named failure reason when state === "failed". */
+  /** Named reason for a non-ack terminal state: the failure when the delivery
+   *  was proven not to have happened (`failed`), or WHY the obligation could
+   *  not be resolved either way (`unconfirmed`). Never set on a live record. */
   failure?: string;
   /** ISO time of the LAST state transition (create counts as the pending
    *  transition). The retention sweep ages a terminal record by THIS, falling
@@ -225,8 +259,10 @@ export interface RetentionResult {
 const ALL_STATES: ReadonlySet<string> = new Set([
   "pending",
   "yielded",
+  "delivering",
   "posted",
   "acked",
+  "unconfirmed",
   "failed",
 ]);
 
@@ -271,8 +307,9 @@ export function obligationLastTransitionMs(record: unknown): number | null {
 
 /**
  * Sweep the agent's obligation store: DELETE only TERMINAL records (acked,
- * failed) whose LAST TRANSITION is older than `retentionDays`. NEVER pending /
- * posted / yielded, at any age — restart recovery reads those.
+ * unconfirmed, failed) whose LAST TRANSITION is older than `retentionDays`.
+ * NEVER pending / delivering / posted / yielded, at any age — restart recovery
+ * reads those.
  *
  * Ages a record by its OWN recorded timestamp (`lastTransitionAt`, else
  * `inboundTimestamp`), never the file mtime. Safe + best-effort: an
@@ -364,7 +401,7 @@ export function sweepTerminalObligations(
     if (!TERMINAL_STATES.has(state as ObligationState)) {
       const liveObligationId = (record as { obligationId?: unknown }).obligationId;
       if (typeof liveObligationId === "string") liveObligationIds.add(liveObligationId);
-      res.left++; // pending / posted / yielded are never deletable
+      res.left++; // pending / delivering / posted / yielded are never deletable
       continue;
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
@@ -547,7 +584,16 @@ export function writeReceipt(mailDir: string, agent: string, record: ReceiptReco
 
 export type ReceiptScan =
   | { status: "found"; path: string }
-  | { status: "malformed"; path: string }
+  | {
+      status: "malformed";
+      path: string;
+      /** cli#389 round 8 — ATTRIBUTION: true when the quarantined record IS this
+       *  reply's own (its name still carries the reply id this obligation knows),
+       *  which makes it a DEFINITIVE non-delivery verdict. False when the
+       *  quarantine cannot be tied to this reply — then it is not a verdict and
+       *  the obligation resolves at its deadline. */
+      ownRecord: boolean;
+    }
   | { status: "absent" };
 
 /**
@@ -664,7 +710,13 @@ export function envelopeFrom(body: string): string | null {
  * A `.malformed-*` quarantine (drainOutbox's quarantine for an unparseable
  * record) is FAILED, never posted — its marker cannot be read, so a malformed
  * file in the receipt dirs is reported as `malformed` only when no valid receipt
- * was found.
+ * was found. cli#389 round 8 makes it ATTRIBUTABLE: the drain renames the record
+ * to `.malformed-<its original name>`, and a record this plugin wrote is named
+ * `<tsSlug>-<replyId>.json` — so when the quarantined name ends with the reply id
+ * the record knows (pin g), the quarantined file IS this reply's own and the
+ * scan says so (`ownRecord`). That is a DEFINITIVE non-delivery verdict: the
+ * reply was quarantined, never delivered. Any other quarantined file is
+ * unattributable and stays a deadline matter.
  * `expectedReplyId` is pin (g): the reply the obligation record KNOWS it was
  * discharged by, when it knows one. An obligation record written before the
  * `replyId` field existed (or one that never reached `posted`) carries none, and
@@ -679,7 +731,7 @@ export function scanForReceipt(
   expectedReplyId?: string,
   fs: ReceiptScanFs = realFs,
 ): ReceiptScan {
-  let malformed: string | null = null;
+  let malformed: { path: string; ownRecord: boolean } | null = null;
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
   //     the agent's receipts root holds a receipt per non-local delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
@@ -713,7 +765,18 @@ export function scanForReceipt(
     }
     for (const name of names) {
       if (name.startsWith(".malformed-")) {
-        malformed = malformed ?? resolve(dir, name);
+        // This reply's OWN quarantined record: the name still carries the reply
+        // id the obligation recorded (pin g), so the quarantine can be ATTRIBUTED
+        // to this reply — a definitive non-delivery. An attributed quarantine is
+        // preferred over an unattributable one, so a stale unrelated marker in the
+        // same dirs can never mask the verdict.
+        const own =
+          typeof expectedReplyId === "string" &&
+          expectedReplyId.length > 0 &&
+          name.endsWith(`-${expectedReplyId}.json`);
+        if (!malformed || (own && !malformed.ownRecord)) {
+          malformed = { path: resolve(dir, name), ownRecord: own };
+        }
         continue;
       }
       if (name.startsWith(".")) continue; // staging temp
@@ -752,7 +815,7 @@ export function scanForReceipt(
       }
     }
   }
-  if (malformed) return { status: "malformed", path: malformed };
+  if (malformed) return { status: "malformed", path: malformed.path, ownRecord: malformed.ownRecord };
   return { status: "absent" };
 }
 

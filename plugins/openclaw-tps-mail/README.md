@@ -78,6 +78,43 @@ packaged install does not.) Raising the floor would break installing the plugin
 on exactly the hosts this warning exists for, so the range stays `>=2026.3.7`
 and the runtime WARN carries the floor instead.
 
+## The obligation lifecycle (cli#389 round 8)
+
+Every inbound opens one durable obligation record, and its `state` is the
+plugin's truth about what the delivery has done — the turn, the deadline timer
+and a RESTART after a crash all read the same record:
+
+- **`pending`** — the obligation exists; no deadline armed yet.
+- **`yielded`** — the run ended without a posted final; the deadline is armed.
+- **`delivering`** — WRITE-AHEAD: persisted BEFORE the delivery call, so a crash
+  mid-delivery is distinguishable from a crash before it.
+- **`posted`** — the delivery call RETURNED: the reply is on the wire.
+- **`acked`** — terminal: a receipt (or the bridge sandbox record) proves the
+  delivery.
+- **`unconfirmed`** — terminal: committed, and no evidence arrived by the
+  deadline. NOT failed, and the sender is never told it failed.
+- **`failed`** — terminal: a definitive non-delivery verdict; failed and nacked.
+
+The transitions: `pending`/`yielded` → `delivering` before the delivery call (if
+THAT write fails, nothing was sent and the obligation fails and nacks as before);
+`delivering` → `posted` the moment the call returns; `posted`/`delivering` →
+`acked` when the scan finds evidence (the ack is gated on the receipt, never on
+the dispatch settling); `delivering`/`posted` → `unconfirmed` at the deadline
+with no evidence; and any live state → `failed` on a definitive non-delivery
+verdict. Arming a deadline never downgrades a committed record: `delivering` and
+`posted` keep their state and only gain `deadlineAt`.
+
+ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
+the only writer of `failed` or `nackedAt`. It decides from the record — evidence
+found → `acked`; committed with no evidence at the deadline → `unconfirmed` (no
+failed state, **no nack mail, no nack stamp**, logged by name); a definitive
+non-delivery verdict → `failed` and a nack, **even after commit**. A definitive
+verdict means an explicit delivery rejection, a delivery call that failed, or the
+outbox drain QUARANTINING THIS REPLY'S OWN RECORD — attributed by the reply id
+itself (the drain keeps the original name, which carries the reply the plugin
+posted). An unrelated `.malformed-*` marker, or an evidence step that threw, is
+NOT a verdict: those resolve at the deadline.
+
 ## Obligation record retention (cli#401)
 
 Every inbound opens a durable obligation record at
@@ -85,9 +122,9 @@ Every inbound opens a durable obligation record at
 accumulate forever (one ~600 B file per inbound), so at **startup recovery** the
 plugin sweeps the store:
 
-- **Only TERMINAL records** (`acked`, `failed`) are deletable. `pending`,
-  `posted` and `yielded` are NEVER deleted, at any age — restart recovery reads
-  them to re-arm deadlines.
+- **Only TERMINAL records** (`acked`, `unconfirmed`, `failed`) are deletable.
+  `pending`, `delivering`, `posted` and `yielded` are NEVER deleted, at any
+  age — restart recovery reads them to re-arm deadlines.
 - A terminal record is deleted when its **last transition** is older than the
   window. The age is the record's OWN recorded `lastTransitionAt` (falling back
   to `inboundTimestamp` for records written before that field existed) — never
@@ -141,18 +178,23 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   obligation supplies them, so that delivery stays locally readable evidence
   even if the receipt above could not be written. A caller that supplies none —
   an ordinary send — leaves the record exactly as it was.
-- **Nothing after a delivery commits fails a delivered reply.** Once a delivery
-  call has returned it has committed, so the plugin guards the failure verb
-  itself: a throw from ANY step that runs after the commit — the ACK transition,
-  the receipt scan, the posted transition, the receipt write, the failedCounts
-  log — is logged by name (`post-commit-error:<step>`, or `receipt-write-failed`
-  for the receipt) and does **not** fail the obligation or nack the inbound,
-  whichever catch it lands in. For the wire route the receipt is the only local
-  evidence, so the residual is this: a replying host that cannot write its own
-  receipt (a full disk, for example — the bridge still has its sandbox record,
-  the wire does not) resolves that obligation at its **deadline** instead of
-  immediately. A committed reply whose own posted record cannot be read back as
-  a valid receipt resolves at its deadline the same way.
+- **A committed delivery is never reported as failed.** The commit is a PERSISTED
+  state of the obligation record (`delivering` before the delivery call, `posted`
+  when it returns), never a flag in the plugin's memory, so a restart, the
+  deadline timer and the dispatch's outer catch all read the same truth. A throw
+  from ANY step that runs after the commit — the ACK transition, the receipt
+  scan, the posted transition, the receipt write, the failedCounts log — is
+  logged by name (`post-commit-error:<step>`, or `receipt-write-failed` for the
+  receipt) and does **not** fail the obligation or nack the inbound, whichever
+  catch it lands in; the obligation's normal deadline is armed so it still
+  resolves to `acked` or `unconfirmed`. The residual that leaves is the wire
+  route's: a replying host that cannot write its own receipt (a full disk, for
+  example — the bridge still has its sandbox record, the wire does not) has no
+  local evidence, so its obligation resolves at its **deadline** — and so does a
+  committed reply whose own posted record cannot be read back as a valid receipt.
+  The one thing that still fails a committed obligation is a DEFINITIVE
+  non-delivery verdict: the drain quarantining this reply's own record, attributed
+  by its reply id.
 
 ## Retiring the old hook
 

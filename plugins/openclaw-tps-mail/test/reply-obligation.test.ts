@@ -19,7 +19,7 @@
  * cross-account rejection; plus the replayed-inbound no-second-obligation case.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -528,4 +528,139 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(1);
     await h2.stop();
   }, 20000);
+
+  // ── round 8: the commit is a PERSISTED state of the obligation record ──────
+
+/**
+ * cli#389 round 8. `committed` used to live in the TURN's context — memory only
+ * — so a restart, the deadline path and the outer catch each saw a different
+ * truth: in one process the deadline still mailed a nack for a reply that had
+ * been delivered, and after a restart the same obligation failed and nacked.
+ * The commit is now a PERSISTED state of the obligation record — `delivering`
+ * before the delivery call, `posted` when it returns — and every disposition
+ * reads the RECORD.
+ *
+ * Each test below seeds the durable state a crash leaves (a record mid-delivery,
+ * a record whose delivery returned) and then RESTARTS the account: recovery
+ * re-arms the deadline from the record, and the deadline resolves the obligation
+ * to the terminal `unconfirmed` — no failed state, no nack stamp, no nack mail
+ * (non-delivery cannot be proven, so the sender is never told it failed). An
+ * implementation that reads an in-memory flag instead of the record cannot pass
+ * these: after a restart there is no flag to read.
+ */
+describe("cli#389 round 8 — the commit is a persisted state of the obligation record", () => {
+  const R8_OBLIGATION = "ob-round8";
+
+  /** The durable state a crash leaves, plus the unacked cur/ record beside it. */
+  function seedCommitted(
+    agentId: string,
+    inboundId: string,
+    state: "delivering" | "posted",
+    replyId: string | null,
+    deadlineInMs: number,
+  ): void {
+    mkdirSync(resolve(tempMailDir, agentId, "cur"), { recursive: true });
+    mkdirSync(resolve(tempMailDir, agentId, ".obligations"), { recursive: true });
+    writeFileSync(
+      resolve(tempMailDir, agentId, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
+      JSON.stringify(
+        { id: inboundId, from: "flint", to: agentId, body: buildSignedBody("flint", agentId, "x", FLINT_SEED), timestamp: new Date().toISOString(), read: false },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    writeFileSync(
+      resolve(tempMailDir, agentId, ".obligations", `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId: R8_OBLIGATION,
+          inboundId,
+          inboundTimestamp: new Date().toISOString(),
+          from: "flint",
+          to: agentId,
+          accountId: "default",
+          state,
+          deadlineAt: new Date(Date.now() + deadlineInMs).toISOString(),
+          attempts: 1,
+          ...(replyId ? { replyId } : {}),
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  }
+
+  /** Every nack mail the sender has received. */
+  function nackMails(sender: string): any[] {
+    const dir = resolve(tempMailDir, sender, "new");
+    return readdirSafe(dir)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => {
+        try {
+          return JSON.parse(readFileSync(resolve(dir, f), "utf-8"));
+        } catch {
+          return null;
+        }
+      })
+      .filter((r) => typeof r?.headers?.["X-TPS-Nack"] === "string");
+  }
+
+  it("R8-a: a restart with the record in `delivering` (the call in flight) → the deadline resolves it `unconfirmed`, no nack stamp, no nack mail", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r8-delivering";
+    seedCommitted(agentId, inboundId, "delivering", null, 250);
+    const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+
+    const unconfirmed = await pollUntil(() => obligationFile(agentId, inboundId)?.state === "unconfirmed", 4000);
+    expect(unconfirmed, "the deadline resolved it").toBe(true);
+    expect(obligationFile(agentId, inboundId)?.failure).toBe("yielded-without-resumption");
+    expect(curRecordById(agentId, inboundId)?.nackedAt, "no nack stamp").toBeUndefined();
+    expect(curRecordById(agentId, inboundId)?.ackedAt, "and it was never acked either").toBeUndefined();
+    expect(nackMails("flint").length, "no nack mail for a committed reply").toBe(0);
+    await h.stop();
+  }, 20000);
+
+  it("R8-b: the same for `posted` (the delivery returned before the crash)", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r8-posted";
+    seedCommitted(agentId, inboundId, "posted", "reply-r8-b", 250);
+    const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+
+    const unconfirmed = await pollUntil(() => obligationFile(agentId, inboundId)?.state === "unconfirmed", 4000);
+    expect(unconfirmed, "the deadline resolved it").toBe(true);
+    expect(curRecordById(agentId, inboundId)?.nackedAt, "no nack stamp").toBeUndefined();
+    expect(nackMails("flint").length, "no nack mail for a committed reply").toBe(0);
+    await h.stop();
+  }, 20000);
+
+  it("R8-c: an IN-PROCESS deadline on a committed obligation sends NO nack mail — it resolves `unconfirmed`", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "350";
+    const h = await start("anvil", "flint", { localSender: true });
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    // The reply lands (creating a file only needs write+execute on the dir) but
+    // the receipt cannot be LISTED, so the delivery commits and the evidence
+    // stays unreadable.
+    chmodSync(flintNew, 0o333);
+    try {
+      await h.deliver("the final answer", "final");
+      h.settle();
+      const posted = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "posted", 2000);
+      expect(posted, "the delivery committed, and the record says so").toBe(true);
+
+      const unconfirmed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "unconfirmed", 4000);
+      expect(unconfirmed, "committed + no evidence at the deadline → unconfirmed").toBe(true);
+      expect(curRecord("anvil")?.nackedAt, "no nack stamp").toBeUndefined();
+      expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    } finally {
+      chmodSync(flintNew, 0o755);
+    }
+    // The reply landed, and NOTHING followed it: no nack mail was sent.
+    const files = readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
+    expect(files.length, "the reply, and no nack mail").toBe(1);
+    expect(nackMails("flint").length, "no nack mail").toBe(0);
+    await h.stop();
+  }, 20000);
+  });
 });

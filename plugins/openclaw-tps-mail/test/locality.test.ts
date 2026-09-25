@@ -24,6 +24,7 @@
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -35,10 +36,15 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+// The REAL consumer: the branch relay quarantines an unparseable outbox record
+// with this exact function (packages/cli/src/commands/branch.ts imports it from
+// the same module). Imported from the built CLI so we exercise the shipped
+// artifact.
+import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as obligationsModule from "../src/obligations.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
@@ -106,7 +112,16 @@ mock.module("@tpsdev-ai/cli/utils/relay", () => ({
 // transition (its obligation write) and the receipt scan. The verb that fails or
 // nacks an obligation must refuse once the delivery has committed, so a throw in
 // EITHER step can never fail a delivered reply or nack its inbound.
-const obligations = { failPostedTransition: false, failAckTransition: false, failReceiptScan: false };
+// cli#389 round 8 adds ONE test-only hook on the scan: `beforeScan` runs at the
+// SCAN moment, so a test can place evidence (or a quarantine) between the
+// delivery and the scan — the only window in which the drain can quarantine a
+// record this very turn wrote.
+const obligations = {
+  failPostedTransition: false,
+  failAckTransition: false,
+  failReceiptScan: false,
+  beforeScan: null as null | ((expectedReplyId: string | undefined) => void),
+};
 const realObligations = { ...obligationsModule };
 mock.module("../src/obligations.js", () => ({
   ...realObligations,
@@ -121,6 +136,7 @@ mock.module("../src/obligations.js", () => ({
   },
   scanForReceipt: (...args: any[]) => {
     if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
+    obligations.beforeScan?.(args[5]);
     return (realObligations.scanForReceipt as any)(...args);
   },
 }));
@@ -762,11 +778,11 @@ describe("cli#389 round 5, item 2 — a receipt write that fails AFTER the bridg
     // …its receipt could not be written, and that is the ONLY local evidence
     // the wire route has…
     expect(outcome.receiptRecord).toBeNull();
-    // …and the send is neither failed nor nacked: it is YIELDED, with its
-    // deadline armed, where the scan decides. That is the residual the README
-    // states.
+    // …and the send is neither failed nor nacked: the record carries the COMMIT
+    // (the delivery returned, so it is `posted`) with its deadline armed, where
+    // the deadline's own scan decides. That is the residual the README states.
     expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
-    expect(outcome.obligation?.state).toBe("yielded");
+    expect(outcome.obligation?.state).toBe("posted");
     expect(outcome.nack).toBeNull();
     expect(typeof outcome.obligation?.deadlineAt, "a deadline is armed").toBe("string");
     // The post-commit error is logged BY NAME — never as a send failure.
@@ -833,7 +849,7 @@ describe("cli#389 round 6, item 2 — a transition that fails AFTER the delivery
     expect(outcome.route).toBe("remote-branch");
     expect(outcome.receiptRecord, "no receipt exists").toBeNull();
     expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
-    expect(outcome.obligation?.state, "not failed — the deadline decides it").toBe("yielded");
+    expect(outcome.obligation?.state, "not failed — the deadline decides it").toBe("delivering");
     expect(outcome.nack).toBeNull();
     expect(
       outcome.warns.some((w) => w.includes("obligation-posted-transition-failed")),
@@ -921,5 +937,140 @@ describe("cli#389 round 7 — the fail/nack verb refuses once the delivery commi
     // The guard must not over-reach: a delivery that never committed still nacks.
     expect(outcome.inboundNackedAt, "the inbound IS nacked").not.toBeNull();
     expect(String(outcome.inboundNackReason)).toMatch(/^write-failed:/);
+  }, 20000);
+});
+
+// ── round 8: the commit is a PERSISTED state, and one verb decides ───────────
+
+/**
+ * cli#389 round 8. Rounds 6 and 7 guarded a `committed` flag held in the turn's
+ * MEMORY, so a restart, the deadline path and the outer catch each saw a
+ * different truth: in the same process the deadline still mailed a nack for a
+ * delivered reply, and after a restart the same obligation failed and nacked.
+ * The commit is now a PERSISTED state of the obligation record — `delivering`
+ * before the delivery call, `posted` when it returns — and ONE verb ends the
+ * obligation from that record:
+ *
+ *   evidence found                → acked;
+ *   delivering/posted, no evidence, no verdict → the terminal `unconfirmed`
+ *                                   (no failed state, no nack stamp, no nack
+ *                                   mail: non-delivery cannot be proven);
+ *   a definitive non-delivery verdict → failed + nacked, even after commit.
+ *
+ * The three drills below cover the parts of that rule a single turn can show:
+ *   (g) a thrown post-commit evidence step is logged by name and ARMS the
+ *       deadline — the obligation is never stranded;
+ *   (h) the drain quarantining THIS reply's own outbox record, attributed by its
+ *       reply id, is a definitive verdict: failed + nacked AT ONCE;
+ *   (i) an unrelated `.malformed-*` is NOT a verdict: the committed obligation
+ *       keeps its deadline and is never failed or nacked.
+ */
+describe("cli#389 round 8 — the commit is persisted, and the deadline never nacks it", () => {
+  const outboxNew = () => join(root, ".tps", "outbox", "new");
+  const outboxSent = () => join(root, ".tps", "outbox", "sent");
+  /** The branch-host route (case (a)): flint has a maildir, is not bound → outbox. */
+  const outboxSetup = () => {
+    branchHost();
+    maildirFor("flint");
+  };
+
+  it("(g) the receipt scan throws: logged by name and the normal deadline is ARMED — never stranded, never failed, never nacked", async () => {
+    obligations.failReceiptScan = true;
+    const outcome = await inFreshHome(outboxSetup, () => routeViaDispatcher("flint", ["anvil"]));
+
+    // The delivery committed…
+    expect(outcome.route).toBe("outbox");
+    expect(outcome.replyId, "the reply is on the wire").toBeTruthy();
+
+    // …so the record carries the COMMIT, not a failure, and nothing is nacked.
+    expect(outcome.obligation?.state).toBe("posted");
+    expect(outcome.obligation?.failure, "no failure is recorded").toBeUndefined();
+    expect(outcome.inboundNackedAt, "the inbound carries no nackedAt").toBeNull();
+    expect(outcome.nack).toBeNull();
+
+    // The throw is logged BY NAME…
+    expect(
+      outcome.warns.some((w) => w.includes("post-commit-error:receipt-scan")),
+      "logged by name",
+    ).toBe(true);
+
+    // …and the obligation is NOT STRANDED: the normal deadline is armed, so it
+    // still resolves to acked (if evidence appears) or unconfirmed.
+    expect(typeof outcome.obligation?.deadlineAt, "a deadline is armed").toBe("string");
+  }, 20000);
+
+  it("(h) the drain quarantines THIS reply's own outbox record → attributed by reply id → receipt-malformed, failed and nacked AT ONCE", async () => {
+    // A deadline would NOT fail this soon: the failure must come from the scan.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const seen: { expectedReplyId: string | undefined; own: boolean; quarantined: number } = {
+      expectedReplyId: undefined,
+      own: false,
+      quarantined: 0,
+    };
+    obligations.beforeScan = (expectedReplyId) => {
+      // The reply's own outbox record, torn by an external fault (a manual edit,
+      // a partial write by something other than the plugin's atomic writer), and
+      // the REAL branch drain quarantining it — the same function the relay runs.
+      // The quarantined name keeps the original one, so it still carries the
+      // reply id and the scan can attribute it.
+      const names = readdirSafe(outboxNew()).filter((f) => f.endsWith(".json"));
+      seen.expectedReplyId = expectedReplyId;
+      seen.own = names.length === 1 && !!expectedReplyId && names[0]!.includes(expectedReplyId);
+      if (!seen.own) return;
+      writeFileSync(join(outboxNew(), names[0]!), "{ torn by an external fault");
+      drainOutbox();
+      seen.quarantined = readdirSafe(outboxSent()).filter((f) => f.startsWith(".malformed-")).length;
+    };
+    try {
+      const outcome = await inFreshHome(outboxSetup, () => routeViaDispatcher("flint", ["anvil"]));
+
+      expect(seen.expectedReplyId, "the scan knows which reply this obligation posted").toBeTruthy();
+      expect(seen.own, "the quarantined record was THIS reply's own, named for it").toBe(true);
+      expect(seen.quarantined, "the drain quarantined it").toBe(1);
+
+      // A definitive non-delivery verdict: failed + nacked, even though the
+      // delivery call returned. NOT the deadline.
+      expect(outcome.obligation?.state).toBe("failed");
+      expect(outcome.obligation?.failure).toBe("receipt-malformed");
+      expect(outcome.inboundNackedAt, "the inbound IS nacked").not.toBeNull();
+      expect(String(outcome.inboundNackReason)).toContain("receipt-malformed");
+    } finally {
+      obligations.beforeScan = null;
+    }
+  }, 20000);
+
+  it("(i) an UNRELATED quarantined record is not a verdict: the committed obligation keeps its deadline, never failed, never nacked", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const seen = { replies: 0 };
+    const outcome = await inFreshHome(
+      () => {
+        outboxSetup();
+        // A quarantined record that is NOT this reply's — a stale quarantine from
+        // an earlier, unrelated send. Its name carries no reply id this obligation
+        // knows, so it cannot be attributed to this reply.
+        mkdirSync(outboxSent(), { recursive: true });
+        writeFileSync(join(outboxSent(), `.malformed-${randomUUID()}.json`), "{ not json, quarantined");
+        // …and the reply lands in outbox/new, which cannot be LISTED during the
+        // turn's scan, so no receipt is visible either.
+        mkdirSync(outboxNew(), { recursive: true });
+        chmodSync(outboxNew(), 0o333);
+      },
+      async () => {
+        const o = await routeViaDispatcher("flint", ["anvil"]);
+        chmodSync(outboxNew(), 0o755);
+        seen.replies = readdirSafe(outboxNew()).filter((f) => f.endsWith(".json")).length;
+        return o;
+      },
+    );
+
+    // The reply landed in the outbox (read after the dir became listable again);
+    // the harness cannot classify the route while the dir is unreadable, so the
+    // record itself is the evidence here — committed, and MISSING its receipt.
+    expect(seen.replies, "the reply did land").toBe(1);
+    expect(outcome.obligation?.state, "committed and unresolved, not failed").toBe("posted");
+    expect(outcome.obligation?.failure, "no failure is recorded").toBeUndefined();
+    expect(outcome.inboundNackedAt, "the inbound carries no nackedAt").toBeNull();
+    expect(outcome.nack, "no nack mail").toBeNull();
+    expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
   }, 20000);
 });

@@ -1,22 +1,28 @@
-- **The one verb that fails or nacks an obligation refuses once a delivery has committed (cli#389 round 7).**
+- **The commit is a PERSISTED state of the obligation record, so nothing after a delivery commits fails a delivered reply (cli#389 round 8).**
 
-  Round 6 moved post-commit calls out of the delivery try one at a time and missed
-  the same class twice: a throw raised AFTER a delivery call returned — the ACK
-  transition writing the obligation, the receipt scan, the failedCounts log —
-  landed in the dispatch's outer catch, which failed the obligation and nacked the
-  inbound of a reply that was already on the wire. The turn's context now carries a
-  `committed` flag, set the moment the delivery call returns, and `failObligation`
-  refuses while it is set: no failed state, no nack, one `post-commit-error:<step>`
-  log line naming the step, and the obligation resolves from its receipt (or from
-  the bridge's sandbox record). Every present and future post-commit path is
-  covered at once, whichever catch it lands in. A pre-commit failure — the dispatch
-  itself throwing, a missing signing key, an unroutable recipient — still fails and
-  nacks exactly as before.
+  Round 7 guarded a `committed` flag held in the turn's memory, and the record was
+  still the only durable truth: in the same process the deadline path mailed a nack
+  for a reply that had already been delivered, and after a restart the same
+  obligation failed and nacked. The commit is now a persisted state of the
+  obligation record — `delivering` written BEFORE the delivery call, `posted` the
+  moment it returns — so the turn, the deadline timer and a restart all read the
+  same truth, and ONE verb settles the obligation from that record. Every writer of
+  `failed` or `nackedAt` goes through it, including the restart-recovery path that
+  used to write `failed` directly.
 
-  One pre-existing exception is retired with it: cli#398 T4(e), where a reply posted
-  to the outbox whose record could not be read back was a named `receipt-malformed`
-  failure. That delivery had committed, so the guard now refuses that failure too;
-  with the evidence unreadable the obligation resolves at its DEADLINE, exactly like
-  the wire route's missing receipt.
+  It decides from the record: evidence found gives `acked`; `delivering` or
+  `posted` at the deadline with no evidence gives the new terminal state
+  `unconfirmed` — no failed state, no nack stamp and no nack mail, logged by name,
+  because non-delivery cannot be proven and the sender is never told a delivered
+  reply failed; and a DEFINITIVE non-delivery verdict fails and nacks even after
+  commit. A definitive verdict is an explicit delivery rejection, a delivery call
+  that failed, or the outbox drain quarantining THIS reply's own record —
+  attributed by the reply id in the quarantined name. An unrelated `.malformed-*`
+  marker, or an evidence step that threw, is not a verdict: a throw from a
+  post-commit step is logged by name (`post-commit-error:<step>`) and arms the
+  normal deadline instead of stranding the obligation, and an unattributable marker
+  resolves by the deadline rule. This restores cli#398 T4(e) as a real test of
+  attributable quarantine: a reply whose own record the drain quarantined fails
+  with `receipt-malformed`.
 
   (Refs #389)

@@ -23,6 +23,15 @@
  * own explicit mails may coincide — they never discharge). The ack is never
  * taken from the fact that a dispatch settled: it is taken from the receipt.
  *
+ * THE COMMIT IS A PERSISTED STATE (cli#389 round 8). The obligation record
+ * carries what the delivery has done — `delivering` written BEFORE the delivery
+ * call, `posted` when it RETURNS — so a restart, the deadline path and the
+ * dispatch's outer catch all read the same truth. Every path that ends an
+ * obligation goes through one verb (settleObligation), which decides from that
+ * record: evidence → `acked`; committed with no evidence at the deadline →
+ * `unconfirmed` (never failed, never nacked); a definitive non-delivery verdict
+ * → `failed` and nacked, even after commit.
+ *
  * Outbound flow:
  *   outbound.sendText(ctx) →
  *   write TPS mail envelope to ~/.tps/mail/<ctx.to>/new/<id>.json
@@ -63,6 +72,7 @@ import {
   sweepTerminalObligations,
   transitionObligation,
   writeReceipt,
+  type ObligationState,
   type ReceiptRecord,
   type ReceiptScanDirs,
 } from "./obligations.js";
@@ -584,17 +594,12 @@ interface YieldContext {
   cfg: any;
   log: any;
   /**
-   * cli#389 round 7 — the turn's COMMIT mark, carried in the turn's context.
-   * Set the moment the delivery call for this turn RETURNS: from then on the
-   * reply is on the wire, so any later failure is evidence upkeep, never a send
-   * failure. The one verb that fails or nacks an obligation refuses while this
-   * is set.
-   */
-  committed?: boolean;
-  /**
-   * The post-commit evidence step currently running — the ACK transition, the
-   * receipt scan, the failedCounts log — so that refusal can name it
-   * (`post-commit-error:<step>`) instead of naming a raw throw.
+   * cli#389 round 8 — the evidence step currently running, so a throw that lands
+   * in the dispatch's outer catch can be logged BY NAME. It is diagnostic ONLY:
+   * whether the delivery committed is read from the OBLIGATION RECORD's persisted
+   * state, never from anything in this context (round 7 kept a `committed` flag
+   * here, and the deadline path, a restart and the catch each saw a different
+   * truth).
    */
   step?: string;
 }
@@ -659,25 +664,95 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
 }
 
-function failObligation(ctx: YieldContext, reason: string): void {
-  // GUARD THE VERB (cli#389 round 7). Once the delivery call has RETURNED the
-  // reply has committed, so no later failure — the ACK transition's obligation
-  // write, the receipt scan, the failedCounts log; whatever catch it lands in —
-  // may fail the obligation or nack its inbound. Round 6 moved calls out of the
-  // delivery try one at a time and missed this class twice, so this is the ONE
-  // function that fails or nacks an obligation and it REFUSES while the turn's
-  // context is committed: it logs the step by name and leaves the obligation to
-  // resolve from its receipt, or from its bridge sandbox record.
-  if (ctx.committed) {
-    ctx.log?.warn?.(
-      `tps-mail: post-commit-error:${ctx.step ?? "unnamed-step"}: ${reason} — the delivery for ${ctx.inboundId} ` +
-        `committed, so it is NOT failed and its inbound is NOT nacked; it resolves from its receipt or sandbox record`,
+/**
+ * THE VERB THAT ENDS AN OBLIGATION (cli#389 round 8) — the ONLY writer of
+ * `failed` or `nackedAt`, and it decides from the PERSISTED RECORD, never an
+ * in-memory flag:
+ *
+ *   evidence found                     → acked;
+ *   delivering/posted, no evidence,
+ *   no verdict                         → the terminal `unconfirmed`: NOT failed,
+ *                                        NO nack mail, NO nack stamp, logged by
+ *                                        name (we cannot prove non-delivery, so
+ *                                        the sender is never told it failed);
+ *   a definitive non-delivery verdict   → failed and nacked, even after commit.
+ *
+ * A definitive non-delivery verdict is an explicit delivery rejection, a
+ * delivery call that failed, or the outbox drain quarantining THIS reply's own
+ * record (attributed by its reply id). An unrelated `.malformed-*` marker, or an
+ * evidence step that threw, is NOT a verdict — those resolve at the deadline.
+ *
+ * Returns the state it applied, or "none" when the record was gone or already
+ * terminal. The CALLER decides whether to announce: only the deadline path mails
+ * the sender.
+ */
+function settleObligation(
+  ctx: YieldContext,
+  obligationId: string,
+  s: {
+    /** The receipt evidence the caller found for this obligation. */
+    receipt: "found" | "none";
+    /** A definitive non-delivery verdict, when there is one. Never a step that
+     *  merely threw. */
+    verdict?: string;
+    /** What to record when there is no verdict. */
+    reason: string;
+    /** The inbound already carries its nack (restart recovery of a cur/ record
+     *  that was nacked before the crash): settle the RECORD only — never
+     *  re-stamp it, never re-announce it to the sender. */
+    alreadyNacked?: boolean;
+  },
+): "acked" | "unconfirmed" | "failed" | "none" {
+  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (!rec) return "none";
+  if (TERMINAL_STATES.has(rec.state)) {
+    ctx.log?.info?.(
+      `tps-mail: obligation ${rec.obligationId} is ${rec.state}; ignoring the ${s.verdict ?? s.reason} determination`,
     );
-    return;
+    return "none";
   }
-  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: reason }, ctx.log);
-  patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: reason });
-  ctx.log?.warn?.(`tps-mail: obligation for ${ctx.inboundId} FAILED: ${reason} — nacked, never acked`);
+  if (s.receipt === "found" && !s.verdict) {
+    ackObligation(ctx, obligationId, s.reason);
+    return "acked";
+  }
+  const committed = rec.state === "delivering" || rec.state === "posted";
+  if (!s.verdict && committed) {
+    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "unconfirmed", { failure: s.reason }, ctx.log);
+    ctx.log?.warn?.(
+      `tps-mail: obligation for ${ctx.inboundId} UNCONFIRMED: ${s.reason} — the reply was committed (${rec.state}) ` +
+        `and no receipt evidence was found by its deadline; NOT failed, no nack sent`,
+    );
+    return "unconfirmed";
+  }
+  const failedOn = s.verdict ?? s.reason;
+  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: failedOn }, ctx.log);
+  if (!s.alreadyNacked) {
+    patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
+  }
+  ctx.log?.warn?.(`tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked, never acked`);
+  return "failed";
+}
+
+/**
+ * WRITE-AHEAD (cli#389 round 8, item 1): persist `delivering` BEFORE the delivery
+ * call, so a crash mid-delivery is distinguishable from a crash before it and a
+ * restart reads what the call was about to do.
+ *
+ * Returns true when the record was reached — the write landed, or the record is
+ * already TERMINAL and refused the transition (the turn may still deliver; the
+ * ack will refuse). False when the record is GONE or the write itself threw:
+ * nothing has been sent, so the caller fails and nacks exactly as before.
+ */
+function markDelivering(mailDir: string, agent: string, inboundId: string, log: any): boolean {
+  try {
+    return transitionObligation(mailDir, agent, inboundId, "delivering", {}, log) !== null;
+  } catch (err: any) {
+    log?.warn?.(
+      `tps-mail: obligation-write-failed: could not mark ${inboundId} delivering (${err?.message ?? err}); ` +
+        `nothing was sent`,
+    );
+    return false;
+  }
 }
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
@@ -685,9 +760,13 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
-  if (rec.state !== "yielded") {
-    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "yielded", { deadlineAt: at }, ctx.log);
-  }
+  // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
+  // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
+  // their state and only gain `deadlineAt`. The deadline must be able to tell
+  // "committed, no evidence yet" from "never delivered" — that is the whole
+  // difference between `unconfirmed` and `failed`.
+  const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
+  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearTimeout(prev);
@@ -701,15 +780,22 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 
 function onDeadline(ctx: YieldContext, obligationId: string): void {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after failed/acked: no-op
+  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
   const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId, rec.replyId);
-  if (receipt.status === "found") {
-    ackObligation(ctx, obligationId, "receipt present at the deadline");
-    return;
-  }
+  // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
+  // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
+  // record) is a definitive non-delivery: the obligation fails and nacks even
+  // though its delivery committed. With no evidence and no verdict, a committed
+  // record becomes `unconfirmed` (no nack mail, no nack stamp) and only a record
+  // that never committed fails and is announced to the sender.
   const reason = "yielded-without-resumption";
-  failObligation(ctx, reason);
-  void sendNackMail(ctx, reason);
+  const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
+  const outcome = settleObligation(ctx, obligationId, {
+    receipt: receipt.status === "found" ? "found" : "none",
+    verdict,
+    reason,
+  });
+  if (outcome === "failed") void sendNackMail(ctx, verdict ?? reason);
 }
 
 function makeYieldCtx(
@@ -734,14 +820,17 @@ function makeYieldCtx(
 function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string; replyId?: string }): void {
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
-    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", {
-      failure: curRec.nackReason ?? "nacked",
-    }, ctx.log);
+    // The cur/ record already carries its nack: the failure was determined and
+    // announced before the crash. cli#389 round 8 routes this writer through the
+    // ONE verb (it used to write `failed` directly, outside every guard), with
+    // `alreadyNacked` so neither the stamp nor the announcement is repeated.
+    const reason = curRec.nackReason ?? "nacked";
+    settleObligation(ctx, rec.obligationId, { receipt: "none", verdict: reason, reason, alreadyNacked: true });
     return;
   }
   const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId, rec.replyId);
   if (receipt.status === "found") {
-    ackObligation(ctx, rec.obligationId, "recovered: receipt already posted");
+    settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
     return;
   }
   armDeadline(ctx, rec.obligationId, rec.deadlineAt);
@@ -1203,36 +1292,26 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // its inbound.
             let route: MailRoute | null = null;
             let deliveredVia: string | null = null;
-            // The delivery call IS the commit: mark the turn the moment it
-            // RETURNS (cli#389 round 7). `posted` drives this turn's own
-            // branches; `yieldCtx.committed` makes the fail/nack verb refuse
-            // from here on, whichever catch a later step lands in.
+            // THE COMMIT IS PERSISTED (cli#389 round 8, item 1). `posted` is written
+            // to the RECORD the moment the delivery call RETURNS — never a flag in
+            // memory — so a restart, the deadline path and the outer catch all read
+            // the same truth. `posted` (the local) still drives this turn's own
+            // branches; the transition is EVIDENCE UPKEEP, guarded by postCommit so
+            // it can never fail a delivered reply.
             const commit = () => {
               posted = true;
-              yieldCtx.committed = true;
+              postCommit(
+                log,
+                "obligation-posted-transition-failed",
+                `the ${route!.kind} reply ${reply.id} committed to ${msg.from} but the obligation for ${msg.id} was not marked posted`,
+                () => transitionObligation(account.mailDir, recipient, msg.id, "posted", { replyId: reply.id }, log),
+              );
             };
             try {
               route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
-              if (route.kind === "local") {
-                writeMailFile(account.mailDir, msg.from, reply);
-                commit();
-              } else if (route.kind === "outbox") {
-                deliveredVia = writeOutboxFile(reply);
-                commit();
-              } else if (route.kind === "remote-branch") {
-                await deliverRemote(reply, route.branchId);
-                commit();
-              } else if (route.kind === "bridge") {
-                // The record carries the obligation ids, so this delivery stays
-                // locally readable even if the receipt write below fails.
-                deliverToSandbox(route.branchId, {
-                  to: msg.from,
-                  from: recipient,
-                  body: reply.body,
-                  ...obligationMetadata(reply),
-                });
-                commit();
-              } else {
+              if (route.kind === "failed" || route.kind === "unknown") {
+                // An explicit delivery rejection (or no route at all): nothing is
+                // sent, so this is a definitive non-delivery — fail and nack.
                 postFailure = postFailure ?? (route.kind === "failed" ? route.reason : `no-route:${msg.from}`);
                 log?.warn?.(
                   route.kind === "failed"
@@ -1240,6 +1319,32 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                     : `tps-mail: no delivery route for reply recipient ${msg.from} ` +
                         `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
                 );
+              } else if (markDelivering(account.mailDir, recipient, msg.id, log)) {
+                // WRITE-AHEAD (item 1): `delivering` is persisted BEFORE the call.
+                if (route.kind === "local") {
+                  writeMailFile(account.mailDir, msg.from, reply);
+                  commit();
+                } else if (route.kind === "outbox") {
+                  deliveredVia = writeOutboxFile(reply);
+                  commit();
+                } else if (route.kind === "remote-branch") {
+                  await deliverRemote(reply, route.branchId);
+                  commit();
+                } else {
+                  // The record carries the obligation ids, so this delivery stays
+                  // locally readable even if the receipt write below fails.
+                  deliverToSandbox(route.branchId, {
+                    to: msg.from,
+                    from: recipient,
+                    body: reply.body,
+                    ...obligationMetadata(reply),
+                  });
+                  commit();
+                }
+              } else {
+                // The write-ahead write failed: NOTHING has been sent, so this is a
+                // pre-commit failure — fail and nack as before (item 1).
+                postFailure = postFailure ?? "delivering-write-failed";
               }
             } catch (err: any) {
               postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
@@ -1267,14 +1372,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                     `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${where}; delivery committed)`,
                   ),
               );
-              // The obligation transition records which reply discharged it, so
-              // a later scan can pin the receipt's reply id (item 1).
-              postCommit(
-                log,
-                "obligation-posted-transition-failed",
-                `the ${r.kind} reply ${reply.id} committed but the obligation for ${msg.id} was not marked posted`,
-                () => transitionObligation(account.mailDir, recipient, msg.id, "posted", { replyId: reply.id }, log),
-              );
               if (r.kind === "remote-branch" || r.kind === "bridge") {
                 // persistReceiptAfterCommit never throws: it logs
                 // receipt-write-failed by name and cannot fail the send.
@@ -1298,9 +1395,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         }
 
         // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
-        // The scan and the ACK below both run AFTER a committed delivery, so
-        // they are evidence upkeep: `step` names whichever is running, and the
-        // fail/nack verb refuses if one throws (cli#389 round 7).
+        // The scan and the disposition below both run AFTER a committed delivery,
+        // so they are evidence upkeep: `step` names whichever is running, and the
+        // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
+        // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
         const receipt = scanForReceipt(
           receiptDirs(yieldCtx),
@@ -1312,49 +1410,62 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         );
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";
-          ackObligation(yieldCtx, obId, "receipt found");
-        } else if (receipt.status === "malformed" && posted) {
-          // ONLY when THIS turn posted: a `.malformed-*` cannot be tied to this
-          // obligation (its marker is unreadable) and quarantined records stay
-          // in the dirs, so an unrelated one must not fail a later non-posting
-          // turn (cli#398 T4).
-          //
-          // cli#389 round 7 RETIRES the failure cli#398 T4(e) recorded HERE.
-          // `posted` means the delivery call RETURNED, so the reply committed:
-          // the fail/nack verb refuses, and a committed turn is never failed and
-          // its inbound is never nacked. The evidence is unreadable, so the
-          // obligation resolves the way the wire route's missing receipt does —
-          // at its DEADLINE — instead of being reported as a failed send.
-          yieldCtx.step = "receipt-malformed";
-          failObligation(yieldCtx, "receipt-malformed");
-          armDeadline(yieldCtx, obId);
+          settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });
+        } else if (receipt.status === "malformed" && receipt.ownRecord) {
+          // cli#398 T4(e) RESTORED (cli#389 round 8) as ATTRIBUTABLE quarantine.
+          // The drain quarantined THIS reply's own record — the quarantined name
+          // still carries the reply id this obligation posted — so its
+          // non-delivery is DEFINITIVE: the obligation fails and nacks AT ONCE,
+          // even though the delivery call returned. An unrelated `.malformed-*`
+          // (a quarantine that cannot be tied to this reply) is NOT a verdict:
+          // that falls through and resolves at the deadline.
+          yieldCtx.step = "receipt-quarantined";
+          settleObligation(yieldCtx, obId, { receipt: "none", verdict: "receipt-malformed", reason: "receipt-malformed" });
         } else if (postFailure) {
-          failObligation(yieldCtx, postFailure);
+          yieldCtx.step = "post-failure";
+          // The delivery call itself failed (or there was no route at all):
+          // nothing was sent, so this is a definitive non-delivery — fail and
+          // nack exactly as before.
+          settleObligation(yieldCtx, obId, { receipt: "none", verdict: postFailure, reason: postFailure });
         } else if (sawSuppressedFinal && latestFinalText === null) {
           // The turn produced finals, but every one was empty or silent — a
           // NAMED failure with a nack, never a silent yield. `latestFinalText`
           // must be null: a turn that POSTED a real final whose receipt is
-          // absent is the posted-without-receipt path below, not this one.
-          failObligation(yieldCtx, "empty-final-text");
+          // absent is the committed-without-evidence path below, not this one.
+          yieldCtx.step = "empty-final-text";
+          settleObligation(yieldCtx, obId, { receipt: "none", verdict: "empty-final-text", reason: "empty-final-text" });
         } else {
           // No final posted and no post failure: the run yielded without
           // resumption (subscription event, or settlement-inference). Stay
-          // UNACKED in cur/ and arm the deadline.
+          // UNACKED in cur/ and arm the deadline; the deadline's scan decides,
+          // and a COMMITTED record (posted, evidence not visible yet) resolves
+          // there to `acked` or `unconfirmed` — never failed, never nacked.
           armDeadline(yieldCtx, obId);
           log?.warn?.(
-            `tps-mail: obligation for ${msg.id} is YIELDED (no final posted yet); deadline armed`,
+            `tps-mail: obligation for ${msg.id} is unresolved (no receipt evidence yet); deadline armed`,
           );
         }
       } catch (err: any) {
-        log?.warn?.(
-          `tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`,
-        );
-        // cli#389 round 7: route this through the ONE verb that fails or nacks
-        // an obligation, so the committed guard covers a throw from ANY
-        // post-commit step (the ACK transition, the receipt scan, the
-        // failedCounts log) that lands in THIS catch. A PRE-commit failure —
-        // the dispatch itself threw — is unchanged: the verb fails and nacks.
-        failObligation(yieldCtx, `dispatch failed: ${err?.message ?? String(err)}`);
+        const reason = `dispatch failed: ${err?.message ?? String(err)}`;
+        log?.warn?.(`tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`);
+        // cli#389 round 8: the PERSISTED RECORD tells a post-commit evidence step
+        // from a failure of the dispatch itself — a flag in the turn's memory
+        // could not (round 7's guard had to refuse the verb instead). A committed
+        // obligation (`delivering`/`posted`) is NOT failed and its inbound is NOT
+        // nacked: the step is logged BY NAME and the normal deadline is ARMED, so
+        // it still resolves to `acked` (if the evidence appears) or `unconfirmed`
+        // — never stranded. A throw from the dispatch itself arrives with the
+        // record still pending/yielded and fails and nacks exactly as before.
+        const rec = readObligation(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
+        if (rec && (rec.state === "delivering" || rec.state === "posted")) {
+          log?.warn?.(
+            `tps-mail: post-commit-error:${yieldCtx.step ?? "unnamed-step"}: ${reason} — the delivery for ${msg.id} ` +
+              `committed (${rec.state}), so it is NOT failed and its inbound is NOT nacked; it resolves at its deadline`,
+          );
+          armDeadline(yieldCtx, obId);
+        } else {
+          settleObligation(yieldCtx, obId, { receipt: "none", verdict: reason, reason });
+        }
       }
     }
 
