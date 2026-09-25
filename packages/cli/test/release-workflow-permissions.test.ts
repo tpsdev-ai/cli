@@ -25,7 +25,7 @@
  *     softprops/action-gh-release, which creates the release and attaches the
  *     binaries and their checksums.
  * Artifact upload/download need no grant of their own: they transfer within this
- * run, which the artifact client scopes to the run's own job without a
+ * workflow run, which the artifact client scopes to that run without a
  * GITHUB_TOKEN scope (`actions: read`/`write` are needed only for artifacts from
  * OTHER runs or repositories).
  */

@@ -68,10 +68,11 @@ jobs:
           - target: bun-linux-x64
             pkg: cli-linux-x64
             artifact: tps-linux-x64
-    # contents: read — actions/checkout. Everything else here is local or a
-    # run-service call: the binary build, the checksum, and the artifact upload,
-    # which transfers within THIS run and so needs no GITHUB_TOKEN scope
-    # (actions: read/write are required only for artifacts from other runs).
+    # contents: read — actions/checkout, and socketdev/action, which fetches its
+    # CLI through the GitHub API with the job token (a read). The binary build
+    # and the checksum are local, and the artifact upload transfers within THIS
+    # workflow run and so needs no GITHUB_TOKEN scope (actions: read/write are
+    # required only for artifacts from other runs).
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -127,9 +128,10 @@ jobs:
   smoke-compiled-binary:
     name: Smoke compiled binary
     needs: preflight
-    # contents: read — actions/checkout. The build and all four smoke checks
-    # (--version, identity init, the Noise handshake, the no-baked-paths grep)
-    # run on the runner; no step reaches the API.
+    # contents: read — actions/checkout, and socketdev/action, which fetches its
+    # CLI through the GitHub API with the job token (a read). The build and all
+    # four smoke checks (--version, identity init, the Noise handshake, the
+    # no-baked-paths grep) run on the runner.
     permissions:
       contents: read
     runs-on: ubuntu-latest
