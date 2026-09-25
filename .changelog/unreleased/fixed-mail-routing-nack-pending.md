@@ -12,10 +12,13 @@
   `nackSentAt` and clears `nackPending` in one further write — when that write
   succeeds; when it does not, the debt stays and the nack may repeat. Restart
   recovery retries delivery for any `failed` record carrying `nackPending` with
-  no `nackSentAt`. AT-LEAST-ONCE, not exactly-once: a crash after the hand-off
+  no `nackSentAt`, but only INSIDE the hold window — a configurable multiple of
+  `retentionDays` (at least 1; the default is 4). Past that window the debt is
+  abandoned ONCE, logged `nack-abandoned`, and normal retention then applies to
+  the record. AT-LEAST-ONCE, not exactly-once: a crash after the hand-off
   but before the record is written retries delivery, so the sender may see the
   nack twice; `nackSentAt` is recorded when that write succeeds, and when it
-  does not the record keeps `nackPending` and the nack may repeat. The cur/
+  does not the record keeps `nackPending` and the nack may repeat. The
   `nackedAt` stamp is no longer evidence that the sender was told: it is written
   before the send, so it never was.
 

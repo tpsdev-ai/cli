@@ -19,7 +19,10 @@
   the deadline caller mailed. The verb now sends the nack mail, so every path
   hands its verdict to that one nack path and the same verdict gives the same
   sender-visible outcome wherever it is found, and no caller mails on its own;
-  with no working route the nack stays owed until one exists. The nack is owed ON
+  with no working route the nack stays owed only inside a bounded hold — a
+  configurable multiple of `retentionDays` (at least 1): past it the debt is
+  abandoned once, logged `nack-abandoned`, and normal retention applies.
+  The nack is owed ON
   THE RECORD, not proven by the cur/ stamp, and a terminal record refuses later
   transitions outright.
 
