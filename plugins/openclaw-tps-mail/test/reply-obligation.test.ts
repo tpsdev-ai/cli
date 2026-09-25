@@ -65,6 +65,19 @@ function readdirSafe(dir: string): string[] {
   try { return readdirSync(dir); } catch { return []; }
 }
 
+/**
+ * Every nack mail under `dir` whose `X-TPS-Nack` reason is `reason` (cli#389
+ * round 9, item 2: the verb sends exactly one per transition to `failed`).
+ */
+function nackMailsIn(dir: string, reason?: string): any[] {
+  return readdirSafe(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => {
+      try { return JSON.parse(readFileSync(resolve(dir, f), "utf-8")); } catch { return null; }
+    })
+    .filter((r) => typeof r?.headers?.["X-TPS-Nack"] === "string" && (reason === undefined || r.headers["X-TPS-Nack"] === reason));
+}
+
 async function pollUntil(pred: () => boolean, ms = 3000): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < ms) {
@@ -304,7 +317,16 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(cur?.nackedAt).toBeDefined();
     expect(cur?.nackReason).toContain("empty-final-text");
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
-    expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(0);
+    // cli#389 round 9, item 2: the VERB owns the nack mail, so a pre-call failure
+    // (nothing was sent) announces the sender from the same place every other
+    // failed transition does — exactly ONE mail, naming this reason.
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const nacked = await pollUntil(
+      () => nackMailsIn(flintNew, "empty-final-text").length === 1,
+      2000,
+    );
+    expect(nacked, "exactly one nack mail from the verb").toBe(true);
+    expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length, "and nothing else was written").toBe(1);
 
     await h.stop();
   }, 15000);
@@ -320,7 +342,14 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(cur?.ackedAt).toBeUndefined();
     expect(cur?.nackReason).toContain("missing-signing-key");
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
-    expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(0);
+    // cli#389 round 9, item 2: the same is true of every other pre-call failure.
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const nacked = await pollUntil(
+      () => nackMailsIn(flintNew, "missing-signing-key:anvil").length === 1,
+      2000,
+    );
+    expect(nacked, "exactly one nack mail from the verb").toBe(true);
+    expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length, "and nothing else was written").toBe(1);
 
     await h.stop();
   }, 15000);
@@ -660,6 +689,133 @@ describe("cli#389 round 8 — the commit is a persisted state of the obligation 
     const files = readdirSafe(flintNew).filter((f) => f.endsWith(".json"));
     expect(files.length, "the reply, and no nack mail").toBe(1);
     expect(nackMails("flint").length, "no nack mail").toBe(0);
+    await h.stop();
+  }, 20000);
+  });
+
+// ── round 9: an old stamp is not a verdict, and a late final is refused ──────
+
+/**
+ * cli#389 round 9. Two more places where the outcome was wrong.
+ *
+ * item 3 — RECOVERY DECIDES FROM EVIDENCE, NOT FROM AN OLD STAMP. Recovery turned
+ * any existing `nackedAt` into a definitive verdict, so a stamp left by earlier
+ * behaviour could fail a record whose own persisted state says the delivery
+ * COMMITTED. For `delivering`/`posted`, recovery now decides by evidence and
+ * deadline like every other path; the stamp is kept and never re-announced.
+ *
+ * item 4 — A TERMINAL OBLIGATION REFUSES `delivering`. `transitionObligation`
+ * returns null for a refusal (rather than the old record), so `markDelivering`
+ * can tell a landed write-ahead from a refused one: a final arriving after the
+ * deadline settled the obligation is logged `late-final-refused` and NOT
+ * delivered, instead of being delivered after the sender was told it failed.
+ */
+describe("cli#389 round 9 — an old stamp is not a verdict, and a late final is refused", () => {
+  const R9_OBLIGATION = "ob-round9";
+
+  /** The durable state a restart finds: an unacked cur/ record + its obligation. */
+  function seedRestart(
+    agentId: string,
+    inboundId: string,
+    state: "posted" | "delivering" | "yielded",
+    opts: { stamp?: string; deadlineInMs?: number } = {},
+  ): void {
+    mkdirSync(resolve(tempMailDir, agentId, "cur"), { recursive: true });
+    mkdirSync(resolve(tempMailDir, agentId, ".obligations"), { recursive: true });
+    writeFileSync(
+      resolve(tempMailDir, agentId, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
+      JSON.stringify(
+        {
+          id: inboundId,
+          from: "flint",
+          to: agentId,
+          body: buildSignedBody("flint", agentId, "x", FLINT_SEED),
+          timestamp: new Date().toISOString(),
+          read: false,
+          ...(opts.stamp ? { nackedAt: opts.stamp, nackReason: "an old stamp" } : {}),
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    writeFileSync(
+      resolve(tempMailDir, agentId, ".obligations", `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId: R9_OBLIGATION,
+          inboundId,
+          inboundTimestamp: new Date().toISOString(),
+          from: "flint",
+          to: agentId,
+          accountId: "default",
+          state,
+          deadlineAt: new Date(Date.now() + (opts.deadlineInMs ?? 250)).toISOString(),
+          attempts: 1,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  }
+
+  it("R9-a: recovery KEEPS an old nack stamp but does NOT treat it as a verdict — a `posted` record resolves by the deadline rule (`unconfirmed`), never re-announced", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r9-oldstamp";
+    const oldStamp = "2026-01-01T00:00:00.000Z";
+    seedRestart(agentId, inboundId, "posted", { stamp: oldStamp, deadlineInMs: 250 });
+    const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+
+    // The record COMMITTED (`posted`), so the old stamp is not a verdict: the
+    // deadline rule decides, exactly as for a record with no stamp at all.
+    const unconfirmed = await pollUntil(() => obligationFile(agentId, inboundId)?.state === "unconfirmed", 4000);
+    expect(unconfirmed, "the deadline rule decided it, not the stamp").toBe(true);
+    expect(obligationFile(agentId, inboundId)?.failure).toBe("yielded-without-resumption");
+    // The stamp is KEPT on the cur/ record…
+    expect(curRecordById(agentId, inboundId)?.nackedAt, "the stamp is kept").toBe(oldStamp);
+    expect(curRecordById(agentId, inboundId)?.ackedAt, "and it is never acked").toBeUndefined();
+    // …and NOTHING was re-announced to the sender.
+    expect(nackMailsIn(resolve(tempMailDir, "flint", "new")).length, "never re-announced").toBe(0);
+    await h.stop();
+  }, 20000);
+
+  it("R9-b: a final arriving AFTER the deadline settled the obligation is REFUSED (`late-final-refused`) and NOT delivered", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "300";
+    const warned: string[] = [];
+    const h = await start("anvil", "flint", { localSender: true, warnCalls: warned });
+    const obId = h.obligationId();
+    expect(obId).not.toBeNull();
+    // The run yields while the dispatch is STILL in flight, so the deadline fires
+    // and settles the obligation first — and the sender is told it failed.
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 4000);
+    expect(failed, "the deadline settled it first").toBe(true);
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const announced = await pollUntil(() => nackMailsIn(flintNew, "yielded-without-resumption").length === 1, 2000);
+    expect(announced, "the sender was told it failed").toBe(true);
+
+    // NOW the turn produces its final.
+    await h.deliver("too late", "final");
+    h.settle();
+    await sleep(250);
+
+    // The write-ahead REFUSED it: the obligation stays terminal, is never acked,
+    // and the late final is NOT delivered.
+    expect(obligationFile("anvil", h.inboundId)?.state, "still the terminal failure").toBe("failed");
+    expect(curRecord("anvil")?.ackedAt, "never acked").toBeUndefined();
+    const delivered = readdirSafe(flintNew)
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => {
+        try { return JSON.parse(readFileSync(resolve(flintNew, f), "utf-8")); } catch { return null; }
+      })
+      .filter((r) => r?.headers?.["X-TPS-Obligation"] === obId);
+    expect(delivered.length, "the late final is NOT delivered").toBe(0);
+    // …and only the ONE nack mail went out (the verb mails once per failed
+    // transition — the refusal is not a second transition).
+    expect(nackMailsIn(flintNew).length, "exactly one nack mail").toBe(1);
+    // The refusal is logged BY NAME (cli#389 round 9, item 4).
+    expect(warned.join("\n"), "logged by name").toContain("late-final-refused");
     await h.stop();
   }, 20000);
   });

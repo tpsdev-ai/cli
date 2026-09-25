@@ -88,7 +88,10 @@ and a RESTART after a crash all read the same record:
 - **`yielded`** — the run ended without a posted final; the deadline is armed.
 - **`delivering`** — WRITE-AHEAD: persisted BEFORE the delivery call, so a crash
   mid-delivery is distinguishable from a crash before it.
-- **`posted`** — the delivery call RETURNED: the reply is on the wire.
+- **`posted`** — the delivery call RETURNED: the reply has been HANDED TO ITS
+  ROUTE — sent over the wire to a remote branch, delivered into a local maildir,
+  or queued in the outbox for the branch drain to send later. It is not a claim
+  that the peer has received it.
 - **`acked`** — terminal: a receipt (or the bridge sandbox record) proves the
   delivery.
 - **`unconfirmed`** — terminal: committed, and no evidence arrived by the
@@ -101,19 +104,27 @@ THAT write fails, nothing was sent and the obligation fails and nacks as before)
 `acked` when the scan finds evidence (the ack is gated on the receipt, never on
 the dispatch settling); `delivering`/`posted` → `unconfirmed` at the deadline
 with no evidence; and any live state → `failed` on a definitive non-delivery
-verdict. Arming a deadline never downgrades a committed record: `delivering` and
-`posted` keep their state and only gain `deadlineAt`.
+verdict. A TERMINAL record refuses a late `delivering` (`late-final-refused`,
+logged by name): a final that arrives after the deadline settled the obligation
+is not delivered, because the sender was already told it failed. Arming a
+deadline never downgrades a committed record: `delivering` and `posted` keep
+their state and only gain `deadlineAt`.
 
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
-the only writer of `failed` or `nackedAt`. It decides from the record — evidence
-found → `acked`; committed with no evidence at the deadline → `unconfirmed` (no
-failed state, **no nack mail, no nack stamp**, logged by name); a definitive
-non-delivery verdict → `failed` and a nack, **even after commit**. A definitive
-verdict means an explicit delivery rejection, a delivery call that failed, or the
+the only writer of `failed` or `nackedAt` — and the only sender of the nack mail,
+so the same verdict reaches the sender whichever path found it, exactly once. It
+decides from the record — evidence found → `acked`; committed with no evidence at
+the deadline → `unconfirmed` (no failed state, **no nack mail, no nack stamp**,
+logged by name); a definitive non-delivery verdict → `failed` and a nack, **even
+after commit**. A definitive verdict is a refusal decided BEFORE the delivery
+call (no route at all, a named route failure such as `gal-without-remote`) or the
 outbox drain QUARANTINING THIS REPLY'S OWN RECORD — attributed by the reply id
 itself (the drain keeps the original name, which carries the reply the plugin
-posted). An unrelated `.malformed-*` marker, or an evidence step that threw, is
-NOT a verdict: those resolve at the deadline.
+posted). A THROW FROM THE DELIVERY CALL IS NOT A VERDICT: once `delivering` is
+persisted the bytes may already have left, so a throw resolves by evidence or
+deadline — and only a throw before the write-ahead landed fails and nacks. An
+unrelated `.malformed-*` marker, or an evidence step that threw, is not a verdict
+either: those resolve at the deadline.
 
 ## Obligation record retention (cli#401)
 

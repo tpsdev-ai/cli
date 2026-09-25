@@ -200,6 +200,35 @@ async function waitFor(pred: () => boolean, ms = 3000): Promise<void> {
 }
 
 /**
+ * Start a SECOND account over the CURRENT tree, so startup recovery runs over it
+ * (cli#389 round 9, item 2: restart idempotency — a fresh account must not
+ * re-announce a failure it finds already settled). Recovery reads the TREE, so a
+ * bare `channelRuntime` is enough: the cur/ sweep skips a nacked record and the
+ * obligation loop skips terminal ones, so nothing dispatches.
+ */
+async function restartAccount(agentId: string): Promise<void> {
+  const cfg = {
+    channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
+    bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
+  };
+  const abort = new AbortController();
+  const p = capturedPlugin.gateway.startAccount({
+    account: { accountId: "default", mailDir, enabled: true },
+    cfg,
+    log: { info: () => {}, warn: () => {}, error: () => {} },
+    channelRuntime: {},
+    abortSignal: abort.signal,
+  });
+  await new Promise((r) => setTimeout(r, 300)); // let the startup sweeps run
+  abort.abort();
+  try {
+    await p;
+  } catch {
+    /* aborted */
+  }
+}
+
+/**
  * Run `fn` against a FRESH HOME. Each path gets its own root so one path's
  * probe mail can never perturb the other's observation.
  */
@@ -235,6 +264,11 @@ async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<
 let root: string;
 let mailDir: string;
 let savedHome: string | undefined;
+// cli#389 round 9: the deadline window is process-wide state the tests set per
+// case, so it is saved and restored here like HOME — a case that shortens it
+// must not decide the NEXT case's deadline (which is how a shorter window leaked
+// into a test that expected its deadline never to fire).
+let savedDeadline: string | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "tps-locality-"));
@@ -242,6 +276,7 @@ beforeEach(() => {
   mkdirSync(mailDir, { recursive: true });
   savedHome = process.env.HOME;
   process.env.HOME = root;
+  savedDeadline = process.env.TPS_OBLIGATION_DEADLINE_MS;
   obligations.failPostedTransition = false;
   obligations.failAckTransition = false;
   obligations.failReceiptScan = false;
@@ -250,6 +285,8 @@ beforeEach(() => {
 afterEach(() => {
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
+  if (savedDeadline === undefined) delete process.env.TPS_OBLIGATION_DEADLINE_MS;
+  else process.env.TPS_OBLIGATION_DEADLINE_MS = savedDeadline;
   try {
     rmSync(root, { recursive: true, force: true });
   } catch {
@@ -412,7 +449,7 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     await waitFor(() => !!readJsonSafe(obligationPath), 2000);
     const obligation = readJsonSafe(obligationPath);
     // A terminal obligation means the post + receipt scan have finished.
-    await waitFor(() => ["acked", "failed"].includes(readJsonSafe(obligationPath)?.state), 2500);
+    await waitFor(() => ["acked", "failed", "unconfirmed"].includes(readJsonSafe(obligationPath)?.state), 2500);
 
     const senderNew = join(mailDir, sender, "new");
     const senderCur = join(mailDir, sender, "cur");
@@ -667,18 +704,29 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     expect(outcome.receiptMode, "0600 at creation").toBe(0o600);
   }, 20000);
 
-  it("relay fails → a named failure, no receipt", async () => {
+  it("relay throws AFTER `delivering` → UNCERTAIN, not a verdict: logged by name, NOT failed, NOT nacked, no receipt", async () => {
+    // cli#389 round 9, item 1. The delivery call can throw AFTER the bytes left
+    // (a timeout after send, a failure writing the local record after a remote
+    // accept), and `delivering` was persisted BEFORE the call — so a throw
+    // resolves by EVIDENCE OR DEADLINE. It is never a definitive verdict.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // long: nothing resolves it here
     const setup = () => {
       galEntry("rockit", "tps-rockit");
       remoteBranch("tps-rockit");
       relay.failDeliver = true;
     };
     const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
-    expect(outcome.route).toBe("failure");
-    expect(outcome.receiptRecord).toBeNull();
-    expect(outcome.obligation?.state).toBe("failed");
-    // The failure is named (the wire error is carried, not a silent yield).
-    expect(String(outcome.obligation?.failure)).toMatch(/^write-failed:/);
+    expect(outcome.route).toBe("failure"); // nothing was delivered
+    expect(outcome.receiptRecord, "no receipt for a delivery that never returned").toBeNull();
+    // NOT a verdict: the record still says the call was in flight, and the
+    // deadline is armed to decide it later.
+    expect(outcome.obligation?.state, "the write-ahead stands").toBe("delivering");
+    expect(outcome.obligation?.failure, "no failure is recorded").toBeUndefined();
+    expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
+    expect(outcome.inboundNackedAt, "the inbound is NOT nacked").toBeNull();
+    expect(outcome.nack, "and no nack mail was sent").toBeNull();
+    // …and the uncertainty is logged BY NAME (never a `write-failed:` verdict).
+    expect(outcome.warns.some((w) => w.includes("delivery-uncertain")), "logged by name").toBe(true);
   }, 20000);
 });
 
@@ -923,20 +971,28 @@ describe("cli#389 round 7 — the fail/nack verb refuses once the delivery commi
     expect(outcome.warns.some((w) => w.includes("post-commit-error:")), "logged as a post-commit error").toBe(true);
   }, 20000);
 
-  it("(h) a PRE-commit failure is UNCHANGED: the obligation FAILS and the inbound IS nacked", async () => {
+  it("(h) a delivery call that throws after the write-ahead is UNCERTAIN: the deadline resolves it `unconfirmed`, no nack stamp, no nack mail", async () => {
+    // cli#389 round 9, item 1. Round 7 read this throw as a PRE-commit failure and
+    // failed and nacked it — but `delivering` is persisted BEFORE the delivery
+    // call, so the throw may have come after the bytes left (a timeout after
+    // send). It resolves by EVIDENCE OR DEADLINE and is never a verdict.
+    // A refusal DECIDED BEFORE THE CALL (no route, `gal-without-remote`) still
+    // fails and nacks: the resolver cases above assert the named failure, and the
+    // S2 suite asserts the nack mail for a pre-call failure by name.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "400";
     const setup = () => {
       galEntry("rockit", "tps-rockit");
       remoteBranch("tps-rockit");
-      relay.failDeliver = true; // the delivery call itself throws: nothing committed
+      relay.failDeliver = true; // the delivery call throws — nothing returned
     };
     const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
 
-    expect(outcome.route).toBe("failure");
-    expect(outcome.obligation?.state).toBe("failed");
-    expect(String(outcome.obligation?.failure)).toMatch(/^write-failed:/);
-    // The guard must not over-reach: a delivery that never committed still nacks.
-    expect(outcome.inboundNackedAt, "the inbound IS nacked").not.toBeNull();
-    expect(String(outcome.inboundNackReason)).toMatch(/^write-failed:/);
+    // The record was `delivering` when the call threw, so the DEADLINE settled it
+    // with the deadline rule — not the throw.
+    expect(outcome.obligation?.state, "no verdict from the throw").toBe("unconfirmed");
+    expect(outcome.obligation?.failure).toBe("yielded-without-resumption");
+    expect(outcome.inboundNackedAt, "the inbound is NOT nacked").toBeNull();
+    expect(outcome.nack, "no nack mail for a reply that may have gone out").toBeNull();
   }, 20000);
 });
 
@@ -1022,7 +1078,17 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
       seen.quarantined = readdirSafe(outboxSent()).filter((f) => f.startsWith(".malformed-")).length;
     };
     try {
-      const outcome = await inFreshHome(outboxSetup, () => routeViaDispatcher("flint", ["anvil"]));
+      const outcome = await inFreshHome(outboxSetup, async () => {
+        const o = await routeViaDispatcher("flint", ["anvil"]);
+        const isNack = (r: any) => typeof r?.headers?.["X-TPS-Nack"] === "string";
+        // The verb sends the mail asynchronously: wait for it, then count.
+        await waitFor(() => scanFor([outboxNew(), outboxSent()], isNack).length > 0, 3000);
+        const mails = scanFor([outboxNew(), outboxSent()], isNack);
+        // …and RESTART over the same tree: recovery must re-announce NOTHING.
+        await restartAccount("anvil");
+        const afterRestart = scanFor([outboxNew(), outboxSent()], isNack).length;
+        return { ...o, nackCount: mails.length, afterRestart };
+      });
 
       expect(seen.expectedReplyId, "the scan knows which reply this obligation posted").toBeTruthy();
       expect(seen.own, "the quarantined record was THIS reply's own, named for it").toBe(true);
@@ -1034,6 +1100,14 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
       expect(outcome.obligation?.failure).toBe("receipt-malformed");
       expect(outcome.inboundNackedAt, "the inbound IS nacked").not.toBeNull();
       expect(String(outcome.inboundNackReason)).toContain("receipt-malformed");
+
+      // cli#389 round 9, item 2: the VERB owns the nack mail, so an attributable
+      // quarantine found DURING THE TURN reaches the sender exactly ONCE — the
+      // same sender-visible outcome the deadline path gives (before round 9 this
+      // verdict failed the obligation silently). The mail is a MAIL, not a
+      // re-stamp: the record carries its single nack.
+      expect(outcome.nackCount, "exactly one nack mail, from the verb").toBe(1);
+      expect(outcome.afterRestart, "and a restart re-announces NOTHING").toBe(1);
     } finally {
       obligations.beforeScan = null;
     }

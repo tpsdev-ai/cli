@@ -15,10 +15,13 @@
   `unconfirmed` — no failed state, no nack stamp and no nack mail, logged by name,
   because non-delivery cannot be proven and the sender is never told a delivered
   reply failed; and a DEFINITIVE non-delivery verdict fails and nacks even after
-  commit. A definitive verdict is an explicit delivery rejection, a delivery call
-  that failed, or the outbox drain quarantining THIS reply's own record —
-  attributed by the reply id in the quarantined name. An unrelated `.malformed-*`
-  marker, or an evidence step that threw, is not a verdict: a throw from a
+  commit. A definitive verdict is a refusal decided BEFORE the delivery call (no
+  route, a named route failure such as `gal-without-remote`) or the outbox drain
+  quarantining THIS reply's own record — attributed by the reply id in the
+  quarantined name. A THROW FROM THE DELIVERY CALL IS NOT A VERDICT: once
+  `delivering` is persisted the call may have thrown after the bytes left, so it
+  resolves by evidence or deadline, never to `failed`. An unrelated `.malformed-*`
+  marker, or an evidence step that threw, is not a verdict either: a throw from a
   post-commit step is logged by name (`post-commit-error:<step>`) and arms the
   normal deadline instead of stranding the obligation, and an unattributable marker
   resolves by the deadline rule. This restores cli#398 T4(e) as a real test of

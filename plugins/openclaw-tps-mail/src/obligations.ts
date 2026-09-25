@@ -208,10 +208,17 @@ export function createObligation(
 }
 
 /**
- * One-way transition. A late event after a TERMINAL state (acked/failed) is a
- * NO-OP, logged — never a state resurrection. Transitions do not enforce a
- * strict order among non-terminal states (pending → posted → acked is the happy
- * path; pending → yielded → failed is the yield path), but terminal is final.
+ * One-way transition. A late event after a TERMINAL state (acked/unconfirmed/
+ * failed) is a NO-OP, logged — never a state resurrection. Transitions do not
+ * enforce a strict order among non-terminal states (pending → posted → acked is
+ * the happy path; pending → yielded → failed is the yield path), but terminal is
+ * final.
+ *
+ * Returns the UPDATED record, or `null` when the record is GONE **or the
+ * transition was REFUSED** because the record is already terminal (cli#389 round
+ * 9, item 4). A refusal must be distinguishable from a landing: a caller that
+ * needs to act on "this transition did not happen" (markDelivering, before a
+ * delivery call) may never be handed the old record as though it were the result.
  */
 export function transitionObligation(
   mailDir: string,
@@ -225,9 +232,9 @@ export function transitionObligation(
   if (!current) return null;
   if (TERMINAL_STATES.has(current.state)) {
     log?.info?.(
-      `tps-mail: obligation ${current.obligationId} is ${current.state}; ignoring late transition to ${next}`,
+      `tps-mail: obligation ${current.obligationId} is ${current.state}; refusing the late transition to ${next}`,
     );
-    return current;
+    return null;
   }
   const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
   writeObligation(mailDir, agent, updated);

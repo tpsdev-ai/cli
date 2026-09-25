@@ -100,7 +100,23 @@ function obligationFile(agent: string, id: string): any | null {
 }
 function postedReplies(recipient: string): any[] {
   const dir = resolve(tempMailDir, recipient, "new");
-  return readdirSafe(dir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")));
+  return readdirSafe(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")))
+    // cli#389 round 9, item 2: a NACK mail is not a posted reply. The verb sends
+    // one on every transition to `failed`, and it lands in the sender's inbox
+    // beside the reply that would have gone there.
+    .filter((r) => typeof r?.headers?.["X-TPS-Nack"] !== "string");
+}
+
+/** The nack mails' reasons, for a recipient's inbox (cli#389 round 9, item 2). */
+function nackReasons(recipient: string): string[] {
+  const dir = resolve(tempMailDir, recipient, "new");
+  return readdirSafe(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => { try { return JSON.parse(readFileSync(join(dir, f), "utf-8")); } catch { return null; } })
+    .filter((r) => typeof r?.headers?.["X-TPS-Nack"] === "string")
+    .map((r) => String(r.headers["X-TPS-Nack"]));
 }
 
 async function start(agentId: string, sender: string, opts: { localSender?: boolean; branchHost?: boolean } = {}) {
@@ -200,7 +216,11 @@ describe("cli#400 — the dispatcher posts the LAST real final", () => {
     expect(obligationFile("anvil", h.inboundId)?.failure).toBe("empty-final-text");
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
-    expect(postedReplies("flint").length).toBe(0);
+    expect(postedReplies("flint").length, "no reply was posted").toBe(0);
+    // cli#389 round 9, item 2: the VERB owns the nack mail, so a pre-call failure
+    // announces the sender — exactly ONE mail, naming the reason.
+    expect(await pollUntil(() => nackReasons("flint").length === 1, 2000), "exactly one nack mail").toBe(true);
+    expect(nackReasons("flint")).toEqual(["empty-final-text"]);
     await h.stop();
   }, 15000);
 });
@@ -243,6 +263,10 @@ describe("cli#400 — yield / deadline interplay", () => {
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
+    // cli#389 round 9, item 4: the late final was REFUSED, not delivered — the
+    // sender was already told it failed, so no reply may follow the nack.
+    expect(postedReplies("flint").length, "the late final is NOT delivered").toBe(0);
+    expect(nackReasons("flint"), "and only the one nack mail went out").toEqual(["yielded-without-resumption"]);
     await h.stop();
   }, 20000);
 });
@@ -258,7 +282,10 @@ describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, 
     expect(obligationFile("anvil", h.inboundId)?.failure).toBe("empty-final-text");
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
-    expect(postedReplies("flint").length).toBe(0);
+    expect(postedReplies("flint").length, "no reply was posted").toBe(0);
+    // cli#389 round 9, item 2: the same single nack mail, from the verb.
+    expect(await pollUntil(() => nackReasons("flint").length === 1, 2000), "exactly one nack mail").toBe(true);
+    expect(nackReasons("flint")).toEqual(["empty-final-text"]);
     await h.stop();
   }, 15000);
 
