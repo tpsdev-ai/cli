@@ -129,6 +129,13 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   receipt, a terminal obligation's receipt goes, and a receipt with no
   obligation left in the store goes once it has aged past the retention window
   (an orphan). A receipt with no readable timestamp is never aged out.
+- **A receipt is matched by what it NAMES, never by a signature.** The scan pins
+  the obligation id, the inbound the receipt answers, and — when the obligation
+  record knows the reply it was discharged by — the reply id too, so a body
+  copied from an older reply under the current ids needs the matching reply id as
+  well. The envelope `from` the scan reads is the CLAIM the body carries, not a
+  verified identity: no signature is checked here (that boundary is tracked
+  separately, and a signature alone would not bind the receipt to one inbound).
 - **A bridge delivery is readable in the sandbox too.** The bridge's reduced
   sandbox record carries the obligation, inbound and reply ids when an
   obligation supplies them, so that delivery stays locally readable evidence

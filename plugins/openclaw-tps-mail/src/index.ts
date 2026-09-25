@@ -315,6 +315,27 @@ function persistReceiptAfterCommit(
 }
 
 /**
+ * Run ONE piece of post-commit evidence upkeep (cli#389 round 6, item 2). Once
+ * a delivery call has RETURNED it has committed, so a failure here is logged by
+ * NAME and swallowed — it never sets a post failure, so a delivered reply is
+ * never reported as failed and its inbound is never nacked. The logger itself is
+ * guarded too: a throwing logger cannot fail a committed send either.
+ */
+function postCommit(log: any, name: string, context: string, step: () => void): void {
+  try {
+    step();
+  } catch (err: any) {
+    try {
+      log?.warn?.(
+        `tps-mail: ${name}: ${context} (${err?.message ?? err}); the delivery committed, so this is not a send failure`,
+      );
+    } catch {
+      /* a logger must never fail a committed send */
+    }
+  }
+}
+
+/**
  * The obligation ids the bridge's `deliverToSandbox` record carries when the
  * caller has them (cli#389 round 5, item 2): the obligation, the inbound the
  * reply answers, and the reply itself. EMPTY for a message that owes no
@@ -652,7 +673,7 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 function onDeadline(ctx: YieldContext, obligationId: string): void {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after failed/acked: no-op
-  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId);
+  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId, rec.replyId);
   if (receipt.status === "found") {
     ackObligation(ctx, obligationId, "receipt present at the deadline");
     return;
@@ -681,7 +702,7 @@ function makeYieldCtx(
  * the deadline is (re-)armed. Used by restart recovery and by a re-dispatch of
  * an inbound that already has an obligation — neither may post a second final.
  */
-function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string }): void {
+function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string; replyId?: string }): void {
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", {
@@ -689,7 +710,7 @@ function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; dea
     }, ctx.log);
     return;
   }
-  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId);
+  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId, rec.replyId);
   if (receipt.status === "found") {
     ackObligation(ctx, rec.obligationId, "recovered: receipt already posted");
     return;
@@ -1072,6 +1093,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // NAMED failure rather than a silent yield.
       let sawSuppressedFinal = false;
       let posted = false;
+      // The reply id of the record this turn actually delivered (cli#389 round
+      // 6, item 1): the receipt scan pins a receipt's `replyId` to it, so a body
+      // copied from an OLDER reply under the current obligation and inbound ids
+      // is not accepted. Null until a delivery commits.
+      let postedReplyId: string | null = null;
       let postFailure: string | null = null;
       try {
         const dispatchResult: any = await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -1138,32 +1164,27 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             };
 
             // (cli#389) Route the reply through the SAME locality decision as
-            // `tps mail send` and the outbound adapter. `posted` is set ONLY
-            // after the delivery returns; a throw, or an unknown recipient on
-            // the office, is a NAMED failure.
+            // `tps mail send` and the outbound adapter. The delivery call IS the
+            // commit: `posted` is set only after it RETURNS, and a throw (or an
+            // unknown recipient on the office) is a NAMED failure. NOTHING else
+            // runs inside this try (cli#389 round 6, item 2) — the obligation
+            // transition, the receipt write and the log line are evidence
+            // UPKEEP, and each runs after the commit under its own guard, so a
+            // transient failure there can never fail a delivered reply or nack
+            // its inbound.
+            let route: MailRoute | null = null;
+            let deliveredVia: string | null = null;
             try {
-              const route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
+              route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
               if (route.kind === "local") {
                 writeMailFile(account.mailDir, msg.from, reply);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
-                );
                 posted = true;
               } else if (route.kind === "outbox") {
-                const path = writeOutboxFile(reply);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
-                );
+                deliveredVia = writeOutboxFile(reply);
                 posted = true;
               } else if (route.kind === "remote-branch") {
-                // The COMMIT first; the receipt is written after it returns and
-                // under a guard that cannot fail the send (cli#389 round 5).
                 await deliverRemote(reply, route.branchId);
                 posted = true;
-                persistReceiptAfterCommit(account.mailDir, recipient, reply, "remote-branch", route.branchId, log);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=remote-branch: ${route.branchId}; delivery committed)`,
-                );
               } else if (route.kind === "bridge") {
                 // The record carries the obligation ids, so this delivery stays
                 // locally readable even if the receipt write below fails.
@@ -1174,10 +1195,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                   ...obligationMetadata(reply),
                 });
                 posted = true;
-                persistReceiptAfterCommit(account.mailDir, recipient, reply, "bridge", route.branchId, log);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=bridge: ${route.branchId}; delivery committed)`,
-                );
               } else {
                 postFailure = postFailure ?? (route.kind === "failed" ? route.reason : `no-route:${msg.from}`);
                 log?.warn?.(
@@ -1187,9 +1204,50 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                         `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
                 );
               }
-              if (posted) transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
             } catch (err: any) {
               postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
+            }
+
+            // ── AFTER THE COMMIT (cli#389 round 6, item 2). Every step below
+            // runs OUTSIDE the delivery try and under its own guard: it is
+            // logged by name and NEVER sets postFailure, so a delivered reply is
+            // never reported as failed and its inbound is never nacked.
+            if (posted && route) {
+              const r = route;
+              postedReplyId = reply.id;
+              const where =
+                r.kind === "outbox"
+                  ? `${r.kind}: ${deliveredVia}`
+                  : r.kind === "remote-branch" || r.kind === "bridge"
+                    ? `${r.kind}: ${r.branchId}`
+                    : r.kind;
+              postCommit(
+                log,
+                "reply-log-failed",
+                `the ${r.kind} reply ${reply.id} committed to ${msg.from} but its log line failed`,
+                () =>
+                  log?.info?.(
+                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${where}; delivery committed)`,
+                  ),
+              );
+              // The obligation transition records which reply discharged it, so
+              // a later scan can pin the receipt's reply id (item 1).
+              postCommit(
+                log,
+                "obligation-posted-transition-failed",
+                `the ${r.kind} reply ${reply.id} committed but the obligation for ${msg.id} was not marked posted`,
+                () => transitionObligation(account.mailDir, recipient, msg.id, "posted", { replyId: reply.id }, log),
+              );
+              if (r.kind === "remote-branch" || r.kind === "bridge") {
+                // persistReceiptAfterCommit never throws: it logs
+                // receipt-write-failed by name and cannot fail the send.
+                postCommit(
+                  log,
+                  "receipt-write-failed",
+                  `the ${r.kind} reply ${reply.id} committed but its receipt was not written`,
+                  () => persistReceiptAfterCommit(account.mailDir, recipient, reply, r.kind, r.branchId, log),
+                );
+              }
             }
           }
         }
@@ -1202,7 +1260,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         }
 
         // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
-        const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, msg.id, recipient, account.accountId);
+        const receipt = scanForReceipt(
+          receiptDirs(yieldCtx),
+          obId,
+          msg.id,
+          recipient,
+          account.accountId,
+          postedReplyId ?? undefined,
+        );
         if (receipt.status === "found") {
           ackObligation(yieldCtx, obId, "receipt found");
         } else if (receipt.status === "malformed" && posted) {

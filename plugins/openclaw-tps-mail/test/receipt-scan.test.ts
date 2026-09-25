@@ -12,11 +12,16 @@
  *     a REUSED obligation id safe: a receipt minted for another inbound (or an
  *     older reply) never satisfies it.
  * (2) POSTED FILE: matched on the obligation marker, the accountId, the record
- *     `from`, the signed envelope's `from`, and `replyToId` — OR (cli#389 round
- *     5, item 2) on the obligation ids `deliverToSandbox` writes into its
- *     reduced record, the record `from` and the signed envelope's `from`.
+ *     `from`, the sender the body's envelope CLAIMS, and `replyToId` — OR
+ *     (cli#389 round 5, item 2) on the obligation ids `deliverToSandbox` writes
+ *     into its reduced record, the record `from` and the sender that envelope
+ *     CLAIMS. The scan does NOT verify a signature, and it does not claim to
+ *     (cli#389 round 6, item 1): the envelope `from` is a string the scan reads,
+ *     not an identity it proves.
  *
- * The `replyToId` rows below are cli#389 round 3, item 3.
+ * The `replyToId` rows below are cli#389 round 3, item 3; the `replyId` rows are
+ * cli#389 round 6, item 1 (the obligation record's own `replyId`, when it has
+ * one, must match the receipt's).
  */
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
 import {
@@ -63,7 +68,7 @@ function reply(
     from: over.from ?? AGENT,
     accountId: over.accountId ?? ACCOUNT,
     replyToId: over.replyToId ?? INBOUND,
-    // The wrapper body is the signed envelope JSON; envelopeFrom reads `.from`.
+    // The wrapper body is the envelope JSON; envelopeFrom reads the sender it CLAIMS.
     body: JSON.stringify({ v: 1, from: over.envelopeFrom ?? AGENT, to: "flint", body: "the answer" }),
     headers: { "X-TPS-Obligation": over.marker ?? OB_ID },
     timestamp: new Date().toISOString(),
@@ -142,6 +147,30 @@ describe("receipt scan — the METADATA receipt, read by its DIRECT path", () =>
     expect(scanForReceipt({ direct: [receiptsRoot()], posted: [] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
   });
 
+  it("item 1: the RIGHT obligation id + inbound but ANOTHER replyId than the record knows → NOT found", () => {
+    writeMetadataReceipt({
+      replyId: "reply-OTHER",
+      obligationId: OB_ID,
+      replyToId: INBOUND,
+      route: "bridge",
+      ts: new Date().toISOString(),
+    });
+    expect(scanForReceipt({ direct: [receiptsRoot()], posted: [] }, OB_ID, INBOUND, AGENT, ACCOUNT, "reply-1").status).toBe(
+      "absent",
+    );
+    // …and with the matching replyId it is found.
+    writeMetadataReceipt({
+      replyId: "reply-1",
+      obligationId: OB_ID,
+      replyToId: INBOUND,
+      route: "bridge",
+      ts: new Date().toISOString(),
+    });
+    expect(scanForReceipt({ direct: [receiptsRoot()], posted: [] }, OB_ID, INBOUND, AGENT, ACCOUNT, "reply-1").status).toBe(
+      "found",
+    );
+  });
+
   it("a receipt for ANOTHER obligation id in the same dir does not satisfy this one", () => {
     writeMetadataReceipt({
       replyId: "reply-2",
@@ -172,12 +201,12 @@ describe("receipt scan — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2)",
   /**
    * The reduced record `deliverToSandbox` writes when the caller gives it the
    * obligation ids. It has NO headers and NO accountId — so of the posted-file
-   * pins only `from`, the signed envelope's `from` and the ids can be checked.
+   * pins only `from`, the sender its envelope CLAIMS and the ids can be checked.
    */
   function sandboxRecord(
-    over: Partial<{ obligationId: string; replyToId: string; from: string; envelopeFrom: string }> = {},
+    over: Partial<{ obligationId: string; replyToId: string; from: string; envelopeFrom: string; replyId: string | null }> = {},
   ): any {
-    return {
+    const rec: any = {
       id: "sandbox-record-1",
       from: over.from ?? AGENT,
       to: "flint",
@@ -189,9 +218,12 @@ describe("receipt scan — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2)",
       replyToId: over.replyToId ?? INBOUND,
       replyId: "reply-1",
     };
+    if (over.replyId === null) delete rec.replyId;
+    else if (typeof over.replyId === "string") rec.replyId = over.replyId;
+    return rec;
   }
 
-  it("the obligation ids + the agent's signed envelope → found (positive control)", () => {
+  it("the obligation ids + the agent's envelope (its CLAIMED sender) → found (positive control)", () => {
     writeReply(sandboxRecord());
     expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("found");
   });
@@ -211,9 +243,32 @@ describe("receipt scan — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2)",
     expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
   });
 
-  it("a body that is NOT this agent's signed envelope → NOT found", () => {
+  it("a body whose envelope does NOT CLAIM this agent → NOT found", () => {
     writeReply(sandboxRecord({ envelopeFrom: "someone-else" }));
     expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT).status).toBe("absent");
+  });
+
+  // ── cli#389 round 6, item 1: the reply binding ────────────────────────────
+
+  it("item 1: the obligation record knows the reply → a sandbox record with the SAME replyId is found", () => {
+    writeReply(sandboxRecord({ replyId: "reply-1" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, "reply-1").status).toBe(
+      "found",
+    );
+  });
+
+  it("item 1: a sandbox record with correct obligation + inbound ids but a DIFFERENT replyId is NOT accepted", () => {
+    writeReply(sandboxRecord({ replyId: "reply-2" }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, "reply-1").status).toBe(
+      "absent",
+    );
+  });
+
+  it("item 1: a sandbox record with NO replyId at all is NOT accepted", () => {
+    writeReply(sandboxRecord({ replyId: null }));
+    expect(scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, "reply-1").status).toBe(
+      "absent",
+    );
   });
 
   it("the CLI's own local-send record (NO obligation ids) never satisfies an obligation", () => {
@@ -280,7 +335,7 @@ describe("cli#389 round 4 — the receipts dir is read by DIRECT PATH ONLY", () 
       },
     };
 
-    const scan = scanForReceipt({ direct: [receiptsRoot()], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, spyFs);
+    const scan = scanForReceipt({ direct: [receiptsRoot()], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, undefined, spyFs);
 
     // The 1,000 receipts and the unreadable file changed nothing: no receipt
     // for this obligation, and NOT a spurious `.malformed-` failure.
@@ -312,7 +367,7 @@ describe("cli#389 round 4 — the receipts dir is read by DIRECT PATH ONLY", () 
       readFileSync: (p: string, enc: "utf-8") => readFileSync(p, enc),
     };
 
-    const scan = scanForReceipt({ direct: [receiptsRoot()], posted: [] }, OB_ID, INBOUND, AGENT, ACCOUNT, spyFs);
+    const scan = scanForReceipt({ direct: [receiptsRoot()], posted: [] }, OB_ID, INBOUND, AGENT, ACCOUNT, undefined, spyFs);
 
     expect(scan.status).toBe("found");
     expect(scan.status === "found" && scan.path).toBe(join(receiptsRoot(), `${OB_ID}.json`));

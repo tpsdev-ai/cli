@@ -315,6 +315,28 @@ describe("cli#389 — the retention sweep owns THIS agent's receipts", () => {
     expect(existsSync(youngOrphan), "a young orphan is not yet an orphan").toBe(true);
   });
 
+  it("(k) item 3: ONE unreadable record makes an aged receipt unprovable — the receipt SURVIVES, and the result names the skip", () => {
+    // A record the sweep cannot read contributes its id to NEITHER the live nor
+    // the terminal snapshot, so a receipt naming that obligation looks orphaned.
+    // Pre-round-6 that receipt was deleted, and repairing the record later found
+    // its evidence gone.
+    mkdirSync(obligationsDir(mailDir, AGENT), { recursive: true });
+    writeFileSync(join(obligationsDir(mailDir, AGENT), "torn.json"), "{ not json ", "utf-8");
+    const orphanLooking = receipt("ob-unreadable", "inbound-torn", daysAgo(30));
+    // A TERMINAL obligation this sweep CAN read: its receipt still goes, so the
+    // guard is narrow (terminal deletions are not evidence in doubt).
+    writeRecord("done-inbound", "acked", daysAgo(10));
+    const spent = receipt("ob-done-inbound", "done-inbound", new Date().toISOString());
+
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+
+    expect(res.unreadable, "the torn record is reported").toBe(1);
+    expect(res.orphanReceiptsSkipped, "the skip is NAMED in the result").toBe(1);
+    expect(existsSync(orphanLooking), "an aged receipt whose obligation cannot be read survives").toBe(true);
+    expect(res.receiptsRemoved, "a terminal rule this sweep CAN read still applies").toBe(1);
+    expect(existsSync(spent), "the readable terminal obligation's receipt goes").toBe(false);
+  });
+
   it("1,000 aged receipts are swept — aged by their OWN ts, never the file mtime", () => {
     for (let i = 0; i < 1000; i++) receipt(`ob-old-${i}`, `inbound-${i}`, daysAgo(30));
     expect(readdirSync(ROOT()).filter((f) => f.endsWith(".json")).length, "fixture written").toBe(1000);

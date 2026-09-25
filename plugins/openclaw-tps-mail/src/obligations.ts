@@ -88,6 +88,13 @@ export interface ObligationRecord {
    *  back to `inboundTimestamp` for records written before this field existed —
    *  never the file mtime. See sweepTerminalObligations. */
   lastTransitionAt?: string;
+  /** The id of the reply this obligation was discharged by, recorded at the
+   *  `posted` transition (cli#389 round 6). The receipt scan pins a receipt's
+   *  `replyId` to THIS when the record knows it, so a body copied from an older
+   *  reply under the CURRENT obligation id and inbound id does not satisfy the
+   *  obligation. Absent until the obligation is posted (and absent on records
+   *  written before the field existed) — when absent there is nothing to pin. */
+  replyId?: string;
 }
 
 export interface ObligationLog {
@@ -205,6 +212,11 @@ export interface RetentionResult {
   receiptsRemoved: number;
   /** Metadata receipts left in place because they could not be read. */
   receiptsUnreadable: number;
+  /** Metadata receipts that LOOKED orphaned (no obligation in the store) but
+   *  were LEFT this pass because an obligation record could not be read: with
+   *  the store partly unreadable, "no obligation here" is not proof that the
+   *  obligation is gone (cli#389 round 6, item 3). */
+  orphanReceiptsSkipped: number;
   disabled: boolean;
 }
 
@@ -291,6 +303,7 @@ export function sweepTerminalObligations(
     heldForRecovery: 0,
     receiptsRemoved: 0,
     receiptsUnreadable: 0,
+    orphanReceiptsSkipped: 0,
     disabled: false,
   };
   if (!(retentionDays > 0)) {
@@ -396,6 +409,12 @@ export function sweepTerminalObligations(
   //   - NO obligation here at all → an orphan: delete once it has aged past the
   //     window, and never before. A receipt with no readable timestamp is never
   //     aged by a missing value, exactly like an obligation record.
+  //   - EXCEPT when an obligation record in the store could not be read: such a
+  //     record contributes no id to either set, so its own receipt would look
+  //     orphaned and be deleted, and repairing the record later would find its
+  //     evidence gone. With ANY unreadable record, NO orphan is deleted this
+  //     pass (the terminal rule above still applies — that evidence is not in
+  //     doubt) and the skip is counted (cli#389 round 6, item 3).
   const receiptsRoot = receiptsDir(mailDir, agent);
   let receiptNames: string[];
   try {
@@ -424,6 +443,16 @@ export function sweepTerminalObligations(
     const live = liveObligationIds.has(obligationId);
     const t = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
     const agedOrphan = !live && Number.isFinite(t) && t < cutoff;
+    // FAIL SAFE (cli#389 round 6, item 3): an obligation record that could not
+    // be read joins neither set, so a receipt for THAT obligation looks
+    // orphaned. Deleting it would destroy evidence a later repair needs, and
+    // "no obligation here" is not proof while part of the store is unreadable.
+    // The TERMINAL rule is unaffected: it is decided from a record this sweep
+    // did read, so that evidence is not in doubt.
+    if (agedOrphan && !terminal && res.unreadable > 0) {
+      res.orphanReceiptsSkipped++;
+      continue;
+    }
     if (!terminal && !agedOrphan) continue;
     try {
       unlinkSync(path);
@@ -439,6 +468,12 @@ export function sweepTerminalObligations(
       `tps-mail: obligation retention: left ${res.receiptsUnreadable} unreadable receipt(s) in place (never deleted)`,
     );
   }
+  if (res.orphanReceiptsSkipped > 0) {
+    log?.warn?.(
+      `tps-mail: obligation retention: left ${res.orphanReceiptsSkipped} aged receipt(s) in place — ` +
+        `${res.unreadable} unreadable/malformed record(s) in the store make an orphan unprovable this pass`,
+    );
+  }
 
   // Logged ONCE: a single line for the unreadable/malformed records we left.
   if (leftUnreadable.length > 0) {
@@ -449,7 +484,8 @@ export function sweepTerminalObligations(
   log?.info?.(
     `tps-mail: obligation retention: removed ${res.removed} terminal record(s) older than ${retentionDays} day(s); kept ${res.left}` +
       (res.heldForRecovery > 0 ? `; held ${res.heldForRecovery} for unresolved cur/ recovery` : "") +
-      (res.receiptsRemoved > 0 ? `; removed ${res.receiptsRemoved} receipt(s)` : ""),
+      (res.receiptsRemoved > 0 ? `; removed ${res.receiptsRemoved} receipt(s)` : "") +
+      (res.orphanReceiptsSkipped > 0 ? `; held ${res.orphanReceiptsSkipped} receipt(s) (store partly unreadable)` : ""),
   );
   return res;
 }
@@ -550,7 +586,9 @@ const realFs: ReceiptScanFs = {
   readFileSync: (path, encoding) => readFileSync(path, encoding),
 };
 
-/** The `from` of a signed envelope body, or null when it does not parse. */
+/** The sender an envelope body CLAIMS (its `.from`), or null when the body does
+ *  not parse. A CLAIM, never a verified identity: nothing in this module checks
+ *  a signature. */
 export function envelopeFrom(body: string): string | null {
   try {
     const parsed = JSON.parse(body);
@@ -561,8 +599,8 @@ export function envelopeFrom(body: string): string | null {
 }
 
 /**
- * TWO receipt forms, ONE rule: a receipt must name THIS obligation AND the
- * inbound it answers.
+ * TWO receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
+ * it answers, and — when the obligation record knows it — the reply itself.
  *
  *   (1) METADATA (cli#389 round 3) — `<mailDir>/<agent>/.obligations/receipts/
  *       <obligationId>.json` (per-agent since round 5): the small record
@@ -570,7 +608,8 @@ export function envelopeFrom(body: string): string | null {
  *       remote-branch, bridge). Read by its DIRECT path — never by parsing the
  *       directory (cli#389 round 4, item 1: it is the `direct` input, and a
  *       `direct` dir is never listed) — and accepted when `obligationId`
- *       matches AND `replyToId` is the inbound this obligation is keyed on.
+ *       matches, `replyToId` is the inbound this obligation is keyed on, and
+ *       (g) holds.
  *   (2) POSTED FILE — the delivered reply record itself, which carries the
  *       marker this inbound minted. Scan the reply's destination directories
  *       (the `posted` input — the only dirs that are ever listed) for a record
@@ -579,40 +618,57 @@ export function envelopeFrom(body: string): string | null {
  *       minted;
  *   (b) `accountId === accountId` — the SAME account that owns the obligation;
  *   (c) `record.from === agent` — the recipient agent wrote it; and
- *   (d) `envelopeFrom(record.body) === agent` — the wrapped signed envelope's
- *       `from` also names that agent (so a re-wrapped body cannot attribute the
- *       reply to someone else); and
+ *   (d) `envelopeFrom(record.body) === agent` — the sender the wrapped envelope
+ *       CLAIMS also names that agent (so a re-wrapped body cannot attribute the
+ *       reply to someone else). That is a CLAIM about a string, never a
+ *       verified signature — see "what this is not" below; and
  *   (e) `record.replyToId === replyToId` — the record ANSWERS this inbound, so a
  *       reused obligation id can never be satisfied by a reply to another one.
  *   OR (f) — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
  *       record `deliverToSandbox` writes, which carries the obligation ids when
- *       the caller supplies them (`record.obligationId === obligationId` and
- *       `record.replyToId === replyToId`), with the replying agent as `from`
- *       and its signed envelope as the body. That record is what keeps a bridge
- *       delivery locally readable evidence when the metadata receipt above
- *       could not be written (a full disk, a permission error). It carries no
- *       headers and no `accountId` — so of the pins in (a)-(e) it carries (c),
- *       (d) and (e), and those are the ones checked.
+ *       the caller supplies them (`record.obligationId === obligationId`,
+ *       `record.replyToId === replyToId` and `record.replyId`), with the
+ *       replying agent as `from` and, as the body, an envelope that CLAIMS that
+ *       same agent. That record is what keeps a bridge delivery locally readable
+ *       evidence when the metadata receipt above could not be written (a full
+ *       disk, a permission error). It carries no headers and no `accountId` — so
+ *       of the pins above it carries (c), (d), (e) and (g), and those are the
+ *       ones checked.
+ *
+ *   (g) THE REPLY BINDING (cli#389 round 6, item 1): when the obligation record
+ *       KNOWS the reply it was discharged by (`replyId`, recorded at the posted
+ *       transition), a receipt must carry the same `replyId`. A body copied from
+ *       an OLDER reply, re-labelled with the current obligation id and inbound
+ *       id, then needs the current reply's id too. Only the forms that carry a
+ *       reply id take part: the metadata receipt (1) and the bridge record (f).
+ *       A posted marker record (2) is the delivered mail itself and names no
+ *       separate reply id, so there is nothing to pin there.
  *
  * WHAT THIS IS NOT: the receipt is NOT signature-verified here, and this scan
- * does not claim it is. Checking the envelope's signature would not close the
- * gap on its own, for two reasons:
+ * does not claim it is. Verifying the body's envelope signature would not close
+ * the gap on its own, for two reasons:
  *   1. the `X-TPS-Obligation` marker rides on the mail RECORD's headers, OUTSIDE
- *      the signed envelope (index.ts sets it when it writes the reply; the
- *      envelope is signed over `body` alone) — so verifying the envelope would
- *      authenticate the TEXT but would not bind the receipt to THIS inbound;
+ *      the envelope a signature covers (index.ts sets it when it writes the
+ *      reply; the signature covers `body` alone) — so verifying that signature
+ *      would authenticate the TEXT but would not bind the receipt to THIS
+ *      inbound;
  *   2. where agents share one OS user, another agent can read BOTH the
  *      obligation record and the signing keys, so no in-band check separates
  *      them — only an OS-level boundary does (tracked separately). The
  *      obligation id is not a secret in that model: a same-user reader simply
  *      reads it, so "unguessable" is not the defence.
- * So the scan pins IDENTITY (which agent, which account) and REACHABILITY (the
- * record's destination); the marker is a routing key, not an authority.
+ * So the scan pins IDENTITY (which agent, which account), the RELATIONSHIP
+ * (which obligation, which inbound, which reply) and REACHABILITY (the record's
+ * destination); the marker is a routing key, not an authority.
  *
  * A `.malformed-*` quarantine (drainOutbox's quarantine for an unparseable
  * record) is FAILED, never posted — its marker cannot be read, so a malformed
  * file in the receipt dirs is reported as `malformed` only when no valid receipt
  * was found.
+ * `expectedReplyId` is pin (g): the reply the obligation record KNOWS it was
+ * discharged by, when it knows one. An obligation record written before the
+ * `replyId` field existed (or one that never reached `posted`) carries none, and
+ * then there is nothing to pin — the scan does not invent a value.
  */
 export function scanForReceipt(
   dirs: ReceiptScanDirs,
@@ -620,6 +676,7 @@ export function scanForReceipt(
   replyToId: string,
   agent: string,
   accountId: string,
+  expectedReplyId?: string,
   fs: ReceiptScanFs = realFs,
 ): ReceiptScan {
   let malformed: string | null = null;
@@ -635,6 +692,7 @@ export function scanForReceipt(
         rec !== null &&
         typeof rec === "object" &&
         typeof rec.replyId === "string" &&
+        (expectedReplyId === undefined || rec.replyId === expectedReplyId) &&
         rec.obligationId === obligationId &&
         rec.replyToId === replyToId
       ) {
@@ -678,11 +736,15 @@ export function scanForReceipt(
       //      record `deliverToSandbox` writes, carrying the obligation ids the
       //      caller supplied. It has no headers and no accountId, so the pins it
       //      CAN carry are the ones checked — the obligation it names, the
-      //      inbound it answers, the replying agent as `from`, and that agent's
-      //      signed envelope as the body.
+      //      inbound it answers, the reply id (g, when the record knows one), the
+      //      replying agent as `from`, and a body whose envelope claims that same
+      //      agent.
       if (
         record?.obligationId === obligationId &&
         record?.replyToId === replyToId &&
+        typeof record?.replyId === "string" &&
+        record.replyId.length > 0 &&
+        (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
         envelopeFrom(record?.body ?? "") === agent
       ) {

@@ -39,6 +39,7 @@ import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+import * as obligationsModule from "../src/obligations.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -91,6 +92,26 @@ mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   },
   resolveAgentMailRoot: (branchId: string) =>
     join(process.env.HOME ?? "", ".tps", "branch-office", branchId, "mail"),
+}));
+
+// ── mock the obligation store so a POST-COMMIT transition failure is injectable ─
+// cli#389 round 6, item 2: the posted transition runs OUTSIDE the delivery try,
+// so a throw there cannot set a post failure. Injecting the throw through the
+// module keeps the rest of the store REAL — the scan still closes the obligation
+// from the receipt (or the sandbox record) — and a mock that swallowed the error
+// would prove nothing. MUST run before the plugin (which imports this module) is
+// loaded. The real module is captured with a STATIC import (no top-level await
+// interleaved with mock.module) and spread eagerly into a plain object.
+const obligations = { failPostedTransition: false };
+const realObligations = { ...obligationsModule };
+mock.module("../src/obligations.js", () => ({
+  ...realObligations,
+  transitionObligation: (mailDir: string, agent: string, inboundId: string, next: string, patch?: any, log?: any) => {
+    if (obligations.failPostedTransition && next === "posted") {
+      throw new Error("injected: the posted transition threw");
+    }
+    return realObligations.transitionObligation(mailDir, agent, inboundId, next as any, patch, log);
+  },
 }));
 
 const pluginModule = (await import("../src/index.js")).default;
@@ -194,6 +215,7 @@ beforeEach(() => {
   mkdirSync(mailDir, { recursive: true });
   savedHome = process.env.HOME;
   process.env.HOME = root;
+  obligations.failPostedTransition = false;
 });
 
 afterEach(() => {
@@ -726,5 +748,73 @@ describe("cli#389 round 5, item 2 — a receipt write that fails AFTER the bridg
     expect(typeof outcome.obligation?.deadlineAt, "a deadline is armed").toBe("string");
     // The post-commit error is logged BY NAME — never as a send failure.
     expect(outcome.warns.some((w) => w.includes("receipt-write-failed")), "logged by name").toBe(true);
+  }, 20000);
+});
+
+// ── item 2 (round 6): a POST-COMMIT transition failure never fails the delivery ─
+
+/**
+ * The delivery call IS the commit. Everything AFTER it — the posted transition,
+ * the receipt write — is evidence upkeep, so when the transition throws the
+ * reply must NOT be reported as failed and the inbound must NOT be nacked; the
+ * obligation still resolves from the receipt (or, on the bridge, the sandbox
+ * record).
+ *
+ * The failure is INJECTED through the obligations module, never mocked away: the
+ * real store still runs, so the receipt/sandbox evidence is the real thing.
+ */
+describe("cli#389 round 6, item 2 — a transition that fails AFTER the delivery committed", () => {
+  it("(d) the receipt still closes it: NOT failed, NO nack, ACKED, and the throw is logged by name", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    obligations.failPostedTransition = true;
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    // The wire send committed…
+    expect(outcome.route).toBe("remote-branch");
+    expect(relay.deliver.length).toBeGreaterThan(0);
+
+    // …the posted transition threw, and that is NOT a send failure: the send is
+    // not failed and the inbound is not nacked.
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.nack).toBeNull();
+
+    // The obligation still RESOLVES — from the receipt this delivery wrote, the
+    // same reply id this turn posted.
+    expect(outcome.obligation?.state).toBe("acked");
+    expect(outcome.receiptRecord, "the receipt is the local evidence").toBeTruthy();
+    expect(outcome.receiptRecord.replyId).toBe(outcome.replyId);
+
+    // The post-commit error is logged BY NAME — never as a send failure.
+    expect(
+      outcome.warns.some((w) => w.includes("obligation-posted-transition-failed")),
+      "logged by name",
+    ).toBe(true);
+  }, 20000);
+
+  it("(d2) with NO receipt either, the send is still NOT failed and NOT nacked — it yields with its deadline", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+      // INJECT the receipt-write failure too: a FILE where the replying agent's
+      // receipts dir must go. With no receipt AND no sandbox record on the wire,
+      // the post-commit throw is the ONLY thing that could fail this send.
+      mkdirSync(join(mailDir, "anvil", ".obligations"), { recursive: true });
+      writeFileSync(join(mailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
+    };
+    obligations.failPostedTransition = true;
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    expect(outcome.route).toBe("remote-branch");
+    expect(outcome.receiptRecord, "no receipt exists").toBeNull();
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.obligation?.state, "not failed — the deadline decides it").toBe("yielded");
+    expect(outcome.nack).toBeNull();
+    expect(
+      outcome.warns.some((w) => w.includes("obligation-posted-transition-failed")),
+      "logged by name",
+    ).toBe(true);
   }, 20000);
 });
