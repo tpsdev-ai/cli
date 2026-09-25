@@ -19,12 +19,14 @@
   the deadline caller mailed. The verb now sends the nack mail, so every path
   hands its verdict to that one nack path and the same verdict gives the same
   sender-visible outcome wherever it is found, and no caller mails on its own;
-  with no working route the nack stays owed only inside a bounded hold — a
+  with no working route the nack stays owed inside a bounded hold — a
   configurable multiple of `retentionDays` (at least 1): past it the debt is
   abandoned, logged `nack-abandoned`, and normal retention applies. The abandon
-  is best-effort: the debt is released, and the log line written once, only when
-  that write lands — when it does not, the record keeps `nackPending` and a
-  later sweep abandons it again.
+  is best-effort: the line is written on EVERY abandoning sweep, including one
+  whose release write failed, and then it repeats until the release is recorded
+  — so the debt is released, and the line stops repeating, only when that write
+  lands. When it does not, the record keeps `nackPending` and a later sweep
+  abandons it again, logging `nack-abandoned` again.
   The nack is owed ON
   THE RECORD, not proven by the cur/ stamp, and a terminal record refuses later
   transitions outright.

@@ -12,12 +12,17 @@
   `nackSentAt` and clears `nackPending` in one further write — when that write
   succeeds; when it does not, the debt stays and the nack may repeat. Restart
   recovery retries delivery for any `failed` record carrying `nackPending` with
-  no `nackSentAt`, but only INSIDE the hold window — a configurable multiple of
-  `retentionDays` (at least 1; the default is 4). Past that window the debt is
-  abandoned, logged `nack-abandoned`, and normal retention then applies to the
-  record; the abandon is best-effort, so the debt is released, and the log line
-  written once, only when that write succeeds — when it does not, the record
-  keeps `nackPending` and a later sweep abandons it again. AT-LEAST-ONCE, not
+  no `nackSentAt`, and that retry runs BEFORE the sweep — so a record already
+  past the hold window gets one more retry on the very start that abandons it.
+  The window bounds the SWEEP, not the retry; what stops both is the debt, which
+  the abandon clears. The window is a configurable multiple of `retentionDays`
+  (at least 1; the default is 4), and while a debt is inside it the sweep HOLDS
+  the record rather than deleting it. Past the window the debt is abandoned,
+  logged `nack-abandoned`, and normal retention then applies to the record; the
+  abandon is best-effort, so the debt is released, and the line stops repeating,
+  only when that write succeeds — when it does not, the record keeps
+  `nackPending` and a later sweep abandons it again, logging `nack-abandoned`
+  again. AT-LEAST-ONCE, not
   exactly-once: a crash after the hand-off
   but before the record is written retries delivery, so the sender may see the
   nack twice; `nackSentAt` is recorded when that write succeeds, and when it
