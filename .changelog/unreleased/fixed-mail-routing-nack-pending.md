@@ -21,8 +21,8 @@
   logged `nack-abandoned`, and normal retention then applies to the record; the
   abandon is best-effort, so the debt is released, and the line stops repeating,
   only when that write succeeds — when it does not, the record keeps
-  `nackPending` and a later sweep abandons it again, logging `nack-abandoned`
-  again. AT-LEAST-ONCE, not
+  `nackPending`, and if normal retention leaves the record in place a later
+  sweep abandons it again, logging `nack-abandoned` again. AT-LEAST-ONCE, not
   exactly-once: a crash after the hand-off
   but before the record is written retries delivery, so the sender may see the
   nack twice; `nackSentAt` is recorded when that write succeeds, and when it
