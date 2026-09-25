@@ -36,7 +36,7 @@
     "lint": "biome lint ./src ./bin && node ../../scripts/lint-flair-keypath.mjs src",
     "lint:ci": "biome lint ./src ./bin --max-diagnostics=200 && node ../../scripts/lint-flair-keypath.mjs src",
     "pretest": "tsc",
-    "test": "bun test",
+    "test": "node ../../scripts/test-suite.mjs cli",
     "postinstall": "node scripts/postinstall.cjs"
   },
   "keywords": [

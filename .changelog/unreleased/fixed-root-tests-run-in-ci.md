@@ -9,23 +9,35 @@
   `bun test ./test`, so that file, and anything added beside it, runs in the
   `Unit & Integration Tests` job on every PR.
 
-  `scripts/check-test-coverage.mjs` keeps it that way, as its OWN step of that
-  job rather than as a test inside a suite. A guard that ran inside a suite could
-  be disarmed by dropping that suite from the wiring — the exact failure it exits
-  to catch — so it is a standalone script: dropping any suite clause leaves it
-  running, and failing, naming what it lost.
+  What keeps it that way MEASURES what ran instead of reading the wiring. Every
+  suite the job runs is launched through `scripts/test-suite.mjs`, which writes
+  bun's JUnit report to a known path per suite (`test-reports/<suite>.xml`) and the
+  suite's console output beside it (`test-reports/<suite>.log`); the plugin's
+  launcher (`plugins/openclaw-tps-mail/scripts/run-tests.mjs`) sets the same
+  flags for its own run. The guard, `scripts/check-test-reports.mjs`, then reads
+  every required report, collects the test files those reports show executed,
+  discovers the test files on disk (every form bun discovers), and fails naming
+  each discovered file that no report shows executed. It fails CLOSED: a
+  required report that is missing, unreadable or empty fails the build, so a
+  suite that never ran cannot read as a suite that covered everything.
 
-  It reads the wiring rather than searching for text. The covered roots are
-  derived from the root `test` script (`scripts.test`, and every script it calls,
-  followed through `cd` and `bun run <name>`) and from the workflow's own steps,
-  parsed as YAML, whose `run:` values are shell programs — so a clause moved into
-  an unused script, or commented out in YAML or on a shell line, does not read as
-  wired. The plugin's launcher (`plugins/openclaw-tps-mail/scripts/run-tests.mjs`)
-  is read for the root IT runs, `bun test test/`, so the plugin's covered root is
-  `plugins/openclaw-tps-mail/test` and a test file elsewhere in the plugin is
-  reported as an orphan. Where a step or script names a test run but no root can
-  be read from it — a launcher the guard cannot open, a `bun test` whose
-  arguments are a variable — it fails and says so instead of widening the covered
-  set, and it names every test file no suite runs.
+  The guard is its own step, and now the LAST step of the job with
+  `if: always()`: a suite step that fails does not skip it, and it is not a
+  clause of any suite, so dropping a suite from the wiring cannot take the guard
+  down with it. Its predecessor INFERRED coverage from the wiring — it parsed the
+  root `test` script and the workflow's `run:` steps as shell programs — and so
+  reported coverage for commands CI never runs: a `bun test` behind a `#` shell
+  comment, inside quotes, behind `false &&`, piped through `xargs`, in a step
+  carrying `if: false`, behind an `env X=1` prefix, or with `--timeout 5000` read
+  as a path. Each was one more construct to teach an interpreter, and there is
+  always another, so the guard no longer infers — it measures.
+
+  bun's JUnit reporter omits a file with ZERO test cases (measured on the pinned
+  bun 1.3.10: such a file appears in no `<testsuite>` and no `<testcase>`, though
+  bun did execute it and counts it in "Ran N tests across M files"). The
+  file-level signal for that case is the suite's console log, whose per-file
+  headers name every file bun ran — which is why a missing log fails closed too,
+  and why both artifacts are written by `scripts/test-suite.mjs` and by the
+  plugin's launcher.
 
   (Refs #411)

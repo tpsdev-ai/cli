@@ -81,14 +81,6 @@ jobs:
       - run: |
           chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
       - run: bun run test
-      # cli#411 — the guard is its OWN step, never a clause of a suite: a guard
-      # that ran inside a suite could be taken down by dropping that suite from
-      # the wiring, which is the failure it exists to catch. It reads the wiring
-      # (the package scripts, and this workflow's own steps as YAML) rather than
-      # searching for text, so a clause moved into an unused script, or commented
-      # out, does not read as wired.
-      - name: Every test file is run by a suite CI runs (cli#411)
-        run: node scripts/check-test-coverage.mjs
       - name: openclaw-tps-mail plugin tests (isolated HOME launcher)
         # cli#398: the plugin's outbox/archive writers resolve ~/.tps and the CLI
         # mail dirs from the process HOME, so the suite MUST run through its
@@ -100,6 +92,18 @@ jobs:
           npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
           npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
           bun run test              # the isolated launcher (see scripts/run-tests.mjs)
+      # cli#411 — the guard runs LAST, with `if: always()`, so a failing suite
+      # step cannot skip it. It is never a clause of a suite: a guard that ran
+      # inside one could be taken down by dropping that suite, which is the
+      # failure it exists to catch. It does not read this file — it MEASURES what
+      # ran, from the JUnit report each suite writes to test-reports/<suite>.xml via
+      # scripts/test-suite.mjs (the plugin's launcher sets the same flags, and
+      # writes test-reports/plugin.xml + test-reports/plugin.log). A required report
+      # is missing or empty fails it closed, and every test file it discovers
+      # that no report shows executed is named.
+      - name: Every test file is run by a suite CI runs (cli#411)
+        if: always()
+        run: node scripts/check-test-reports.mjs
 
   # cli#394 — the openclaw-tps-mail plugin is otherwise outside CI (#393), so a
   # `bun:` import reachable from the CLI's archive util could break the gateway's

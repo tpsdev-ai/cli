@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "bun test",
+    "test": "node ../../scripts/test-suite.mjs agent",
     "lint": "biome lint ./src",
     "lint:ci": "biome lint ./src --max-diagnostics=200"
   },

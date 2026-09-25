@@ -25,9 +25,17 @@
  *   node scripts/run-tests.mjs [bun test args…]   # default: `test/`
  *   TPS_TEST_KEEP_ROOT=1 node scripts/run-tests.mjs   # keep the temp root,
  *                                                      # printed for inspection
+ *
+ * cli#411: the run also writes the two artifacts the coverage guard reads — a
+ * JUnit report (test-reports/plugin.xml, bun --reporter=junit) and the console
+ * log beside it (test-reports/plugin.log), both at the repo root, or under
+ * TPS_TEST_REPORT_DIR when set. The flags are set here rather than imported
+ * from the monorepo's scripts/test-suite.mjs so this launcher stays
+ * self-contained (it ships inside the plugin's own package), and a caller's own
+ * --reporter argument is left alone.
  */
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { createWriteStream, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,11 +68,37 @@ Object.assign(env, {
 
 console.log(`openclaw-tps-mail tests: isolated root ${root}`);
 
+// cli#411: test-reports/<suite>.xml + .log, beside the other suites' reports.
+const repoRoot = resolve(pluginDir, "..", "..");
+const reportDir = process.env.TPS_TEST_REPORT_DIR
+  ? resolve(process.env.TPS_TEST_REPORT_DIR)
+  : join(repoRoot, "test-reports");
+mkdirSync(reportDir, { recursive: true });
+const reportXml = join(reportDir, "plugin.xml");
+const reportLog = join(reportDir, "plugin.log");
+
 const passthrough = process.argv.slice(2);
-const child = spawn("bun", ["test", ...(passthrough.length ? passthrough : ["test/"])], {
+const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
+if (!args.some((arg) => arg.startsWith("--reporter"))) {
+  args.push("--reporter=junit", `--reporter-outfile=${reportXml}`);
+}
+const child = spawn("bun", args, {
   cwd: pluginDir,
   env,
-  stdio: "inherit",
+  stdio: ["inherit", "pipe", "pipe"],
+});
+
+// Forward the output to this process's streams AND to the suite's log: the JUnit
+// report drops a file with zero test cases, and the log's per-file headers are
+// the file-level signal that covers it.
+const logStream = createWriteStream(reportLog, { flags: "w" });
+child.stdout?.on("data", (chunk) => {
+  process.stdout.write(chunk);
+  logStream.write(chunk);
+});
+child.stderr?.on("data", (chunk) => {
+  process.stderr.write(chunk);
+  logStream.write(chunk);
 });
 
 child.on("error", (err) => {
@@ -82,6 +116,9 @@ child.on("close", (code, signal) => {
       /* best effort — a leaked temp root is preferable to masking a result */
     }
   }
-  if (signal) process.exit(1);
-  process.exit(code ?? 1);
+  // Close the log before exiting (process.exit would truncate it), and exit via
+  // the code so the guard sees a complete report even when tests failed.
+  logStream.end(() => {
+    process.exitCode = signal ? 1 : (code ?? 1);
+  });
 });
