@@ -25,8 +25,11 @@ function rootFile(path: string): string {
   return readFileSync(join(ROOT, path), "utf-8");
 }
 
-/** The file names bun's test discovery picks up (`.` and `_test` forms). */
-const TEST_FILE_NAME = /(?:\.test|\.spec|_test)\.[cm]?[jt]sx?$/;
+/** The file names bun's test discovery picks up (`.` and `_` forms, `.test`/`.spec`). */
+const TEST_FILE_NAME = /(?:[._](?:test|spec))\.[cm]?[jt]sx?$/;
+
+/** Forward-slashed: `relative()` yields `\`-separated paths on Windows. */
+const posix = (path: string): string => path.replaceAll("\\", "/");
 
 /** Every test file in the repo, repo-relative and sorted. `node_modules`/`.git` aside. */
 function testFiles(): string[] {
@@ -36,7 +39,7 @@ function testFiles(): string[] {
       if (entry.name === "node_modules" || entry.name === ".git") continue;
       const path = join(dir, entry.name);
       if (entry.isDirectory()) walk(path);
-      else if (TEST_FILE_NAME.test(entry.name)) found.push(relative(ROOT, path));
+      else if (TEST_FILE_NAME.test(entry.name)) found.push(posix(relative(ROOT, path)));
     }
   };
   walk(ROOT);
@@ -85,6 +88,23 @@ function covers(dir: string, file: string): boolean {
 }
 
 describe("every test file is run by a suite CI runs (cli#411)", () => {
+  test("the scan's filename pattern matches every name bun discovers", () => {
+    // bun discovers the `.` and `_` forms of both words (measured on 1.3.10):
+    // a `_spec` file left out of the pattern would be an orphan the scan misses.
+    for (const name of ["x.test.ts", "x_test.ts", "x.spec.ts", "x_spec.ts", "x.test.js", "x_spec.mjs"]) {
+      expect(TEST_FILE_NAME.test(name), name).toBe(true);
+    }
+    expect(TEST_FILE_NAME.test("x.ts")).toBe(false);
+    expect(TEST_FILE_NAME.test("contest.ts")).toBe(false);
+  });
+
+  test("discovered paths compare against forward-slash prefixes (Windows-safe)", () => {
+    // `relative()` yields `\`-separated paths on Windows; the covered
+    // directories and the assertions here are written with `/`.
+    expect(posix("packages\\cli\\test\\x.test.ts")).toBe("packages/cli/test/x.test.ts");
+    expect(testFiles().every((file) => !file.includes("\\"))).toBe(true);
+  });
+
   test("the root test/ directory is wired into the root test script", () => {
     // The regression cli#411 filed: the root directory's tests ran nowhere.
     expect(rootFile("package.json")).toContain("bun test ./test");
