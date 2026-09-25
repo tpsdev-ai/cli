@@ -101,16 +101,15 @@ export const posix = (path) => path.replaceAll("\\", "/");
  */
 export function discoverTestFiles(rootDir) {
   const found = [];
-  const walk = (dir, isRoot) => {
+  const walk = (dir) => {
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
     } catch (err) {
-      // A subdirectory removed between listing its parent and reading it holds
-      // no test files. Any other failure (EACCES, EMFILE, ...) or a missing root
-      // means discovery did not see the whole tree, and a partial discovery can
-      // pass a guard that should fail, so it throws and the guard fails closed.
-      if (!isRoot && err?.code === "ENOENT") return;
+      // Any failure to read a directory (EACCES, EMFILE, a directory that
+      // vanished mid-walk, a missing root) means discovery did not see the whole
+      // tree, and a partial discovery can pass a guard that should fail. So it
+      // throws and the guard fails closed; a transient failure costs a re-run.
       throw new Error(
         `test discovery could not read ${posix(relative(rootDir, dir)) || "."} (${err?.code ?? err?.message ?? err}); refusing to report coverage from a partial walk`,
       );
@@ -119,11 +118,11 @@ export function discoverTestFiles(rootDir) {
       if (entry.name.startsWith(".") && entry.isDirectory()) continue;
       if (SKIPPED_DIRS.has(entry.name)) continue;
       const path = join(dir, entry.name);
-      if (entry.isDirectory()) walk(path, false);
+      if (entry.isDirectory()) walk(path);
       else if (TEST_FILE_NAME.test(entry.name)) found.push(posix(relative(rootDir, path)));
     }
   };
-  walk(rootDir, true);
+  walk(rootDir);
   return found.sort();
 }
 
