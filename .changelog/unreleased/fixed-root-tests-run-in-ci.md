@@ -11,7 +11,8 @@
   added beside it, runs in the `Unit & Integration Tests` job on every PR.
 
   What keeps it that way MEASURES what ran instead of reading the wiring. Every
-  suite the job runs is launched through `scripts/test-suite.mjs`, which writes
+  suite the job runs, except the plugin's, is launched through
+  `scripts/test-suite.mjs`, which writes
   bun's JUnit report to a known path per suite (`test-reports/<suite>.xml`, the
   record the guard reads) and saves the suite's console output beside it
   (`test-reports/<suite>.log`, the CI record); the plugin's launcher

@@ -44,10 +44,11 @@
  * now fails — which is exactly what a zero-case file looks like — and the
  * failure names the file and says what to do about it.
  *
- * WHAT IT DOES NOT CHECK: whether the tests PASSED. A failing suite still writes
- * a complete report, and this guard passes it when every discovered file is
- * accounted for; the job fails through that suite's own step. What this guard
- * holds is which files RAN.
+ * WHAT IT DOES NOT CHECK: whether the tests PASSED. A suite whose tests fail but
+ * which runs to the end still writes a complete report, and this guard passes it
+ * when every discovered file is accounted for; the job fails through that suite's
+ * own step. A run that dies before bun writes its report leaves none, and the
+ * guard fails closed on that. What this guard holds is which files RAN.
  *
  * A detective, not a boundary: a pull request can edit this script and the
  * wiring together, and the boundary there is review of the diff. What it holds

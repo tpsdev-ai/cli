@@ -13,12 +13,14 @@
  * `if: false`, a dropped launcher argument, an `env X=1` prefix it skips, a
  * `--timeout 5000` it reads as a path. There will always be another construct.
  *
- * THE SHAPE NOW: measure what RAN. Every suite CI runs is launched through this
- * script, which runs `bun test` with bun's JUnit reporter writing to a known
- * path per suite:
+ * THE SHAPE NOW: measure what RAN. Every suite CI runs, except the plugin's, is
+ * launched through this script, which runs `bun test` with bun's JUnit reporter
+ * writing to a known path per suite (the plugin's own launcher sets the same
+ * reporter):
  *
  *   test-reports/<suite>.xml   — the JUnit XML: one <testsuite file="…"> per file bun
- *                           executed (and `<testcase file="…">` per case)
+ *                           executed that registers at least one case (and
+ *                           `<testcase file="…">` per case)
  *   test-reports/<suite>.log   — the suite's console output, saved beside the report
  *
  * WHAT EACH FILE IS FOR. The XML is the record the guard reads; nothing else is.
