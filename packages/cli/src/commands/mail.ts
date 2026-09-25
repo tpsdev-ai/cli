@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
-import { galLookup } from "../utils/gal.js";
+import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
@@ -192,9 +192,16 @@ export async function runMail(args: MailArgs): Promise<void> {
       // leaving K&S/branch-office dispatches unsigned (signed-envelopes gap #1).
       args.message = maybeSignEnvelopeBody(from, to, args.message);
 
-      // Branch mode: queue outbound to be picked up by host on next connect
-      const branchHostFile = join(process.env.HOME || homedir(), ".tps", "identity", "host.json");
-      if (existsSync(branchHostFile)) {
+      // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
+      // plugin so the two cannot drift: `resolveMailRoute` owns the
+      // branch/office + GAL rules. The CLI has no OpenClaw bindings, so it
+      // passes none — on a branch every recipient is relayed through the
+      // outbox, exactly as before.
+      const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+      const route = resolveMailRoute({ to, mailDir: mailRoot, localAgents: [] });
+
+      // Branch mode: queue outbound to be picked up by host on next connect.
+      if (route.kind === "outbox") {
         assertValidBody(args.message);
         queueOutboxMessage(to, args.message, from);
         if (args.json) {
@@ -205,35 +212,24 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
-      // GAL lookup: resolve agent name → physical branch ID
-      const galBranchId = galLookup(to);
-      const effectiveTo = galBranchId ?? to;
-
-      // Check for remote branch (has remote.json)
-      const remoteJsonPath = join(
-        process.env.HOME || homedir(),
-        ".tps",
-        "branch-office",
-        effectiveTo,
-        "remote.json"
-      );
-      if (existsSync(remoteJsonPath)) {
+      // A recipient registered for remote delivery (GAL entry + remote.json).
+      if (route.kind === "remote-branch") {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(effectiveTo, { to, from, body: args.message });
+        await deliverToRemoteBranch(route.branchId, { to, from, body: args.message });
         if (args.json) {
-          console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: effectiveTo }));
+          console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: route.branchId }));
         } else {
-          const resolvedNote = galBranchId ? ` (via GAL: ${galBranchId})` : "";
+          const resolvedNote = route.branchId !== to ? ` (via GAL: ${route.branchId})` : "";
           console.log(`Mail delivered to remote branch '${to}'${resolvedNote}.`);
         }
         return;
       }
 
-      // Inbound Bridge: check if recipient is a local branch office agent
-      const branchInbox = join(process.env.HOME || homedir(), ".tps", "branch-office", effectiveTo, "mail", "inbox");
-      if (existsSync(branchInbox)) {
+      // A local branch-office sandbox (an inbox with no remote.json) → the
+      // CLI's own bridge, shared with the plugin (cli#389).
+      if (route.kind === "bridge") {
         assertValidBody(args.message);
-        deliverToSandbox(effectiveTo, {
+        deliverToSandbox(route.branchId, {
           to,
           from,
           body: args.message,
@@ -246,8 +242,34 @@ export async function runMail(args: MailArgs): Promise<void> {
         return;
       }
 
+      // A GAL entry naming a branch with NO remote registration is a
+      // misconfiguration: refuse with the SAME named failure the plugin uses,
+      // whatever maildirs exist — never a fall-through to the local maildir.
+      if (route.kind === "failed") {
+        console.error(
+          `Refusing to send to '${to}': ${route.reason} — the GAL names branch '${route.branchId}' but it has no remote registration ` +
+            `(~/.tps/branch-office/${route.branchId}/remote.json). Fix the GAL entry or register the branch.`,
+        );
+        process.exit(1);
+      }
+
+      // (cli#389 round 13) An UNKNOWN recipient — no binding, no GAL entry, no
+      // maildir, no branch-office bridge — is a NAMED failure on the CLI too,
+      // exactly as the shared rule and the plugin treat it. Falling through to
+      // `sendMessage` created `~/.tps/mail/<to>/new/` for a name nothing reads
+      // and exited 0, so a typo became silent loss — and the directory it
+      // created then reclassified that name as local on the next decision.
+      if (route.kind === "unknown") {
+        console.error(
+          `Refusing to send to '${to}': no route — '${to}' is not a local agent and not in the GAL. ` +
+            `Create the agent first, or add it to the GAL; nothing was written.`,
+        );
+        process.exit(1);
+      }
+
       // Direct Maildir send: args.message was already signed by
-      // maybeSignEnvelopeBody above.
+      // maybeSignEnvelopeBody above; `route.kind === "local"`, or the CLI's
+      // fallback for an office recipient with no maildir yet.
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
         console.log(JSON.stringify(msg, null, 2));

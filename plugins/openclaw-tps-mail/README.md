@@ -78,6 +78,73 @@ packaged install does not.) Raising the floor would break installing the plugin
 on exactly the hosts this warning exists for, so the range stays `>=2026.3.7`
 and the runtime WARN carries the floor instead.
 
+## The obligation lifecycle (cli#389 round 8)
+
+Every inbound opens one durable obligation record, and its `state` is the
+plugin's truth about what the delivery has done — the turn, the deadline timer
+and a RESTART after a crash all read the same record:
+
+- **`pending`** — the obligation exists; no deadline armed yet.
+- **`yielded`** — the run ended without a posted final; the deadline is armed.
+- **`delivering`** — WRITE-AHEAD: persisted BEFORE the delivery call, so a crash
+  mid-delivery is distinguishable from a crash before it.
+- **`posted`** — the delivery call RETURNED: the reply has been HANDED TO ITS
+  ROUTE — sent over the wire to a remote branch, delivered into a local maildir,
+  or queued in the outbox for the branch drain to send later. It is not a claim
+  that the peer has received it.
+- **`acked`** — terminal: a receipt (or the bridge sandbox record) proves the
+  delivery.
+- **`unconfirmed`** — terminal: committed, and no evidence arrived by the
+  deadline. NOT failed, and the sender is never told it failed.
+- **`failed`** — terminal: a definitive non-delivery verdict; failed and nacked.
+
+The transitions: `pending`/`yielded` → `delivering` before the delivery call (if
+THAT write fails, nothing was sent — the plugin makes ONE attempt to record the
+failure and tell the sender, and does not retry in a loop; if the obligation
+store cannot be written EITHER, nothing can be recorded at all, the failure is
+logged by name (`obligation-write-failed`) and the obligation resolves on a
+later start, once the store can be written); `delivering` → `posted` the moment the call returns; `posted`/`delivering` →
+`acked` when the scan finds evidence (the ack is gated on the receipt, never on
+the dispatch settling); `delivering`/`posted` → `unconfirmed` at the deadline
+with no evidence; and any live state → `failed` on a definitive non-delivery
+verdict. A TERMINAL record refuses a late `delivering` (`late-final-refused`,
+logged by name): a final that arrives after the obligation CLOSED is not
+delivered. The obligation can close as `acked`, `failed` or `unconfirmed`, and
+`unconfirmed` tells the sender nothing at all — the reason is that the
+obligation is closed, never that the sender was told it failed. Arming a
+deadline never downgrades a committed record: `delivering` and `posted` keep
+their state and only gain `deadlineAt`.
+
+ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
+the only writer of `failed` or `nackedAt` — and the only sender of the nack mail:
+every path hands its verdict to that ONE nack path, so the same verdict reaches
+the sender whichever path found it, and with no working route the nack stays owed
+until one exists. That nack is
+carried on the RECORD and is **at-least-once, never exactly-once**: the write
+that sets `failed` also sets `nackPending`, the send is awaited, and a mail that
+reaches a route records `nackSentAt` and clears `nackPending` in one further
+write — WHEN THAT WRITE SUCCEEDS; when it does not, the debt stays and the nack
+may repeat. So a crash between settling and sending — or a send that could not be
+delivered — is visible on the record, and a later start retries delivery for any
+`failed` record carrying `nackPending` with no `nackSentAt`, once the store can
+be written; a crash AFTER the hand-off but before that write retries delivery
+too, so the sender may see the nack twice — the mail is owed until a hand-off is
+RECORDED. It
+decides from the record — evidence found → `acked`; committed with no evidence at
+the deadline → `unconfirmed` (no failed state, **no nack mail, no nack stamp**,
+logged by name); a definitive non-delivery verdict → `failed` and a nack, **even
+after commit**. A definitive verdict is a refusal decided BEFORE the delivery
+call (no route at all, a named route failure such as `gal-without-remote`) or the
+outbox drain QUARANTINING THIS REPLY'S OWN RECORD — attributed by the reply id
+itself (the drain keeps the original name, which carries the reply the plugin
+posted). A THROW FROM THE DELIVERY CALL IS NOT A VERDICT: once `delivering` is
+persisted the bytes may already have left, so a throw resolves by evidence or
+deadline — on a later start once the store can be written, if it cannot be
+written at that deadline — and only a throw before the write-ahead landed fails
+and nacks. An
+unrelated `.malformed-*` marker, or an evidence step that threw, is not a verdict
+either: those resolve at the deadline.
+
 ## Obligation record retention (cli#401)
 
 Every inbound opens a durable obligation record at
@@ -85,9 +152,20 @@ Every inbound opens a durable obligation record at
 accumulate forever (one ~600 B file per inbound), so at **startup recovery** the
 plugin sweeps the store:
 
-- **Only TERMINAL records** (`acked`, `failed`) are deletable. `pending`,
-  `posted` and `yielded` are NEVER deleted, at any age — restart recovery reads
-  them to re-arm deadlines.
+- **Only TERMINAL records** (`acked`, `unconfirmed`, `failed`) are deletable.
+  `pending`, `delivering`, `posted` and `yielded` are NEVER deleted, at any
+  age — restart recovery reads them to re-arm deadlines.
+- **A terminal record still OWING its nack mail is HELD, while it is inside the
+  hold window.** A `failed` record with `nackPending` and no `nackSentAt` is not
+  swept while its OWN last transition is inside the hold (a configurable multiple
+  of `obligationRetentionDays`, default **4×**): startup retries delivery from
+  that record, so deleting it would erase the only durable evidence that the
+  sender is still owed a mail. Startup retries owed nacks OFF the startup path
+  (one unreachable branch must not stall the start) and the sweep HOLDS a
+  still-owed record whichever of the two runs first; once the debt is discharged
+  (`nackSentAt` recorded) the record is ordinary and ages out normally. **Past the
+  hold the debt is ABANDONED** — logged `nack-abandoned`, once, by name — and
+  normal retention applies to the record.
 - A terminal record is deleted when its **last transition** is older than the
   window. The age is the record's OWN recorded `lastTransitionAt` (falling back
   to `inboundTimestamp` for records written before that field existed) — never
@@ -106,12 +184,68 @@ plugin sweeps the store:
   }
   ```
 
+- **The owed-nack hold is configurable too.** Key `obligationNackHoldMultiple`
+  (same two config locations), a multiple of `obligationRetentionDays`: default
+  **4** (so a 7-day window holds an owed nack for 28 days before abandoning it).
+  A non-positive/invalid value falls back to the default.
+
 - **Safe + best-effort:** a record that is unreadable/malformed (or has no
   parseable timestamp) is LEFT in place and logged once, and a deletion failure
   never blocks startup.
 - **Replay after a sweep is ACCEPTED:** a replayed inbound id whose record was
   swept opens a FRESH obligation. Relay retries arrive within minutes or hours,
   never 7 days later, so the sweep cannot collide with a real retry.
+
+## Metadata receipts and the delivery residual
+
+A reply delivered over a route that leaves **no locally readable mail file** —
+the wire to a remote branch, or the branch-office bridge — is receipted so the
+obligation loop can see that it committed. The receipt is a small metadata-only
+record: the reply id, the obligation id, the inbound it answers, the route and
+the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
+`<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` — inside the
+**replying agent's own** obligation store.
+
+- **The replying agent owns its receipts.** They live beside the obligations
+  that owe them, so a startup sweep sees only its own agent's receipts and keys
+  each one on the obligation id (a unique id): a live obligation keeps its
+  receipt, a terminal obligation's receipt goes, and a receipt with no
+  obligation left in the store goes once it has aged past the retention window
+  (an orphan). A receipt with no readable timestamp is never aged out.
+- **A receipt is matched by what it NAMES, never by a signature.** The scan pins
+  the obligation id, the inbound the receipt answers, and — when the obligation
+  record knows the reply it was discharged by — the reply id too, so a body
+  copied from an older reply under the current ids needs the matching reply id as
+  well. The envelope `from` the scan reads is the CLAIM the body carries, not a
+  verified identity: no signature is checked here (that boundary is tracked
+  separately, and a signature alone would not bind the receipt to one inbound).
+- **A bridge delivery is readable in the sandbox too.** The bridge's reduced
+  sandbox record carries the obligation, inbound and reply ids when an
+  obligation supplies them, so that delivery stays locally readable evidence
+  even if the receipt above could not be written. A caller that supplies none —
+  an ordinary send — leaves the record exactly as it was.
+- **A committed delivery fails only on a definitive non-delivery verdict.** The
+  commit is a PERSISTED
+  state of the obligation record (`delivering` before the delivery call, `posted`
+  when it returns), never a flag in the plugin's memory, so a restart, the
+  deadline timer and the dispatch's outer catch all read the same truth. A throw
+  from ANY step that runs after the commit — the ACK transition, the receipt
+  scan, the posted transition, the receipt write, the failedCounts log — is
+  logged by name (`post-commit-error:<step>`, or `receipt-write-failed` for the
+  receipt) and does **not** fail the obligation or nack the inbound, whichever
+  catch it lands in; the obligation's normal deadline is armed so it still
+  resolves to `acked` or `unconfirmed` once the store can be written. The
+  residual that leaves is the wire
+  route's: a replying host that cannot write its own receipt (a full disk, for
+  example — the bridge still has its sandbox record, the wire does not) has no
+  local evidence, so its obligation resolves at its **deadline** — and so does a
+  committed reply whose own posted record cannot be read back as a valid receipt.
+  Either resolution needs the obligation store to be writable: if it cannot be
+  written at that deadline, the record stays live and resolves on a later start,
+  once the store can be written.
+  The one thing that still fails a committed obligation is a DEFINITIVE
+  non-delivery verdict: the drain quarantining this reply's own record, attributed
+  by its reply id.
 
 ## Retiring the old hook
 

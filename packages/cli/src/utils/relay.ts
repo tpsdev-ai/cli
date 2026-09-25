@@ -27,6 +27,15 @@ export interface RelayMessage {
   read?: boolean;
   origin?: string;
   error?: string;
+  /**
+   * cli#389 round 5, item 2: the obligation ids a caller discharging a reply
+   * obligation supplies. Written into the delivered record when given (see
+   * deliverToSandbox) so a bridge reply stays locally readable evidence; absent
+   * for every ordinary send.
+   */
+  obligationId?: string;
+  replyToId?: string;
+  replyId?: string;
 }
 
 /** Returns the mail root dir for an agent (branch-office or team workspace). Used by deliverToSandbox and external callers that need to read delivered messages. */
@@ -391,9 +400,33 @@ export function startRelay(agentId: string): () => void {
   return stop;
 }
 
+/** The overall bound for a remote delivery (the connection AND the ACK wait)
+ *  when the caller does not give one. */
+export const DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS = 20_000;
+
+/** Thrown when a remote delivery exceeds its overall bound. NAMED so a caller
+ *  can tell a bounded timeout (the transport was CLOSED) from any other
+ *  failure — connect to an unreachable branch has no application-level timeout
+ *  of its own. */
+export class RemoteDeliveryTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RemoteDeliveryTimeoutError";
+  }
+}
+
+export interface RemoteBranchDeliveryOptions {
+  /** Overall bound for the WHOLE delivery — the connection AND the ACK wait —
+   *  in milliseconds. On expiry the in-flight transport/channel is CLOSED and
+   *  the attempt rejects with a `RemoteDeliveryTimeoutError`. Omitted/<=0 uses
+   *  `DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS`. */
+  timeoutMs?: number;
+}
+
 export async function deliverToRemoteBranch(
   branchId: string,
-  message: RelayMessage
+  message: RelayMessage,
+  opts: RemoteBranchDeliveryOptions = {}
 ): Promise<void> {
   const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId);
   const remotePath = join(branchDir, "remote.json");
@@ -410,18 +443,57 @@ export async function deliverToRemoteBranch(
   if (!branch || !branch.encryptionKey) {
     throw new Error(`Remote branch '${branchId}': not registered or missing encryption key`);
   }
+  // Captured as a const: the guard's narrowing of the property does not survive
+  // into the async closures below.
+  const hostPublicKey = branch.encryptionKey;
 
   const hostKp = await loadHostIdentity();
   const transport = transportType === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
-  
-  const channel = await transport.connect({
-    host,
-    port,
-    branchId,
-    hostPublicKey: branch.encryptionKey,
+
+  // cli#389 round 12 (CodeRabbit, Major): one OVERALL bound spanning the
+  // connection AND the ACK wait. Without it, `connect` to an unreachable branch
+  // (the initial open/connect has no application-level timeout) can hang a
+  // caller forever; on expiry the transport is CLOSED so no half-open socket is
+  // left behind.
+  const overallMs =
+    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
+  // A closer for the channel once it exists, so BOTH the expiry handler and the
+  // finally can tear it down. Starts as a no-op (there is nothing to close
+  // before connect returns).
+  const channelCloser: { close: () => Promise<void> } = { close: async () => {} };
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const overallDeadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      // During connect there is no channel yet, so tear the TRANSPORT down;
+      // after connect, close the channel too. Both are idempotent/best-effort.
+      try {
+        transport.close();
+      } catch {
+        /* best effort */
+      }
+      try {
+        void channelCloser.close();
+      } catch {
+        /* best effort */
+      }
+      reject(new RemoteDeliveryTimeoutError(`Remote delivery to branch "${branchId}" exceeded ${overallMs}ms (connect + ack)`));
+    }, overallMs);
+    // Never let the guard timer keep the process alive on its own.
+    if (timer && typeof (timer as { unref?: () => void }).unref === "function") {
+      (timer as { unref: () => void }).unref();
+    }
   });
 
-  try {
+  const send = (async () => {
+    const channel = await transport.connect({
+      host,
+      port,
+      branchId,
+      hostPublicKey,
+    });
+    channelCloser.close = () => channel.close().catch(() => {});
+
     const msgId = message.id || randomUUID();
     const payload = {
       id: msgId,
@@ -431,16 +503,17 @@ export async function deliverToRemoteBranch(
       timestamp: message.timestamp || new Date().toISOString(),
     };
 
+    const ch = channel;
     const acked = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        channel.offMessage(handler);
+        ch.offMessage(handler);
         reject(new Error("Delivery timeout (5s)"));
       }, 5000);
 
       const handler = (msg: TpsMessage) => {
         if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
           clearTimeout(timeout);
-          channel.offMessage(handler);
+          ch.offMessage(handler);
           // Honor the branch's honest ACK: accepted:false means the write
           // failed (inbox full, mode error, etc). Surface as a real delivery
           // error rather than treating any ACK as success.
@@ -452,10 +525,10 @@ export async function deliverToRemoteBranch(
           }
         }
       };
-      channel.onMessage(handler);
+      ch.onMessage(handler);
     });
 
-    await channel.send({
+    await ch.send({
       type: MSG_MAIL_DELIVER,
       seq: 0,
       ts: payload.timestamp,
@@ -466,8 +539,20 @@ export async function deliverToRemoteBranch(
     // Close immediately after ACK — don't hold the connection open for a
     // drain window. Inbound message sync is handled by connectAndKeepAlive /
     // tps mail sync, not by individual send operations. (#mail-send-hang)
+  })();
+  // If the overall deadline wins, the send arm may still settle later; make sure
+  // its rejection is never an unhandled one.
+  void send.catch(() => {});
+
+  try {
+    await Promise.race([send, overallDeadline]);
   } finally {
-    await channel.close();
+    if (timer) clearTimeout(timer);
+    try {
+      await channelCloser.close();
+    } catch {
+      /* best effort */
+    }
   }
 }
 
@@ -684,6 +769,15 @@ function migrateOrphanedInboxMessages(mailRoot: string): void {
   }
 }
 
+/**
+ * Deliver a message into a branch-office (or team workspace) sandbox inbox.
+ *
+ * cli#389 round 5, item 2: the optional obligation ids on `message` are written
+ * into the record when given, so a caller discharging a reply obligation leaves
+ * locally readable evidence of which obligation and which inbound the delivery
+ * answers. A caller that supplies none (the local send path) is unaffected: the
+ * record keeps exactly the fields — and the order — it had before.
+ */
 export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   assertAgent(agentId);
 
@@ -696,7 +790,7 @@ export function deliverToSandbox(agentId: string, message: RelayMessage): void {
   // Migrate any orphaned messages from old inbox/new/ path on first delivery
   migrateOrphanedInboxMessages(mailRoot);
 
-  const payload = {
+  const payload: Record<string, unknown> = {
     id: message.id || randomUUID(),
     from: message.from || "host",
     to: message.to,
@@ -705,6 +799,11 @@ export function deliverToSandbox(agentId: string, message: RelayMessage): void {
     read: false,
     origin: message.origin || "host",
   };
+  // Appended ONLY when the caller supplies them, so a record for an ordinary
+  // send serializes exactly as it did before this field existed.
+  if (message.obligationId) payload.obligationId = message.obligationId;
+  if (message.replyToId) payload.replyToId = message.replyToId;
+  if (message.replyId) payload.replyId = message.replyId;
 
   const filename = `${timestampPrefix()}-${randomUUID()}.json`;
   atomicWriteJson(join(freshDir, filename), payload);

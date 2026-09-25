@@ -24,6 +24,10 @@ import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+// The REAL drain: the branch relay quarantines an unparseable outbox record with
+// this exact function (packages/cli/src/commands/branch.ts imports it from the
+// same module). Imported from the built CLI so we exercise the shipped artifact.
+import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -96,10 +100,26 @@ function obligationFile(agent: string, id: string): any | null {
 }
 function postedReplies(recipient: string): any[] {
   const dir = resolve(tempMailDir, recipient, "new");
-  return readdirSafe(dir).filter((f) => f.endsWith(".json")).map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")));
+  return readdirSafe(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => JSON.parse(readFileSync(join(dir, f), "utf-8")))
+    // cli#389 round 9, item 2: a NACK mail is not a posted reply. The verb sends
+    // one on every transition to `failed`, and it lands in the sender's inbox
+    // beside the reply that would have gone there.
+    .filter((r) => typeof r?.headers?.["X-TPS-Nack"] !== "string");
 }
 
-async function start(agentId: string, sender: string, opts: { localSender?: boolean } = {}) {
+/** The nack mails' reasons, for a recipient's inbox (cli#389 round 9, item 2). */
+function nackReasons(recipient: string): string[] {
+  const dir = resolve(tempMailDir, recipient, "new");
+  return readdirSafe(dir)
+    .filter((f) => f.endsWith(".json"))
+    .map((f) => { try { return JSON.parse(readFileSync(join(dir, f), "utf-8")); } catch { return null; } })
+    .filter((r) => typeof r?.headers?.["X-TPS-Nack"] === "string")
+    .map((r) => String(r.headers["X-TPS-Nack"]));
+}
+
+async function start(agentId: string, sender: string, opts: { localSender?: boolean; branchHost?: boolean } = {}) {
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
     createMailVerifyClient: async () => ({
       async getAgent(name: string) {
@@ -110,6 +130,12 @@ async function start(agentId: string, sender: string, opts: { localSender?: bool
     }),
   }));
   if (opts.localSender) mkdirSync(resolve(tempMailDir, sender, "new"), { recursive: true });
+  // cli#389: host TYPE decides locality (a branch relays non-bound recipients
+  // to the outbox; the office delivers into a maildir).
+  if (opts.branchHost) {
+    mkdirSync(resolve(tempHome, ".tps", "identity"), { recursive: true });
+    writeFileSync(resolve(tempHome, ".tps", "identity", "host.json"), "{}\n", "utf-8");
+  }
   const newDir = resolve(tempMailDir, agentId, "new");
   mkdirSync(newDir, { recursive: true });
   const inboundId = `msg-${Math.random().toString(36).slice(2, 10)}`;
@@ -190,7 +216,11 @@ describe("cli#400 — the dispatcher posts the LAST real final", () => {
     expect(obligationFile("anvil", h.inboundId)?.failure).toBe("empty-final-text");
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
-    expect(postedReplies("flint").length).toBe(0);
+    expect(postedReplies("flint").length, "no reply was posted").toBe(0);
+    // cli#389 round 9, item 2: the VERB owns the nack mail, so a pre-call failure
+    // announces the sender — exactly ONE mail, naming the reason.
+    expect(await pollUntil(() => nackReasons("flint").length === 1, 2000), "exactly one nack mail").toBe(true);
+    expect(nackReasons("flint")).toEqual(["empty-final-text"]);
     await h.stop();
   }, 15000);
 });
@@ -233,6 +263,12 @@ describe("cli#400 — yield / deadline interplay", () => {
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
+    // cli#389 round 9, item 4: the late final was REFUSED, not delivered — the
+    // obligation is CLOSED (here by the deadline), so no reply may follow the
+    // nack. Closure is the reason, not the nack: an obligation can also close as
+    // `unconfirmed`, which tells the sender nothing at all (round 10, item 3).
+    expect(postedReplies("flint").length, "the late final is NOT delivered").toBe(0);
+    expect(nackReasons("flint"), "and only the one nack mail went out").toEqual(["yielded-without-resumption"]);
     await h.stop();
   }, 20000);
 });
@@ -248,7 +284,10 @@ describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, 
     expect(obligationFile("anvil", h.inboundId)?.failure).toBe("empty-final-text");
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
-    expect(postedReplies("flint").length).toBe(0);
+    expect(postedReplies("flint").length, "no reply was posted").toBe(0);
+    // cli#389 round 9, item 2: the same single nack mail, from the verb.
+    expect(await pollUntil(() => nackReasons("flint").length === 1, 2000), "exactly one nack mail").toBe(true);
+    expect(nackReasons("flint")).toEqual(["empty-final-text"]);
     await h.stop();
   }, 15000);
 
@@ -291,7 +330,7 @@ describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, 
     await h.stop();
   }, 15000);
 
-  it("(b4) 'verdict' then a raw NO_REPLY with the receipt made ABSENT → NOT empty-final-text (posted-without-receipt → yield)", async () => {
+  it("(b4) 'verdict' then a raw NO_REPLY with the receipt made ABSENT → NOT empty-final-text (posted-without-receipt → the deadline rule)", async () => {
     process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
     const h = await start("anvil", "flint", { localSender: true });
     const flintNew = resolve(tempMailDir, "flint", "new");
@@ -304,7 +343,10 @@ describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, 
       h.settle();
       await new Promise((r) => setTimeout(r, 300));
       expect(obligationFile("anvil", h.inboundId)?.failure).not.toBe("empty-final-text");
-      expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
+      // The delivery committed, so the record says `posted` (not `yielded`): the
+      // deadline, not the yield path, decides what this becomes.
+      expect(obligationFile("anvil", h.inboundId)?.state).toBe("posted");
+      expect(obligationFile("anvil", h.inboundId)?.deadlineAt).toBeTruthy();
       expect(curRecord("anvil")?.ackedAt).toBeUndefined();
     } finally {
       chmodSync(flintNew, 0o755);
@@ -325,7 +367,7 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
   it("(c) unrelated .malformed-* in the remote route + a turn that yields with no final → deadline ARMED, not receipt-malformed", async () => {
     process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
     seedMalformed("sent");
-    const h = await start("anvil", "flint", { localSender: false });
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
     h.settle(); // no final → yield
     await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "yielded", 2000);
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("yielded");
@@ -337,7 +379,7 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
 
   it("(d) unrelated .malformed-* present + this turn posts a valid reply → found → ack", async () => {
     seedMalformed("sent");
-    const h = await start("anvil", "flint", { localSender: false });
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
     await h.deliver("verdict");
     h.settle();
     await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
@@ -345,20 +387,103 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
     await h.stop();
   }, 15000);
 
-  it("(e) this turn posts, its own record is quarantined and NO valid receipt is visible → receipt-malformed", async () => {
-    seedMalformed("sent"); // the quarantined record the scan can see
+  it("(e) [cli#389 round 8] the drain quarantines THIS reply's own outbox record → attributed by its reply id → receipt-malformed, failed and nacked", async () => {
+    // The deadline is short here, but it is NOT what fails this obligation: the
+    // VERDICT does. A quarantined record that is this reply's own is a definitive
+    // non-delivery, so the obligation fails and nacks even though the delivery
+    // call returned — cli#398 T4(e) restored as a REAL test of attribution.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    const h = await start("anvil", "flint", { localSender: false, branchHost: true });
+    // The reply lands in outbox/new, but the dir cannot be listed during the
+    // turn's own scan, so this turn resolves to `posted` with its deadline armed.
     mkdirSync(outbox("new"), { recursive: true });
-    chmodSync(outbox("new"), 0o333); // posted reply lands here but is not listable
+    chmodSync(outbox("new"), 0o333);
     try {
-      const h = await start("anvil", "flint", { localSender: false });
       await h.deliver("verdict");
       h.settle();
-      const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
-      expect(failed).toBe(true);
-      expect(obligationFile("anvil", h.inboundId)?.failure).toBe("receipt-malformed");
+      const posted = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "posted", 2000);
+      expect(posted, "the delivery committed").toBe(true);
+    } finally {
+      chmodSync(outbox("new"), 0o755);
+    }
+
+    // The reply's own record is visible again. An external fault tore it; the
+    // REAL drain — the function the branch relay calls — quarantines it, and the
+    // quarantined name keeps the original one, so it still carries the reply id
+    // the obligation recorded at its `posted` transition.
+    const names = readdirSafe(outbox("new")).filter((f) => f.endsWith(".json"));
+    expect(names.length, "exactly the reply is in the outbox").toBe(1);
+    const own = names[0]!;
+    const replyId = obligationFile("anvil", h.inboundId)?.replyId;
+    expect(own.includes(replyId), "the quarantined record is named for THIS reply").toBe(true);
+    writeFileSync(join(outbox("new"), own), "{ torn by an external fault");
+    expect(drainOutbox().length, "nothing was delivered").toBe(0);
+    expect(
+      readdirSafe(outbox("sent")).filter((f) => f.startsWith(".malformed-")).length,
+      "the drain quarantined it",
+    ).toBe(1);
+
+    // The verdict is definitive: failed with receipt-malformed, and nacked.
+    const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
+    expect(failed).toBe(true);
+    expect(obligationFile("anvil", h.inboundId)?.failure).toBe("receipt-malformed");
+    expect(curRecord("anvil")?.nackedAt, "the inbound IS nacked").toBeDefined();
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    // The nack mail names the definitive verdict.
+    const nackMail = [...readdirSafe(outbox("new")), ...readdirSafe(outbox("sent"))]
+      .filter((f) => f.endsWith(".json"))
+      .filter((f) =>
+        [outbox("new"), outbox("sent")].some((d) => {
+          try {
+            return JSON.parse(readFileSync(join(d, f), "utf-8"))?.headers?.["X-TPS-Nack"] === "receipt-malformed";
+          } catch {
+            return false;
+          }
+        }),
+      );
+    expect(nackMail.length, "the nack mail names the definitive verdict").toBe(1);
+    await h.stop();
+  }, 20000);
+
+  it("(e2) [cli#389 round 8] an UNRELATED quarantined record is not a verdict: the committed obligation is not failed, and the deadline rule resolves it (unconfirmed, no nack)", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    seedMalformed("sent"); // named for no reply this obligation knows
+    mkdirSync(outbox("new"), { recursive: true });
+    chmodSync(outbox("new"), 0o333); // the reply lands here but is not listable
+    try {
+      const h = await start("anvil", "flint", { localSender: false, branchHost: true });
+      await h.deliver("verdict");
+      h.settle();
+
+      // The delivery committed, so the record carries the COMMIT — an unrelated
+      // marker is not a verdict.
+      const posted = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "posted", 2000);
+      expect(posted).toBe(true);
+      expect(obligationFile("anvil", h.inboundId)?.failure, "an unrelated marker is not a verdict").toBeUndefined();
+      expect(curRecord("anvil")?.nackedAt, "and it is not nacked").toBeUndefined();
+
+      // …and the deadline rule resolves it: committed + no evidence at the
+      // deadline → `unconfirmed`, never failed, never nacked.
+      const unconfirmed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "unconfirmed", 4000);
+      expect(unconfirmed).toBe(true);
+      expect(curRecord("anvil")?.nackedAt, "no nack stamp").toBeUndefined();
+      expect(curRecord("anvil")?.ackedAt).toBeUndefined();
       await h.stop();
     } finally {
       chmodSync(outbox("new"), 0o755);
     }
-  }, 15000);
+    // No nack mail was sent on this route either.
+    const nack = [...readdirSafe(outbox("new")), ...readdirSafe(outbox("sent"))]
+      .filter((f) => f.endsWith(".json"))
+      .some((f) =>
+        [outbox("new"), outbox("sent")].some((d) => {
+          try {
+            return Boolean(JSON.parse(readFileSync(join(d, f), "utf-8"))?.headers?.["X-TPS-Nack"]);
+          } catch {
+            return false;
+          }
+        }),
+      );
+    expect(nack, "no nack mail for a committed reply").toBe(false);
+  }, 20000);
 });

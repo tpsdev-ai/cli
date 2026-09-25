@@ -171,10 +171,27 @@ class WsNoiseServer implements TransportServer {
 }
 
 export class WsNoiseTransport implements WireTransport {
+  /** The WebSocket of an IN-FLIGHT `connect`, so a caller that bounds the
+   *  connection (cli#389 round 12) can tear it down instead of leaking a
+   *  half-open socket when the attempt is abandoned. */
+  private inFlight: WebSocket | null = null;
+
   constructor(
     private readonly localKeyPair: TpsKeyPair,
     private readonly hostKeyPair?: TpsKeyPair
   ) {}
+
+  /** Close/destroy an in-flight connection attempt. Safe to call at any time;
+   *  a no-op once there is nothing in flight. Idempotent. */
+  close(): void {
+    const ws = this.inFlight;
+    this.inFlight = null;
+    try {
+      ws?.close();
+    } catch {
+      /* best effort — tearing down a socket must never throw */
+    }
+  }
 
   async listen(port: number): Promise<TransportServer> {
     const host = this.hostKeyPair ?? await loadHostIdentity();
@@ -239,6 +256,11 @@ export class WsNoiseTransport implements WireTransport {
       // Required for TLS-terminating proxies like exe.dev
       headers: { "Connection": "Upgrade", "Upgrade": "websocket" },
     });
+    // Track the socket so a bounded caller can destroy it on expiry (cli#389
+    // round 12). Cleared on the way out of connect, so only a PENDING
+    // connection is ever torn down by `close()`.
+    this.inFlight = ws;
+    ws.once("close", () => { if (this.inFlight === ws) this.inFlight = null; });
 
     // Track early close from server (rejection before handshake completes)
     let earlyClose = false;

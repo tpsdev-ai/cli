@@ -52,6 +52,15 @@ function mockFlair(agentSeeds: Record<string, Buffer>) {
 function runMailSend(args: string[], env: Record<string, string>) {
   const home = env.HOME ?? join(env.TPS_MAIL_DIR ? join(env.TPS_MAIL_DIR, "..") : tmpdir(), "home");
   mkdirSync(home, { recursive: true });
+  // cli#389 round 13: `tps mail send` now REFUSES an `unknown` recipient (no
+  // GAL, no binding, no maildir, no bridge) instead of silently creating a
+  // maildir for a name nothing reads. These tests exercise local delivery, so
+  // make the recipient a local agent first — an existing `mailDir/<to>` is the
+  // office's local signal (a branch-office bridge, when the test sets one up,
+  // still wins: the bridge rule is checked before the maildir rule).
+  if (typeof args[0] === "string" && env.TPS_MAIL_DIR) {
+    mkdirSync(join(env.TPS_MAIL_DIR, args[0]), { recursive: true });
+  }
   return spawnSync("bun", [TPS_BIN, "mail", "send", ...args], {
     encoding: "utf-8",
     cwd: tmpdir(),
@@ -335,6 +344,10 @@ describe("tps mail send with signed envelopes", () => {
     expect(files.length).toBe(1);
 
     const wrapper = JSON.parse(readFileSync(join(deliveredDir, files[0]!), "utf-8"));
+    // cli#389 round 5, item 2: this caller passes NO obligation ids, so the
+    // record is exactly the reduced shape it has always been — no fields added,
+    // no order changed.
+    expect(Object.keys(wrapper)).toEqual(["id", "from", "to", "body", "timestamp", "read", "origin"]);
     // The wrapper.body is the signed envelope JSON string.
     const env = JSON.parse(wrapper.body) as Envelope;
     expect(env.v).toBe(1);

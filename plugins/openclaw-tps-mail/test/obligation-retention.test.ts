@@ -17,13 +17,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import pluginModule from "../src/index.js";
-import { resolveObligationRetentionDays } from "../src/index.js";
+import { resolveObligationNackHoldMultiple, resolveObligationRetentionDays } from "../src/index.js";
 import {
   createObligation,
+  nackOwed,
   obligationPath,
   obligationsDir,
   readObligation,
   sweepTerminalObligations,
+  writeReceipt,
 } from "../src/obligations.js";
 
 const AGENT = "retentionbot";
@@ -43,23 +45,49 @@ function daysAgo(n: number): string {
   return new Date(Date.now() - n * 24 * 60 * 60 * 1000).toISOString();
 }
 
-function writeRecord(id: string, state: string, lastTransitionAt: string | null): void {
-  const dir = obligationsDir(mailDir, AGENT);
+/** Write a record into an agent's store (the suite's agent unless given). */
+function writeRecordFor(
+  agent: string,
+  inboundId: string,
+  obligationId: string,
+  state: string,
+  lastTransitionAt: string | null,
+): void {
+  const dir = obligationsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const rec = {
-    obligationId: `ob-${id}`,
-    inboundId: id,
+    obligationId,
+    inboundId,
     inboundTimestamp: lastTransitionAt ?? daysAgo(30),
     from: "sender",
-    to: AGENT,
+    to: agent,
     accountId: "default",
     state,
     deadlineAt: null,
     attempts: 1,
     ...(lastTransitionAt ? { lastTransitionAt } : {}),
   };
-  writeFileSync(join(dir, `${id}.json`), JSON.stringify(rec, null, 2), "utf-8");
+  writeFileSync(join(dir, `${inboundId}.json`), JSON.stringify(rec, null, 2), "utf-8");
 }
+
+function writeRecord(id: string, state: string, lastTransitionAt: string | null): void {
+  writeRecordFor(AGENT, id, `ob-${id}`, state, lastTransitionAt);
+}
+
+/** The receipts dir for an agent — inside that agent's own obligation store. */
+const receiptsRootFor = (agent: string = AGENT): string => join(obligationsDir(mailDir, agent), "receipts");
+
+/** Write a metadata receipt fixture by hand — the shape the sweep and scan read. */
+const receipt = (obligationId: string, replyToId: string, ts: string, agent: string = AGENT): string => {
+  mkdirSync(receiptsRootFor(agent), { recursive: true });
+  const path = join(receiptsRootFor(agent), `${obligationId}.json`);
+  writeFileSync(
+    path,
+    JSON.stringify({ replyId: `reply-${obligationId}`, obligationId, replyToId, route: "remote-branch", ts }, null, 2),
+    { encoding: "utf-8", mode: 0o600 },
+  );
+  return path;
+};
 
 /** Drive the plugin's startup (which runs the retention sweep) and wait until
  *  `done()` or a deadline, then abort. */
@@ -249,5 +277,303 @@ describe("cli#401 — obligation retention", () => {
     // once recovery resolves the cur/ record, a later sweep removes it normally
     writeFileSync(join(curDir, "held-id.json"), JSON.stringify({ id: "held-id", ackedAt: new Date().toISOString() }), "utf-8");
     expect(sweepTerminalObligations(mailDir, AGENT, 7, { info: () => {}, warn: () => {} }).removed).toBe(1);
+  });
+});
+
+// ── cli#389 rounds 3-5: the SAME sweep owns THIS agent's metadata receipts ──
+
+/**
+ * A receipt is written on every successful delivery that leaves no locally
+ * readable mail file (the wire, the sandbox bridge), so the receipts store grows
+ * with traffic and NOTHING else ever removes a file from it. The sweep owns them
+ * — and since cli#389 round 5 they live in the REPLYING agent's OWN obligation
+ * store (`<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`), so
+ * every receipt a sweep sees belongs to an obligation IT can look up:
+ *
+ *   its obligation is LIVE here     → keep;
+ *   its obligation is TERMINAL here → delete;
+ *   no obligation here at all       → delete once aged past the window (an
+ *                                     orphan), never before. A receipt with no
+ *                                     readable timestamp is never aged.
+ */
+describe("cli#389 — the retention sweep owns THIS agent's receipts", () => {
+  /** The receipts dir for this suite's agent (see receiptsRootFor). */
+  const ROOT = (agent: string = AGENT): string => receiptsRootFor(agent);
+  const quiet = { info: () => {}, warn: () => {} };
+
+  it("(b) a terminal obligation's receipt is REMOVED, a live obligation's OLD receipt is KEPT, and an aged orphan is swept", () => {
+    writeRecord("terminal-inbound", "acked", daysAgo(10));
+    writeRecord("live-inbound", "posted", daysAgo(30)); // live, and well past the window
+    const spent = receipt("ob-terminal-inbound", "terminal-inbound", new Date().toISOString());
+    const live = receipt("ob-live-inbound", "live-inbound", daysAgo(30));
+    const orphan = receipt("ob-orphan", "no-record-for-this", daysAgo(30));
+    const youngOrphan = receipt("ob-young-orphan", "no-record-for-this-either", new Date().toISOString());
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(res.receiptsRemoved).toBe(2);
+    expect(existsSync(spent), "a terminal obligation's receipt is gone").toBe(false);
+    expect(existsSync(orphan), "an orphan past the window is swept").toBe(false);
+    expect(existsSync(live), "a LIVE obligation's OLD receipt is kept").toBe(true);
+    expect(existsSync(youngOrphan), "a young orphan is not yet an orphan").toBe(true);
+  });
+
+  it("(k) item 3: ONE unreadable record makes an aged receipt unprovable — the receipt SURVIVES, and the result names the skip", () => {
+    // A record the sweep cannot read contributes its id to NEITHER the live nor
+    // the terminal snapshot, so a receipt naming that obligation looks orphaned.
+    // Pre-round-6 that receipt was deleted, and repairing the record later found
+    // its evidence gone.
+    mkdirSync(obligationsDir(mailDir, AGENT), { recursive: true });
+    writeFileSync(join(obligationsDir(mailDir, AGENT), "torn.json"), "{ not json ", "utf-8");
+    const orphanLooking = receipt("ob-unreadable", "inbound-torn", daysAgo(30));
+    // A TERMINAL obligation this sweep CAN read: its receipt still goes, so the
+    // guard is narrow (terminal deletions are not evidence in doubt).
+    writeRecord("done-inbound", "acked", daysAgo(10));
+    const spent = receipt("ob-done-inbound", "done-inbound", new Date().toISOString());
+
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+
+    expect(res.unreadable, "the torn record is reported").toBe(1);
+    expect(res.orphanReceiptsSkipped, "the skip is NAMED in the result").toBe(1);
+    expect(existsSync(orphanLooking), "an aged receipt whose obligation cannot be read survives").toBe(true);
+    expect(res.receiptsRemoved, "a terminal rule this sweep CAN read still applies").toBe(1);
+    expect(existsSync(spent), "the readable terminal obligation's receipt goes").toBe(false);
+  });
+
+  it("1,000 aged receipts are swept — aged by their OWN ts, never the file mtime", () => {
+    for (let i = 0; i < 1000; i++) receipt(`ob-old-${i}`, `inbound-${i}`, daysAgo(30));
+    expect(readdirSync(ROOT()).filter((f) => f.endsWith(".json")).length, "fixture written").toBe(1000);
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(res.receiptsRemoved).toBe(1000);
+    expect(readdirSync(ROOT()).filter((f) => f.endsWith(".json")).length).toBe(0);
+  });
+
+  it("a receipt with NO parseable ts and no obligation is LEFT in place", () => {
+    const p = receipt("ob-no-ts", "inbound-not-here", "not-a-date");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(res.receiptsRemoved).toBe(0);
+    expect(existsSync(p)).toBe(true);
+  });
+
+  it("a receipt that names NO obligation id is LEFT in place (never aged out on a guess)", () => {
+    mkdirSync(ROOT(), { recursive: true });
+    const p = join(ROOT(), "ob-nameless.json");
+    writeFileSync(p, JSON.stringify({ replyId: "reply-x", replyToId: "inbound-x", route: "bridge", ts: daysAgo(30) }), "utf-8");
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(res.receiptsRemoved).toBe(0);
+    expect(existsSync(p)).toBe(true);
+  });
+});
+
+// ── cli#389 round 5, item 1: the receipts are PER-AGENT ──────────────
+
+/**
+ * Two agents on ONE host can answer the SAME inbound id, and each agent's sweep
+ * may touch only its OWN receipts. Rounds 3-4 kept receipts in a host-wide
+ * shared directory and tried to make that store safe with a pair (obligation id
+ * + inbound) and a per-agent live guard — but obligations live in per-agent
+ * stores, so neither rule can speak for another agent's obligation: an agent
+ * with no live record for an inbound could age out a receipt another agent still
+ * needed, and an inbound-keyed live guard could hold another agent's receipt
+ * forever.
+ *
+ * Since round 5 a receipt lives INSIDE the replying agent's own obligation store
+ * (`<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`) and is keyed on
+ * the obligation id — a unique UUID — so a sweep owns exactly its own receipts
+ * and can look up the obligation behind every one. These receipts go through
+ * `writeReceipt`, the REAL writer: pointing that back at a shared directory
+ * turns this test red.
+ */
+describe("cli#389 round 5 — two agents answering one inbound own their own receipts", () => {
+  const OTHER = "secondbot";
+  const quiet = { info: () => {}, warn: () => {} };
+  const receiptFor = (agent: string, obligationId: string, replyToId: string, ts: string): string =>
+    writeReceipt(mailDir, agent, { replyId: `reply-${obligationId}`, obligationId, replyToId, route: "remote-branch", ts });
+
+  it("(a) each agent's sweep touches only its OWN receipts — neither deletes nor pins the other's", () => {
+    const SHARED_INBOUND = "shared-inbound";
+    // THIS agent: a TERMINAL obligation for that inbound, aged.
+    writeRecordFor(AGENT, SHARED_INBOUND, `ob-${AGENT}-${SHARED_INBOUND}`, "acked", daysAgo(10));
+    // THE OTHER agent: a LIVE obligation for the SAME inbound, whose receipt is
+    // older than the window (kept because its obligation is live, not because
+    // of its age).
+    writeRecordFor(OTHER, SHARED_INBOUND, `ob-${OTHER}-${SHARED_INBOUND}`, "posted", daysAgo(30));
+    const mine = receiptFor(AGENT, `ob-${AGENT}-${SHARED_INBOUND}`, SHARED_INBOUND, daysAgo(10));
+    const theirs = receiptFor(OTHER, `ob-${OTHER}-${SHARED_INBOUND}`, SHARED_INBOUND, daysAgo(30));
+    expect(mine).not.toBe(theirs);
+
+    // The OTHER agent's sweep runs FIRST.
+    const resOther = sweepTerminalObligations(mailDir, OTHER, 7, quiet);
+    expect(resOther.receiptsRemoved, "the other agent removes nothing").toBe(0);
+    expect(existsSync(theirs), "its own live obligation's receipt stays").toBe(true);
+    expect(existsSync(mine), "and it does not touch this agent's receipt").toBe(true);
+
+    // Then this agent's sweep: only ITS terminal obligation's receipt goes.
+    const resMine = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(resMine.receiptsRemoved, "only this agent's own receipt").toBe(1);
+    expect(existsSync(mine), "this agent's terminal obligation's receipt is swept").toBe(false);
+    expect(existsSync(theirs), "the OTHER agent's receipt is untouched").toBe(true);
+  });
+
+  it("a same-inbound receipt this store has no obligation for is not taken by this agent's terminal obligation", () => {
+    // The pair rule's successor: the key is the obligation id alone, so a
+    // receipt for ANOTHER obligation is never attributed to this terminal one,
+    // whatever inbound they share.
+    writeRecordFor(AGENT, "shared-inbound", "ob-shared-inbound", "acked", daysAgo(10));
+    const terminalReceipt = receipt("ob-shared-inbound", "shared-inbound", new Date().toISOString());
+    const anotherObligationsReceipt = receipt("ob-still-live", "shared-inbound", new Date().toISOString());
+
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+
+    expect(existsSync(terminalReceipt), "the terminal obligation's own receipt is swept").toBe(false);
+    expect(existsSync(anotherObligationsReceipt), "a same-inbound receipt for ANOTHER obligation is not terminal").toBe(true);
+    expect(res.receiptsRemoved, "exactly the terminal one").toBe(1);
+  });
+});
+
+// ── cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age ──────────
+
+/**
+ * cli#389 round 12, item 2 (CodeRabbit, Minor). The owed-nack hold used to be
+ * UNBOUNDED: a sender with no route kept its `failed` record forever, so startup
+ * work and `nack-pending` log volume grew with those records without limit. The
+ * hold is now bounded by AGE — a configurable multiple of `retentionDays`
+ * (`nackHoldDays`) — after which the debt is abandoned: logged `nack-abandoned`,
+ * ONCE, by name, and normal retention then applies to the record.
+ */
+describe("cli#389 round 12 — the owed-nack hold is bounded by age", () => {
+  /** A `failed` record still owing its nack, aged `ageDays` (nackPending set). */
+  function owedRecord(inboundId: string, ageDays: number): string {
+    const dir = obligationsDir(mailDir, AGENT);
+    mkdirSync(dir, { recursive: true });
+    const ts = daysAgo(ageDays);
+    const p = join(dir, `${inboundId}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          obligationId: `ob-${inboundId}`,
+          inboundId,
+          inboundTimestamp: ts,
+          from: "sender",
+          to: AGENT,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: "no-route",
+          nackPending: true,
+          lastTransitionAt: ts,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    return p;
+  }
+
+  it("an owed record WITHIN the bound is still held; PAST it the debt is abandoned by name and the record is swept", () => {
+    const within = owedRecord("owed-within", 10); // 10d: past the 7d window, inside the 28d hold
+    const past = owedRecord("owed-past", 40); // 40d: past the 28d hold
+    const seen = { info: [] as string[], warn: [] as string[] };
+
+    const res = sweepTerminalObligations(
+      mailDir,
+      AGENT,
+      7,
+      { info: (m) => seen.info.push(m), warn: (m) => seen.warn.push(m) },
+      Date.now(),
+      28,
+    );
+
+    expect(res.heldForNack, "the within-bound owed record is still held for its mail").toBe(1);
+    expect(res.abandonedForNack, "the past-bound owed record is abandoned").toBe(1);
+    expect(res.removed, "and normal retention then sweeps it").toBe(1);
+    expect(existsSync(within), "within-bound: the durable record survives").toBe(true);
+    expect(existsSync(past), "past-bound: the record is gone").toBe(false);
+
+    const abandoned = seen.warn.filter((m) => m.includes("nack-abandoned"));
+    expect(abandoned.length, "logged once").toBe(1);
+    expect(abandoned[0], "and BY NAME").toContain("owed-past");
+  });
+});
+
+// ── cli#389 round 13, item 2: the multiple is validated, and abandonment RELEASES the debt ──
+
+/**
+ * cli#389 round 13, item 2. Two defects in the round-12 hold:
+ *   - a multiple in (0,1) made the hold SHORTER than retention, so an owed
+ *     record was abandoned, kept by retention, and abandoned (and logged) again
+ *     on every sweep while the startup retry kept firing;
+ *   - abandonment did not release the debt, so a record retention kept stayed
+ *     `nackPending` and the retry never stopped.
+ * The multiple is now validated (>= 1, else the default, with a named log) and
+ * abandoning CLEARS `nackPending` and records `nackAbandonedAt`.
+ */
+describe("cli#389 round 13 — the hold multiple, and abandonment releasing the debt", () => {
+  function owedRecord(inboundId: string, ageDays: number): string {
+    const dir = obligationsDir(mailDir, AGENT);
+    mkdirSync(dir, { recursive: true });
+    const ts = daysAgo(ageDays);
+    const p = join(dir, `${inboundId}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          obligationId: `ob-${inboundId}`,
+          inboundId,
+          inboundTimestamp: ts,
+          from: "sender",
+          to: AGENT,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: "no-route",
+          nackPending: true,
+          lastTransitionAt: ts,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    return p;
+  }
+
+  it("rejects a hold multiple below 1 with a named log, and falls back to the default", () => {
+    const seen = { warn: [] as string[] };
+    const log = { warn: (m: string) => seen.warn.push(m) };
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 0.5 }, undefined, log)).toBe(4);
+    expect(seen.warn.filter((m) => m.includes("obligation-nack-hold-multiple-invalid")).length, "named once").toBe(1);
+    expect(seen.warn.join("\n")).toContain("below 1");
+    // A valid value (>= 1) is used as given; unset → the default.
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 1 }, undefined, { warn: () => {} })).toBe(1);
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 2.5 }, undefined, { warn: () => {} })).toBe(2.5);
+    expect(resolveObligationNackHoldMultiple({}, undefined, { warn: () => {} })).toBe(4);
+  });
+
+  it("abandons an owed record EXACTLY ONCE across two sweeps, and its retry stops", () => {
+    // A hold SHORTER than retention (nackHoldDays 2 < 7) is the case a sub-1
+    // multiple made reachable: the record is past the hold but still inside
+    // retention, so it SURVIVES — and would be abandoned and logged on every
+    // sweep unless abandoning releases the debt.
+    const p = owedRecord("owed-once", 5);
+    const seen = { warn: [] as string[] };
+    const log = { info: () => {}, warn: (m: string) => seen.warn.push(m) };
+
+    const first = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 2);
+    expect(first.abandonedForNack, "abandoned once").toBe(1);
+    expect(existsSync(p), "the record survives (still inside retention)").toBe(true);
+    const after = readObligation(mailDir, AGENT, "owed-once");
+    expect(after?.nackPending, "the debt is RELEASED — nackPending cleared").toBeFalsy();
+    expect(typeof after?.nackAbandonedAt, "and the abandonment is recorded").toBe("string");
+    expect(nackOwed(after), "so the record no longer owes a nack — the startup retry stops").toBe(false);
+
+    const second = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 2);
+    expect(second.abandonedForNack, "a second sweep abandons nothing").toBe(0);
+    expect(
+      seen.warn.filter((m) => m.includes("nack-abandoned")).length,
+      "nack-abandoned is logged exactly once",
+    ).toBe(1);
   });
 });

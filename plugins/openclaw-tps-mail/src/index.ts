@@ -23,6 +23,15 @@
  * own explicit mails may coincide — they never discharge). The ack is never
  * taken from the fact that a dispatch settled: it is taken from the receipt.
  *
+ * THE COMMIT IS A PERSISTED STATE (cli#389 round 8). The obligation record
+ * carries what the delivery has done — `delivering` written BEFORE the delivery
+ * call, `posted` when it RETURNS — so a restart, the deadline path and the
+ * dispatch's outer catch all read the same truth. Every path that ends an
+ * obligation goes through one verb (settleObligation), which decides from that
+ * record: evidence → `acked`; committed with no evidence at the deadline →
+ * `unconfirmed` (never failed, never nacked); a definitive non-delivery verdict
+ * → `failed` and nacked, even after commit.
+ *
  * Outbound flow:
  *   outbound.sendText(ctx) →
  *   write TPS mail envelope to ~/.tps/mail/<ctx.to>/new/<id>.json
@@ -50,15 +59,25 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
+import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
 import {
   TERMINAL_STATES,
   createObligation,
   listObligations,
+  markNackSent,
+  nackOwed,
   newestSessionTranscript,
   readObligation,
+  receiptsDir,
   scanForReceipt,
   sweepTerminalObligations,
   transitionObligation,
+  writeReceipt,
+  type ObligationRecord,
+  type ObligationState,
+  type ReceiptRecord,
+  type ReceiptScanDirs,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
@@ -124,6 +143,60 @@ export function resolveObligationRetentionDays(pluginCfg: any, channelCfg: any):
     if (Number.isFinite(n)) return n;
   }
   return DEFAULT_OBLIGATION_RETENTION_DAYS;
+}
+
+/** How many `retentionDays` an owed nack is held before it is abandoned
+ *  (cli#389 round 12, item 2). The hold keeps a still-owed record from being
+ *  swept, but must not keep it forever: a sender with no route would otherwise
+ *  pin one record per affected inbound indefinitely. */
+export const OBLIGATION_NACK_HOLD_MULTIPLE_KEY = "obligationNackHoldMultiple";
+export const DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE = 4;
+export function resolveObligationNackHoldMultiple(pluginCfg: any, channelCfg: any, log?: any): number {
+  for (const src of [pluginCfg, channelCfg]) {
+    const v = src?.[OBLIGATION_NACK_HOLD_MULTIPLE_KEY];
+    const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+    if (!Number.isFinite(n)) continue;
+    if (n >= 1) return n;
+    // cli#389 round 13, item 2: a multiple BELOW 1 makes the hold SHORTER than
+    // the retention window, so an owed record is abandoned and then KEPT by
+    // retention — abandoned (and logged) again on every sweep, while the
+    // startup retry keeps firing for a debt nobody is going to pay. Reject it
+    // BY NAME and fall back to the default.
+    log?.warn?.(
+      `tps-mail: obligation-nack-hold-multiple-invalid: ${OBLIGATION_NACK_HOLD_MULTIPLE_KEY}=${n} is below 1 ` +
+        `(a hold shorter than the retention window would abandon an owed nack on every sweep); using the default ${DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE}`,
+    );
+    return DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE;
+  }
+  return DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE;
+}
+
+/** The age bound (in days) for the owed-nack hold: `retentionDays` times the
+ *  configured multiple. `retentionDays <= 0` (the sweep is disabled) disables
+ *  the bound too — the sweep never runs. */
+export function resolveObligationNackHoldDays(
+  retentionDays: number,
+  pluginCfg: any,
+  channelCfg: any,
+  log?: any,
+): number {
+  return retentionDays * resolveObligationNackHoldMultiple(pluginCfg, channelCfg, log);
+}
+
+/** The OVERALL bound (ms) for one owed-nack retry — the connection AND the ACK
+ *  wait (cli#389 round 12, item 1). The env override exists so a test can drive
+ *  a hung connect to its timeout quickly; production uses the default. */
+export const DEFAULT_NACK_RETRY_TIMEOUT_MS = 20_000;
+/** How far ABOVE the delivery's own bound the background retry's backstop sits
+ *  (cli#389 round 12, item 1). The relay closes the transport at the overall
+ *  bound and reports that timeout; the backstop only guarantees the retry
+ *  promise cannot hang the process if the delivery does not settle for another
+ *  reason, and ordering it later keeps a single log line. */
+const NACK_RETRY_BACKSTOP_MS = 2_000;
+function resolveNackRetryTimeoutMs(): number {
+  const v = process.env.TPS_NACK_RETRY_TIMEOUT_MS;
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_NACK_RETRY_TIMEOUT_MS;
 }
 
 function expandHome(p: string): string {
@@ -241,6 +314,134 @@ function writeOutboxFile(message: TpsMailBody): string {
 }
 
 /**
+ * cli#389: a NON-LOCAL delivery can leave no locally readable mail file, so the
+ * obligation scan could never find a receipt for it and a delivered reply was
+ * later marked failed and nacked — the wire case (round 1, item 1) and the
+ * bridge case (round 3, item 1) are the same defect. Persist the metadata-only
+ * receipt those routes owe, into the REPLYING agent's own obligation store at
+ * `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` (per-agent since
+ * cli#389 round 5): the ids, the route, the branch and the timestamp — NEVER
+ * the body.
+ *
+ * SCOPE: only a route that leaves NO locally readable mail file needs one. A
+ * LOCAL reply lives in the recipient's maildir and an OUTBOX reply in the file
+ * the branch drain carries, each carrying the obligation marker — those records
+ * ARE their receipts, and the scan still reads them (cli#398 T4 pins that a
+ * posted record the scan cannot see is a NAMED failure, so minting a second,
+ * always-readable receipt for them would change adjudicated behaviour).
+ *
+ * A message with no `X-TPS-Obligation` marker owes no obligation (a nack, or an
+ * ordinary outbound send), so nothing is written for it: a receipt is evidence
+ * of a discharged obligation, never a mail copy.
+ */
+function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, route: "remote-branch" | "bridge", branchId?: string): void {
+  const obligationId = message.headers?.["X-TPS-Obligation"];
+  if (typeof obligationId !== "string" || obligationId.length === 0) return;
+  // The receipt must answer a specific inbound: without a replyToId it could
+  // never satisfy the obligation scan, and writing it would only grow the dir.
+  if (typeof message.replyToId !== "string" || message.replyToId.length === 0) return;
+  const record: ReceiptRecord = {
+    replyId: message.id,
+    obligationId,
+    replyToId: message.replyToId,
+    route,
+    ...(branchId ? { branchId } : {}),
+    ts: typeof message.timestamp === "string" && message.timestamp.length > 0 ? message.timestamp : new Date().toISOString(),
+  };
+  writeReceipt(mailDir, agent, record);
+}
+
+/**
+ * cli#389 round 5, item 2: a receipt write is EVIDENCE UPKEEP, never part of the
+ * send. Once a delivery call has RETURNED it has committed, so a receipt that
+ * cannot be written (a full disk, a permission error) must not set a failure —
+ * that reported a delivered reply as failed and nacked its inbound. The error is
+ * logged by name and swallowed, on every route.
+ *
+ * Nothing is lost: the bridge's sandbox record carries the same ids (see
+ * obligationMetadata), so the scan still finds that delivery; for the wire the
+ * receipt is the only local evidence, so that obligation resolves at its
+ * deadline instead of immediately (stated in the README).
+ */
+function persistReceiptAfterCommit(
+  mailDir: string,
+  agent: string,
+  message: TpsMailBody,
+  route: "remote-branch" | "bridge",
+  branchId: string | undefined,
+  log?: any,
+): void {
+  try {
+    persistReceipt(mailDir, agent, message, route, branchId);
+  } catch (err: any) {
+    log?.warn?.(
+      `tps-mail: receipt-write-failed: the ${route} delivery committed, but its receipt was not written ` +
+        `(${err?.message ?? err}); the obligation resolves at its deadline`,
+    );
+  }
+}
+
+/**
+ * Run ONE piece of post-commit evidence upkeep (cli#389 round 6, item 2). Once
+ * a delivery call has RETURNED it has committed, so a failure here is logged by
+ * NAME and swallowed — it never sets a post failure, so a delivered reply is
+ * never reported as failed and its inbound is never nacked. The logger itself is
+ * guarded too: a throwing logger cannot fail a committed send either.
+ */
+function postCommit(log: any, name: string, context: string, step: () => void): void {
+  try {
+    step();
+  } catch (err: any) {
+    try {
+      log?.warn?.(
+        `tps-mail: ${name}: ${context} (${err?.message ?? err}); the delivery committed, so this is not a send failure`,
+      );
+    } catch {
+      /* a logger must never fail a committed send */
+    }
+  }
+}
+
+/**
+ * The obligation ids the bridge's `deliverToSandbox` record carries when the
+ * caller has them (cli#389 round 5, item 2): the obligation, the inbound the
+ * reply answers, and the reply itself. EMPTY for a message that owes no
+ * obligation (an ordinary outbound send, a nack), so that record stays
+ * byte-identical to the one the CLI's own local send writes.
+ */
+function obligationMetadata(message: TpsMailBody): { obligationId?: string; replyToId?: string; replyId?: string } {
+  const obligationId = message.headers?.["X-TPS-Obligation"];
+  if (typeof obligationId !== "string" || obligationId.length === 0) return {};
+  if (typeof message.replyToId !== "string" || message.replyToId.length === 0) return {};
+  return { obligationId, replyToId: message.replyToId, replyId: message.id };
+}
+
+/**
+ * Deliver to a remote branch — the COMMIT of the wire route. The local receipt
+ * is written by the caller AFTER this returns and under its own guard
+ * (persistReceiptAfterCommit): a receipt that cannot be written must never
+ * report a delivered reply as failed (cli#389 round 5, item 2).
+ */
+async function deliverRemote(reply: TpsMailBody, branchId: string, opts: { timeoutMs?: number } = {}): Promise<void> {
+  // Preserve the outbound identity (id + timestamp) so the wire payload — and
+  // the branch's ACK correlation — match the record this plugin reports as the
+  // reply id, not a UUID the relay invents. `opts.timeoutMs` bounds the WHOLE
+  // attempt (connect + ACK); the relay CLOSES the transport when it expires
+  // (cli#389 round 12, item 1).
+  await deliverToRemoteBranch(
+    branchId,
+    {
+      id: reply.id,
+      to: reply.to,
+      from: reply.from,
+      body: reply.body,
+      timestamp: reply.timestamp,
+    },
+    { timeoutMs: opts.timeoutMs },
+  );
+}
+
+/**
  * Decide where to write outbound mail.
  * - Local recipient (bound to this gateway via `bindings`): write to the
  *   recipient's local inbox so the watcher picks it up directly.
@@ -256,12 +457,50 @@ function deliverOutboundMail(
   accountId: string,
   mailDir: string,
   message: TpsMailBody,
-): { path: string; route: "local" | "outbox" } {
-  const localAgents = findBoundAgents(cfg, accountId);
-  if (localAgents.includes(message.to)) {
-    return { path: writeMailFile(mailDir, message.to, message), route: "local" };
+): Promise<{ path: string; route: MailRoute["kind"] }> {
+  const route = routeFor(mailDir, cfg, accountId, message.to);
+  switch (route.kind) {
+    case "local":
+      return Promise.resolve({ path: writeMailFile(mailDir, message.to, message), route: "local" });
+    case "outbox":
+      // The outbox record IS the receipt for this route: the branch drain keeps
+      // its marker (new/ → sent/), so the obligation scan reads it there. Only a
+      // route that leaves NO locally readable mail file owes a metadata receipt
+      // (the wire, the sandbox bridge) — see persistReceipt.
+      return Promise.resolve({ path: writeOutboxFile(message), route: "outbox" });
+    case "remote-branch":
+      // The wire path, exactly as `tps mail send` sends it, PLUS the local
+      // receipt item 1 requires so a later obligation scan can find it. The
+      // receipt is written after the send RETURNS and cannot fail it (round 5).
+      return deliverRemote(message, route.branchId).then(() => {
+        persistReceiptAfterCommit(mailDir, message.from, message, "remote-branch", route.branchId);
+        return { path: `remote-branch:${route.branchId}`, route: "remote-branch" as const };
+      });
+    case "bridge": {
+      // A local branch-office sandbox — the CLI's own bridge, imported. Its
+      // sandbox record is REDUCED (no marker, no accountId), so the obligation
+      // scan reads it through the obligation ids `deliverToSandbox` writes into
+      // it when given (round 5, item 2) and/or the metadata receipt the bridge
+      // owes exactly like the wire (round 3, item 1).
+      deliverToSandbox(route.branchId, {
+        to: message.to,
+        from: message.from,
+        body: message.body,
+        ...obligationMetadata(message),
+      });
+      persistReceiptAfterCommit(mailDir, message.from, message, "bridge", route.branchId);
+      return Promise.resolve({ path: `bridge:${route.branchId}`, route: "bridge" });
+    }
+    case "failed":
+      // A GAL entry naming a branch with no remote registration.
+      throw new Error(`refusing to deliver to "${message.to}": ${route.reason} (branch ${route.branchId})`);
+    case "unknown":
+      // (cli#389 rule 3) Never a silent write into a directory nothing reads.
+      throw new Error(
+        `no delivery route for recipient "${message.to}" on this host ` +
+          `(not bound to this gateway, no local maildir, no registered remote branch)`,
+      );
   }
-  return { path: writeOutboxFile(message), route: "outbox" };
 }
 
 /**
@@ -307,20 +546,15 @@ function signReplyEnvelope(from: string, to: string, body: string): string | nul
 }
 
 /**
- * Is `to` a local recipient? True when it has a maildir under `mailDir` on
- * this host, or when it is bound to this gateway. A LOCAL recipient's reply is
- * delivered to their maildir and never goes to ~/.tps/outbox (cli#338
- * requirement 3). A recipient that is neither is REMOTE: its reply goes to
- * ~/.tps/outbox/new/ for the branch service to relay, never dropped.
+ * ONE locality decision for outbound mail (cli#389), shared with `tps mail
+ * send` via `@tpsdev-ai/cli/utils/mail-routing` — the plugin no longer keeps a
+ * second rule. A recipient with a maildir used to be treated as local on ANY
+ * host, so a maildir created for archiving/inspection (or by accident) for a
+ * REMOTE peer silently swallowed the reply. Directory existence now decides
+ * only on the OFFICE; on a BRANCH only a bound recipient is local.
  */
-function isLocalRecipient(
-  mailDir: string,
-  cfg: any,
-  accountId: string,
-  to: string,
-): boolean {
-  if (existsSync(resolve(mailDir, to))) return true;
-  return findBoundAgents(cfg, accountId).includes(to);
+function routeFor(mailDir: string, cfg: any, accountId: string, to: string): MailRoute {
+  return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
 /**
@@ -422,6 +656,15 @@ interface YieldContext {
   inboundId: string;
   cfg: any;
   log: any;
+  /**
+   * cli#389 round 8 — the evidence step currently running, so a throw that lands
+   * in the dispatch's outer catch can be logged BY NAME. It is diagnostic ONLY:
+   * whether the delivery committed is read from the OBLIGATION RECORD's persisted
+   * state, never from anything in this context (round 7 kept a `committed` flag
+   * here, and the deadline path, a restart and the catch each saw a different
+   * truth).
+   */
+  step?: string;
 }
 
 /** obligationId → the context needed to ack/nack it after the dispatch is gone. */
@@ -430,14 +673,41 @@ const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
-function receiptDirs(ctx: YieldContext): string[] {
-  if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
-    return [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")];
+function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
+  // TWO receipt forms (cli#389 round 3): the metadata receipt every NON-LOCAL
+  // route persists — found by its DIRECT path — and, for a route that also
+  // writes a mail file, the posted record itself.
+  //
+  // The receipt lives in the REPLYING agent's OWN obligation store (round 5),
+  // so the agent that owes the obligation is the one whose sweep owns it.
+  //
+  // SPLIT BY HOW A SCAN MAY READ EACH DIR (cli#389 round 4, item 1): the agent's
+  // receipts root is the `direct` input — probed once at `<obligationId>.json`
+  // and NEVER listed (it accumulates a receipt per non-local delivery, so a
+  // listing would parse every retained receipt on every scan). The route's own
+  // posted-record dirs are the `posted` input — the only dirs a scan lists: a
+  // local reply lives in the recipient's maildir, a bridge delivery in the
+  // branch sandbox `deliverToSandbox` wrote to (its reduced record carries the
+  // obligation ids when the bridge was given them — round 5, item 2 — and the
+  // metadata receipt is the other way it closes the obligation), and every other
+  // relayed route in the outbox the branch drains.
+  const home = process.env.HOME ?? homedir();
+  const direct = [receiptsDir(ctx.mailDir, ctx.agent)];
+  const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
+  if (route.kind === "local") {
+    return { direct, posted: [resolve(ctx.mailDir, ctx.sender, "new"), resolve(ctx.mailDir, ctx.sender, "cur")] };
   }
-  const outbox = resolve(process.env.HOME ?? homedir(), ".tps", "outbox");
+  if (route.kind === "remote-branch") {
+    return { direct, posted: [] }; // the metadata receipt is the only local evidence of the wire send
+  }
+  if (route.kind === "bridge") {
+    const mailRoot = resolveAgentMailRoot(route.branchId);
+    return { direct, posted: [resolve(mailRoot, "new"), resolve(mailRoot, "cur")] };
+  }
+  const outbox = resolve(home, ".tps", "outbox");
   // The branch drain moves the record new/ → sent/ keeping replyToId+headers,
   // so a REMOTE receipt is either file; .malformed-* in either is a FAILURE.
-  return [resolve(outbox, "new"), resolve(outbox, "sent")];
+  return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
@@ -448,8 +718,11 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   // while the obligation stays failed (cli#400).
   const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
   if (!updated || updated.state !== "acked") {
+    // The transition was REFUSED, not landed (cli#389 round 9: a refused
+    // transition returns null) — so read the record to name WHY.
+    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
     ctx.log?.warn?.(
-      `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${updated?.state ?? "gone"}; the inbound keeps no ackedAt`,
+      `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
     return;
   }
@@ -457,10 +730,320 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
 }
 
-function failObligation(ctx: YieldContext, reason: string): void {
-  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: reason }, ctx.log);
-  patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: reason });
-  ctx.log?.warn?.(`tps-mail: obligation for ${ctx.inboundId} FAILED: ${reason} — nacked, never acked`);
+/**
+ * THE VERB THAT ENDS AN OBLIGATION (cli#389 round 8) — the ONLY writer of
+ * `failed` or `nackedAt` — and, since round 9, the ONLY sender of the nack mail
+ * (item 2). It decides from the PERSISTED RECORD, never an in-memory flag:
+ *
+ *   evidence found                     → acked;
+ *   delivering/posted, no evidence,
+ *   no verdict                         → the terminal `unconfirmed`: NOT failed,
+ *                                        NO nack mail, NO nack stamp, logged by
+ *                                        name (we cannot prove non-delivery, so
+ *                                        the sender is never told it failed);
+ *   a definitive non-delivery verdict   → failed and nacked, even after commit.
+ *
+ * A definitive non-delivery verdict is a REFUSAL DECIDED BEFORE THE DELIVERY
+ * CALL (no route, a named route failure such as `gal-without-remote`), or the
+ * outbox drain quarantining THIS reply's own record (attributed by its reply
+ * id). A THROW FROM THE DELIVERY CALL IS NOT A VERDICT (cli#389 round 9, item
+ * 1): once `delivering` is persisted the bytes may already have left, so a throw
+ * — and any evidence step that threw — resolves by evidence or deadline, never
+ * to `failed`. An unrelated `.malformed-*` marker is not a verdict either.
+ *
+ * EVERY transition to `failed` announces the sender from here (cli#389 round 9,
+ * item 2): the same verdict gives the same sender-visible outcome whichever path
+ * found it, and no caller mails on its own. Since round 10 (item 1) that
+ * announcement is DURABLE and AT-LEAST-ONCE: the same write that settles the
+ * failure records `nackPending`, the send is AWAITED, and a successful hand-off
+ * records `nackSentAt` and clears the flag — so a crash between settling and
+ * sending, or a send that could not be delivered, retries delivery on a later
+ * start (once the store can be written) rather than leaving the sender never
+ * told. A crash after the hand-off but before the record is written retries
+ * delivery, so the sender may see the nack twice; the record keeps the debt
+ * until a hand-off is recorded. `alreadyStamped` marks a failure whose cur/
+ * record ALREADY
+ * carries the nack (restart recovery of a record settled before the crash): the
+ * record is settled and the stamp is not rewritten, but the MAIL is still owed
+ * and is sent by the same rule as every other failure.
+ *
+ * Returns the state it applied, or "none" when the record was gone, already
+ * terminal, or could not be settled (the store itself rejected the write).
+ */
+async function settleObligation(
+  ctx: YieldContext,
+  obligationId: string,
+  s: {
+    /** The receipt evidence the caller found for this obligation. */
+    receipt: "found" | "none";
+    /** A definitive non-delivery verdict, when there is one. Never a step that
+     *  merely threw. */
+    verdict?: string;
+    /** What to record when there is no verdict. */
+    reason: string;
+    /** The inbound ALREADY carries its nack stamp (restart recovery of a cur/
+     *  record stamped before the crash): settle the RECORD and do not rewrite
+     *  the stamp. The nack MAIL is a separate question and is still owed unless
+     *  the record itself says it was sent. */
+    alreadyStamped?: boolean;
+  },
+): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
+  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (!rec) return "none";
+  if (TERMINAL_STATES.has(rec.state)) {
+    ctx.log?.info?.(
+      `tps-mail: obligation ${rec.obligationId} is ${rec.state}; ignoring the ${s.verdict ?? s.reason} determination`,
+    );
+    return "none";
+  }
+  if (s.receipt === "found" && !s.verdict) {
+    ackObligation(ctx, obligationId, s.reason);
+    return "acked";
+  }
+  const committed = rec.state === "delivering" || rec.state === "posted";
+  if (!s.verdict && committed) {
+    // ONE ATTEMPT at the store too (cli#389 round 10, item 2): a store that
+    // cannot be written leaves the record where it is — logged by name, never
+    // retried in a loop — and the obligation resolves on the next start.
+    try {
+      const appliedUnconfirmed = transitionObligation(
+        ctx.mailDir,
+        ctx.agent,
+        ctx.inboundId,
+        "unconfirmed",
+        { failure: s.reason },
+        ctx.log,
+      );
+      if (appliedUnconfirmed === null) {
+        // cli#389 round 13, item 3: a REFUSED transition (the record is gone or
+        // already terminal) is not a recorded outcome — say so and stop, exactly
+        // as the ack path does. Do not treat the refusal as a settled state.
+        const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+        ctx.log?.warn?.(
+          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
+        );
+        return "none";
+      }
+    } catch (err: any) {
+      ctx.log?.warn?.(
+        `tps-mail: obligation-write-failed: could not record the unconfirmed outcome for ${ctx.inboundId} ` +
+          `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
+      );
+      return "none";
+    }
+    ctx.log?.warn?.(
+      `tps-mail: obligation for ${ctx.inboundId} UNCONFIRMED: ${s.reason} — the reply was committed (${rec.state}) ` +
+        `and no receipt evidence was found by its deadline; NOT failed, no nack sent`,
+    );
+    return "unconfirmed";
+  }
+  const failedOn = s.verdict ?? s.reason;
+  // cli#389 round 10, item 1: the SAME write that sets `failed` records that a
+  // nack mail is OWED (`nackPending`), so a crash before or during the send is
+  // visible to restart recovery instead of leaving the sender never told.
+  //
+  // cli#389 round 10, item 2: ONE ATTEMPT. If the store cannot be written the
+  // failure cannot be recorded — there is nothing to retry against in this
+  // process, and a loop would only spin on a broken store — so it is logged by
+  // name and the obligation is left to resolve at the next start, exactly like
+  // the write-ahead whose own write failed. `transitionObligation` returns null
+  // (not a throw) for a record that is GONE or already terminal; that is a
+  // different case — nothing to settle, and the null is not an error.
+  let appliedFailed: ObligationRecord | null;
+  try {
+    appliedFailed = transitionObligation(
+      ctx.mailDir,
+      ctx.agent,
+      ctx.inboundId,
+      "failed",
+      { failure: failedOn, nackPending: true },
+      ctx.log,
+    );
+  } catch (err: any) {
+    ctx.log?.warn?.(
+      `tps-mail: obligation-write-failed: could not record the failure for ${ctx.inboundId} ` +
+        `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
+    );
+    return "none";
+  }
+  if (appliedFailed === null) {
+    // cli#389 round 13, item 3: the transition was REFUSED (the record is gone
+    // or already terminal) — do NOT stamp the inbound and do NOT send a nack
+    // mail for a failure that was never recorded. An await added to this window
+    // can therefore never leave a refused record stamped or nacked.
+    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    ctx.log?.warn?.(
+      `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
+        `the inbound keeps no nack stamp and no nack mail is sent`,
+    );
+    return "none";
+  }
+  if (!s.alreadyStamped) {
+    patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
+  }
+  // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
+  // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
+  const nackHandedOff = await deliverNack(ctx, failedOn);
+  ctx.log?.warn?.(
+    `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
+      (s.alreadyStamped ? ", the inbound already carried its nack" : "") +
+      (nackHandedOff ? ", sender notified" : ", the nack mail is still OWED (nackPending) — the next start retries delivery") +
+      ", never acked",
+  );
+  return "failed";
+}
+
+/**
+ * Hand a settled failure's nack mail to its route and record the outcome on the
+ * obligation record (cli#389 round 10, item 1). The caller is the verb that
+ * settled the failure, and it AWAITS this — the mail is no longer a fire-and-
+ * forget promise a crash can swallow.
+ *
+ *   handed to a route → `markNackSent`: `nackSentAt` recorded, `nackPending`
+ *                       cleared, in one write on the record;
+ *   no route, or a route that threw → the record KEEPS `nackPending` and the
+ *                       attempt is logged by name, so a later start retries
+ *                       delivery
+ *                       (at-least-once: a crash between the two writes
+ *                       duplicates a mail; it never loses one);
+ *   handed, but the record write FAILED → the mail has left and the record
+ *                       still owes it: logged by name (round 11, item 2) and a
+ *                       later start may hand it over again.
+ *
+ * Never throws into the caller. Returns true when the mail reached a route, so
+ * the caller can say what actually happened to the sender.
+ */
+async function deliverNack(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
+  let handedOff = false;
+  try {
+    handedOff = await sendNackMail(ctx, reason, opts);
+  } catch (err: any) {
+    ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+    handedOff = false;
+  }
+  if (handedOff) {
+    // cli#389 round 11, item 2: the hand-off LANDED, but the record that says so
+    // may not have. A failed write is logged BY NAME inside markNackSent, never
+    // ignored — and the record still owes the mail, so a later start may hand it
+    // over again. The line here says which of the two happened.
+    const recorded = markNackSent(ctx.mailDir, ctx.agent, ctx.inboundId, ctx.log);
+    ctx.log?.warn?.(
+      `tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}` +
+        (recorded ? "" : " — the record could not be updated: it still owes the nack and a later start may send it again"),
+    );
+    return true;
+  }
+  ctx.log?.warn?.(
+    `tps-mail: nack-pending: the sender was NOT told about the failure of ${ctx.inboundId} (${reason}); ` +
+      `the obligation record keeps nackPending and the next start retries delivery`,
+  );
+  return false;
+}
+
+/**
+ * cli#389 round 12, item 1 (CodeRabbit, Major): retry ONE owed nack OFF the
+ * startup path. Awaited, an unreachable branch — whose connect has no
+ * application-level timeout — stalled recovery for this agent and every later
+ * one. The whole retry (the connection AND the ACK wait) is bounded by an
+ * overall timeout; that timeout is handed to the delivery, which CLOSES the
+ * transport when it expires, and a timeout is logged BY NAME here.
+ *
+ * Never throws into the caller: it is fire-and-forget, so a rejection would
+ * otherwise be unhandled.
+ */
+function retryOwedNackInBackground(
+  mailDir: string,
+  agentId: string,
+  sender: string,
+  inboundId: string,
+  reason: string,
+  accountId: string,
+  cfg: any,
+  log: any,
+): void {
+  const timeoutMs = resolveNackRetryTimeoutMs();
+  // BACKSTOP, deliberately ABOVE the delivery's own bound: the relay closes the
+  // transport at `timeoutMs` and reports the timeout (logged by name in
+  // sendNackMail), so the retry only needs a slightly later net to guarantee
+  // the promise NEVER hangs the process here — e.g. a route that does not
+  // settle for some other reason. Ordering it later keeps a single log line.
+  const backstopMs = timeoutMs + NACK_RETRY_BACKSTOP_MS;
+  const recCurPath = findCurPath(mailDir, agentId, inboundId);
+  const ctx = makeYieldCtx(
+    mailDir,
+    agentId,
+    sender,
+    accountId,
+    recCurPath ?? resolve(mailDir, agentId, "cur", `${inboundId}.json`),
+    inboundId,
+    cfg,
+    log,
+  );
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const expired = new Promise<"expired">((res) => {
+    timer = setTimeout(() => res("expired"), backstopMs);
+    if (timer && typeof (timer as { unref?: () => void }).unref === "function") {
+      (timer as { unref: () => void }).unref();
+    }
+  });
+  void Promise.race([
+    deliverNack(ctx, reason, { timeoutMs }).then(
+      () => "done" as const,
+      () => "done" as const,
+    ),
+    expired,
+  ])
+    .then((outcome) => {
+      if (outcome === "expired") {
+        log?.warn?.(
+          `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not complete within ${backstopMs}ms ` +
+            `(connect + ack); the transport was closed and the record keeps nackPending`,
+        );
+      }
+    })
+    .catch((err: any) => {
+      log?.warn?.(`tps-mail: nack-retry-failed: the owed nack for ${inboundId} to ${sender} threw: ${err?.message ?? err}`);
+    })
+    .finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+}
+
+/**
+ * WRITE-AHEAD (cli#389 round 8, item 1): persist `delivering` BEFORE the delivery
+ * call, so a crash mid-delivery is distinguishable from a crash before it and a
+ * restart reads what the call was about to do.
+ *
+ * Returns true only when the write LANDED (`delivering` is on the record).
+ *
+ * cli#389 round 9, item 4: a TERMINAL record REFUSES the late final. The
+ * transition returns null for a refusal (obligations.ts), so this logs
+ * `late-final-refused` BY NAME and returns false — a final arriving after the
+ * obligation CLOSED must NOT be delivered, whatever told the sender what. The
+ * obligation may have closed as `unconfirmed`, which tells the sender nothing at
+ * all (cli#389 round 10, item 3: the reason is closure, not "the sender was told
+ * it failed"). False also when the record is GONE or the write itself threw: nothing has been sent, so the caller fails and nacks
+ * exactly as before.
+ */
+function markDelivering(mailDir: string, agent: string, inboundId: string, log: any): boolean {
+  try {
+    if (transitionObligation(mailDir, agent, inboundId, "delivering", {}, log) !== null) return true;
+    // Refused or gone — distinguish the two so the log names the real case.
+    const current = readObligation(mailDir, agent, inboundId);
+    if (current && TERMINAL_STATES.has(current.state)) {
+      log?.warn?.(
+        `tps-mail: late-final-refused: obligation ${current.obligationId} for ${inboundId} is ${current.state}; ` +
+          `the late final is NOT delivered`,
+      );
+    }
+    return false;
+  } catch (err: any) {
+    log?.warn?.(
+      `tps-mail: obligation-write-failed: could not mark ${inboundId} delivering (${err?.message ?? err}); ` +
+        `nothing was sent`,
+    );
+    return false;
+  }
 }
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
@@ -468,31 +1051,47 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
-  if (rec.state !== "yielded") {
-    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "yielded", { deadlineAt: at }, ctx.log);
-  }
+  // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
+  // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
+  // their state and only gain `deadlineAt`. The deadline must be able to tell
+  // "committed, no evidence yet" from "never delivered" — that is the whole
+  // difference between `unconfirmed` and `failed`.
+  const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
+  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearTimeout(prev);
   const timer = setTimeout(() => {
     armedDeadlines.delete(obligationId);
-    onDeadline(ctx, obligationId);
+    void onDeadline(ctx, obligationId);
   }, remaining);
   if (typeof (timer as any).unref === "function") (timer as any).unref();
   armedDeadlines.set(obligationId, timer);
 }
 
-function onDeadline(ctx: YieldContext, obligationId: string): void {
+async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after failed/acked: no-op
-  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.agent, ctx.accountId);
-  if (receipt.status === "found") {
-    ackObligation(ctx, obligationId, "receipt present at the deadline");
-    return;
-  }
+  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
+  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId, rec.replyId);
+  // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
+  // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
+  // record) is a definitive non-delivery: the obligation fails and nacks even
+  // though its delivery committed. With no evidence and no verdict, a committed
+  // record becomes `unconfirmed` (no nack mail, no nack stamp) and only a record
+  // that never committed fails and is announced to the sender.
   const reason = "yielded-without-resumption";
-  failObligation(ctx, reason);
-  sendNackMail(ctx, reason);
+  const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
+  // cli#389 round 9, item 2: the VERB announces a failure — this caller does not
+  // mail on its own, so the deadline and the turn's own scan give the sender the
+  // same outcome. cli#389 round 10, item 1: AWAIT that send here too, so the
+  // deadline's own nack has landed (and its outcome is on the record) before
+  // this path finishes; the mail is at-least-once, and a start retries
+  // delivery of anything still owed.
+  await settleObligation(ctx, obligationId, {
+    receipt: receipt.status === "found" ? "found" : "none",
+    verdict,
+    reason,
+  });
 }
 
 function makeYieldCtx(
@@ -513,24 +1112,51 @@ function makeYieldCtx(
  * a failure; a posted marker is an ack; otherwise the work is outstanding and
  * the deadline is (re-)armed. Used by restart recovery and by a re-dispatch of
  * an inbound that already has an obligation — neither may post a second final.
+ *
+ * ASYNC since cli#389 round 10: settling a failure AWAITS the nack mail, so
+ * recovery can hand a still-owed nack to the sender before it returns.
  */
-function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string }): void {
+async function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string; replyId?: string }): Promise<void> {
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
-    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", {
-      failure: curRec.nackReason ?? "nacked",
-    }, ctx.log);
-    return;
+    // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
+    // earlier behaviour must not fail a record whose own persisted state says the
+    // delivery COMMITTED (`delivering`/`posted`): for those, recovery decides by
+    // evidence and deadline like every other path, and the stamp is KEPT on the
+    // cur/ record. For a record that never committed (pending/yielded) the stamp
+    // says a failure was determined before the crash: settle the RECORD through
+    // the ONE verb with `alreadyStamped`, so the stamp is not rewritten. The
+    // nack MAIL is a separate, durable question (cli#389 round 10, item 1): the
+    // verb sends it unless the record itself records that it was sent, so a
+    // stamp alone never proves the sender was told.
+    const state = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId)?.state;
+    if (state !== "delivering" && state !== "posted") {
+      const reason = curRec.nackReason ?? "nacked";
+      await settleObligation(ctx, rec.obligationId, { receipt: "none", verdict: reason, reason, alreadyStamped: true });
+      return;
+    }
   }
-  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, ctx.agent, ctx.accountId);
+  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId, rec.replyId);
   if (receipt.status === "found") {
-    ackObligation(ctx, rec.obligationId, "recovered: receipt already posted");
+    await settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
     return;
   }
   armDeadline(ctx, rec.obligationId, rec.deadlineAt);
 }
 
-function sendNackMail(ctx: YieldContext, reason: string): void {
+/**
+ * Hand a nack mail to the sender through the SAME locality decision as the
+ * reply (cli#389) and report whether it reached a route (cli#389 round 10, item
+ * 1 — the verb records that outcome on the obligation record and retries the
+ * delivery when it is missing). `false` means the mail was NOT handed over:
+ * either no route exists at all, or the route threw. Never throws.
+ *
+ * `opts.timeoutMs` (cli#389 round 12, item 1) is the OVERALL bound for a wire
+ * nack — the connection AND the ACK wait. The relay CLOSES the transport when it
+ * expires; that timeout is logged BY NAME rather than as an ordinary delivery
+ * error, so an operator can tell a dead branch from a refused one.
+ */
+async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -553,18 +1179,46 @@ function sendNackMail(ctx: YieldContext, reason: string): void {
     deliveryAttempts: 0,
   };
   try {
-    // Route like the dispatcher reply: a LOCAL recipient (a maildir on this
-    // host, or a binding) gets the nack in their maildir; a REMOTE one gets it
-    // in the outbox for the branch relay. Never dropped.
-    if (isLocalRecipient(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender)) {
+    // Route the nack through the SAME locality decision as the reply (cli#389).
+    const route = routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender);
+    if (route.kind === "local") {
       writeMailFile(ctx.mailDir, ctx.sender, message);
-    } else {
+    } else if (route.kind === "outbox") {
       writeOutboxFile(message);
+    } else if (route.kind === "remote-branch") {
+      await deliverRemote(message, route.branchId, { timeoutMs: opts.timeoutMs });
+    } else if (route.kind === "bridge") {
+      deliverToSandbox(route.branchId, { to: ctx.sender, from: ctx.agent, body: message.body });
+    } else {
+      ctx.log?.warn?.(
+        `tps-mail: no delivery route for the nack to ${ctx.sender} ` +
+          `(${route.kind === "failed" ? route.reason : "no binding, no maildir, no remote branch, no bridge"}); the obligation record carries the failure`,
+      );
+      return false;
     }
-    ctx.log?.warn?.(`tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}`);
+    return true;
   } catch (err: any) {
-    ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+    if (isRemoteDeliveryTimeout(err)) {
+      // cli#389 round 12, item 1: the connection (or the ACK wait) exceeded the
+      // overall bound and the relay CLOSED the transport. Logged BY NAME so the
+      // branch that could not be reached is identifiable.
+      ctx.log?.warn?.(
+        `tps-mail: nack-retry-timeout: the owed nack for ${ctx.inboundId} to ${ctx.sender} did not complete within ` +
+          `${opts.timeoutMs ?? DEFAULT_NACK_RETRY_TIMEOUT_MS}ms (connect + ack); the delivery was abandoned, the transport closed, ` +
+          `and the record keeps nackPending`,
+      );
+    } else {
+      ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
+    }
+    return false;
   }
+}
+
+/** True for the relay's bounded-timeout error (cli#389 round 12, item 1).
+ *  Matched BY NAME so a module mock that does not re-export the class still
+ *  classifies correctly. */
+function isRemoteDeliveryTimeout(err: any): boolean {
+  return err?.name === "RemoteDeliveryTimeoutError";
 }
 
 /**
@@ -663,17 +1317,23 @@ const outbound: ChannelOutboundAdapter = {
       },
       deliveryAttempts: 0,
     };
-    const { path: filePath, route } = deliverOutboundMail(
-      ctx.cfg as any,
-      ctx.accountId ?? "default",
-      account.mailDir,
-      message,
-    );
+    let delivered: { path: string; route: MailRoute["kind"] };
+    try {
+      delivered = await deliverOutboundMail(
+        ctx.cfg as any,
+        ctx.accountId ?? "default",
+        account.mailDir,
+        message,
+      );
+    } catch (err: any) {
+      // (cli#389 rule 3) No route → a NAMED failure, never a silent write.
+      return { ok: false, error: `tps-mail: ${err?.message ?? err}` } as any;
+    }
     return {
       ok: true,
       id: message.id,
       externalId: message.id,
-      details: { path: filePath, route },
+      details: { path: delivered.path, route: delivered.route },
     } as any;
   },
 };
@@ -874,7 +1534,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // (receipt → ack; nacked → failed; otherwise re-arm the deadline).
       if (!created.created) {
         log?.info?.(`tps-mail: inbound ${msg.id} already has obligation ${obId}; reconciling, not re-dispatching`);
-        reconcileObligation(yieldCtx, created.record);
+        await reconcileObligation(yieldCtx, created.record);
         return;
       }
 
@@ -890,6 +1550,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // NAMED failure rather than a silent yield.
       let sawSuppressedFinal = false;
       let posted = false;
+      // The reply id of the record this turn actually delivered (cli#389 round
+      // 6, item 1): the receipt scan pins a receipt's `replyId` to it, so a body
+      // copied from an OLDER reply under the current obligation and inbound ids
+      // is not accepted. Null until a delivery commits.
+      let postedReplyId: string | null = null;
       let postFailure: string | null = null;
       try {
         const dispatchResult: any = await channelRuntime.reply.dispatchReplyWithBufferedBlockDispatcher({
@@ -955,26 +1620,134 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               deliveryAttempts: 0,
             };
 
-            // Requirement 3 + 5: a local recipient's reply goes to their
-            // maildir; a REMOTE recipient's reply goes to ~/.tps/outbox/new/
-            // for the branch service to relay — never dropped. `posted` is set
-            // ONLY after the write returns; a throw is a NAMED failure.
+            // (cli#389) Route the reply through the SAME locality decision as
+            // `tps mail send` and the outbound adapter. The delivery call IS the
+            // commit: `posted` is set only after it RETURNS, and a throw (or an
+            // unknown recipient on the office) is a NAMED failure. NOTHING else
+            // runs inside this try (cli#389 round 6, item 2) — the obligation
+            // transition, the receipt write and the log line are evidence
+            // UPKEEP, and each runs after the commit under its own guard, so a
+            // transient failure there can never fail a delivered reply or nack
+            // its inbound.
+            let route: MailRoute | null = null;
+            let deliveredVia: string | null = null;
+            // THE COMMIT IS PERSISTED (cli#389 round 8, item 1). `posted` is written
+            // to the RECORD the moment the delivery call RETURNS — never a flag in
+            // memory — so a restart, the deadline path and the outer catch all read
+            // the same truth. `posted` (the local) still drives this turn's own
+            // branches; the transition is EVIDENCE UPKEEP, guarded by postCommit so
+            // it can never fail a delivered reply.
+            const commit = () => {
+              posted = true;
+              postCommit(
+                log,
+                "obligation-posted-transition-failed",
+                `the ${route!.kind} reply ${reply.id} committed to ${msg.from} but the obligation for ${msg.id} was not marked posted`,
+                () => transitionObligation(account.mailDir, recipient, msg.id, "posted", { replyId: reply.id }, log),
+              );
+            };
             try {
-              if (isLocalRecipient(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from)) {
-                writeMailFile(account.mailDir, msg.from, reply);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=local)`,
+              route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
+              if (route.kind === "failed" || route.kind === "unknown") {
+                // An explicit delivery rejection (or no route at all): nothing is
+                // sent, so this is a definitive non-delivery — fail and nack.
+                postFailure = postFailure ?? (route.kind === "failed" ? route.reason : `no-route:${msg.from}`);
+                log?.warn?.(
+                  route.kind === "failed"
+                    ? `tps-mail: refusing the reply to ${msg.from}: ${route.reason} (the GAL names branch ${route.branchId} with no remote registration)`
+                    : `tps-mail: no delivery route for reply recipient ${msg.from} ` +
+                        `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
+                );
+              } else if (markDelivering(account.mailDir, recipient, msg.id, log)) {
+                // WRITE-AHEAD (item 1): `delivering` is persisted BEFORE the call.
+                if (route.kind === "local") {
+                  writeMailFile(account.mailDir, msg.from, reply);
+                  commit();
+                } else if (route.kind === "outbox") {
+                  deliveredVia = writeOutboxFile(reply);
+                  commit();
+                } else if (route.kind === "remote-branch") {
+                  await deliverRemote(reply, route.branchId);
+                  commit();
+                } else {
+                  // The record carries the obligation ids, so this delivery stays
+                  // locally readable even if the receipt write below fails.
+                  deliverToSandbox(route.branchId, {
+                    to: msg.from,
+                    from: recipient,
+                    body: reply.body,
+                    ...obligationMetadata(reply),
+                  });
+                  commit();
+                }
+              } else {
+                // Either the write-ahead write ITSELF failed — nothing has been
+                // sent, so this is a pre-commit failure and the obligation fails
+                // and nacks as before — or the record is already TERMINAL and
+                // REFUSED the late final (cli#389 round 9, item 4): markDelivering
+                // logged `late-final-refused`, the verb has already settled this
+                // obligation, and a final arriving after the obligation CLOSED
+                // is NOT delivered (cli#389 round 10, item 3: closure is the
+                // reason, not "the sender was told it failed" — the obligation
+                // may have closed as `unconfirmed`, which tells nobody anything).
+                const cur = readObligation(account.mailDir, recipient, msg.id);
+                if (!(cur && TERMINAL_STATES.has(cur.state))) {
+                  postFailure = postFailure ?? "delivering-write-failed";
+                }
+              }
+            } catch (err: any) {
+              // cli#389 round 9, item 1: A THROW FROM THE DELIVERY CALL IS
+              // UNCERTAIN, NOT A VERDICT. The call can throw AFTER the bytes left
+              // (a timeout after send, a failure writing the local record after a
+              // remote accept), and `delivering` was persisted BEFORE it — so when
+              // the record says the call was in flight (or had returned), the
+              // throw resolves by EVIDENCE OR DEADLINE instead of failing the
+              // obligation and nacking the sender. Only a throw before the
+              // write-ahead landed (nothing sent) fails and nacks as before.
+              const at = readObligation(account.mailDir, recipient, msg.id);
+              if (at && (at.state === "delivering" || at.state === "posted")) {
+                log?.warn?.(
+                  `tps-mail: delivery-uncertain: ${err?.message ?? err} — the obligation for ${msg.id} was already ` +
+                    `${at.state} when the delivery call threw, so the reply may have gone out; NOT failed, NOT nacked, ` +
+                    `it resolves by evidence or at its deadline`,
                 );
               } else {
-                const path = writeOutboxFile(reply);
-                log?.info?.(
-                  `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=outbox: ${path})`,
+                postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
+              }
+            }
+
+            // ── AFTER THE COMMIT (cli#389 round 6, item 2). Every step below
+            // runs OUTSIDE the delivery try and under its own guard: it is
+            // logged by name and NEVER sets postFailure, so a delivered reply is
+            // never reported as failed and its inbound is never nacked.
+            if (posted && route) {
+              const r = route;
+              postedReplyId = reply.id;
+              const where =
+                r.kind === "outbox"
+                  ? `${r.kind}: ${deliveredVia}`
+                  : r.kind === "remote-branch" || r.kind === "bridge"
+                    ? `${r.kind}: ${r.branchId}`
+                    : r.kind;
+              postCommit(
+                log,
+                "reply-log-failed",
+                `the ${r.kind} reply ${reply.id} committed to ${msg.from} but its log line failed`,
+                () =>
+                  log?.info?.(
+                    `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${where}; delivery committed)`,
+                  ),
+              );
+              if (r.kind === "remote-branch" || r.kind === "bridge") {
+                // persistReceiptAfterCommit never throws: it logs
+                // receipt-write-failed by name and cannot fail the send.
+                postCommit(
+                  log,
+                  "receipt-write-failed",
+                  `the ${r.kind} reply ${reply.id} committed but its receipt was not written`,
+                  () => persistReceiptAfterCommit(account.mailDir, recipient, reply, r.kind, r.branchId, log),
                 );
               }
-              posted = true;
-              transitionObligation(account.mailDir, recipient, msg.id, "posted", {}, log);
-            } catch (err: any) {
-              postFailure = postFailure ?? `write-failed:${err?.message ?? err}`;
             }
           }
         }
@@ -983,48 +1756,88 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // no posted final is exactly the shape that used to ack silently).
         const failedCounts = dispatchResult?.failedCounts;
         if (failedCounts !== undefined) {
+          yieldCtx.step = "failed-counts-log";
           log?.warn?.(`tps-mail: runtime failedCounts for ${msg.id}: ${JSON.stringify(failedCounts)}`);
         }
 
         // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
-        const receipt = scanForReceipt(receiptDirs(yieldCtx), obId, recipient, account.accountId);
+        // The scan and the disposition below both run AFTER a committed delivery,
+        // so they are evidence upkeep: `step` names whichever is running, and the
+        // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
+        // `delivering`/`posted` are never failed by a mere throw).
+        yieldCtx.step = "receipt-scan";
+        const receipt = scanForReceipt(
+          receiptDirs(yieldCtx),
+          obId,
+          msg.id,
+          recipient,
+          account.accountId,
+          postedReplyId ?? undefined,
+        );
         if (receipt.status === "found") {
-          ackObligation(yieldCtx, obId, "receipt found");
-        } else if (receipt.status === "malformed" && posted) {
-          // ONLY when THIS turn posted: a `.malformed-*` cannot be tied to this
-          // obligation (its marker is unreadable) and quarantined records stay
-          // in the dirs, so an unrelated one must not fail a later non-posting
-          // turn (cli#398 T4). A posted reply the scan cannot find as a valid
-          // receipt is the one case that is ours.
-          failObligation(yieldCtx, "receipt-malformed");
+          yieldCtx.step = "ack-transition";
+          await settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });
+        } else if (receipt.status === "malformed" && receipt.ownRecord) {
+          // cli#398 T4(e) RESTORED (cli#389 round 8) as ATTRIBUTABLE quarantine.
+          // The drain quarantined THIS reply's own record — the quarantined name
+          // still carries the reply id this obligation posted — so its
+          // non-delivery is DEFINITIVE: the obligation fails and nacks AT ONCE,
+          // even though the delivery call returned. An unrelated `.malformed-*`
+          // (a quarantine that cannot be tied to this reply) is NOT a verdict:
+          // that falls through and resolves at the deadline.
+          yieldCtx.step = "receipt-quarantined";
+          await settleObligation(yieldCtx, obId, { receipt: "none", verdict: "receipt-malformed", reason: "receipt-malformed" });
         } else if (postFailure) {
-          failObligation(yieldCtx, postFailure);
+          yieldCtx.step = "post-failure";
+          // The delivery call itself failed (or there was no route at all):
+          // nothing was sent, so this is a definitive non-delivery — fail and
+          // nack exactly as before.
+          await settleObligation(yieldCtx, obId, { receipt: "none", verdict: postFailure, reason: postFailure });
         } else if (sawSuppressedFinal && latestFinalText === null) {
           // The turn produced finals, but every one was empty or silent — a
           // NAMED failure with a nack, never a silent yield. `latestFinalText`
           // must be null: a turn that POSTED a real final whose receipt is
-          // absent is the posted-without-receipt path below, not this one.
-          failObligation(yieldCtx, "empty-final-text");
+          // absent is the committed-without-evidence path below, not this one.
+          yieldCtx.step = "empty-final-text";
+          await settleObligation(yieldCtx, obId, { receipt: "none", verdict: "empty-final-text", reason: "empty-final-text" });
         } else {
           // No final posted and no post failure: the run yielded without
           // resumption (subscription event, or settlement-inference). Stay
-          // UNACKED in cur/ and arm the deadline.
+          // UNACKED in cur/ and arm the deadline; the deadline's scan decides,
+          // and a COMMITTED record (posted, evidence not visible yet) resolves
+          // there to `acked` or `unconfirmed` — never failed, never nacked.
           armDeadline(yieldCtx, obId);
-          log?.warn?.(
-            `tps-mail: obligation for ${msg.id} is YIELDED (no final posted yet); deadline armed`,
-          );
+          // …unless the record is already TERMINAL: a late final the write-ahead
+          // refused (cli#389 round 9, item 4) is settled, not "unresolved", and
+          // is announced by name as `late-final-refused` instead.
+          const live = readObligation(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
+          if (live && !TERMINAL_STATES.has(live.state)) {
+            log?.warn?.(
+              `tps-mail: obligation for ${msg.id} is unresolved (no receipt evidence yet); deadline armed`,
+            );
+          }
         }
       } catch (err: any) {
-        log?.warn?.(
-          `tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`,
-        );
-        transitionObligation(account.mailDir, recipient, msg.id, "failed", {
-          failure: `dispatch failed: ${err?.message ?? String(err)}`,
-        }, log);
-        patchMailFile(curPath, {
-          nackedAt: new Date().toISOString(),
-          nackReason: `dispatch failed: ${err?.message ?? String(err)}`,
-        });
+        const reason = `dispatch failed: ${err?.message ?? String(err)}`;
+        log?.warn?.(`tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`);
+        // cli#389 round 8: the PERSISTED RECORD tells a post-commit evidence step
+        // from a failure of the dispatch itself — a flag in the turn's memory
+        // could not (round 7's guard had to refuse the verb instead). A committed
+        // obligation (`delivering`/`posted`) is NOT failed and its inbound is NOT
+        // nacked: the step is logged BY NAME and the normal deadline is ARMED, so
+        // it still resolves to `acked` (if the evidence appears) or `unconfirmed`
+        // — never stranded. A throw from the dispatch itself arrives with the
+        // record still pending/yielded and fails and nacks exactly as before.
+        const rec = readObligation(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
+        if (rec && (rec.state === "delivering" || rec.state === "posted")) {
+          log?.warn?.(
+            `tps-mail: post-commit-error:${yieldCtx.step ?? "unnamed-step"}: ${reason} — the delivery for ${msg.id} ` +
+              `committed (${rec.state}), so it is NOT failed and its inbound is NOT nacked; it resolves at its deadline`,
+          );
+          armDeadline(yieldCtx, obId);
+        } else {
+          await settleObligation(yieldCtx, obId, { receipt: "none", verdict: reason, reason });
+        }
       }
     }
 
@@ -1088,18 +1901,50 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
 
+        // UNSENT NACKS (cli#389 round 10, item 1): a TERMINAL failure whose nack
+        // mail never went out — a crash between settling the failure and sending
+        // its nack, or a send that could not be delivered — is retried here. The
+        // RECORD decides (`nackPending` with no `nackSentAt`), never the cur/
+        // stamp, so a stamp can no longer stand in for a mail the sender never
+        // received. AT-LEAST-ONCE: a crash after the send but before
+        // `nackSentAt` is written retries delivery, so the sender may see the
+        // nack twice; the record keeps the debt until a hand-off is recorded.
+        //
+        // cli#389 round 12, item 1 (CodeRabbit, Major): the retries run in the
+        // BACKGROUND, NOT awaited on the startup path. Awaited, one unreachable
+        // branch (connect has no application-level timeout) stalled recovery for
+        // this agent and every later one. Each retry is bounded by an overall
+        // timeout — the connection AND the ACK wait — that CLOSES the transport
+        // on expiry and logs BY NAME (`nack-retry-timeout`).
+        //
+        // cli#389 round 12, item 1: the ordering dependency is GONE. The sweep
+        // below HOLDS any record still owing its nack (obligations.ts) while it
+        // is inside the bounded hold, so an owed mail survives whether the retry
+        // or the sweep runs first.
+        for (const rec of listObligations(account.mailDir, agentId)) {
+          if (!nackOwed(rec)) continue;
+          retryOwedNackInBackground(account.mailDir, agentId, rec.from, rec.inboundId, rec.failure ?? "failed", account.accountId, cfg, log);
+        }
+
         // OBLIGATION RETENTION (cli#401): delete ONLY terminal records (acked,
         // failed) whose LAST TRANSITION is older than the window; pending /
         // posted / yielded are never deletable (recovery reads them).
         // Best-effort — a failure never blocks startup. A replayed id whose
         // record was swept opens a FRESH obligation: accepted, since relay
         // retries arrive within minutes/hours, never the window later.
+        //
+        // cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age — a
+        // configurable multiple of `retentionDays` — so a sender that NEVER gets
+        // a route cannot pin a record forever.
         try {
+          const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
           sweepTerminalObligations(
             account.mailDir,
             agentId,
-            resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]),
+            retentionDays,
             log,
+            Date.now(),
+            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
           );
         } catch (err: any) {
           log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);
@@ -1122,7 +1967,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             log,
           );
           yieldContexts.set(rec.obligationId, ctx);
-          reconcileObligation(ctx, rec);
+          await reconcileObligation(ctx, rec);
         }
       } catch (err: any) {
         log?.warn?.(
