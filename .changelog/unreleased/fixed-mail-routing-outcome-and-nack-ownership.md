@@ -21,7 +21,10 @@
   sender-visible outcome wherever it is found, and no caller mails on its own;
   with no working route the nack stays owed only inside a bounded hold — a
   configurable multiple of `retentionDays` (at least 1): past it the debt is
-  abandoned once, logged `nack-abandoned`, and normal retention applies.
+  abandoned, logged `nack-abandoned`, and normal retention applies. The abandon
+  is best-effort: the debt is released, and the log line written once, only when
+  that write lands — when it does not, the record keeps `nackPending` and a
+  later sweep abandons it again.
   The nack is owed ON
   THE RECORD, not proven by the cur/ stamp, and a terminal record refuses later
   transitions outright.

@@ -14,8 +14,11 @@
   recovery retries delivery for any `failed` record carrying `nackPending` with
   no `nackSentAt`, but only INSIDE the hold window — a configurable multiple of
   `retentionDays` (at least 1; the default is 4). Past that window the debt is
-  abandoned ONCE, logged `nack-abandoned`, and normal retention then applies to
-  the record. AT-LEAST-ONCE, not exactly-once: a crash after the hand-off
+  abandoned, logged `nack-abandoned`, and normal retention then applies to the
+  record; the abandon is best-effort, so the debt is released, and the log line
+  written once, only when that write succeeds — when it does not, the record
+  keeps `nackPending` and a later sweep abandons it again. AT-LEAST-ONCE, not
+  exactly-once: a crash after the hand-off
   but before the record is written retries delivery, so the sender may see the
   nack twice; `nackSentAt` is recorded when that write succeeds, and when it
   does not the record keeps `nackPending` and the nack may repeat. The
