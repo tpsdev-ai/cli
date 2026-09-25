@@ -17,8 +17,11 @@
  *
  *  1. Every suite CI runs writes a JUnit report to a known path per suite
  *     (`test-reports/<suite>.xml`), through `scripts/test-suite.mjs`; the plugin's
- *     launcher sets the same flags for its own run. Beside each report is the
- *     suite's console log (`test-reports/<suite>.log`).
+ *     launcher sets the same flags for its own run. Each launcher DELETES its own
+ *     suite's files before that suite starts, so a report left by an earlier step
+ *     or run cannot stand in for this one. Beside each report is the suite's
+ *     console output, saved for the CI record (`test-reports/<suite>.log`) — this
+ *     script does not read it.
  *  2. This script reads every report a suite MUST have written, collects the
  *     test FILES those reports show executed, discovers the test files on disk
  *     (every form bun discovers), and fails naming each discovered file that no
@@ -30,13 +33,21 @@
  *     suite step failing does not skip it — and it is not a clause of any suite,
  *     so removing a suite from the wiring cannot take the guard down with it.
  *
- * WHY THE LOG TOO. bun 1.3.10's JUnit reporter omits a file with ZERO test
- * cases: such a file appears in no `<testsuite>` and no `<testcase>`, though bun
- * did execute it (its console reporter prints the file's header line and counts
- * it in "Ran N tests across M files"). The log's per-file headers are the
- * file-level signal for exactly that case, so executed files are read from the
- * XML plus the log, and a missing log fails closed for the same reason a missing
- * report does.
+ * THE EXECUTED SET COMES FROM THE JUNIT REPORTS AND NOTHING ELSE. bun writes
+ * those reports; a test's own stdout and stderr cannot put a file into them. An
+ * earlier revision ALSO read each suite's console log and matched bun's per-file
+ * header lines (`extra.test.ts:`), to cover a file bun executed whose JUnit
+ * report names it nowhere — a file with ZERO test cases appears in no
+ * `<testsuite>` and no `<testcase>`. That signal was forgeable: a test that
+ * PRINTED a line ending in `extra.test.ts:` put a file into the executed set
+ * that never ran. So it is gone. A discovered test file that no report names
+ * now fails — which is exactly what a zero-case file looks like — and the
+ * failure names the file and says what to do about it.
+ *
+ * WHAT IT DOES NOT CHECK: whether the tests PASSED. A failing suite still writes
+ * a complete report, and this guard passes it when every discovered file is
+ * accounted for; the job fails through that suite's own step. What this guard
+ * holds is which files RAN.
  *
  * A detective, not a boundary: a pull request can edit this script and the
  * wiring together, and the boundary there is review of the diff. What it holds
@@ -80,9 +91,6 @@ const SKIPPED_DIRS = new Set(["node_modules", ".git"]);
 
 /** Forward-slashed: `relative()` yields `\`-separated paths on Windows. */
 export const posix = (path) => path.replaceAll("\\", "/");
-
-/** ANSI escapes are stripped before a log line is read: a TTY run colorizes. */
-const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
 
 /**
  * Every test file under `rootDir`, repo-relative and sorted. This mirrors bun's
@@ -138,29 +146,6 @@ export function parseJunit(text) {
 }
 
 /**
- * The test files a suite's console log shows bun executing. bun's console
- * reporter prints a bare `<path>:` line, relative to its cwd, for every file it
- * runs — including a file with zero test cases, which its JUnit report drops.
- * Only a line that resolves to a discovered test file counts, so a test that
- * prints text ending in a colon cannot invent one. `exists(abs)` is the
- * caller's view of the tree, so its own tests can drive this with fixtures.
- */
-export function parseExecutedFromLog(text, suiteCwd, rootDir, exists) {
-  const found = new Set();
-  for (const raw of text.split("\n")) {
-    const line = raw.replace(ANSI, "").trimEnd();
-    if (!line.endsWith(":") || line.startsWith(" ")) continue;
-    const candidate = line.slice(0, -1);
-    if (!TEST_FILE_NAME.test(candidate.split("/").pop() ?? "")) continue;
-    const rel = posix(relative(rootDir, resolve(suiteCwd, candidate)));
-    if (rel.startsWith("..")) continue;
-    if (!exists(join(rootDir, rel))) continue;
-    found.add(rel);
-  }
-  return found;
-}
-
-/**
  * The whole check, over injected reads so its own tests can drive it with
  * fixtures. `readFile(abs)` returns a file's text, or `undefined` if it is not
  * there. Returns what each suite contributed, the executed set, the discovered
@@ -177,14 +162,11 @@ export function checkTestReports({
   const executed = new Set();
   const suiteResults = [];
   const failures = [];
-  const exists = (abs) => readFile(abs) !== undefined;
 
   for (const { suite, cwd } of suites) {
     const xml = join(reportDir, `${suite}.xml`);
-    const log = join(reportDir, `${suite}.log`);
     const suiteCwd = resolve(root, cwd);
     const text = readFile(xml);
-    const logText = readFile(log);
     const parsed = text === undefined ? { testsuites: [], testcases: [] } : parseJunit(text);
     const files = new Set();
     let state = "ran";
@@ -215,20 +197,6 @@ export function checkTestReports({
       }
     }
     for (const file of files) executed.add(file);
-    // The log is read even when the report is missing or empty: the report is
-    // still the failure, and the log keeps the orphan list to the files that are
-    // genuinely unaccounted for. It is REQUIRED either way — a file with zero
-    // test cases is named nowhere else, so a missing log fails closed too.
-    if (logText === undefined) {
-      failures.push({
-        suite,
-        kind: "missing-log",
-        detail: `no console log at ${posix(relative(root, log))} — a file with zero test cases is visible nowhere else`,
-      });
-      if (state === "ran") state = "missing-log";
-    } else {
-      for (const file of parseExecutedFromLog(logText, suiteCwd, root, exists)) executed.add(file);
-    }
     suiteResults.push({ suite, cwd, state, files: files.size });
   }
 
@@ -238,7 +206,11 @@ export function checkTestReports({
     failures.push({
       suite: undefined,
       kind: "unexecuted",
-      detail: `${file} is a test file, and no report shows a suite executing it`,
+      detail:
+        `${file} is a test file, and no JUnit report shows a suite executing it: either no suite ran it,\n` +
+        `  or it registers ZERO test cases — bun's report names a file only when it has at least one case.\n` +
+        `  A test file must register at least one case: test.skip or test.todo for a placeholder, or\n` +
+        `  describe.if / test.skipIf for a platform-only file, so its cases show as skipped.`,
     });
   }
 
@@ -266,9 +238,7 @@ export function formatReport(result) {
         ? `${files} test file${files === 1 ? "" : "s"}`
         : state === "missing"
           ? "NO REPORT"
-          : state === "empty"
-            ? "EMPTY REPORT"
-            : "NO LOG";
+          : "EMPTY REPORT";
     lines.push(`  ${suite.padEnd(12)} [${where}] ${how}`);
   }
   if (result.ok) {
@@ -280,9 +250,10 @@ export function formatReport(result) {
     lines.push(`  ${failure.detail}`);
   }
   lines.push(
-    "  Wire a runner for an unexecuted file (a suite in the root `test` script, or a step in\n" +
-      "  .github/workflows/test.yml) — or, if a suite did not run, fix that first: this check\n" +
-      "  fails closed, so a suite that never ran cannot read as a suite that covered everything.",
+    "  Either wire a runner for it (a suite in the root `test` script, or a step in\n" +
+      "  .github/workflows/test.yml), or give it at least one case. And if a suite did not run\n" +
+      "  at all, fix that first: a missing report fails closed, so a suite that never ran cannot\n" +
+      "  read as a suite that covered everything.",
   );
   return lines.join("\n");
 }

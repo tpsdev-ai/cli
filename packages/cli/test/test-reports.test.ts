@@ -10,10 +10,21 @@
  *
  * What is left here is the guard's own test suite. It drives the guard's
  * exported functions over fixture reports and a fixture tree, so every way the
- * measurement can go quiet is a case below: a file no report shows executed is
+ * measurement can go quiet is a case below: a file no JUnit report names is
  * named, a missing report fails, an empty report fails, and a file a report
  * names passes. Nothing here asserts that a clause is present in a file — the
  * guard reads what RAN, and so do these tests.
+ *
+ * WHAT NO LONGER FEEDS THE EXECUTED SET: the suites' console logs. The guard used
+ * to read them too, matching bun's per-file header lines, so a file bun executed
+ * but its JUnit report omits (a file with ZERO test cases appears in no
+ * `<testsuite>` and no `<testcase>`) still counted. A test that PRINTED a line
+ * ending in `extra.test.ts:` could therefore put a file into the executed set
+ * that never ran. The two cases below hold that shut: a log line naming an unrun
+ * file does not count, and a file no report names fails — which is what a
+ * zero-case file looks like — with the message that says how to register a case.
+ * The last describe block drives the launchers, which delete their own suite's
+ * report before the suite starts.
  *
  * The discovery rules asserted at the end are the ones measured against the
  * pinned bun (1.3.10), not the ones a changelog claims: `.test`/`_test`/`.spec`/
@@ -21,17 +32,18 @@
  * skipped, `dist/` NOT skipped, dot-files discovered.
  */
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  REPO,
   REQUIRED_SUITES,
   TEST_FILE_NAME,
   checkTestReports,
   discoverTestFiles,
   exitCodeFor,
   formatReport,
-  parseExecutedFromLog,
   parseJunit,
 } from "../../../scripts/check-test-reports.mjs";
 
@@ -48,7 +60,7 @@ const SUITES = [
 const DEFAULT_DISCOVERED = [
   "packages/agent/test/a.test.ts",
   "packages/cli/test/b.test.ts",
-  "packages/cli/test/c-zero.test.ts",
+  "packages/cli/test/c.test.ts",
   "test/root.test.ts",
 ];
 
@@ -71,11 +83,11 @@ function consoleLog(files: string[]): string {
 }
 
 interface FixtureOptions {
-  /** Executed files per suite, as bun's report and log name them. */
+  /** Executed files per suite, as bun's JUnit report names them. */
   executed?: Record<string, string[]>;
-  /** Files present in the report but named nowhere in the log, and vice versa. */
-  logOnly?: Record<string, string[]>;
-  /** Suite reports/logs to leave out entirely. */
+  /** Files a suite's console LOG prints a header for (the report does not name them). */
+  logSays?: Record<string, string[]>;
+  /** Suite reports to leave out entirely. */
   omit?: string[];
   /** Test files the fixture tree holds (discovery's input). */
   discovered?: string[];
@@ -83,19 +95,17 @@ interface FixtureOptions {
 
 /**
  * A fixture repo: a tree of test files, one JUnit report + console log per
- * suite, and the discovered set. By default the cli suite's log names a file its
- * report does NOT (`test/c-zero.test.ts`) — exactly how a file with zero test
- * cases looks, since bun's console reporter prints its header and its JUnit
- * reporter omits it.
+ * suite, and the discovered set. `logSays` builds the log a test would need in
+ * order to forge coverage — a header line for a file the report never names.
  */
 function fixture(options: FixtureOptions = {}): { readFile: (path: string) => string | undefined } {
   const {
     executed = {
       agent: ["test/a.test.ts"],
-      cli: ["test/b.test.ts"],
+      cli: ["test/b.test.ts", "test/c.test.ts"],
       "root-test": ["test/root.test.ts"],
     },
-    logOnly = { cli: ["test/c-zero.test.ts"] },
+    logSays = {},
     omit = [],
     discovered = DEFAULT_DISCOVERED,
   } = options;
@@ -106,9 +116,7 @@ function fixture(options: FixtureOptions = {}): { readFile: (path: string) => st
     if (!omit.includes(`${suite}.xml`)) {
       files.set(join(REPORT_DIR, `${suite}.xml`), junit(ran));
     }
-    if (!omit.includes(`${suite}.log`)) {
-      files.set(join(REPORT_DIR, `${suite}.log`), consoleLog([...ran, ...(logOnly[suite] ?? [])]));
-    }
+    files.set(join(REPORT_DIR, `${suite}.log`), consoleLog([...ran, ...(logSays[suite] ?? [])]));
   }
   return { readFile: (path) => files.get(path) };
 }
@@ -134,29 +142,53 @@ describe("check-test-reports", () => {
     expect(result.executed).toEqual([
       "packages/agent/test/a.test.ts",
       "packages/cli/test/b.test.ts",
-      "packages/cli/test/c-zero.test.ts",
+      "packages/cli/test/c.test.ts",
       "test/root.test.ts",
     ]);
     expect(formatReport(result)).toContain("OK: every test file on disk is shown executed");
   });
 
-  test("a file no report shows executed is NAMED", () => {
+  test("a file no JUnit report names is NAMED, with what to do about it", () => {
+    // What a file that registers ZERO test cases looks like: bun executes it, and
+    // its JUnit report names it nowhere. It must fail, by name.
     const result = run({
-      discovered: ["packages/agent/test/a.test.ts", "packages/cli/test/orphan.test.ts"],
+      discovered: [...DEFAULT_DISCOVERED, "packages/cli/test/zero.test.ts"],
     });
     expect(result.ok).toBe(false);
-    expect(result.orphans).toEqual(["packages/cli/test/orphan.test.ts"]);
+    expect(result.orphans).toEqual(["packages/cli/test/zero.test.ts"]);
     expect(exitCodeFor(result)).toBe(1);
     const report = formatReport(result);
     expect(report).toContain("FAILED");
-    expect(report).toContain("packages/cli/test/orphan.test.ts is a test file, and no report shows a suite executing it");
+    expect(report).toContain(
+      "packages/cli/test/zero.test.ts is a test file, and no JUnit report shows a suite executing it",
+    );
+    expect(report).toContain("registers ZERO test cases");
+    expect(report).toContain("must register at least one case");
+    expect(report).toContain("test.skip or test.todo");
+    expect(report).toContain("describe.if / test.skipIf");
+  });
+
+  test("a log line naming an unrun file does not count — the log is not read", () => {
+    // The forgery this replaced: a genuine report for the other files, plus a
+    // printed line reading `zero.test.ts:`. The file is on disk and never in a
+    // report, so it stays unexecuted however the log reads.
+    const result = run({
+      discovered: [...DEFAULT_DISCOVERED, "packages/cli/test/zero.test.ts"],
+      logSays: { cli: ["test/zero.test.ts"] },
+    });
+    expect(result.ok).toBe(false);
+    expect(result.orphans).toEqual(["packages/cli/test/zero.test.ts"]);
+    expect(result.executed).not.toContain("packages/cli/test/zero.test.ts");
   });
 
   test("a MISSING report fails, naming the suite", () => {
     const result = run({ omit: ["cli.xml"] });
     expect(result.ok).toBe(false);
-    expect(result.failures.map((f) => f.kind)).toEqual(["missing-report"]);
+    // The report is the failure, AND its files are unaccounted for: with no
+    // report there is nothing to show them executed, so they are named too.
+    expect(result.failures.map((f) => f.kind)).toEqual(["missing-report", "unexecuted", "unexecuted"]);
     expect(result.failures[0]?.detail).toContain("test-reports/cli.xml");
+    expect(result.orphans).toEqual(["packages/cli/test/b.test.ts", "packages/cli/test/c.test.ts"]);
     expect(formatReport(result)).toContain("NO REPORT");
   });
 
@@ -167,11 +199,14 @@ describe("check-test-reports", () => {
       reportDir: REPORT_DIR,
       suites: SUITES,
       readFile: (path) =>
-        path === join(REPORT_DIR, "cli.xml") ? `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n` : readFile(path),
+        path === join(REPORT_DIR, "cli.xml")
+          ? `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n`
+          : readFile(path),
       discover: () => ["packages/agent/test/a.test.ts", "packages/cli/test/b.test.ts", "test/root.test.ts"],
     });
     expect(result.ok).toBe(false);
-    expect(result.failures.map((f) => f.kind)).toEqual(["empty-report"]);
+    expect(result.failures.map((f) => f.kind)).toEqual(["empty-report", "unexecuted"]);
+    expect(result.orphans).toEqual(["packages/cli/test/b.test.ts"]);
     expect(formatReport(result)).toContain("EMPTY REPORT");
   });
 
@@ -185,28 +220,17 @@ describe("check-test-reports", () => {
       discover: () => [...DEFAULT_DISCOVERED].sort(),
     });
     expect(result.ok).toBe(false);
-    expect(result.failures.map((f) => f.kind)).toEqual(["unreadable-report"]);
-  });
-
-  test("a file with ZERO test cases rides its suite's LOG, and a missing log fails closed", () => {
-    // bun 1.3.10's JUnit report omits a file with no cases: it is in the log's
-    // per-file headers only. That file must still count as executed.
-    const withLog = run();
-    expect(withLog.ok).toBe(true);
-    expect(withLog.executed).toContain("packages/cli/test/c-zero.test.ts");
-
-    // Without the log that file is visible nowhere — the check fails, naming it,
-    // rather than passing on a report that cannot see it.
-    const withoutLog = run({ omit: ["cli.log"] });
-    expect(withoutLog.ok).toBe(false);
-    expect(withoutLog.failures.map((f) => f.kind)).toEqual(["missing-log", "unexecuted"]);
-    expect(withoutLog.orphans).toEqual(["packages/cli/test/c-zero.test.ts"]);
+    expect(result.failures.map((f) => f.kind)).toEqual([
+      "unreadable-report",
+      "unexecuted",
+      "unexecuted",
+    ]);
+    expect(result.orphans).toEqual(["packages/cli/test/b.test.ts", "packages/cli/test/c.test.ts"]);
   });
 
   test("the report's file attributes are resolved against the suite's own cwd", () => {
     const { readFile } = fixture({
       executed: { agent: ["test/security/mail.test.ts"], cli: [], "root-test": [] },
-      logOnly: {},
     });
     const result = checkTestReports({
       rootDir: ROOT,
@@ -236,7 +260,61 @@ describe("check-test-reports", () => {
   });
 });
 
-describe("parseJunit / parseExecutedFromLog", () => {
+describe("the launchers delete their own suite's report before the suite starts", () => {
+  /** A report + log left behind by an earlier step, in a throwaway dir. */
+  function staleReportDir(prefix: string, suite: string): string {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    writeFileSync(join(dir, `${suite}.xml`), junit(["test/stale.test.ts"]));
+    writeFileSync(join(dir, `${suite}.log`), "STALE-MARKER\n");
+    return dir;
+  }
+
+  test("scripts/test-suite.mjs removes its own report and log first", () => {
+    const dir = staleReportDir("cli411-launcher-", "agent");
+    try {
+      // `--reporter=spec` is a caller's own reporter, so this run writes no JUnit
+      // report at all: if `agent.xml` is gone afterwards, the launcher deleted it.
+      const res = spawnSync(
+        process.execPath,
+        [join(REPO, "scripts/test-suite.mjs"), "agent", "--reporter=spec", join(dir, "no-such-file.test.ts")],
+        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir }, encoding: "utf8" },
+      );
+      expect(res.error).toBeUndefined();
+      expect(existsSync(join(dir, "agent.xml"))).toBe(false);
+      expect(readFileSync(join(dir, "agent.log"), "utf8")).not.toContain("STALE-MARKER");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the plugin launcher removes its own report and log first", () => {
+    const dir = staleReportDir("cli411-plugin-launcher-", "plugin");
+    try {
+      const res = spawnSync(
+        process.execPath,
+        [
+          join(REPO, "plugins/openclaw-tps-mail/scripts/run-tests.mjs"),
+          "--reporter=spec",
+          join(dir, "no-such-file.test.ts"),
+        ],
+        {
+          cwd: join(REPO, "plugins/openclaw-tps-mail"),
+          env: { ...process.env, TPS_TEST_REPORT_DIR: dir },
+          encoding: "utf8",
+        },
+      );
+      expect(res.error).toBeUndefined();
+      // Past its setup, into the run: the isolated root line precedes the spawn.
+      expect(res.stdout ?? "").toContain("openclaw-tps-mail tests: isolated root");
+      expect(existsSync(join(dir, "plugin.xml"))).toBe(false);
+      expect(readFileSync(join(dir, "plugin.log"), "utf8")).not.toContain("STALE-MARKER");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("parseJunit", () => {
   test("parseJunit reads the file names out of a real-shaped report", () => {
     const parsed = parseJunit(junit(["test/a.test.ts", "test/b.test.ts"]));
     expect(parsed.testsuites.map((s) => s.file)).toEqual(["test/a.test.ts", "test/b.test.ts"]);
@@ -246,28 +324,6 @@ describe("parseJunit / parseExecutedFromLog", () => {
   test("parseJunit sees nothing in a report bun wrote for a zero-case file", () => {
     const empty = `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n`;
     expect(parseJunit(empty).testsuites).toEqual([]);
-  });
-
-  test("a log header counts only when it names a test file that exists", () => {
-    const exists = (path: string) => path === join(ROOT, "packages/cli/test/b.test.ts");
-    const log = [
-      "test/b.test.ts:",
-      "(pass) a case [0.04ms]",
-      "not a test file:",
-      "test/missing.test.ts:",
-      "(pass) printed by a test that ends in a colon:",
-    ].join("\n");
-    expect([...parseExecutedFromLog(log, join(ROOT, "packages/cli"), ROOT, exists)]).toEqual([
-      "packages/cli/test/b.test.ts",
-    ]);
-  });
-
-  test("ANSI-colored headers (a local TTY run) are still read", () => {
-    const exists = () => true;
-    const log = "\u001b[36mtest/b.test.ts\u001b[0m:\n";
-    expect([...parseExecutedFromLog(log, join(ROOT, "packages/cli"), ROOT, exists)]).toEqual([
-      "packages/cli/test/b.test.ts",
-    ]);
   });
 });
 

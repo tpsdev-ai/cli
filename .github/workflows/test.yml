@@ -96,11 +96,12 @@ jobs:
       # step cannot skip it. It is never a clause of a suite: a guard that ran
       # inside one could be taken down by dropping that suite, which is the
       # failure it exists to catch. It does not read this file — it MEASURES what
-      # ran, from the JUnit report each suite writes to test-reports/<suite>.xml via
-      # scripts/test-suite.mjs (the plugin's launcher sets the same flags, and
-      # writes test-reports/plugin.xml + test-reports/plugin.log). A required report
-      # is missing or empty fails it closed, and every test file it discovers
-      # that no report shows executed is named.
+      # ran, from the JUnit report each suite writes to test-reports/<suite>.xml
+      # via scripts/test-suite.mjs (the plugin's launcher sets the same flags for
+      # its own run), and each launcher deletes its own suite's report before that
+      # suite starts, so a stale report cannot stand in for this run's. A required
+      # report that is missing or empty fails it closed, and every test file it
+      # discovers that no report shows executed is named.
       - name: Every test file is run by a suite CI runs (cli#411)
         if: always()
         run: node scripts/check-test-reports.mjs

@@ -19,15 +19,20 @@
  *
  *   test-reports/<suite>.xml   — the JUnit XML: one <testsuite file="…"> per file bun
  *                           executed (and `<testcase file="…">` per case)
- *   test-reports/<suite>.log   — the suite's console output, saved beside it
+ *   test-reports/<suite>.log   — the suite's console output, saved beside the report
  *
- * The log is not decoration. bun 1.3.10's JUnit reporter omits a file with ZERO
- * test cases — it appears in neither a <testsuite> nor a <testcase> — while its
- * console reporter prints that file's header line (and counts it in "Ran N tests
- * across M files"). The guard reads both: the XML names the files, and the log's
- * per-file headers cover the zero-case file the XML drops. Both are written
- * here, so a suite that produces neither cannot be mistaken for one that
- * produced a report.
+ * WHAT EACH FILE IS FOR. The XML is the record the guard reads; nothing else is.
+ * The log is the suite's console output kept for the CI record (the step's own
+ * log shows it too) — it is not evidence, so a test that prints a line ending in
+ * `extra.test.ts:` cannot put a file into the guard's executed set. A file that
+ * registers ZERO test cases is named by no report at all; the guard fails on it,
+ * naming it, and the failure says how to register one (a `test.skip`/`test.todo`
+ * placeholder, or `describe.if`/`test.skipIf` for a platform-only file).
+ *
+ * THE REPORT IS DELETED FIRST. Before the suite starts, this launcher removes its
+ * own suite's XML and log, so a report left by an earlier step or run cannot
+ * stand in for the one this run is supposed to write. A run that dies before
+ * writing its report therefore leaves none, and the guard fails closed on it.
  *
  * USAGE
  *   node scripts/test-suite.mjs <suite> [bun test args…]
@@ -37,7 +42,7 @@
  * left alone, so a caller can choose its own path.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync } from "node:fs";
+import { createWriteStream, mkdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -49,7 +54,7 @@ export const REPORT_DIR = process.env.TPS_TEST_REPORT_DIR
   ? resolve(process.env.TPS_TEST_REPORT_DIR)
   : join(REPO, "test-reports");
 
-/** The two files a suite writes: its JUnit XML, and its console log. */
+/** The two files a suite writes: its JUnit XML (the guard's record), its console log (the CI record). */
 export function reportPaths(suite, reportDir = REPORT_DIR) {
   return {
     xml: join(reportDir, `${suite}.xml`),
@@ -60,12 +65,16 @@ export function reportPaths(suite, reportDir = REPORT_DIR) {
 /**
  * Run one suite. Resolves with the child's exit code (1 for a signal). The
  * child's output is forwarded to this process AND written to the suite's log,
- * so the CI step's own log still shows the tests and the guard can read the
- * per-file headers afterwards.
+ * so the CI step's own log still shows the tests. The suite's OWN report and log
+ * are deleted first: this run's report must be the one that gets read.
  */
 export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.env, reportDir = REPORT_DIR }) {
   const { xml, log } = reportPaths(suite, reportDir);
   mkdirSync(reportDir, { recursive: true });
+  // Stale artifacts go first — a report or log from an earlier step or run must
+  // not stand in for this one (the guard reads the XML; the log is the record).
+  rmSync(xml, { force: true });
+  rmSync(log, { force: true });
   const reporters = args.filter((arg) => arg.startsWith("--reporter"));
   const bunArgs = [
     "test",
@@ -88,8 +97,8 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
       rejectExit(err);
     });
     child.on("close", (code) => {
-      // Close the log stream before resolving: the guard reads it after this
-      // process is gone, and a truncated log could hide the file it needs.
+      // Close the log stream before resolving: the guard reads the report after
+      // this process is gone, and a truncated log is a truncated record.
       logStream.end(() => resolveExit(code ?? 1));
     });
   });
