@@ -10,7 +10,7 @@
  * (no remote.json) the bridge; else local (binding/maildir) or unknown.
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -142,5 +142,20 @@ describe("tps mail send — the CLI caller (cli#389)", () => {
     expect(res.status).toBe(0);
     // deliverToSandbox writes to the branch mail root's new/.
     expect(countJson(join(root, ".tps", "branch-office", "ember", "mail", "new"))).toBeGreaterThan(0);
+  });
+
+  test("an UNKNOWN recipient: exits NON-ZERO, names the failure, and creates no directory (cli#389 round 13)", () => {
+    // OFFICE (no host.json), no GAL entry, no maildir, no branch-office bridge
+    // → `unknown`. Before this guard the CLI fell through to a local write: it
+    // exited 0 and created ~/.tps/mail/stranger/new/, so a typo became silent
+    // loss AND the directory it created reclassified the typo as local.
+    const res = runMailSend(["stranger", "hello"]);
+    expect(res.status).not.toBe(0);
+    const out = `${res.stderr ?? ""}${res.stdout ?? ""}`;
+    expect(out).toContain("no route");
+    expect(out).toContain("stranger");
+    // Nothing was written, and no directory was created for the name.
+    expect(existsSync(join(mailDir, "stranger"))).toBe(false);
+    expect(countJson(join(mailDir, "stranger", "new"))).toBe(0);
   });
 });

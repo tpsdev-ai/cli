@@ -253,6 +253,20 @@ export async function runMail(args: MailArgs): Promise<void> {
         process.exit(1);
       }
 
+      // (cli#389 round 13) An UNKNOWN recipient — no binding, no GAL entry, no
+      // maildir, no branch-office bridge — is a NAMED failure on the CLI too,
+      // exactly as the shared rule and the plugin treat it. Falling through to
+      // `sendMessage` created `~/.tps/mail/<to>/new/` for a name nothing reads
+      // and exited 0, so a typo became silent loss — and the directory it
+      // created then reclassified that name as local on the next decision.
+      if (route.kind === "unknown") {
+        console.error(
+          `Refusing to send to '${to}': no route — '${to}' is not a local agent and not in the GAL. ` +
+            `Create the agent first, or add it to the GAL; nothing was written.`,
+        );
+        process.exit(1);
+      }
+
       // Direct Maildir send: args.message was already signed by
       // maybeSignEnvelopeBody above; `route.kind === "local"`, or the CLI's
       // fallback for an office recipient with no maildir yet.

@@ -17,9 +17,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import pluginModule from "../src/index.js";
-import { resolveObligationRetentionDays } from "../src/index.js";
+import { resolveObligationNackHoldMultiple, resolveObligationRetentionDays } from "../src/index.js";
 import {
   createObligation,
+  nackOwed,
   obligationPath,
   obligationsDir,
   readObligation,
@@ -493,5 +494,86 @@ describe("cli#389 round 12 — the owed-nack hold is bounded by age", () => {
     const abandoned = seen.warn.filter((m) => m.includes("nack-abandoned"));
     expect(abandoned.length, "logged once").toBe(1);
     expect(abandoned[0], "and BY NAME").toContain("owed-past");
+  });
+});
+
+// ── cli#389 round 13, item 2: the multiple is validated, and abandonment RELEASES the debt ──
+
+/**
+ * cli#389 round 13, item 2. Two defects in the round-12 hold:
+ *   - a multiple in (0,1) made the hold SHORTER than retention, so an owed
+ *     record was abandoned, kept by retention, and abandoned (and logged) again
+ *     on every sweep while the startup retry kept firing;
+ *   - abandonment did not release the debt, so a record retention kept stayed
+ *     `nackPending` and the retry never stopped.
+ * The multiple is now validated (>= 1, else the default, with a named log) and
+ * abandoning CLEARS `nackPending` and records `nackAbandonedAt`.
+ */
+describe("cli#389 round 13 — the hold multiple, and abandonment releasing the debt", () => {
+  function owedRecord(inboundId: string, ageDays: number): string {
+    const dir = obligationsDir(mailDir, AGENT);
+    mkdirSync(dir, { recursive: true });
+    const ts = daysAgo(ageDays);
+    const p = join(dir, `${inboundId}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify(
+        {
+          obligationId: `ob-${inboundId}`,
+          inboundId,
+          inboundTimestamp: ts,
+          from: "sender",
+          to: AGENT,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: "no-route",
+          nackPending: true,
+          lastTransitionAt: ts,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    return p;
+  }
+
+  it("rejects a hold multiple below 1 with a named log, and falls back to the default", () => {
+    const seen = { warn: [] as string[] };
+    const log = { warn: (m: string) => seen.warn.push(m) };
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 0.5 }, undefined, log)).toBe(4);
+    expect(seen.warn.filter((m) => m.includes("obligation-nack-hold-multiple-invalid")).length, "named once").toBe(1);
+    expect(seen.warn.join("\n")).toContain("below 1");
+    // A valid value (>= 1) is used as given; unset → the default.
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 1 }, undefined, { warn: () => {} })).toBe(1);
+    expect(resolveObligationNackHoldMultiple({ obligationNackHoldMultiple: 2.5 }, undefined, { warn: () => {} })).toBe(2.5);
+    expect(resolveObligationNackHoldMultiple({}, undefined, { warn: () => {} })).toBe(4);
+  });
+
+  it("abandons an owed record EXACTLY ONCE across two sweeps, and its retry stops", () => {
+    // A hold SHORTER than retention (nackHoldDays 2 < 7) is the case a sub-1
+    // multiple made reachable: the record is past the hold but still inside
+    // retention, so it SURVIVES — and would be abandoned and logged on every
+    // sweep unless abandoning releases the debt.
+    const p = owedRecord("owed-once", 5);
+    const seen = { warn: [] as string[] };
+    const log = { info: () => {}, warn: (m: string) => seen.warn.push(m) };
+
+    const first = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 2);
+    expect(first.abandonedForNack, "abandoned once").toBe(1);
+    expect(existsSync(p), "the record survives (still inside retention)").toBe(true);
+    const after = readObligation(mailDir, AGENT, "owed-once");
+    expect(after?.nackPending, "the debt is RELEASED — nackPending cleared").toBeFalsy();
+    expect(typeof after?.nackAbandonedAt, "and the abandonment is recorded").toBe("string");
+    expect(nackOwed(after), "so the record no longer owes a nack — the startup retry stops").toBe(false);
+
+    const second = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 2);
+    expect(second.abandonedForNack, "a second sweep abandons nothing").toBe(0);
+    expect(
+      seen.warn.filter((m) => m.includes("nack-abandoned")).length,
+      "nack-abandoned is logged exactly once",
+    ).toBe(1);
   });
 });

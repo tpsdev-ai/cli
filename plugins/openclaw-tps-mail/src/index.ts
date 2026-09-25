@@ -74,6 +74,7 @@ import {
   sweepTerminalObligations,
   transitionObligation,
   writeReceipt,
+  type ObligationRecord,
   type ObligationState,
   type ReceiptRecord,
   type ReceiptScanDirs,
@@ -150,11 +151,22 @@ export function resolveObligationRetentionDays(pluginCfg: any, channelCfg: any):
  *  pin one record per affected inbound indefinitely. */
 export const OBLIGATION_NACK_HOLD_MULTIPLE_KEY = "obligationNackHoldMultiple";
 export const DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE = 4;
-export function resolveObligationNackHoldMultiple(pluginCfg: any, channelCfg: any): number {
+export function resolveObligationNackHoldMultiple(pluginCfg: any, channelCfg: any, log?: any): number {
   for (const src of [pluginCfg, channelCfg]) {
     const v = src?.[OBLIGATION_NACK_HOLD_MULTIPLE_KEY];
     const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : Number.NaN;
-    if (Number.isFinite(n) && n > 0) return n;
+    if (!Number.isFinite(n)) continue;
+    if (n >= 1) return n;
+    // cli#389 round 13, item 2: a multiple BELOW 1 makes the hold SHORTER than
+    // the retention window, so an owed record is abandoned and then KEPT by
+    // retention — abandoned (and logged) again on every sweep, while the
+    // startup retry keeps firing for a debt nobody is going to pay. Reject it
+    // BY NAME and fall back to the default.
+    log?.warn?.(
+      `tps-mail: obligation-nack-hold-multiple-invalid: ${OBLIGATION_NACK_HOLD_MULTIPLE_KEY}=${n} is below 1 ` +
+        `(a hold shorter than the retention window would abandon an owed nack on every sweep); using the default ${DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE}`,
+    );
+    return DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE;
   }
   return DEFAULT_OBLIGATION_NACK_HOLD_MULTIPLE;
 }
@@ -162,8 +174,13 @@ export function resolveObligationNackHoldMultiple(pluginCfg: any, channelCfg: an
 /** The age bound (in days) for the owed-nack hold: `retentionDays` times the
  *  configured multiple. `retentionDays <= 0` (the sweep is disabled) disables
  *  the bound too — the sweep never runs. */
-export function resolveObligationNackHoldDays(retentionDays: number, pluginCfg: any, channelCfg: any): number {
-  return retentionDays * resolveObligationNackHoldMultiple(pluginCfg, channelCfg);
+export function resolveObligationNackHoldDays(
+  retentionDays: number,
+  pluginCfg: any,
+  channelCfg: any,
+  log?: any,
+): number {
+  return retentionDays * resolveObligationNackHoldMultiple(pluginCfg, channelCfg, log);
 }
 
 /** The OVERALL bound (ms) for one owed-nack retry — the connection AND the ACK
@@ -789,7 +806,24 @@ async function settleObligation(
     // cannot be written leaves the record where it is — logged by name, never
     // retried in a loop — and the obligation resolves on the next start.
     try {
-      transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "unconfirmed", { failure: s.reason }, ctx.log);
+      const appliedUnconfirmed = transitionObligation(
+        ctx.mailDir,
+        ctx.agent,
+        ctx.inboundId,
+        "unconfirmed",
+        { failure: s.reason },
+        ctx.log,
+      );
+      if (appliedUnconfirmed === null) {
+        // cli#389 round 13, item 3: a REFUSED transition (the record is gone or
+        // already terminal) is not a recorded outcome — say so and stop, exactly
+        // as the ack path does. Do not treat the refusal as a settled state.
+        const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+        ctx.log?.warn?.(
+          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
+        );
+        return "none";
+      }
     } catch (err: any) {
       ctx.log?.warn?.(
         `tps-mail: obligation-write-failed: could not record the unconfirmed outcome for ${ctx.inboundId} ` +
@@ -815,12 +849,32 @@ async function settleObligation(
   // the write-ahead whose own write failed. `transitionObligation` returns null
   // (not a throw) for a record that is GONE or already terminal; that is a
   // different case — nothing to settle, and the null is not an error.
+  let appliedFailed: ObligationRecord | null;
   try {
-    transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: failedOn, nackPending: true }, ctx.log);
+    appliedFailed = transitionObligation(
+      ctx.mailDir,
+      ctx.agent,
+      ctx.inboundId,
+      "failed",
+      { failure: failedOn, nackPending: true },
+      ctx.log,
+    );
   } catch (err: any) {
     ctx.log?.warn?.(
       `tps-mail: obligation-write-failed: could not record the failure for ${ctx.inboundId} ` +
         `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
+    );
+    return "none";
+  }
+  if (appliedFailed === null) {
+    // cli#389 round 13, item 3: the transition was REFUSED (the record is gone
+    // or already terminal) — do NOT stamp the inbound and do NOT send a nack
+    // mail for a failure that was never recorded. An await added to this window
+    // can therefore never leave a refused record stamped or nacked.
+    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    ctx.log?.warn?.(
+      `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
+        `the inbound keeps no nack stamp and no nack mail is sent`,
     );
     return "none";
   }
@@ -1890,7 +1944,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             retentionDays,
             log,
             Date.now(),
-            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]),
+            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
           );
         } catch (err: any) {
           log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);

@@ -278,6 +278,14 @@ describe("mail command", () => {
   async function run(args: string[], env: Record<string, string>): Promise<{ status: number; stdout: string; stderr: string }> {
     const home = env.HOME ?? join(tempRoot, "home");
     mkdirSync(home, { recursive: true });
+    // cli#389 round 13: `tps mail send` now REFUSES an `unknown` recipient (no
+    // GAL, no binding, no maildir, no bridge) instead of silently creating a
+    // maildir for a name nothing reads. These tests exercise LOCAL delivery, so
+    // make the recipient a local agent first — an existing `mailDir/<to>` is the
+    // office's local signal.
+    if (args[0] === "mail" && args[1] === "send" && typeof args[2] === "string" && env.TPS_MAIL_DIR) {
+      mkdirSync(join(env.TPS_MAIL_DIR, args[2]), { recursive: true });
+    }
     // Async spawn (NOT spawnSync): the stub Flair lives in THIS process, so the
     // event loop must stay free to answer the child's verification request.
     const proc = Bun.spawn(["bun", TPS_BIN, ...args], {

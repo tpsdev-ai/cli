@@ -141,6 +141,12 @@ export interface ObligationRecord {
    *  `nackPending` until a hand-off is recorded — the debt outlives a crash,
    *  never the other way round. */
   nackSentAt?: string;
+  /** cli#389 round 13, item 2: ISO time an owed nack was ABANDONED — the debt
+   *  was given up because the record sat past the hold window and the sender
+   *  still had no route. The abandonment CLEARS `nackPending` in the same write
+   *  (like `markNackSent` clears it on a hand-off), so it happens ONCE and the
+   *  startup retry no longer fires for that record. */
+  nackAbandonedAt?: string;
 }
 
 export interface ObligationLog {
@@ -301,6 +307,41 @@ export function markNackSent(
     log?.warn?.(
       `tps-mail: obligation-write-failed: could not record nackSentAt for ${inboundId} ` +
         `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later start may send the nack again`,
+    );
+    return false;
+  }
+}
+
+/**
+ * cli#389 round 13, item 2: GIVE UP an owed nack — the record sat past the hold
+ * window and the sender still had no route. Clears `nackPending` and records
+ * `nackAbandonedAt` in the same write, so the debt is RELEASED: `nackOwed`
+ * becomes false, the sweep no longer abandons (and logs) it on every pass, and
+ * the startup retry stops for that record. Unlike `markNackSent` this is not a
+ * hand-off — nothing was delivered — so the record keeps its OWN
+ * `lastTransitionAt` and ages out by normal retention from there.
+ *
+ * Best-effort by design: a store that cannot be written leaves `nackPending`
+ * set, so a later sweep abandons it again (logged by name). Returns true when
+ * the write landed.
+ */
+export function abandonOwedNack(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  log?: ObligationLog,
+  when?: string,
+): boolean {
+  const current = readObligation(mailDir, agent, inboundId);
+  if (!current || current.state !== "failed") return false;
+  const { nackPending: _cleared, ...rest } = current;
+  try {
+    writeObligation(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
+    return true;
+  } catch (err) {
+    log?.warn?.(
+      `tps-mail: obligation-write-failed: could not record the nack abandonment for ${inboundId} ` +
+        `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later sweep will abandon it again`,
     );
     return false;
   }
@@ -524,9 +565,24 @@ export function sweepTerminalObligations(
         continue;
       }
       res.abandonedForNack++;
+      // cli#389 round 13, item 2: RELEASE the debt in the same pass that gives up
+      // on it — clear `nackPending` and record `nackAbandonedAt`. Without the
+      // clear, a record retention then KEEPS would be abandoned and logged
+      // again on every sweep, and the startup retry would keep firing for a debt
+      // nobody is going to pay. Best-effort: an unwritable store keeps
+      // `nackPending`, so a later sweep abandons it again.
+      const recInbound = (record as { inboundId?: unknown }).inboundId;
+      const released = abandonOwedNack(
+        mailDir,
+        agent,
+        typeof recInbound === "string" ? recInbound : name.replace(/\.json$/, ""),
+        log,
+        new Date(nowMs).toISOString(),
+      );
       log?.warn?.(
         `tps-mail: nack-abandoned: ${name} has owed its nack past the hold window (${nackHoldDays} day(s)); ` +
-          `giving up the debt and letting normal retention apply`,
+          `the debt is released${released ? "" : " (the release could not be recorded, so a later sweep will abandon it again)"} ` +
+          `and normal retention applies to the record`,
       );
       // fall through to the normal terminal-retention rules below
     }

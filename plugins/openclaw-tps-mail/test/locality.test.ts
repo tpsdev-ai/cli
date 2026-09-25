@@ -120,6 +120,10 @@ const obligations = {
   failPostedTransition: false,
   failAckTransition: false,
   failReceiptScan: false,
+  // cli#389 round 13, item 3: make a transition to `failed` be REFUSED (a null
+  // return, not a throw) — the shape a record that is gone or already terminal
+  // produces — so a test can prove the verb stamps nothing and mails nothing.
+  refuseFailedTransition: false,
   beforeScan: null as null | ((expectedReplyId: string | undefined) => void),
 };
 const realObligations = { ...obligationsModule };
@@ -131,6 +135,9 @@ mock.module("../src/obligations.js", () => ({
     }
     if (obligations.failAckTransition && next === "acked") {
       throw new Error("injected: the ack transition threw");
+    }
+    if (obligations.refuseFailedTransition && next === "failed") {
+      return null; // refused, not thrown — obligations.ts returns null for that
     }
     return realObligations.transitionObligation(mailDir, agent, inboundId, next as any, patch, log);
   },
@@ -280,6 +287,7 @@ beforeEach(() => {
   obligations.failPostedTransition = false;
   obligations.failAckTransition = false;
   obligations.failReceiptScan = false;
+  obligations.refuseFailedTransition = false;
 });
 
 afterEach(() => {
@@ -1109,6 +1117,42 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
       expect(outcome.nackCount, "exactly one nack mail, from the verb").toBe(1);
       expect(outcome.afterRestart, "and a restart re-announces NOTHING").toBe(1);
     } finally {
+      obligations.beforeScan = null;
+    }
+  }, 20000);
+
+  it("(j) a REFUSED transition to `failed` is not recorded: NO nack mail and NO nack stamp (cli#389 round 13, item 3)", async () => {
+    // Same attributable-quarantine verdict as (h), but the transition to `failed`
+    // is REFUSED (a null return — the record is gone or already terminal, the
+    // shape an `await` added to that window would expose). A refusal is not a
+    // recorded outcome: nothing may be stamped and no nack mail may be sent.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    obligations.refuseFailedTransition = true;
+    obligations.beforeScan = () => {
+      const names = readdirSafe(outboxNew()).filter((f) => f.endsWith(".json"));
+      if (names.length !== 1) return;
+      writeFileSync(join(outboxNew(), names[0]!), "{ torn by an external fault");
+      drainOutbox();
+    };
+    try {
+      const outcome = await inFreshHome(outboxSetup, async () => {
+        const o = await routeViaDispatcher("flint", ["anvil"]);
+        const isNack = (r: any) => typeof r?.headers?.["X-TPS-Nack"] === "string";
+        // Give any (wrong) async send a chance to appear before asserting none.
+        await waitFor(() => scanFor([outboxNew(), outboxSent()], isNack).length > 0, 800);
+        return { ...o, nackCount: scanFor([outboxNew(), outboxSent()], isNack).length };
+      });
+
+      expect(outcome.obligation?.state, "the commit is kept — the failure was never recorded").toBe("posted");
+      expect(outcome.obligation?.failure, "no failure is recorded").toBeUndefined();
+      expect(outcome.inboundNackedAt, "the inbound is NOT stamped").toBeNull();
+      expect(outcome.nackCount, "and NO nack mail is sent for a failure that was never recorded").toBe(0);
+      expect(
+        outcome.warns.some((w) => w.includes("refusing to record the failure")),
+        "the refusal is logged by name",
+      ).toBe(true);
+    } finally {
+      obligations.refuseFailedTransition = false;
       obligations.beforeScan = null;
     }
   }, 20000);
