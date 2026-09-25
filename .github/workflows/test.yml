@@ -81,6 +81,14 @@ jobs:
       - run: |
           chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
       - run: bun run test
+      # cli#411 — the guard is its OWN step, never a clause of a suite: a guard
+      # that ran inside a suite could be taken down by dropping that suite from
+      # the wiring, which is the failure it exists to catch. It reads the wiring
+      # (the package scripts, and this workflow's own steps as YAML) rather than
+      # searching for text, so a clause moved into an unused script, or commented
+      # out, does not read as wired.
+      - name: Every test file is run by a suite CI runs (cli#411)
+        run: node scripts/check-test-coverage.mjs
       - name: openclaw-tps-mail plugin tests (isolated HOME launcher)
         # cli#398: the plugin's outbox/archive writers resolve ~/.tps and the CLI
         # mail dirs from the process HOME, so the suite MUST run through its

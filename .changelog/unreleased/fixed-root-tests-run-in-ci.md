@@ -9,17 +9,23 @@
   `bun test ./test`, so that file, and anything added beside it, runs in the
   `Unit & Integration Tests` job on every PR.
 
-  `packages/cli/test/test-coverage.test.ts` keeps it that way. It walks the tree
-  for `*.test.ts` / `*.spec.ts` / `*_test.ts` files, derives the directories a
-  suite runs from the root `test` script and from the workflow step that runs the
-  plugin's isolated launcher, and fails naming every file outside them — so a
-  test that no suite runs cannot land unnoticed again, whether it is new or
-  became uncovered because a step was dropped from the wiring. The wiring is
-  itself asserted, by an exact string in the file that wires each suite, so
-  removing a suite fails the guard instead of silently orphaning its files.
+  `scripts/check-test-coverage.mjs` keeps it that way, as its OWN step of that
+  job rather than as a test inside a suite. A guard that ran inside a suite could
+  be disarmed by dropping that suite from the wiring — the exact failure it exits
+  to catch — so it is a standalone script: dropping any suite clause leaves it
+  running, and failing, naming what it lost.
 
-  It lives in the CLI suite rather than in the root directory it polices: a guard
-  inside `test/` would be run only because of the wiring it checks, so deleting
-  that clause from the root `test` script would disarm it silently.
+  It reads the wiring rather than searching for text. The covered roots are
+  derived from the root `test` script (`scripts.test`, and every script it calls,
+  followed through `cd` and `bun run <name>`) and from the workflow's own steps,
+  parsed as YAML, whose `run:` values are shell programs — so a clause moved into
+  an unused script, or commented out in YAML or on a shell line, does not read as
+  wired. The plugin's launcher (`plugins/openclaw-tps-mail/scripts/run-tests.mjs`)
+  is read for the root IT runs, `bun test test/`, so the plugin's covered root is
+  `plugins/openclaw-tps-mail/test` and a test file elsewhere in the plugin is
+  reported as an orphan. Where a step or script names a test run but no root can
+  be read from it — a launcher the guard cannot open, a `bun test` whose
+  arguments are a variable — it fails and says so instead of widening the covered
+  set, and it names every test file no suite runs.
 
   (Refs #411)

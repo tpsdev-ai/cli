@@ -1,96 +1,361 @@
+/**
+ * test-coverage.test.ts — the cli#411 wiring guard's own tests.
+ *
+ * The guard is `scripts/check-test-coverage.mjs`: a standalone script, run as
+ * its own step of the Unit & Integration Tests job. It is NOT this file — the
+ * guard was moved out of this suite in round 2, because a guard that ran only
+ * because the CLI suite ran could be disarmed by dropping the CLI suite from
+ * the wiring, which is exactly the failure it exists to catch.
+ *
+ * What is left here is the guard's own test suite. It drives the guard's
+ * exported functions over fixtures, so every way the wiring can go quiet is a
+ * case below, and `checkTestCoverage` against the real repository is asserted
+ * green the same way the CI step asserts it. A fixture that says "the clause is
+ * in the file" is not enough anywhere: the guard reads what RUNS.
+ */
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import yaml from "js-yaml";
+import {
+  GUARD_COMMAND,
+  GUARD_SCRIPT,
+  REPO,
+  TEST_FILE_NAME,
+  WORKFLOW_FILE,
+  bunTestCalls,
+  checkTestCoverage,
+  exitCodeFor,
+  formatReport,
+  posix,
+  shellCommands,
+  stripModuleComments,
+  stripShellComments,
+  testishScriptName,
+  walkTestFiles,
+  words,
+} from "../../../scripts/check-test-coverage.mjs";
 
-/**
- * cli#411 — a test file no suite runs is a test that cannot fail.
- *
- * `test/security-properties.test.ts` at the repo root asserted the supervisor's
- * socket, secrets-gate, signal and launch properties, and nothing ran it:
- * `bun run test` walked the three package suites only, and no workflow step
- * invoked the root directory. These assertions are the wiring's own guard.
- *
- * WHY THIS FILE LIVES IN THIS SUITE, NOT IN THE DIRECTORY IT POLICES.
- * A guard inside the root `test/` directory would be run only because of the
- * very wiring it checks — delete that one clause from the root `test` script
- * and the guard stops running, silently, which is the failure it exists to
- * catch. This suite is run by `bun run test` on every PR today, so the guard
- * runs whether or not the root directory is wired, and says which it is.
- */
+type Files = Record<string, string>;
 
-/** The repo root, from this file's own location: <root>/packages/cli/test/…. */
-const ROOT = resolve(import.meta.dir, "../../..");
-
-function rootFile(path: string): string {
-  return readFileSync(join(ROOT, path), "utf-8");
+interface Fixture {
+  files: Files;
+  testFiles: string[];
 }
 
-/** The file names bun's test discovery picks up (`.` and `_` forms, `.test`/`.spec`). */
-const TEST_FILE_NAME = /(?:[._](?:test|spec))\.[cm]?[jt]sx?$/;
+/** The root `test` script as it stands: three package suites, then the root dir. */
+const ROOT_TEST_SCRIPT =
+  "cd packages/agent && bun test && cd ../cli && bun test && cd ../pi-tps-mail && bun test && " +
+  "cd ../.. && bun test ./test";
 
-/** Forward-slashed: `relative()` yields `\`-separated paths on Windows. */
-const posix = (path: string): string => path.replaceAll("\\", "/");
+/** The plugin's launcher, reduced to the line that names the roots it runs. */
+const LAUNCHER = [
+  'import { spawn } from "node:child_process";',
+  'const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");',
+  "const passthrough = process.argv.slice(2);",
+  'const child = spawn("bun", ["test", ...(passthrough.length ? passthrough : ["test/"])], {',
+  "  cwd: pluginDir,",
+  "});",
+].join("\n");
 
-/** Every test file in the repo, repo-relative and sorted. `node_modules`/`.git` aside. */
-function testFiles(): string[] {
-  const found: string[] = [];
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === "node_modules" || entry.name === ".git") continue;
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) walk(path);
-      else if (TEST_FILE_NAME.test(entry.name)) found.push(posix(relative(ROOT, path)));
-    }
-  };
-  walk(ROOT);
-  return found.sort();
-}
+/** A workflow shaped like the real one: the root test script, and the plugin step. */
+const WORKFLOW = [
+  "jobs:",
+  "  test:",
+  "    name: Unit & Integration Tests",
+  "    steps:",
+  "      - run: bun run test",
+  "      - name: openclaw-tps-mail plugin tests (isolated HOME launcher)",
+  "        working-directory: plugins/openclaw-tps-mail",
+  "        run: |",
+  "          npm ci --ignore-scripts",
+  "          npm run build",
+  "          bun run test",
+].join("\n");
 
-/** The steps of the job that runs the tests, split on the step-list indentation. */
-function ciSteps(): string[] {
-  return rootFile(".github/workflows/test.yml").split(/\n(?= {6}- )/);
-}
+const PLUGIN_STEP = [
+  "      - name: openclaw-tps-mail plugin tests (isolated HOME launcher)",
+  "        working-directory: plugins/openclaw-tps-mail",
+  "        run: |",
+  "          npm ci --ignore-scripts",
+  "          npm run build",
+  "          bun run test",
+].join("\n");
 
-/** The directories a workflow step runs its own test script in. */
-function ciSuiteDirs(): string[] {
-  return ciSteps()
-    .filter((step) => /\brun test\b/.test(step))
-    .map((step) => /working-directory:\s*(\S+)/.exec(step)?.[1])
-    .filter((dir): dir is string => dir !== undefined);
-}
-
-/**
- * Every directory a suite runs, with the wiring text that proves it is still
- * run. The proof is an exact substring of the file that wires the suite, so
- * dropping a suite from the wiring fails here rather than quietly orphaning
- * every file under it.
- */
-const WIRED: { dir: string; file: string; contains: string }[] = [
-  { dir: "packages/agent", file: "package.json", contains: "cd packages/agent && bun test" },
-  { dir: "packages/cli", file: "package.json", contains: "cd ../cli && bun test" },
-  { dir: "packages/pi-tps-mail", file: "package.json", contains: "cd ../pi-tps-mail && bun test" },
-  { dir: "test", file: "package.json", contains: "bun test ./test" },
+/** The four suites and the file each one owns, for the "clause dropped" cases. */
+const SUITES = [
+  { clause: "cd packages/agent && bun test && ", file: "packages/agent/test/a.test.ts", root: "packages/agent" },
+  { clause: "cd ../cli && bun test && ", file: "packages/cli/test/b.test.ts", root: "packages/cli" },
+  { clause: "cd ../pi-tps-mail && bun test && ", file: "packages/pi-tps-mail/test/c.test.ts", root: "packages/pi-tps-mail" },
+  { clause: "cd ../.. && bun test ./test", file: "test/e.test.ts", root: "test" },
 ];
 
-/**
- * The directories a suite really runs right now: a `WIRED` entry counts only
- * while its proof is present in the file that wires it. A directory whose
- * wiring was dropped stops counting here, so the files under it are reported as
- * orphans by the scan below instead of being covered on the table's say-so.
- */
-function coveredDirs(): string[] {
-  const fromScript = WIRED.filter((w) => rootFile(w.file).includes(w.contains)).map((w) => w.dir);
-  return [...fromScript, ...ciSuiteDirs()];
+function fixture(override: Partial<Fixture> = {}): Fixture {
+  return {
+    files: {
+      "package.json": JSON.stringify({ scripts: { test: ROOT_TEST_SCRIPT } }),
+      [WORKFLOW_FILE]: WORKFLOW,
+      "plugins/openclaw-tps-mail/package.json": JSON.stringify({
+        scripts: { test: "node scripts/run-tests.mjs" },
+      }),
+      "plugins/openclaw-tps-mail/scripts/run-tests.mjs": LAUNCHER,
+      ...(override.files ?? {}),
+    },
+    testFiles: override.testFiles ?? [
+      "packages/agent/test/a.test.ts",
+      "packages/cli/test/b.test.ts",
+      "packages/pi-tps-mail/test/c.test.ts",
+      "plugins/openclaw-tps-mail/test/d.test.ts",
+      "test/e.test.ts",
+    ],
+  };
 }
 
-function covers(dir: string, file: string): boolean {
-  return file === dir || file.startsWith(`${dir}/`);
+const FIXTURE_ROOT = "/fixture";
+
+function check(fixtureFiles: Fixture) {
+  const { files } = fixtureFiles;
+  return checkTestCoverage({
+    rootDir: FIXTURE_ROOT,
+    readFile: (path: string) => {
+      const rel = posix(relative(FIXTURE_ROOT, path));
+      return Object.hasOwn(files, rel) ? files[rel] : undefined;
+    },
+    listTestFiles: () => fixtureFiles.testFiles,
+  });
 }
 
-describe("every test file is run by a suite CI runs (cli#411)", () => {
+/** The guard against the actual repository — the CI step's own assertion. */
+function checkRepo() {
+  return checkTestCoverage({
+    rootDir: REPO,
+    readFile: (path: string) => {
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        return undefined;
+      }
+    },
+    listTestFiles: () => walkTestFiles(REPO),
+  });
+}
+
+const rootsOf = (result: { roots: { root: string }[] }) => result.roots.map((entry) => entry.root);
+
+describe("the guard is its own CI step, not a suite clause (cli#411 round 2)", () => {
+  test("it runs as its own step of the Unit & Integration Tests job", () => {
+    const workflow = yaml.load(readFileSync(join(REPO, WORKFLOW_FILE), "utf8")) as {
+      jobs: Record<string, { steps: { run?: string; "working-directory"?: string }[] }>;
+    };
+    const steps = workflow.jobs.test.steps;
+    const guardSteps = steps.filter((step) => step.run?.includes(GUARD_SCRIPT));
+    // Exactly one step, and it is the guard itself — not a suite that runs it.
+    expect(guardSteps.length, "the guard must be exactly one step of the job").toBe(1);
+    expect(guardSteps[0].run?.trim()).toBe(GUARD_COMMAND);
+    expect(guardSteps[0]["working-directory"]).toBeUndefined();
+  });
+
+  test("the guard is a script, not a test file inside a suite it polices", () => {
+    expect(GUARD_SCRIPT.startsWith("scripts/")).toBe(true);
+    expect(TEST_FILE_NAME.test(GUARD_SCRIPT)).toBe(false);
+  });
+
+  test("dropping a suite clause leaves the guard failing, not silent", () => {
+    // The round-2 property, stated directly: with any one suite clause gone the
+    // guard still returns a failing verdict (exit 1) naming what it lost.
+    for (const { clause, file } of SUITES) {
+      const f = fixture({
+        files: { "package.json": JSON.stringify({ scripts: { test: ROOT_TEST_SCRIPT.replace(clause, "") } }) },
+      });
+      const result = check(f);
+      expect(result.orphans, `expected ${file} to be orphaned`).toContain(file);
+      expect(exitCodeFor(result), `${file}'s suite clause`).toBe(1);
+      expect(formatReport(result)).toContain("FAILED");
+    }
+    const noPluginStep = fixture({ files: { [WORKFLOW_FILE]: WORKFLOW.replace(PLUGIN_STEP, "") } });
+    const result = check(noPluginStep);
+    expect(result.orphans).toContain("plugins/openclaw-tps-mail/test/d.test.ts");
+    expect(exitCodeFor(result)).toBe(1);
+  });
+});
+
+describe("the covered roots come from configuration (cli#411)", () => {
+  test("an untouched fixture is green, and derives all five roots", () => {
+    const result = check(fixture());
+    expect(result.unresolved).toEqual([]);
+    expect(rootsOf(result).sort()).toEqual([
+      "packages/agent",
+      "packages/cli",
+      "packages/pi-tps-mail",
+      "plugins/openclaw-tps-mail/test",
+      "test",
+    ]);
+    expect(result.orphans).toEqual([]);
+    expect(result.ok).toBe(true);
+    expect(exitCodeFor(result)).toBe(0);
+  });
+
+  test("the plugin's root is the launcher's test root, not the plugin directory", () => {
+    // cli#411 round 2, item 3: the launcher runs `bun test test/` inside the
+    // plugin, so the plugin DIRECTORY is not a covered root.
+    const result = check(fixture());
+    expect(rootsOf(result)).toContain("plugins/openclaw-tps-mail/test");
+    expect(rootsOf(result)).not.toContain("plugins/openclaw-tps-mail");
+  });
+
+  test("a test file under the plugin but outside its test/ is an orphan", () => {
+    const f = fixture();
+    f.testFiles = [...f.testFiles, "plugins/openclaw-tps-mail/extra.test.ts"];
+    const result = check(f);
+    expect(result.orphans).toEqual(["plugins/openclaw-tps-mail/extra.test.ts"]);
+    expect(exitCodeFor(result)).toBe(1);
+  });
+
+  test("a clause in a script nothing runs covers nothing", () => {
+    const f = fixture({
+      files: {
+        "package.json": JSON.stringify({
+          scripts: {
+            test: "cd packages/agent && bun test",
+            "test:root": "cd ../.. && bun test ./test", // never called
+          },
+        }),
+      },
+    });
+    // The wiring text IS in the file — a search over package.json would pass.
+    expect(f.files["package.json"]).toContain("bun test ./test");
+    const result = check(f);
+    expect(result.orphans).toContain("test/e.test.ts");
+    expect(exitCodeFor(result)).toBe(1);
+  });
+
+  test("a clause in a comment covers nothing — a YAML comment and a shell one", () => {
+    const yamlComment = fixture({
+      files: {
+        [WORKFLOW_FILE]: WORKFLOW.replace(
+          PLUGIN_STEP,
+          "      # - working-directory: plugins/openclaw-tps-mail\n      #   run: bun run test",
+        ),
+      },
+    });
+    // The text is still in the workflow file — counting text would pass.
+    expect(yamlComment.files[WORKFLOW_FILE]).toContain("run: bun run test");
+    const fromYaml = check(yamlComment);
+    expect(fromYaml.orphans).toContain("plugins/openclaw-tps-mail/test/d.test.ts");
+    expect(exitCodeFor(fromYaml)).toBe(1);
+
+    const shellComment = fixture({
+      files: { [WORKFLOW_FILE]: WORKFLOW.replace("          bun run test", "          # bun run test") },
+    });
+    const fromShell = check(shellComment);
+    expect(fromShell.orphans).toContain("plugins/openclaw-tps-mail/test/d.test.ts");
+    expect(exitCodeFor(fromShell)).toBe(1);
+  });
+
+  test("each suite clause removed is caught, naming that suite's files", () => {
+    for (const { clause, file, root } of SUITES) {
+      const f = fixture({
+        files: { "package.json": JSON.stringify({ scripts: { test: ROOT_TEST_SCRIPT.replace(clause, "") } }) },
+      });
+      const result = check(f);
+      expect(rootsOf(result), `${root} must no longer be covered`).not.toContain(root);
+      expect(result.orphans, `${file} must be reported`).toContain(file);
+      expect(exitCodeFor(result)).toBe(1);
+    }
+  });
+
+  test("a test run the guard cannot read is UNRESOLVED, never assumed covered", () => {
+    // The launcher is gone: `bun run test` names a test run whose roots are unreadable.
+    const missing = fixture();
+    delete missing.files["plugins/openclaw-tps-mail/scripts/run-tests.mjs"];
+    const unreadable = check(missing);
+    expect(unreadable.unresolved.length).toBeGreaterThan(0);
+    expect(exitCodeFor(unreadable)).toBe(1);
+    expect(formatReport(unreadable)).toContain("UNRESOLVED");
+
+    // The launcher passes a VARIABLE: the roots it runs are unknown, so the
+    // guard must not widen to the plugin directory and must not pass.
+    const dynamic = fixture({
+      files: {
+        "plugins/openclaw-tps-mail/scripts/run-tests.mjs":
+          'const child = spawn("bun", ["test", ...args], { cwd: pluginDir });\n',
+      },
+    });
+    const guessed = check(dynamic);
+    expect(guessed.unresolved.some((entry) => entry.source.includes("run-tests.mjs"))).toBe(true);
+    expect(rootsOf(guessed)).not.toContain("plugins/openclaw-tps-mail");
+    expect(exitCodeFor(guessed)).toBe(1);
+  });
+
+  test("a launcher whose only invocation is in a docblock is unresolved, not the cwd", () => {
+    // A traced module's own documentation must not widen the covered set: with
+    // the invocation commented out, `bun run test` has no readable root.
+    const f = fixture({
+      files: {
+        "plugins/openclaw-tps-mail/scripts/run-tests.mjs":
+          '// spawn("bun", ["test", "test/"]);\nconsole.log("nothing runs tests here");\n',
+      },
+    });
+    const result = check(f);
+    expect(result.unresolved.length).toBeGreaterThan(0);
+    expect(rootsOf(result)).not.toContain("plugins/openclaw-tps-mail");
+    expect(exitCodeFor(result)).toBe(1);
+  });
+
+  test("a bare `bun test` at the repo root covers the repository, as bun would", () => {
+    const f = fixture({
+      files: { [WORKFLOW_FILE]: "jobs:\n  test:\n    steps:\n      - run: cd packages/agent && bun test\n" },
+    });
+    f.testFiles = ["packages/agent/test/a.test.ts", "packages/agent/test/deeper/b.test.ts"];
+    const result = check(f);
+    expect(rootsOf(result)).toEqual(["packages/agent"]);
+    expect(result.orphans).toEqual([]);
+  });
+});
+
+describe("reading shell and module wiring (cli#411)", () => {
+  test("comments are not commands, quoted hashes are not comments", () => {
+    expect(stripShellComments("bun run test # not this\n")).toBe("bun run test \n");
+    expect(stripShellComments("echo \"a # b\"\n")).toBe("echo \"a # b\"\n");
+    expect(stripShellComments("# bun test ./test\nbun run test\n")).toBe("\nbun run test\n");
+    expect(shellCommands("a\nb && c || d; e")).toEqual(["a", "b", "c", "d", "e"]);
+    expect(words('cd "a b" && bun test')).toEqual(["cd", "a b", "&&", "bun", "test"]);
+  });
+
+  test("a module's comments are not invocations", () => {
+    expect(stripModuleComments('// spawn("bun", ["test", "test/"]);\nspawn("bun", ["test"]);')).toBe(
+      '\nspawn("bun", ["test"]);',
+    );
+    expect(stripModuleComments('/* spawn("bun", ["test"]); */\nx()\n')).toBe("\nx()\n");
+    expect(stripModuleComments('const url = "a // b"; // gone\n')).toBe('const url = "a // b"; \n');
+  });
+
+  test("a test-ish script name is recognised, a shell fixture is not", () => {
+    for (const name of ["test", "test:unit", "test:raw"]) expect(testishScriptName(name), name).toBe(true);
+    for (const name of ["build", "lint:ci", "pretest-x", "testing"]) {
+      expect(testishScriptName(name), name).toBe(false);
+    }
+  });
+
+  test("the launcher's bun arguments are read as literals", () => {
+    expect(bunTestCalls(LAUNCHER)).toEqual([{ kind: "test", args: ["test/"], dynamic: false }]);
+    // A literal default inside a ternary is the default CI runs.
+    expect(bunTestCalls('spawn("bun", ["test", ...(keep ? keep : ["test/", "x.test.ts"])]);')).toEqual([
+      { kind: "test", args: ["test/", "x.test.ts"], dynamic: false },
+    ]);
+    // No path literal, only a variable: the guard must not invent one.
+    expect(bunTestCalls('spawn("bun", ["test", ...args]);')).toEqual([
+      { kind: "test", args: [], dynamic: true },
+    ]);
+    // A bare `bun test` is not dynamic: it runs the cwd.
+    expect(bunTestCalls('spawn("bun", ["test"]);')).toEqual([{ kind: "test", args: [], dynamic: false }]);
+    // `bun run <script>` is followed, not guessed.
+    expect(bunTestCalls('spawn("bun", ["run", "test:raw"]);')).toEqual([{ kind: "run", name: "test:raw" }]);
+  });
+});
+
+describe("the real repository's wiring (cli#411)", () => {
   test("the scan's filename pattern matches every name bun discovers", () => {
-    // bun discovers the `.` and `_` forms of both words (measured on 1.3.10):
-    // a `_spec` file left out of the pattern would be an orphan the scan misses.
     for (const name of ["x.test.ts", "x_test.ts", "x.spec.ts", "x_spec.ts", "x.test.js", "x_spec.mjs"]) {
       expect(TEST_FILE_NAME.test(name), name).toBe(true);
     }
@@ -99,50 +364,28 @@ describe("every test file is run by a suite CI runs (cli#411)", () => {
   });
 
   test("discovered paths compare against forward-slash prefixes (Windows-safe)", () => {
-    // `relative()` yields `\`-separated paths on Windows; the covered
-    // directories and the assertions here are written with `/`.
     expect(posix("packages\\cli\\test\\x.test.ts")).toBe("packages/cli/test/x.test.ts");
-    expect(testFiles().every((file) => !file.includes("\\"))).toBe(true);
+    expect(walkTestFiles(REPO).every((file) => !file.includes("\\"))).toBe(true);
   });
 
-  test("the root test/ directory is wired into the root test script", () => {
-    // The regression cli#411 filed: the root directory's tests ran nowhere.
-    expect(rootFile("package.json")).toContain("bun test ./test");
-    expect(testFiles().filter((file) => covers("test", file)).length).toBeGreaterThan(0);
-  });
-
-  test("each package suite is still wired into the root test script", () => {
-    for (const { dir, file, contains } of WIRED) {
-      expect(rootFile(file), `${dir} is no longer run from ${file}`).toContain(contains);
-    }
-  });
-
-  test("the plugin suite is still wired into a workflow step", () => {
-    expect(ciSuiteDirs()).toContain("plugins/openclaw-tps-mail");
-  });
-
-  test("no test file lives outside a directory a suite runs", () => {
-    const files = testFiles();
-    // The walk must have seen the repo: a scan that found nothing (a moved
-    // ROOT, a renamed pattern) would otherwise read as "no orphans".
-    expect(files.length).toBeGreaterThan(100);
-    expect(files).toContain("test/security-properties.test.ts");
-
-    const dirs = coveredDirs();
-    const orphans = files.filter((file) => !dirs.some((dir) => covers(dir, file)));
-
-    expect(
-      orphans,
-      "test files no suite runs — wire a runner for them (a suite in the root `test` " +
-        "script, or a step in .github/workflows/test.yml) or move them under a " +
-        `directory that is already run:\n  ${orphans.join("\n  ")}`,
-    ).toEqual([]);
-  });
-
-  test("every covered directory holds at least one test", () => {
-    const files = testFiles();
-    for (const dir of coveredDirs()) {
-      expect(files.some((file) => covers(dir, file)), `no test files under ${dir}`).toBe(true);
-    }
+  test("every test file in the repository is inside a suite CI runs", () => {
+    const result = checkRepo();
+    // The walk must have seen the repository: a scan that found nothing (a moved
+    // root, a renamed pattern) would otherwise read as "no orphans".
+    expect(result.files.length).toBeGreaterThan(100);
+    expect(result.files).toContain("test/security-properties.test.ts");
+    // The root test/ directory is wired into the root test script (the cli#411
+    // regression), and the plugin's root is its test/ directory (round 2).
+    expect(result.unresolved).toEqual([]);
+    expect(rootsOf(result).sort()).toEqual([
+      "packages/agent",
+      "packages/cli",
+      "packages/pi-tps-mail",
+      "plugins/openclaw-tps-mail/test",
+      "test",
+    ]);
+    expect(result.orphans).toEqual([]);
+    expect(result.emptyRoots).toEqual([]);
+    expect(result.ok).toBe(true);
   });
 });
