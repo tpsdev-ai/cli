@@ -5,13 +5,22 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write
-  id-token: write
+# Least privilege, per job (slice S1b of the release auto-tag design,
+# tpsdev-ai/flair#1890). Nothing is granted at the top level: a job that forgets
+# its block gets no token scopes at all, rather than every job inheriting the
+# union of everything this release needs. Each block names the step that needs
+# the grant; packages/cli/test/release-workflow-permissions.test.ts fails if the
+# union grows back, if a job's grants widen, or if an OIDC token can be minted
+# outside the publishing job.
+permissions: {}
 
 jobs:
   preflight:
     name: Release Preflight
+    # contents: read — actions/checkout (fetch-depth 0) and the read-only tag
+    # checks below. Nothing in this job talks to the API.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -59,6 +68,13 @@ jobs:
           - target: bun-linux-x64
             pkg: cli-linux-x64
             artifact: tps-linux-x64
+    # contents: read — actions/checkout, and socketdev/action, which fetches its
+    # CLI through the GitHub API with the job token (a read). The binary build
+    # and the checksum are local, and the artifact upload transfers within THIS
+    # workflow run and so needs no GITHUB_TOKEN scope (actions: read/write are
+    # required only for artifacts from other runs).
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -112,6 +128,12 @@ jobs:
   smoke-compiled-binary:
     name: Smoke compiled binary
     needs: preflight
+    # contents: read — actions/checkout, and socketdev/action, which fetches its
+    # CLI through the GitHub API with the job token (a read). The build and all
+    # four smoke checks (--version, identity init, the Noise handshake, the
+    # no-baked-paths grep) run on the runner.
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -175,6 +197,12 @@ jobs:
     name: Publish npm packages
     needs: [build-binaries, smoke-compiled-binary]
     runs-on: ubuntu-latest
+    # contents: read — actions/checkout (the artifact downloads are same-run,
+    # so they need no scope of their own).
+    # id-token: write — the ONLY grant in this workflow that mints an OIDC
+    # token, and the step that needs it is "Stage-publish all packages (OIDC
+    # trusted publishing)": `npm stage publish` exchanges it for a short-lived
+    # npm publish credential. No other job has a use for an OIDC token.
     permissions:
       contents: read
       id-token: write
@@ -502,6 +530,13 @@ jobs:
     # release advertises a version `npm install` will not yet give you.
     needs: [build-binaries, publish-packages]
     runs-on: ubuntu-latest
+    # contents: write — the one repository write in this workflow, and the step
+    # that needs it is "Publish checksums to GitHub release":
+    # softprops/action-gh-release creates the release and attaches the binaries
+    # and their checksums, authenticating with the GITHUB_TOKEN below. The
+    # artifact download is same-run, so it needs no scope of its own.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
