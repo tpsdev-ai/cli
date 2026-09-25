@@ -707,8 +707,9 @@ describe("cli#389 round 8 — the commit is a persisted state of the obligation 
  * item 4 — A TERMINAL OBLIGATION REFUSES `delivering`. `transitionObligation`
  * returns null for a refusal (rather than the old record), so `markDelivering`
  * can tell a landed write-ahead from a refused one: a final arriving after the
- * deadline settled the obligation is logged `late-final-refused` and NOT
- * delivered, instead of being delivered after the sender was told it failed.
+ * obligation CLOSED is logged `late-final-refused` and NOT delivered. Closure is
+ * the reason (cli#389 round 10, item 3): an obligation can also close as
+ * `unconfirmed`, which tells the sender nothing at all.
  */
 describe("cli#389 round 9 — an old stamp is not a verdict, and a late final is refused", () => {
   const R9_OBLIGATION = "ob-round9";
@@ -819,4 +820,130 @@ describe("cli#389 round 9 — an old stamp is not a verdict, and a late final is
     await h.stop();
   }, 20000);
   });
+
+// ── round 10: the nack mail is durable and at-least-once ────────────────────
+
+/**
+ * cli#389 round 10, item 1. The verb wrote `failed`, stamped the inbound and
+ * then started an UNAWAITED send — so a crash between settling and sending, or a
+ * send that could not be delivered, left the sender never told, and restart
+ * recovery skipped terminal records entirely. The nack is now carried ON THE
+ * RECORD (`nackPending`, cleared together with `nackSentAt`) and re-sent by the
+ * next start whenever it is still owed. AT-LEAST-ONCE, not exactly-once.
+ *
+ * The two cases below are the two durable shapes that leaves:
+ *   (a) the settle LANDED and the send never happened (a crash in between);
+ *   (b) the settle landed and the send could not be delivered (no route).
+ * Both are read back from the RECORD, never from the cur/ stamp — the stamp is
+ * written before the send, so it can never prove the sender was told.
+ */
+describe("cli#389 round 10 — a settled failure's nack mail survives a crash", () => {
+  const R10_OBLIGATION = "ob-round10";
+
+  /** The durable state a crash between settling the failure and sending its nack
+   *  leaves: a `failed` record still owing the mail, and the unacked cur/ record
+   *  beside it (stamped, exactly as the settle wrote it before the send). */
+  function seedNackOwed(agentId: string, inboundId: string, reason: string): void {
+    mkdirSync(resolve(tempMailDir, agentId, "cur"), { recursive: true });
+    mkdirSync(resolve(tempMailDir, agentId, ".obligations"), { recursive: true });
+    writeFileSync(
+      resolve(tempMailDir, agentId, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
+      JSON.stringify(
+        {
+          id: inboundId,
+          from: "flint",
+          to: agentId,
+          body: buildSignedBody("flint", agentId, "x", FLINT_SEED),
+          timestamp: new Date().toISOString(),
+          read: false,
+          nackedAt: new Date().toISOString(),
+          nackReason: reason,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    writeFileSync(
+      resolve(tempMailDir, agentId, ".obligations", `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId: R10_OBLIGATION,
+          inboundId,
+          inboundTimestamp: new Date().toISOString(),
+          from: "flint",
+          to: agentId,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: reason,
+          nackPending: true,
+          lastTransitionAt: new Date().toISOString(),
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  }
+
+  it("R10-a: a crash between settling the failure and sending its nack → the next start SENDS it once, and the record says so", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r10-crash";
+    seedNackOwed(agentId, inboundId, "receipt-malformed");
+
+    const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const arrived = await pollUntil(() => nackMailsIn(flintNew, "receipt-malformed").length === 1, 3000);
+    expect(arrived, "the next start tells the sender").toBe(true);
+
+    const rec = obligationFile(agentId, inboundId);
+    expect(rec?.state, "the record keeps the terminal failure").toBe("failed");
+    expect(rec?.failure).toBe("receipt-malformed");
+    expect(rec?.nackPending, "the owed flag is cleared once the mail is handed over").toBeFalsy();
+    expect(typeof rec?.nackSentAt, "and the send is recorded on the record").toBe("string");
+    expect(nackMailsIn(flintNew).length, "exactly one nack mail").toBe(1);
+    await h.stop();
+
+    // A LATER start owes nothing: it must not send the mail a second time.
+    abortController = new AbortController();
+    const h2 = await start(agentId, "flint", { localSender: true, noInbound: true });
+    await sleep(300);
+    expect(nackMailsIn(flintNew).length, "and a later start re-sends NOTHING").toBe(1);
+    await h2.stop();
+  }, 20000);
+
+  it("R10-b: a nack that could not be delivered leaves `nackPending`, and the next start re-sends it", async () => {
+    const warned: string[] = [];
+    // No route to the sender at all: the nack cannot be handed over, so the
+    // failure settles with the mail still owed.
+    const h = await start("anvil", "flint", { warnCalls: warned });
+    h.skip("empty");
+    h.settle();
+    await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
+
+    const rec = obligationFile("anvil", h.inboundId);
+    expect(rec?.failure).toBe("empty-final-text");
+    expect(rec?.nackPending, "the mail is still owed — nothing was handed over").toBe(true);
+    expect(rec?.nackSentAt, "and nothing is recorded as sent").toBeUndefined();
+    const owedLogged = await pollUntil(() => warned.join("\n").includes("nack-pending"), 2000);
+    expect(owedLogged, "the attempt is logged by name").toBe(true);
+    await h.stop();
+
+    // The route now exists (the sender has a maildir): the next start re-sends.
+    abortController = new AbortController();
+    const h2 = await start("anvil", "flint", { localSender: true, noInbound: true });
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const arrived = await pollUntil(() => nackMailsIn(flintNew, "empty-final-text").length === 1, 3000);
+    expect(arrived, "the next start hands the owed nack over").toBe(true);
+
+    const after = obligationFile("anvil", h.inboundId);
+    expect(after?.state, "the record is still the same terminal failure").toBe("failed");
+    expect(after?.nackPending, "the flag is cleared").toBeFalsy();
+    expect(typeof after?.nackSentAt, "and the send is recorded").toBe("string");
+    expect(nackMailsIn(flintNew).length, "exactly one nack mail, sent by the restart").toBe(1);
+    await h2.stop();
+  }, 20000);
+});
 });

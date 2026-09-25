@@ -12,14 +12,13 @@
   BEFORE the call (no route at all, a named route failure such as
   `gal-without-remote`) and the drain's attributable quarantine.
 
-  **Every transition to `failed` announces the sender exactly once, from the
-  verb.** An attributable quarantine found during the turn used to fail and stamp
-  the obligation silently, because only the deadline caller mailed. The verb now
-  sends the single nack mail, so the same verdict gives the same sender-visible
-  outcome wherever it is found, and no caller mails on its own. It is idempotent
-  across restarts: a failure whose announcement was already made (a cur/ record
-  carrying its nack) settles the RECORD alone and is never re-announced, and a
-  terminal record refuses later transitions outright.
+  **Every transition to `failed` announces the sender, from the verb, and the
+  announcement is durable and at-least-once.** An attributable quarantine found
+  during the turn used to fail and stamp the obligation silently, because only
+  the deadline caller mailed. The verb now sends the nack mail, so the same
+  verdict gives the same sender-visible outcome wherever it is found, and no
+  caller mails on its own. The nack is owed ON THE RECORD, not proven by the
+  cur/ stamp, and a terminal record refuses later transitions outright.
 
   **Recovery decides from evidence, not from an old stamp.** A `nackedAt` left by
   earlier behaviour no longer promotes to a verdict for a record whose own
@@ -30,8 +29,10 @@
   **A terminal obligation refuses `delivering`.** The one-way transition now
   returns null for a refusal instead of the old record, so `markDelivering` can
   tell a landed write-ahead from a refused one: a final arriving after the
-  deadline already settled the obligation is logged `late-final-refused` and NOT
-  delivered, instead of being delivered after the sender was told it failed.
+  obligation CLOSED is logged `late-final-refused` and NOT delivered. The
+  obligation may have closed as `acked`, `failed` or `unconfirmed` — and
+  `unconfirmed` tells the sender nothing — so the reason is closure, not "after
+  the sender was told it failed".
 
   README: `posted` means the reply was handed to its route — sent over the wire
   to a remote branch, delivered into a local maildir, or queued in the outbox for

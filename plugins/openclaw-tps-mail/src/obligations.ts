@@ -129,6 +129,16 @@ export interface ObligationRecord {
    *  obligation. Absent until the obligation is posted (and absent on records
    *  written before the field existed) — when absent there is nothing to pin. */
   replyId?: string;
+  /** cli#389 round 10, item 1: the nack mail is OWED for this settled failure.
+   *  Written in the SAME transition that sets `failed`, and CLEARED when
+   *  `nackSentAt` records that the mail was handed to its route — so the durable
+   *  record, never the cur/ `nackedAt` stamp, says whether the sender has been
+   *  told. Only ever present on a `failed` record; absent once the send landed. */
+  nackPending?: boolean;
+  /** cli#389 round 10, item 1: ISO time the nack mail was handed to its route.
+   *  AT-LEAST-ONCE: a crash after the hand-off but before this is written
+   *  re-sends, so the sender may see the nack twice — never zero times. */
+  nackSentAt?: string;
 }
 
 export interface ObligationLog {
@@ -239,6 +249,44 @@ export function transitionObligation(
   const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
   writeObligation(mailDir, agent, updated);
   return updated;
+}
+
+/**
+ * cli#389 round 10, item 1: a settled failure whose nack mail is STILL OWED —
+ * the durable shape a crash between settling the failure and sending its nack
+ * (or a send that could not be delivered) leaves behind. Restart recovery
+ * re-sends for exactly these records and no others. A record written before
+ * these fields existed carries no `nackPending`, so it is never re-sent on a
+ * guess about a mail the plugin cannot prove was owed.
+ */
+export function nackOwed(record: unknown): boolean {
+  const r = record as ObligationRecord | null;
+  return r?.state === "failed" && r?.nackPending === true && !r?.nackSentAt;
+}
+
+/**
+ * cli#389 round 10, item 1: record that the nack mail for a settled failure was
+ * handed to its route, and CLEAR the pending flag in the same write.
+ *
+ * The record is TERMINAL (`failed`) here, so this is NOT a state transition and
+ * `transitionObligation` — which refuses everything after a terminal state —
+ * would refuse it; this patches the two nack fields only, keeping the record's
+ * state and every other field exactly as they are.
+ *
+ * Best-effort by design: a store that cannot be written leaves `nackPending`
+ * set, so the next start re-sends the mail (at-least-once). Returns true when
+ * the write landed.
+ */
+export function markNackSent(mailDir: string, agent: string, inboundId: string, when?: string): boolean {
+  const current = readObligation(mailDir, agent, inboundId);
+  if (!current || current.state !== "failed") return false;
+  const { nackPending: _clear, ...rest } = current;
+  try {
+    writeObligation(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ── retention ────────────────────────────────────────────────────────────────

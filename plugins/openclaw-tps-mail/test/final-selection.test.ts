@@ -264,7 +264,9 @@ describe("cli#400 — yield / deadline interplay", () => {
     expect(curRecord("anvil")?.ackedAt).toBeUndefined();
     expect(curRecord("anvil")?.nackedAt).toBeDefined();
     // cli#389 round 9, item 4: the late final was REFUSED, not delivered — the
-    // sender was already told it failed, so no reply may follow the nack.
+    // obligation is CLOSED (here by the deadline), so no reply may follow the
+    // nack. Closure is the reason, not the nack: an obligation can also close as
+    // `unconfirmed`, which tells the sender nothing at all (round 10, item 3).
     expect(postedReplies("flint").length, "the late final is NOT delivered").toBe(0);
     expect(nackReasons("flint"), "and only the one nack mail went out").toEqual(["yielded-without-resumption"]);
     await h.stop();

@@ -99,20 +99,33 @@ and a RESTART after a crash all read the same record:
 - **`failed`** — terminal: a definitive non-delivery verdict; failed and nacked.
 
 The transitions: `pending`/`yielded` → `delivering` before the delivery call (if
-THAT write fails, nothing was sent and the obligation fails and nacks as before);
-`delivering` → `posted` the moment the call returns; `posted`/`delivering` →
+THAT write fails, nothing was sent — the plugin makes ONE attempt to record the
+failure and tell the sender, and does not retry in a loop; if the obligation
+store cannot be written EITHER, nothing can be recorded at all, the failure is
+logged by name (`obligation-write-failed`) and the obligation resolves on the
+next start); `delivering` → `posted` the moment the call returns; `posted`/`delivering` →
 `acked` when the scan finds evidence (the ack is gated on the receipt, never on
 the dispatch settling); `delivering`/`posted` → `unconfirmed` at the deadline
 with no evidence; and any live state → `failed` on a definitive non-delivery
 verdict. A TERMINAL record refuses a late `delivering` (`late-final-refused`,
-logged by name): a final that arrives after the deadline settled the obligation
-is not delivered, because the sender was already told it failed. Arming a
+logged by name): a final that arrives after the obligation CLOSED is not
+delivered. The obligation can close as `acked`, `failed` or `unconfirmed`, and
+`unconfirmed` tells the sender nothing at all — the reason is that the
+obligation is closed, never that the sender was told it failed. Arming a
 deadline never downgrades a committed record: `delivering` and `posted` keep
 their state and only gain `deadlineAt`.
 
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
 the only writer of `failed` or `nackedAt` — and the only sender of the nack mail,
-so the same verdict reaches the sender whichever path found it, exactly once. It
+so the same verdict reaches the sender whichever path found it. That nack is
+carried on the RECORD and is **at-least-once, never exactly-once**: the write
+that sets `failed` also sets `nackPending`, the send is awaited, and a mail that
+reaches a route records `nackSentAt` and clears `nackPending` in one further
+write. So a crash between settling and sending — or a send that could not be
+delivered — is visible on the record, and the next start re-sends for any
+`failed` record carrying `nackPending` with no `nackSentAt`; a crash AFTER the
+hand-off but before that write re-sends too, so the sender may see the nack
+twice, never zero times. It
 decides from the record — evidence found → `acked`; committed with no evidence at
 the deadline → `unconfirmed` (no failed state, **no nack mail, no nack stamp**,
 logged by name); a definitive non-delivery verdict → `failed` and a nack, **even
@@ -189,7 +202,8 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   obligation supplies them, so that delivery stays locally readable evidence
   even if the receipt above could not be written. A caller that supplies none —
   an ordinary send — leaves the record exactly as it was.
-- **A committed delivery is never reported as failed.** The commit is a PERSISTED
+- **A committed delivery fails only on a definitive non-delivery verdict.** The
+  commit is a PERSISTED
   state of the obligation record (`delivering` before the delivery call, `posted`
   when it returns), never a flag in the plugin's memory, so a restart, the
   deadline timer and the dispatch's outer catch all read the same truth. A throw

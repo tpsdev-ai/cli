@@ -18,8 +18,10 @@
   caller supplies them, so a bridge delivery stays locally readable evidence even
   when the receipt cannot be written, and on every route a post-commit error is
   logged by name (`receipt-write-failed`) without failing the obligation or
-  nacking the inbound. A delivered reply is therefore never reported as failed.
-  The wire route's residual is stated in the README: a replying host that cannot
+  nacking the inbound. A post-commit error therefore never reports a delivered
+  reply as failed; the only thing that still fails a committed delivery is a
+  definitive non-delivery verdict (the drain quarantining that reply's own
+  record). The wire route's residual is stated in the README: a replying host that cannot
   write its own receipt resolves that obligation at its deadline instead of
   immediately.
 
