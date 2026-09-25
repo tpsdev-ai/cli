@@ -102,7 +102,11 @@ mock.module("@tpsdev-ai/cli/utils/relay", () => ({
 // would prove nothing. MUST run before the plugin (which imports this module) is
 // loaded. The real module is captured with a STATIC import (no top-level await
 // interleaved with mock.module) and spread eagerly into a plain object.
-const obligations = { failPostedTransition: false };
+// cli#389 round 7 adds two more injectable POST-COMMIT steps: the ACK
+// transition (its obligation write) and the receipt scan. The verb that fails or
+// nacks an obligation must refuse once the delivery has committed, so a throw in
+// EITHER step can never fail a delivered reply or nack its inbound.
+const obligations = { failPostedTransition: false, failAckTransition: false, failReceiptScan: false };
 const realObligations = { ...obligationsModule };
 mock.module("../src/obligations.js", () => ({
   ...realObligations,
@@ -110,7 +114,14 @@ mock.module("../src/obligations.js", () => ({
     if (obligations.failPostedTransition && next === "posted") {
       throw new Error("injected: the posted transition threw");
     }
+    if (obligations.failAckTransition && next === "acked") {
+      throw new Error("injected: the ack transition threw");
+    }
     return realObligations.transitionObligation(mailDir, agent, inboundId, next as any, patch, log);
+  },
+  scanForReceipt: (...args: any[]) => {
+    if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
+    return (realObligations.scanForReceipt as any)(...args);
   },
 }));
 
@@ -216,6 +227,8 @@ beforeEach(() => {
   savedHome = process.env.HOME;
   process.env.HOME = root;
   obligations.failPostedTransition = false;
+  obligations.failAckTransition = false;
+  obligations.failReceiptScan = false;
 });
 
 afterEach(() => {
@@ -296,6 +309,10 @@ interface DispatchOutcome {
   obligation: any | null;
   /** A nack record for this inbound, if one was written. */
   nack: string | null;
+  /** The INBOUND record's nackedAt stamp — the nack the plugin writes on a real failure. */
+  inboundNackedAt: string | null;
+  /** The inbound record's nackReason, when it was nacked. */
+  inboundNackReason: string | null;
   /** The bridge's sandbox record for this inbound, when the bridge was used. */
   sandboxRecord: any | null;
   /** Every warn the plugin logged while this route ran. */
@@ -410,6 +427,10 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const nack = scanFor([senderNew, senderCur, ...outboxDirs, ...receiptDirsAll, ...bridgeDirs], (r) =>
       typeof r?.headers?.["X-TPS-Nack"] === "string",
     );
+    // The INBOUND record itself (promote() moves it new/ → cur/): on a real
+    // failure the plugin stamps nackedAt on it. A POST-COMMIT error must leave
+    // this stamp absent, so it is read here as well as the nack mail above.
+    const inboundRec = scanFor([join(mailDir, agentId, "cur"), newDir], (r) => r?.id === inboundId)[0];
     // cli#389 round 5, item 2: the bridge's sandbox record, carrying the
     // obligation ids deliverToSandbox was given.
     const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundId);
@@ -451,6 +472,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       receiptMode,
       obligation: readJsonSafe(obligationPath) ?? obligation,
       nack: nack[0]?.path ?? null,
+      inboundNackedAt: inboundRec?.rec?.nackedAt ?? null,
+      inboundNackReason: inboundRec?.rec?.nackReason ?? null,
       sandboxRecord: bridgeRecord[0]?.rec ?? null,
       warns,
     };
@@ -816,5 +839,87 @@ describe("cli#389 round 6, item 2 — a transition that fails AFTER the delivery
       outcome.warns.some((w) => w.includes("obligation-posted-transition-failed")),
       "logged by name",
     ).toBe(true);
+  }, 20000);
+});
+
+// ── round 7: the fail/nack VERB refuses once the delivery committed ──────────
+
+/**
+ * Round 6 moved calls out of the delivery try one at a time and missed this
+ * class twice. Round 7 guards the VERB instead: the turn's context carries a
+ * `committed` flag, set the moment the delivery call returns, and the function
+ * that fails or nacks an obligation REFUSES while that flag is set.
+ *
+ * The class: a throw from work that runs AFTER a delivery committed — the ACK
+ * transition (its obligation write), the receipt scan, the failedCounts log —
+ * lands in the dispatch's OUTER catch, which used to fail the obligation and
+ * nack the inbound of a reply that was already on the wire.
+ *
+ * A post-commit throw must: never FAIL the obligation, never write the nackedAt
+ * stamp, and be logged by name as a POST-COMMIT error. The obligation then
+ * resolves from its receipt (or its bridge sandbox record).
+ *
+ * The other two post-commit steps are injected elsewhere and assert the same
+ * thing: the POSTED transition in "cli#389 round 6, item 2", and the RECEIPT
+ * WRITE in "cli#389 round 5, item 2".
+ */
+describe("cli#389 round 7 — the fail/nack verb refuses once the delivery committed", () => {
+  it("(e) the ACK transition throws: NOT failed, the inbound NOT nacked, logged as a post-commit error", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    obligations.failAckTransition = true;
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    // The wire send committed, and its receipt — the local evidence — was written.
+    expect(outcome.route).toBe("remote-branch");
+    expect(relay.deliver.length).toBeGreaterThan(0);
+    expect(outcome.receiptRecord, "the receipt exists").toBeTruthy();
+
+    // The ACK transition threw. That is NOT a send failure: no failed state.
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.obligation?.state).not.toBe("failed");
+
+    // …and the inbound is NOT nacked — neither the stamp nor a nack mail.
+    expect(outcome.inboundNackedAt, "the inbound carries no nackedAt").toBeNull();
+    expect(outcome.nack).toBeNull();
+
+    // Logged BY NAME as a post-commit error — never as a send failure.
+    expect(outcome.warns.some((w) => w.includes("post-commit-error:")), "logged as a post-commit error").toBe(true);
+  }, 20000);
+
+  it("(f) the receipt scan throws: NOT failed, the inbound NOT nacked, logged as a post-commit error", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    obligations.failReceiptScan = true;
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    expect(outcome.route).toBe("remote-branch");
+    expect(relay.deliver.length).toBeGreaterThan(0);
+
+    expect(outcome.obligation?.failure, "no post-commit failure is recorded").toBeUndefined();
+    expect(outcome.obligation?.state).not.toBe("failed");
+    expect(outcome.inboundNackedAt, "the inbound carries no nackedAt").toBeNull();
+    expect(outcome.nack).toBeNull();
+    expect(outcome.warns.some((w) => w.includes("post-commit-error:")), "logged as a post-commit error").toBe(true);
+  }, 20000);
+
+  it("(h) a PRE-commit failure is UNCHANGED: the obligation FAILS and the inbound IS nacked", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+      relay.failDeliver = true; // the delivery call itself throws: nothing committed
+    };
+    const outcome = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+
+    expect(outcome.route).toBe("failure");
+    expect(outcome.obligation?.state).toBe("failed");
+    expect(String(outcome.obligation?.failure)).toMatch(/^write-failed:/);
+    // The guard must not over-reach: a delivery that never committed still nacks.
+    expect(outcome.inboundNackedAt, "the inbound IS nacked").not.toBeNull();
+    expect(String(outcome.inboundNackReason)).toMatch(/^write-failed:/);
   }, 20000);
 });

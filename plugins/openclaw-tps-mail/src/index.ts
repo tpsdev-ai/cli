@@ -583,6 +583,20 @@ interface YieldContext {
   inboundId: string;
   cfg: any;
   log: any;
+  /**
+   * cli#389 round 7 — the turn's COMMIT mark, carried in the turn's context.
+   * Set the moment the delivery call for this turn RETURNS: from then on the
+   * reply is on the wire, so any later failure is evidence upkeep, never a send
+   * failure. The one verb that fails or nacks an obligation refuses while this
+   * is set.
+   */
+  committed?: boolean;
+  /**
+   * The post-commit evidence step currently running — the ACK transition, the
+   * receipt scan, the failedCounts log — so that refusal can name it
+   * (`post-commit-error:<step>`) instead of naming a raw throw.
+   */
+  step?: string;
 }
 
 /** obligationId → the context needed to ack/nack it after the dispatch is gone. */
@@ -646,6 +660,21 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
 }
 
 function failObligation(ctx: YieldContext, reason: string): void {
+  // GUARD THE VERB (cli#389 round 7). Once the delivery call has RETURNED the
+  // reply has committed, so no later failure — the ACK transition's obligation
+  // write, the receipt scan, the failedCounts log; whatever catch it lands in —
+  // may fail the obligation or nack its inbound. Round 6 moved calls out of the
+  // delivery try one at a time and missed this class twice, so this is the ONE
+  // function that fails or nacks an obligation and it REFUSES while the turn's
+  // context is committed: it logs the step by name and leaves the obligation to
+  // resolve from its receipt, or from its bridge sandbox record.
+  if (ctx.committed) {
+    ctx.log?.warn?.(
+      `tps-mail: post-commit-error:${ctx.step ?? "unnamed-step"}: ${reason} — the delivery for ${ctx.inboundId} ` +
+        `committed, so it is NOT failed and its inbound is NOT nacked; it resolves from its receipt or sandbox record`,
+    );
+    return;
+  }
   transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "failed", { failure: reason }, ctx.log);
   patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: reason });
   ctx.log?.warn?.(`tps-mail: obligation for ${ctx.inboundId} FAILED: ${reason} — nacked, never acked`);
@@ -1174,17 +1203,25 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // its inbound.
             let route: MailRoute | null = null;
             let deliveredVia: string | null = null;
+            // The delivery call IS the commit: mark the turn the moment it
+            // RETURNS (cli#389 round 7). `posted` drives this turn's own
+            // branches; `yieldCtx.committed` makes the fail/nack verb refuse
+            // from here on, whichever catch a later step lands in.
+            const commit = () => {
+              posted = true;
+              yieldCtx.committed = true;
+            };
             try {
               route = routeFor(account.mailDir, cfg as any, ctx.accountId ?? "default", msg.from);
               if (route.kind === "local") {
                 writeMailFile(account.mailDir, msg.from, reply);
-                posted = true;
+                commit();
               } else if (route.kind === "outbox") {
                 deliveredVia = writeOutboxFile(reply);
-                posted = true;
+                commit();
               } else if (route.kind === "remote-branch") {
                 await deliverRemote(reply, route.branchId);
-                posted = true;
+                commit();
               } else if (route.kind === "bridge") {
                 // The record carries the obligation ids, so this delivery stays
                 // locally readable even if the receipt write below fails.
@@ -1194,7 +1231,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                   body: reply.body,
                   ...obligationMetadata(reply),
                 });
-                posted = true;
+                commit();
               } else {
                 postFailure = postFailure ?? (route.kind === "failed" ? route.reason : `no-route:${msg.from}`);
                 log?.warn?.(
@@ -1256,10 +1293,15 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // no posted final is exactly the shape that used to ack silently).
         const failedCounts = dispatchResult?.failedCounts;
         if (failedCounts !== undefined) {
+          yieldCtx.step = "failed-counts-log";
           log?.warn?.(`tps-mail: runtime failedCounts for ${msg.id}: ${JSON.stringify(failedCounts)}`);
         }
 
         // THE ACK IS GATED ON THE RECEIPT, never on the dispatch settling.
+        // The scan and the ACK below both run AFTER a committed delivery, so
+        // they are evidence upkeep: `step` names whichever is running, and the
+        // fail/nack verb refuses if one throws (cli#389 round 7).
+        yieldCtx.step = "receipt-scan";
         const receipt = scanForReceipt(
           receiptDirs(yieldCtx),
           obId,
@@ -1269,14 +1311,23 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           postedReplyId ?? undefined,
         );
         if (receipt.status === "found") {
+          yieldCtx.step = "ack-transition";
           ackObligation(yieldCtx, obId, "receipt found");
         } else if (receipt.status === "malformed" && posted) {
           // ONLY when THIS turn posted: a `.malformed-*` cannot be tied to this
           // obligation (its marker is unreadable) and quarantined records stay
           // in the dirs, so an unrelated one must not fail a later non-posting
-          // turn (cli#398 T4). A posted reply the scan cannot find as a valid
-          // receipt is the one case that is ours.
+          // turn (cli#398 T4).
+          //
+          // cli#389 round 7 RETIRES the failure cli#398 T4(e) recorded HERE.
+          // `posted` means the delivery call RETURNED, so the reply committed:
+          // the fail/nack verb refuses, and a committed turn is never failed and
+          // its inbound is never nacked. The evidence is unreadable, so the
+          // obligation resolves the way the wire route's missing receipt does —
+          // at its DEADLINE — instead of being reported as a failed send.
+          yieldCtx.step = "receipt-malformed";
           failObligation(yieldCtx, "receipt-malformed");
+          armDeadline(yieldCtx, obId);
         } else if (postFailure) {
           failObligation(yieldCtx, postFailure);
         } else if (sawSuppressedFinal && latestFinalText === null) {
@@ -1298,13 +1349,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         log?.warn?.(
           `tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`,
         );
-        transitionObligation(account.mailDir, recipient, msg.id, "failed", {
-          failure: `dispatch failed: ${err?.message ?? String(err)}`,
-        }, log);
-        patchMailFile(curPath, {
-          nackedAt: new Date().toISOString(),
-          nackReason: `dispatch failed: ${err?.message ?? String(err)}`,
-        });
+        // cli#389 round 7: route this through the ONE verb that fails or nacks
+        // an obligation, so the committed guard covers a throw from ANY
+        // post-commit step (the ACK transition, the receipt scan, the
+        // failedCounts log) that lands in THIS catch. A PRE-commit failure —
+        // the dispatch itself threw — is unchanged: the verb fails and nacks.
+        failObligation(yieldCtx, `dispatch failed: ${err?.message ?? String(err)}`);
       }
     }
 

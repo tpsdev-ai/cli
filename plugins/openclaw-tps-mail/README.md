@@ -141,13 +141,18 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   obligation supplies them, so that delivery stays locally readable evidence
   even if the receipt above could not be written. A caller that supplies none —
   an ordinary send — leaves the record exactly as it was.
-- **A receipt failure never fails a delivered reply.** Once a delivery call has
-  returned it has committed, so a receipt that then cannot be written is logged
-  by name (`receipt-write-failed`) and does **not** fail the obligation or nack
-  the inbound. For the wire route the receipt is the only local evidence, so the
-  residual is this: a replying host that cannot write its own receipt (a full
-  disk, for example — the bridge still has its sandbox record, the wire does
-  not) resolves that obligation at its **deadline** instead of immediately.
+- **Nothing after a delivery commits fails a delivered reply.** Once a delivery
+  call has returned it has committed, so the plugin guards the failure verb
+  itself: a throw from ANY step that runs after the commit — the ACK transition,
+  the receipt scan, the posted transition, the receipt write, the failedCounts
+  log — is logged by name (`post-commit-error:<step>`, or `receipt-write-failed`
+  for the receipt) and does **not** fail the obligation or nack the inbound,
+  whichever catch it lands in. For the wire route the receipt is the only local
+  evidence, so the residual is this: a replying host that cannot write its own
+  receipt (a full disk, for example — the bridge still has its sandbox record,
+  the wire does not) resolves that obligation at its **deadline** instead of
+  immediately. A committed reply whose own posted record cannot be read back as
+  a valid receipt resolves at its deadline the same way.
 
 ## Retiring the old hook
 

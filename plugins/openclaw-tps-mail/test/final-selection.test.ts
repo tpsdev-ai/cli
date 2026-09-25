@@ -351,7 +351,8 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
     await h.stop();
   }, 15000);
 
-  it("(e) this turn posts, its own record is quarantined and NO valid receipt is visible → receipt-malformed", async () => {
+  it("(e) [cli#389 round 7] this turn posts, its own record is unreadable and NO valid receipt is visible → NOT failed, NOT nacked: the committed guard refuses the receipt-malformed determination and the deadline resolves it", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
     seedMalformed("sent"); // the quarantined record the scan can see
     mkdirSync(outbox("new"), { recursive: true });
     chmodSync(outbox("new"), 0o333); // posted reply lands here but is not listable
@@ -359,9 +360,17 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
       const h = await start("anvil", "flint", { localSender: false, branchHost: true });
       await h.deliver("verdict");
       h.settle();
-      const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 3000);
-      expect(failed).toBe(true);
-      expect(obligationFile("anvil", h.inboundId)?.failure).toBe("receipt-malformed");
+      // cli#389 round 7 RETIRES the named failure cli#398 T4(e) recorded here.
+      // The posted reply makes the turn COMMITTED, so the fail/nack verb refuses
+      // the receipt-malformed determination: the obligation is not failed and the
+      // inbound is not nacked. The evidence is unreadable, so the obligation
+      // resolves at its DEADLINE, exactly like the wire route's missing receipt.
+      const yielded = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "yielded", 3000);
+      expect(yielded).toBe(true);
+      expect(obligationFile("anvil", h.inboundId)?.failure).toBeUndefined();
+      expect(obligationFile("anvil", h.inboundId)?.deadlineAt).toBeTruthy();
+      expect(curRecord("anvil")?.nackedAt).toBeUndefined();
+      expect(curRecord("anvil")?.ackedAt).toBeUndefined();
       await h.stop();
     } finally {
       chmodSync(outbox("new"), 0o755);
