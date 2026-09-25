@@ -38,6 +38,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 
 // Import the plugin — default export gives us { register }.
 import pluginModule from "../src/index.js";
+import { sweepTerminalObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
 let capturedSubscription: any;
@@ -944,6 +945,134 @@ describe("cli#389 round 10 — a settled failure's nack mail survives a crash", 
     expect(typeof after?.nackSentAt, "and the send is recorded").toBe("string");
     expect(nackMailsIn(flintNew).length, "exactly one nack mail, sent by the restart").toBe(1);
     await h2.stop();
+  }, 20000);
+});
+
+// ── round 11: an owed nack is never swept ───────────────────────────────────
+
+/**
+ * cli#389 round 11, item 1. Startup ran the retention sweep BEFORE owed-nack
+ * recovery, and the sweep deleted an aged `failed` record without ever asking
+ * whether its nack mail was still owed — so a record that owed the sender a
+ * mail was swept the moment it aged past the window, and recovery then had
+ * nothing left to re-send. Two changes: the sweep never removes a record whose
+ * nack is owed (`nackPending` with no `nackSentAt`), at any age; and startup
+ * re-sends owed nacks before it sweeps.
+ *
+ * The record below is aged past the DEFAULT window (7 days), so age alone is
+ * what the sweep acts on, and its cur/ record is stamped — so the older
+ * unresolved-cur/ hold does not apply and the DEBT is the only thing that can
+ * hold it back. The sweep is therefore driven DIRECTLY first (that is the hold
+ * under test), and then a start proves the owed mail is actually re-sent.
+ */
+describe("cli#389 round 11 — an owed nack is never swept", () => {
+  const R11_OBLIGATION = "ob-round11";
+
+  /** The durable shape an owed nack leaves, aged past the retention window. */
+  function seedAgedNackOwed(agentId: string, inboundId: string, reason: string, ageDays: number): void {
+    const aged = new Date(Date.now() - ageDays * 24 * 60 * 60 * 1000).toISOString();
+    mkdirSync(resolve(tempMailDir, agentId, "cur"), { recursive: true });
+    mkdirSync(resolve(tempMailDir, agentId, ".obligations"), { recursive: true });
+    writeFileSync(
+      resolve(tempMailDir, agentId, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
+      JSON.stringify(
+        {
+          id: inboundId,
+          from: "flint",
+          to: agentId,
+          body: buildSignedBody("flint", agentId, "x", FLINT_SEED),
+          timestamp: aged,
+          read: false,
+          nackedAt: aged,
+          nackReason: reason,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    writeFileSync(
+      resolve(tempMailDir, agentId, ".obligations", `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId: R11_OBLIGATION,
+          inboundId,
+          inboundTimestamp: aged,
+          from: "flint",
+          to: agentId,
+          accountId: "default",
+          state: "failed",
+          deadlineAt: null,
+          attempts: 1,
+          failure: reason,
+          nackPending: true,
+          lastTransitionAt: aged,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+  }
+
+  it("R11-a: an aged failed record whose nack is owed survives the sweep and is re-sent", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r11-aged-nack";
+    const reason = "receipt-malformed";
+    seedAgedNackOwed(agentId, inboundId, reason, 30); // 30 days: well past the 7-day default window
+
+    // The SWEEP on its own: age is what it acts on, and the owed mail is the only
+    // thing that can hold the record back.
+    const swept = sweepTerminalObligations(tempMailDir, agentId, 7, { info: () => {}, warn: () => {} });
+    expect(swept.removed, "the aged record is NOT deleted while its nack is owed").toBe(0);
+    expect(swept.heldForNack, "and it is counted as held for the mail it owes").toBe(1);
+    expect(obligationFile(agentId, inboundId), "so the durable record survives the sweep").toBeTruthy();
+
+    // A start then re-sends the mail the record still owes. Recovery runs BEFORE
+    // the sweep, so the debt is discharged and the record becomes ordinary.
+    const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const arrived = await pollUntil(() => nackMailsIn(flintNew, reason).length === 1, 3000);
+    expect(arrived, "the start re-sends the nack the aged record still owes").toBe(true);
+    expect(nackMailsIn(flintNew).length, "exactly one nack mail").toBe(1);
+    await h.stop();
+
+    // Nothing is left owing: a later start re-sends nothing (the discharged,
+    // aged record is ordinary, so the sweep takes it then, or already did).
+    abortController = new AbortController();
+    const h2 = await start(agentId, "flint", { localSender: true, noInbound: true });
+    await sleep(300);
+    expect(nackMailsIn(flintNew).length, "a later start re-sends nothing").toBe(1);
+    await h2.stop();
+  }, 20000);
+
+  it("R11-b: a nackSentAt write that FAILS is logged by name — the mail is not silently 'recorded'", async () => {
+    const agentId = "anvil";
+    const inboundId = "msg-r11-unwritable-record";
+    const reason = "receipt-malformed";
+    seedAgedNackOwed(agentId, inboundId, reason, 0); // owed, and NOT aged
+
+    // The record store still READS (the debt is visible) but cannot be WRITTEN,
+    // so the mail hands over and the write that would discharge the debt fails.
+    const warned: string[] = [];
+    const obligationsDir = resolve(tempMailDir, agentId, ".obligations");
+    chmodSync(obligationsDir, 0o500);
+    try {
+      const h = await start(agentId, "flint", { localSender: true, noInbound: true, warnCalls: warned });
+      const flintNew = resolve(tempMailDir, "flint", "new");
+      const arrived = await pollUntil(() => nackMailsIn(flintNew, reason).length === 1, 3000);
+      expect(arrived, "the owed mail is handed over").toBe(true);
+
+      const logged = await pollUntil(
+        () => warned.join("\n").includes(`could not record nackSentAt for ${inboundId}`),
+        2000,
+      );
+      expect(logged, "and the failed record write is logged BY NAME").toBe(true);
+      expect(warned.join("\n"), "the line names the consequence for the sender").toContain("later start");
+      await h.stop();
+    } finally {
+      chmodSync(obligationsDir, 0o700); // let the harness remove the tree
+    }
   }, 20000);
 });
 });

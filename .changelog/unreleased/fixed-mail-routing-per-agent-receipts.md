@@ -22,7 +22,7 @@
   reply as failed; the only thing that still fails a committed delivery is a
   definitive non-delivery verdict (the drain quarantining that reply's own
   record). The wire route's residual is stated in the README: a replying host that cannot
-  write its own receipt resolves that obligation at its deadline instead of
-  immediately.
+  write its own receipt resolves that obligation at its deadline — or on a later
+  start once the store can be written — instead of immediately.
 
   (Refs #389)

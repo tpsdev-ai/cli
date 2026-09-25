@@ -696,10 +696,11 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
  * announcement is DURABLE and AT-LEAST-ONCE: the same write that settles the
  * failure records `nackPending`, the send is AWAITED, and a successful hand-off
  * records `nackSentAt` and clears the flag — so a crash between settling and
- * sending, or a send that could not be delivered, is re-sent at the next start
- * rather than leaving the sender never told. A crash after the hand-off but
- * before the record is written re-sends, so the sender may see the nack twice —
- * never zero times. `alreadyStamped` marks a failure whose cur/ record ALREADY
+ * sending, or a send that could not be delivered, is re-sent on a later start
+ * (once the store can be written) rather than leaving the sender never told. A
+ * crash after the hand-off but before the record is written re-sends, so the
+ * sender may see the nack twice; the record keeps the debt until a hand-off is
+ * recorded. `alreadyStamped` marks a failure whose cur/ record ALREADY
  * carries the nack (restart recovery of a record settled before the crash): the
  * record is settled and the stamp is not rewritten, but the MAIL is still owed
  * and is sent by the same rule as every other failure.
@@ -802,9 +803,12 @@ async function settleObligation(
  *   handed to a route → `markNackSent`: `nackSentAt` recorded, `nackPending`
  *                       cleared, in one write on the record;
  *   no route, or a route that threw → the record KEEPS `nackPending` and the
- *                       attempt is logged by name, so the next start re-sends
+ *                       attempt is logged by name, so a later start re-sends
  *                       (at-least-once: a crash between the two writes
- *                       duplicates a mail; it never loses one).
+ *                       duplicates a mail; it never loses one);
+ *   handed, but the record write FAILED → the mail has left and the record
+ *                       still owes it: logged by name (round 11, item 2) and a
+ *                       later start may hand it over again.
  *
  * Never throws into the caller. Returns true when the mail reached a route, so
  * the caller can say what actually happened to the sender.
@@ -818,8 +822,15 @@ async function deliverNack(ctx: YieldContext, reason: string): Promise<boolean> 
     handedOff = false;
   }
   if (handedOff) {
-    markNackSent(ctx.mailDir, ctx.agent, ctx.inboundId);
-    ctx.log?.warn?.(`tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}`);
+    // cli#389 round 11, item 2: the hand-off LANDED, but the record that says so
+    // may not have. A failed write is logged BY NAME inside markNackSent, never
+    // ignored — and the record still owes the mail, so a later start may hand it
+    // over again. The line here says which of the two happened.
+    const recorded = markNackSent(ctx.mailDir, ctx.agent, ctx.inboundId, ctx.log);
+    ctx.log?.warn?.(
+      `tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}` +
+        (recorded ? "" : " — the record could not be updated: it still owes the nack and a later start may send it again"),
+    );
     return true;
   }
   ctx.log?.warn?.(
@@ -1698,6 +1709,36 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
         } catch { /* ignore */ }
 
+        // UNSENT NACKS (cli#389 round 10, item 1): a TERMINAL failure whose nack
+        // mail never went out — a crash between settling the failure and sending
+        // its nack, or a send that could not be delivered — is re-sent here. The
+        // RECORD decides (`nackPending` with no `nackSentAt`), never the cur/
+        // stamp, so a stamp can no longer stand in for a mail the sender never
+        // received. AT-LEAST-ONCE: a crash after the send but before
+        // `nackSentAt` is written re-sends, so the sender may see the nack twice;
+        // the record keeps the debt until a hand-off is recorded.
+        //
+        // cli#389 round 11, item 1: this runs BEFORE the retention sweep below.
+        // The sweep itself also HOLDS any record still owing its nack
+        // (obligations.ts), so an owed mail survives whichever order the two run
+        // in — but recovery goes first, so an owed nack is re-sent (and the debt
+        // discharged) before any retention decision reads the store.
+        for (const rec of listObligations(account.mailDir, agentId)) {
+          if (!nackOwed(rec)) continue;
+          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
+          const ctx = makeYieldCtx(
+            account.mailDir,
+            agentId,
+            rec.from,
+            account.accountId,
+            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
+            rec.inboundId,
+            cfg,
+            log,
+          );
+          await deliverNack(ctx, rec.failure ?? "failed");
+        }
+
         // OBLIGATION RETENTION (cli#401): delete ONLY terminal records (acked,
         // failed) whose LAST TRANSITION is older than the window; pending /
         // posted / yielded are never deletable (recovery reads them).
@@ -1733,30 +1774,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           );
           yieldContexts.set(rec.obligationId, ctx);
           await reconcileObligation(ctx, rec);
-        }
-
-        // UNSENT NACKS (cli#389 round 10, item 1): a TERMINAL failure whose nack
-        // mail never went out — a crash between settling the failure and sending
-        // its nack, or a send that could not be delivered — is re-sent here. The
-        // RECORD decides (`nackPending` with no `nackSentAt`), never the cur/
-        // stamp, so a stamp can no longer stand in for a mail the sender never
-        // received. AT-LEAST-ONCE: a crash after the send but before
-        // `nackSentAt` is written re-sends, so the sender may see the nack twice
-        // — never zero times.
-        for (const rec of listObligations(account.mailDir, agentId)) {
-          if (!nackOwed(rec)) continue;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
-          const ctx = makeYieldCtx(
-            account.mailDir,
-            agentId,
-            rec.from,
-            account.accountId,
-            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
-            rec.inboundId,
-            cfg,
-            log,
-          );
-          await deliverNack(ctx, rec.failure ?? "failed");
         }
       } catch (err: any) {
         log?.warn?.(

@@ -7,8 +7,9 @@
   BEFORE the delivery call (round 8), so a call that throws may have thrown after
   the bytes left: a timeout after send, or a failure writing the local record
   after a remote accept. Such a throw is now logged by name
-  (`delivery-uncertain:`) and resolves by EVIDENCE OR DEADLINE — never `failed`,
-  never nacked. The definitive verdicts stay what they were: refusals decided
+  (`delivery-uncertain:`) and resolves by EVIDENCE OR DEADLINE — or, if the
+  obligation store cannot be written at that point, on a later start once it can
+  — never `failed`, never nacked. The definitive verdicts stay what they were: refusals decided
   BEFORE the call (no route at all, a named route failure such as
   `gal-without-remote`) and the drain's attributable quarantine.
 

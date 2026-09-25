@@ -102,8 +102,8 @@ The transitions: `pending`/`yielded` → `delivering` before the delivery call (
 THAT write fails, nothing was sent — the plugin makes ONE attempt to record the
 failure and tell the sender, and does not retry in a loop; if the obligation
 store cannot be written EITHER, nothing can be recorded at all, the failure is
-logged by name (`obligation-write-failed`) and the obligation resolves on the
-next start); `delivering` → `posted` the moment the call returns; `posted`/`delivering` →
+logged by name (`obligation-write-failed`) and the obligation resolves on a
+later start, once the store can be written); `delivering` → `posted` the moment the call returns; `posted`/`delivering` →
 `acked` when the scan finds evidence (the ack is gated on the receipt, never on
 the dispatch settling); `delivering`/`posted` → `unconfirmed` at the deadline
 with no evidence; and any live state → `failed` on a definitive non-delivery
@@ -122,10 +122,12 @@ carried on the RECORD and is **at-least-once, never exactly-once**: the write
 that sets `failed` also sets `nackPending`, the send is awaited, and a mail that
 reaches a route records `nackSentAt` and clears `nackPending` in one further
 write. So a crash between settling and sending — or a send that could not be
-delivered — is visible on the record, and the next start re-sends for any
-`failed` record carrying `nackPending` with no `nackSentAt`; a crash AFTER the
-hand-off but before that write re-sends too, so the sender may see the nack
-twice, never zero times. It
+delivered — is visible on the record, and a later start re-sends for any
+`failed` record carrying `nackPending` with no `nackSentAt`, once the store can
+be written; a crash AFTER the hand-off but before that write re-sends too, so
+the sender may see the nack twice. `nackSentAt` is recorded when that write
+succeeds; when it does not, the record keeps `nackPending` and the nack may
+repeat — the mail is owed until a hand-off is RECORDED. It
 decides from the record — evidence found → `acked`; committed with no evidence at
 the deadline → `unconfirmed` (no failed state, **no nack mail, no nack stamp**,
 logged by name); a definitive non-delivery verdict → `failed` and a nack, **even
@@ -135,7 +137,9 @@ outbox drain QUARANTINING THIS REPLY'S OWN RECORD — attributed by the reply id
 itself (the drain keeps the original name, which carries the reply the plugin
 posted). A THROW FROM THE DELIVERY CALL IS NOT A VERDICT: once `delivering` is
 persisted the bytes may already have left, so a throw resolves by evidence or
-deadline — and only a throw before the write-ahead landed fails and nacks. An
+deadline — on a later start once the store can be written, if it cannot be
+written at that deadline — and only a throw before the write-ahead landed fails
+and nacks. An
 unrelated `.malformed-*` marker, or an evidence step that threw, is not a verdict
 either: those resolve at the deadline.
 
@@ -149,6 +153,12 @@ plugin sweeps the store:
 - **Only TERMINAL records** (`acked`, `unconfirmed`, `failed`) are deletable.
   `pending`, `delivering`, `posted` and `yielded` are NEVER deleted, at any
   age — restart recovery reads them to re-arm deadlines.
+- **A terminal record still OWING its nack mail is HELD, at any age.** A
+  `failed` record with `nackPending` and no `nackSentAt` is never swept:
+  restart recovery re-sends from that record, so deleting it would erase the
+  only durable evidence that the sender is still owed a mail. Startup re-sends
+  owed nacks BEFORE it sweeps, and once the debt is discharged (`nackSentAt`
+  recorded) the record is ordinary and ages out normally.
 - A terminal record is deleted when its **last transition** is older than the
   window. The age is the record's OWN recorded `lastTransitionAt` (falling back
   to `inboundTimestamp` for records written before that field existed) — never
@@ -212,11 +222,15 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   logged by name (`post-commit-error:<step>`, or `receipt-write-failed` for the
   receipt) and does **not** fail the obligation or nack the inbound, whichever
   catch it lands in; the obligation's normal deadline is armed so it still
-  resolves to `acked` or `unconfirmed`. The residual that leaves is the wire
+  resolves to `acked` or `unconfirmed` once the store can be written. The
+  residual that leaves is the wire
   route's: a replying host that cannot write its own receipt (a full disk, for
   example — the bridge still has its sandbox record, the wire does not) has no
   local evidence, so its obligation resolves at its **deadline** — and so does a
   committed reply whose own posted record cannot be read back as a valid receipt.
+  Either resolution needs the obligation store to be writable: if it cannot be
+  written at that deadline, the record stays live and resolves on a later start,
+  once the store can be written.
   The one thing that still fails a committed obligation is a DEFINITIVE
   non-delivery verdict: the drain quarantining this reply's own record, attributed
   by its reply id.
