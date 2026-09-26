@@ -40,9 +40,14 @@
  * launcher writes `test-reports/<suite>.xml.sha256`, holding the SHA-256 of the
  * report's bytes and the suite's own name, then reads it back once to confirm
  * what is on disk is what it wrote. A second suite — a test writing into
- * `test-reports/`, a fixture pointed at the real directory — can no longer
- * replace this suite's report after it ended: the guard (`check-test-reports.mjs`)
+ * `test-reports/`, a fixture pointed at the real directory — that replaces this
+ * suite's report after it ended is DETECTED: the guard (`check-test-reports.mjs`)
  * reads the seal and fails closed when the report's bytes no longer hash to it.
+ * THE LIMIT, STATED: the seal defeats an ACCIDENTAL overwrite by a later step in
+ * the same job. It is not a defence against code in the same job that rewrites
+ * the report and the seal together (a launcher re-run for the same suite name
+ * does exactly that): that code shares the job's filesystem, and the job's
+ * credential separation is the control for it.
  * The seal is written whether the suite passed or FAILED — a failed suite's
  * partial report is sealed too, so the guard's account of that report stays
  * true. A stale seal is deleted with the report and log before the suite starts,
@@ -97,6 +102,9 @@ export function sealText(suite, hash) {
  * leaving the guard to read a seal that is not there. bun's JUnit report is
  * UTF-8 XML, so hashing the file's bytes and hashing its utf8 text agree.
  */
+/** A seal that could not be written or read back — reported as such, never as a launch failure. */
+export class SealError extends Error {}
+
 export function sealReport(suite, reportDir = REPORT_DIR) {
   const { xml } = reportPaths(suite, reportDir);
   const hash = createHash("sha256").update(readFileSync(xml)).digest("hex");
@@ -104,7 +112,7 @@ export function sealReport(suite, reportDir = REPORT_DIR) {
   const seal = sealPath(suite, reportDir);
   writeFileSync(seal, expected);
   if (readFileSync(seal, "utf8") !== expected) {
-    throw new Error(`seal for ${suite} did not read back as written`);
+    throw new SealError(`seal for ${suite} did not read back as written`);
   }
 }
 
@@ -174,7 +182,8 @@ async function main() {
   try {
     process.exitCode = await runSuite({ suite, args });
   } catch (err) {
-    process.stderr.write(`${suite}: could not launch bun test: ${err.message}\n`);
+    const what = err instanceof SealError ? "could not seal the report" : "could not launch bun test";
+    process.stderr.write(`${suite}: ${what}: ${err.message}\n`);
     process.exitCode = 1;
   }
 }

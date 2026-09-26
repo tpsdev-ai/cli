@@ -44,6 +44,10 @@
  * scripts/test-suite.mjs writes; it is spelled out here because this launcher
  * is self-contained. A stale seal is deleted with the report and log before the
  * run starts.
+ * The limit, stated: the seal defeats an ACCIDENTAL overwrite by a later step in
+ * the same job; it is not a defence against code in the same job that rewrites
+ * the report and the seal together — that code shares the job's filesystem, and
+ * the job's credential separation is the control for it.
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";

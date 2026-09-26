@@ -240,7 +240,6 @@ describe("check-test-reports", () => {
     // the seal check), and the content check then fails closed on it.
     const result = run({
       reportText: { cli: "not a report\n" },
-      discover: () => [...DEFAULT_DISCOVERED].sort(),
     });
     expect(result.ok).toBe(false);
     expect(result.failures.map((f) => f.kind)).toEqual([

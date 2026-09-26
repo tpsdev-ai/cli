@@ -27,10 +27,15 @@
  *     bytes and the suite's own name, then reads it back once. This script
  *     verifies the seal BEFORE it uses the report: a missing seal, a seal naming
  *     another suite, a malformed seal, or a hash that does not match the report's
- *     current bytes fails closed, naming the suite. That is what stops a LATER
+ *     current bytes fails closed, naming the suite. That is what makes a LATER
  *     suite — a test writing into `test-reports/`, a fixture pointed at the real
- *     directory — from replacing an EARLIER suite's report with another valid
- *     JUnit file the guard would otherwise read.
+ *     directory — that replaces an EARLIER suite's report with another valid
+ *     JUnit file FAIL the build instead of being read. The limit, stated: the
+ *     seal defeats an ACCIDENTAL overwrite by a later step in the same job; it is
+ *     not a defence against code in the same job that rewrites the report and
+ *     the seal together (a launcher re-run for the same suite name does exactly
+ *     that) — such code shares the job's filesystem, and the job's credential
+ *     separation is the control for it.
  *  3. This script reads every report a suite MUST have written, collects the
  *     test FILES those reports show executed, discovers the test files on disk
  *     (every form bun discovers), and fails naming each discovered file that no
@@ -234,7 +239,7 @@ export function checkTestReports({
         failures.push({
           suite,
           kind: "no-seal",
-          detail: `${sealRel} is missing — the suite ended without sealing its report, so the report cannot be trusted to be the one it produced`,
+          detail: `${sealRel} is missing — the suite ended without sealing its report, so the report cannot be trusted to be the one it produced; run the suite through its launcher (scripts/test-suite.mjs, or the plugin's scripts/run-tests.mjs), which writes the seal`,
         });
         state = "unsealed";
       } else if (parsedSeal === undefined) {
