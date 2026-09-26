@@ -117,23 +117,45 @@ function runsPRCode(file: string): boolean {
 }
 
 interface WriteScope {
-  /** The job the block belongs to, or null for the workflow-level block. */
+  /** The job the declaration belongs to, or null for the workflow-level block. */
   job: string | null;
   scope: string;
-  /** Whether the line carrying the `write` has an inline `#` comment. */
-  hasComment: boolean;
+  /** The text after `#` on the declaring line ("" when there is no comment). */
+  comment: string;
+}
+
+interface PermScan {
+  writes: WriteScope[];
+  /** Declarations whose form the scanner cannot read — fail closed on these. */
+  unreadable: string[];
+}
+
+function where(job: string | null): string {
+  return job ?? "<workflow-level>";
+}
+
+/** The `#`-comment text on a line, or "" when the line carries none. */
+function commentOn(line: string): string {
+  const hash = line.indexOf("#");
+  return hash === -1 ? "" : line.slice(hash + 1).trim();
 }
 
 /**
- * Every `<scope>: write` line in a `permissions:` block, workflow-level or
- * per-job, read from the RAW text because YAML drops comments. The job a block
- * sits under is the nearest preceding two-space-indented `name:` line.
+ * Every `<scope>: write` declaration under a `permissions:` key, workflow-level
+ * or per-job, read from the RAW text because YAML drops comments. Block-style
+ * maps are read line by line; a single-line flow-style map
+ * (`permissions: {a: read, b: write}`) is read from its own line. A scalar grant
+ * (`permissions: write-all`) or a flow map that does not close on its line is
+ * reported as unreadable, so an unread form cannot slip past the comment check.
+ * The job a declaration sits under is the nearest preceding two-space-indented
+ * `name:` line.
  */
-function writeScopes(file: string): WriteScope[] {
+function scanPermissions(file: string): PermScan {
   const lines = raw(file).split("\n");
-  const out: WriteScope[] = [];
+  const writes: WriteScope[] = [];
+  const unreadable: string[] = [];
   let job: string | null = null;
-  let inPermissions = false;
+  let inBlock = false;
   let blockIndent = -1;
 
   for (const line of lines) {
@@ -142,28 +164,59 @@ function writeScopes(file: string): WriteScope[] {
 
     const permMatch = /^(\s*)permissions:\s*(.*)$/.exec(line);
     if (permMatch) {
-      blockIndent = permMatch[1].length;
-      inPermissions = true;
+      const value = permMatch[2].trim();
+      if (value === "") {
+        inBlock = true;
+        blockIndent = permMatch[1].length;
+      } else if (value === "{}") {
+        // Grants nothing — the shape cli#415 uses at the top level.
+      } else if (value.startsWith("{")) {
+        if (!value.endsWith("}")) {
+          unreadable.push(`${where(job)} → flow-style map not closed on one line`);
+        } else {
+          const re = /([A-Za-z0-9_-]+)\s*:\s*["']?([A-Za-z-]+)["']?/g;
+          for (let m = re.exec(value); m !== null; m = re.exec(value)) {
+            if (m[2] === "write") writes.push({ job, scope: m[1], comment: commentOn(line) });
+          }
+        }
+      } else {
+        unreadable.push(`${where(job)} → scalar permissions "${value}"`);
+      }
       continue;
     }
 
-    if (!inPermissions) continue;
-
-    const indent = line.length - line.trimStart().length;
+    if (!inBlock) continue;
     if (line.trim() === "") continue;
     // A line at or above the `permissions:` line closes the block.
+    const indent = line.length - line.trimStart().length;
     if (indent <= blockIndent) {
-      inPermissions = false;
+      inBlock = false;
       continue;
     }
 
     const entry = /^\s*([A-Za-z0-9_-]+):\s*(\S+)(.*)$/.exec(line);
     if (entry && entry[2] === "write") {
-      out.push({ job, scope: entry[1], hasComment: /#/.test(entry[3]) });
+      writes.push({ job, scope: entry[1], comment: commentOn(entry[3]) });
     }
   }
 
-  return out;
+  return { writes, unreadable };
+}
+
+/**
+ * The names and actions a job's steps expose, for checking that a write's
+ * comment names the step that needs the grant rather than merely carrying a `#`.
+ */
+function stepIdentifiers(job: Job | undefined): string[] {
+  const ids: string[] = [];
+  for (const step of job?.steps ?? []) {
+    if (step.name) ids.push(step.name);
+    if (step.uses) {
+      ids.push(step.uses);
+      ids.push(step.uses.split("@")[0]);
+    }
+  }
+  return ids;
 }
 
 function checkouts(file: string): Array<{ job: string; step: Step }> {
@@ -190,28 +243,45 @@ describe("test workflow — least privilege (cli#416)", () => {
     expect(wf.permissions).toEqual({});
   });
 
-  test("every job declares its own permissions block", () => {
+  test("every job declares its own permissions map", () => {
     const jobNames = Object.keys(wf.jobs ?? {});
     expect(jobNames.length, "test.yml has at least one job").toBeGreaterThan(0);
 
-    const missing = jobNames.filter((name) => wf.jobs?.[name].permissions === undefined);
+    // A missing block inherits the workflow default; a scalar (`write-all`) is a
+    // whole access class with no step to name. Either way the job does not opt
+    // in to a scope it can be held to, so both fail here.
+    const bad = jobNames.filter((name) => {
+      const p = wf.jobs?.[name].permissions as unknown;
+      return p === undefined || p === null || typeof p !== "object" || Array.isArray(p);
+    });
     expect(
-      missing,
-      `jobs with no permissions block (they inherit the workflow default): ${missing.join(", ")}`,
+      bad,
+      `jobs without a permissions map of their own (they inherit the workflow default, or grant a whole access class): ${bad.join(", ")}`,
     ).toEqual([]);
   });
 
-  test("every write scope names the step that needs it in an inline comment", () => {
+  test("every write scope is readable and names the step that needs it", () => {
     // The model is the CodeQL job's `security-events: write # CodeQL's upload of
     // SARIF results (the "Perform CodeQL Analysis" step)`. A bare `write` says a
     // scope is needed but not by what, so the next reader cannot tell whether it
-    // is still needed at all.
-    const offending = writeScopes("test.yml")
-      .filter((w) => !w.hasComment)
-      .map((w) => `${w.job ?? "<workflow-level>"} → ${w.scope}: write`);
+    // is still needed at all; a `# TODO` says just as little.
+    const { writes, unreadable } = scanPermissions("test.yml");
+    expect(writes.length, "test.yml declares at least one write scope (positive control)").toBeGreaterThan(
+      0,
+    );
+
+    const problems = unreadable.map((u) => `unreadable permissions declaration: ${u}`);
+    for (const w of writes) {
+      const ids = w.job === null ? [] : stepIdentifiers(wf.jobs?.[w.job]);
+      if (w.comment === "") {
+        problems.push(`${where(w.job)} → ${w.scope}: write (no inline comment)`);
+      } else if (ids.length > 0 && !ids.some((id) => w.comment.toLowerCase().includes(id.toLowerCase()))) {
+        problems.push(`${where(w.job)} → ${w.scope}: write (comment names no step: "${w.comment}")`);
+      }
+    }
     expect(
-      offending,
-      `write scopes with no inline comment naming the step that needs them: ${offending.join("; ")}`,
+      problems,
+      `write scopes with no comment naming the step that needs them: ${problems.join("; ")}`,
     ).toEqual([]);
   });
 
