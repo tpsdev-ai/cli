@@ -36,6 +36,23 @@
  * stand in for the one this run is supposed to write. A run that dies before
  * writing its report therefore leaves none, and the guard fails closed on it.
  *
+ * THE REPORT IS SEALED AFTER THE SUITE EXITS (cli#414). Once bun is gone, this
+ * launcher writes `test-reports/<suite>.xml.sha256`, holding the SHA-256 of the
+ * report's bytes and the suite's own name, then reads it back once to confirm
+ * what is on disk is what it wrote. A second suite — a test writing into
+ * `test-reports/`, a fixture pointed at the real directory — that replaces this
+ * suite's report after it ended is DETECTED: the guard (`check-test-reports.mjs`)
+ * reads the seal and fails closed when the report's bytes no longer hash to it.
+ * THE LIMIT, STATED: the seal defeats an ACCIDENTAL overwrite by a later step in
+ * the same job. It is not a defence against code in the same job that rewrites
+ * the report and the seal together (a launcher re-run for the same suite name
+ * does exactly that): that code shares the job's filesystem, and the job's
+ * credential separation is the control for it.
+ * The seal is written whether the suite passed or FAILED — a failed suite's
+ * partial report is sealed too, so the guard's account of that report stays
+ * true. A stale seal is deleted with the report and log before the suite starts,
+ * so a seal left by an earlier run cannot vouch for a report this run never made.
+ *
  * USAGE
  *   node scripts/test-suite.mjs <suite> [bun test args…]
  *
@@ -44,7 +61,8 @@
  * left alone, so a caller can choose its own path.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -64,6 +82,40 @@ export function reportPaths(suite, reportDir = REPORT_DIR) {
   };
 }
 
+/** The seal a suite writes beside its report: `test-reports/<suite>.xml.sha256`. */
+export function sealPath(suite, reportDir = REPORT_DIR) {
+  return join(reportDir, `${suite}.xml.sha256`);
+}
+
+/**
+ * The seal's text: the report's SHA-256 (hex) and the suite name, on one line.
+ * This is the format `check-test-reports.mjs` parses and the plugin's own
+ * launcher writes (it is self-contained, so the two must agree).
+ */
+export function sealText(suite, hash) {
+  return `${hash}  ${suite}\n`;
+}
+
+/**
+ * Seal the report this suite just produced: hash its bytes, write the seal, and
+ * read it back once so a truncated or unwritten seal fails the step rather than
+ * leaving the guard to read a seal that is not there. bun's JUnit report is
+ * UTF-8 XML, so hashing the file's bytes and hashing its utf8 text agree.
+ */
+/** A seal that could not be written or read back — reported as such, never as a launch failure. */
+export class SealError extends Error {}
+
+export function sealReport(suite, reportDir = REPORT_DIR) {
+  const { xml } = reportPaths(suite, reportDir);
+  const hash = createHash("sha256").update(readFileSync(xml)).digest("hex");
+  const expected = sealText(suite, hash);
+  const seal = sealPath(suite, reportDir);
+  writeFileSync(seal, expected);
+  if (readFileSync(seal, "utf8") !== expected) {
+    throw new SealError(`seal for ${suite} did not read back as written`);
+  }
+}
+
 /**
  * Run one suite. Resolves with the child's exit code (1 for a signal). The
  * child's output is forwarded to this process AND written to the suite's log,
@@ -72,11 +124,14 @@ export function reportPaths(suite, reportDir = REPORT_DIR) {
  */
 export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.env, reportDir = REPORT_DIR }) {
   const { xml, log } = reportPaths(suite, reportDir);
+  const seal = sealPath(suite, reportDir);
   mkdirSync(reportDir, { recursive: true });
-  // Stale artifacts go first — a report or log from an earlier step or run must
-  // not stand in for this one (the guard reads the XML; the log is the record).
+  // Stale artifacts go first — a report, log or seal from an earlier step or run
+  // must not stand in for this one (the guard reads the XML and its seal; the
+  // log is the record).
   rmSync(xml, { force: true });
   rmSync(log, { force: true });
+  rmSync(seal, { force: true });
   const reporters = args.filter((arg) => arg.startsWith("--reporter"));
   const bunArgs = [
     "test",
@@ -101,7 +156,18 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
     child.on("close", (code) => {
       // Close the log stream before resolving: the guard reads the report after
       // this process is gone, and a truncated log is a truncated record.
-      logStream.end(() => resolveExit(code ?? 1));
+      logStream.end(() => {
+        try {
+          // Seal whatever bun left, success or failure. A run that died before
+          // writing a report leaves none to seal, and the guard fails closed on
+          // the missing report.
+          if (existsSync(xml)) sealReport(suite, reportDir);
+        } catch (err) {
+          rejectExit(err);
+          return;
+        }
+        resolveExit(code ?? 1);
+      });
     });
   });
 }
@@ -116,7 +182,8 @@ async function main() {
   try {
     process.exitCode = await runSuite({ suite, args });
   } catch (err) {
-    process.stderr.write(`${suite}: could not launch bun test: ${err.message}\n`);
+    const what = err instanceof SealError ? "could not seal the report" : "could not launch bun test";
+    process.stderr.write(`${suite}: ${what}: ${err.message}\n`);
     process.exitCode = 1;
   }
 }

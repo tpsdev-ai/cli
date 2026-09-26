@@ -22,14 +22,30 @@
  *     or run cannot stand in for this one. Beside each report is the suite's
  *     console output, saved for the CI record (`test-reports/<suite>.log`) — this
  *     script does not read it.
- *  2. This script reads every report a suite MUST have written, collects the
+ *  2. Each launcher SEALS its report as soon as the suite exits (cli#414): it
+ *     writes `test-reports/<suite>.xml.sha256` holding the SHA-256 of the report's
+ *     bytes and the suite's own name, then reads it back once. This script
+ *     verifies the seal BEFORE it uses the report: a missing seal, a seal naming
+ *     another suite, a malformed seal, or a hash that does not match the report's
+ *     current bytes fails closed, naming the suite. That is what makes a LATER
+ *     suite — a test writing into `test-reports/`, a fixture pointed at the real
+ *     directory — that replaces an EARLIER suite's report with another valid
+ *     JUnit file FAIL the build instead of being read. The limit, stated: the
+ *     seal defeats an ACCIDENTAL overwrite by a later step in the same job; it is
+ *     not a defence against code in the same job that rewrites the report and
+ *     the seal together (a launcher re-run for the same suite name does exactly
+ *     that) — such code shares the job's filesystem, and the job's credential
+ *     separation is the control for it.
+ *  3. This script reads every report a suite MUST have written, collects the
  *     test FILES those reports show executed, discovers the test files on disk
  *     (every form bun discovers), and fails naming each discovered file that no
  *     report shows executed.
- *  3. It FAILS CLOSED: a required suite whose report is missing, unreadable, or
- *     empty (no `<testsuite>` at all) fails the check, because a suite that
- *     measured nothing must never read as a suite that measured everything.
- *  4. It is its own step and runs LAST in the job with `if: always()`, so a
+ *  4. It FAILS CLOSED: a required suite whose report is missing, unreadable, or
+ *     empty (no `<testsuite>` at all) fails the check, and so does one whose seal
+ *     is missing or does not match, because a suite that measured nothing — or
+ *     whose measurement was replaced — must never read as a suite that measured
+ *     everything.
+ *  5. It is its own step and runs LAST in the job with `if: always()`, so a
  *     suite step failing does not skip it — and it is not a clause of any suite,
  *     so removing a suite from the wiring cannot take the guard down with it.
  *
@@ -55,6 +71,7 @@
  * is that coverage cannot go quiet.
  */
 import { readdirSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -65,6 +82,32 @@ export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const REPORT_DIR = process.env.TPS_TEST_REPORT_DIR
   ? resolve(process.env.TPS_TEST_REPORT_DIR)
   : join(REPO, "test-reports");
+
+/**
+ * The seal a suite writes beside its report when it exits (cli#414):
+ * `test-reports/<suite>.xml.sha256`, holding the report's SHA-256 and the suite
+ * name. `scripts/test-suite.mjs` and the plugin's own self-contained launcher
+ * both write this format; this script is its reader.
+ */
+export const sealPath = (suite, reportDir = REPORT_DIR) => join(reportDir, `${suite}.xml.sha256`);
+
+/** SHA-256 (hex) of a report's bytes; a string is hashed as its utf8 encoding. */
+export function sha256Hex(data) {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+/**
+ * Parse a seal's text — one line of `<64-hex>  <suite>` — into its parts, or
+ * `undefined` when it is not a seal at all. A malformed seal fails closed, so
+ * nothing permissive happens here: the hash must be full lowercase hex and the
+ * suite a bare token.
+ */
+export function parseSeal(text) {
+  if (typeof text !== "string") return undefined;
+  const match = /^([0-9a-f]{64})[ \t]+(\S+)\s*$/.exec(text);
+  if (!match) return undefined;
+  return { sha256: match[1], suite: match[2] };
+}
 
 /**
  * The suites CI must run, each with the directory its `bun test` runs in (the
@@ -172,9 +215,9 @@ export function checkTestReports({
 
   for (const { suite, cwd } of suites) {
     const xml = join(reportDir, `${suite}.xml`);
+    const seal = sealPath(suite, reportDir);
     const suiteCwd = resolve(root, cwd);
     const text = readFile(xml);
-    const parsed = text === undefined ? { testsuites: [], testcases: [] } : parseJunit(text);
     const files = new Set();
     let state = "ran";
     if (text === undefined) {
@@ -184,23 +227,66 @@ export function checkTestReports({
         detail: `no JUnit report at ${posix(relative(root, xml))} — the suite did not run, or did not write one`,
       });
       state = "missing";
-    } else if (!text.includes("<testsuites")) {
-      failures.push({
-        suite,
-        kind: "unreadable-report",
-        detail: `${posix(relative(root, xml))} is not a JUnit report (no <testsuites>) — a report that cannot be read fails closed`,
-      });
-      state = "empty";
-    } else if (parsed.testsuites.length === 0) {
-      failures.push({
-        suite,
-        kind: "empty-report",
-        detail: `${posix(relative(root, xml))} shows no executed file (no <testsuite>) — an empty report fails closed`,
-      });
-      state = "empty";
     } else {
-      for (const entry of [...parsed.testsuites, ...parsed.testcases]) {
-        files.add(posix(relative(root, resolve(suiteCwd, entry.file))));
+      // The seal is verified BEFORE the report is used (cli#414). A report whose
+      // bytes no longer hash to its seal may have been replaced after the suite
+      // ended, so it must not contribute a single file to the executed set.
+      const sealRead = readFile(seal);
+      const parsedSeal = sealRead === undefined ? undefined : parseSeal(sealRead);
+      const sealRel = posix(relative(root, seal));
+      let sealed = false;
+      if (sealRead === undefined) {
+        failures.push({
+          suite,
+          kind: "no-seal",
+          detail: `${sealRel} is missing — the suite ended without sealing its report, so the report cannot be trusted to be the one it produced; run the suite through its launcher (scripts/test-suite.mjs, or the plugin's scripts/run-tests.mjs), which writes the seal`,
+        });
+        state = "unsealed";
+      } else if (parsedSeal === undefined) {
+        failures.push({
+          suite,
+          kind: "malformed-seal",
+          detail: `${sealRel} is not a seal (<sha256>  <suite>) — a seal that cannot be read fails closed`,
+        });
+        state = "unsealed";
+      } else if (parsedSeal.suite !== suite) {
+        failures.push({
+          suite,
+          kind: "wrong-suite-seal",
+          detail: `the seal at ${sealRel} names suite "${parsedSeal.suite}", not "${suite}"`,
+        });
+        state = "unsealed";
+      } else if (parsedSeal.sha256 !== sha256Hex(text)) {
+        failures.push({
+          suite,
+          kind: "changed-after-suite",
+          detail: `the report at ${posix(relative(root, xml))} changed after the suite ended — its bytes no longer match the seal at ${sealRel}`,
+        });
+        state = "unsealed";
+      } else {
+        sealed = true;
+      }
+      const parsed = parseJunit(text);
+      if (!sealed) {
+        // Unsealed: no file from this report enters the executed set.
+      } else if (!text.includes("<testsuites")) {
+        failures.push({
+          suite,
+          kind: "unreadable-report",
+          detail: `${posix(relative(root, xml))} is not a JUnit report (no <testsuites>) — a report that cannot be read fails closed`,
+        });
+        state = "unreadable";
+      } else if (parsed.testsuites.length === 0) {
+        failures.push({
+          suite,
+          kind: "empty-report",
+          detail: `${posix(relative(root, xml))} shows no executed file (no <testsuite>) — an empty report fails closed`,
+        });
+        state = "empty";
+      } else {
+        for (const entry of [...parsed.testsuites, ...parsed.testcases]) {
+          files.add(posix(relative(root, resolve(suiteCwd, entry.file))));
+        }
       }
     }
     for (const file of files) executed.add(file);
@@ -245,7 +331,11 @@ export function formatReport(result) {
         ? `${files} test file${files === 1 ? "" : "s"}`
         : state === "missing"
           ? "NO REPORT"
-          : "EMPTY REPORT";
+          : state === "unsealed"
+            ? "UNSEALED REPORT"
+            : state === "unreadable"
+              ? "UNREADABLE REPORT"
+              : "EMPTY REPORT";
     lines.push(`  ${suite.padEnd(12)} [${where}] ${how}`);
   }
   if (result.ok) {

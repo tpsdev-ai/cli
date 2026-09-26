@@ -23,8 +23,18 @@
  * that never ran. The two cases below hold that shut: a log line naming an unrun
  * file does not count, and a file no report names fails — which is what a
  * zero-case file looks like — with the message that says how to register a case.
- * The last describe block drives the launchers, which delete their own suite's
- * report before the suite starts.
+ *
+ * cli#414 — THE SEAL. A report alone says what a suite wrote, not that what is on
+ * disk is still that. Each launcher now seals the report the moment its suite
+ * exits: `test-reports/<suite>.xml.sha256`, the SHA-256 of the report's bytes and
+ * the suite name, read back once. The guard verifies the seal BEFORE using the
+ * report, so a later suite — a test writing into `test-reports/`, a fixture
+ * pointed at the real directory — cannot replace an earlier suite's report with
+ * another valid JUnit file the guard would otherwise read. The cases below hold
+ * that shut: a matching seal passes, a report replaced after sealing fails by
+ * name, a missing seal fails by name, and a seal naming another suite fails. The
+ * last describe blocks drive the launchers, which seal their own report and
+ * delete their own suite's report, log and seal before the suite starts.
  *
  * The discovery rules asserted at the end are the ones measured against the
  * pinned bun (1.3.10), not the ones a changelog claims: `.test`/`_test`/`.spec`/
@@ -45,6 +55,9 @@ import {
   exitCodeFor,
   formatReport,
   parseJunit,
+  parseSeal,
+  sealPath,
+  sha256Hex,
 } from "../../../scripts/check-test-reports.mjs";
 
 /** A fixture root that need not exist on disk: every read below is injected. */
@@ -63,6 +76,13 @@ const DEFAULT_DISCOVERED = [
   "packages/cli/test/c.test.ts",
   "test/root.test.ts",
 ];
+
+/** What each suite's report names, by default. */
+const DEFAULT_EXECUTED: Record<string, string[]> = {
+  agent: ["test/a.test.ts"],
+  cli: ["test/b.test.ts", "test/c.test.ts"],
+  "root-test": ["test/root.test.ts"],
+};
 
 /** bun's JUnit reporter for a run that executed `files`. */
 function junit(files: string[]): string {
@@ -91,32 +111,44 @@ interface FixtureOptions {
   omit?: string[];
   /** Test files the fixture tree holds (discovery's input). */
   discovered?: string[];
+  /** Suite names whose seal file is left out entirely (cli#414 case c). */
+  omitSeal?: string[];
+  /** Exact report text per suite (default: the JUnit report for `executed`). */
+  reportText?: Record<string, string>;
+  /** Exact seal text per suite (default: the seal of that suite's report text). */
+  sealText?: Record<string, string>;
 }
 
 /**
- * A fixture repo: a tree of test files, one JUnit report + console log per
- * suite, and the discovered set. `logSays` builds the log a test would need in
- * order to forge coverage — a header line for a file the report never names.
+ * A fixture repo: a tree of test files, one JUnit report + console log + report
+ * seal per suite, and the discovered set. `logSays` builds the log a test would
+ * need in order to forge coverage — a header line for a file the report never
+ * names. `reportText`/`sealText` let a case hand the guard a report and a seal
+ * that do not agree (a report replaced after sealing, a seal naming another
+ * suite); the default seal is the correct seal of that suite's report text.
  */
 function fixture(options: FixtureOptions = {}): { readFile: (path: string) => string | undefined } {
   const {
-    executed = {
-      agent: ["test/a.test.ts"],
-      cli: ["test/b.test.ts", "test/c.test.ts"],
-      "root-test": ["test/root.test.ts"],
-    },
+    executed = DEFAULT_EXECUTED,
     logSays = {},
     omit = [],
     discovered = DEFAULT_DISCOVERED,
+    omitSeal = [],
+    reportText = {},
+    sealText = {},
   } = options;
   const files = new Map<string, string>();
   for (const file of discovered) files.set(join(ROOT, file), "// fixture test file\n");
   for (const { suite } of SUITES) {
     const ran = executed[suite] ?? [];
+    const report = reportText[suite] ?? junit(ran);
     if (!omit.includes(`${suite}.xml`)) {
-      files.set(join(REPORT_DIR, `${suite}.xml`), junit(ran));
+      files.set(join(REPORT_DIR, `${suite}.xml`), report);
     }
     files.set(join(REPORT_DIR, `${suite}.log`), consoleLog([...ran, ...(logSays[suite] ?? [])]));
+    if (!omitSeal.includes(suite) && !omit.includes(`${suite}.xml`)) {
+      files.set(sealPath(suite, REPORT_DIR), sealText[suite] ?? `${sha256Hex(report)}  ${suite}\n`);
+    }
   }
   return { readFile: (path) => files.get(path) };
 }
@@ -193,16 +225,9 @@ describe("check-test-reports", () => {
   });
 
   test("an EMPTY report fails closed", () => {
-    const { readFile } = fixture();
-    const result = checkTestReports({
-      rootDir: ROOT,
-      reportDir: REPORT_DIR,
-      suites: SUITES,
-      readFile: (path) =>
-        path === join(REPORT_DIR, "cli.xml")
-          ? `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n`
-          : readFile(path),
-      discover: () => ["packages/agent/test/a.test.ts", "packages/cli/test/b.test.ts", "test/root.test.ts"],
+    const result = run({
+      executed: { agent: ["test/a.test.ts"], cli: [], "root-test": ["test/root.test.ts"] },
+      discovered: ["packages/agent/test/a.test.ts", "packages/cli/test/b.test.ts", "test/root.test.ts"],
     });
     expect(result.ok).toBe(false);
     expect(result.failures.map((f) => f.kind)).toEqual(["empty-report", "unexecuted"]);
@@ -211,13 +236,10 @@ describe("check-test-reports", () => {
   });
 
   test("a report with no <testsuites> at all fails closed too", () => {
-    const { readFile } = fixture();
-    const result = checkTestReports({
-      rootDir: ROOT,
-      reportDir: REPORT_DIR,
-      suites: SUITES,
-      readFile: (path) => (path === join(REPORT_DIR, "cli.xml") ? "not a report\n" : readFile(path)),
-      discover: () => [...DEFAULT_DISCOVERED].sort(),
+    // A sealed file that is not a JUnit report: the seal matches (so it gets past
+    // the seal check), and the content check then fails closed on it.
+    const result = run({
+      reportText: { cli: "not a report\n" },
     });
     expect(result.ok).toBe(false);
     expect(result.failures.map((f) => f.kind)).toEqual([
@@ -260,16 +282,84 @@ describe("check-test-reports", () => {
   });
 });
 
+describe("check-test-reports — the report seal (cli#414)", () => {
+  test("(a) a valid report with its matching seal passes", () => {
+    const result = run();
+    expect(result.ok).toBe(true);
+    expect(result.failures).toEqual([]);
+  });
+
+  test("(b) a report REPLACED after the suite ended fails, naming the suite and the fact", () => {
+    // The sealed report named cli's two files; another VALID JUnit file that
+    // names the same two files (so, with no seal check, the guard would be green)
+    // is put there afterwards. The seal still holds the original bytes' hash.
+    const original = junit(["test/b.test.ts", "test/c.test.ts"]);
+    const replacement = original.replace('name="a case"', 'name="a later case"');
+    expect(replacement).not.toBe(original);
+    const result = run({
+      reportText: { cli: replacement },
+      sealText: { cli: `${sha256Hex(original)}  cli\n` },
+    });
+    expect(result.ok).toBe(false);
+    // The overwrite is the failure, and cli's files are now unaccounted for too:
+    // an untrusted report contributes nothing to the executed set.
+    expect(result.failures.map((f) => f.kind)).toEqual([
+      "changed-after-suite",
+      "unexecuted",
+      "unexecuted",
+    ]);
+    expect(result.failures[0]?.suite).toBe("cli");
+    expect(result.orphans).toEqual(["packages/cli/test/b.test.ts", "packages/cli/test/c.test.ts"]);
+    const report = formatReport(result);
+    expect(report).toContain("cli");
+    expect(report).toContain("changed after the suite ended");
+    expect(report).toContain("UNSEALED REPORT");
+    // Its files are unaccounted for, because the report is not trusted.
+    expect(result.executed).not.toContain("packages/cli/test/b.test.ts");
+  });
+
+  test("(c) a report with NO seal fails, naming the suite", () => {
+    const result = run({ omitSeal: ["cli"] });
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]?.suite).toBe("cli");
+    expect(result.failures[0]?.kind).toBe("no-seal");
+    expect(result.failures[0]?.detail).toContain("test-reports/cli.xml.sha256");
+    // No seal means no trusted report, so cli's files are unaccounted for.
+    expect(result.orphans).toEqual(["packages/cli/test/b.test.ts", "packages/cli/test/c.test.ts"]);
+  });
+
+  test("(d) a seal naming ANOTHER suite fails, naming both suites", () => {
+    const result = run({ sealText: { cli: `${"a".repeat(64)}  agent\n` } });
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]?.suite).toBe("cli");
+    expect(result.failures[0]?.kind).toBe("wrong-suite-seal");
+    expect(result.failures[0]?.detail).toContain('names suite "agent", not "cli"');
+  });
+
+  test("a malformed seal fails closed", () => {
+    const result = run({ sealText: { cli: "not a seal at all\n" } });
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]?.kind).toBe("malformed-seal");
+  });
+
+  test("a seal whose hash is not the report's fails closed", () => {
+    const result = run({ sealText: { cli: `${"0".repeat(64)}  cli\n` } });
+    expect(result.ok).toBe(false);
+    expect(result.failures[0]?.kind).toBe("changed-after-suite");
+  });
+});
+
 describe("the launchers delete their own suite's report before the suite starts", () => {
-  /** A report + log left behind by an earlier step, in a throwaway dir. */
+  /** A report + log + seal left behind by an earlier step, in a throwaway dir. */
   function staleReportDir(prefix: string, suite: string): string {
     const dir = mkdtempSync(join(tmpdir(), prefix));
     writeFileSync(join(dir, `${suite}.xml`), junit(["test/stale.test.ts"]));
     writeFileSync(join(dir, `${suite}.log`), "STALE-MARKER\n");
+    writeFileSync(sealPath(suite, dir), `${sha256Hex(junit(["test/stale.test.ts"]))}  ${suite}\n`);
     return dir;
   }
 
-  test("scripts/test-suite.mjs removes its own report and log first", () => {
+  test("scripts/test-suite.mjs removes its own report, log and seal first", () => {
     const dir = staleReportDir("cli411-launcher-", "agent");
     try {
       // `--reporter=spec` is a caller's own reporter, so this run writes no JUnit
@@ -281,13 +371,14 @@ describe("the launchers delete their own suite's report before the suite starts"
       );
       expect(res.error).toBeUndefined();
       expect(existsSync(join(dir, "agent.xml"))).toBe(false);
+      expect(existsSync(sealPath("agent", dir))).toBe(false);
       expect(readFileSync(join(dir, "agent.log"), "utf8")).not.toContain("STALE-MARKER");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  test("the plugin launcher removes its own report and log first", () => {
+  test("the plugin launcher removes its own report, log and seal first", () => {
     const dir = staleReportDir("cli411-plugin-launcher-", "plugin");
     try {
       const res = spawnSync(
@@ -307,7 +398,72 @@ describe("the launchers delete their own suite's report before the suite starts"
       // Past its setup, into the run: the isolated root line precedes the spawn.
       expect(res.stdout ?? "").toContain("openclaw-tps-mail tests: isolated root");
       expect(existsSync(join(dir, "plugin.xml"))).toBe(false);
+      expect(existsSync(sealPath("plugin", dir))).toBe(false);
       expect(readFileSync(join(dir, "plugin.log"), "utf8")).not.toContain("STALE-MARKER");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the launchers seal the report they produce (cli#414)", () => {
+  /** A throwaway dir holding one passing fixture suite, run through the launcher. */
+  function runFixtureLauncher(prefix: string): { dir: string; status: number | null } {
+    const dir = mkdtempSync(join(tmpdir(), prefix));
+    writeFileSync(
+      join(dir, "sealed.test.ts"),
+      'import { test, expect } from "bun:test";\ntest("ok", () => { expect(1).toBe(1); });\n',
+    );
+    const res = spawnSync(
+      process.execPath,
+      [join(REPO, "scripts/test-suite.mjs"), "fixture", "./sealed.test.ts"],
+      { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir }, encoding: "utf8" },
+    );
+    expect(res.error).toBeUndefined();
+    return { dir, status: res.status };
+  }
+
+  test("scripts/test-suite.mjs seals its report with the report's own hash and the suite name", () => {
+    const { dir, status } = runFixtureLauncher("cli414-launcher-");
+    try {
+      expect(status).toBe(0);
+      const xml = readFileSync(join(dir, "fixture.xml"));
+      const seal = parseSeal(readFileSync(join(dir, "fixture.xml.sha256"), "utf8"));
+      expect(seal?.suite).toBe("fixture");
+      expect(seal?.sha256).toBe(sha256Hex(xml));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a launcher's sealed report passes the guard end to end, and fails closed once the seal is gone", () => {
+    const { dir, status } = runFixtureLauncher("cli414-e2e-");
+    try {
+      expect(status).toBe(0);
+      const readFile = (path: string) => {
+        try {
+          return readFileSync(path, "utf8");
+        } catch {
+          return undefined;
+        }
+      };
+      const options = {
+        rootDir: dir,
+        reportDir: dir,
+        suites: [{ suite: "fixture", cwd: "." }],
+        readFile,
+        discover: () => ["sealed.test.ts"],
+      };
+      // The launcher's own report + seal pass the guard...
+      const green = checkTestReports(options);
+      expect(green.ok).toBe(true);
+      expect(green.executed).toEqual(["sealed.test.ts"]);
+      // ...and removing the seal fails it closed, naming the suite (case c).
+      rmSync(sealPath("fixture", dir), { force: true });
+      const red = checkTestReports(options);
+      expect(red.ok).toBe(false);
+      expect(red.failures[0]?.suite).toBe("fixture");
+      expect(red.failures[0]?.kind).toBe("no-seal");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -324,6 +480,18 @@ describe("parseJunit", () => {
   test("parseJunit sees nothing in a report bun wrote for a zero-case file", () => {
     const empty = `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="bun test" tests="0"></testsuites>\n`;
     expect(parseJunit(empty).testsuites).toEqual([]);
+  });
+});
+
+describe("parseSeal", () => {
+  test("parseSeal reads a seal the launchers write", () => {
+    expect(parseSeal(`${sha256Hex("x")}  cli\n`)).toEqual({ sha256: sha256Hex("x"), suite: "cli" });
+  });
+
+  test("parseSeal rejects a malformed seal", () => {
+    expect(parseSeal("not a seal\n")).toBeUndefined();
+    expect(parseSeal(`${sha256Hex("x")}\n`)).toBeUndefined();
+    expect(parseSeal(`${sha256Hex("x").toUpperCase()}  cli\n`)).toBeUndefined();
   });
 });
 
