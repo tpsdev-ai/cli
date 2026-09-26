@@ -7,19 +7,19 @@ on:
     branches: [main]
 
 # Least privilege: no job inherits any scope; each job below declares exactly
-# what its steps use.
+# what its steps use, and names the step beside each grant.
 permissions: {}
 
 jobs:
   build:
     name: Build (TypeScript strict)
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -32,12 +32,12 @@ jobs:
   lint:
     name: Lint (Biome)
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - name: nono pin gate (cli#341 S4)
         run: ./scripts/check-nono-pin.sh
       - name: nono pin gate — fails-first fixtures (cli#341 S4)
@@ -59,7 +59,7 @@ jobs:
   promote-latest-fixtures:
     name: promote-latest fixtures (${{ matrix.os }})
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     strategy:
       fail-fast: false
       matrix:
@@ -80,12 +80,12 @@ jobs:
     name: Unit & Integration Tests
     needs: build
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -132,12 +132,12 @@ jobs:
   node-plugin-load:
     name: Node plugin load (openclaw-tps-mail)
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code + npm lifecycle scripts must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config; npm lifecycle scripts run below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -166,12 +166,12 @@ jobs:
   audit:
     name: Dependency Audit
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -186,12 +186,12 @@ jobs:
     name: Docker Integration
     needs: test
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - name: Resolve the pinned nono commit
         id: pin
         run: |
@@ -289,12 +289,12 @@ jobs:
   binary-smoke:
     name: Binary Smoke Test
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: 1.3.10
@@ -320,7 +320,7 @@ jobs:
   nono-profile-gate:
     name: nono profile gate (${{ matrix.os }})
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     strategy:
       fail-fast: false
       matrix:
@@ -329,7 +329,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -378,13 +378,13 @@ jobs:
   sast-semgrep:
     name: Semgrep SAST
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
     # Known false positives excluded via --exclude-rule flags above
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - run: python3 -m pip install semgrep
       - run: >
           semgrep scan --config=auto --error
@@ -400,13 +400,13 @@ jobs:
   sast-codeql:
     name: CodeQL SAST
     permissions:
-      contents: read
+      contents: read # actions/checkout reads the repository
       security-events: write # CodeQL's upload of SARIF results (the "Perform CodeQL Analysis" step)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          persist-credentials: false # PR-controlled code must not see the token
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - name: Initialize CodeQL
         uses: github/codeql-action/init@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
         with:
