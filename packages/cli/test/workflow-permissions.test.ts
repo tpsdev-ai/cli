@@ -151,15 +151,27 @@ function commentOn(line: string): string {
  * `name:` line.
  */
 function scanPermissions(file: string): PermScan {
-  const lines = raw(file).split("\n");
+  return scanPermissionsText(raw(file));
+}
+
+/** The same scan over workflow text, so the rules can be checked on fixtures. */
+function scanPermissionsText(text: string): PermScan {
+  const lines = text.split("\n");
   const writes: WriteScope[] = [];
   const unreadable: string[] = [];
   let job: string | null = null;
+  let inJobs = false;
   let inBlock = false;
   let blockIndent = -1;
 
   for (const line of lines) {
-    const jobMatch = /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line);
+    // A two-space key is a JOB only under `jobs:`; the same indent under `on:`
+    // names a trigger (`pull_request:`), which must not be reported as a job.
+    if (/^[A-Za-z0-9_-]+:/.test(line)) {
+      inJobs = /^jobs:\s*(#.*)?$/.test(line);
+      job = null;
+    }
+    const jobMatch = inJobs ? /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line) : null;
     if (jobMatch) job = jobMatch[1];
 
     const permMatch = /^(\s*)permissions:\s*(.*)$/.exec(line);
@@ -219,13 +231,44 @@ function stepIdentifiers(job: Job | undefined): string[] {
   return ids;
 }
 
-function checkouts(file: string): Array<{ job: string; step: Step }> {
-  const wf = load(file);
+/**
+ * A checkout is any `uses:` whose action name is `checkout`, whatever owner it
+ * comes from: a fork such as `someone/checkout@v4` persists the token exactly
+ * like `actions/checkout@…`, so it is held to the same rule (cli#418 review).
+ */
+function isCheckout(uses: unknown): boolean {
+  return typeof uses === "string" && /(^|\/)checkout(@|$)/i.test(uses.split("@")[0] + (uses.includes("@") ? "@" : ""));
+}
+
+function checkoutsOf(wf: Workflow): Array<{ job: string; step: Step }> {
   return Object.entries(wf.jobs ?? {}).flatMap(([job, j]) =>
-    (j.steps ?? [])
-      .filter((s) => typeof s.uses === "string" && s.uses.startsWith("actions/checkout@"))
-      .map((step) => ({ job, step })),
+    (j.steps ?? []).filter((s) => isCheckout(s.uses)).map((step) => ({ job, step })),
   );
+}
+
+function checkouts(file: string): Array<{ job: string; step: Step }> {
+  return checkoutsOf(load(file));
+}
+
+/** The write-scope rule over a parsed workflow and its permission scan. */
+function writeScopeProblems(wf: Workflow, scan: PermScan): string[] {
+  const problems = scan.unreadable.map((u) => `unreadable permissions declaration: ${u}`);
+  for (const w of scan.writes) {
+    const ids = w.job === null ? [] : stepIdentifiers(wf.jobs?.[w.job]);
+    if (w.comment === "") {
+      problems.push(`${where(w.job)} → ${w.scope}: write (no inline comment)`);
+    } else if (ids.length === 0) {
+      // A comment can only name a step the job exposes by `name:` or `uses:`. A
+      // job whose steps have neither cannot satisfy the rule, so it fails closed
+      // rather than letting any comment through (cli#418 review).
+      problems.push(
+        `${where(w.job)} → ${w.scope}: write (the job has no named or uses: step for the comment to name)`,
+      );
+    } else if (!ids.some((id) => w.comment.toLowerCase().includes(id.toLowerCase()))) {
+      problems.push(`${where(w.job)} → ${w.scope}: write (comment names no step: "${w.comment}")`);
+    }
+  }
+  return problems;
 }
 
 function stepLabel(step: Step): string {
@@ -270,22 +313,14 @@ describe("test workflow — least privilege (cli#416)", () => {
       0,
     );
 
-    const problems = unreadable.map((u) => `unreadable permissions declaration: ${u}`);
-    for (const w of writes) {
-      const ids = w.job === null ? [] : stepIdentifiers(wf.jobs?.[w.job]);
-      if (w.comment === "") {
-        problems.push(`${where(w.job)} → ${w.scope}: write (no inline comment)`);
-      } else if (ids.length > 0 && !ids.some((id) => w.comment.toLowerCase().includes(id.toLowerCase()))) {
-        problems.push(`${where(w.job)} → ${w.scope}: write (comment names no step: "${w.comment}")`);
-      }
-    }
+    const problems = writeScopeProblems(wf, { writes, unreadable });
     expect(
       problems,
       `write scopes with no comment naming the step that needs them: ${problems.join("; ")}`,
     ).toEqual([]);
   });
 
-  test("every actions/checkout disables credential persistence", () => {
+  test("every checkout (any owner's checkout action) disables credential persistence", () => {
     const found = checkouts("test.yml");
     expect(found.length, "test.yml checks out at least once").toBeGreaterThan(0);
 
@@ -325,6 +360,14 @@ describe("workflow permissions — inventory (cli#416)", () => {
     }
   });
 
+  test("every recorded exclusion carries a reason, not an empty string", () => {
+    // An empty reason would let a workflow be waved through by adding its name
+    // to a list; the decision has to be written down (cli#418 review).
+    for (const [file, why] of [...Object.entries(PR_EXCLUDED), ...Object.entries(NOT_PR)]) {
+      expect(why.trim().length, `${file}: the recorded reason is a sentence`).toBeGreaterThanOrEqual(20);
+    }
+  });
+
   test("every workflow is either guarded or accounted for", () => {
     const classified = new Set([...GUARDED, ...Object.keys(PR_EXCLUDED), ...Object.keys(NOT_PR)]);
     const unclassified = workflowFiles().filter((f) => !classified.has(f));
@@ -332,5 +375,54 @@ describe("workflow permissions — inventory (cli#416)", () => {
       unclassified,
       `workflows with no decision recorded in this file: ${unclassified.join(", ")}`,
     ).toEqual([]);
+  });
+});
+// The rules on fixtures: each case is the shape the cli#418 review named, so a
+// regression in the rule itself goes red here without editing test.yml.
+describe("workflow permissions — the rules on fixtures (cli#418)", () => {
+  const parse = (text: string): Workflow => yaml.load(text) as Workflow;
+
+  test("a checkout from another owner is held to the persist-credentials rule", () => {
+    const wf = parse(`
+jobs:
+  a:
+    steps:
+      - uses: someone/checkout@v4
+      - uses: actions/checkout@abc
+        with:
+          persist-credentials: false
+`);
+    const offending = checkoutsOf(wf).filter(({ step }) => step.with?.["persist-credentials"] !== false);
+    expect(offending.map(({ step }) => step.uses)).toEqual(["someone/checkout@v4"]);
+    expect(isCheckout("actions/cache@v4")).toBe(false);
+  });
+
+  test("a write scope in a job whose steps carry no name or uses fails closed, whatever the comment", () => {
+    const text = `
+jobs:
+  a:
+    permissions:
+      contents: write # release step
+    steps:
+      - run: echo hi
+`;
+    const problems = writeScopeProblems(parse(text), scanPermissionsText(text));
+    expect(problems.join("; ")).toContain("no named or uses: step");
+  });
+
+  test("a top-level scalar grant is attributed to the top level, not to a trigger key", () => {
+    const text = `
+on:
+  pull_request:
+    branches: [main]
+permissions: write-all
+jobs:
+  a:
+    steps:
+      - run: echo hi
+`;
+    const { unreadable } = scanPermissionsText(text);
+    expect(unreadable.join("; ")).toContain("<workflow-level>");
+    expect(unreadable.join("; ")).not.toContain("pull_request");
   });
 });
