@@ -36,9 +36,27 @@
  * than imported from the monorepo's scripts/test-suite.mjs so this launcher
  * stays self-contained (it ships inside the plugin's own package), and a
  * caller's own --reporter argument is left alone.
+ *
+ * cli#414: once bun exits, this launcher SEALS the report it produced —
+ * test-reports/plugin.xml.sha256, holding the report's SHA-256 and the suite
+ * name "plugin", read back once — so a later suite cannot replace it after the
+ * suite ended. The seal format is the one check-test-reports.mjs parses and
+ * scripts/test-suite.mjs writes; it is spelled out here because this launcher
+ * is self-contained. A stale seal is deleted with the report and log before the
+ * run starts.
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  createWriteStream,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -79,9 +97,14 @@ const reportDir = process.env.TPS_TEST_REPORT_DIR
 mkdirSync(reportDir, { recursive: true });
 const reportXml = join(reportDir, "plugin.xml");
 const reportLog = join(reportDir, "plugin.log");
-// Stale artifacts go first: this run's report must be the one the guard reads.
+// cli#414: the seal this run writes when the suite exits, holding the report's
+// SHA-256 and the suite name. Written and read back on close.
+const reportSeal = join(reportDir, "plugin.xml.sha256");
+// Stale artifacts go first: this run's report must be the one the guard reads,
+// and this run's seal must vouch for it (not a seal left by an earlier run).
 rmSync(reportXml, { force: true });
 rmSync(reportLog, { force: true });
+rmSync(reportSeal, { force: true });
 
 const passthrough = process.argv.slice(2);
 const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
@@ -124,6 +147,23 @@ child.on("close", (code, signal) => {
   // Close the log before exiting (process.exit would truncate it), and exit via
   // the code so the guard sees a complete report even when tests failed.
   logStream.end(() => {
+    // cli#414: seal the report bun just wrote, success or failure. A run that
+    // died before writing one leaves none to seal, and the guard fails closed on
+    // the missing report.
+    try {
+      if (existsSync(reportXml)) {
+        const hash = createHash("sha256").update(readFileSync(reportXml)).digest("hex");
+        const expected = `${hash}  plugin\n`;
+        writeFileSync(reportSeal, expected);
+        if (readFileSync(reportSeal, "utf8") !== expected) {
+          throw new Error("seal did not read back as written");
+        }
+      }
+    } catch (err) {
+      console.error(`openclaw-tps-mail tests: could not seal the report: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
     process.exitCode = signal ? 1 : (code ?? 1);
   });
 });
