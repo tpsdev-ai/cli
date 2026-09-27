@@ -5,7 +5,7 @@
   ],
   "packageRules": [
     {
-      "description": "cli's own @tpsdev-ai/* packages (tps, cli, agent, pi-tps-mail and the cli-<platform> binaries) are released in lockstep by the release process, not bumped by Renovate.",
+      "description": "Every @tpsdev-ai/* dependency in this repo is one of cli's own release packages (cli, agent and the four cli-<platform> binaries), which the release workflow versions and publishes together; Renovate does not bump them.",
       "matchPackageNames": [
         "@tpsdev-ai/**"
       ],
