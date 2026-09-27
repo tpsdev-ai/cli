@@ -386,9 +386,13 @@ jobs:
         with:
           persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
       - run: python3 -m pip install semgrep
+      # .github/renovate.json is excluded: its cooldown (minimumReleaseAge) comes from the shared
+      # tpsdev-ai preset it extends, which Semgrep cannot resolve, so the v42
+      # renovate-missing-minimum-release-age rule reports a false positive. Renovate config is
+      # reviewed in PR review, not SAST (tpsdev-ai/flair excludes its Renovate files the same way).
       - run: >
           semgrep scan --config=auto --error
-          --exclude='**/test/**' --exclude='**/dist/**'
+          --exclude='**/test/**' --exclude='**/dist/**' --exclude='.github/renovate.json'
           --exclude-rule javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
           --exclude-rule javascript.lang.security.audit.unsafe-formatstring.unsafe-formatstring
           --exclude-rule javascript.node-crypto.security.gcm-no-tag-length.gcm-no-tag-length
