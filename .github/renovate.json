@@ -1,11 +1,12 @@
 {
-   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-   "extends": ["github>tpsdev-ai/flair//.github/renovate-preset"],
-   "packageRules": [
-     {
-       "description": "cli's own @tpsdev-ai/* packages (tps, cli, agent, pi-tps-mail and the cli-<platform> binaries) are released in lockstep by the release process, not bumped by Renovate.",
-       "matchPackageNames": ["@tpsdev-ai/**"],
-       "enabled": false
-     }
-   ]
+     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+     "extends": ["github>tpsdev-ai/flair//.github/renovate-preset"],
+     "packageRules": [
+        {
+           "description": "cli's own @tpsdev-ai/* packages (tps, cli, agent, pi-tps-mail and the cli-<platform> binaries) are released in lockstep by the release process, not bumped by Renovate.",
+           "matchPackageNames": ["@tpsdev-ai/**"],
+           "minimumReleaseAge": "7 days",
+            "enabled": false
+        }
+     ]
 }
