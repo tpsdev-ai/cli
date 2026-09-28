@@ -19,7 +19,30 @@
 
 import { randomUUID } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
-import { readAgentPrivateKey, readPrivateKeyAtPath } from "./agent-keys.js";
+import { readAgentPrivateKey, readPrivateKeyAtPath, agentKeyPath } from "./agent-keys.js";
+
+/**
+ * Allowed shape for a `--reply-to` id (cli#429). A signed envelope's
+ * `messageId` is a UUID; this accepts that and the dotted/hyphenated ids the
+ * fleet also uses, while rejecting empty strings, whitespace and control
+ * characters. Bounded so a caller cannot smuggle a blob into the signed
+ * envelope through the flag.
+ */
+const REPLY_TO_ID = /^[A-Za-z0-9._-]{1,128}$/;
+
+/**
+ * Throws a named error if `id` is not a plausible signed-envelope messageId.
+ * Exported so the CLI can validate before it builds (and so a test can target
+ * the validator directly).
+ */
+export function assertValidReplyToId(id: string): void {
+  if (!REPLY_TO_ID.test(id)) {
+    throw new Error(
+      `invalid --reply-to id: must be the signed messageId of the message being replied to ` +
+        `(letters, digits, dot, underscore or hyphen, 1-128 chars)`,
+    );
+  }
+}
 
 export interface SignOutboundOptions {
   /** Explicit Ed25519 key path. Falls back to ~/.flair/keys/<from>.key (or TPS_TEST_KEYS_DIR). */
@@ -32,6 +55,12 @@ export interface SignOutboundOptions {
   subject?: string;
   /** Override the generated messageId (tests). */
   messageId?: string;
+  /**
+   * cli#429: the signed `messageId` this body replies to. Carried INSIDE the
+   * envelope (so it is covered by the signature and cannot be altered in
+   * transit); surfaced on receipt. Validated here so no caller can widen it.
+   */
+  replyToId?: string;
   /** When true, throw if no key is available instead of returning the raw body. */
   requireKey?: boolean;
 }
@@ -53,7 +82,7 @@ export function signOutboundBody(
 
   if (!privkey) {
     if (opts.requireKey) {
-      const where = opts.keyPath ? `Looked at ${opts.keyPath}.` : `Looked for ~/.flair/keys/${from}.key.`;
+      const where = opts.keyPath ? `Looked at ${opts.keyPath}.` : `Looked at ${agentKeyPath(from)}.`;
       throw new Error(
         `no Ed25519 private key for agent "${from}" — refusing to send an unsigned body: ` +
           `a promote()-reading recipient dead-letters it terminal. ${where} ` +
@@ -96,6 +125,15 @@ export function signOutboundBody(
     timestamp: now,
     delegationChain: chain,
   };
+
+  // cli#429: thread the reply. Validated BEFORE the envelope is built, and only
+  // set when present, so an absent --reply-to produces byte-for-byte the same
+  // envelope (and signature) as before. Set as a top-level field: JCS
+  // canonicalization in signEnvelope() then covers it with the signature.
+  if (opts.replyToId !== undefined) {
+    assertValidReplyToId(opts.replyToId);
+    envelope.replyToId = opts.replyToId;
+  }
 
   return JSON.stringify(signEnvelope(envelope, { [from]: privkey }));
 }

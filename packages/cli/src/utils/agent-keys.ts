@@ -6,13 +6,16 @@
  *   - a raw 32-byte seed (e.g. flint), or
  *   - base64-encoded PKCS8 DER — the canonical Flair key format used by
  *     kern/sherlock/anvil/pulse and emitted by
- *     `openssl pkcs8 -topk8 -nocrypt -outform DER | base64`.
+ *     `openssl pkcs8 -topk8 -nocrypt -outform DER | base64`,
+ *   - PEM PKCS8 (the text `-----BEGIN PRIVATE KEY----- … -----END PRIVATE
+ *     KEY-----` form) — the format `bob onboard` writes (cli#429).
  *
- * readAgentPrivateKey normalizes both to the 32-byte seed that @noble/ed25519
- * signing expects. Historically it returned the raw file bytes and assumed a
- * 32-byte seed, so signing silently produced invalid signatures for every
- * agent whose key was stored as base64-PKCS8 (all but flint) — breaking
- * `tps mail send` for them. For tests, TPS_TEST_KEYS_DIR overrides the dir.
+ * readAgentPrivateKey normalizes every format to the 32-byte seed that
+ * @noble/ed25519 signing expects. Historically it returned the raw file bytes
+ * and assumed a 32-byte seed, so signing silently produced invalid signatures
+ * for every agent whose key was stored as base64-PKCS8 (all but flint) —
+ * breaking `tps mail send` for them. For tests, TPS_TEST_KEYS_DIR overrides the
+ * dir.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -34,9 +37,19 @@ function keysDir(): string {
  * unrecognized format.
  */
 export function readAgentPrivateKey(agentName: string): Buffer | null {
-  const path = join(keysDir(), `${agentName}.key`);
+  const path = agentKeyPath(agentName);
   if (!existsSync(path)) return null;
   return toEd25519Seed(readFileSync(path));
+}
+
+/**
+ * The path readAgentPrivateKey() resolves for an agent — `~/.flair/keys/<id>.key`
+ * (or `<TPS_TEST_KEYS_DIR>/<id>.key` under tests). Exported so an error about a
+ * missing key can name the exact file it looked at instead of hard-coding a
+ * path that TPS_TEST_KEYS_DIR would falsify (cli#429).
+ */
+export function agentKeyPath(agentName: string): string {
+  return join(keysDir(), `${agentName}.key`);
 }
 
 /**
@@ -66,14 +79,42 @@ export function toEd25519Seed(raw: Buffer): Buffer {
     if (seed) return seed;
   }
 
+  // PEM PKCS8 (or any PEM private-key encoding node:crypto understands): the
+  // text form `-----BEGIN … PRIVATE KEY-----`, which is what `bob onboard`
+  // writes and what the CLI used to reject with "Unrecognized Ed25519 private
+  // key format" (cli#429). Detect by the PEM armor, not by base64-matching the
+  // body (the base64 body would otherwise be misread as PKCS8 DER).
+  if (text.includes("-----BEGIN")) {
+    const seed = seedFromPem(text);
+    if (seed) return seed;
+  }
+
   // Raw (non-base64) PKCS8 DER bytes.
   const seed = seedFromPkcs8Der(raw);
   if (seed) return seed;
 
   throw new Error(
     `Unrecognized Ed25519 private key format (${raw.length} bytes); ` +
-      `expected a raw 32-byte seed or base64-encoded PKCS8 DER`,
+      `expected a raw 32-byte seed, base64-encoded PKCS8 DER, or PEM PKCS8`,
   );
+}
+
+/**
+ * Extract the 32-byte Ed25519 seed from a PEM-encoded PKCS8 private key,
+ * validating the structure via node:crypto (no hand-rolled PEM/base64 parsing).
+ * Returns null if the text is not a valid Ed25519 private key.
+ */
+function seedFromPem(pem: string): Buffer | null {
+  try {
+    const key = createPrivateKey({ key: pem, format: "pem" });
+    if (key.asymmetricKeyType !== "ed25519") return null;
+    const jwk = key.export({ format: "jwk" }) as { d?: string };
+    if (!jwk.d) return null;
+    const seed = Buffer.from(jwk.d, "base64url");
+    return seed.length === 32 ? seed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

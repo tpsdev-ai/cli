@@ -34,6 +34,16 @@ export interface Envelope {
   body: string;
   messageId: string;
   timestamp: string;
+  /**
+   * cli#429: the signed `messageId` of the mail this one replies to (threading).
+   * It is a top-level envelope field, so it is covered by the envelope
+   * signature exactly like `body`: JCS canonicalization of the whole envelope
+   * includes it, and `verifyEnvelope` re-canonicalizes the received envelope
+   * (which carries it) — so a reply-to cannot be added, changed or stripped in
+   * transit without invalidating the outer signature. Optional: absent for a
+   * message that is not a reply.
+   */
+  replyToId?: string;
   delegationChain: ChainEntry[];
   signature?: string; // populated by signEnvelope
 }

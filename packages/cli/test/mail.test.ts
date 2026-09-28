@@ -338,7 +338,10 @@ describe("mail command", () => {
     fs.writeFileSync(join(home, ".tps", "identity", "host.json"), JSON.stringify({ hostId: "host" }));
 
     const env = { TPS_MAIL_DIR: join(tempRoot, "mail"), HOME: home, TPS_AGENT_ID: "austin" };
-    const sent = await run(["mail", "send", "host", "reply from branch"], env);
+    // cli#429: a send that cannot sign now FAILS. This test exercises the
+    // outbox ROUTING (austin has no key here), so it opts into the explicit
+    // local-testing `--unsigned` path. A real branch reply signs like any other.
+    const sent = await run(["mail", "send", "host", "reply from branch", "--unsigned"], env);
     expect(sent.status).toBe(0);
     expect(sent.stdout).toContain("Queued for delivery to host");
 

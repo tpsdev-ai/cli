@@ -36,12 +36,19 @@ export interface MailMessage {
    * the two either breaks this envelope's signature or fails the field match.
    */
   envelope?: Envelope;
+  /**
+   * cli#429: the signed `messageId` this message replies to, stamped from the
+   * VERIFIED envelope at promotion (it is also bound to the envelope by
+   * ENVELOPE_BINDINGS.replyToId, so it cannot diverge from what was signed).
+   * Absent for a message that is not a reply.
+   */
+  replyToId?: string;
   /** Set by listMessages() for dlq records: the sidecar reason class. */
   rejectClass?: string;
   rejectReason?: string;
 }
 
-const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_INBOX_MESSAGES = 100;
 const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -649,6 +656,7 @@ export const ENVELOPE_BINDINGS = {
   body: { kind: "bind", recordField: "body" },
   messageId: { kind: "bind", recordField: "envelopeId" },
   timestamp: { kind: "bind", recordField: "timestamp" },
+  replyToId: { kind: "bind", recordField: "replyToId" },
   delegationChain: { kind: "exclude", reason: "signed as part of the envelope and verified" },
   signature: { kind: "exclude", reason: "verified by decideEnvelopeForMailbox" },
 } satisfies Record<keyof Envelope, EnvelopeBinding>;
@@ -891,6 +899,10 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      // Stamp the verified reply-to (or clear it): the binding table checks
+      // record.replyToId against envelope.replyToId, so presentation cannot
+      // show a reply-to that is not the one that was signed.
+      replyToId: envelope.replyToId,
       checkedOutAt: new Date().toISOString(),
       checkedOutBy: msg.checkedOutBy ?? agent,
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
@@ -945,7 +957,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       // best effort
     }
 
-    logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
+    logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id, replyToId: promoted.replyToId }, promoted.body);
     return { ok: true, message: promoted, path: curPath };
   } finally {
     lock.release();
@@ -1089,6 +1101,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     body: env.body,
     timestamp: env.timestamp,
     envelopeId: env.messageId,
+    replyToId: env.replyToId,
   };
   return { ok: true, message: presented, path: curPath };
 }

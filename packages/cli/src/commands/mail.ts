@@ -9,8 +9,9 @@ import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
-import { readAgentPrivateKey, parseInboundChain } from "../utils/agent-keys.js";
-import { signOutboundBody } from "../utils/mail-sign.js";
+import { parseInboundChain } from "../utils/agent-keys.js";
+import { signOutboundBody, assertValidReplyToId } from "../utils/mail-sign.js";
+import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
@@ -26,6 +27,12 @@ interface MailArgs {
   output?: string;
   taskContext?: string;
   messageId?: string;
+  /** cli#429: read the message body from stdin (fd 0) instead of argv. */
+  stdin?: boolean;
+  /** cli#429: the signed messageId this message replies to. */
+  replyTo?: string;
+  /** cli#429: local-testing opt-in to ship an UNSIGNED body (never the default). */
+  unsigned?: boolean;
   json?: boolean;
   count?: boolean;
   since?: string;
@@ -118,28 +125,42 @@ function validateAgent(agent?: string): string {
   return agent;
 }
 
-// Sign the outbound body if a private key is available for `from`.
-// Returns the JSON-stringified signed envelope, or the original body
-// (with warning) when no key is present. Called once before route
-// dispatch so all delivery paths (branch-mode outbox, remote-branch,
-// branch-office bridge, direct maildir) ship signed bodies.
+// Sign the outbound body, or FAIL.
+//
+// cli#429: `tps mail send` no longer silently degrades to unsigned. With no
+// key available the send exits NON-ZERO, the error names the key path it looked
+// at and the remedy, and NOTHING is written to any outbox or maildir — because
+// this runs BEFORE every delivery path (branch-mode outbox, remote-branch,
+// branch-office bridge, direct maildir). `--unsigned` is an explicit,
+// local-testing-only opt-in (warned on stderr) and is never the default.
 //
 // The envelope builder itself lives in utils/mail-sign.ts (shared with the
-// agent runtimes) so the two cannot drift; this wrapper only keeps the
-// historical operator-friendly unsigned fallback + warning.
-function maybeSignEnvelopeBody(from: string, to: string, body: string): string {
-  if (!readAgentPrivateKey(from)) {
+// agent runtimes) so the two cannot drift.
+function signOutboundOrFail(
+  from: string,
+  to: string,
+  body: string,
+  opts: { replyToId?: string; unsigned?: boolean },
+): string {
+  if (opts.unsigned) {
     console.warn(
-      `No private key found for agent "${from}" — sending unsigned. ` +
-      `Place a 32-byte Ed25519 seed at ~/.flair/keys/${from}.key or set ` +
-      `TPS_TEST_KEYS_DIR to enable envelope signing.`,
+      "⚠️  --unsigned: sending WITHOUT a signature. Local testing only — " +
+        "a promote()-reading recipient dead-letters an unsigned body terminal.",
     );
     return body;
   }
-  return signOutboundBody(from, to, body, {
-    rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
-    priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
-  });
+  try {
+    if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
+    return signOutboundBody(from, to, body, {
+      requireKey: true,
+      replyToId: opts.replyToId,
+      rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
+      priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
+    });
+  } catch (err) {
+    console.error(`Refusing to send: ${(err as Error).message}`);
+    process.exit(1);
+  }
 }
 
 function newestJsonMtime(dir: string): string | null {
@@ -157,9 +178,31 @@ export async function runMail(args: MailArgs): Promise<void> {
     case "send": {
       const to = validateAgent(args.agent);
 
-      // Build message body: --task flag constructs a task envelope
+      // Build the message body. Three sources, mutually exclusive (cli#429):
+      //   --stdin   read the body from fd 0
+      //   --task    construct a task envelope
+      //   positional message from argv (the historical path)
       let messageBody: string;
-      if (args.task) {
+      if (args.stdin) {
+        if (args.task) {
+          console.error("Refusing to send: --stdin cannot be combined with --task.");
+          process.exit(1);
+        }
+        if (args.message && args.message.trim() !== "") {
+          console.error("Refusing to send: --stdin cannot be combined with a positional message.");
+          process.exit(1);
+        }
+        try {
+          messageBody = readStdinBodySync();
+        } catch (err) {
+          if (err instanceof EmptyStdinError || err instanceof StdinTooLargeError) {
+            console.error(`Refusing to send: ${err.message}.`);
+          } else {
+            console.error(`Failed to read the message body from stdin: ${(err as Error).message}`);
+          }
+          process.exit(1);
+        }
+      } else if (args.task) {
         try {
           messageBody = createTaskEnvelope(`task.${args.task}`, {
             taskId: args.taskId,
@@ -176,21 +219,22 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
       } else {
         if (!args.message) {
-          console.error("Usage: tps mail send <agent> <message>");
+          console.error("Usage: tps mail send <agent> <message>  (or --stdin)");
           process.exit(1);
         }
         messageBody = args.message;
       }
-      // Reassign for downstream use
-      args.message = messageBody;
 
       const from = await resolveAgentId();
 
-      // Sign the envelope BEFORE route dispatch so all four delivery paths
+      // Sign BEFORE route dispatch so all four delivery paths
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
-      // ship signed bodies. Previously only the direct-maildir path signed,
-      // leaving K&S/branch-office dispatches unsigned (signed-envelopes gap #1).
-      args.message = maybeSignEnvelopeBody(from, to, args.message);
+      // ship signed bodies, and so a send that cannot sign fails with nothing
+      // written. cli#429.
+      args.message = signOutboundOrFail(from, to, messageBody, {
+        replyToId: args.replyTo,
+        unsigned: args.unsigned,
+      });
 
       // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
       // plugin so the two cannot drift: `resolveMailRoute` owns the
@@ -289,6 +333,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       } else {
         for (const m of messages) {
           console.log(`📬 ${m.from} → ${m.to}  ${m.timestamp}`);
+          if (m.replyToId) console.log(`↳ reply-to: ${m.replyToId}`);
           const taskEnv = parseTaskEnvelope(m.body);
           console.log(taskEnv ? formatTaskEnvelope(taskEnv) : m.body);
           console.log("---");
@@ -347,7 +392,8 @@ export async function runMail(args: MailArgs): Promise<void> {
               : m.body
                 ? `  ${m.body.slice(0, 60)}${m.body.length > 60 ? "…" : ""}`
                 : "";
-            console.log(`${marker} ${id8} ${m.from} → ${m.to}  ${m.timestamp}${summary}`);
+            const replyMarker = m.replyToId ? `  ↳ reply-to: ${m.replyToId}` : "";
+            console.log(`${marker} ${id8} ${m.from} → ${m.to}  ${m.timestamp}${replyMarker}${summary}`);
           }
         }
       }
@@ -418,6 +464,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         const marker = found.read ? "📖" : "📬";
         console.log(`${marker} ${found.from} → ${found.to}  ${found.timestamp}`);
         console.log(`ID: ${found.id}`);
+        if (found.replyToId) console.log(`Reply-to: ${found.replyToId}`);
         const taskEnv = parseTaskEnvelope(found.body);
         if (taskEnv) {
           console.log(`Task: ${formatTaskEnvelope(taskEnv)}`);
@@ -462,7 +509,8 @@ export async function runMail(args: MailArgs): Promise<void> {
         for (const e of events) {
           const icon = e.event === "sent" ? "📤" : e.event === "read" ? "📬" : "📋";
           const preview = e.bodyPreview ? ` — ${e.bodyPreview}` : "";
-          console.log(`${icon} [${e.event}] ${e.from} → ${e.to} @ ${e.timestamp}${preview}`);
+          const reply = e.replyToId ? `  ↳ reply-to: ${e.replyToId}` : "";
+          console.log(`${icon} [${e.event}] ${e.from} → ${e.to} @ ${e.timestamp}${reply}${preview}`);
         }
       }
       // Back-pressure is aimed at the recipient but the "Inbox full" throw only
