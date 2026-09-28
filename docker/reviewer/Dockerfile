@@ -89,3 +89,6 @@ WORKDIR /workspace
 USER reviewer
 
 ENTRYPOINT ["node", "/opt/reviewer/reviewer-launch.mjs"]
+
+# TEMPORARY red-run probe: a credential helper must fail the A9 lane.
+RUN git config --system credential.helper store
