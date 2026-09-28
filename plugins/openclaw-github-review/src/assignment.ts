@@ -44,11 +44,14 @@ export class FileAssignmentResolver implements AssignmentResolver {
       return null;
     }
     const list = Array.isArray(parsed.assignments) ? parsed.assignments : [];
-    for (const entry of list) {
-      const a = parseAssignment(entry);
-      if (a && a.sessionKey === sessionKey) return a;
-    }
-    return null;
+    // An ambiguous assignment refuses: gather EVERY entry whose sessionKey
+    // matches and require exactly one — a duplicate session key is not resolved
+    // by position, it is refused.
+    const matches = list.filter(
+      (entry) => typeof entry === "object" && entry !== null && (entry as { sessionKey?: unknown }).sessionKey === sessionKey,
+    );
+    if (matches.length !== 1) return null;
+    return parseAssignment(matches[0]);
   }
 }
 

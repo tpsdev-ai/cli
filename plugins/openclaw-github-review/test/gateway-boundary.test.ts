@@ -1,26 +1,40 @@
 /**
- * gateway-boundary.test.ts — section E / A10 (host/container contrast) and A11
- * (secret canaries).
+ * gateway-boundary.test.ts — the section-E gateway boundary lane (round 2) and
+ * the A11 secret scans.
  *
- * The lane registers the plugin through the SAME `api.registerTool` mechanism
- * the gateway uses, then dispatches twice from one session: once with the
- * gateway's host context and once with a sandbox context. The host half posts
- * and reads a host-only marker; the sandbox half is refused and cannot read the
- * marker.
+ * The lane loads the BUILT plugin through OpenClaw's REAL registration machinery
+ * (see openclaw-loader.ts) with a mode=all reviewer config, and proves the
+ * handler executes in the GATEWAY process: a mode=all (sandboxed) session is NOT
+ * refused and the handler runs its ordinary pipeline, and the host-only marker
+ * CONTENTS are readable from the fixture registered through the same mechanism.
  *
- * HONEST SCOPE: this environment has no container runtime, so the "sandbox" is
- * modelled by an isolated child process plus the handler's own sandboxed-context
- * refusal — the strongest assertion available without the reviewer image
- * (section A, PR 2). The real container lane is a follow-up.
+ * The secret scans drive the plugin through registerGithubReview (not
+ * registerWithDeps) with a real config and a real signing key, over the success,
+ * refusal, rejected, ambiguous and audit-failure paths, using the marker's
+ * CONTENTS and a signing-key canary.
+ *
+ * The container half (a real sandbox where the marker is NOT readable) is
+ * deferred to section A / a later PR.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { registerWithDeps } from "../src/index.js";
-import { makeDeps, scenario, TOKEN, validInput } from "./helpers.js";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  CI_PROBE_ENV,
+  CI_PROBE_TOOL_NAME,
+  HOST_MARKER_ENV,
+  registerGithubReview,
+  registerWithDeps,
+  TOOL_NAME,
+} from "../src/index.js";
+import { FakeGitHub, makeDeps, resolver, scenario, session, TOKEN, validAssignment, validInput } from "./helpers.js";
+import { openclawDistDir, registerBuiltPlugin, type CapturedTool } from "./openclaw-loader.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const pluginDir = resolve(here, "..");
+const MARKER = "HOST-ONLY-MARKER-7c21";
 
 let root: string;
 let savedProbe: string | undefined;
@@ -28,145 +42,212 @@ let savedMarker: string | undefined;
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "gr-boundary-"));
-  savedProbe = process.env.TPS_GITHUB_REVIEW_CI_PROBE;
-  savedMarker = process.env.TPS_GITHUB_REVIEW_HOST_MARKER;
+  savedProbe = process.env[CI_PROBE_ENV];
+  savedMarker = process.env[HOST_MARKER_ENV];
 });
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
-  if (savedProbe === undefined) delete process.env.TPS_GITHUB_REVIEW_CI_PROBE;
-  else process.env.TPS_GITHUB_REVIEW_CI_PROBE = savedProbe;
-  if (savedMarker === undefined) delete process.env.TPS_GITHUB_REVIEW_HOST_MARKER;
-  else process.env.TPS_GITHUB_REVIEW_HOST_MARKER = savedMarker;
+  if (savedProbe === undefined) delete process.env[CI_PROBE_ENV];
+  else process.env[CI_PROBE_ENV] = savedProbe;
+  if (savedMarker === undefined) delete process.env[HOST_MARKER_ENV];
+  else process.env[HOST_MARKER_ENV] = savedMarker;
 });
 
-interface Registered {
-  name: string;
-  factory: (ctx: { sessionKey?: string; sandboxed?: boolean }) => {
-    execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }>;
-  };
+async function textOf(tool: { execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }> }, params: unknown): Promise<string> {
+  return (await tool.execute("call", params)).content[0]!.text;
 }
 
-function registerCapturing(deps: ReturnType<typeof makeDeps>["deps"]): { tools: Registered[]; logs: string[] } {
-  const tools: Registered[] = [];
-  const logs: string[] = [];
-  const api = {
-    logger: { info: (...a: unknown[]) => logs.push(a.join(" ")), warn: (...a: unknown[]) => logs.push(a.join(" ")), error: (...a: unknown[]) => logs.push(a.join(" ")) },
-    registerTool: (factory: unknown, opts?: { name?: string }) => tools.push({ name: opts?.name ?? "?", factory: factory as Registered["factory"] }),
-    registerChannel: () => {},
-  };
-  registerWithDeps(api as never, deps);
-  return { tools, logs };
-}
+/** The github_review tool's `execute` shape after a factory call. */
+type Tool = CapturedTool["factory"] extends never ? never : { execute: (id: string, params: unknown) => Promise<{ content: Array<{ text: string }> }> };
 
-const MARKER = "HOST-ONLY-MARKER-9f3c";
-
-describe("E / A10 — host/container contrast through the registration path", () => {
-  test("the host half posts and reads the host-only marker", async () => {
-    process.env.TPS_GITHUB_REVIEW_CI_PROBE = "1";
+describe("E — the real registration/delivery path (gateway process)", () => {
+  test("the BUILT plugin registers through OpenClaw's real machinery and a mode=all session is NOT refused", async () => {
+    process.env[CI_PROBE_ENV] = "1";
     const markerPath = join(root, "host-only.marker");
     writeFileSync(markerPath, MARKER, { mode: 0o600 });
-    process.env.TPS_GITHUB_REVIEW_HOST_MARKER = markerPath;
+    process.env[HOST_MARKER_ENV] = markerPath;
 
-    const { deps, github } = makeDeps(scenario(root));
-    const { tools } = registerCapturing(deps);
-    const byName = new Map(tools.map((t) => [t.name, t]));
-    expect([...byName.keys()].sort()).toEqual(["github_review", "github_review_ci_probe"]);
+    const s = scenario(root, { allowedRepositories: [] }); // refuse pre-request, no network
+    const { tools, logs } = await registerBuiltPlugin({
+      pluginDir,
+      openclawDistDir: openclawDistDir(pluginDir),
+      pluginConfig: {
+        allowedRepositories: [],
+        maxBodyBytes: 65_536,
+        credentialFile: s.config.credentialFile,
+        provisioningFile: s.config.provisioningFile,
+        signingKeyFile: s.config.signingKeyFile,
+        reviewerIdentity: s.config.reviewerIdentity,
+        pendingAuditFile: s.config.pendingAuditFile,
+        reconcileFile: s.config.reconcileFile,
+      },
+      registrationMode: "full",
+    });
 
-    // The probe reports the gateway identity and reads the marker.
-    const probe = byName.get("github_review_ci_probe")!.factory({ sessionKey: "sess-1", sandboxed: false });
-    const probeOut = JSON.parse((await probe.execute("p1", {})).content[0]!.text) as { hostname: string; pid: number; marker: string | null };
+    // The one production verb and the CI probe both register through the real
+    // mechanism; nothing else.
+    const names = tools.map((t) => t.name).sort();
+    expect(names).toEqual([CI_PROBE_TOOL_NAME, TOOL_NAME].sort());
+
+    // A mode=all (sandboxed) session is accepted: the handler runs its ordinary
+    // pipeline and refuses at a NORMAL gate, never a sandbox gate.
+    const review = tools.find((t) => t.name === TOOL_NAME)!.factory({
+      sessionKey: "sess-1",
+      agentId: "anvil",
+      sandboxed: true,
+    }) as Tool;
+    const out = JSON.parse(await textOf(review, validInput())) as { status: string; reason?: string };
+    expect(out.status).toBe("refused");
+    expect(out.reason).toBe("repo_not_configured");
+
+    // The host-only marker's CONTENTS are readable from this gateway process,
+    // through the fixture registered by the same mechanism.
+    const probe = tools.find((t) => t.name === CI_PROBE_TOOL_NAME)!.factory({
+      sessionKey: "sess-1",
+      agentId: "anvil",
+      sandboxed: true,
+    }) as Tool;
+    const probeOut = JSON.parse(await textOf(probe, {})) as { marker: string | null };
     expect(probeOut.marker).toBe(MARKER);
-    expect(probeOut.hostname).toBe(hostname());
+    expect(logs.join("\n")).not.toContain(TOKEN);
+  });
 
-    // The real handler, on the host, posts.
-    const tool = byName.get("github_review")!.factory({ sessionKey: "sess-1", sandboxed: false });
-    const out = JSON.parse((await tool.execute("c1", validInput())).content[0]!.text) as { status: string };
+  test("a mode=all (sandboxed:true) session POSTS successfully", async () => {
+    const { deps, github } = makeDeps(scenario(root));
+    const tools: CapturedTool[] = [];
+    const api = {
+      registrationMode: "full",
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      registerTool: (t: unknown, o?: { name?: string }) =>
+        tools.push({ name: o?.name ?? "?", factory: (typeof t === "function" ? t : () => t) as CapturedTool["factory"] }),
+    };
+    registerWithDeps(api as never, deps);
+    const tool = tools.find((t) => t.name === TOOL_NAME)!.factory({
+      sessionKey: "sess-1",
+      agentId: "anvil",
+      sandboxed: true,
+    }) as Tool;
+    const out = JSON.parse(await textOf(tool, validInput())) as { status: string };
     expect(out.status).toBe("posted");
     expect(github.reviewCalls.length).toBe(1);
   });
-
-  test("the sandbox half is refused and posts nothing", async () => {
-    const { deps, github } = makeDeps(scenario(root));
-    const { tools } = registerCapturing(deps);
-    const tool = new Map(tools.map((t) => [t.name, t])).get("github_review")!.factory({ sessionKey: "sess-1", sandboxed: true });
-    const out = JSON.parse((await tool.execute("c1", validInput())).content[0]!.text) as { status: string; reason?: string };
-    expect(out.status).toBe("refused");
-    expect(out.reason).toBe("handler_sandboxed");
-    expect(github.reviewCalls.length).toBe(0);
-  });
-
-  test("sandbox execution cannot read the host-only marker", () => {
-    // The marker lives OUTSIDE the sandbox root; a child whose only view is the
-    // sandbox root cannot find it.
-    const markerPath = join(root, "host-only.marker");
-    writeFileSync(markerPath, MARKER, { mode: 0o600 });
-    const sandboxRoot = join(root, "sandbox");
-    const script = [
-      "const { readdirSync, statSync } = require('node:fs');",
-      "const { join } = require('node:path');",
-      "let found = false;",
-      "const walk = (d, depth) => { if (depth > 6) return; let e; try { e = readdirSync(d, {withFileTypes:true}); } catch { return; }",
-      "  for (const x of e) { const p = join(d, x.name); if (x.isDirectory()) walk(p, depth+1); else if (x.name === 'host-only.marker') found = true; } };",
-      "walk(process.env.HOME, 0);",
-      "console.log(found ? 'FOUND' : 'SANDBOX_CANNOT_READ_MARKER');",
-    ].join("\n");
-    const res = spawnSync("node", ["-e", script], {
-      encoding: "utf8",
-      env: { PATH: process.env.PATH, HOME: sandboxRoot },
-      timeout: 20_000,
-    });
-    expect((res.stdout ?? "").trim()).toBe("SANDBOX_CANNOT_READ_MARKER");
-  });
 });
 
-/** A scanner returning the matches of any canary present in a haystack. */
-function scanForSecrets(haystack: string, canaries: string[]): string[] {
-  return canaries.filter((c) => c.length > 0 && haystack.includes(c));
-}
+describe("A11 — full secret scans through registerGithubReview", () => {
+  function mockApi(pluginConfig: unknown, tools: CapturedTool[], logs: string[]) {
+    return {
+      pluginConfig,
+      registrationMode: "full",
+      version: "0.1.0-test",
+      logger: {
+        info: (...a: unknown[]) => logs.push(a.join(" ")),
+        warn: (...a: unknown[]) => logs.push(a.join(" ")),
+        error: (...a: unknown[]) => logs.push(a.join(" ")),
+      },
+      registerTool: (tool: unknown, opts?: { name?: string }) => {
+        const factory = typeof tool === "function" ? (tool as CapturedTool["factory"]) : () => tool;
+        tools.push({ name: opts?.name ?? "(unnamed)", factory });
+      },
+      registerChannel: () => {},
+    };
+  }
 
-describe("A11 — complete secret-canary scans", () => {
-  test("the scanner detects a controlled positive fixture", () => {
-    expect(scanForSecrets(`x ${TOKEN} y`, [TOKEN])).toEqual([TOKEN]);
-    expect(scanForSecrets("no secret here", [TOKEN])).toEqual([]);
-  });
-
-  test("no canary escapes into results, logs, transcripts or a sandbox env", async () => {
-    const signingKey = "FAKE-SIGNING-KEY-DO-NOT-USE-4b1d";
+  /** Run one scenario through registerGithubReview and return everything a leak
+   *  could surface in. */
+  async function runScenario(opts: {
+    reviewResult?: FakeGitHub["reviewResult"];
+    auditStatus?: number;
+    input?: unknown;
+  }): Promise<{ haystack: string; result: string; logs: string[]; errors: string[] }> {
     const markerPath = join(root, "host-only.marker");
     writeFileSync(markerPath, MARKER, { mode: 0o600 });
+    process.env[HOST_MARKER_ENV] = markerPath;
 
-    process.env.TPS_GITHUB_REVIEW_CI_PROBE = "1";
-    process.env.TPS_GITHUB_REVIEW_HOST_MARKER = markerPath;
+    const s = scenario(root);
+    const github = new FakeGitHub();
+    if (opts.reviewResult) github.reviewResult = opts.reviewResult;
+    const flairRequests: unknown[] = [];
+    const flairFetch = (async (url: string, init: RequestInit) => {
+      flairRequests.push({ url, init });
+      return new Response("", { status: opts.auditStatus ?? 200 });
+    }) as unknown as typeof fetch;
 
-    const { deps, github } = makeDeps(scenario(root));
-    const { tools, logs } = registerCapturing(deps);
-    const byName = new Map(tools.map((t) => [t.name, t]));
-    const tool = byName.get("github_review")!.factory({ sessionKey: "sess-1", sandboxed: false });
-
-    const transcript: string[] = [];
-    const ok = await tool.execute("c1", validInput());
-    transcript.push(ok.content[0]!.text);
-
-    // The exact bytes transmitted to GitHub (which are NOT secret).
-    const transmitted = github.reviewCalls.map((c) => JSON.stringify(c)).join("\n");
-
-    // A sandbox child's complete environment.
-    const envRes = spawnSync("node", ["-e", "console.log(JSON.stringify(process.env))"], {
-      encoding: "utf8",
-      env: { PATH: process.env.PATH, HOME: join(root, "sandbox") },
-      timeout: 20_000,
+    const tools: CapturedTool[] = [];
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const api = mockApi(
+      {
+        allowedRepositories: ["tpsdev-ai/cli"],
+        maxBodyBytes: 65_536,
+        credentialFile: s.config.credentialFile,
+        provisioningFile: s.config.provisioningFile,
+        signingKeyFile: s.config.signingKeyFile,
+        reviewerIdentity: "anvil",
+        pendingAuditFile: s.config.pendingAuditFile,
+        reconcileFile: s.config.reconcileFile,
+      },
+      tools,
+      logs,
+    );
+    registerGithubReview(api as never, {
+      assignments: resolver([validAssignment()]),
+      github,
+      flairFetch,
     });
 
-    const canaries = [TOKEN, signingKey, process.env.TPS_GITHUB_REVIEW_HOST_MARKER!];
-    const scans: Array<[string, string]> = [
-      ["tool result", ok.content[0]!.text],
-      ["gateway log", logs.join("\n")],
-      ["session transcript", transcript.join("\n")],
-      ["sandbox environment", envRes.stdout ?? ""],
-      ["transmitted review", transmitted],
-    ];
-    for (const [label, hay] of scans) {
-      expect([label, scanForSecrets(hay, canaries)]).toEqual([label, []]);
+    const review = tools.find((t) => t.name === TOOL_NAME)!.factory({
+      sessionKey: "sess-1",
+      agentId: "anvil",
+      sandboxed: true,
+    }) as Tool;
+
+    let result = "";
+    try {
+      result = await textOf(review, opts.input ?? validInput());
+    } catch (err) {
+      errors.push(String((err as Error).message));
     }
+
+    const keyCanary = readFileSync(s.config.signingKeyFile!, "utf8").trim();
+    const haystack = [result, logs.join("\n"), errors.join("\n")].join("\n");
+    return { haystack, result, logs, errors, keyCanary };
+  }
+
+  test("the scanner detects a controlled positive fixture", () => {
+    const found = [TOKEN, MARKER].filter((c) => `x ${TOKEN} y`.includes(c));
+    expect(found).toEqual([TOKEN]);
+  });
+
+  test("success path: no canary in result, logs or errors", async () => {
+    const { haystack, result, keyCanary } = await runScenario({});
+    expect(JSON.parse(result).status).toBe("posted");
+    for (const c of [TOKEN, MARKER, keyCanary]) expect(haystack).not.toContain(c);
+  });
+
+  test("refusal path: no canary leaks", async () => {
+    const { haystack, keyCanary } = await runScenario({ input: validInput({ repo: "not/configured" }) });
+    for (const c of [TOKEN, MARKER, keyCanary]) expect(haystack).not.toContain(c);
+  });
+
+  test("rejected path: no canary leaks", async () => {
+    const { haystack, result, keyCanary } = await runScenario({
+      reviewResult: { ok: false, kind: "rejected", detail: "posting returned status 422" },
+    });
+    expect(JSON.parse(result).reason).toBe("github_rejected");
+    for (const c of [TOKEN, MARKER, keyCanary]) expect(haystack).not.toContain(c);
+  });
+
+  test("ambiguous path: no canary leaks", async () => {
+    const { haystack, result, keyCanary } = await runScenario({
+      reviewResult: { ok: false, kind: "ambiguous", detail: "posting returned status 502" },
+    });
+    expect(JSON.parse(result).status).toBe("unknown");
+    for (const c of [TOKEN, MARKER, keyCanary]) expect(haystack).not.toContain(c);
+  });
+
+  test("audit-failure path: no canary leaks", async () => {
+    const { haystack, result, keyCanary } = await runScenario({ auditStatus: 500 });
+    expect(JSON.parse(result).status).toBe("posted_audit_pending");
+    for (const c of [TOKEN, MARKER, keyCanary]) expect(haystack).not.toContain(c);
   });
 });

@@ -4,7 +4,9 @@
  * The order below is the authorization order in section B: local, cheap checks
  * and the credential/scope gate run BEFORE any outbound request; only then does
  * the host fetch the PR, and the post is constructed and its receipt validated
- * host-side. Nothing here reads trust from the caller.
+ * host-side. `repo`, `pr` and `commit_id` ARE caller input — they are accepted
+ * only when they equal the trusted dispatch assignment and the host-fetched
+ * head.
  */
 
 import { createHash } from "node:crypto";
@@ -17,6 +19,7 @@ import {
   type GitHubApi,
   type Outcome,
   type PendingAuditStore,
+  type ReconcileStore,
   type RefusalReason,
   type ReviewEvent,
   type RuntimeEvidence,
@@ -31,6 +34,7 @@ export interface HandlerDeps {
   github: GitHubApi;
   audit: AuditSink;
   pendingAudits: PendingAuditStore;
+  reconcile: ReconcileStore;
   runtime: RuntimeEvidence;
   clock: () => Date;
   newId: () => string;
@@ -60,17 +64,7 @@ export async function runGithubReview(
   ctx: SessionContext,
   deps: HandlerDeps,
 ): Promise<Outcome> {
-  const { config, custody, assignments, github, audit, pendingAudits, runtime, clock, newId } = deps;
-
-  // ── E: the handler executes in the gateway process, never in the sandbox ──
-  if (ctx.sandboxed) {
-    return refuse(
-      "handler_sandboxed",
-      null,
-      "the review handler was invoked from inside the sandbox",
-      "invoke github_review from the gateway host process; the sandbox is not allowed to post",
-    );
-  }
+  const { config, custody, assignments, github, audit, pendingAudits, reconcile, runtime, clock, newId } = deps;
 
   // ── input shape and unsupported fields ──
   if (typeof rawInput !== "object" || rawInput === null || Array.isArray(rawInput)) {
@@ -99,6 +93,14 @@ export async function runGithubReview(
   }
   if (typeof body !== "string") {
     return refuse("invalid_input", null, "body must be a string", "pass the review body as a string");
+  }
+  if (/\p{Cs}/u.test(body)) {
+    return refuse(
+      "invalid_input",
+      null,
+      "body is not well-formed Unicode (lone surrogate)",
+      "remove unpaired surrogate code units from the body",
+    );
   }
   if (typeof event !== "string" || !(REVIEW_EVENTS as readonly string[]).includes(event)) {
     return refuse(
@@ -129,6 +131,14 @@ export async function runGithubReview(
     return refuse("assignment_missing", null, "no dispatch assignment for this session", "create a trusted dispatch assignment for the session");
   }
   const actor = assignment.reviewer;
+  if (ctx.agentId !== assignment.reviewer) {
+    return refuse(
+      "assignment_mismatch",
+      actor,
+      "the session's agent does not match the assignment's reviewer",
+      "dispatch the review to the assignment's reviewer",
+    );
+  }
   if (!assignment.active) {
     return refuse("assignment_expired", actor, "the dispatch assignment is no longer active", "dispatch the review again");
   }
@@ -144,12 +154,22 @@ export async function runGithubReview(
       "review the assigned pull request, or obtain a fresh assignment",
     );
   }
-  if (config.reviewerIdentity !== null && assignment.reviewer !== config.reviewerIdentity) {
+  if (config.reviewerIdentity === null || assignment.reviewer !== config.reviewerIdentity) {
     return refuse(
       "assignment_mismatch",
       actor,
       "the assignment's reviewer does not match the host signing identity",
       "dispatch the review to the reviewer whose signing key the host holds",
+    );
+  }
+
+  // ── a latched unknown outcome refuses until the host reconciles ──
+  if (reconcile.has(assignment.dispatchId)) {
+    return refuse(
+      "reconcile_required",
+      actor,
+      "a previous post for this dispatch has an unknown external state",
+      "reconcile the pull request's reviews, then have the host clear the dispatch latch",
     );
   }
 
@@ -164,6 +184,16 @@ export async function runGithubReview(
       actor,
       `body is ${bodyBytes} bytes, over the ${config.maxBodyBytes}-byte limit`,
       "shorten the review body",
+    );
+  }
+
+  // ── durable stores must be configured BEFORE any request ──
+  if (!config.pendingAuditFile || !config.reconcileFile) {
+    return refuse(
+      "pending_audit_unconfigured",
+      actor,
+      `${!config.pendingAuditFile ? "pendingAuditFile" : "reconcileFile"} is not configured`,
+      "configure both durable stores on the host and restart",
     );
   }
 
@@ -199,7 +229,7 @@ export async function runGithubReview(
     );
   }
 
-  // ── host-computed digest over the exact bytes to be sent ──
+  // ── host-computed digest over the UTF-8 body handed to the serializer ──
   const bodySha256 = sha256Hex(Buffer.from(body, "utf8"));
 
   // ── post and validate the receipt ──
@@ -208,14 +238,23 @@ export async function runGithubReview(
     if (posted.kind === "rejected") {
       return refuse("github_rejected", actor, posted.detail, "correct the review and retry");
     }
-    return refuse("github_ambiguous", actor, `${posted.detail}; reconcile before another post`, "reconcile the PR's reviews before retrying");
+    // AMBIGUOUS: a review may exist. Report an UNKNOWN state, never a refusal,
+    // and latch the dispatch so a retry cannot post a second review.
+    reconcile.add(assignment.dispatchId);
+    return {
+      ok: true,
+      status: "unknown",
+      reason: "reconcile_required",
+      reviewId: null,
+      reviewUrl: null,
+      commitId: head,
+      auditEventId: null,
+      login: scope.login,
+    };
   }
   const receipt = posted.receipt;
-  if (receipt.commitId !== head || receipt.state !== expectedReceiptState(reviewEvent)) {
-    return refuse("receipt_invalid", actor, "the posting receipt does not match the request", "reconcile the PR's reviews manually");
-  }
 
-  // ── signed audit record ──
+  // ── audit record (built from the confirmed receipt) ──
   const auditEventId = newId();
   const draft = buildOrgEvent({
     id: auditEventId,
@@ -231,13 +270,38 @@ export async function runGithubReview(
     login: scope.login,
     createdAt: clock().toISOString(),
   });
+
+  // Receipt validation happens AFTER the audit record is built, because a 2xx
+  // means the review exists and must be retained for the audit even when the
+  // receipt does not match.
+  if (receipt.commitId !== head || receipt.state !== expectedReceiptState(reviewEvent)) {
+    reconcile.add(assignment.dispatchId);
+    let retainedId: string | null = null;
+    try {
+      await audit.record(draft);
+      retainedId = auditEventId;
+    } catch {
+      retainPendingAudit(pendingAudits, draft);
+    }
+    return {
+      ok: true,
+      status: "unknown",
+      reason: "receipt_invalid",
+      reviewId: receipt.id,
+      reviewUrl: receipt.url,
+      commitId: head,
+      auditEventId: retainedId,
+      login: scope.login,
+    };
+  }
+
   try {
     await audit.record(draft);
   } catch {
     // GitHub created the review but auditing failed: explicit partial outcome,
     // with the audit work retained host-side for retry. Never reported as a
-    // complete success.
-    pendingAudits.save(draft);
+    // complete success, and a retention failure is never allowed to throw.
+    retainPendingAudit(pendingAudits, draft);
     return {
       ok: true,
       status: "posted_audit_pending",
@@ -260,10 +324,32 @@ export async function runGithubReview(
   };
 }
 
+/** Retain an audit record for host-side retry. A retention failure is caught
+ *  and never thrown after a post; the failure text is not surfaced. */
+function retainPendingAudit(pendingAudits: PendingAuditStore, draft: ReturnType<typeof buildOrgEvent>): void {
+  try {
+    pendingAudits.save(draft);
+  } catch {
+    // Best effort: the audit record is not retained, and nothing about the
+    // host filesystem is disclosed. The result stays a partial outcome.
+  }
+}
+
 /** A stable, safe JSON view of an outcome for the tool result. It contains no
  *  credential, no host path and no raw upstream error text. */
 export function outcomeToJson(outcome: Outcome): string {
   if (outcome.ok) {
+    if (outcome.status === "unknown") {
+      return JSON.stringify({
+        status: "unknown",
+        reason: outcome.reason,
+        review_id: outcome.reviewId,
+        review_url: outcome.reviewUrl,
+        commit_id: outcome.commitId,
+        audit_event_id: outcome.auditEventId,
+        github_login: outcome.login,
+      });
+    }
     return JSON.stringify({
       status: outcome.status,
       review_id: outcome.reviewId,

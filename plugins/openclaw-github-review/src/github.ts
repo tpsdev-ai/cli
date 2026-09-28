@@ -4,8 +4,8 @@
  * It builds every request internally from the validated {repo, pr, commit,
  * event, body}. There is no endpoint, method, header or body passthrough: the
  * caller cannot select a URL or add a header. The body is serialized exactly as
- * given (no rewriting or enrichment), so the host-side sha256 commits to the
- * bytes actually transmitted.
+ * given (no rewriting or enrichment), so the host-side sha256 is taken over the
+ * same UTF-8 body handed to the serializer.
  */
 
 import type { CredentialCustody } from "./credential.js";

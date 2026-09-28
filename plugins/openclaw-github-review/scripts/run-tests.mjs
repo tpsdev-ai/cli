@@ -13,7 +13,7 @@
  *   node scripts/run-tests.mjs [bun test args…]
  *   TPS_TEST_KEEP_ROOT=1 node scripts/run-tests.mjs   # keep the temp root
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +31,16 @@ delete env.TPS_TEST_ROOT;
 Object.assign(env, { HOME: root, TPS_TEST_ROOT: root });
 
 console.log(`openclaw-github-review tests: isolated root ${root}`);
+
+// The gateway-boundary lane loads the BUILT plugin entry (dist/src/index.js)
+// through OpenClaw's real registration machinery, so the build must reflect the
+// current sources. Build first and refuse to run if it fails.
+const tsc = join(pluginDir, "node_modules", "typescript", "bin", "tsc");
+const build = spawnSync(process.execPath, [tsc, "-p", "tsconfig.json"], { cwd: pluginDir, stdio: "inherit" });
+if (build.status !== 0) {
+  console.error(`openclaw-github-review tests: build failed (exit ${build.status}); refusing to run the suite`);
+  process.exit(1);
+}
 
 const repoRoot = resolve(pluginDir, "..", "..");
 const reportDir = process.env.TPS_TEST_REPORT_DIR ? resolve(process.env.TPS_TEST_REPORT_DIR) : join(repoRoot, "test-reports");

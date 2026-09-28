@@ -26,6 +26,8 @@ export interface GithubReviewConfig {
   reviewerIdentity: string | null;
   /** Where a pending (unacknowledged) audit record is retained for retry. */
   pendingAuditFile: string | null;
+  /** Durable per-dispatch latch for outcomes whose external state is unknown. */
+  reconcileFile: string | null;
   flairUrl: string;
   /** The deployed reviewer sandbox image digest, recorded in audit records. */
   sandboxImageDigest: string | null;
@@ -54,13 +56,14 @@ export function resolveConfig(raw: unknown, pluginVersion: string): GithubReview
   return {
     allowedRepositories: repos,
     maxBodyBytes: asPositiveInt(cfg.maxBodyBytes),
-    assignmentsFile: asString(cfg.assignmentsFile) ?? asString(process.env.TPS_GITHUB_REVIEW_ASSIGNMENTS),
+    assignmentsFile: asString(cfg.assignmentsFile),
     credentialFile: asString(cfg.credentialFile),
     provisioningFile: asString(cfg.provisioningFile),
     provisioningMaxAgeDays: maxAge,
     signingKeyFile: asString(cfg.signingKeyFile),
     reviewerIdentity: asString(cfg.reviewerIdentity),
     pendingAuditFile: asString(cfg.pendingAuditFile),
+    reconcileFile: asString(cfg.reconcileFile),
     flairUrl: asString(cfg.flairUrl) ?? "http://127.0.0.1:9926",
     sandboxImageDigest: asString(cfg.sandboxImageDigest),
     pluginVersion,

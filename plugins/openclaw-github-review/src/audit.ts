@@ -8,7 +8,7 @@
  */
 
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { AuditSink, OrgEventDraft, PendingAuditStore, ReviewEvent, ReviewReceipt, RuntimeEvidence } from "./types.js";
+import type { AuditSink, OrgEventDraft, PendingAuditStore, ReconcileStore, ReviewEvent, ReviewReceipt, RuntimeEvidence } from "./types.js";
 
 /** The minimal Flair request surface the audit sink uses. A real FlairClient
  *  satisfies it; tests inject a fake. */
@@ -159,6 +159,61 @@ export class MemoryPendingAuditStore implements PendingAuditStore {
   }
   remove(id: string): void {
     this.events = this.events.filter((e) => e.id !== id);
+  }
+}
+
+interface ReconcileFileShape {
+  dispatchIds?: unknown;
+}
+
+/** A durable per-dispatch reconcile latch. Once a dispatch's outcome is unknown,
+ *  the id stays latched until the host clears it, so a retry cannot post a
+ *  second review. */
+export class FileReconcileStore implements ReconcileStore {
+  constructor(private readonly file: string) {}
+
+  private read(): string[] {
+    try {
+      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as ReconcileFileShape;
+      return Array.isArray(parsed.dispatchIds) ? parsed.dispatchIds.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  private write(ids: string[]): void {
+    const tmp = `${this.file}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ dispatchIds: ids }), { encoding: "utf8", mode: 0o600 });
+    renameSync(tmp, this.file);
+  }
+
+  has(dispatchId: string): boolean {
+    return this.read().includes(dispatchId);
+  }
+  add(dispatchId: string): void {
+    const ids = this.read();
+    if (!ids.includes(dispatchId)) {
+      ids.push(dispatchId);
+      this.write(ids);
+    }
+  }
+  clear(dispatchId: string): void {
+    const ids = this.read().filter((x) => x !== dispatchId);
+    this.write(ids);
+  }
+}
+
+/** An in-memory reconcile latch for tests. */
+export class MemoryReconcileStore implements ReconcileStore {
+  private ids = new Set<string>();
+  has(dispatchId: string): boolean {
+    return this.ids.has(dispatchId);
+  }
+  add(dispatchId: string): void {
+    this.ids.add(dispatchId);
+  }
+  clear(dispatchId: string): void {
+    this.ids.delete(dispatchId);
   }
 }
 

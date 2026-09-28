@@ -115,6 +115,7 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm run build
+          npm run typecheck:test
           bun run test
       # cli#411 — the guard runs LAST, with `if: always()`, so a failing suite
       # step cannot skip it. It is never a clause of a suite: a guard that ran
@@ -171,15 +172,13 @@ jobs:
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
 
-  # Section E — the permanent gateway-boundary lane for github_review. The
-  # handler must execute in the GATEWAY process, never inside the sandbox. The
-  # lane registers the plugin through the real `api.registerTool` mechanism and
-  # dispatches across one session twice: the host context posts and reads a
-  # host-only marker; the sandbox context is refused and cannot read it. The
-  # handler's own sandboxed-context refusal is the control, shown RED in review
-  # by stubbing that check. (A real container half is a follow-up once the
-  # reviewer image lands; this lane exercises the deployment-independent
-  # contract today.)
+  # Section E — the permanent gateway-boundary lane for github_review. The lane
+  # loads the BUILT plugin through OpenClaw's own registration machinery with a
+  # mode=all reviewer configuration and proves the handler executes in the
+  # GATEWAY process: a sandboxed (mode=all) session is accepted and the host-only
+  # marker's contents are readable there, and the secret scans cover the success,
+  # refusal, rejected, ambiguous and audit-failure paths. The container half of
+  # the host/container contrast arrives with the reviewer image (section A).
   github-review-gateway-boundary:
     name: GitHub review gateway-boundary lane
     permissions:
@@ -202,6 +201,7 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm run build
+          npm run typecheck:test
           test -f dist/src/index.js
       - name: Run the gateway-boundary lane
         working-directory: plugins/openclaw-github-review

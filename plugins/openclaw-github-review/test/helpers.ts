@@ -5,7 +5,7 @@
  * outside the test's own temp root.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
@@ -21,13 +21,21 @@ import type {
   OrgEventDraft,
   ReviewEvent,
   ReviewReceipt,
+  SessionContext,
 } from "../src/types.js";
 
 export const REPO = "tpsdev-ai/cli";
 export const PR = 425;
 export const COMMIT = "a".repeat(40);
+export const REVIEWER = "anvil";
 export const FUTURE = new Date(Date.now() + 3_600_000).toISOString();
 export const PAST = new Date(Date.now() - 3_600_000).toISOString();
+
+/** The trusted session context the gateway supplies: the reviewer's agent id and
+ *  the session key the dispatch assignment is bound to. */
+export function session(overrides: Partial<SessionContext> = {}): SessionContext {
+  return { sessionKey: "sess-1", agentId: REVIEWER, ...overrides };
+}
 
 export class FakeGitHub implements GitHubApi {
   fetchPullCalls: Array<{ repo: string; pr: number }> = [];
@@ -63,10 +71,24 @@ export class FakeAudit implements AuditSink {
   }
 }
 
+/** A pending-audit store whose save() throws — for the "audit retention fails
+ *  after a post" case (the handler must not throw). */
+export class FailingSavePendingStore {
+  list(): OrgEventDraft[] {
+    return [];
+  }
+  save(): void {
+    throw new Error("pending store path /host/secret/pending.json is unwritable");
+  }
+  remove(): void {
+    /* noop */
+  }
+}
+
 export function validAssignment(overrides: Partial<DispatchAssignment> = {}): DispatchAssignment {
   return {
     sessionKey: "sess-1",
-    reviewer: "anvil",
+    reviewer: REVIEWER,
     repo: REPO,
     pr: PR,
     reviewedCommit: COMMIT,
@@ -78,6 +100,15 @@ export function validAssignment(overrides: Partial<DispatchAssignment> = {}): Di
 }
 
 export const TOKEN = "github_pat_11TESTONLY0000000000000000000000000000000000000000000000000000000";
+
+/** A real Ed25519 key written as base64 PKCS8 DER, returning the public key so a
+ *  test can verify a signature the sink produced. */
+export function writeEd25519Key(path: string): KeyObject {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const der = privateKey.export({ format: "der", type: "pkcs8" }).toString("base64");
+  writeFileSync(path, der, { mode: 0o600 });
+  return publicKey;
+}
 
 /** Write a credential file and (by default) matching provisioning evidence. */
 export function fakeCredentialFiles(
@@ -101,7 +132,7 @@ export function fakeCredentialFiles(
   const evidence = {
     login: "anvil-reviewer",
     repositories: [REPO],
-    permissions: { pull_requests: "write", contents: "read", metadata: "read" },
+    permissions: { pull_requests: "write", contents: "none", metadata: "read" },
     boundCredentialSha256: sha,
     recordedAt: opts.recordedAt ?? new Date().toISOString(),
     credentialType: "fine-grained",
@@ -117,16 +148,25 @@ export interface Scenario {
 }
 
 /** The standard, fully-valid host configuration for a test. */
-export function scenario(root: string, configOverrides: Record<string, unknown> = {}, credOpts: Parameters<typeof fakeCredentialFiles>[1] = {}): Scenario {
+export function scenario(
+  root: string,
+  configOverrides: Record<string, unknown> = {},
+  credOpts: Parameters<typeof fakeCredentialFiles>[1] = {},
+): Scenario {
+  ensureDir(root);
   const files = fakeCredentialFiles(root, credOpts);
+  const signingKeyFile = join(root, "anvil.key");
+  writeEd25519Key(signingKeyFile);
   const config = resolveConfig(
     {
       allowedRepositories: [REPO],
       maxBodyBytes: 65_536,
       credentialFile: files.credentialFile,
       provisioningFile: files.provisioningFile,
-      signingKeyFile: join(root, "anvil.key"),
-      reviewerIdentity: "anvil",
+      signingKeyFile,
+      reviewerIdentity: REVIEWER,
+      pendingAuditFile: join(root, "pending.json"),
+      reconcileFile: join(root, "reconcile.json"),
       sandboxImageDigest: "sha256:deadbeef",
       ...configOverrides,
     },

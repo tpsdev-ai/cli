@@ -1,14 +1,13 @@
 /**
- * authorization.test.ts — A4: local authorization refusals.
- *
- * Every malformed or unauthorized case is refused with a stable reason, the
- * safely resolved actor, relevant state and a remedy — and NO outbound request
- * leaves.
+ * authorization.test.ts — A4: local authorization refusals, plus the round-2
+ * STEP 0 guards (reviewer identity must be set, lone surrogates are refused,
+ * and `assignmentsFile` comes only from plugin config).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveConfig } from "../src/config.js";
 import { runGithubReview } from "../src/handler.js";
 import type { Outcome } from "../src/types.js";
 import {
@@ -19,6 +18,7 @@ import {
   REPO,
   resolver,
   scenario,
+  session,
   validAssignment,
   validInput,
   type Scenario,
@@ -32,7 +32,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-const HOST = { sessionKey: "sess-1", sandboxed: false };
+const HOST = session();
 
 function refused(o: Outcome): asserts o is Extract<Outcome, { ok: false }> {
   expect(o.ok).toBe(false);
@@ -67,9 +67,15 @@ describe("A4 — local authorization refusals", () => {
   });
 
   test("a missing dispatch assignment is refused", async () => {
-    const o = await run(scenario(root), validInput(), { sessionKey: "sess-unknown", sandboxed: false });
+    const o = await run(scenario(root), validInput(), session({ sessionKey: "sess-unknown" }));
     refused(o);
     expect(o.reason).toBe("assignment_missing");
+  });
+
+  test("a session agent that does not match the assignment's reviewer is refused", async () => {
+    const o = await run(scenario(root), validInput(), session({ agentId: "someone-else" }));
+    refused(o);
+    expect(o.reason).toBe("assignment_mismatch");
   });
 
   test("an assignment mismatch WITHIN the configured repository set is refused", async () => {
@@ -83,8 +89,8 @@ describe("A4 — local authorization refusals", () => {
 
   test("a reviewer identity that does not match the host signing identity is refused", async () => {
     const s = scenario(root);
-    const { deps } = makeDeps(s, { assignments: resolver([validAssignment({ reviewer: "someone-else" })]) });
-    const o = await runGithubReview(validInput(), HOST, deps);
+    const { deps } = makeDeps(s, { assignments: resolver([validAssignment({ reviewer: "someone-else" })]), });
+    const o = await runGithubReview(validInput(), session({ agentId: "someone-else" }), deps);
     refused(o);
     expect(o.reason).toBe("assignment_mismatch");
   });
@@ -148,5 +154,37 @@ describe("A4 — local authorization refusals", () => {
     const o = await runGithubReview(validInput({ commit_id: COMMIT }), HOST, deps);
     expect(o.ok).toBe(true);
     expect(github.reviewCalls.length).toBe(1);
+  });
+});
+
+describe("STEP 0 guards", () => {
+  test("an unset reviewerIdentity refuses instead of skipping the signer check", async () => {
+    // The pre-guard behaviour skipped the check when reviewerIdentity was unset.
+    const s = scenario(root, { reviewerIdentity: null });
+    const { deps, github } = makeDeps(s);
+    const o = await runGithubReview(validInput(), HOST, deps);
+    refused(o);
+    expect(o.reason).toBe("assignment_mismatch");
+    expect(github.reviewCalls.length).toBe(0);
+  });
+
+  test("a body containing a lone surrogate is refused as invalid_input", async () => {
+    const o = await run(scenario(root), validInput({ body: "ok \ud800 bad" }));
+    refused(o);
+    expect(o.reason).toBe("invalid_input");
+  });
+
+  test("assignmentsFile is taken only from plugin config, never the environment", () => {
+    const saved = process.env.TPS_GITHUB_REVIEW_ASSIGNMENTS;
+    process.env.TPS_GITHUB_REVIEW_ASSIGNMENTS = "/from/env/assignments.json";
+    try {
+      const fromEnv = resolveConfig({}, "0.1.0-test");
+      expect(fromEnv.assignmentsFile).toBeNull();
+      const fromCfg = resolveConfig({ assignmentsFile: "/from/config.json" }, "0.1.0-test");
+      expect(fromCfg.assignmentsFile).toBe("/from/config.json");
+    } finally {
+      if (saved === undefined) delete process.env.TPS_GITHUB_REVIEW_ASSIGNMENTS;
+      else process.env.TPS_GITHUB_REVIEW_ASSIGNMENTS = saved;
+    }
   });
 });

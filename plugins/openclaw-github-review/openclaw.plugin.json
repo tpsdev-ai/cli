@@ -55,12 +55,16 @@
       },
       "pendingAuditFile": {
         "type": "string",
-        "description": "Where an audit record that failed after a confirmed GitHub post is retained for host-side retry."
+        "description": "Where an audit record that failed after a confirmed GitHub post is retained for host-side retry. Required: posting is refused before any request when unset."
+      },
+      "reconcileFile": {
+        "type": "string",
+        "description": "Durable per-dispatch latch for outcomes whose external state is unknown (an ambiguous GitHub response or an invalid 2xx receipt). Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
       "sandboxImageDigest": {
         "type": "string",
-        "description": "The deployed reviewer sandbox image digest, recorded in every audit record."
+        "description": "The deployed reviewer sandbox image digest, recorded in every audit record once the reviewer image (section A) supplies it."
       },
       "provisioningMaxAgeDays": {
         "type": "number",

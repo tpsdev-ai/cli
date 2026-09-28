@@ -1,7 +1,7 @@
 /**
  * credential.ts — GitHub credential custody and the literal pre-request gate.
  *
- * The token is read ONCE, at gateway start, into a private field of this
+ * The token is read ONCE, at gateway start, into a #private field of this
  * object. Its path is not re-read afterwards, and no method returns or logs the
  * token. Scope (login, repository coverage, permissions) is established from
  * trusted PROVISIONING EVIDENCE — recorded when the token was installed or
@@ -35,12 +35,13 @@ export type ScopeResult =
 const FINE_GRAINED_PREFIX = "github_pat_";
 
 /** Permissions a reviewer posting may hold. Anything outside this map, or any
- *  write beyond pull requests and a read-only contents, is refused. */
+ *  write beyond pull requests, is refused. `contents` and `issues` may only be
+ *  `none`: no documented operation for this verb needs to read them. */
 const ALLOWED_PERMISSIONS: Record<string, readonly string[]> = {
   pull_requests: ["write"],
-  contents: ["read", "none"],
+  contents: ["none"],
   metadata: ["read"],
-  issues: ["read", "none"],
+  issues: ["none"],
 };
 
 export interface CredentialLoadResult {
@@ -50,10 +51,12 @@ export interface CredentialLoadResult {
 }
 
 export class CredentialCustody {
-  private token: string | null = null;
+  // A TRUE private field (#) — not reachable from outside the class body, so the
+  // token cannot be read back through the instance.
+  #token: string | null = null;
+  #tokenSha256: string | null = null;
   private evidence: ProvisioningEvidence | null = null;
   private loadedDetail = "not loaded";
-  private tokenSha256: string | null = null;
 
   private constructor() {}
 
@@ -137,8 +140,8 @@ export class CredentialCustody {
       return { custody: c, detail: c.loadedDetail };
     }
 
-    c.token = token;
-    c.tokenSha256 = sha;
+    c.#token = token;
+    c.#tokenSha256 = sha;
     c.evidence = evidence;
     c.loadedDetail = `loaded; login ${evidence.login}`;
     return { custody: c, detail: c.loadedDetail };
@@ -146,7 +149,7 @@ export class CredentialCustody {
 
   /** Whether the credential and its evidence are usable at all. */
   isReady(): boolean {
-    return this.token !== null && this.evidence !== null;
+    return this.#token !== null && this.evidence !== null;
   }
 
   /** The verified login from the provisioning record. Available only when
@@ -161,7 +164,7 @@ export class CredentialCustody {
    * for the specific repository being posted to.
    */
   verifyForRepo(repo: string): ScopeResult {
-    if (!this.token || !this.evidence) {
+    if (!this.#token || !this.evidence) {
       return {
         ok: false,
         reason: "credential_unavailable",
@@ -193,7 +196,7 @@ export class CredentialCustody {
           ok: false,
           reason: "scope_unverified",
           state: `disallowed permission ${name}:${value}`,
-          remedy: "reduce the token to pull-request write (plus read-only metadata/contents) and re-record the evidence",
+          remedy: "reduce the token to pull-request write (plus read-only metadata; contents and issues none) and re-record the evidence",
         };
       }
     }
@@ -214,12 +217,12 @@ export class CredentialCustody {
    * token, and callers must not log it. The token itself is never returned.
    */
   authorizationHeader(): string {
-    if (!this.token) throw new Error("credential not loaded");
-    return `Bearer ${this.token}`;
+    if (!this.#token) throw new Error("credential not loaded");
+    return `Bearer ${this.#token}`;
   }
 
   /** The sha256 binding of the loaded token, for evidence comparisons. */
   bindingSha256(): string | null {
-    return this.tokenSha256;
+    return this.#tokenSha256;
   }
 }

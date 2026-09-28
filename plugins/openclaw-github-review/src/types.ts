@@ -2,15 +2,17 @@
  * types.ts — the shared vocabulary of the github_review plugin.
  *
  * The plugin is deliberately small and independent: it holds ONE production
- * verb, and everything it needs to authorize and audit a post comes from
- * trusted host context, never from the caller.
+ * verb. The caller supplies `repo`, `pr` and `commit_id`, which MUST equal the
+ * trusted host dispatch assignment and the host-fetched head; they are never
+ * trusted on their own. Everything else (identity, session, credentials, audit
+ * metadata) comes from trusted host context.
  */
 
 /** The three supported review events. Nothing else is accepted. */
 export const REVIEW_EVENTS = ["APPROVE", "REQUEST_CHANGES", "COMMENT"] as const;
 export type ReviewEvent = (typeof REVIEW_EVENTS)[number];
 
-/** The exact caller-visible input. No `repo`/`pr` trust is taken from it: it is
+/** The exact caller-visible input. `repo` and `pr` are caller-supplied and are
  *  validated against the trusted dispatch assignment before use. */
 export interface ReviewRequestInput {
   repo: string;
@@ -23,7 +25,6 @@ export interface ReviewRequestInput {
 /** Stable refusal reasons. A refusal always carries one of these, the safely
  *  resolved actor (when known), the relevant state and a remedy. */
 export type RefusalReason =
-  | "handler_sandboxed"
   | "invalid_input"
   | "unsupported_field"
   | "repo_not_configured"
@@ -36,6 +37,8 @@ export type RefusalReason =
   | "credential_unavailable"
   | "signing_unavailable"
   | "scope_unverified"
+  | "pending_audit_unconfigured"
+  | "reconcile_required"
   | "pr_unavailable"
   | "pr_not_open"
   | "commit_mismatch"
@@ -43,43 +46,47 @@ export type RefusalReason =
   | "github_rejected"
   | "github_ambiguous";
 
-/** The terminal outcome of one dispatch. `posted_audit_pending` is a partial:
- *  GitHub created the review but auditing has not been acknowledged. */
-export type Outcome =
-  | {
-      ok: true;
-      status: "posted";
-      reviewId: number;
-      reviewUrl: string;
-      commitId: string;
-      auditEventId: string;
-      login: string;
-    }
-  | {
-      ok: true;
-      status: "posted_audit_pending";
-      reviewId: number;
-      reviewUrl: string;
-      commitId: string;
-      auditEventId: string;
-      login: string;
-    }
-  | {
-      ok: false;
-      reason: RefusalReason;
-      actor: string | null;
-      state: string;
-      remedy: string;
-    };
+/** A completed post. */
+export interface PostedOutcome {
+  ok: true;
+  status: "posted" | "posted_audit_pending";
+  reviewId: number;
+  reviewUrl: string;
+  commitId: string;
+  auditEventId: string;
+  login: string;
+}
+
+/** An outcome whose external state is not known to be clean: an ambiguous
+ *  GitHub response, or a 2xx whose receipt did not validate. NEVER reported as
+ *  a refusal, because a review may exist. */
+export interface UnknownOutcome {
+  ok: true;
+  status: "unknown";
+  reason: "reconcile_required" | "receipt_invalid";
+  reviewId: number | null;
+  reviewUrl: string | null;
+  commitId: string;
+  auditEventId: string | null;
+  login: string;
+}
+
+export interface RefusedOutcome {
+  ok: false;
+  reason: RefusalReason;
+  actor: string | null;
+  state: string;
+  remedy: string;
+}
+
+export type Outcome = PostedOutcome | UnknownOutcome | RefusedOutcome;
 
 /** Trusted, host-resolved session facts. The tool factory receives these from
- *  the gateway; nothing here is caller-controlled. */
+ *  the gateway. `agentId` is the gateway's agent for the run, bound to the
+ *  assignment's reviewer; `sessionKey` keys the dispatch assignment. */
 export interface SessionContext {
-  /** The gateway session key, the key the dispatch assignment is bound to. */
   sessionKey: string | null;
-  /** Whether the run is executing inside the sandbox. The handler MUST run in
-   *  the gateway process, so a sandboxed run is refused outright. */
-  sandboxed: boolean;
+  agentId: string | null;
 }
 
 /** A trusted dispatch assignment: an immutable {repo, pr} bound to a reviewer
@@ -161,7 +168,18 @@ export interface PendingAuditStore {
   remove(id: string): void;
 }
 
-/** Host-resolved runtime/attestation metadata recorded in the audit detail. */
+/** A durable per-dispatch latch that records an outcome whose external state is
+ *  not known to be clean, so a retry does not post a second review. */
+export interface ReconcileStore {
+  has(dispatchId: string): boolean;
+  add(dispatchId: string): void;
+  clear(dispatchId: string): void;
+}
+
+/** Host-resolved runtime/attestation metadata recorded in the audit detail.
+ *  The review environment's versions and image digest are supplied by the
+ *  reviewer image (section A); until then they are recorded as null rather than
+ *  presenting the gateway's own versions as the review's. */
 export interface RuntimeEvidence {
   bunVersion: string | null;
   nodeVersion: string | null;

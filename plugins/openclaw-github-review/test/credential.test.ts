@@ -10,7 +10,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGithubReview } from "../src/handler.js";
-import { makeDeps, scenario, TOKEN, validInput, type Scenario } from "./helpers.js";
+import { makeDeps, scenario, session, TOKEN, validInput, type Scenario } from "./helpers.js";
 
 let root: string;
 beforeEach(() => {
@@ -19,7 +19,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
-const HOST = { sessionKey: "sess-1", sandboxed: false };
+const HOST = session();
 
 async function expectRefusedWith(s: Scenario, expected: string) {
   const { deps, github } = makeDeps(s);

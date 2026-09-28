@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGithubReview } from "../src/handler.js";
-import { COMMIT, makeDeps, PR, REPO, resolver, scenario, validAssignment, validInput } from "./helpers.js";
+import { COMMIT, makeDeps, PR, REPO, resolver, scenario, session, validAssignment, validInput } from "./helpers.js";
 
 let root: string;
 beforeEach(() => {
@@ -16,7 +16,7 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
-const HOST = { sessionKey: "sess-1", sandboxed: false };
+const HOST = session();
 const OTHER = "b".repeat(40);
 
 describe("A5 — host-authoritative PR checks", () => {
@@ -59,12 +59,14 @@ describe("A5 — host-authoritative PR checks", () => {
     expect(github.reviewCalls.length).toBe(0);
   });
 
-  test("an incomplete receipt is refused", async () => {
-    const { deps, github } = makeDeps(scenario(root));
+  test("a 2xx receipt for the wrong commit is UNKNOWN (the review exists)", async () => {
+    const { deps, github, audit } = makeDeps(scenario(root));
     github.reviewResult = { ok: true, receipt: { id: 1, url: "u", commitId: OTHER, state: "APPROVED" } };
     const o = await runGithubReview(validInput(), HOST, deps);
-    expect(o.ok).toBe(false);
-    if (!o.ok) expect(o.reason).toBe("receipt_invalid");
+    expect(o.ok).toBe(true);
+    if (o.ok) expect(o.status).toBe("unknown");
+    // The external record is retained for the audit.
+    expect(audit.events.length).toBe(1);
   });
 
   test("the handler trusts the HOST lookup, not caller metadata (control)", async () => {
