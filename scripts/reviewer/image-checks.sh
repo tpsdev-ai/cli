@@ -58,23 +58,34 @@ if [ -z "$envdump" ]; then fail "environment inspection produced no output"; fi
 
 # ── the OpenClaw run model ───────────────────────────────────────────────────
 
+# The reviewed actions the fixture job uses: reviewed immutable refs only.
+CHECKOUT_REF="actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
+SETUP_BUN_REF="oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76"
+
 # A reviewed-commit workspace: package.json pins bun and the given node range;
-# the named job records the effective environment, then writes the marker.
-make_fixture() { # <name> <engines.node range>
-  local dir="$SCRATCH/$1"
+# the named job (on pull_request into main) records the effective environment,
+# then writes the marker. Options: git (a clean git repository), gitcred (a git
+# repository whose config carries a FAKE auth header), envtoken (the job's env
+# sets a FAKE GH_TOKEN), evil (node/bun/touch impostors in /workspace/evil that
+# leave evil-ran if anything runs them).
+make_fixture() { # <name> <engines.node range> [git|gitcred|envtoken|evil ...]
+  local name="$1" range="$2" dir="$SCRATCH/$1" opt
+  shift 2
   mkdir -p "$dir/.github/workflows"
-  printf '{"name":"reviewer-fixture","private":true,"packageManager":"bun@%s","engines":{"node":"%s"}}\n' "$BUN_V" "$2" >"$dir/package.json"
+  printf '{"name":"reviewer-fixture","private":true,"packageManager":"bun@%s","engines":{"node":"%s"}}\n' "$BUN_V" "$range" >"$dir/package.json"
   cat >"$dir/.github/workflows/review.yml" <<'YAML'
 name: reviewer fixture
-on: push
+on:
+  pull_request:
+    branches: [main]
 jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: @CHECKOUT@
         with:
           persist-credentials: false
-      - uses: oven-sh/setup-bun@v2
+      - uses: @SETUP_BUN@
         with:
           bun-version: "@BUN_V@"
       - name: record the effective environment
@@ -87,6 +98,7 @@ jobs:
             echo "npm_config_cache=$npm_config_cache"
             echo "BUN_INSTALL_CACHE_DIR=$BUN_INSTALL_CACHE_DIR"
             echo "CI=$CI"
+            echo "PATH=$PATH"
             echo "home_fs=$(stat -f -c %T "$HOME")"
             echo "tmp_fs=$(stat -f -c %T "$TMPDIR")"
             echo "cache_fs=$(stat -f -c %T "$BUN_INSTALL_CACHE_DIR")"
@@ -99,17 +111,35 @@ jobs:
       - name: marker
         run: echo ran > review-marker
 YAML
-  sed -i "s/@BUN_V@/${BUN_V}/" "$dir/.github/workflows/review.yml"
+  sed -i -e "s/@BUN_V@/${BUN_V}/" -e "s#@CHECKOUT@#${CHECKOUT_REF}#" -e "s#@SETUP_BUN@#${SETUP_BUN_REF}#" "$dir/.github/workflows/review.yml"
+  for opt in "$@"; do
+    case "$opt" in
+      git) git -C "$dir" init -q ;;
+      gitcred)
+        git -C "$dir" init -q
+        git -C "$dir" config http.https://github.com/.extraheader "AUTHORIZATION: basic RkFLRS1BOS1GSVhUVVJF"
+        ;;
+      envtoken) sed -i 's/^    runs-on: ubuntu-latest$/    runs-on: ubuntu-latest\n    env:\n      GH_TOKEN: fake-a9-fixture-token/' "$dir/.github/workflows/review.yml" ;;
+      evil)
+        mkdir -p "$dir/evil"
+        for b in node bun touch; do printf '#!/bin/sh\necho evil > /workspace/evil-ran\n' >"$dir/evil/$b"; chmod 0755 "$dir/evil/$b"; done
+        ;;
+    esac
+  done
   # The container user (uid 1000) must be able to write the marker into the bind.
   chmod 0777 "$dir"
   chmod -R a+rX "$dir"
 }
 
-# Create the sandbox exactly as OpenClaw does, exec the launcher with a polluted
-# parent environment, and keep its stdout/stderr, filesystem diff and mounts.
+# Create the sandbox exactly as OpenClaw does — the host assignment in the
+# create-time env file — exec the launcher with a polluted parent environment
+# (plus EXEC_EXTRA and LAUNCH_ARGS when set), and keep its stdout/stderr,
+# filesystem diff and mounts.
+EXEC_EXTRA=()
+LAUNCH_ARGS=()
 openclaw_launch() { # <name>
   local name="$1" dir="$SCRATCH/$1" cid
-  printf 'REVIEWER_CI_WORKFLOW=.github/workflows/review.yml\nREVIEWER_CI_JOB=review\n' >"$SCRATCH/$name.env"
+  printf 'REVIEWER_CI_WORKFLOW=.github/workflows/review.yml\nREVIEWER_CI_JOB=review\nREVIEWER_CI_BASE=main\n' >"$SCRATCH/$name.env"
   LAUNCH_RC=125
   cid="$(docker create --init --read-only --tmpfs /tmp --tmpfs /var/tmp --tmpfs /run \
     --network none --cap-drop ALL --security-opt no-new-privileges \
@@ -120,10 +150,19 @@ openclaw_launch() { # <name>
   docker exec \
     -e FOO_SECRET=canary-foo-secret -e NPM_TOKEN=canary-npm-token -e NODE_AUTH_TOKEN=canary-node-auth \
     -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=credential.helper -e GIT_CONFIG_VALUE_0=store \
-    "$cid" /opt/reviewer/bin/reviewer-launch >"$SCRATCH/$name.out" 2>"$SCRATCH/$name.err"
+    "${EXEC_EXTRA[@]+"${EXEC_EXTRA[@]}"}" \
+    "$cid" /opt/reviewer/bin/reviewer-launch "${LAUNCH_ARGS[@]+"${LAUNCH_ARGS[@]}"}" >"$SCRATCH/$name.out" 2>"$SCRATCH/$name.err"
   LAUNCH_RC=$?
+  EXEC_EXTRA=()
+  LAUNCH_ARGS=()
   docker diff "$cid" >"$SCRATCH/$name.diff" 2>&1
   docker inspect --format '{{json .Mounts}}' "$cid" >"$SCRATCH/$name.mounts" 2>&1
+}
+refused_with() { # <name> <text>: the launcher exited non-zero with that refusal and wrote no marker
+  [ "$LAUNCH_RC" -ne 0 ] && [ "$LAUNCH_RC" -ne 125 ] && grep -qF "$2" "$SCRATCH/$1.err" && [ ! -e "$SCRATCH/$1/review-marker" ]
+}
+why() { # <name>
+  echo "rc=${LAUNCH_RC} marker=$([ -e "$SCRATCH/$1/review-marker" ] && echo present || echo absent) err=$(cat "$SCRATCH/$1.err" "$SCRATCH/$1.create.err" 2>/dev/null | tail -n 3)"
 }
 
 # ── A2: runtime + image integrity ────────────────────────────────────────────
@@ -226,21 +265,51 @@ fi
 
 # The in-matrix run feeds both A2 (it builds) and A3 (what it saw).
 if want A2 || want A3; then
-  make_fixture ok "${NODE_V%%.*}.x"
+  make_fixture ok "${NODE_V%%.*}.x" git evil
+  EXEC_EXTRA=(-e "PATH=/workspace/evil:/usr/local/bin:/usr/bin:/bin")
   openclaw_launch ok
   OK_RC=$LAUNCH_RC
 fi
 
 if want A2; then
   if [ "$OK_RC" -eq 0 ] && grep -q '"status":"review-build-ok"' "$SCRATCH/ok.out" && [ -e "$SCRATCH/ok/review-marker" ] \
-    && grep -q '"uses":"actions/checkout@v4"' "$SCRATCH/ok.out" && grep -q '"uses":"oven-sh/setup-bun@v2"' "$SCRATCH/ok.out"; then
-    pass "A2 build path: an in-matrix pin runs the named job to review-build-ok and writes the marker; skipped actions are named"
+    && grep -qF "\"uses\":\"${CHECKOUT_REF}\"" "$SCRATCH/ok.out" && grep -qF "\"uses\":\"${SETUP_BUN_REF}\"" "$SCRATCH/ok.out"; then
+    pass "A2 build path: an in-matrix pin runs the host-named job to review-build-ok and writes the marker; skipped actions are named"
   else
     fail "A2 build path in-matrix: rc=${OK_RC} out=$(cat "$SCRATCH/ok.out" 2>/dev/null) err=$(cat "$SCRATCH/ok.err" "$SCRATCH/ok.create.err" 2>/dev/null | tail -n 5)"
   fi
   seen="$SCRATCH/ok/review-env.txt"
   grep -qx "node=v${NODE_V}" "$seen" 2>/dev/null && grep -qx "bun=${BUN_V}" "$seen" 2>/dev/null \
     && pass "A2 the job's steps ran node ${NODE_V} and bun ${BUN_V}" || fail "A2 runtimes seen by the job: $(grep -E '^(node|bun)=' "$seen" 2>/dev/null | tr '\n' ' ')"
+  # Blocker-1 proofs: the caller's PATH named impostors; nothing ran them.
+  if [ "$OK_RC" -eq 0 ] && [ ! -e "$SCRATCH/ok/evil-ran" ] && grep -qx "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$seen" 2>/dev/null; then
+    pass "A2 a caller PATH naming impostor node/bun/touch is ignored: the probe and steps use fixed paths"
+  else
+    fail "A2 caller PATH: evil-ran=$([ -e "$SCRATCH/ok/evil-ran" ] && echo present || echo absent) $(grep '^PATH=' "$seen" 2>/dev/null)"
+  fi
+  if [ "$OK_RC" -eq 0 ] && grep -q '"base":"main"' "$SCRATCH/ok.out" && grep -q '"job":"review"' "$SCRATCH/ok.out"; then
+    pass "A2 the host assignment was read from the sandbox's creation environment"
+  else
+    fail "A2 host assignment: $(why ok)"
+  fi
+
+  make_fixture override "${NODE_V%%.*}.x"
+  EXEC_EXTRA=(-e "REVIEWER_CI_JOB=other")
+  openclaw_launch override
+  if refused_with override "refused: assignment-override"; then
+    pass "A2 a caller that names another job is refused (assignment-override); nothing runs"
+  else
+    fail "A2 assignment override: $(why override)"
+  fi
+
+  make_fixture wsflag "${NODE_V%%.*}.x"
+  LAUNCH_ARGS=(--workspace /tmp)
+  openclaw_launch wsflag
+  if [ "$LAUNCH_RC" -eq 2 ] && grep -q "usage:" "$SCRATCH/wsflag.err" && [ ! -e "$SCRATCH/wsflag/review-marker" ]; then
+    pass "A2 the launcher takes no --workspace: the worktree is always /workspace"
+  else
+    fail "A2 --workspace: $(why wsflag)"
+  fi
 fi
 
 # ── A3: hermetic defaults ────────────────────────────────────────────────────
@@ -326,6 +395,22 @@ if want A9; then
 
   gitcreds="$(docker run --rm "$IMG" sh -c 'git config --list --show-origin 2>/dev/null | grep -iE "credential|extraheader|authorization|://[^/@[:space:]]+@"' 2>/dev/null)"
   if [ -n "$gitcreds" ]; then fail "A9 git credential config: $gitcreds"; else pass "A9 git has no credential helper, auth header or token URL configured"; fi
+
+  # The mounted worktree and the workflow cannot hand a step a credential either.
+  make_fixture gitcred "${NODE_V%%.*}.x" gitcred
+  openclaw_launch gitcred
+  if refused_with gitcred "refused: git-credential-config" && ! grep -qF "RkFLRS1BOS1GSVhUVVJF" "$SCRATCH/gitcred.out" "$SCRATCH/gitcred.err"; then
+    pass "A9 launcher: a worktree whose git config carries an auth header is refused before any step, without repeating the value"
+  else
+    fail "A9 launcher git credential: $(why gitcred)"
+  fi
+  make_fixture envtoken "${NODE_V%%.*}.x" envtoken
+  openclaw_launch envtoken
+  if refused_with envtoken "sets GH_TOKEN"; then
+    pass "A9 launcher: a workflow env GH_TOKEN is refused; no step runs with it"
+  else
+    fail "A9 launcher workflow token: $(why envtoken)"
+  fi
 fi
 
 # ── summary ──────────────────────────────────────────────────────────────────

@@ -1,46 +1,75 @@
 /**
- * ci-job.test.ts — the review build's step plan comes from ONE named job of the
- * reviewed commit's workflow, parsed as YAML (cli#425 section A: CI-equivalent
- * install/build/test; no blanket command, no dropped stage, no skipped stage
- * counted as evidence). What the planner runs, skips and refuses is asserted
- * case by case.
+ * ci-job.test.ts — the review build's plan comes from ONE host-named job of the
+ * reviewed commit's workflow and the jobs it needs, parsed as bounded YAML
+ * (cli#425 section A: CI-equivalent install/build/test; no blanket command, no
+ * dropped stage, no skipped stage counted as evidence). What the planner runs,
+ * skips and refuses is asserted case by case.
  */
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { condition, planJob } from "../../../../scripts/reviewer/ci-job.mjs";
+import {
+  checkTrigger,
+  condition,
+  forbiddenEnvReason,
+  MAX_WORKFLOW_BYTES,
+  planJob,
+  SKIPPED_ACTIONS,
+} from "../../../../scripts/reviewer/ci-job.mjs";
 import { RESERVED_ENV_KEYS } from "../../../../scripts/reviewer/reviewer-launch.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..", "..", "..", "..");
 
-function plan(workflowText: string, jobId = "t") {
-  return planJob({ workflowText, workflowFile: ".github/workflows/ci.yml", jobId, reservedEnvKeys: RESERVED_ENV_KEYS });
+const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
+const SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
+const SOCKET = "socketdev/action@ba6de6cc0565af1f42295590380973573297e31f";
+const CACHE = "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830";
+const UPLOAD = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
+
+function plan(workflowText: string, jobId = "t", baseBranch = "main") {
+  return planJob({ workflowText, workflowFile: ".github/workflows/ci.yml", jobId, baseBranch, reservedEnvKeys: RESERVED_ENV_KEYS });
 }
 
-function refused(workflowText: string, jobId = "t") {
-  const p = plan(workflowText, jobId);
+function refused(workflowText: string, jobId = "t", baseBranch = "main") {
+  const p = plan(workflowText, jobId, baseBranch);
   expect(p.ok).toBe(false);
   if (p.ok) throw new Error("expected a refusal");
   return p.refusal;
 }
 
-/** A one-job workflow around the given step lines (already indented as list items). */
-const job = (steps: string, extra = "") => `on: push\njobs:\n  t:\n    runs-on: ubuntu-latest\n${extra}    steps:\n${steps}`;
+/** The planned job `id` of an accepted plan. */
+function jobOf(p: ReturnType<typeof planJob>, id = "t") {
+  expect(p.ok).toBe(true);
+  if (!p.ok) throw new Error(p.refusal.message);
+  const j = p.jobs.find((x: { id: string }) => x.id === id);
+  if (!j) throw new Error(`no job ${id}`);
+  return j;
+}
+
+/** A one-job pull_request workflow around the given step lines (already indented as list items). */
+const job = (steps: string, extra = "", on = "on: pull_request\n") =>
+  `${on}jobs:\n  t:\n    runs-on: ubuntu-latest\n${extra}    steps:\n${steps}`;
 
 describe("this repository's test job", () => {
   const p = planJob({
     workflowText: readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"),
     workflowFile: ".github/workflows/test.yml",
     jobId: "test",
+    baseBranch: "main",
     reservedEnvKeys: RESERVED_ENV_KEYS,
   });
 
-  test("every run: step, in order, in its working directory — including the plugin launcher and the report guard", () => {
+  test("runs its needs closure dependencies first: build, then test", () => {
     expect(p.ok).toBe(true);
-    if (!p.ok) return;
-    expect(p.steps.map((s) => [s.index, s.workingDirectory, s.always])).toEqual([
+    if (p.ok) expect(p.jobs.map((j: { id: string; needs: string[] }) => [j.id, j.needs])).toEqual([["build", []], ["test", ["build"]]]);
+  });
+
+  test("every run: step of test, in order, in its working directory — including the plugin launcher and the report guard", () => {
+    const t = jobOf(p, "test");
+    expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
       [4, ".", false],
       [5, ".", false],
       [6, ".", false],
@@ -48,85 +77,156 @@ describe("this repository's test job", () => {
       [8, "plugins/openclaw-tps-mail", false],
       [9, ".", true],
     ]);
-    expect(p.steps[0].script).toBe("sfw bun install --frozen-lockfile");
-    expect(p.steps[1].script).toBe("bun run build");
-    expect(p.steps[3].script).toBe("bun run test");
-    expect(p.steps[4].script).toContain("npm ci --ignore-scripts");
-    expect(p.steps[4].script).toContain("npm run build");
-    expect(p.steps[4].script).toContain("bun run test");
-    expect(p.steps[5].script).toBe("node scripts/check-test-reports.mjs");
+    expect(t.steps[0].script).toBe("sfw bun install --frozen-lockfile");
+    expect(t.steps[3].script).toBe("bun run test");
+    expect(t.steps[4].script).toContain("npm ci --ignore-scripts");
+    expect(t.steps[5].script).toBe("node scripts/check-test-reports.mjs");
   });
 
-  test("the setup actions are skipped by name, their pins kept, and sfw is shimmed", () => {
-    if (!p.ok) throw new Error("plan refused");
-    expect(p.skipped.map((s) => s.uses.split("@")[0])).toEqual(["actions/checkout", "oven-sh/setup-bun", "socketdev/action"]);
-    expect(p.pins).toEqual([{ tool: "bun", range: "1.3.10", source: '.github/workflows/test.yml job "test" step 2 bun-version' }]);
+  test("the setup actions are skipped by name at their reviewed tags, their pins kept, and sfw is shimmed", () => {
+    const t = jobOf(p, "test");
+    expect(t.skipped.map((s: { uses: string; tag: string }) => `${s.uses.split("@")[0]}@${s.tag}`)).toEqual([
+      "actions/checkout@v4.2.2",
+      "oven-sh/setup-bun@v2.0.2",
+      "socketdev/action@v1.3.2",
+    ]);
+    if (!p.ok) return;
+    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["1.3.10", "1.3.10"]);
     expect(p.shims).toEqual(["sfw"]);
+  });
+
+  test("every ref this repository's workflows use for a skipped action is in the reviewed allowlist", () => {
+    const dir = resolve(repo, ".github", "workflows");
+    for (const file of readdirSync(dir)) {
+      for (const m of readFileSync(resolve(dir, file), "utf8").matchAll(/uses:\s*([A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+)@([0-9a-f]{40})/g)) {
+        const action = (SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>)[m[1].toLowerCase()];
+        if (action) expect(Object.keys(action.refs)).toContain(m[2]);
+      }
+    }
   });
 });
 
-describe("the host names the job; the planner never picks one", () => {
-  const decoy = `on: push
-jobs:
-  decoy:
-    if: false
-    runs-on: ubuntu-latest
-    steps:
-      - run: bun install --frozen-lockfile && echo DECOY
-  real:
-    runs-on: ubuntu-latest
-    steps:
-      - run: bun install --frozen-lockfile
-      - run: bun run build
-      - run: |
-          # run: bun run not-a-step
-          bun run test
-`;
-
-  test("the named job's steps, not the first job's and not text inside a script", () => {
-    const p = plan(decoy, "real");
-    expect(p.ok).toBe(true);
-    if (p.ok) {
-      expect(p.steps.map((s) => s.script.trim())).toEqual([
-        "bun install --frozen-lockfile",
-        "bun run build",
-        "# run: bun run not-a-step\nbun run test",
-      ]);
+describe("the reviewed allowlist of skipped-action refs", () => {
+  test("every ref is a full 40-hex commit SHA with its release tag", () => {
+    for (const [name, action] of Object.entries(SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>)) {
+      expect(Object.keys(action.refs).length).toBeGreaterThan(0);
+      for (const [sha, tag] of Object.entries(action.refs)) {
+        expect(`${name}@${sha}`).toMatch(/@[0-9a-f]{40}$/);
+        expect(tag).toMatch(/^v\d+\.\d+\.\d+$/);
+      }
     }
   });
 
-  test("a job CI never runs (if: false) refuses", () => {
-    const r = refused(decoy, "decoy");
-    expect(r.kind).toBe("ci-unhonourable");
-    expect(r.message).toContain("if: false");
+  test("a tag, a branch, a short SHA or an unreviewed SHA refuses", () => {
+    for (const ref of ["actions/checkout@v4", "actions/checkout@main", "actions/checkout@11bd719", "actions/checkout@arbitrary-ref", `actions/checkout@${"a".repeat(40)}`]) {
+      const r = refused(job(`      - uses: ${ref}\n      - run: a\n`));
+      expect(r.kind).toBe("ci-unhonourable");
+      expect(r.message).toContain("not a reviewed immutable ref");
+    }
   });
 
-  test("a missing job refuses and lists the jobs", () => {
-    const r = refused(decoy, "tests");
-    expect(r.kind).toBe("no-ci-job");
-    expect(r.message).toContain("jobs: decoy, real");
+  test("a reviewed SHA is skipped and named with its tag", () => {
+    const t = jobOf(plan(job(`      - uses: ${CHECKOUT}\n        with:\n          persist-credentials: false\n          fetch-depth: 0\n      - run: a\n`)));
+    expect(t.skipped).toEqual([{ index: 1, uses: CHECKOUT, tag: "v4.2.2", reason: "the workspace is the host-created worktree at the assigned head" }]);
+  });
+});
+
+describe("the trigger: CI must run the workflow for a pull request into the host-named base", () => {
+  test("pull_request as a string, a list or a mapping is accepted", () => {
+    expect(plan(job("      - run: a\n", "", "on: pull_request\n")).ok).toBe(true);
+    expect(plan(job("      - run: a\n", "", "on: [push, pull_request]\n")).ok).toBe(true);
+    expect(plan(job("      - run: a\n", "", "on:\n  pull_request:\n")).ok).toBe(true);
+    expect(plan(job("      - run: a\n", "", "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n")).ok).toBe(true);
   });
 
-  test("invalid YAML and duplicate keys refuse", () => {
-    expect(refused("jobs: [unclosed").kind).toBe("ci-unreadable");
-    expect(refused(job("      - run: a\n", "    env:\n      A: 1\n    env:\n      A: 2\n")).kind).toBe("ci-unreadable");
+  test("an absent, push-only, manual-only or scheduled trigger refuses", () => {
+    expect(refused(job("      - run: a\n", "", "")).kind).toBe("ci-not-triggered");
+    for (const on of ["on: push\n", "on: workflow_dispatch\n", "on: [push, workflow_dispatch]\n", "on:\n  schedule:\n    - cron: '0 0 * * *'\n", "on:\n  pull_request_target:\n"]) {
+      expect(refused(job("      - run: a\n", "", on)).kind).toBe("ci-not-triggered");
+    }
   });
 
-  test("a job with no run: step has nothing to build", () => {
-    expect(refused(job("      - uses: actions/checkout@v4\n")).kind).toBe("no-ci-plan");
+  test("a lookalike of on (Cyrillic о) is refused, never read as on", () => {
+    const r = refused(job("      - run: a\n", "", "\u043en: pull_request\n"));
+    expect(r.message).toContain("not printable ASCII");
+  });
+
+  test("a branches filter must list the base exactly; branches-ignore must not", () => {
+    const on = "on:\n  pull_request:\n    branches: [main, release]\n";
+    expect(plan(job("      - run: a\n", "", on), "t", "main").ok).toBe(true);
+    expect(refused(job("      - run: a\n", "", on), "t", "develop").kind).toBe("ci-not-triggered");
+    const ignore = "on:\n  pull_request:\n    branches-ignore: [develop]\n";
+    expect(plan(job("      - run: a\n", "", ignore), "t", "main").ok).toBe(true);
+    expect(refused(job("      - run: a\n", "", ignore), "t", "develop").kind).toBe("ci-not-triggered");
+  });
+
+  test("patterns, path filters and narrowed types cannot be evaluated or do not cover every head", () => {
+    expect(refused(job("      - run: a\n", "", "on:\n  pull_request:\n    branches: ['releases/**']\n")).message).toContain("pattern");
+    expect(refused(job("      - run: a\n", "", "on:\n  pull_request:\n    branches: ['!main']\n")).message).toContain("pattern");
+    expect(refused(job("      - run: a\n", "", "on:\n  pull_request:\n    paths: [src/**]\n")).message).toContain("changed files");
+    expect(refused(job("      - run: a\n", "", "on:\n  pull_request:\n    types: [labeled]\n")).kind).toBe("ci-not-triggered");
+    expect(refused(job("      - run: a\n", "", "on:\n  pull_request:\n    types: [opened]\n")).kind).toBe("ci-not-triggered");
+    expect(plan(job("      - run: a\n", "", "on:\n  pull_request:\n    types: [opened, synchronize, reopened]\n")).ok).toBe(true);
+  });
+
+  test("checkTrigger names the base it was given", () => {
+    const r = checkTrigger({ pull_request: { branches: ["main"] } }, "next", "ci.yml");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("not into next");
+  });
+
+  test("a base that is not a plain branch name refuses", () => {
+    for (const base of ["", "main*", "../main", "/main", "main/"]) expect(refused(job("      - run: a\n"), "t", base).kind).toBe("no-ci-job");
+  });
+});
+
+describe("needs: the dependency closure", () => {
+  const wf = `on: pull_request
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  lint:
+    runs-on: ubuntu-latest
+    needs: guard
+    steps:
+      - run: echo lint
+  t:
+    runs-on: ubuntu-latest
+    needs: [lint, guard]
+    steps:
+      - run: echo test
+  unrelated:
+    runs-on: macos-14
+    steps:
+      - run: echo never planned
+`;
+
+  test("the named job and everything it needs, dependencies first; unrelated jobs are not planned", () => {
+    const p = plan(wf);
+    expect(p.ok).toBe(true);
+    if (p.ok) expect(p.jobs.map((j: { id: string }) => j.id)).toEqual(["guard", "lint", "t"]);
+  });
+
+  test("an undefined need, a cycle, or a needed job the launcher cannot reproduce refuses", () => {
+    expect(refused(job("      - run: a\n", "    needs: missing\n")).message).toContain('needs "missing"');
+    const cycle = "on: pull_request\njobs:\n  a:\n    runs-on: ubuntu-latest\n    needs: t\n    steps:\n      - run: a\n  t:\n    runs-on: ubuntu-latest\n    needs: a\n    steps:\n      - run: b\n";
+    expect(refused(cycle).message).toContain("cycle");
+    const bad = wf.replace("  guard:\n    runs-on: ubuntu-latest", "  guard:\n    runs-on: windows-latest");
+    expect(refused(bad).message).toContain('job "guard" runs-on');
   });
 });
 
 describe("working directories, shells and env", () => {
   test("a step's working-directory is kept; defaults.run.working-directory applies", () => {
-    const p = plan(
-      job("      - run: bun run test\n        working-directory: packages/x\n      - run: bun run build\n", "    defaults:\n      run:\n        working-directory: ./packages/y/\n"),
+    const t = jobOf(
+      plan(job("      - run: bun run test\n        working-directory: packages/x\n      - run: bun run build\n", "    defaults:\n      run:\n        working-directory: ./packages/y/\n")),
     );
-    expect(p.ok).toBe(true);
-    if (p.ok) expect(p.steps.map((s) => s.workingDirectory)).toEqual(["packages/x", "packages/y"]);
+    expect(t.steps.map((s: { workingDirectory: string }) => s.workingDirectory)).toEqual(["packages/x", "packages/y"]);
   });
 
-  test("a working directory outside the workspace refuses", () => {
+  test("a working directory lexically outside the workspace refuses", () => {
     expect(refused(job("      - run: a\n        working-directory: /etc\n")).message).toContain("leaves the workspace");
     expect(refused(job("      - run: a\n        working-directory: packages/../../x\n")).message).toContain("leaves the workspace");
   });
@@ -138,18 +238,53 @@ describe("working directories, shells and env", () => {
   });
 
   test("plain env is honoured, workflow < job < step", () => {
-    const p = plan(
-      `env:\n  A: wf\n  B: wf\n  N: 3\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    env:\n      B: job\n      C: job\n    steps:\n      - run: a\n        env:\n          C: step\n`,
+    const t = jobOf(
+      plan(`on: pull_request\nenv:\n  A: wf\n  B: wf\n  N: 3\njobs:\n  t:\n    runs-on: ubuntu-24.04\n    env:\n      B: job\n      C: job\n    steps:\n      - run: a\n        env:\n          C: step\n          GIT_AUTHOR_NAME: ci\n`),
     );
-    expect(p.ok).toBe(true);
-    if (p.ok) expect(p.steps[0].env).toEqual({ A: "wf", B: "job", N: "3", C: "step" });
+    expect(t.steps[0].env).toEqual({ A: "wf", B: "job", N: "3", C: "step", GIT_AUTHOR_NAME: "ci" });
   });
 
   test("env the launcher owns, or that needs an expression, refuses", () => {
-    for (const key of ["HOME", "TMPDIR", "PATH", "npm_config_cache", "BUN_INSTALL_CACHE_DIR", "CI"]) {
+    for (const key of ["HOME", "TMPDIR", "PATH", "npm_config_cache", "BUN_INSTALL_CACHE_DIR", "CI", "LANG"]) {
       expect(refused(job(`      - run: a\n        env:\n          ${key}: /x\n`)).message).toContain(`sets ${key}`);
     }
     expect(refused(job("      - run: a\n        env:\n          T: ${{ secrets.T }}\n")).message).toContain("expression");
+  });
+
+  test("credential-shaped and config-redirecting env refuses at workflow, job and step level", () => {
+    const keys = [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "NPM_TOKEN",
+      "NODE_AUTH_TOKEN",
+      "MY_SECRET",
+      "DEPLOY_KEY",
+      "API_KEY",
+      "DB_PASSWORD",
+      "GIT_CONFIG_COUNT",
+      "GIT_CONFIG_KEY_0",
+      "GIT_ASKPASS",
+      "GIT_SSH_COMMAND",
+      "SSH_AUTH_SOCK",
+      "NPM_CONFIG_USERCONFIG",
+      "npm_config_registry",
+      "BUN_CONFIG_REGISTRY",
+      "NODE_OPTIONS",
+      "BASH_ENV",
+      "LD_PRELOAD",
+      "HTTPS_PROXY",
+      "AWS_ACCESS_KEY_ID",
+      "XDG_RUNTIME_DIR",
+    ];
+    for (const key of keys) {
+      expect(forbiddenEnvReason(key)).not.toBeNull();
+      expect(refused(job(`      - run: a\n        env:\n          ${key}: fake\n`)).message).toContain(`sets ${key}:`);
+    }
+    expect(refused(`on: pull_request\nenv:\n  GH_TOKEN: fake\njobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n      - run: a\n`).message).toContain("GH_TOKEN");
+    expect(refused(job("      - run: a\n", "    env:\n      GIT_CONFIG_GLOBAL: /x\n")).message).toContain("GIT_CONFIG_GLOBAL");
+    for (const key of ["NODE_ENV", "GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL", "FORCE_COLOR", "TPS_TEST_MODE", "KEYBOARD"]) {
+      expect(forbiddenEnvReason(key)).toBeNull();
+    }
   });
 
   test("an expression in a script refuses", () => {
@@ -157,7 +292,7 @@ describe("working directories, shells and env", () => {
   });
 });
 
-describe("if:, continue-on-error and job keys", () => {
+describe("if:, continue-on-error and keys", () => {
   test("only absent / true / success() / always() are honoured", () => {
     expect(condition(undefined)).toBe("success");
     expect(condition(true)).toBe("success");
@@ -172,9 +307,13 @@ describe("if:, continue-on-error and job keys", () => {
   });
 
   test("an always() step is marked to run after a failure", () => {
-    const p = plan(job("      - run: a\n      - run: b\n        if: always()\n"));
-    expect(p.ok).toBe(true);
-    if (p.ok) expect(p.steps.map((s) => s.always)).toEqual([false, true]);
+    const t = jobOf(plan(job("      - run: a\n      - run: b\n        if: always()\n")));
+    expect(t.steps.map((s: { always: boolean }) => s.always)).toEqual([false, true]);
+  });
+
+  test("a job CI never runs (if: false) refuses", () => {
+    const r = refused(job("      - run: a\n", "    if: false\n"));
+    expect(r.message).toContain("if: false");
   });
 
   test("continue-on-error would count a failure as success: refused on steps and jobs", () => {
@@ -183,12 +322,18 @@ describe("if:, continue-on-error and job keys", () => {
     expect(plan(job("      - run: a\n        continue-on-error: false\n")).ok).toBe(true);
   });
 
-  test("strategy, container, services, environment and reusable workflows refuse", () => {
+  test("strategy, container, services, environment, reusable workflows and unknown top-level keys refuse", () => {
     expect(refused(job("      - run: a\n", "    strategy:\n      matrix:\n        n: [22, 24]\n")).message).toContain('"strategy"');
     expect(refused(job("      - run: a\n", "    container: node:22\n")).message).toContain('"container"');
     expect(refused(job("      - run: a\n", "    services:\n      db:\n        image: pg\n")).message).toContain('"services"');
     expect(refused(job("      - run: a\n", "    environment: prod\n")).message).toContain('"environment"');
-    expect(refused("jobs:\n  t:\n    uses: org/repo/.github/workflows/x.yml@main\n").message).toContain('"uses"');
+    expect(refused("on: pull_request\njobs:\n  t:\n    uses: org/repo/.github/workflows/x.yml@main\n").message).toContain('"uses"');
+    expect(refused(`defaultz: {}\n${job("      - run: a\n")}`).message).toContain('top-level key "defaultz"');
+  });
+
+  test("a lookalike key anywhere is refused (e.g. a Cyrillic і in if)", () => {
+    expect(refused(job("      - run: a\n        \u0456f: failure()\n")).message).toContain("not printable ASCII");
+    expect(refused(job("      - run: a\n", "    ne\u0435ds: guard\n")).message).toContain("not printable ASCII");
   });
 
   test("runs-on must be an x86_64 ubuntu runner", () => {
@@ -198,21 +343,20 @@ describe("if:, continue-on-error and job keys", () => {
     }
   });
 
-  test("ignored job keys are accepted: name, needs, permissions, concurrency, outputs, timeout-minutes", () => {
-    const extra = "    name: T\n    needs: build\n    permissions: {}\n    concurrency: x\n    outputs:\n      o: v\n    timeout-minutes: 5\n";
+  test("ignored job keys are accepted: name, permissions, concurrency, outputs, timeout-minutes", () => {
+    const extra = "    name: T\n    permissions: {}\n    concurrency: x\n    outputs:\n      o: v\n    timeout-minutes: 5\n";
     expect(plan(job("      - run: a\n        timeout-minutes: 1\n", extra)).ok).toBe(true);
   });
 });
 
-describe("uses: — skipped by name or refused", () => {
+describe("uses: — skipped at a reviewed ref, or refused", () => {
   test("an action the launcher does not know refuses, naming it", () => {
     const r = refused(job("      - uses: actions/github-script@v7\n      - run: a\n"));
     expect(r.kind).toBe("ci-unhonourable");
     expect(r.message).toContain("actions/github-script@v7");
     expect(refused(job("      - uses: ./.github/actions/setup\n      - run: a\n")).kind).toBe("ci-unhonourable");
     expect(refused(job("      - uses: docker://alpine:3\n      - run: a\n")).kind).toBe("ci-unhonourable");
-    const unpinned = refused(job("      - uses: actions/checkout\n      - run: a\n"));
-    expect(unpinned.message).toContain('uses "actions/checkout", which the review launcher cannot reproduce');
+    expect(refused(job("      - uses: actions/checkout\n      - run: a\n")).message).toContain('uses "actions/checkout", which the review launcher cannot reproduce');
   });
 
   test("a step key the launcher does not know refuses", () => {
@@ -220,61 +364,89 @@ describe("uses: — skipped by name or refused", () => {
   });
 
   test("checkout is skipped only with inputs that do not change the tree", () => {
-    expect(plan(job("      - uses: actions/checkout@v4\n        with:\n          persist-credentials: false\n          fetch-depth: 0\n      - run: a\n")).ok).toBe(true);
     for (const input of ["ref: other", "submodules: true", "lfs: true", "repository: x/y", "token: t"]) {
-      expect(refused(job(`      - uses: actions/checkout@v4\n        with:\n          ${input}\n      - run: a\n`)).message).toContain(
-        `the input "${input.split(":")[0]}"`,
-      );
+      expect(refused(job(`      - uses: ${CHECKOUT}\n        with:\n          ${input}\n      - run: a\n`)).message).toContain(`the input "${input.split(":")[0]}"`);
     }
   });
 
   test("setup-bun: bun-version becomes a pin; no version, or a registry, refuses", () => {
-    const p = plan(job('      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version: "1.3.10"\n      - run: a\n'));
+    const p = plan(job(`      - uses: ${SETUP_BUN}\n        with:\n          bun-version: "1.3.10"\n      - run: a\n`));
     expect(p.ok).toBe(true);
     if (p.ok) expect(p.pins).toEqual([{ tool: "bun", range: "1.3.10", source: '.github/workflows/ci.yml job "t" step 1 bun-version' }]);
-    expect(refused(job("      - uses: oven-sh/setup-bun@v2\n      - run: a\n")).kind).toBe("ambiguous");
-    expect(refused(job("      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version: 1.3.10\n          registry-url: https://r\n      - run: a\n")).kind).toBe(
-      "ci-unhonourable",
-    );
-    expect(plan(job("      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version-file: .bun-version\n      - run: a\n")).ok).toBe(true);
-    expect(refused(job("      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version-file: tools/bun.txt\n      - run: a\n")).kind).toBe(
-      "ci-unhonourable",
-    );
+    expect(refused(job(`      - uses: ${SETUP_BUN}\n      - run: a\n`)).kind).toBe("ambiguous");
+    expect(refused(job(`      - uses: ${SETUP_BUN}\n        with:\n          bun-version: 1.3.10\n          registry-url: https://r\n      - run: a\n`)).kind).toBe("ci-unhonourable");
+    expect(plan(job(`      - uses: ${SETUP_BUN}\n        with:\n          bun-version-file: .bun-version\n      - run: a\n`)).ok).toBe(true);
+    expect(refused(job(`      - uses: ${SETUP_BUN}\n        with:\n          bun-version-file: tools/bun.txt\n      - run: a\n`)).kind).toBe("ci-unhonourable");
   });
 
   test("setup-node: node-version becomes a pin; check-latest, a registry or an expression refuses", () => {
-    const p = plan(job("      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n          cache: npm\n      - run: a\n"));
+    const p = plan(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: 22\n          cache: npm\n      - run: a\n`));
     expect(p.ok).toBe(true);
-    if (p.ok) expect(p.pins.map((x) => [x.tool, x.range])).toEqual([["node", "22"]]);
-    expect(refused(job("      - uses: actions/setup-node@v4\n        with:\n          node-version: 22\n          check-latest: true\n      - run: a\n")).kind).toBe(
-      "ambiguous",
-    );
-    expect(refused(job("      - uses: actions/setup-node@v4\n        with:\n          registry-url: https://r\n      - run: a\n")).kind).toBe(
-      "ci-unhonourable",
-    );
-    expect(refused(job("      - uses: actions/setup-node@v4\n        with:\n          node-version: ${{ matrix.node }}\n      - run: a\n")).message).toContain(
-      "expression",
-    );
+    if (p.ok) expect(p.pins.map((x: { tool: string; range: string }) => [x.tool, x.range])).toEqual([["node", "22"]]);
+    expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: 22\n          check-latest: true\n      - run: a\n`)).message).toContain("check-latest");
+    expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          registry-url: https://r\n      - run: a\n`)).kind).toBe("ci-unhonourable");
+    expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: \${{ matrix.node }}\n      - run: a\n`)).message).toContain("expression");
   });
 
-  test("cache and upload-artifact are skipped whole, expressions and all", () => {
-    const p = plan(
-      job("      - uses: actions/cache@v4\n        with:\n          key: ${{ runner.os }}-x\n      - run: a\n      - uses: actions/upload-artifact@v4\n        with:\n          path: out\n"),
-    );
-    expect(p.ok).toBe(true);
-    if (p.ok) expect(p.skipped.map((s) => s.uses)).toEqual(["actions/cache@v4", "actions/upload-artifact@v4"]);
+  test("socketdev is skipped only in firewall-free mode", () => {
+    expect(plan(job(`      - uses: ${SOCKET}\n        with:\n          mode: firewall-free\n      - run: a\n`)).ok).toBe(true);
+    expect(refused(job(`      - uses: ${SOCKET}\n        with:\n          mode: patch\n      - run: a\n`)).message).toContain("firewall-free");
+  });
+
+  test("cache is skipped, key expressions and all, unless a miss would fail CI", () => {
+    const t = jobOf(plan(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: \${{ runner.os }}-x\n      - run: a\n`)));
+    expect(t.skipped.map((s: { tag: string }) => s.tag)).toEqual(["v4.3.0"]);
+    expect(refused(job(`      - uses: ${CACHE}\n        with:\n          key: k\n          fail-on-cache-miss: true\n      - run: a\n`)).message).toContain("fail-on-cache-miss");
+  });
+
+  test("upload-artifact is skipped unless no files would fail CI", () => {
+    expect(plan(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n`)).ok).toBe(true);
+    expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n          if-no-files-found: error\n`)).message).toContain("if-no-files-found");
   });
 
   test("a scalar run: is text, as Actions reads it; an empty or mapping run: refuses", () => {
-    const p = plan(job("      - run: true\n      - run: 42\n"));
-    expect(p.ok).toBe(true);
-    if (p.ok) expect(p.steps.map((s) => s.script)).toEqual(["true", "42"]);
+    const t = jobOf(plan(job("      - run: true\n      - run: 42\n")));
+    expect(t.steps.map((s: { script: string }) => s.script)).toEqual(["true", "42"]);
     expect(refused(job("      - run:\n")).message).toContain("not a script");
     expect(refused(job("      - run:\n          a: b\n")).message).toContain("not a script");
   });
 
   test("a step with both uses: and run:, or neither, refuses", () => {
-    expect(refused(job("      - uses: actions/checkout@v4\n        run: a\n")).message).toContain("exactly one");
+    expect(refused(job(`      - uses: ${CHECKOUT}\n        run: a\n`)).message).toContain("exactly one");
     expect(refused(job("      - name: nothing\n      - run: a\n")).message).toContain("exactly one");
+  });
+});
+
+describe("bounded input", () => {
+  test("a workflow over the byte limit refuses before parsing", () => {
+    const big = job(`      - run: a\n        name: ${"x".repeat(MAX_WORKFLOW_BYTES)}\n`);
+    expect(refused(big).message).toContain(`larger than ${MAX_WORKFLOW_BYTES} bytes`);
+  });
+
+  test("an alias bomb is refused by the node budget", () => {
+    // Nine levels of ten aliases each: tiny as text, 10^9 nodes if walked naively.
+    let anchors = "  l0: &a0 [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\n";
+    for (let i = 1; i <= 8; i++) anchors += `  l${i}: &a${i} [${Array(10).fill(`*a${i - 1}`).join(", ")}]\n`;
+    const r = refused(`bomb:\n${anchors}${job("      - run: a\n")}`);
+    expect(r.kind).toBe("ci-unreadable");
+    expect(r.message).toContain("YAML nodes");
+  });
+
+  test("nesting deeper than the limit refuses", () => {
+    let nested = "a";
+    for (let i = 0; i < 40; i++) nested = `[${nested}]`;
+    expect(refused(`${job("      - run: a\n")}deep: ${nested}\n`).message).toContain("nests deeper");
+  });
+
+  test("invalid YAML and duplicate keys refuse", () => {
+    expect(refused("jobs: [unclosed").kind).toBe("ci-unreadable");
+    expect(refused(job("      - run: a\n", "    env:\n      A: 1\n    env:\n      A: 2\n")).kind).toBe("ci-unreadable");
+  });
+
+  test("a job with no run: step has nothing to build; a missing job lists the jobs", () => {
+    expect(refused(job(`      - uses: ${CHECKOUT}\n`)).kind).toBe("no-ci-plan");
+    const r = refused(job("      - run: a\n"), "tests");
+    expect(r.kind).toBe("no-ci-job");
+    expect(r.message).toContain("jobs: t");
   });
 });

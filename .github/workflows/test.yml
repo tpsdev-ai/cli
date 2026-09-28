@@ -166,15 +166,17 @@ jobs:
   # cli#425 section A — the reviewer sandbox image matrix (linux/amd64). Builds
   # every trusted runtime image and runs the image-level acceptance checks: A2
   # integrity, the image's own resolver refusals and the build-path fixtures (an
-  # out-of-matrix pin and a pin for another image run nothing; an in-matrix pin
-  # runs the named job), A3 hermetic defaults observed inside a build run the way
-  # OpenClaw runs the sandbox (read-only root, tmpfs, no network, `sleep
-  # infinity` + exec), and A9 tokenless gh. The A9 red proofs then require the
-  # same A9 checks to FAIL on derived images carrying planted fake credentials,
-  # so the lane proves A9 fires on every run. No registry: the local image ids
-  # are recorded as evidence of this build only (a host builds its own at
-  # install time). The host unit tests for the planner/resolver/launcher run in
-  # the cli suite.
+  # out-of-matrix pin, a pin for another image, a caller naming another job and a
+  # --workspace argument run nothing; an in-matrix pin runs the host-named job
+  # while impostor binaries on the caller's PATH never run), A3 hermetic defaults
+  # observed inside a build run the way OpenClaw runs the sandbox (read-only
+  # root, tmpfs, no network, `sleep infinity` + exec), and A9 tokenless gh plus
+  # the launcher refusing a worktree git auth header and a workflow GH_TOKEN. The
+  # A9 red proofs then require the same A9 checks to FAIL on derived images
+  # carrying planted fake credentials, so the lane proves A9 fires on every run.
+  # No registry: the local image ids are recorded as evidence of this build only
+  # (a host builds its own at install time). The host unit tests for the
+  # planner/resolver/launcher run in the cli suite.
   reviewer-image:
     name: Reviewer sandbox image (A2/A3/A9)
     permissions:

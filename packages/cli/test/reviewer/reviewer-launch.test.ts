@@ -1,27 +1,51 @@
 /**
- * reviewer-launch.test.ts — the trusted launcher (cli#425 acceptance A2, A3):
- * the allowlisted child environment, the runtime verification, and the review
- * build end to end — trusted table and baked identity, the host-named job,
- * resolution, the image check, the version check, and only then real bash steps
- * — using temporary trusted/workspace/scratch directories in place of
- * /opt/reviewer, /workspace and /tmp/review.
+ * reviewer-launch.test.ts — the trusted launcher (cli#425 acceptance A2, A3,
+ * A9): the host assignment and its override refusal, the allowlisted child
+ * environment with a fixed PATH, runtime verification with fixed binaries, the
+ * worktree checks (symlinked lockfiles and directories, bounded reads, git
+ * credential settings, resolved working directories), and the review build end
+ * to end — the needs closure, fresh worktree per job, real bash steps — using
+ * temporary trusted/workspace/scratch directories in place of /opt/reviewer,
+ * /workspace and /tmp/review.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildArgsFor, loadTable } from "../../../../scripts/reviewer/build-reviewer-image.mjs";
 import {
+  checkStepEnv,
+  containedDirectory,
+  gitAuthFindings,
+  guardStep,
   HERMETIC,
   HERMETIC_KEYS,
-  PASSTHROUGH_KEYS,
   hermeticEnv,
+  hostAssignment,
+  inspectGitConfig,
+  PASSTHROUGH_KEYS,
   probeActualVersions,
+  readBoundedFile,
+  readCreationEnv,
+  removeCreatedPaths,
   reviewBuild,
   runSteps,
+  scanWorkspace,
   selfCheck,
+  STEP_PATH,
   verifyArtifact,
   verifyRuntime,
 } from "../../../../scripts/reviewer/reviewer-launch.mjs";
@@ -31,6 +55,10 @@ const repo = resolve(here, "..", "..", "..", "..");
 const table = loadTable(resolve(repo, "docker", "reviewer", "runtime-matrix.json"));
 const node22 = table.images.find((i: { id: string }) => i.id === "reviewer-node22-bun1310");
 const launcher = resolve(repo, "scripts", "reviewer", "reviewer-launch.mjs");
+
+const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
+const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
+const SOCKET = "socketdev/action@ba6de6cc0565af1f42295590380973573297e31f";
 
 /** Parent-environment values that must never reach a step. */
 const POLLUTION: Record<string, string> = {
@@ -52,12 +80,15 @@ const POLLUTION: Record<string, string> = {
   REVIEWER_IMAGE_ID: "reviewer-node22-bun1310",
 };
 
-describe("A3 — the child environment is an allowlist", () => {
-  test("hermetic values + PATH, LANG, LC_ALL, TERM, TZ + CI=true; nothing else", () => {
+/** The host's assignment, as the container init's environment carries it. */
+const HOST = { REVIEWER_CI_WORKFLOW: ".github/workflows/ci.yml", REVIEWER_CI_JOB: "review", REVIEWER_CI_BASE: "main" };
+
+describe("A3 — the child environment is an allowlist with a fixed PATH", () => {
+  test("hermetic values + fixed PATH + LANG, LC_ALL, TERM, TZ + CI=true; nothing else", () => {
     const env = hermeticEnv(
       {
         ...POLLUTION,
-        PATH: "/usr/bin",
+        PATH: "/evil/bin:/usr/bin",
         LANG: "C.UTF-8",
         LC_ALL: "C.UTF-8",
         TERM: "dumb",
@@ -69,16 +100,14 @@ describe("A3 — the child environment is an allowlist", () => {
       },
       "/scratch",
     );
-    expect(Object.keys(env).sort()).toEqual([...PASSTHROUGH_KEYS, ...HERMETIC_KEYS, "CI"].sort());
+    expect(Object.keys(env).sort()).toEqual([...PASSTHROUGH_KEYS, ...HERMETIC_KEYS, "PATH", "CI"].sort());
     for (const key of [...Object.keys(POLLUTION), "BASH_ENV"]) expect(env[key]).toBeUndefined();
-    expect(env.PATH).toBe("/usr/bin");
+    expect(env.PATH).toBe(STEP_PATH);
     expect(env.CI).toBe("true");
     expect(env.HOME).toBe("/scratch/home");
-    expect(env.USERPROFILE).toBe("/scratch/home");
     expect(env.TMPDIR).toBe("/scratch/tmp");
     expect(env.npm_config_cache).toBe("/scratch/cache/npm");
     expect(env.BUN_INSTALL_CACHE_DIR).toBe("/scratch/cache/bun");
-    expect(env.XDG_CACHE_HOME).toBe("/scratch/cache");
   });
 
   test("the image's ENV defaults are exactly the launcher's hermetic layout, under /tmp/review", () => {
@@ -87,6 +116,37 @@ describe("A3 — the child environment is an allowlist", () => {
     for (const [key, value] of Object.entries(HERMETIC)) {
       expect(value.startsWith("/tmp/review/")).toBe(true);
       expect(envBlock).toContain(`${key}=${value}`);
+    }
+  });
+
+  test("guardStep refuses a step whose effective env the planner should never have produced", () => {
+    const dir = mkdtempSync(join(tmpdir(), "guard-"));
+    try {
+      const launcherEnv = hermeticEnv({}, "/scratch");
+      const step = { index: 1, name: "s", script: "true", workingDirectory: ".", env: { NODE_ENV: "test" }, always: false };
+      const ok = guardStep(step, launcherEnv, dir);
+      expect(ok.ok).toBe(true);
+      if (ok.ok) expect(ok.env.NODE_ENV).toBe("test");
+      for (const env of [{ GH_TOKEN: "x" }, { PATH: "/evil" }, { HOME: "/elsewhere" }]) {
+        const r = guardStep({ ...step, env }, launcherEnv, dir);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.refusal.kind).toBe("step-env");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a step's effective env is re-checked: launcher-owned values unchanged, nothing credential-shaped", () => {
+    const launcherEnv = hermeticEnv({}, "/scratch");
+    expect(checkStepEnv({ ...launcherEnv, NODE_ENV: "test" }, launcherEnv).ok).toBe(true);
+    const home = checkStepEnv({ ...launcherEnv, HOME: "/elsewhere" }, launcherEnv);
+    expect(home.ok).toBe(false);
+    if (!home.ok) expect(home.refusal.message).toContain("HOME changed");
+    for (const key of ["GH_TOKEN", "GIT_CONFIG_COUNT", "NODE_OPTIONS", "SOME_SECRET"]) {
+      const r = checkStepEnv({ ...launcherEnv, [key]: "x" }, launcherEnv);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.refusal.kind).toBe("step-env");
     }
   });
 });
@@ -118,8 +178,7 @@ describe("A2 — runtime verification", () => {
       expect(r.refusal.kind).toBe("version-mismatch");
       expect(r.refusal.message).toContain("actual bun 1.3.9");
     }
-    const missing = verifyRuntime({ image: node22, actual: { node: node22.node, bun: null } });
-    expect(missing.ok).toBe(false);
+    expect(verifyRuntime({ image: node22, actual: { node: node22.node, bun: null } }).ok).toBe(false);
   });
 
   test("stops when the actual node does not satisfy a repository requirement", () => {
@@ -135,10 +194,7 @@ describe("A2 — runtime verification", () => {
       requirements: [{ tool: "bun", range: ">=1.4", source: ".bun-version" }],
     });
     expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.refusal.kind).toBe("unsupported");
-      expect(r.refusal.message).toContain("actual bun 1.3.10 does not satisfy >=1.4 (required by .bun-version)");
-    }
+    if (!r.ok) expect(r.refusal.message).toContain("actual bun 1.3.10 does not satisfy >=1.4 (required by .bun-version)");
   });
 
   test("a requirement for a runtime the image does not provide stops the build", () => {
@@ -154,6 +210,39 @@ describe("A2 — runtime verification", () => {
   test("checksum verification fails closed", () => {
     expect(verifyArtifact({ sha256: "a".repeat(64) }, "a".repeat(64)).ok).toBe(true);
     expect(verifyArtifact({ sha256: "a".repeat(64) }, "b".repeat(64)).ok).toBe(false);
+  });
+});
+
+describe("the host assignment", () => {
+  test("comes from the creation environment; the caller may repeat it but not change or add it", () => {
+    const ok = hostAssignment(HOST, { ...HOST, PATH: "/x" });
+    expect(ok).toEqual({ ok: true, workflow: HOST.REVIEWER_CI_WORKFLOW, job: HOST.REVIEWER_CI_JOB, base: HOST.REVIEWER_CI_BASE });
+    for (const key of Object.keys(HOST)) {
+      const r = hostAssignment(HOST, { [key]: "other" });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.refusal.kind).toBe("assignment-override");
+    }
+    const added = hostAssignment({}, HOST);
+    expect(added.ok).toBe(false);
+    if (!added.ok) expect(added.refusal.kind).toBe("assignment-override");
+  });
+
+  test("an unreadable creation environment, a missing value or a malformed one refuses", () => {
+    const none = hostAssignment(null, {});
+    expect(none.ok).toBe(false);
+    if (!none.ok) expect(none.refusal.message).toContain("creation environment");
+    const missing = hostAssignment({ ...HOST, REVIEWER_CI_BASE: "" }, {});
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.refusal.message).toContain("the host names no CI job");
+    for (const [key, value, text] of [
+      ["REVIEWER_CI_WORKFLOW", "ci.yml", "is not a .github/workflows/<name>.yml path"],
+      ["REVIEWER_CI_JOB", "review;x", 'REVIEWER_CI_JOB "review;x" is not a job id'],
+      ["REVIEWER_CI_BASE", "main*", "is not a branch name"],
+    ]) {
+      const r = hostAssignment({ ...HOST, [key]: value }, {});
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.refusal.message).toContain(text);
+    }
   });
 });
 
@@ -174,6 +263,60 @@ describe("A2 — step execution order", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.failed).toEqual({ step: 2, name: "b", code: 3 });
   });
+
+  test("a refusal from the step runner stops at once", async () => {
+    const ran: number[] = [];
+    const r = await runSteps(
+      [
+        { index: 1, name: "a", always: false },
+        { index: 2, name: "b", always: true },
+      ],
+      async (s: { index: number }) => {
+        ran.push(s.index);
+        return { ok: false, refusal: { kind: "working-directory", message: "x" } };
+      },
+    );
+    expect(ran).toEqual([1]);
+    expect(r.refusal?.kind).toBe("working-directory");
+  });
+});
+
+describe("git credential and auth settings", () => {
+  test("gitAuthFindings names keys and origins, never values, and masks userinfo — each rule on its own", () => {
+    const listing = [
+      "file:.git/config\tcore.bare=false",
+      "file:.git/config\thttp.https://github.com/.extraheader=X-Trace: 1",
+      "file:.git/config\turl.https://u:ghs_SECRET@github.com/.insteadof=https://github.com/",
+      "file:.git/config\tremote.origin.url=https://x:ghp_SECRET@github.com/o/r",
+      "file:/etc/gitconfig\tcredential.helper=store",
+      "file:.git/config\tcore.askpass=/x",
+      "file:.git/config\tcore.sshcommand=ssh -i k",
+      "file:.git/config\tinclude.path=../evil",
+      "file:.git/config\tincludeif.gitdir:/x/.path=y",
+      "file:.git/config\thttp.cookiefile=/c",
+      "file:.git/config\thttp.sslcert=/c",
+      "file:.git/config\tsendemail.smtppass=hunter2",
+      "file:.git/config\talias.x=!curl -H 'Authorization: Basic c2VjcmV0'",
+      "command line:\tsafe.directory=/workspace",
+    ].join("\n");
+    const findings = gitAuthFindings(listing);
+    expect(findings).toEqual([
+      "http.https://github.com/.extraheader (file:.git/config)",
+      "url.https://***@github.com/.insteadof (file:.git/config)",
+      "remote.origin.url (file:.git/config)",
+      "credential.helper (file:/etc/gitconfig)",
+      "core.askpass (file:.git/config)",
+      "core.sshcommand (file:.git/config)",
+      "include.path (file:.git/config)",
+      "includeif.gitdir:/x/.path (file:.git/config)",
+      "http.cookiefile (file:.git/config)",
+      "http.sslcert (file:.git/config)",
+      "sendemail.smtppass (file:.git/config)",
+      "alias.x (file:.git/config)",
+    ]);
+    const joined = findings.join(" ");
+    for (const secret of ["SECRET", "c2VjcmV0", "hunter2"]) expect(joined).not.toContain(secret);
+  });
 });
 
 // ─── the review build, end to end ────────────────────────────────────────────
@@ -182,11 +325,16 @@ let root: string;
 let trusted: string;
 let workspace: string;
 let scratch: string;
+let outside: string;
 
-const HOST_JOB = { REVIEWER_CI_WORKFLOW: ".github/workflows/ci.yml", REVIEWER_CI_JOB: "review" };
 const actual22 = () => ({ node: "22.22.1", bun: "1.3.10" });
+const git = (...args: string[]) => spawnSync("/usr/bin/git", args, { cwd: workspace, encoding: "utf8", env: { PATH: "/usr/bin:/bin", HOME: root } });
+/** The real inspector, with the host machine's own system git config excluded. */
+const inspectNoSystem = (a: { workspace: string; env: Record<string, string> }) =>
+  inspectGitConfig({ ...a, env: { ...a.env, GIT_CONFIG_NOSYSTEM: "1" } });
 
-function writeWorkspace(nodeRange: string, steps: string, jobExtra = "") {
+/** A pull_request workflow whose `review` job runs the given step lines; `jobs` adds jobs before it. */
+function writeWorkspace(nodeRange: string, steps: string, { jobExtra = "", jobs = "", env = "" } = {}) {
   writeFileSync(
     join(workspace, "package.json"),
     JSON.stringify({ name: "fixture", private: true, packageManager: "bun@1.3.10", engines: { node: nodeRange } }),
@@ -194,7 +342,7 @@ function writeWorkspace(nodeRange: string, steps: string, jobExtra = "") {
   mkdirSync(join(workspace, ".github", "workflows"), { recursive: true });
   writeFileSync(
     join(workspace, ".github", "workflows", "ci.yml"),
-    `on: push\njobs:\n  review:\n    runs-on: ubuntu-latest\n${jobExtra}    steps:\n      - uses: actions/checkout@v4\n      - uses: oven-sh/setup-bun@v2\n        with:\n          bun-version: "1.3.10"\n${steps}`,
+    `on:\n  pull_request:\n    branches: [main]\n${env}jobs:\n${jobs}  review:\n    runs-on: ubuntu-latest\n${jobExtra}    steps:\n      - uses: ${CHECKOUT}\n      - uses: ${SETUP_BUN}\n        with:\n          bun-version: "1.3.10"\n${steps}`,
   );
 }
 
@@ -203,19 +351,23 @@ function build(overrides: Record<string, unknown> = {}) {
     workspace,
     trustedDir: trusted,
     hermeticRoot: scratch,
-    parentEnv: { PATH: process.env.PATH, ...POLLUTION, ...HOST_JOB },
+    parentEnv: { PATH: process.env.PATH, ...POLLUTION, ...HOST },
+    creationEnv: HOST,
     probe: actual22,
+    inspectGit: inspectNoSystem,
     ...overrides,
   });
 }
 
 beforeEach(() => {
-  root = mkdtempSync(join(tmpdir(), "reviewer-launch-"));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "reviewer-launch-")));
   trusted = join(root, "opt-reviewer");
   workspace = join(root, "workspace");
   scratch = join(root, "tmp-review");
+  outside = join(root, "outside");
   mkdirSync(join(trusted, "shims"), { recursive: true });
   mkdirSync(workspace);
+  mkdirSync(outside);
   copyFileSync(resolve(repo, "docker", "reviewer", "runtime-matrix.json"), join(trusted, "runtime-matrix.json"));
   copyFileSync(resolve(repo, "docker", "reviewer", "shims", "sfw"), join(trusted, "shims", "sfw"));
   chmodSync(join(trusted, "shims", "sfw"), 0o755);
@@ -227,14 +379,14 @@ afterEach(() => {
 });
 
 describe("A2/A3 — the review build", () => {
-  test("an in-matrix pin for THIS image runs every step, in order, in its directory, with the allowlisted env", async () => {
+  test("an in-matrix pin for THIS image runs every step, in order, in its directory, with the allowlisted env and fixed PATH", async () => {
     mkdirSync(join(workspace, "sub"));
     writeWorkspace(
       "22.x",
       [
         "      - run: echo one > order",
         "      - run: pwd > ../where\n        working-directory: sub",
-        "      - run: |\n          env > child-env\n          echo \"$HOME|$TMPDIR|$npm_config_cache\" > child-dirs\n          touch \"$HOME/h\" \"$TMPDIR/t\" \"$BUN_INSTALL_CACHE_DIR/b\"",
+        "      - run: |\n          env > child-env\n          echo \"$HOME|$TMPDIR|$npm_config_cache|$PATH\" > child-dirs\n          touch \"$HOME/h\" \"$TMPDIR/t\" \"$BUN_INSTALL_CACHE_DIR/b\"",
         "      - run: |\n          if shopt -q login_shell; then exit 90; fi\n          case $- in *i*) exit 91 ;; esac\n          echo two >> order",
       ].join("\n") + "\n",
     );
@@ -243,16 +395,27 @@ describe("A2/A3 — the review build", () => {
     if (!r.ok) return;
     expect(r.status).toBe("review-build-ok");
     expect(r.image).toBe("reviewer-node22-bun1310");
-    expect(r.steps.map((s: { code?: number }) => s.code)).toEqual([0, 0, 0, 0]); // step 4: not a login or interactive shell
-    expect(r.skipped.map((s: { uses: string }) => s.uses)).toEqual(["actions/checkout@v4", "oven-sh/setup-bun@v2"]);
+    expect(r.base).toBe("main");
+    expect(r.jobs).toHaveLength(1);
+    expect(r.jobs[0].steps.map((s: { code?: number }) => s.code)).toEqual([0, 0, 0, 0]); // step 4: not a login or interactive shell
+    expect(r.jobs[0].skipped.map((s: { uses: string }) => s.uses)).toEqual([CHECKOUT, SETUP_BUN]);
     expect(readFileSync(join(workspace, "order"), "utf8")).toBe("one\ntwo\n");
-    expect(readFileSync(join(workspace, "where"), "utf8").trim().endsWith("/workspace/sub")).toBe(true);
-    expect(readFileSync(join(workspace, "child-dirs"), "utf8").trim()).toBe(
-      `${scratch}/home|${scratch}/tmp|${scratch}/cache/npm`,
-    );
+    expect(readFileSync(join(workspace, "where"), "utf8").trim()).toBe(join(workspace, "sub"));
+    expect(readFileSync(join(workspace, "child-dirs"), "utf8").trim()).toBe(`${scratch}/home|${scratch}/tmp|${scratch}/cache/npm|${STEP_PATH}`);
     const childEnv = readFileSync(join(workspace, "child-env"), "utf8");
-    for (const key of Object.keys(POLLUTION)) expect(childEnv).not.toMatch(new RegExp(`^${key}=`, "m"));
+    for (const key of [...Object.keys(POLLUTION), ...Object.keys(HOST)]) expect(childEnv).not.toMatch(new RegExp(`^${key}=`, "m"));
     expect(childEnv).toMatch(/^CI=true$/m);
+  });
+
+  test("a caller's PATH never selects a step's executables", async () => {
+    const evil = join(root, "evil");
+    mkdirSync(evil);
+    writeFileSync(join(evil, "touch"), `#!/bin/sh\necho evil > "${join(root, "evil-ran")}"\n`, { mode: 0o755 });
+    writeWorkspace("22.x", "      - run: touch made\n");
+    const r = await build({ parentEnv: { ...POLLUTION, ...HOST, PATH: `${evil}:/usr/bin:/bin` } });
+    expect(r.ok).toBe(true);
+    expect(existsSync(join(workspace, "made"))).toBe(true);
+    expect(existsSync(join(root, "evil-ran"))).toBe(false);
   });
 
   test("an out-of-matrix pin refuses by name before anything runs", async () => {
@@ -275,12 +438,11 @@ describe("A2/A3 — the review build", () => {
     if (!r.ok) {
       expect(r.refusal.kind).toBe("wrong-image");
       expect(r.refusal.message).toContain("resolves to reviewer-node24-bun1310");
-      expect(r.refusal.message).toContain("this sandbox is reviewer-node22-bun1310");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
   });
 
-  test("the actual runtime is measured under the CHILD env and must match; a mismatch runs nothing", async () => {
+  test("the actual runtime is measured with the CHILD env and must match; a mismatch runs nothing", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
     let seen: Record<string, string> = {};
     const r = await build({
@@ -292,52 +454,39 @@ describe("A2/A3 — the review build", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal.kind).toBe("version-mismatch");
     expect(seen.HOME).toBe(`${scratch}/home`);
+    expect(seen.PATH).toBe(STEP_PATH);
     expect(seen.FOO_SECRET).toBeUndefined();
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
   });
 
   test("the image's baked identity is authoritative: a disagreeing REVIEWER_IMAGE_ID or a missing one refuses", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
-    const wrongEnv = await build({ parentEnv: { PATH: process.env.PATH, ...HOST_JOB, REVIEWER_IMAGE_ID: "reviewer-node24-bun1310" } });
+    const wrongEnv = await build({ parentEnv: { PATH: "/x", ...HOST, REVIEWER_IMAGE_ID: "reviewer-node24-bun1310" } });
     expect(wrongEnv.ok).toBe(false);
     if (!wrongEnv.ok) expect(wrongEnv.refusal.kind).toBe("image-identity");
     rmSync(join(trusted, "image-id"));
     const none = await build();
     expect(none.ok).toBe(false);
-    if (!none.ok) {
-      expect(none.refusal.kind).toBe("image-identity");
-      expect(none.refusal.message).toContain("carries no baked image identity");
-    }
+    if (!none.ok) expect(none.refusal.message).toContain("carries no baked image identity");
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
   });
 
-  test("without a host-named job nothing is guessed", async () => {
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
-    const r = await build({ parentEnv: { PATH: process.env.PATH } });
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.refusal.kind).toBe("no-ci-job");
-      expect(r.refusal.message).toContain("the host names no CI job");
-    }
-    const badJob = await build({ parentEnv: { PATH: process.env.PATH, ...HOST_JOB, REVIEWER_CI_JOB: "review;x" } });
-    expect(badJob.ok).toBe(false);
-    if (!badJob.ok) expect(badJob.refusal.message).toContain('REVIEWER_CI_JOB "review;x" is not a job id');
-    // A workflow outside .github/workflows is not a CI lane, even when it is a valid one.
-    copyFileSync(join(workspace, ".github", "workflows", "ci.yml"), join(workspace, "ci.yml"));
-    const outside = await build({ parentEnv: { PATH: process.env.PATH, REVIEWER_CI_WORKFLOW: "ci.yml", REVIEWER_CI_JOB: "review" } });
-    expect(outside.ok).toBe(false);
-    if (!outside.ok) expect(outside.refusal.message).toContain("is not a .github/workflows/<name>.yml path");
+  test("the job comes only from the host: a caller naming another job, or no host assignment, runs nothing", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", { jobs: "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo other > other-marker\n" });
+    const override = await build({ parentEnv: { PATH: "/x", ...HOST, REVIEWER_CI_JOB: "other" } });
+    expect(override.ok).toBe(false);
+    if (!override.ok) expect(override.refusal.kind).toBe("assignment-override");
+    const none = await build({ creationEnv: null });
+    expect(none.ok).toBe(false);
+    if (!none.ok) expect(none.refusal.kind).toBe("no-ci-job");
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+    expect(existsSync(join(workspace, "other-marker"))).toBe(false);
   });
 
   test("each step runs under bash -eo pipefail: a failed command or pipeline fails the step; always() still runs", async () => {
     writeWorkspace(
       "22.x",
-      [
-        "      - run: |\n          false | true\n          touch after-pipe",
-        "      - run: touch skipped",
-        "      - run: touch always-ran\n        if: always()",
-      ].join("\n") + "\n",
+      ["      - run: |\n          false | true\n          touch after-pipe", "      - run: touch skipped", "      - run: touch always-ran\n        if: always()"].join("\n") + "\n",
     );
     const r = await build();
     expect(r.ok).toBe(false);
@@ -351,7 +500,7 @@ describe("A2/A3 — the review build", () => {
     expect(existsSync(join(workspace, "after-false"))).toBe(false);
   });
 
-  test("a build that changes a lockfile is not a frozen install", async () => {
+  test("a build that changes or creates a lockfile is not a frozen install", async () => {
     writeFileSync(join(workspace, "bun.lock"), "{}\n");
     writeWorkspace("22.x", "      - run: echo '// drift' >> bun.lock\n");
     const r = await build();
@@ -360,22 +509,155 @@ describe("A2/A3 — the review build", () => {
       expect(r.refusal.kind).toBe("unfrozen-install");
       expect(r.refusal.message).toContain("bun.lock (changed)");
     }
+    writeFileSync(join(workspace, "bun.lock"), "{}\n");
     writeWorkspace("22.x", "      - run: mkdir -p pkg && echo '{}' > pkg/package-lock.json\n");
     const created = await build();
     expect(created.ok).toBe(false);
     if (!created.ok) expect(created.refusal.message).toContain("pkg/package-lock.json (created)");
   });
 
-  test("a job using socketdev/action gets the sfw shim, which runs its command unwrapped", async () => {
+  test("a symlinked lockfile or a symlinked directory refuses before any step runs", async () => {
+    writeFileSync(join(outside, "bun.lock"), "{}\n");
+    symlinkSync(join(outside, "bun.lock"), join(workspace, "bun.lock"));
+    writeWorkspace("22.x", "      - run: echo changed >> bun.lock && echo ran > review-marker\n");
+    const lock = await build();
+    expect(lock.ok).toBe(false);
+    if (!lock.ok) {
+      expect(lock.refusal.kind).toBe("symlinked-path");
+      expect(lock.refusal.message).toContain("a symlinked lockfile bun.lock");
+    }
+    expect(readFileSync(join(outside, "bun.lock"), "utf8")).toBe("{}\n");
+    rmSync(join(workspace, "bun.lock"));
+    symlinkSync(outside, join(workspace, "pkg"));
+    const alias = await build();
+    expect(alias.ok).toBe(false);
+    if (!alias.ok) expect(alias.refusal.message).toContain("a symlinked directory pkg");
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a lockfile the build turns into a symlink is drift", async () => {
+    writeFileSync(join(workspace, "bun.lock"), "{}\n");
+    writeFileSync(join(outside, "bun.lock"), "{}\n");
+    writeWorkspace("22.x", `      - run: rm bun.lock && ln -s "${join(outside, "bun.lock")}" bun.lock\n`);
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("unfrozen-install");
+      expect(r.refusal.message).toContain("symlinked lockfiles (bun.lock)");
+    }
+  });
+
+  test("a working directory that RESOLVES outside the worktree refuses immediately before the step", async () => {
     writeWorkspace(
       "22.x",
-      "      - run: |\n          command -v sfw > sfw-path\n          sfw sh -c 'echo shimmed > sfw-out'\n",
-      "",
+      [`      - run: ln -s "${outside}" esc`, "      - run: echo escaped > marker\n        working-directory: esc"].join("\n") + "\n",
     );
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("working-directory");
+      expect(r.refusal.message).toContain('"esc" resolves outside the worktree');
+    }
+    expect(existsSync(join(outside, "marker"))).toBe(false);
+  });
+
+  test("a symlinked directory that stays inside the worktree runs in its resolved path", async () => {
+    mkdirSync(join(workspace, "real"));
+    writeWorkspace("22.x", ["      - run: ln -s real alias", "      - run: pwd -P > ../cwd\n        working-directory: alias"].join("\n") + "\n");
+    const r = await build();
+    expect(r.ok).toBe(true);
+    expect(readFileSync(join(workspace, "cwd"), "utf8").trim()).toBe(join(workspace, "real"));
+  });
+
+  test("git credential or auth settings in the worktree refuse before any step, without repeating the value", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    git("init", "-q");
+    git("config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic ZmFrZS1yZWQtcHJvb2Y=");
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("git-credential-config");
+      expect(r.refusal.message).toContain("http.https://github.com/.extraheader (file:.git/config)");
+      expect(r.refusal.message).not.toContain("ZmFrZS1yZWQtcHJvb2Y=");
+    }
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+    git("config", "--unset", "http.https://github.com/.extraheader");
+    expect((await build()).ok).toBe(true);
+  });
+
+  test("a git configuration git cannot read, or a missing git, refuses rather than passes", () => {
+    const bad = join(root, "bad-git");
+    writeFileSync(bad, "#!/bin/sh\necho 'fatal: bad config line 1 in file .git/config' >&2\nexit 128\n", { mode: 0o755 });
+    const unreadable = inspectGitConfig({ workspace, env: hermeticEnv({}, scratch), git: bad });
+    expect(unreadable.ok).toBe(false);
+    if (!unreadable.ok) {
+      expect(unreadable.refusal.kind).toBe("git-config-unreadable");
+      expect(unreadable.refusal.message).toContain("bad config line 1");
+    }
+    const missing = inspectGitConfig({ workspace, env: hermeticEnv({}, scratch), git: join(root, "no-such-git") });
+    expect(missing.ok).toBe(false);
+    if (!missing.ok) expect(missing.refusal.kind).toBe("git-config-unreadable");
+  });
+
+  test("a worktree whose git metadata is outside the sandbox is not an error", () => {
+    writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
+    const r = inspectNoSystem({ workspace, env: hermeticEnv({}, scratch) });
+    expect(r.ok).toBe(true);
+  });
+
+  test("workflow env carrying a credential never reaches a step", async () => {
+    writeWorkspace("22.x", "      - run: echo \"$GH_TOKEN\" > leaked\n", { env: "env:\n  GH_TOKEN: fake-token\n" });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("sets GH_TOKEN");
+    expect(existsSync(join(workspace, "leaked"))).toBe(false);
+  });
+
+  test("a job whose needed guard fails does not run, and the build is not ok", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+      jobExtra: "    needs: guard\n",
+      jobs: "  guard:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n",
+    });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("stage-failed");
+      expect(r.refusal.message).toBe("job guard: step 1 (run 1) exited 3");
+      expect(r.jobs.at(-1)).toEqual({ job: "review", skipped: "needs guard, which did not succeed" });
+    }
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("the closure runs dependencies first, each job from the worktree as the build found it", async () => {
+    writeFileSync(join(workspace, "kept"), "pre-existing\n");
+    writeWorkspace("22.x", "      - run: |\n          test ! -e left-behind\n          test ! -e made-dir\n          test -e kept\n          echo ran > review-marker\n", {
+      jobExtra: "    needs: build\n",
+      jobs: "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo x > left-behind\n          mkdir -p made-dir/sub && echo y > made-dir/sub/f\n",
+    });
+    const r = await build();
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.jobs.map((j: { job: string }) => j.job)).toEqual(["build", "review"]);
+    expect(existsSync(join(workspace, "review-marker"))).toBe(true);
+    expect(readFileSync(join(workspace, "kept"), "utf8")).toBe("pre-existing\n");
+  });
+
+  test("a job-level always() still runs after a failed need, and the build is still not ok", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+      jobExtra: "    needs: guard\n    if: always()\n",
+      jobs: "  guard:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n",
+    });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("job guard: step 1");
+    expect(existsSync(join(workspace, "review-marker"))).toBe(true);
+  });
+
+  test("a job using socketdev/action gets the sfw shim, which runs its command unwrapped", async () => {
+    writeWorkspace("22.x", "      - run: |\n          command -v sfw > sfw-path\n          sfw sh -c 'echo shimmed > sfw-out'\n");
     const text = readFileSync(join(workspace, ".github", "workflows", "ci.yml"), "utf8");
     writeFileSync(
       join(workspace, ".github", "workflows", "ci.yml"),
-      text.replace("    steps:\n", "    steps:\n      - uses: socketdev/action@v1\n        with:\n          mode: firewall-free\n"),
+      text.replace(`      - uses: ${CHECKOUT}\n`, `      - uses: ${CHECKOUT}\n      - uses: ${SOCKET}\n        with:\n          mode: firewall-free\n`),
     );
     const r = await build();
     expect(r.ok).toBe(true);
@@ -386,40 +668,121 @@ describe("A2/A3 — the review build", () => {
   test("the hermetic scratch root is recreated on every run", async () => {
     mkdirSync(join(scratch, "home"), { recursive: true });
     writeFileSync(join(scratch, "home", ".npmrc"), "//registry/:_authToken=planted\n");
-    writeWorkspace("22.x", "      - run: test ! -e \"$HOME/.npmrc\"\n");
+    writeWorkspace("22.x", '      - run: test ! -e "$HOME/.npmrc"\n');
     expect((await build()).ok).toBe(true);
+  });
+
+  test("a symlinked workflow file refuses", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    const wf = join(workspace, ".github", "workflows", "ci.yml");
+    copyFileSync(wf, join(workspace, "real-ci.yml"));
+    rmSync(wf);
+    symlinkSync(join(workspace, "real-ci.yml"), wf);
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("reached through a symlink");
+  });
+});
+
+describe("bounded reads of the worktree", () => {
+  test("a declaration that is not a regular file, too large, dangling or outside the worktree refuses without hanging", () => {
+    expect(spawnSync("mkfifo", [join(workspace, ".nvmrc")]).status).toBe(0);
+    const fifo = readBoundedFile(workspace, ".nvmrc", 100);
+    expect(fifo.ok).toBe(false);
+    rmSync(join(workspace, ".nvmrc"));
+    writeFileSync(join(workspace, "big"), "x".repeat(101));
+    expect(readBoundedFile(workspace, "big", 100).ok).toBe(false);
+    symlinkSync(join(outside, "nope"), join(workspace, "dangling"));
+    expect(readBoundedFile(workspace, "dangling", 100).ok).toBe(false);
+    writeFileSync(join(outside, "secret"), "x");
+    symlinkSync(join(outside, "secret"), join(workspace, ".node-version"));
+    const out = readBoundedFile(workspace, ".node-version", 100);
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.refusal.message).toContain("resolves outside the worktree");
+    expect(readBoundedFile(workspace, "absent", 100)).toEqual({ ok: true, text: null });
+  });
+
+  test("scanWorkspace finds symlinked lockfiles and directory aliases, skips node_modules/.git, and is bounded", () => {
+    mkdirSync(join(workspace, "node_modules", "x"), { recursive: true });
+    writeFileSync(join(workspace, "node_modules", "x", "yarn.lock"), "");
+    writeFileSync(join(workspace, "yarn.lock"), "a");
+    symlinkSync(join(outside), join(workspace, "alias"));
+    symlinkSync(join(workspace, "yarn.lock"), join(workspace, "package-lock.json"));
+    const s = scanWorkspace(workspace);
+    expect(s.ok).toBe(true);
+    if (s.ok) {
+      expect([...s.lockfiles.keys()]).toEqual(["yarn.lock"]);
+      expect(s.symlinkedLockfiles).toEqual(["package-lock.json"]);
+      expect(s.directoryAliases).toEqual(["alias"]);
+    }
+    const bounded = scanWorkspace(workspace, { maxEntries: 2 });
+    expect(bounded.ok).toBe(false);
+  });
+
+  test("a lockfile that is not a regular file (a FIFO) refuses without hanging", () => {
+    expect(spawnSync("mkfifo", [join(workspace, "bun.lock")]).status).toBe(0);
+    const s = scanWorkspace(workspace);
+    expect(s.ok).toBe(false);
+    if (!s.ok) expect(s.refusal.message).toContain("bun.lock is not a regular file");
+  });
+
+  test("removeCreatedPaths removes only what was not there before, top-most first", () => {
+    writeFileSync(join(workspace, "old"), "o");
+    const before = scanWorkspace(workspace);
+    mkdirSync(join(workspace, "new-dir", "deep"), { recursive: true });
+    writeFileSync(join(workspace, "new-dir", "deep", "f"), "n");
+    writeFileSync(join(workspace, "new-file"), "n");
+    const now = scanWorkspace(workspace);
+    if (!before.ok || !now.ok) throw new Error("scan failed");
+    expect(removeCreatedPaths(workspace, before.paths, now.paths).sort()).toEqual(["new-dir", "new-file"]);
+    expect(existsSync(join(workspace, "old"))).toBe(true);
+    expect(existsSync(join(workspace, "new-dir"))).toBe(false);
+  });
+
+  test("containedDirectory resolves symlinks and refuses an escape", () => {
+    symlinkSync(outside, join(workspace, "out"));
+    mkdirSync(join(workspace, "in"));
+    expect(containedDirectory(workspace, "out").ok).toBe(false);
+    expect(containedDirectory(workspace, "missing").ok).toBe(false);
+    expect(containedDirectory(workspace, "in")).toEqual({ ok: true, dir: join(workspace, "in") });
   });
 });
 
 describe("the launcher's own inputs", () => {
-  test("probeActualVersions looks node and bun up on the child's PATH", () => {
+  test("probeActualVersions runs the fixed binaries, not whatever PATH names", () => {
     const bin = join(root, "bin");
     mkdirSync(bin);
     writeFileSync(join(bin, "node"), "#!/bin/sh\necho v22.22.1\n", { mode: 0o755 });
     writeFileSync(join(bin, "bun"), "#!/bin/sh\necho 1.3.10\n", { mode: 0o755 });
-    expect(probeActualVersions({ PATH: bin })).toEqual({ node: "22.22.1", bun: "1.3.10" });
-    expect(probeActualVersions({ PATH: join(root, "empty") })).toEqual({ node: null, bun: null });
+    const bins = { node: join(bin, "node"), bun: join(bin, "bun") };
+    expect(probeActualVersions({ PATH: join(root, "empty") }, bins)).toEqual({ node: "22.22.1", bun: "1.3.10" });
+    expect(probeActualVersions({ PATH: bin }, { node: join(root, "none", "node"), bun: join(root, "none", "bun") })).toEqual({ node: null, bun: null });
+  });
+
+  test("readCreationEnv parses a NUL-separated environ block; unreadable is null", () => {
+    const f = join(root, "environ");
+    writeFileSync(f, "A=1\0REVIEWER_CI_JOB=test\0B=x=y\0");
+    expect(readCreationEnv(f)).toEqual({ A: "1", REVIEWER_CI_JOB: "test", B: "x=y" });
+    expect(readCreationEnv(join(root, "missing"))).toBeNull();
   });
 
   test("self-check verifies the actual runtimes against the baked entry", () => {
-    const ok = selfCheck({ trustedDir: trusted, parentEnv: { PATH: "/x" }, probe: actual22 });
-    expect(ok.ok).toBe(true);
-    const bad = selfCheck({ trustedDir: trusted, parentEnv: { PATH: "/x" }, probe: () => ({ node: "22.22.0", bun: "1.3.10" }) });
-    expect(bad.ok).toBe(false);
+    expect(selfCheck({ trustedDir: trusted, parentEnv: { PATH: "/x" }, probe: actual22 }).ok).toBe(true);
+    expect(selfCheck({ trustedDir: trusted, parentEnv: { PATH: "/x" }, probe: () => ({ node: "22.22.0", bun: "1.3.10" }) }).ok).toBe(false);
   });
 
-  test("the CLI takes no table override and refuses unknown arguments", () => {
-    const run = (args: string[]) =>
-      spawnSync(process.execPath, [launcher, ...args], { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } });
-    const matrix = run(["--matrix", join(trusted, "runtime-matrix.json")]);
-    expect(matrix.status).toBe(2);
-    expect(matrix.stderr).toContain("usage:");
-    // With no host-named job the build path refuses by name: outside an image
-    // at the identity check (no /opt/reviewer), inside one at the job check.
-    const outside = run(["--workspace", workspace]);
-    expect(outside.status).toBe(1);
-    expect(outside.stderr).toMatch(/refused: (image-identity|no-ci-job): /);
-    expect(JSON.parse(outside.stdout.trim()).status).toBe("refused");
+  test("the CLI takes no workspace or table override and refuses unknown arguments", () => {
+    const run = (args: string[]) => spawnSync(process.execPath, [launcher, ...args], { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } });
+    for (const args of [["--workspace", workspace], ["--matrix", join(trusted, "runtime-matrix.json")], ["extra"]]) {
+      const r = run(args);
+      expect(r.status).toBe(2);
+      expect(r.stderr).toContain("usage:");
+    }
+    // Outside an image there is no /opt/reviewer: the build path refuses by name.
+    const outsideImage = run([]);
+    expect(outsideImage.status).toBe(1);
+    expect(outsideImage.stderr).toMatch(/refused: (image-identity|no-ci-job): /);
+    expect(JSON.parse(outsideImage.stdout.trim()).status).toBe("refused");
   });
 });
 
@@ -429,11 +792,9 @@ describe("A2 — build args come from the table", () => {
     expect(args.slice(0, 2)).toEqual(["--platform", "linux/amd64"]);
     const joined = args.join(" ");
     expect(joined).toContain(`BASE_REF=${table.base.image}@${table.base.digest}`);
-    expect(joined).toContain(`NODE_VERSION=${node22.node}`);
     expect(joined).toContain(`NODE_SHA256=${table.artifacts.node[node22.node].sha256}`);
     expect(joined).toContain(`BUN_SHA256=${table.artifacts.bun[node22.bun].sha256}`);
     expect(joined).toContain(`GH_SHA256=${table.artifacts.gh[node22.gh].sha256}`);
-    expect(joined).toContain(`JSYAML_VERSION=${table.launcherDeps["js-yaml"].version}`);
     expect(joined).toContain(`JSYAML_SHA256=${table.launcherDeps["js-yaml"].sha256}`);
     expect(joined).toContain(`REVIEWER_IMAGE_ID=${node22.id}`);
   });

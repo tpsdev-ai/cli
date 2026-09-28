@@ -3,40 +3,89 @@
  *
  * In the image it is /opt/reviewer/bin/reviewer-launch: an explicit command,
  * never the entrypoint (OpenClaw starts the sandbox as `<image> sleep infinity`
- * with a read-only root and tmpfs on /tmp, /var/tmp and /run).
+ * with a read-only root and tmpfs on /tmp, /var/tmp and /run). It builds the
+ * worktree the host mounted at /workspace; no argument or variable moves it.
  *
  * Before ANY repository code runs it:
  *   1. reads the trusted runtime table (/opt/reviewer/runtime-matrix.json — no
  *      override) and the image's baked identity (/opt/reviewer/image-id);
- *   2. reads the CI job the HOST names (REVIEWER_CI_WORKFLOW + REVIEWER_CI_JOB in
- *      the sandbox env) and plans it (ci-job.mjs), refusing what it cannot honour;
- *   3. reads the workspace's declarations (package.json packageManager/engines,
- *      .nvmrc, .node-version, .bun-version, .tool-versions) plus the job's
- *      runtime pins and resolves them to one matrix image (resolve-runtime.mjs);
- *   4. refuses unless that image is THIS image;
- *   5. creates the hermetic HOME/TMPDIR/cache directories under /tmp/review and
- *      builds the child environment from an allowlist (hermetic values, PATH,
- *      LANG, LC_ALL, TERM, TZ, CI=true) — nothing else is inherited;
- *   6. measures the actual node and bun a step would run and verifies them
- *      against the image entry and every resolved requirement.
- * Only then does it run each `run:` step of the job, in order, as one script in
- * its working directory under `bash --noprofile --norc -eo pipefail`. It reports
- * review-build-ok only when every step exited 0 and no lockfile changed.
+ *   2. reads the host's assignment — REVIEWER_CI_WORKFLOW, REVIEWER_CI_JOB and
+ *      REVIEWER_CI_BASE — from the environment the HOST gave the sandbox when it
+ *      created it (the container init's environment, /proc/1/environ), and
+ *      refuses if its own caller supplied different values;
+ *   3. refuses symlinked lockfiles and symlinked directories in the worktree
+ *      (outside node_modules/ and .git/) and hashes every lockfile;
+ *   4. plans the named job and its `needs` closure (ci-job.mjs), refusing what it
+ *      cannot honour, and reads the workspace's declarations (package.json
+ *      packageManager/engines, .nvmrc, .node-version, .bun-version,
+ *      .tool-versions — each bounded, contained in the worktree) plus every
+ *      planned job's runtime pins and resolves them to one matrix image;
+ *   5. refuses unless that image is THIS image;
+ *   6. creates the hermetic HOME/TMPDIR/cache directories under /tmp/review and
+ *      builds the child environment from an allowlist (hermetic values, a FIXED
+ *      PATH, LANG, LC_ALL, TERM, TZ, CI=true) — nothing else is inherited;
+ *   7. runs the image's own node and bun (fixed paths) and verifies their
+ *      versions against the image entry and every resolved requirement.
+ * Then, per job in dependency order: it removes what earlier jobs of this build
+ * created (so each job starts from the worktree as the build found it), refuses
+ * a worktree whose git configuration carries credentials or auth settings, and
+ * runs each `run:` step as one script under `/bin/bash --noprofile --norc -eo
+ * pipefail`, after re-checking the step's effective environment and the
+ * RESOLVED working directory (it must stay inside the worktree). A job runs
+ * only if the jobs it needs succeeded (or its `if:` is always()). It reports
+ * review-build-ok only when every job in the closure ran and every step exited
+ * 0, and no lockfile in the worktree (outside node_modules/ and .git/) changed,
+ * appeared or disappeared.
  *
  * stdout carries exactly one JSON line (the verdict); step output and refusals
  * go to stderr. Exit 0 = review-build-ok, 1 = refused or failed, 2 = usage.
  */
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
-import { JOB_ID_RE, planJob, WORKFLOW_PATH_RE } from "./ci-job.mjs";
+import {
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join, relative, sep } from "node:path";
+import { BRANCH_RE, forbiddenEnvReason, JOB_ID_RE, MAX_WORKFLOW_BYTES, planJob, WORKFLOW_PATH_RE } from "./ci-job.mjs";
 import { resolveRuntime, satisfiesRange } from "./resolve-runtime.mjs";
 
 /** Where the image keeps the launcher's trusted inputs. Fixed: no flag moves it. */
 export const TRUSTED_DIR = "/opt/reviewer";
+/** The worktree the host mounts (OpenClaw's sandbox workdir). Fixed: no flag moves it. */
+export const WORKSPACE = "/workspace";
 /** The launcher-owned scratch root: a tmpfs in the OpenClaw run model. */
 export const HERMETIC_ROOT = "/tmp/review";
+/** The environment the host gave the sandbox at creation: the container init's. */
+export const CREATION_ENV_PATH = "/proc/1/environ";
+/** Fixed executables: never looked up on a caller's PATH. */
+export const BASH = "/bin/bash";
+export const GIT = "/usr/bin/git";
+export const TRUSTED_BINARIES = Object.freeze({ node: "/usr/local/bin/node", bun: "/usr/local/bin/bun" });
+/** The PATH every step gets (Debian's default); the caller's PATH is never used. */
+export const STEP_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/** The host assignment's variables. */
+export const ASSIGNMENT_KEYS = Object.freeze({
+  workflow: "REVIEWER_CI_WORKFLOW",
+  job: "REVIEWER_CI_JOB",
+  base: "REVIEWER_CI_BASE",
+});
+
+/** Bounds on what the launcher reads from the worktree. */
+export const MAX_MANIFEST_BYTES = 1024 * 1024;
+export const MAX_VERSION_FILE_BYTES = 64 * 1024;
+export const MAX_LOCKFILE_BYTES = 64 * 1024 * 1024;
+export const MAX_SCAN_ENTRIES = 200_000;
+export const MAX_SCAN_DEPTH = 64;
 
 /** Hermetic HOME/tmp/cache locations under a root. */
 export function hermeticLayout(root = HERMETIC_ROOT) {
@@ -62,14 +111,14 @@ export function hermeticLayout(root = HERMETIC_ROOT) {
 export const HERMETIC = hermeticLayout();
 export const HERMETIC_KEYS = Object.keys(HERMETIC);
 /** The only values a child takes from the launcher's own environment. */
-export const PASSTHROUGH_KEYS = ["PATH", "LANG", "LC_ALL", "TERM", "TZ"];
+export const PASSTHROUGH_KEYS = ["LANG", "LC_ALL", "TERM", "TZ"];
 /** Keys a workflow's env: may not set: the launcher owns them. */
-export const RESERVED_ENV_KEYS = [...HERMETIC_KEYS, ...PASSTHROUGH_KEYS, "CI"];
+export const RESERVED_ENV_KEYS = [...HERMETIC_KEYS, ...PASSTHROUGH_KEYS, "PATH", "CI"];
 
 /**
- * Build the child environment from an ALLOWLIST: the hermetic values, PATH,
- * LANG, LC_ALL, TERM and TZ from the parent, and CI=true. Every other parent
- * variable — tokens, git/npm/bun config redirections, anything — is absent.
+ * Build the child environment from an ALLOWLIST: the hermetic values, the fixed
+ * STEP_PATH, LANG, LC_ALL, TERM and TZ from the parent, and CI=true. Every other
+ * parent variable — PATH, tokens, git/npm/bun config redirections — is absent.
  */
 export function hermeticEnv(parentEnv = {}, root = HERMETIC_ROOT) {
   const env = {};
@@ -77,11 +126,30 @@ export function hermeticEnv(parentEnv = {}, root = HERMETIC_ROOT) {
     if (typeof parentEnv[key] === "string") env[key] = parentEnv[key];
   }
   Object.assign(env, hermeticLayout(root));
+  env.PATH = STEP_PATH;
   env.CI = "true";
   return env;
 }
 
 const refuse = (kind, message) => ({ ok: false, refusal: { kind, message } });
+const inside = (root, path) => path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+
+/**
+ * Check a step's EFFECTIVE environment immediately before it runs: every key the
+ * launcher owns must carry the launcher's value, and no other key may be
+ * credential-shaped or redirect configuration (ci-job.mjs forbiddenEnvReason).
+ */
+export function checkStepEnv(effective, launcherEnv) {
+  for (const [key, value] of Object.entries(effective)) {
+    if (Object.hasOwn(launcherEnv, key)) {
+      if (value !== launcherEnv[key]) return refuse("step-env", `a step would run with ${key} changed from the launcher's value`);
+      continue;
+    }
+    const reason = forbiddenEnvReason(key);
+    if (reason) return refuse("step-env", `a step would run with ${key}: ${reason}`);
+  }
+  return { ok: true };
+}
 
 /** Normalize requirements to [{tool, range, source}]; accepts {node, bun} too. */
 function requirementList(requirements) {
@@ -176,48 +244,112 @@ export function readIdentity(trustedDir, parentEnv = {}) {
   return { ok: true, table, imageId, entry };
 }
 
-/** The CI job the host names in the sandbox env. */
-export function hostJob(parentEnv = {}) {
-  const workflow = parentEnv.REVIEWER_CI_WORKFLOW;
-  const job = parentEnv.REVIEWER_CI_JOB;
-  if (!workflow || !job) {
+/** Parse a NUL-separated environ block (/proc/<pid>/environ), or null when unreadable. */
+export function readCreationEnv(path = CREATION_ENV_PATH) {
+  let raw;
+  try {
+    raw = readFileSync(path);
+  } catch {
+    return null;
+  }
+  const env = {};
+  for (const entry of raw.toString("utf8").split("\0")) {
+    const eq = entry.indexOf("=");
+    if (eq > 0 && !Object.hasOwn(env, entry.slice(0, eq))) env[entry.slice(0, eq)] = entry.slice(eq + 1);
+  }
+  return env;
+}
+
+/**
+ * The host's assignment: taken ONLY from the environment the host gave the
+ * sandbox at creation. The launcher's own caller may repeat a value but never
+ * change or add one.
+ */
+export function hostAssignment(creationEnv, processEnv = {}) {
+  if (!creationEnv) {
     return refuse(
       "no-ci-job",
-      "the host names no CI job: set REVIEWER_CI_WORKFLOW (e.g. .github/workflows/test.yml) and REVIEWER_CI_JOB (e.g. test) in the reviewer's sandbox env",
+      `the sandbox's creation environment (${CREATION_ENV_PATH}) is unreadable, so the host's assignment cannot be established`,
+    );
+  }
+  for (const key of Object.values(ASSIGNMENT_KEYS)) {
+    if (processEnv[key] !== undefined && processEnv[key] !== creationEnv[key]) {
+      return refuse(
+        "assignment-override",
+        `${key} in the launcher's environment differs from what the host set when it created the sandbox; the assignment comes only from the host`,
+      );
+    }
+  }
+  const workflow = creationEnv[ASSIGNMENT_KEYS.workflow];
+  const job = creationEnv[ASSIGNMENT_KEYS.job];
+  const base = creationEnv[ASSIGNMENT_KEYS.base];
+  if (!workflow || !job || !base) {
+    return refuse(
+      "no-ci-job",
+      "the host names no CI job: set REVIEWER_CI_WORKFLOW (e.g. .github/workflows/test.yml), REVIEWER_CI_JOB (e.g. test) and REVIEWER_CI_BASE (e.g. main) in the reviewer's sandbox env",
     );
   }
   if (!WORKFLOW_PATH_RE.test(workflow)) {
     return refuse("no-ci-job", `REVIEWER_CI_WORKFLOW "${workflow}" is not a .github/workflows/<name>.yml path`);
   }
   if (!JOB_ID_RE.test(job)) return refuse("no-ci-job", `REVIEWER_CI_JOB "${job}" is not a job id`);
-  return { ok: true, workflow, job };
+  if (!BRANCH_RE.test(base)) return refuse("no-ci-job", `REVIEWER_CI_BASE "${base}" is not a branch name`);
+  return { ok: true, workflow, job, base };
+}
+
+/**
+ * Read a worktree file with bounds: a regular file of at most `maxBytes`, whose
+ * resolved path stays inside the worktree. `exact` also refuses a symlink
+ * anywhere on the path. Returns { ok, text } (text null when absent).
+ */
+export function readBoundedFile(workspace, rel, maxBytes, { exact = false } = {}) {
+  const path = join(workspace, rel);
+  try {
+    lstatSync(path);
+  } catch (err) {
+    if (err?.code === "ENOENT") return { ok: true, text: null };
+    return refuse("invalid-declaration", `${rel} cannot be inspected (${err?.code ?? "error"})`);
+  }
+  let real;
+  try {
+    real = realpathSync(path);
+  } catch {
+    return refuse("invalid-declaration", `${rel} is a dangling symlink`);
+  }
+  const root = realpathSync(workspace);
+  if (!inside(root, real)) return refuse("invalid-declaration", `${rel} resolves outside the worktree`);
+  if (exact && real !== join(root, rel)) return refuse("invalid-declaration", `${rel} is reached through a symlink`);
+  const st = statSync(real);
+  if (!st.isFile()) return refuse("invalid-declaration", `${rel} is not a regular file`);
+  if (st.size > maxBytes) return refuse("invalid-declaration", `${rel} is larger than ${maxBytes} bytes`);
+  const buf = Buffer.alloc(maxBytes + 1);
+  const fd = openSync(real, "r");
+  let n;
+  try {
+    n = readSync(fd, buf, 0, maxBytes + 1, 0);
+  } finally {
+    closeSync(fd);
+  }
+  if (n > maxBytes) return refuse("invalid-declaration", `${rel} is larger than ${maxBytes} bytes`);
+  return { ok: true, text: buf.subarray(0, n).toString("utf8") };
 }
 
 const RUNTIME_FILES = [".nvmrc", ".node-version", ".bun-version", ".tool-versions"];
 
-/** The workspace's runtime declarations. */
+/** The workspace's runtime declarations, each bounded and contained. */
 export function readDeclarations(workspace) {
   const runtimeFiles = {};
   for (const name of RUNTIME_FILES) {
-    let text;
-    try {
-      text = readFileSync(join(workspace, name), "utf8");
-    } catch (err) {
-      if (err?.code === "ENOENT") continue;
-      return refuse("invalid-declaration", `${name} exists but cannot be read as a file (${err?.code ?? "error"})`);
-    }
-    runtimeFiles[name] = text;
+    const r = readBoundedFile(workspace, name, MAX_VERSION_FILE_BYTES);
+    if (!r.ok) return r;
+    if (r.text !== null) runtimeFiles[name] = r.text;
   }
+  const pkg = readBoundedFile(workspace, "package.json", MAX_MANIFEST_BYTES);
+  if (!pkg.ok) return pkg;
   let manifest = {};
-  let raw = null;
-  try {
-    raw = readFileSync(join(workspace, "package.json"), "utf8");
-  } catch (err) {
-    if (err?.code !== "ENOENT") return refuse("invalid-declaration", `package.json exists but cannot be read (${err?.code ?? "error"})`);
-  }
-  if (raw !== null) {
+  if (pkg.text !== null) {
     try {
-      manifest = JSON.parse(raw);
+      manifest = JSON.parse(pkg.text);
     } catch {
       return refuse("invalid-declaration", "package.json is not valid JSON");
     }
@@ -230,27 +362,74 @@ export function readDeclarations(workspace) {
 
 const LOCKFILES = new Set(["bun.lock", "bun.lockb", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml"]);
 
-/** SHA-256 of every lockfile in the workspace (node_modules and .git excluded, symlinks not followed). */
-export function snapshotLockfiles(workspace) {
-  const out = new Map();
-  const walk = (dir) => {
+/**
+ * One bounded walk of the worktree (node_modules/ and .git/ are entries, not
+ * descended into; symlinks are never followed). Returns every path, the SHA-256
+ * of every lockfile, and the symlinked lockfiles and symlinked directories
+ * (directory aliases) it found.
+ */
+export function scanWorkspace(workspace, { maxEntries = MAX_SCAN_ENTRIES, maxDepth = MAX_SCAN_DEPTH } = {}) {
+  const paths = new Set();
+  const lockfiles = new Map();
+  const symlinkedLockfiles = [];
+  const directoryAliases = [];
+  let problem = null;
+  const walk = (dir, depth) => {
+    if (problem) return;
+    if (depth > maxDepth) {
+      problem = refuse("workspace-unverifiable", `the worktree nests deeper than ${maxDepth} directories; its lockfiles cannot be verified`);
+      return;
+    }
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      problem = refuse("workspace-unverifiable", `${relative(workspace, dir) || "."} cannot be listed (${err?.code ?? "error"})`);
       return;
     }
     for (const e of entries) {
-      if (e.name === "node_modules" || e.name === ".git") continue;
+      if (problem) return;
       const p = join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.isFile() && LOCKFILES.has(e.name)) {
-        out.set(relative(workspace, p), createHash("sha256").update(readFileSync(p)).digest("hex"));
+      const rel = relative(workspace, p);
+      paths.add(rel);
+      if (paths.size > maxEntries) {
+        problem = refuse("workspace-unverifiable", `the worktree has more than ${maxEntries} entries outside node_modules/ and .git/; its lockfiles cannot be verified`);
+        return;
+      }
+      if (e.isSymbolicLink()) {
+        if (LOCKFILES.has(e.name)) symlinkedLockfiles.push(rel);
+        else {
+          let target = null;
+          try {
+            target = statSync(p);
+          } catch {
+            target = null; // dangling: not a directory alias
+          }
+          if (target?.isDirectory()) directoryAliases.push(rel);
+        }
+        continue;
+      }
+      if (e.isDirectory()) {
+        if (e.name !== "node_modules" && e.name !== ".git") walk(p, depth + 1);
+        continue;
+      }
+      if (LOCKFILES.has(e.name)) {
+        if (!e.isFile()) {
+          problem = refuse("workspace-unverifiable", `${rel} is not a regular file`);
+          return;
+        }
+        const size = statSync(p).size;
+        if (size > MAX_LOCKFILE_BYTES) {
+          problem = refuse("workspace-unverifiable", `${rel} is larger than ${MAX_LOCKFILE_BYTES} bytes`);
+          return;
+        }
+        lockfiles.set(rel, createHash("sha256").update(readFileSync(p)).digest("hex"));
       }
     }
   };
-  walk(workspace);
-  return out;
+  walk(workspace, 0);
+  if (problem) return problem;
+  return { ok: true, paths, lockfiles, symlinkedLockfiles, directoryAliases };
 }
 
 /** Lockfiles that changed, appeared or disappeared between two snapshots. */
@@ -264,6 +443,87 @@ export function lockfileDrift(before, after) {
   return drift;
 }
 
+/** Remove the top-most paths that exist now but did not when the build started. */
+export function removeCreatedPaths(workspace, beforePaths, nowPaths) {
+  const removed = [];
+  for (const rel of nowPaths) {
+    if (beforePaths.has(rel)) continue;
+    const parent = dirname(rel);
+    if (parent !== "." && !beforePaths.has(parent)) continue; // inside a created directory: removed with it
+    rmSync(join(workspace, rel), { recursive: true, force: true });
+    removed.push(rel);
+  }
+  return removed;
+}
+
+/** Git config keys that carry or fetch credentials or auth. */
+const GIT_AUTH_KEY_RES = [
+  /^credential\./,
+  /(^|\.)extraheader$/,
+  /^core\.askpass$/,
+  /^core\.sshcommand$/,
+  /^include\.path$/,
+  /^includeif\./,
+  /(^|\.)cookiefile$/,
+  /^http\.(.*\.)?ssl(cert|key)$/,
+  /pass(word)?$/, // e.g. sendemail.smtppass, a proxy password
+];
+const USERINFO_RE = /:\/\/[^/@\s]+@/;
+
+/**
+ * Credential or auth settings in `git config --list --show-origin` output, by
+ * key and origin only (a value is never repeated; userinfo in a key is masked).
+ */
+export function gitAuthFindings(listing) {
+  const findings = new Set();
+  for (const line of String(listing).split("\n")) {
+    if (line.trim() === "") continue;
+    const tab = line.indexOf("\t");
+    const origin = tab >= 0 ? line.slice(0, tab) : "";
+    const entry = tab >= 0 ? line.slice(tab + 1) : line;
+    if (origin === "command line:") continue; // the launcher's own -c safe.directory
+    const eq = entry.indexOf("=");
+    const key = (eq >= 0 ? entry.slice(0, eq) : entry).toLowerCase();
+    const value = eq >= 0 ? entry.slice(eq + 1) : "";
+    const flagged =
+      GIT_AUTH_KEY_RES.some((re) => re.test(key)) ||
+      USERINFO_RE.test(key) ||
+      USERINFO_RE.test(value) ||
+      /authorization:|bearer\s/i.test(value);
+    if (flagged) findings.add(`${key.replace(/:\/\/[^/@\s]+@/g, "://***@")} (${origin.replace(/:$/, "")})`);
+  }
+  return [...findings];
+}
+
+/**
+ * What git would see in the worktree before a job runs: `git config --list
+ * --show-origin` with the step environment (fresh HOME), never climbing above
+ * the worktree. Refuses when it carries credentials or auth settings.
+ */
+export function inspectGitConfig({ workspace, env, git = GIT }) {
+  const root = realpathSync(workspace);
+  const r = spawnSync(git, ["-c", `safe.directory=${root}`, "config", "--list", "--show-origin"], {
+    cwd: root,
+    env: { ...env, GIT_CEILING_DIRECTORIES: dirname(root) },
+    encoding: "utf8",
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (r.error) return refuse("git-config-unreadable", `git could not be run to inspect the worktree's configuration (${r.error.code ?? "error"})`);
+  if (r.status !== 0) {
+    // A worktree whose git metadata lives outside the sandbox: git in a step cannot read it either.
+    if (/not a git repository/.test(r.stderr ?? "")) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
+    return refuse("git-config-unreadable", `git could not read the worktree's configuration: ${(r.stderr ?? "").split("\n")[0]}`);
+  }
+  const findings = gitAuthFindings(r.stdout);
+  if (findings.length > 0) {
+    return refuse(
+      "git-credential-config",
+      `the worktree's git configuration carries credential or auth settings: ${findings.join(", ")}; the review sandbox runs no step with them`,
+    );
+  }
+  return { ok: true };
+}
+
 /** Recreate the hermetic root and every directory the layout names (mode 0700). */
 export function prepareHermeticRoot(root) {
   rmSync(root, { recursive: true, force: true });
@@ -271,8 +531,8 @@ export function prepareHermeticRoot(root) {
   for (const dir of dirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 
-/** The node and bun a step would run: looked up on the CHILD's PATH. */
-export function probeActualVersions(env) {
+/** The image's own node and bun, at fixed paths, run with the child env. */
+export function probeActualVersions(env, bins = TRUSTED_BINARIES) {
   const options = { env, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] };
   const read = (run) => {
     try {
@@ -282,19 +542,49 @@ export function probeActualVersions(env) {
     }
   };
   return {
-    node: read(() => execFileSync("node", ["--version"], options)),
-    bun: read(() => execFileSync("bun", ["--version"], options)),
+    node: read(() => execFileSync(bins.node, ["--version"], options)),
+    bun: read(() => execFileSync(bins.bun, ["--version"], options)),
   };
 }
 
-/** Run one step as a script file under bash, the way the Actions runner does. */
-export function bashStep({ step, workspace, scriptDir, env }) {
-  const script = join(scriptDir, `step-${String(step.index).padStart(2, "0")}.sh`);
+/** The resolved working directory of a step, which must stay inside the worktree. */
+export function containedDirectory(workspace, workingDirectory) {
+  const root = realpathSync(workspace);
+  let real;
+  try {
+    real = realpathSync(join(workspace, workingDirectory));
+  } catch {
+    return refuse("working-directory", `the working directory "${workingDirectory}" does not exist`);
+  }
+  if (!inside(root, real)) {
+    return refuse("working-directory", `the working directory "${workingDirectory}" resolves outside the worktree`);
+  }
+  if (!statSync(real).isDirectory()) return refuse("working-directory", `the working directory "${workingDirectory}" is not a directory`);
+  return { ok: true, dir: real };
+}
+
+/**
+ * Immediately before a step runs: its effective environment must pass
+ * checkStepEnv, and its working directory must RESOLVE inside the worktree. The
+ * step then starts in the resolved directory.
+ */
+export function guardStep(step, env, workspace) {
+  const effective = { ...env, ...step.env };
+  const envCheck = checkStepEnv(effective, env);
+  if (!envCheck.ok) return envCheck;
+  const cwd = containedDirectory(workspace, step.workingDirectory);
+  if (!cwd.ok) return cwd;
+  return { ok: true, env: effective, cwd: cwd.dir };
+}
+
+/** Run one step as a script file under /bin/bash, the way the Actions runner does. */
+export function bashStep({ step, scriptDir, env }) {
+  const script = join(scriptDir, `step-${step.job}-${String(step.index).padStart(2, "0")}.sh`);
   writeFileSync(script, step.script, { mode: 0o600 });
   return new Promise((resolveCode) => {
-    const child = spawn("bash", ["--noprofile", "--norc", "-eo", "pipefail", script], {
-      cwd: join(workspace, step.workingDirectory),
-      env: { ...env, ...step.env },
+    const child = spawn(BASH, ["--noprofile", "--norc", "-eo", "pipefail", script], {
+      cwd: step.cwd,
+      env,
       // stdout of a step goes to stderr: the launcher's stdout is its verdict.
       stdio: ["ignore", 2, 2],
     });
@@ -303,7 +593,10 @@ export function bashStep({ step, workspace, scriptDir, env }) {
   });
 }
 
-/** Run the steps in order. After a failure only `always()` steps still run. */
+/**
+ * Run the steps in order. After a failure only `always()` steps still run. A
+ * runner that returns { refusal } stops the build at once.
+ */
 export async function runSteps(steps, runStep) {
   const results = [];
   let failed = null;
@@ -313,6 +606,7 @@ export async function runSteps(steps, runStep) {
       continue;
     }
     const code = await runStep(step);
+    if (code !== null && typeof code === "object" && code.refusal) return { ok: false, refusal: code.refusal, results };
     results.push({ step: step.index, name: step.name, code });
     if (code !== 0 && !failed) failed = { step: step.index, name: step.name, code };
   }
@@ -321,29 +615,47 @@ export async function runSteps(steps, runStep) {
 
 /**
  * The review build. Every input that decides WHAT runs is read here, in order,
- * before anything is spawned; `trustedDir`, `hermeticRoot`, `probe` and
- * `runStep` are injectable for host tests only (the CLI passes the constants).
+ * before anything is spawned. `workspace`, `trustedDir`, `hermeticRoot`,
+ * `creationEnv`, `probe`, `inspectGit` and `runStep` are injectable for host
+ * tests only; the CLI passes none of them.
  */
 export async function reviewBuild({
-  workspace,
+  workspace = WORKSPACE,
   trustedDir = TRUSTED_DIR,
   hermeticRoot = HERMETIC_ROOT,
   parentEnv = {},
+  creationEnv = readCreationEnv(),
   probe = probeActualVersions,
+  inspectGit = inspectGitConfig,
   runStep = bashStep,
 }) {
   const identity = readIdentity(trustedDir, parentEnv);
   if (!identity.ok) return identity;
+  const assignment = hostAssignment(creationEnv, parentEnv);
+  if (!assignment.ok) return assignment;
 
-  const named = hostJob(parentEnv);
-  if (!named.ok) return named;
-  let workflowText;
-  try {
-    workflowText = readFileSync(join(workspace, named.workflow), "utf8");
-  } catch {
-    return refuse("no-ci-job", `the reviewed commit has no ${named.workflow}`);
+  const before = scanWorkspace(workspace);
+  if (!before.ok) return before;
+  if (before.symlinkedLockfiles.length > 0 || before.directoryAliases.length > 0) {
+    return refuse(
+      "symlinked-path",
+      `the worktree has ${[
+        ...before.symlinkedLockfiles.map((p) => `a symlinked lockfile ${p}`),
+        ...before.directoryAliases.map((p) => `a symlinked directory ${p}`),
+      ].join(", ")}; lockfile drift cannot be verified through a symlink`,
+    );
   }
-  const plan = planJob({ workflowText, workflowFile: named.workflow, jobId: named.job, reservedEnvKeys: RESERVED_ENV_KEYS });
+
+  const workflowFile = readBoundedFile(workspace, assignment.workflow, MAX_WORKFLOW_BYTES, { exact: true });
+  if (!workflowFile.ok) return workflowFile;
+  if (workflowFile.text === null) return refuse("no-ci-job", `the reviewed commit has no ${assignment.workflow}`);
+  const plan = planJob({
+    workflowText: workflowFile.text,
+    workflowFile: assignment.workflow,
+    jobId: assignment.job,
+    baseBranch: assignment.base,
+    reservedEnvKeys: RESERVED_ENV_KEYS,
+  });
   if (!plan.ok) return plan;
 
   const declarations = readDeclarations(workspace);
@@ -364,26 +676,65 @@ export async function reviewBuild({
 
   prepareHermeticRoot(hermeticRoot);
   const env = hermeticEnv(parentEnv, hermeticRoot);
-  if (plan.shims.length > 0) env.PATH = `${join(trustedDir, "shims")}${env.PATH ? `:${env.PATH}` : ""}`;
+  if (plan.shims.length > 0) env.PATH = `${join(trustedDir, "shims")}:${env.PATH}`;
 
   const verified = verifyRuntime({ image: identity.entry, actual: probe(env), requirements: resolved.requirements });
   if (!verified.ok) return verified;
 
-  const before = snapshotLockfiles(workspace);
   const scriptDir = join(hermeticRoot, "steps");
-  const outcome = await runSteps(plan.steps, (step) => runStep({ step, workspace, scriptDir, env }));
-  if (!outcome.ok) {
-    return {
-      ...refuse("stage-failed", `step ${outcome.failed.step} (${outcome.failed.name}) exited ${outcome.failed.code}`),
-      steps: outcome.results,
-    };
+  const status = new Map();
+  const jobs = [];
+  const stop = (refusal) => ({ ok: false, refusal, jobs });
+  for (const [i, job] of plan.jobs.entries()) {
+    const blocked = job.needs.filter((n) => status.get(n) !== "ok");
+    if (blocked.length > 0 && job.when !== "always") {
+      status.set(job.id, "skipped");
+      jobs.push({ job: job.id, skipped: `needs ${blocked.join(", ")}, which did not succeed` });
+      continue;
+    }
+    if (i > 0) {
+      // Each job starts from the worktree as the build found it, as on a fresh runner.
+      const now = scanWorkspace(workspace);
+      if (!now.ok) return stop(now.refusal);
+      removeCreatedPaths(workspace, before.paths, now.paths);
+    }
+    const git = inspectGit({ workspace, env });
+    if (!git.ok) return stop(git.refusal);
+
+    const outcome = await runSteps(
+      job.steps.map((s) => ({ ...s, job: job.id })),
+      (step) => {
+        const guard = guardStep(step, env, workspace);
+        if (!guard.ok) return guard;
+        return runStep({ step: { ...step, cwd: guard.cwd }, workspace, scriptDir, env: guard.env });
+      },
+    );
+    jobs.push({ job: job.id, steps: outcome.results, skipped: job.skipped });
+    if (outcome.refusal) return stop(outcome.refusal);
+
+    const after = scanWorkspace(workspace);
+    if (!after.ok) return stop(after.refusal);
+    if (after.symlinkedLockfiles.length > 0) {
+      return stop({ kind: "unfrozen-install", message: `job ${job.id} left symlinked lockfiles (${after.symlinkedLockfiles.join(", ")})` });
+    }
+    const drift = lockfileDrift(before.lockfiles, after.lockfiles);
+    if (drift.length > 0) {
+      return stop({
+        kind: "unfrozen-install",
+        message: `job ${job.id} changed lockfiles (${drift.join(", ")}); a review build requires a frozen install`,
+      });
+    }
+    status.set(job.id, outcome.ok ? "ok" : "failed");
+    if (!outcome.ok) jobs[jobs.length - 1].failed = outcome.failed;
   }
-  const drift = lockfileDrift(before, snapshotLockfiles(workspace));
-  if (drift.length > 0) {
-    return {
-      ...refuse("unfrozen-install", `the build changed lockfiles (${drift.join(", ")}); a review build requires a frozen install`),
-      steps: outcome.results,
-    };
+
+  const notOk = plan.jobs.find((j) => status.get(j.id) !== "ok");
+  if (notOk) {
+    const entry = jobs.find((j) => j.job === notOk.id);
+    const why = entry?.failed
+      ? `step ${entry.failed.step} (${entry.failed.name}) exited ${entry.failed.code}`
+      : entry?.skipped ?? "it did not run";
+    return stop({ kind: "stage-failed", message: `job ${notOk.id}: ${why}` });
   }
   return {
     ok: true,
@@ -393,8 +744,8 @@ export async function reviewBuild({
     bun: verified.receipt.bun,
     workflow: plan.workflow,
     job: plan.job,
-    steps: outcome.results,
-    skipped: plan.skipped,
+    base: assignment.base,
+    jobs,
   };
 }
 
@@ -402,7 +753,7 @@ export async function reviewBuild({
 export function selfCheck({ trustedDir = TRUSTED_DIR, parentEnv = {}, probe = probeActualVersions }) {
   const identity = readIdentity(trustedDir, parentEnv);
   if (!identity.ok) return identity;
-  const result = verifyRuntime({ image: identity.entry, actual: probe({ PATH: parentEnv.PATH ?? "" }) });
+  const result = verifyRuntime({ image: identity.entry, actual: probe(hermeticEnv(parentEnv, HERMETIC_ROOT)) });
   if (!result.ok) return result;
   return { ok: true, status: "self-check-ok", ...result.receipt };
 }
@@ -415,20 +766,18 @@ function emit(result) {
     return 0;
   }
   process.stderr.write(`refused: ${result.refusal.kind}: ${result.refusal.message}\n`);
-  process.stdout.write(`${JSON.stringify({ status: "refused", ...result.refusal, steps: result.steps })}\n`);
+  process.stdout.write(`${JSON.stringify({ status: "refused", ...result.refusal, jobs: result.jobs })}\n`);
   return 1;
 }
 
 async function main(argv) {
   const args = argv.slice(2);
   if (args.length === 1 && args[0] === "--self-check") return emit(selfCheck({ parentEnv: process.env }));
-  let workspace = "/workspace";
-  if (args.length === 2 && args[0] === "--workspace") workspace = args[1];
-  else if (args.length !== 0) {
-    process.stderr.write("usage: reviewer-launch [--workspace <dir>] | reviewer-launch --self-check\n");
+  if (args.length !== 0) {
+    process.stderr.write("usage: reviewer-launch | reviewer-launch --self-check  (the worktree is always /workspace)\n");
     return 2;
   }
-  return emit(await reviewBuild({ workspace, parentEnv: process.env }));
+  return emit(await reviewBuild({ parentEnv: process.env }));
 }
 
 // Only act as an entry point when executed directly.

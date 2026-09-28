@@ -79,6 +79,7 @@ describe("A2 — requirement resolution", () => {
       workflowText: readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"),
       workflowFile: ".github/workflows/test.yml",
       jobId: "test",
+      baseBranch: "main",
     });
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
