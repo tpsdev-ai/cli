@@ -96,7 +96,22 @@ jobs:
       - run: bun run build
       - run: |
           chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
-      - run: bun run test
+      - name: Unit + integration tests, HOME-isolated (cli#430)
+        # The suite used to resolve the real ~/.tps (identity, credentials, auth,
+        # agents, run, mail); on a host that runs production agents under the same
+        # user that is a real write. Run it with HOME pointed at an EMPTY directory
+        # and assert that directory still has no `.tps` afterwards — the suite must
+        # not write into the HOME it was given. The lane launcher
+        # (scripts/test-suite.mjs) additionally points each child's HOME at a
+        # throwaway root, preloads a guard that aborts a non-isolated run, and
+        # snapshots the real ~/.tps before/after (fail on any change).
+        run: |
+          iso_home="$(mktemp -d)"
+          HOME="$iso_home" bun run test
+          if [ -e "$iso_home/.tps" ]; then
+            echo "::error::the suite wrote $iso_home/.tps — HOME is not isolated"
+            exit 1
+          fi
       - name: openclaw-tps-mail plugin tests (isolated HOME launcher)
         # cli#398: the plugin's outbox/archive writers resolve ~/.tps and the CLI
         # mail dirs from the process HOME, so the suite MUST run through its

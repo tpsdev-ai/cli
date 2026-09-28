@@ -62,12 +62,20 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { describeLeak, diffSnapshots, snapshotTps } from "./test-home-guard.mjs";
 
 /** The repo root, from this file's own location: `<root>/scripts/test-suite.mjs`. */
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/**
+ * The preload that aborts a run which did not come up under the isolated root
+ * (cli#430). Passed to `bun --preload`, so it loads before any test module.
+ */
+export const HOME_ISOLATION_PRELOAD = join(REPO, "scripts", "home-isolation-preload.ts");
 
 /** Where the reports go: `<root>/test-reports`, or TPS_TEST_REPORT_DIR when set. */
 export const REPORT_DIR = process.env.TPS_TEST_REPORT_DIR
@@ -132,13 +140,32 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
   rmSync(xml, { force: true });
   rmSync(log, { force: true });
   rmSync(seal, { force: true });
+
+  // cli#430: isolate HOME for the whole lane. The suite used to resolve the
+  // real ~/.tps (identity, credentials, auth, agents, run, mail, outbox) from the
+  // operator HOME. Create a throwaway root, point the child's HOME and
+  // TPS_TEST_ROOT at it, DROP any ambient mail/keys dir so a real one cannot
+  // leak back in, and pass the isolation PRELOAD so a child that did not come up
+  // under the root aborts before any test module loads. The real ~/.tps (the HOME
+  // this launcher runs under) is snapshotted before and after: a change fails the
+  // lane even if every test passed (scripts/test-home-guard.mjs).
+  const isoRoot = realpathSync(mkdtempSync(join(tmpdir(), `tps-test-${suite}-`)));
+  mkdirSync(join(isoRoot, ".tps", "mail"), { recursive: true });
+  mkdirSync(join(isoRoot, "keys"), { recursive: true });
+  const childEnv = { ...env, HOME: isoRoot, TPS_TEST_ROOT: isoRoot };
+  delete childEnv.TPS_MAIL_DIR;
+  delete childEnv.TPS_TEST_KEYS_DIR;
+  const guardHome = env.HOME || homedir();
+  const tpsBefore = snapshotTps(guardHome);
+
   const reporters = args.filter((arg) => arg.startsWith("--reporter"));
   const bunArgs = [
+    `--preload=${HOME_ISOLATION_PRELOAD}`,
     "test",
     ...(reporters.length ? [] : ["--reporter=junit", `--reporter-outfile=${xml}`]),
     ...args,
   ];
-  const child = spawn("bun", bunArgs, { cwd, env });
+  const child = spawn("bun", bunArgs, { cwd, env: childEnv });
   const logStream = createWriteStream(log, { flags: "w" });
   child.stdout?.on("data", (chunk) => {
     process.stdout.write(chunk);
@@ -154,6 +181,26 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
       rejectExit(err);
     });
     child.on("close", (code) => {
+      let exitCode = code ?? 1;
+      // cli#430: compare the real ~/.tps before/after. A change is a leak and
+      // fails the lane even when every test passed. Paths + sizes + mtimes only,
+      // never contents.
+      const changed = diffSnapshots(tpsBefore, snapshotTps(guardHome));
+      if (changed.length > 0) {
+        process.stderr.write(`\n${describeLeak(guardHome, changed)}\n`);
+        exitCode = 1;
+      }
+      // Remove the throwaway root (a leaked temp root is preferable to masking
+      // a result, so failures here are best-effort).
+      if (process.env.TPS_TEST_KEEP_ROOT === "1") {
+        console.log(`tps-test-${suite}: kept isolated root ${isoRoot}`);
+      } else {
+        try {
+          rmSync(isoRoot, { recursive: true, force: true });
+        } catch {
+          /* best effort */
+        }
+      }
       // Close the log stream before resolving: the guard reads the report after
       // this process is gone, and a truncated log is a truncated record.
       logStream.end(() => {
@@ -166,7 +213,7 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
           rejectExit(err);
           return;
         }
-        resolveExit(code ?? 1);
+        resolveExit(exitCode);
       });
     });
   });

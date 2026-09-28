@@ -1,0 +1,14 @@
+# bunfig.toml — packages/agent test configuration (cli#430).
+#
+# The PRELOAD below loads before any test module. It ABORTS the run unless
+# os.homedir() resolves inside the isolated test root the launcher created
+# (TPS_TEST_ROOT). Run the suite through the launcher:
+#
+#   bun run test                          # from the repo root
+#   node ../../scripts/test-suite.mjs agent
+#
+# A bare `bun test` here aborts by name — that is the point: the suite resolves
+# ~/.tps from the process HOME, so an unisolated run writes into the live tree.
+
+[test]
+preload = ["../../scripts/home-isolation-preload.ts"]

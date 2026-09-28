@@ -61,12 +61,20 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { describeLeak, diffSnapshots, snapshotTps } from "../../../scripts/test-home-guard.mjs";
 
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const keep = process.env.TPS_TEST_KEEP_ROOT === "1";
+
+// cli#430: the real ~/.tps (the HOME this launcher runs under) is snapshotted
+// before and after the run; a change fails the lane. This is the backstop for a
+// leak that hard-codes the real home — the child's HOME override + the bunfig
+// preload cover everything that resolves through the process HOME.
+const guardHome = process.env.HOME || homedir();
+const tpsBefore = snapshotTps(guardHome);
 
 // realpath the root: on macOS /tmp is a symlink to /private/tmp, and the guard
 // compares realpaths so a symlinked tmpdir still counts as "inside".
@@ -139,6 +147,14 @@ child.on("error", (err) => {
 });
 
 child.on("close", (code, signal) => {
+  // cli#430: compare the real ~/.tps before/after; a change is a leak and fails
+  // the lane even when every test passed. Paths + sizes + mtimes only.
+  let exitCode = signal ? 1 : (code ?? 1);
+  const changed = diffSnapshots(tpsBefore, snapshotTps(guardHome));
+  if (changed.length > 0) {
+    process.stderr.write(`\n${describeLeak(guardHome, changed)}\n`);
+    exitCode = 1;
+  }
   if (keep) {
     console.log(`openclaw-tps-mail tests: kept isolated root ${root}`);
   } else {
@@ -168,6 +184,6 @@ child.on("close", (code, signal) => {
       process.exitCode = 1;
       return;
     }
-    process.exitCode = signal ? 1 : (code ?? 1);
+    process.exitCode = exitCode;
   });
 });
