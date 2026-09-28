@@ -179,7 +179,7 @@ jobs:
           persist-credentials: false
       - name: Build and check each matrix image
         run: |
-          set -eux
+          set -euo pipefail
           ids="$(node -e 'const t=require("./docker/reviewer/runtime-matrix.json"); process.stdout.write(t.images.map((i)=>i.id).join(" "))')"
           count=0
           for id in $ids; do
