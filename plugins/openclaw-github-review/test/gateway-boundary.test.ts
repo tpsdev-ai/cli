@@ -72,6 +72,15 @@ const REVIEWER = "anvil";
 const SESSION = "agent:anvil:review-427";
 const FLAIR = "http://flair.lane.invalid";
 const GITHUB = `https://api.github.com/repos/${REPO}/pulls/${PR}`;
+const FLAIR_EVENT = new URL(`${FLAIR}/OrgEvent/`);
+const GITHUB_PULL = new URL(GITHUB);
+const GITHUB_REVIEW = new URL(`${GITHUB}/reviews`);
+
+function sameEndpoint(actual: URL, expected: URL): boolean {
+  return actual.protocol === expected.protocol &&
+    actual.host === expected.host &&
+    actual.pathname === expected.pathname;
+}
 
 let root: string;
 let savedProbe: string | undefined;
@@ -175,11 +184,12 @@ function scanLaneRun(run: LaneRun, host: LaneHost): void {
   const launch = [...run.argv, ...Object.entries(run.env).map(([k, v]) => `${k}=${v}`)].join("\n");
   for (const canary of [TOKEN, host.keyCanary, MARKER]) expect(launch).not.toContain(canary);
   for (const r of run.requests) {
-    if (r.url.startsWith(FLAIR)) {
+    const requestUrl = new URL(r.url);
+    if (sameEndpoint(requestUrl, FLAIR_EVENT)) {
       expect(`${r.authorization}\n${r.body}`).not.toContain(TOKEN);
       expect(`${r.authorization}\n${r.body}`).not.toContain(host.keyCanary);
     } else {
-      expect(r.url.startsWith(GITHUB)).toBe(true);
+      expect(sameEndpoint(requestUrl, GITHUB_PULL) || sameEndpoint(requestUrl, GITHUB_REVIEW)).toBe(true);
       expect(r.authorization).toBe(`Bearer ${TOKEN}`);
       expect(r.body ?? "").not.toContain(host.keyCanary);
     }
@@ -187,6 +197,14 @@ function scanLaneRun(run: LaneRun, host: LaneHost): void {
 }
 
 describe("E — the gateway-boundary lane (OpenClaw loader + gateway tool dispatch, in a separate node process)", () => {
+  test("controlled request classification rejects lookalike hosts and paths", () => {
+    expect(sameEndpoint(new URL(`${FLAIR}/OrgEvent/`), FLAIR_EVENT)).toBe(true);
+    expect(sameEndpoint(new URL("http://flair.lane.invalid.evil.test/OrgEvent/"), FLAIR_EVENT)).toBe(false);
+    expect(sameEndpoint(new URL("https://flair.lane.invalid/OrgEvent/"), FLAIR_EVENT)).toBe(false);
+    expect(sameEndpoint(new URL(`${FLAIR}/OrgEvent/other`), FLAIR_EVENT)).toBe(false);
+    expect(sameEndpoint(new URL("https://api.github.com.evil.test/repos/tpsdev-ai/cli/pulls/427"), GITHUB_PULL)).toBe(false);
+  });
+
   test("the SHIPPED manifest: zero diagnostics, default sandbox policy withholds the verb, the documented allow offers it, and it POSTS with the audit acknowledged", () => {
     const host = laneHost(root, "lane-dispatch-1");
     const run = runGatewayLane(
