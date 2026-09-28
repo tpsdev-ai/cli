@@ -3,148 +3,353 @@
  * explicit entry in the trusted runtime matrix, or refuse by name.
  *
  * Requirements are read from the reviewed commit's own declarations
- * (`packageManager`, `engines`, and the applicable runtime-version files) and
- * reconciled with its CI lanes. Ranges are resolved against the trusted table
- * only; the reviewed checkout cannot extend the table or pick a download source.
+ * (`packageManager`, `engines`, and the runtime-version files `.nvmrc`,
+ * `.node-version`, `.bun-version`, `.tool-versions`) and reconciled with the
+ * pins of the CI job the host names (see ci-job.mjs). Ranges are resolved
+ * against the trusted table only; the reviewed checkout cannot extend the table
+ * or pick a download source.
+ *
+ * Ranges follow npm semver (node-semver's grammar and desugaring, with
+ * includePrerelease off): partial comparators are widened the way npm widens
+ * them (`>22` is `>=23.0.0`, `<=24` is `<25.0.0-0`), and x-ranges, hyphen,
+ * tilde, caret and `||` sets are supported. A requirement this parser cannot
+ * read (`latest`, `lts/*`, `node`, a malformed range) is never matched: it is
+ * refused as ambiguous.
  *
  * Refusal kinds (all named, all fail closed):
- *   - ambiguous      two or more requirements, or two or more matrix entries,
- *                    leave more than one supported runtime.
- *   - conflicting    requirements individually resolvable but mutually
- *                    unsatisfiable.
- *   - out-of-matrix  a requirement matches no entry in the table; the message
- *                    names the missing image.
+ *   - invalid-declaration  a declaration has the wrong shape (a non-string
+ *                          engines.node, a packageManager that is not a string,
+ *                          a tool line with no version).
+ *   - ambiguous            a requirement is not an explicit version or semver
+ *                          range, a version file lists more than one version,
+ *                          or the requirement set leaves more than one trusted
+ *                          version or image.
+ *   - conflicting          requirements individually resolvable but mutually
+ *                          unsatisfiable.
+ *   - out-of-matrix        no trusted image provides a requirement. The message
+ *                          names the missing image by its requirements, e.g.
+ *                          `missing image: node >=25 with bun 1.3.10`.
  */
 
-/** A version as a numeric triple; a partial version (e.g. "22") leaves the
- *  unspecified parts as null to mean "any". */
-function parseVersion(text) {
-  const m = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$/.exec(String(text).trim());
+// ─── npm-semver ranges ──────────────────────────────────────────────────────
+
+const NUM = "0|[1-9]\\d*";
+const XR = `[xX*]|${NUM}`;
+const PRE_ID = `${NUM}|\\d*[a-zA-Z-][0-9a-zA-Z-]*`;
+const PRERELEASE = `(?:${PRE_ID})(?:\\.(?:${PRE_ID}))*`;
+const BUILD = "[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*";
+// A partial version as a range operand: "22", "22.x", "22.22.1-rc.1+b".
+const PARTIAL_RE = new RegExp(`^v?(${XR})(?:\\.(${XR})(?:\\.(${XR})(?:-(${PRERELEASE}))?(?:\\+${BUILD})?)?)?$`);
+// A tested version: always a full release (matrix entries and actual runtimes).
+const RELEASE_RE = new RegExp(`^v?(${NUM})\\.(${NUM})\\.(${NUM})(?:\\+${BUILD})?$`);
+
+const isX = (part) => part === undefined || part === "x" || part === "X" || part === "*";
+
+function parsePartial(text) {
+  const m = PARTIAL_RE.exec(text);
   if (!m) return null;
-  return {
-    major: Number(m[1]),
-    minor: m[2] === undefined ? null : Number(m[2]),
-    patch: m[3] === undefined ? null : Number(m[3]),
-  };
+  const [, major, minor, patch, pre] = m;
+  // A qualifier only exists on a full version.
+  if (pre !== undefined && (isX(major) || isX(minor) || isX(patch))) return null;
+  return { major, minor, patch, pre };
 }
 
-function cmp(a, b) {
-  // Compare full triples; -1/0/1.
-  for (const k of ["major", "minor", "patch"]) {
-    const av = a[k] ?? 0;
-    const bv = b[k] ?? 0;
-    if (av !== bv) return av < bv ? -1 : 1;
+function version(major, minor, patch, pre) {
+  const preIds = pre === undefined || pre === "" ? [] : String(pre).split(".");
+  return { major: Number(major), minor: Number(minor), patch: Number(patch), pre: preIds };
+}
+
+const ANY = [];
+const NOTHING = [{ op: "<", v: version(0, 0, 0, "0") }];
+const cmpOp = (op, v) => [{ op, v }];
+
+/** Desugar a tilde operand, as node-semver's replaceTilde does. */
+function tilde(p) {
+  if (isX(p.major)) return ANY;
+  const M = Number(p.major);
+  if (isX(p.minor)) return [{ op: ">=", v: version(M, 0, 0) }, { op: "<", v: version(M + 1, 0, 0, "0") }];
+  const m = Number(p.minor);
+  if (isX(p.patch)) return [{ op: ">=", v: version(M, m, 0) }, { op: "<", v: version(M, m + 1, 0, "0") }];
+  return [{ op: ">=", v: version(M, m, p.patch, p.pre) }, { op: "<", v: version(M, m + 1, 0, "0") }];
+}
+
+/** Desugar a caret operand, as node-semver's replaceCaret does. */
+function caret(p) {
+  if (isX(p.major)) return ANY;
+  const M = Number(p.major);
+  if (isX(p.minor)) return [{ op: ">=", v: version(M, 0, 0) }, { op: "<", v: version(M + 1, 0, 0, "0") }];
+  const m = Number(p.minor);
+  if (isX(p.patch)) {
+    const upper = M === 0 ? version(0, m + 1, 0, "0") : version(M + 1, 0, 0, "0");
+    return [{ op: ">=", v: version(M, m, 0) }, { op: "<", v: upper }];
+  }
+  const pt = Number(p.patch);
+  let upper;
+  if (M !== 0) upper = version(M + 1, 0, 0, "0");
+  else if (m !== 0) upper = version(0, m + 1, 0, "0");
+  else upper = version(0, 0, pt + 1, "0");
+  return [{ op: ">=", v: version(M, m, pt, p.pre) }, { op: "<", v: upper }];
+}
+
+/** Desugar a primitive or bare x-range, as node-semver's replaceXRange does. */
+function xrange(op, p) {
+  const xM = isX(p.major);
+  const xm = xM || isX(p.minor);
+  const xp = xm || isX(p.patch);
+  let gtlt = op === "=" && xp ? "" : op;
+  if (xM) return gtlt === ">" || gtlt === "<" ? NOTHING : ANY;
+  let M = Number(p.major);
+  let m = xm ? 0 : Number(p.minor);
+  let pt = xp ? 0 : Number(p.patch);
+  if (gtlt && xp) {
+    if (gtlt === ">") {
+      gtlt = ">=";
+      if (xm) {
+        M += 1;
+        m = 0;
+      } else {
+        m += 1;
+      }
+      pt = 0;
+    } else if (gtlt === "<=") {
+      gtlt = "<";
+      if (xm) M += 1;
+      else m += 1;
+    }
+    return cmpOp(gtlt, version(M, m, pt, gtlt === "<" ? "0" : undefined));
+  }
+  if (xm) return [{ op: ">=", v: version(M, 0, 0) }, { op: "<", v: version(M + 1, 0, 0, "0") }];
+  if (xp) return [{ op: ">=", v: version(M, m, 0) }, { op: "<", v: version(M, m + 1, 0, "0") }];
+  return cmpOp(gtlt === "" ? "=" : gtlt, version(M, m, pt, p.pre));
+}
+
+/** Desugar a hyphen range "A - B", as node-semver's hyphenReplace does. */
+function hyphen(from, to) {
+  const out = [];
+  if (!isX(from.major)) {
+    if (isX(from.minor)) out.push({ op: ">=", v: version(from.major, 0, 0) });
+    else if (isX(from.patch)) out.push({ op: ">=", v: version(from.major, from.minor, 0) });
+    else out.push({ op: ">=", v: version(from.major, from.minor, from.patch, from.pre) });
+  }
+  if (!isX(to.major)) {
+    if (isX(to.minor)) out.push({ op: "<", v: version(Number(to.major) + 1, 0, 0, "0") });
+    else if (isX(to.patch)) out.push({ op: "<", v: version(to.major, Number(to.minor) + 1, 0, "0") });
+    else out.push({ op: "<=", v: version(to.major, to.minor, to.patch, to.pre) });
+  }
+  return out;
+}
+
+function parseToken(token) {
+  let m = /^\^(.*)$/.exec(token);
+  if (m) {
+    const p = parsePartial(m[1]);
+    return p ? caret(p) : null;
+  }
+  m = /^~>?(.*)$/.exec(token);
+  if (m) {
+    const p = parsePartial(m[1]);
+    return p ? tilde(p) : null;
+  }
+  m = /^(<=|>=|<|>|=)?=?(.*)$/.exec(token);
+  const p = parsePartial(m[2]);
+  return p ? xrange(m[1] ?? "", p) : null;
+}
+
+/**
+ * Parse a range into its comparator sets (an OR of ANDs), or null when the text
+ * is not a semver range. An empty set matches every release.
+ */
+function parseRange(range) {
+  if (typeof range !== "string") return null;
+  const text = range.trim();
+  if (text === "") return [ANY];
+  const sets = [];
+  for (const rawPart of text.split(/\s*\|\|\s*/)) {
+    const part = rawPart.trim();
+    if (part === "") return null; // an empty alternative: refused rather than read as "*"
+    const hy = /^(\S+)\s+-\s+(\S+)$/.exec(part);
+    if (hy) {
+      const from = parsePartial(hy[1]);
+      const to = parsePartial(hy[2]);
+      if (!from || !to) return null;
+      sets.push(hyphen(from, to));
+      continue;
+    }
+    // "> = 1.2" / "^ 1.2" / "~> 1.2" are one comparator with inner spaces.
+    const joined = part.replace(/(<=|>=|<|>|=|\^|~>?)\s+/g, "$1");
+    const set = [];
+    for (const token of joined.split(/\s+/)) {
+      const comps = parseToken(token);
+      if (!comps) return null;
+      set.push(...comps);
+    }
+    sets.push(set);
+  }
+  return sets;
+}
+
+function comparePre(a, b) {
+  if (a.length === 0 && b.length === 0) return 0;
+  if (a.length === 0) return 1; // a release sorts after its prereleases
+  if (b.length === 0) return -1;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] === undefined) return -1;
+    if (b[i] === undefined) return 1;
+    // PRE_ID admits numeric identifiers only without leading zeros.
+    const an = String(Number(a[i])) === a[i];
+    const bn = String(Number(b[i])) === b[i];
+    if (an && bn) {
+      const d = Number(a[i]) - Number(b[i]);
+      if (d !== 0) return d < 0 ? -1 : 1;
+    } else if (an !== bn) {
+      return an ? -1 : 1;
+    } else if (a[i] !== b[i]) {
+      return a[i] < b[i] ? -1 : 1;
+    }
   }
   return 0;
 }
 
-function bumpMajor(v) {
-  return { major: v.major + 1, minor: 0, patch: 0 };
+function compare(a, b) {
+  for (const k of ["major", "minor", "patch"]) {
+    if (a[k] !== b[k]) return a[k] < b[k] ? -1 : 1;
+  }
+  return comparePre(a.pre, b.pre);
 }
 
-function satisfiesRange(version, range) {
-  const v = parseVersion(version);
-  if (!v) return false;
-  const r = String(range).trim();
-  if (r === "" || r === "*" || r === "x" || r === "latest") return true;
-  return r.split("||").some((part) =>
-    part
-      .trim()
-      .split(/\s+/)
-      .filter((t) => t !== "")
-      .every((tok) => satisfiesToken(v, tok)),
-  );
-}
-
-function satisfiesToken(v, tok) {
-  if (tok === "*" || tok === "x") return true;
-  let op = "";
-  let rest = tok;
-  for (const candidate of [">=", "<=", ">", "<", "=", "^", "~"]) {
-    if (tok.startsWith(candidate)) {
-      op = candidate;
-      rest = tok.slice(candidate.length);
-      break;
-    }
-  }
-  const p = parseVersion(rest);
-  if (!p) {
-    // A non-version token (e.g. "lts/*", a tag) cannot be resolved explicitly.
-    return false;
-  }
+function testComparator(v, { op, v: c }) {
+  const d = compare(v, c);
   switch (op) {
-    case "":
-    case "=": {
-      if (p.minor === null) return v.major === p.major;
-      if (p.patch === null) return v.major === p.major && v.minor === p.minor;
-      return cmp(v, p) === 0;
-    }
-    case ">":
-      return cmp(v, p) > 0;
     case ">=":
-      return cmp(v, p) >= 0;
+      return d >= 0;
+    case ">":
+      return d > 0;
     case "<":
-      return cmp(v, p) < 0;
+      return d < 0;
     case "<=":
-      return cmp(v, p) <= 0;
-    case "^": {
-      if (p.minor === null) return v.major === p.major;
-      return cmp(v, p) >= 0 && v.major === p.major;
-    }
-    case "~": {
-      if (p.minor === null) return v.major === p.major;
-      return cmp(v, p) >= 0 && v.major === p.major && v.minor === p.minor;
-    }
+      return d <= 0;
     default:
-      return false;
+      return d === 0;
   }
 }
 
-/** Split "name@range" (a packageManager field) into its parts. */
-function parsePackageManager(value) {
-  if (typeof value !== "string" || value.trim() === "") return null;
-  const at = value.lastIndexOf("@");
-  if (at <= 0) return { tool: value.trim(), range: "*" };
-  return { tool: value.slice(0, at).trim(), range: value.slice(at + 1).trim() || "*" };
+/**
+ * Does the release `version` satisfy the npm-semver `range`? False for a range
+ * that is not semver (never a guess) and for a tested version that is not a
+ * full release.
+ */
+export function satisfiesRange(versionText, range) {
+  const m = RELEASE_RE.exec(String(versionText).trim());
+  if (!m) return false;
+  const v = version(m[1], m[2], m[3]);
+  const sets = parseRange(range);
+  if (!sets) return false;
+  return sets.some((set) => set.every((comp) => testComparator(v, comp)));
 }
+
+/** Is `range` a semver range this resolver can read? */
+export function isSemverRange(range) {
+  return parseRange(range) !== null;
+}
+
+// ─── declarations ───────────────────────────────────────────────────────────
 
 /** The tools the matrix can provide. Anything else is a named refusal. */
 const SUPPORTED_TOOLS = new Set(["node", "bun"]);
+/** asdf/mise tool names for the supported runtimes. */
+const TOOL_ALIASES = { nodejs: "node", node: "node", bun: "bun" };
+
+const refuse = (kind, message) => ({ ok: false, refusal: { kind, message } });
+
+function typeName(value) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  return typeof value;
+}
+
+/** Lines of a version file with `#` comments and blank lines removed. */
+function meaningfulLines(text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.replace(/#.*$/, "").trim())
+    .filter((line) => line !== "");
+}
+
+/** A single-version file (.nvmrc, .node-version, .bun-version). */
+function singleVersion(name, text) {
+  const tokens = meaningfulLines(text).flatMap((line) => line.split(/\s+/));
+  if (tokens.length === 0) return { ok: true, range: null };
+  if (tokens.length > 1) {
+    return refuse(
+      "ambiguous",
+      `${name} lists more than one version (${tokens.join(" ")}); pin exactly one`,
+    );
+  }
+  return { ok: true, range: tokens[0] };
+}
 
 function collectConstraints(input) {
   const constraints = [];
   const notes = [];
   const manifest = input.manifest ?? {};
-  const pm = parsePackageManager(manifest.packageManager);
-  if (pm) constraints.push({ tool: pm.tool, range: pm.range, source: "packageManager" });
-  const engines = manifest.engines ?? {};
-  for (const [tool, range] of Object.entries(engines)) {
-    if (typeof range !== "string") continue;
-    if (tool === "node" || tool === "bun") constraints.push({ tool, range, source: `engines.${tool}` });
-    else notes.push(`${tool}@${range}`);
+
+  const pm = manifest.packageManager;
+  if (pm !== undefined && pm !== null) {
+    if (typeof pm !== "string" || pm.trim() === "") {
+      return refuse(
+        "invalid-declaration",
+        `package.json packageManager must be a "name@version" string (got ${typeName(pm)})`,
+      );
+    }
+    const at = pm.lastIndexOf("@");
+    const tool = (at > 0 ? pm.slice(0, at) : pm).trim();
+    const range = at > 0 ? pm.slice(at + 1).trim() : "*";
+    constraints.push({ tool, range: range || "*", source: "packageManager" });
   }
-  const files = input.runtimeFiles ?? {};
-  for (const [name, value] of Object.entries(files)) {
-    if (value == null) continue;
-    const text = String(value).trim();
-    if (text === "") continue;
-    if (name === ".nvmrc" || name === ".node-version") {
-      if (/^lts(\/.*)?$/i.test(text)) {
-        constraints.push({ tool: "node", range: "lts/*", source: name, unresolvable: true });
-      } else {
-        constraints.push({ tool: "node", range: text.replace(/^v/, ""), source: name });
+
+  const engines = manifest.engines;
+  if (engines !== undefined && engines !== null) {
+    if (typeof engines !== "object" || Array.isArray(engines)) {
+      return refuse("invalid-declaration", `package.json engines must be an object (got ${typeName(engines)})`);
+    }
+    for (const [tool, range] of Object.entries(engines)) {
+      if (!SUPPORTED_TOOLS.has(tool)) {
+        notes.push(`engines.${tool} is not a runtime the matrix selects; ignored`);
+        continue;
       }
-    } else if (name === ".bun-version") {
-      constraints.push({ tool: "bun", range: text, source: name });
-    } else if (name === ".tool-versions") {
-      for (const line of text.split(/\r?\n/)) {
-        const m = /^(\S+)\s+(\S+)$/.exec(line.trim());
-        if (!m) continue;
-        const tool = m[1] === "nodejs" ? "node" : m[1];
-        constraints.push({ tool, range: m[2], source: ".tool-versions" });
+      if (typeof range !== "string") {
+        return refuse(
+          "invalid-declaration",
+          `package.json engines.${tool} must be a semver range string (got ${typeName(range)} ${JSON.stringify(range)})`,
+        );
       }
+      constraints.push({ tool, range, source: `engines.${tool}` });
     }
   }
+
+  const files = input.runtimeFiles ?? {};
+  for (const name of [".nvmrc", ".node-version", ".bun-version"]) {
+    if (files[name] == null) continue;
+    const r = singleVersion(name, files[name]);
+    if (!r.ok) return r;
+    if (r.range !== null) constraints.push({ tool: name === ".bun-version" ? "bun" : "node", range: r.range, source: name });
+  }
+  if (files[".tool-versions"] != null) {
+    for (const line of meaningfulLines(files[".tool-versions"])) {
+      const [rawTool, ...versions] = line.split(/\s+/);
+      if (versions.length === 0) {
+        return refuse("invalid-declaration", `.tool-versions line "${line}" names ${rawTool} with no version`);
+      }
+      if (versions.length > 1) {
+        return refuse(
+          "ambiguous",
+          `.tool-versions line "${line}" lists more than one ${rawTool} version (an asdf fallback list); pin exactly one`,
+        );
+      }
+      constraints.push({ tool: TOOL_ALIASES[rawTool] ?? rawTool, range: versions[0], source: ".tool-versions" });
+    }
+  }
+
   if (Array.isArray(input.ciConstraints)) {
     for (const c of input.ciConstraints) {
       if (c && typeof c.tool === "string" && typeof c.range === "string") {
@@ -152,165 +357,129 @@ function collectConstraints(input) {
       }
     }
   }
-  return { constraints, notes };
+  return { ok: true, constraints, notes };
 }
 
+// ─── resolution ─────────────────────────────────────────────────────────────
+
 function imageList(table) {
-  return Array.isArray(table.images) ? table.images : [];
+  return Array.isArray(table?.images) ? table.images : [];
 }
 
 function availableImages(table) {
-  return imageList(table)
-    .map((i) => `${i.id} (node ${i.node}, bun ${i.bun})`)
-    .join(", ");
+  const list = imageList(table).map((i) => `${i.id} (node ${i.node}, bun ${i.bun})`);
+  return list.length > 0 ? list.join(", ") : "none";
 }
 
+/** Resolve one tool's constraints against the table's versions of that tool. */
 function resolveTool(tool, constraints, table) {
-  const versions = Object.keys((table.artifacts ?? {})[tool] ?? {});
-  if (versions.length === 0) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "out-of-matrix",
-        message: `runtime "${tool}" is not in the trusted matrix; no image provides it. Available images: ${availableImages(table)}`,
-      },
-    };
-  }
-  // Each constraint must individually resolve (else the pin is outside the matrix).
+  if (constraints.length === 0) return { status: "unconstrained" };
+  const versions = Object.keys(table?.artifacts?.[tool] ?? {});
   const perConstraint = [];
   for (const c of constraints) {
-    if (c.unresolvable) {
-      return {
-        ok: false,
-        refusal: {
-          kind: "ambiguous",
-          message: `requirement "${c.range}" from ${c.source} is not an explicit version; no image can be selected. Available images: ${availableImages(table)}`,
-        },
-      };
-    }
     const matching = versions.filter((v) => satisfiesRange(v, c.range));
-    if (matching.length === 0) {
-      return {
-        ok: false,
-        refusal: {
-          kind: "out-of-matrix",
-          message: `no trusted image provides ${tool} ${c.range} (required by ${c.source}); the missing image is named. Available images: ${availableImages(table)}`,
-        },
-      };
-    }
+    if (matching.length === 0) return { status: "out", constraint: c };
     perConstraint.push(matching);
   }
   const all = versions.filter((v) => perConstraint.every((set) => set.includes(v)));
-  if (all.length === 0) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "conflicting",
-        message: `conflicting ${tool} requirements (${constraints.map((c) => `${c.source}=${c.range}`).join(", ")}); no single trusted version satisfies all. Available images: ${availableImages(table)}`,
-      },
-    };
-  }
-  if (all.length > 1) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "ambiguous",
-        message: `the ${tool} requirement set resolves to more than one trusted version (${all.join(", ")}); pin one explicitly. Available images: ${availableImages(table)}`,
-      },
-    };
-  }
-  return { ok: true, version: all[0] };
+  if (all.length === 0) return { status: "conflict", constraints };
+  if (all.length > 1) return { status: "ambiguous", constraints, versions: all };
+  return { status: "resolved", version: all[0] };
+}
+
+/** "node >=25" / "bun 1.3.10" — how the missing image names one tool. */
+function describeTool(tool, result, constraints) {
+  if (result.status === "unconstrained") return null;
+  if (result.status === "resolved") return `${tool} ${result.version}`;
+  if (result.status === "out") return `${tool} ${result.constraint.range}`;
+  return `${tool} ${constraints.map((c) => c.range).join(" ")}`;
 }
 
 /**
  * Resolve requirements to exactly one matrix image.
- * @returns {{ok:true, image:object, node:string, bun:string, notes:string[]}
+ * @returns {{ok:true, image:object, node:string, bun:string,
+ *            requirements:{tool:string, range:string, source:string}[], notes:string[]}
  *          | {ok:false, refusal:{kind:string, message:string}}}
  */
 export function resolveRuntime(input) {
   const table = input.table;
-  const { constraints, notes } = collectConstraints(input);
+  const collected = collectConstraints(input);
+  if (!collected.ok) return collected;
+  const { constraints, notes } = collected;
+  const provides = `The trusted matrix provides: ${availableImages(table)}`;
 
-  // A packageManager naming a tool the matrix cannot provide is a refusal.
+  // A requirement the resolver cannot read is never guessed at.
+  const unreadable = constraints.find((c) => !isSemverRange(c.range));
+  if (unreadable) {
+    return refuse(
+      "ambiguous",
+      `requirement "${unreadable.range}" for ${unreadable.tool} (from ${unreadable.source}) is not an explicit version or semver range; an alias or dist-tag floats, so no image can be selected. ${provides}`,
+    );
+  }
+
+  // A tool the matrix cannot provide at all is a missing image.
   const unsupported = constraints.find((c) => !SUPPORTED_TOOLS.has(c.tool));
   if (unsupported) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "out-of-matrix",
-        message: `runtime "${unsupported.tool}" (from ${unsupported.source}) is outside the trusted matrix; no image provides it. Available images: ${availableImages(table)}`,
-      },
-    };
+    return refuse(
+      "out-of-matrix",
+      `missing image: ${unsupported.tool} ${unsupported.range} (required by ${unsupported.source}); no reviewer image provides ${unsupported.tool}. ${provides}`,
+    );
   }
 
-  const nodeConstraints = constraints.filter((c) => c.tool === "node");
-  const bunConstraints = constraints.filter((c) => c.tool === "bun");
+  const byTool = {
+    node: constraints.filter((c) => c.tool === "node"),
+    bun: constraints.filter((c) => c.tool === "bun"),
+  };
+  const result = { node: resolveTool("node", byTool.node, table), bun: resolveTool("bun", byTool.bun, table) };
+  const describe = (tool) => describeTool(tool, result[tool], byTool[tool]);
+  const missingImage = () => ["node", "bun"].map(describe).filter((d) => d !== null).join(" with ");
 
-  let node = null;
-  let bun = null;
-  if (nodeConstraints.length > 0) {
-    const r = resolveTool("node", nodeConstraints, table);
-    if (!r.ok) return { ok: false, refusal: r.refusal };
-    node = r.version;
+  for (const tool of ["node", "bun"]) {
+    const r = result[tool];
+    if (r.status === "out") {
+      return refuse(
+        "out-of-matrix",
+        `missing image: ${missingImage()} (${tool} ${r.constraint.range} is required by ${r.constraint.source}). ${provides}`,
+      );
+    }
   }
-  if (bunConstraints.length > 0) {
-    const r = resolveTool("bun", bunConstraints, table);
-    if (!r.ok) return { ok: false, refusal: r.refusal };
-    bun = r.version;
+  for (const tool of ["node", "bun"]) {
+    const r = result[tool];
+    if (r.status === "conflict") {
+      return refuse(
+        "conflicting",
+        `conflicting ${tool} requirements (${r.constraints.map((c) => `${c.source}=${c.range}`).join(", ")}); no single trusted version satisfies all. ${provides}`,
+      );
+    }
+    if (r.status === "ambiguous") {
+      return refuse(
+        "ambiguous",
+        `the ${tool} requirements (${r.constraints.map((c) => `${c.source}=${c.range}`).join(", ")}) match more than one trusted version (${r.versions.join(", ")}); pin one explicitly. ${provides}`,
+      );
+    }
   }
 
+  const node = result.node.status === "resolved" ? result.node.version : null;
+  const bun = result.bun.status === "resolved" ? result.bun.version : null;
   if (node === null && bun === null) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "ambiguous",
-        message: `the reviewed commit declares no runtime requirement; no image can be selected. Available images: ${availableImages(table)}`,
-      },
-    };
+    return refuse(
+      "ambiguous",
+      `the reviewed commit declares no node or bun requirement; no image can be selected. ${provides}`,
+    );
   }
 
   const candidates = imageList(table).filter(
     (img) => (node === null || img.node === node) && (bun === null || img.bun === bun),
   );
   if (candidates.length === 0) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "out-of-matrix",
-        message: `no trusted image matches the resolved runtime (${node ? `node ${node}` : ""}${node && bun ? ", " : ""}${bun ? `bun ${bun}` : ""}); the missing image is named. Available images: ${availableImages(table)}`,
-      },
-    };
+    return refuse("out-of-matrix", `missing image: ${missingImage()}. ${provides}`);
   }
   if (candidates.length > 1) {
-    return {
-      ok: false,
-      refusal: {
-        kind: "ambiguous",
-        message: `the resolved runtime matches more than one image (${candidates.map((c) => c.id).join(", ")}); pin the runtime explicitly. Available images: ${availableImages(table)}`,
-      },
-    };
+    return refuse(
+      "ambiguous",
+      `the resolved runtime (${missingImage()}) matches more than one image (${candidates.map((c) => c.id).join(", ")}); declare the other runtime explicitly. ${provides}`,
+    );
   }
   const image = candidates[0];
-  return { ok: true, image, node: image.node, bun: image.bun, notes };
+  return { ok: true, image, node: image.node, bun: image.bun, requirements: [...byTool.node, ...byTool.bun], notes };
 }
-
-/** Parse the runtime-version pins out of CI lane YAML text (setup-node /
- *  setup-bun `*-version:` inputs). Kept deliberately narrow: only explicit
- *  versions and simple ranges are read; anything else is ignored here and
- *  surfaces through the manifest constraints. */
-export function ciConstraintsFromLanes(lanes) {
-  const out = [];
-  for (const lane of lanes ?? []) {
-    const text = typeof lane === "string" ? lane : lane?.text ?? "";
-    const file = typeof lane === "string" ? "lane" : lane?.file ?? "lane";
-    for (const m of text.matchAll(/\bnode-version:\s*["']?([^"'\n]+)["']?/g)) {
-      out.push({ tool: "node", range: m[1].trim(), source: `${file}:node-version` });
-    }
-    for (const m of text.matchAll(/\bbun-version:\s*["']?([^"'\n]+)["']?/g)) {
-      out.push({ tool: "bun", range: m[1].trim(), source: `${file}:bun-version` });
-    }
-  }
-  return out;
-}
-
-export { satisfiesRange };

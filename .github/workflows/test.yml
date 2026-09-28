@@ -163,11 +163,18 @@ jobs:
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
 
-  # cli#425 section A — the reviewer sandbox image matrix. Builds every trusted
-  # runtime image and runs the image-level acceptance checks (A2 integrity and
-  # runtime-state refusals, A3 hermetic defaults and mounts, A9 tokenless gh).
-  # Digests are recorded as artifacts; registry publishing is a separate
-  # decision. The host unit tests for the resolver/launcher run in the cli suite.
+  # cli#425 section A — the reviewer sandbox image matrix (linux/amd64). Builds
+  # every trusted runtime image and runs the image-level acceptance checks: A2
+  # integrity, the image's own resolver refusals and the build-path fixtures (an
+  # out-of-matrix pin and a pin for another image run nothing; an in-matrix pin
+  # runs the named job), A3 hermetic defaults observed inside a build run the way
+  # OpenClaw runs the sandbox (read-only root, tmpfs, no network, `sleep
+  # infinity` + exec), and A9 tokenless gh. The A9 red proofs then require the
+  # same A9 checks to FAIL on derived images carrying planted fake credentials,
+  # so the lane proves A9 fires on every run. No registry: the local image ids
+  # are recorded as evidence of this build only (a host builds its own at
+  # install time). The host unit tests for the planner/resolver/launcher run in
+  # the cli suite.
   reviewer-image:
     name: Reviewer sandbox image (A2/A3/A9)
     permissions:
@@ -189,10 +196,15 @@ jobs:
             bash scripts/reviewer/image-checks.sh "$tag" "$id" docker/reviewer/runtime-matrix.json | tee "checks-${id}.log"
           done
           test "$count" -ge 1   # an empty matrix must not read as a pass
-      - name: Record image digests
+      - name: A9 red proofs (the A9 checks must fail on credential-bearing derived images)
+        run: |
+          set -euo pipefail
+          id="$(node -e 'process.stdout.write(require("./docker/reviewer/runtime-matrix.json").images[0].id)')"
+          bash scripts/reviewer/a9-red-proofs.sh "reviewer-image:${id}" "$id" docker/reviewer/runtime-matrix.json
+      - name: Record the local image ids of this build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: reviewer-image-digests
+          name: reviewer-image-ids
           path: build-*.json
           if-no-files-found: error
 

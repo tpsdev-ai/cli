@@ -1,10 +1,12 @@
 {
   "schema": 1,
-  "comment": "Trusted runtime table for reviewer sandbox images. Maintained in this repository and installed on the host; the REVIEWED checkout can neither extend it nor choose a download source. A reviewed commit that pins a runtime outside this table is refused by name, and the refusal names the missing image.",
+  "comment": "Trusted runtime table for reviewer sandbox images. Maintained in this repository and installed on the host; the REVIEWED checkout can neither extend it nor choose a download source. A reviewed commit that pins a runtime outside this table is refused, and the refusal names the missing image by its requirements (e.g. 'missing image: node >=25 with bun 1.3.10'). Every image is linux/amd64.",
   "base": {
-    "family": "openclaw-sandbox",
+    "family": "debian-bookworm-slim",
     "image": "debian:bookworm-slim",
-    "digest": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251"
+    "digest": "sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251",
+    "platform": "linux/amd64",
+    "note": "Not an OpenClaw-published base: OpenClaw publishes no digest-pinnable sandbox image; its documented sandbox build is a local FROM debian:bookworm-slim (floating tag). This pins that base by digest and installs the same packages (see docker/reviewer/Dockerfile)."
   },
   "artifacts": {
     "node": {
@@ -30,20 +32,28 @@
       }
     }
   },
+  "launcherDeps": {
+    "js-yaml": {
+      "version": "4.3.2",
+      "url": "https://registry.npmjs.org/js-yaml/-/js-yaml-4.3.2.tgz",
+      "sha256": "c7b241d2224cf9253ff53854aa4cee87da91bd889c4d0fa3a3ffd1041ecee5b1",
+      "integrity": "sha512-SFNOvSJ+Dgf/9An904Yx+CgSlIPCkIpao4qo51lpee25TIRejdH3rhR4EZMGoNx3/TP3O+wzWuiTFl4sqbltzA=="
+    }
+  },
   "images": [
     {
       "id": "reviewer-node22-bun1310",
+      "platform": "linux/amd64",
       "node": "22.22.1",
       "bun": "1.3.10",
-      "gh": "2.101.0",
-      "digest": null
+      "gh": "2.101.0"
     },
     {
       "id": "reviewer-node24-bun1310",
+      "platform": "linux/amd64",
       "node": "24.21.0",
       "bun": "1.3.10",
-      "gh": "2.101.0",
-      "digest": null
+      "gh": "2.101.0"
     }
   ]
 }
