@@ -163,6 +163,39 @@ jobs:
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
 
+  # cli#425 section A — the reviewer sandbox image matrix. Builds every trusted
+  # runtime image and runs the image-level acceptance checks (A2 integrity and
+  # runtime-state refusals, A3 hermetic defaults and mounts, A9 tokenless gh).
+  # Digests are recorded as artifacts; registry publishing is a separate
+  # decision. The host unit tests for the resolver/launcher run in the cli suite.
+  reviewer-image:
+    name: Reviewer sandbox image (A2/A3/A9)
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - name: Build and check each matrix image
+        run: |
+          set -eux
+          ids="$(node -e 'const t=require("./docker/reviewer/runtime-matrix.json"); process.stdout.write(t.images.map((i)=>i.id).join(" "))')"
+          count=0
+          for id in $ids; do
+            count=$((count+1))
+            tag="reviewer-image:${id}"
+            node scripts/reviewer/build-reviewer-image.mjs "$id" --tag "$tag" | tee "build-${id}.json"
+            bash scripts/reviewer/image-checks.sh "$tag" "$id" docker/reviewer/runtime-matrix.json | tee "checks-${id}.log"
+          done
+          test "$count" -ge 1   # an empty matrix must not read as a pass
+      - name: Record image digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reviewer-image-digests
+          path: build-*.json
+          if-no-files-found: error
+
   audit:
     name: Dependency Audit
     permissions:
