@@ -17,11 +17,16 @@
   `TPS_MAIL_DIR`/`TPS_TEST_KEYS_DIR` so a real one cannot leak back in, and
   preloads (`bun --preload`) a guard that ABORTS the run unless `os.homedir()`
   resolves inside that root — so a forgotten test cannot reach the real HOME.
-  The launcher also snapshots the real `~/.tps` before and after every lane
-  (paths, sizes and mtimes only — never contents) and FAILS the lane if anything
-  changed, catching a leak that hard-codes the real path. The
-  `openclaw-tps-mail` plugin's self-contained launcher gets the same before/after
-  snapshot beside its existing HOME override and bunfig preload.
+  `bunfig.toml` preloads in `packages/agent`, `packages/cli` and
+  `packages/pi-tps-mail` apply the same guard to a bare `bun test` in those
+  directories (mirroring the plugin's existing bunfig guard); the repo root has
+  none, because the container `attested` lane runs a targeted `bun test` there
+  against its own ephemeral HOME. The launcher also snapshots the real `~/.tps`
+  before and after every lane (paths, sizes and mtimes only — never contents)
+  and FAILS the lane if anything changed, catching a leak that hard-codes the
+  real path. The `openclaw-tps-mail` plugin's self-contained launcher gets the
+  same before/after snapshot beside its existing HOME override and bunfig
+  preload.
 
   A CI step runs the suite with `HOME` pointed at an empty directory and asserts
   that directory still has no `.tps` afterwards.
