@@ -26,6 +26,14 @@ export interface WatchOptions {
   launcherArgs?: string[];
   /** Dispatch timeout in ms (default: 1_800_000 = 30 min) */
   timeoutMs?: number;
+  /** Poll interval for new/ in ms (default: 5000) */
+  pollIntervalMs?: number;
+  /**
+   * First retry delay in ms after a reply send FAILS (default: 60_000). The
+   * inbound is not acknowledged; it goes back to new/ and the same reply is
+   * re-sent after this delay, doubling per failure up to 30 minutes.
+   */
+  retryBackoffMs?: number;
 }
 
 /** Mail watcher handle */

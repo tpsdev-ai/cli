@@ -58,7 +58,7 @@ import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
-import { promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
 import {
@@ -69,6 +69,7 @@ import {
   nackOwed,
   newestSessionTranscript,
   readObligation,
+  receiptThread,
   receiptsDir,
   scanForReceipt,
   sweepTerminalObligations,
@@ -116,7 +117,15 @@ interface TpsMailBody {
    *  startAccount). */
   accountId?: string;
   headers?: Record<string, string>;
+  /** The thread this mail claims. On a mail this plugin WRITES it is the
+   *  inbound's SIGNED envelope messageId, equal to the `replyToId` signed inside
+   *  the envelope (cli#429); a recipient's promote() re-stamps it from the
+   *  verified envelope. The inbound's local record id rides only in the
+   *  `X-TPS-InReplyTo` header, as bookkeeping. */
   replyToId?: string;
+  /** Set by promote() on an INBOUND: its verified envelope's messageId — the
+   *  thread id a reply to it signs (cli#429). */
+  envelopeId?: string;
   ackedAt?: string;
   nackedAt?: string;
   nackReason?: string;
@@ -404,8 +413,9 @@ function postCommit(log: any, name: string, context: string, step: () => void): 
 
 /**
  * The obligation ids the bridge's `deliverToSandbox` record carries when the
- * caller has them (cli#389 round 5, item 2): the obligation, the inbound the
- * reply answers, and the reply itself. EMPTY for a message that owes no
+ * caller has them (cli#389 round 5, item 2): the obligation, the thread the
+ * reply answers (its signed `replyToId` — the inbound's envelope id, cli#429),
+ * and the reply itself. EMPTY for a message that owes no
  * obligation (an ordinary outbound send, a nack), so that record stays
  * byte-identical to the one the CLI's own local send writes.
  */
@@ -503,15 +513,39 @@ function deliverOutboundMail(
   }
 }
 
+/** The outcome of signing a reply or nack (cli#429): the signed envelope JSON,
+ *  or a NAMED reason it could not be signed — never a raw body to fall back on. */
+type SignedReply = { ok: true; body: string } | { ok: false; reason: string; detail: string };
+
 /**
- * Sign a dispatcher reply as a v1 signed envelope, exactly like `tps mail
- * send` (packages/cli/src/commands/mail.ts `maybeSignEnvelopeBody`). Returns
- * the JSON-stringified signed envelope, or null when the agent has no
- * signing key (caller must warn and write nothing).
+ * Sign a dispatcher reply (or a nack) as a v1 signed envelope, like `tps mail
+ * send` (packages/cli/src/utils/mail-sign.ts). The key is resolved by the CLI's
+ * agent-keys search path (~/.flair/keys/<id>.key, then ~/.tps/identity/<id>.key).
+ *
+ * cli#429: `replyToId` is the inbound's SIGNED envelope messageId — the durable
+ * thread id — and it is carried INSIDE the envelope, so the signature covers it:
+ * a recipient's promote() rejects a reply whose thread was changed or stripped.
+ * It must satisfy the CLI's one id rule (isValidEnvelopeId). The wrapper id of
+ * the inbound is local bookkeeping and never goes in here.
+ *
+ * NEVER throws and never yields an unsigned body: a missing, unreadable or
+ * malformed key (or an invalid thread id) is a named `{ ok: false }`, and every
+ * caller refuses to send in that case.
  */
-function signReplyEnvelope(from: string, to: string, body: string): string | null {
-  const privkey = readAgentPrivateKey(from);
-  if (!privkey) return null;
+function signReplyEnvelope(from: string, to: string, body: string, replyToId: string | undefined): SignedReply {
+  if (replyToId !== undefined && !isValidEnvelopeId(replyToId)) {
+    return { ok: false, reason: "invalid-thread-id", detail: "the inbound's envelope id does not satisfy the id rule" };
+  }
+  let privkey: Buffer | null;
+  try {
+    privkey = readAgentPrivateKey(from);
+  } catch (err: any) {
+    // AgentKeyError: names the path and the defect, never key material.
+    return { ok: false, reason: `unusable-signing-key:${from}`, detail: String(err?.message ?? err) };
+  }
+  if (!privkey) {
+    return { ok: false, reason: `missing-signing-key:${from}`, detail: `no Ed25519 private key for ${from}` };
+  }
 
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
@@ -541,8 +575,13 @@ function signReplyEnvelope(from: string, to: string, body: string): string | nul
     timestamp: now,
     delegationChain: chain,
   };
+  if (replyToId !== undefined) envelope.replyToId = replyToId;
 
-  return JSON.stringify(signEnvelope(envelope, { [from]: privkey }));
+  try {
+    return { ok: true, body: JSON.stringify(signEnvelope(envelope, { [from]: privkey })) };
+  } catch (err: any) {
+    return { ok: false, reason: `signing-failed:${from}`, detail: String(err?.message ?? err) };
+  }
 }
 
 /**
@@ -654,6 +693,9 @@ interface YieldContext {
   accountId: string;
   curPath: string;
   inboundId: string;
+  /** cli#429: the inbound's SIGNED envelope messageId, from the obligation
+   *  record — the thread a nack signs. Undefined for a pre-cli#429 record. */
+  inboundEnvelopeId?: string;
   cfg: any;
   log: any;
   /**
@@ -960,6 +1002,7 @@ function retryOwedNackInBackground(
   accountId: string,
   cfg: any,
   log: any,
+  inboundEnvelopeId?: string,
 ): void {
   const timeoutMs = resolveNackRetryTimeoutMs();
   // BACKSTOP, deliberately ABOVE the delivery's own bound: the relay closes the
@@ -978,6 +1021,7 @@ function retryOwedNackInBackground(
     inboundId,
     cfg,
     log,
+    inboundEnvelopeId,
   );
   let timer: ReturnType<typeof setTimeout> | null = null;
   const expired = new Promise<"expired">((res) => {
@@ -1072,7 +1116,7 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
-  const receipt = scanForReceipt(receiptDirs(ctx), obligationId, ctx.inboundId, ctx.agent, ctx.accountId, rec.replyId);
+  const receipt = scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
   // record) is a definitive non-delivery: the obligation fails and nacks even
@@ -1103,8 +1147,35 @@ function makeYieldCtx(
   inboundId: string,
   cfg: any,
   log: any,
+  inboundEnvelopeId?: string,
 ): YieldContext {
-  return { mailDir, agent, sender, accountId, curPath, inboundId, cfg, log };
+  return { mailDir, agent, sender, accountId, curPath, inboundId, inboundEnvelopeId, cfg, log };
+}
+
+/**
+ * The receipt scan for one obligation, with the thread its receipt must carry
+ * taken from the obligation RECORD (cli#429, receiptThread): the inbound's
+ * signed envelope id for a current record, its record id for a pre-cli#429
+ * one. Every scan (the turn's own, the deadline's, recovery's) goes through
+ * this, so all three check the same thread.
+ */
+function scanObligationReceipt(
+  ctx: YieldContext,
+  obligationId: string,
+  rec: { inboundId: string; inboundEnvelopeId?: string },
+  expectedReplyId: string | undefined,
+): ReturnType<typeof scanForReceipt> {
+  const thread = receiptThread(rec);
+  return scanForReceipt(
+    receiptDirs(ctx),
+    obligationId,
+    thread.threadId,
+    ctx.agent,
+    ctx.accountId,
+    expectedReplyId,
+    undefined,
+    thread.mode,
+  );
 }
 
 /**
@@ -1116,7 +1187,10 @@ function makeYieldCtx(
  * ASYNC since cli#389 round 10: settling a failure AWAITS the nack mail, so
  * recovery can hand a still-owed nack to the sender before it returns.
  */
-async function reconcileObligation(ctx: YieldContext, rec: { obligationId: string; deadlineAt: string | null; inboundId: string; replyId?: string }): Promise<void> {
+async function reconcileObligation(
+  ctx: YieldContext,
+  rec: { obligationId: string; deadlineAt: string | null; inboundId: string; inboundEnvelopeId?: string; replyId?: string },
+): Promise<void> {
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
@@ -1136,7 +1210,7 @@ async function reconcileObligation(ctx: YieldContext, rec: { obligationId: strin
       return;
     }
   }
-  const receipt = scanForReceipt(receiptDirs(ctx), rec.obligationId, rec.inboundId, ctx.agent, ctx.accountId, rec.replyId);
+  const receipt = scanObligationReceipt(ctx, rec.obligationId, rec, rec.replyId);
   if (receipt.status === "found") {
     await settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
     return;
@@ -1161,18 +1235,34 @@ async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
     : `${reason}; no session transcript was found under the agent's sessions dir`;
-  const signedBody = signReplyEnvelope(ctx.agent, ctx.sender, detail);
+  // cli#429: the nack threads on the inbound's SIGNED envelope id (from the
+  // obligation record), signed inside the envelope like a reply. A record from
+  // before cli#429 has none: that nack is signed but unthreaded.
+  const thread = isValidEnvelopeId(ctx.inboundEnvelopeId) ? ctx.inboundEnvelopeId : undefined;
+  const signed = signReplyEnvelope(ctx.agent, ctx.sender, detail, thread);
+  if (!signed.ok) {
+    // cli#429: NEVER an unsigned nack. A body a promote()-reading recipient
+    // dead-letters tells the sender nothing — so nothing is sent, the failure
+    // is logged BY NAME, and the record keeps nackPending: the next start
+    // retries, and a provisioned key lets that retry go out.
+    ctx.log?.warn?.(
+      `tps-mail: nack-unsigned-refused: the nack for ${ctx.inboundId} to ${ctx.sender} was NOT sent — ` +
+        `it could not be signed (${signed.reason}: ${signed.detail}); an unsigned nack is never sent`,
+    );
+    return false;
+  }
   const message: TpsMailBody = {
     id: randomUUID(),
     from: ctx.agent,
     to: ctx.sender,
-    body: signedBody ?? detail,
+    body: signed.body,
     timestamp: new Date().toISOString(),
-    replyToId: ctx.inboundId,
+    ...(thread ? { replyToId: thread } : {}),
     accountId: ctx.accountId,
     headers: {
       "X-TPS-Trust": "agent",
       "X-TPS-Surface": CHANNEL_ID,
+      // Bookkeeping: the inbound's LOCAL record id (never the thread).
       "X-TPS-InReplyTo": ctx.inboundId,
       "X-TPS-Nack": reason,
     },
@@ -1515,6 +1605,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         () => ({
           obligationId,
           inboundId: msg.id,
+          // cli#429: the durable thread id — the inbound's SIGNED envelope id
+          // (promote()/recoverPromoted() stamp it, and the id rule holds there).
+          ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
           inboundTimestamp: msg.timestamp,
           from: msg.from,
           to: recipient,
@@ -1526,7 +1619,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         log,
       );
       const obId = created.record.obligationId;
-      const yieldCtx = makeYieldCtx(account.mailDir, recipient, msg.from, account.accountId, curPath, msg.id, cfg, log);
+      const yieldCtx = makeYieldCtx(
+        account.mailDir,
+        recipient,
+        msg.from,
+        account.accountId,
+        curPath,
+        msg.id,
+        cfg,
+        log,
+        created.record.inboundEnvelopeId,
+      );
       yieldContexts.set(obId, yieldCtx);
 
       // A replayed inbound (or a re-dispatch) must NOT open a SECOND obligation
@@ -1594,25 +1697,33 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // POST EXACTLY ONCE, after the dispatch has resolved.
         if (latestFinalText !== null) {
           const replyText = latestFinalText;
-          // Requirement 4: sign the reply (Ed25519 + messageId).
-          const signedBody = signReplyEnvelope(recipient, msg.from, replyText);
-          if (!signedBody) {
-            postFailure = postFailure ?? `missing-signing-key:${recipient}`;
+          // Requirement 4: sign the reply (Ed25519 + messageId). cli#429: the
+          // thread is the inbound's SIGNED envelope id, signed INSIDE the
+          // envelope; the inbound's record id is bookkeeping only.
+          const thread = msg.envelopeId;
+          const signed: SignedReply = isValidEnvelopeId(thread)
+            ? signReplyEnvelope(recipient, msg.from, replyText, thread)
+            : { ok: false, reason: `unthreadable-inbound:${msg.id}`, detail: "the inbound carries no valid signed envelope id" };
+          if (!signed.ok) {
+            postFailure = postFailure ?? signed.reason;
             log?.warn?.(
-              `tps-mail: no signing key for ${recipient}; cannot sign dispatcher reply to ${msg.from}`,
+              `tps-mail: cannot sign the dispatcher reply from ${recipient} to ${msg.from} (${signed.reason}: ${signed.detail}); ` +
+                `nothing is sent — an unsigned reply is never sent`,
             );
           } else {
             const reply: TpsMailBody = {
               id: randomUUID(),
               from: recipient,
               to: msg.from,
-              body: signedBody,
+              body: signed.body,
               timestamp: new Date().toISOString(),
-              replyToId: msg.id,
+              // The SIGNED thread — the same value the envelope carries.
+              replyToId: thread,
               accountId: account.accountId,
               headers: {
                 "X-TPS-Trust": "agent",
                 "X-TPS-Surface": CHANNEL_ID,
+                // Bookkeeping: the inbound's LOCAL record id (never the thread).
                 "X-TPS-InReplyTo": msg.id,
                 // THE RECEIPT: the marker the ack scan keys on.
                 "X-TPS-Obligation": obId,
@@ -1766,14 +1877,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
         // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
-        const receipt = scanForReceipt(
-          receiptDirs(yieldCtx),
-          obId,
-          msg.id,
-          recipient,
-          account.accountId,
-          postedReplyId ?? undefined,
-        );
+        const receipt = scanObligationReceipt(yieldCtx, obId, created.record, postedReplyId ?? undefined);
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";
           await settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });
@@ -1923,7 +2027,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // or the sweep runs first.
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!nackOwed(rec)) continue;
-          retryOwedNackInBackground(account.mailDir, agentId, rec.from, rec.inboundId, rec.failure ?? "failed", account.accountId, cfg, log);
+          retryOwedNackInBackground(
+            account.mailDir,
+            agentId,
+            rec.from,
+            rec.inboundId,
+            rec.failure ?? "failed",
+            account.accountId,
+            cfg,
+            log,
+            rec.inboundEnvelopeId,
+          );
         }
 
         // OBLIGATION RETENTION (cli#401): delete ONLY terminal records (acked,
@@ -1965,6 +2079,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             rec.inboundId,
             cfg,
             log,
+            rec.inboundEnvelopeId,
           );
           yieldContexts.set(rec.obligationId, ctx);
           await reconcileObligation(ctx, rec);

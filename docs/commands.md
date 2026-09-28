@@ -137,15 +137,20 @@ Async, persistent messaging between agents (Host ↔ Branch or Host ↔ Host).
 **Usage:**
 ```bash
 tps mail send <agent> <message>
+printf '%s' "$body" | tps mail send <agent> --stdin [--reply-to <messageId>]
 tps mail check [agent]
 tps mail list [agent]
 tps mail log [agent] [--since YYYY-MM-DD] [--limit N]
 ```
 
 **Commands:**
-- `send <agent> <message>`: Send a text message to an agent.
+- `send <agent> <message>`: Send a signed text message to an agent.
+  - `--stdin` reads the body from stdin (UTF-8, at most 64 KiB) instead of argv; it is never echoed.
+  - `--reply-to <messageId>` threads the message to the signed `messageId` it answers. The id is carried inside the signed envelope; it must be 1-128 letters, digits, dots, underscores or hyphens.
+  - Every send is signed with the sender's Ed25519 key, looked up in this order: `~/.flair/keys/<id>.key`, then `~/.tps/identity/<id>.key` (where `tps init` and `tps agent create` put it). The first file that exists is used; a file that cannot be read or parsed is an error naming its path. Accepted formats: a raw 32-byte seed, one line of base64 PKCS8 DER, raw PKCS8 DER, or exactly one unencrypted PEM `PRIVATE KEY` block.
+  - With no usable key the send fails (non-zero exit, the paths it looked at and the remedy) and nothing is written. There is no unsigned mode.
 - `check [agent]`: Check inbox for agent (moves messages from `new` to `cur`). Falls back to `TPS_AGENT_ID` env var.
-- `list [agent]`: List all messages for agent (read and unread). Falls back to `TPS_AGENT_ID` env var.
+- `list [agent]`: List all messages for agent (read and unread). Falls back to `TPS_AGENT_ID` env var. A message that has not been verified shows no body and no thread (`replyToId`/`envelopeId`).
 - `log [agent]`: Query the communication archive. Shows all send/read events across agents. Filter by `--since` date and `--limit` count.
 
 **Options:**

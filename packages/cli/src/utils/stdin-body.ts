@@ -68,11 +68,36 @@ function sleepSync(ms: number): void {
 }
 
 /**
- * Read all of fd 0 as UTF-8, capped at `maxBytes` (default: the envelope body
- * cap, `MAX_BODY_BYTES`). Throws EmptyStdinError on zero bytes and
- * StdinTooLargeError past the cap. Never touches `process.stdin`.
+ * The I/O the reader performs — injectable so a test can drive the EAGAIN path
+ * DETERMINISTICALLY (a real non-blocking fd returns EAGAIN only when the writer
+ * happens to be slower than the reader, which no test can schedule). Default:
+ * node's `readSync` on fd 0 and a synchronous sleep.
  */
-export function readStdinBodySync(maxBytes: number = MAX_BODY_BYTES): string {
+export interface StdinReadIo {
+  readSync: (fd: number, buffer: Buffer, offset: number, length: number, position: null) => number;
+  sleep: (ms: number) => void;
+  /** Give up after this many ms of consecutive EAGAIN. Default EAGAIN_TIMEOUT_MS. */
+  eagainTimeoutMs: number;
+}
+
+/** Error thrown when stdin stayed EAGAIN (no data, no EOF) past the retry budget. */
+export class StdinTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`timed out reading the message body from stdin (no data for ${ms}ms)`);
+    this.name = "StdinTimeoutError";
+  }
+}
+
+/**
+ * Read all of fd 0 as UTF-8, capped at `maxBytes` (default: the envelope body
+ * cap, `MAX_BODY_BYTES`). Throws EmptyStdinError on zero bytes,
+ * StdinTooLargeError past the cap, and StdinTimeoutError when the fd stays
+ * EAGAIN past the budget. Never touches `process.stdin`.
+ */
+export function readStdinBodySync(maxBytes: number = MAX_BODY_BYTES, io: Partial<StdinReadIo> = {}): string {
+  const read = io.readSync ?? ((fd, b, off, len, pos) => readSync(fd, b, off, len, pos));
+  const sleep = io.sleep ?? sleepSync;
+  const budgetMs = io.eagainTimeoutMs ?? EAGAIN_TIMEOUT_MS;
   const chunks: Buffer[] = [];
   const buf = Buffer.alloc(CHUNK);
   let total = 0;
@@ -82,17 +107,17 @@ export function readStdinBodySync(maxBytes: number = MAX_BODY_BYTES): string {
     let n: number;
     try {
       // position=null: read from the fd's current position (sequential).
-      n = readSync(0, buf, 0, buf.length, null);
+      n = read(0, buf, 0, buf.length, null);
     } catch (err: unknown) {
       const code = (err as { code?: string } | null)?.code;
       if (code === "EAGAIN") {
         // Non-blocking fd, no data available yet: back off and retry rather
-        // than treating "not ready" as EOF.
+        // than treating "not ready" as EOF. The budget counts CONSECUTIVE
+        // EAGAIN time: any data resets it (a writer that pauses between chunks
+        // is not a dead writer).
         eagainMs += EAGAIN_SLEEP_MS;
-        if (eagainMs > EAGAIN_TIMEOUT_MS) {
-          throw new Error("timed out reading the message body from stdin");
-        }
-        sleepSync(EAGAIN_SLEEP_MS);
+        if (eagainMs > budgetMs) throw new StdinTimeoutError(budgetMs);
+        sleep(EAGAIN_SLEEP_MS);
         continue;
       }
       // `EOF` is not thrown by node's readSync (it returns 0); treat a stray one
@@ -103,6 +128,7 @@ export function readStdinBodySync(maxBytes: number = MAX_BODY_BYTES): string {
 
     if (n === 0) break; // EOF
 
+    eagainMs = 0;
     total += n;
     if (total > maxBytes) throw new StdinTooLargeError(total, maxBytes);
     chunks.push(Buffer.from(buf.subarray(0, n)));

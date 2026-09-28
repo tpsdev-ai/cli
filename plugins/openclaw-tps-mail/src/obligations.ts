@@ -101,8 +101,16 @@ export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "
 
 export interface ObligationRecord {
   obligationId: string;
-  /** The mail file id this obligation is keyed on (the plugin's MessageSid). */
+  /** The mail file id this obligation is keyed on (the plugin's MessageSid).
+   *  BOOKKEEPING ONLY: a record id is local — a branch regenerates it on
+   *  delivery — so it is never the thread a reply claims (cli#429). */
   inboundId: string;
+  /** cli#429: the inbound's SIGNED envelope `messageId` — the durable thread
+   *  id. The reply (and the nack) sign it as `replyToId` inside the envelope,
+   *  and the receipt scan requires a receipt to carry it. Absent on records
+   *  written before cli#429: such an obligation's receipt carries the
+   *  inbound's record id instead, and the scan checks that (see receiptThread). */
+  inboundEnvelopeId?: string;
   inboundTimestamp: string;
   /** The VERIFIED sender — the value promote() overwrote/wrote. */
   from: string;
@@ -721,7 +729,9 @@ export interface ReceiptRecord {
   replyId: string;
   /** The obligation this receipt discharges. */
   obligationId: string;
-  /** The inbound the reply answers (the obligation's `inboundId`). */
+  /** The thread the reply carries (receiptThread): the inbound's SIGNED
+   *  envelope messageId (cli#429) — for an obligation written before cli#429,
+   *  the inbound's record id. */
   replyToId: string;
   /** local | outbox | remote-branch | bridge */
   route: string;
@@ -826,6 +836,41 @@ export function envelopeFrom(body: string): string | null {
   }
 }
 
+/** The thread an envelope body CLAIMS (its `.replyToId`), or null when absent or
+ *  unparseable (cli#429). A CLAIM: the RECIPIENT's promote() verifies the
+ *  signature that covers it; this scan does not. */
+export function envelopeReplyTo(body: string): string | null {
+  try {
+    const parsed = JSON.parse(body);
+    return typeof parsed?.replyToId === "string" ? parsed.replyToId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * cli#429 — WHICH thread a receipt for this obligation must carry, and how.
+ *
+ *   - `signed`: the obligation knows the inbound's SIGNED envelope messageId.
+ *     Its reply signs that id as `replyToId` INSIDE the envelope, so a receipt
+ *     must carry it on the record AND in the envelope it wraps (for a record
+ *     that wraps one) — a reply whose signed thread was changed or stripped is
+ *     not accepted as this obligation's receipt.
+ *   - `legacy`: an obligation written before cli#429 has no envelope id; its
+ *     reply carried the inbound RECORD id on the wrapper only, so that is what
+ *     its receipt is checked against. Never used for a new obligation.
+ */
+export function receiptThread(record: { inboundId: string; inboundEnvelopeId?: string }): {
+  threadId: string;
+  mode: ReceiptThreadMode;
+} {
+  return typeof record.inboundEnvelopeId === "string" && record.inboundEnvelopeId.length > 0
+    ? { threadId: record.inboundEnvelopeId, mode: "signed" }
+    : { threadId: record.inboundId, mode: "legacy" };
+}
+
+export type ReceiptThreadMode = "signed" | "legacy";
+
 /**
  * TWO receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
  * it answers, and — when the obligation record knows it — the reply itself.
@@ -852,6 +897,10 @@ export function envelopeFrom(body: string): string | null {
  *       verified signature — see "what this is not" below; and
  *   (e) `record.replyToId === replyToId` — the record ANSWERS this inbound, so a
  *       reused obligation id can never be satisfied by a reply to another one.
+ *       In `signed` thread mode (cli#429, see receiptThread) `replyToId` is the
+ *       inbound's SIGNED envelope id and the wrapped envelope must CLAIM the
+ *       same `replyToId` too — the thread lives inside the signature, so a
+ *       record whose envelope thread was changed or stripped is not a receipt.
  *   OR (f) — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
  *       record `deliverToSandbox` writes, which carries the obligation ids when
  *       the caller supplies them (`record.obligationId === obligationId`,
@@ -912,8 +961,13 @@ export function scanForReceipt(
   accountId: string,
   expectedReplyId?: string,
   fs: ReceiptScanFs = realFs,
+  threadMode: ReceiptThreadMode = "legacy",
 ): ReceiptScan {
   let malformed: { path: string; ownRecord: boolean } | null = null;
+  // cli#429: in `signed` mode the envelope a record wraps must claim the same
+  // thread as the record (the signed one); `legacy` records predate that.
+  const envelopeThreadOk = (body: unknown): boolean =>
+    threadMode !== "signed" || envelopeReplyTo(typeof body === "string" ? body : "") === replyToId;
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
   //     the agent's receipts root holds a receipt per non-local delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
@@ -975,6 +1029,7 @@ export function scanForReceipt(
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
         if (envelopeFrom(record?.body ?? "") !== agent) continue;
+        if (!envelopeThreadOk(record?.body)) continue;
         return { status: "found", path };
       }
       // (2b) the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
@@ -991,7 +1046,8 @@ export function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
-        envelopeFrom(record?.body ?? "") === agent
+        envelopeFrom(record?.body ?? "") === agent &&
+        envelopeThreadOk(record?.body)
       ) {
         return { status: "found", path };
       }

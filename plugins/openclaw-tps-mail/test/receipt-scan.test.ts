@@ -36,7 +36,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { scanForReceipt } from "../src/obligations.js";
+import { receiptThread, scanForReceipt } from "../src/obligations.js";
 
 const AGENT = "anvil";
 const ACCOUNT = "default";
@@ -372,5 +372,65 @@ describe("cli#389 round 4 — the receipts dir is read by DIRECT PATH ONLY", () 
     expect(scan.status).toBe("found");
     expect(scan.status === "found" && scan.path).toBe(join(receiptsRoot(), `${OB_ID}.json`));
     expect(listed, "the direct path answers, so nothing is listed").toEqual([]);
+  });
+});
+
+// ── cli#429: the SIGNED thread — a changed or stripped envelope thread is not a receipt ──
+
+describe("receipt scan — cli#429 signed thread mode", () => {
+  /** The inbound's SIGNED envelope id: the thread a current obligation's reply carries. */
+  const THREAD = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0";
+
+  function signedReply(envReplyTo: string | null, wrapperReplyTo = THREAD): any {
+    const env: Record<string, unknown> = { v: 1, from: AGENT, to: "flint", body: "the answer" };
+    if (envReplyTo !== null) env.replyToId = envReplyTo;
+    return { ...reply({ replyToId: wrapperReplyTo }), body: JSON.stringify(env) };
+  }
+  const scan = (mode: "signed" | "legacy", thread = THREAD) =>
+    scanForReceipt({ direct: [], posted: [dir] }, OB_ID, thread, AGENT, ACCOUNT, undefined, undefined, mode).status;
+
+  it("wrapper AND envelope carry the signed thread → found (positive control)", () => {
+    writeReply(signedReply(THREAD));
+    expect(scan("signed")).toBe("found");
+  });
+
+  it("the envelope's thread CHANGED (wrapper still right) → NOT found", () => {
+    writeReply(signedReply("a-different-thread"));
+    expect(scan("signed")).toBe("absent");
+  });
+
+  it("the envelope's thread STRIPPED (wrapper still right) → NOT found", () => {
+    writeReply(signedReply(null));
+    expect(scan("signed")).toBe("absent");
+  });
+
+  it("the WRAPPER's thread changed (envelope right) → NOT found", () => {
+    writeReply(signedReply(THREAD, "a-different-thread"));
+    expect(scan("signed")).toBe("absent");
+  });
+
+  it("the bridge sandbox record is held to the same envelope thread", () => {
+    const env = { v: 1, from: AGENT, to: "flint", body: "the answer", replyToId: "a-different-thread" };
+    writeReply({
+      id: "sandbox-record-1", from: AGENT, to: "flint", body: JSON.stringify(env), timestamp: new Date().toISOString(),
+      obligationId: OB_ID, replyToId: THREAD, replyId: "reply-1",
+    });
+    expect(scan("signed")).toBe("absent");
+    writeReply({
+      id: "sandbox-record-1", from: AGENT, to: "flint", body: JSON.stringify({ ...env, replyToId: THREAD }),
+      timestamp: new Date().toISOString(), obligationId: OB_ID, replyToId: THREAD, replyId: "reply-1",
+    });
+    expect(scan("signed")).toBe("found");
+  });
+
+  it("LEGACY mode (an obligation written before cli#429) keeps the old wrapper-only check", () => {
+    // Its reply carried the inbound RECORD id on the wrapper and nothing in the envelope.
+    writeReply(signedReply(null, INBOUND));
+    expect(scan("legacy", INBOUND)).toBe("found");
+  });
+
+  it("receiptThread: a current record threads on its SIGNED envelope id; a pre-cli#429 record on its record id", () => {
+    expect(receiptThread({ inboundId: INBOUND, inboundEnvelopeId: THREAD })).toEqual({ threadId: THREAD, mode: "signed" });
+    expect(receiptThread({ inboundId: INBOUND })).toEqual({ threadId: INBOUND, mode: "legacy" });
   });
 });

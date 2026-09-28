@@ -39,7 +39,7 @@ import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
-import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@tpsdev-ai/agent";
 // The REAL consumer: the branch relay quarantines an unparseable outbox record
 // with this exact function (packages/cli/src/commands/branch.ts imports it from
 // the same module). Imported from the built CLI so we exercise the shipped
@@ -378,6 +378,10 @@ interface DispatchOutcome {
   sandboxRecord: any | null;
   /** Every warn the plugin logged while this route ran. */
   warns: string[];
+  /** The inbound's local record id (bookkeeping only). */
+  inboundId: string;
+  /** cli#429: the inbound's SIGNED envelope messageId — the thread a reply signs. */
+  inboundEnvelopeId: string;
 }
 
 /** Route the DISPATCHER reply path and report the full obligation outcome. */
@@ -413,6 +417,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       deliveryAttempts: 0,
     };
     writeFileSync(join(newDir, `2026-05-26T00-00-00-${inboundId}.json`), JSON.stringify(inbound, null, 2), "utf-8");
+    // cli#429: the durable thread id is the SIGNED envelope's messageId.
+    const inboundEnvelopeId: string = JSON.parse(inbound.body).messageId;
 
     let dispatched: any = null;
     let settleFn: (() => void) | null = null;
@@ -468,8 +474,9 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const bridgeDirs = [join(root, ".tps", "branch-office", sender, "mail", "new")];
     const isReply = (rec: any) => rec?.headers?.["X-TPS-InReplyTo"] === inboundId;
     // cli#389 round 3: a metadata receipt carries NO headers and NO body, so it
-    // is found by the ids it names — the reply, and the inbound it answers.
-    const isReceipt = (rec: any) => typeof rec?.replyId === "string" && rec?.replyToId === inboundId;
+    // is found by the ids it names — the reply, and the thread it answers
+    // (cli#429: the inbound's SIGNED envelope id, not its record id).
+    const isReceipt = (rec: any) => typeof rec?.replyId === "string" && rec?.replyToId === inboundEnvelopeId;
 
     const local = scanFor([senderNew, senderCur], isReply);
     const outbox = scanFor(outboxDirs, isReply);
@@ -494,7 +501,7 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const inboundRec = scanFor([join(mailDir, agentId, "cur"), newDir], (r) => r?.id === inboundId)[0];
     // cli#389 round 5, item 2: the bridge's sandbox record, carrying the
     // obligation ids deliverToSandbox was given.
-    const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundId);
+    const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundEnvelopeId);
 
     let route: DispatchOutcome["route"] = "failure";
     let replyId: string | null = null;
@@ -537,6 +544,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       inboundNackReason: inboundRec?.rec?.nackReason ?? null,
       sandboxRecord: bridgeRecord[0]?.rec ?? null,
       warns,
+      inboundId,
+      inboundEnvelopeId,
     };
   } finally {
     if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
@@ -755,7 +764,8 @@ describe("cli#389 item 1 (round 3) — a bridge reply persists the same receipt"
     expect(outcome.receiptRecord.branchId).toBe("ember");
     expect(outcome.receiptRecord.obligationId).toBe(outcome.obligation?.obligationId);
     expect(typeof outcome.receiptRecord.replyId).toBe("string");
-    expect(outcome.receiptRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    // cli#429: the receipt names the THREAD — the inbound's signed envelope id.
+    expect(outcome.receiptRecord.replyToId).toBe(outcome.obligation?.inboundEnvelopeId);
     // The obligation is DISCHARGED: acked at the receipt, never nacked.
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
@@ -813,7 +823,7 @@ describe("cli#389 round 5, item 2 — a receipt write that fails AFTER the bridg
     expect(outcome.sandboxRecord, "the sandbox record is the local evidence").not.toBeNull();
     expect(outcome.sandboxRecord.obligationId).toBe(relay.bridge[0]!.msg.obligationId);
     expect(outcome.sandboxRecord.obligationId).toBe(outcome.obligation?.obligationId);
-    expect(outcome.sandboxRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    expect(outcome.sandboxRecord.replyToId).toBe(outcome.obligation?.inboundEnvelopeId);
     expect(outcome.sandboxRecord.replyId).toBe(relay.bridge[0]!.msg.replyId);
   }, 20000);
 
@@ -1190,5 +1200,100 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
     expect(outcome.inboundNackedAt, "the inbound carries no nackedAt").toBeNull();
     expect(outcome.nack, "no nack mail").toBeNull();
     expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
+  }, 20000);
+});
+
+// ── cli#429: a reply threads on the SIGNED inbound id, INSIDE the signature ──
+
+/**
+ * cli#429 (blocker 1). A dispatcher reply must claim its thread INSIDE the
+ * envelope the signature covers, and the thread is the inbound's SIGNED
+ * envelope messageId — never the inbound's local record id (a branch
+ * regenerates that on delivery). The record id stays only as bookkeeping (the
+ * obligation key and the `X-TPS-InReplyTo` header).
+ *
+ * For each route the reply leaves this host by — local maildir, outbox, wire —
+ * the delivered envelope is checked three ways: it VERIFIES as sent; a CHANGED
+ * thread id breaks the signature; a STRIPPED thread id breaks the signature.
+ * A recipient's promote() runs exactly that verification first, so a changed or
+ * stripped reply is dead-lettered there (proved end-to-end for the local route).
+ */
+describe("cli#429 — replies thread on the SIGNED inbound envelope id, inside the signature", () => {
+  const anvilKeys = { async getAgent(name: string) { return name === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+
+  async function expectThreadBound(env: Envelope, inboundEnvelopeId: string): Promise<void> {
+    expect(env.replyToId, "the envelope carries the SIGNED inbound id").toBe(inboundEnvelopeId);
+    expect(await verifyEnvelope(env, anvilKeys), "the reply verifies as sent").toEqual({ ok: true });
+    const changed = { ...env, replyToId: "a-different-thread-id" };
+    expect((await verifyEnvelope(changed, anvilKeys)).ok, "a CHANGED thread breaks the signature").toBe(false);
+    const { replyToId: _stripped, ...stripped } = env;
+    expect((await verifyEnvelope(stripped as Envelope, anvilKeys)).ok, "a STRIPPED thread breaks the signature").toBe(false);
+  }
+
+  it("LOCAL: the maildir reply signs the inbound envelope id; a changed or stripped copy is dead-lettered by the recipient's promote()", async () => {
+    const setup = () => maildirFor("flint");
+    const r = await inFreshHome(setup, async () => {
+      const o = await routeViaDispatcher("flint", ["anvil"]);
+      // End-to-end: plant a CHANGED and a STRIPPED copy of the delivered reply
+      // in the recipient's new/ and run the recipient's own enforcement point.
+      const { promote } = await import("@tpsdev-ai/cli/utils/mail");
+      const flintNew = join(mailDir, "flint", "new");
+      const results: Record<string, any> = {};
+      if (o.replyRecord) {
+        const env = JSON.parse(o.replyRecord.body);
+        const { replyToId: _gone, ...strippedEnv } = env;
+        const variants: Record<string, any> = {
+          changed: { ...env, replyToId: "a-different-thread-id" },
+          stripped: strippedEnv,
+        };
+        for (const [name, variant] of Object.entries(variants)) {
+          const rec = { ...o.replyRecord, id: `tampered-${name}`, body: JSON.stringify(variant) };
+          const p = join(flintNew, `2026-05-27T00-00-00-tampered-${name}.json`);
+          writeFileSync(p, JSON.stringify(rec, null, 2), "utf-8");
+          results[name] = await promote("flint", p);
+        }
+      }
+      return { o, results };
+    });
+    const o = r.o;
+    expect(o.route).toBe("local");
+    expect(o.obligation?.state, "the obligation is discharged by the signed-thread receipt").toBe("acked");
+    expect(o.obligation?.inboundEnvelopeId).toBe(o.inboundEnvelopeId);
+    expect(o.inboundEnvelopeId).not.toBe(o.inboundId);
+    // The wrapper claims the SAME signed thread; the record id is bookkeeping only.
+    expect(o.replyRecord.replyToId).toBe(o.inboundEnvelopeId);
+    expect(o.replyRecord.headers["X-TPS-InReplyTo"]).toBe(o.inboundId);
+    await expectThreadBound(JSON.parse(o.replyRecord.body), o.inboundEnvelopeId);
+    // The recipient's promote() dead-letters both tampered copies.
+    for (const name of ["changed", "stripped"]) {
+      expect(r.results[name]?.ok, `${name} copy is not promoted`).toBe(false);
+      expect(r.results[name]?.class, `${name} copy is rejected as invalid`).toBe("invalid");
+    }
+  }, 20000);
+
+  it("OUTBOX: the queued reply signs the inbound envelope id; changed or stripped fails verification", async () => {
+    const setup = () => {
+      branchHost();
+      maildirFor("flint");
+    };
+    const o = await inFreshHome(setup, () => routeViaDispatcher("flint", ["anvil"]));
+    expect(o.route).toBe("outbox");
+    expect(o.obligation?.state).toBe("acked");
+    expect(o.replyRecord.replyToId).toBe(o.inboundEnvelopeId);
+    expect(o.replyRecord.headers["X-TPS-InReplyTo"]).toBe(o.inboundId);
+    await expectThreadBound(JSON.parse(o.replyRecord.body), o.inboundEnvelopeId);
+  }, 20000);
+
+  it("WIRE: the delivered payload signs the inbound envelope id; changed or stripped fails verification; the receipt names the thread", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    const o = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+    expect(o.route).toBe("remote-branch");
+    expect(o.obligation?.state).toBe("acked");
+    expect(relay.deliver.length).toBe(1);
+    await expectThreadBound(JSON.parse(relay.deliver[0]!.msg.body), o.inboundEnvelopeId);
+    expect(o.receiptRecord?.replyToId, "the metadata receipt names the signed thread").toBe(o.inboundEnvelopeId);
   }, 20000);
 });

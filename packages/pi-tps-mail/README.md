@@ -67,14 +67,23 @@ process.on("SIGTERM", () => watcher.stop());
 
 ### `watchMail` behavior
 
-1. Polls `~/.tps/mail/{agent}/new/` every 5 seconds
+1. Polls `~/.tps/mail/{agent}/new/` every 5 seconds (`pollIntervalMs`)
 2. For each JSON file:
    - Parses as `MailMessage` (id, from, body)
    - Moves file to `~/.tps/mail/{agent}/cur/`
    - Spawns launcher script with message body as argument
    - Enforces hard timeout with SIGTERM → 5s grace → SIGKILL
-   - Sends reply via `tps mail send {from} {stdout}` on success
-   - Sends ack via `tps mail ack {id} {agent}` on success
+   - Sends the reply with `tps mail send {from} --stdin --reply-to {messageId}`:
+     the reply goes on **stdin** (never argv), and `--reply-to` threads it to
+     the signed `messageId` of the inbound's envelope (omitted when the inbound
+     carries none). The CLI signs it with the agent's key —
+     `~/.flair/keys/{agent}.key`, else `~/.tps/identity/{agent}.key` — and
+     refuses to send (non-zero, nothing written) when it cannot.
+   - Acknowledges with `tps mail ack {id} {agent}` **only after the send
+     succeeded**. A failed send (e.g. no signing key yet) is logged with the
+     CLI's reason, the inbound goes back to `new/`, and the same reply is
+     re-sent after a backoff (`retryBackoffMs`, default 60 s, doubling to 30
+     minutes) — the launcher is not re-run for a send failure.
 3. Continues loop on errors (bad JSON, spawn failures, timeouts)
 4. Gracefully exits on SIGINT/SIGTERM
 

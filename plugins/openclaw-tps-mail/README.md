@@ -115,6 +115,18 @@ obligation is closed, never that the sender was told it failed. Arming a
 deadline never downgrades a committed record: `delivering` and `posted` keep
 their state and only gain `deadlineAt`.
 
+**Replies and nacks are signed and threaded (cli#429).** The dispatcher's reply
+and every nack sign the inbound's verified envelope `messageId` as `replyToId`
+INSIDE the envelope, so the signature covers the thread; the inbound's local
+record id stays only in the plugin's bookkeeping (the obligation key and the
+`X-TPS-InReplyTo` header). The key is resolved like `tps mail send`'s
+(`~/.flair/keys/<id>.key`, then `~/.tps/identity/<id>.key`). A reply or nack that
+cannot be signed is NOT sent — there is no unsigned fallback: a reply becomes a
+named failure (`missing-signing-key:<id>`, `unusable-signing-key:<id>`), and a
+nack is logged `nack-unsigned-refused` and stays owed (`nackPending`) for the
+next start. The receipt scan requires the signed thread, on the record and in
+the envelope it wraps.
+
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
 the only writer of `failed` or `nackedAt` — and the only sender of the nack mail:
 every path hands its verdict to that ONE nack path, so the same verdict reaches

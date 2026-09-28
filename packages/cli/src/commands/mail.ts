@@ -1,4 +1,4 @@
-import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, type MailMessage } from "../utils/mail.js";
+import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -10,7 +10,7 @@ import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { parseInboundChain } from "../utils/agent-keys.js";
-import { signOutboundBody, assertValidReplyToId } from "../utils/mail-sign.js";
+import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 
 interface MailArgs {
@@ -31,7 +31,11 @@ interface MailArgs {
   stdin?: boolean;
   /** cli#429: the signed messageId this message replies to. */
   replyTo?: string;
-  /** cli#429: local-testing opt-in to ship an UNSIGNED body (never the default). */
+  /**
+   * cli#429: `--unsigned` is NOT supported — every send is signed. The flag is
+   * still parsed so that passing it is REFUSED by name (exit 1, nothing
+   * written) instead of being silently ignored.
+   */
   unsigned?: boolean;
   json?: boolean;
   count?: boolean;
@@ -127,30 +131,23 @@ function validateAgent(agent?: string): string {
 
 // Sign the outbound body, or FAIL.
 //
-// cli#429: `tps mail send` no longer silently degrades to unsigned. With no
-// key available the send exits NON-ZERO, the error names the key path it looked
-// at and the remedy, and NOTHING is written to any outbox or maildir — because
-// this runs BEFORE every delivery path (branch-mode outbox, remote-branch,
-// branch-office bridge, direct maildir). `--unsigned` is an explicit,
-// local-testing-only opt-in (warned on stderr) and is never the default.
+// cli#429: `tps mail send` never sends unsigned. With no usable key the send
+// exits NON-ZERO, the error names the key path(s) it looked at (or the path of
+// a key it could not read or parse) and the remedy, and NOTHING is written to
+// any outbox or maildir — because this runs BEFORE every delivery path
+// (branch-mode outbox, remote-branch, branch-office bridge, direct maildir).
+// There is no unsigned opt-in.
 //
 // The envelope builder itself lives in utils/mail-sign.ts (shared with the
-// agent runtimes) so the two cannot drift.
+// agent runtimes) so the two cannot drift; it validates --reply-to (the ONE
+// id rule) before it reads any key.
 function signOutboundOrFail(
   from: string,
   to: string,
   body: string,
-  opts: { replyToId?: string; unsigned?: boolean },
+  opts: { replyToId?: string },
 ): string {
-  if (opts.unsigned) {
-    console.warn(
-      "⚠️  --unsigned: sending WITHOUT a signature. Local testing only — " +
-        "a promote()-reading recipient dead-letters an unsigned body terminal.",
-    );
-    return body;
-  }
   try {
-    if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
     return signOutboundBody(from, to, body, {
       requireKey: true,
       replyToId: opts.replyToId,
@@ -176,6 +173,16 @@ function newestJsonMtime(dir: string): string | null {
 export async function runMail(args: MailArgs): Promise<void> {
   switch (args.action) {
     case "send": {
+      // cli#429: there is no unsigned send. Refuse the flag by name — alone or
+      // combined with --reply-to/--stdin — before any input is read or any
+      // route is touched, so nothing is written.
+      if (args.unsigned) {
+        console.error(
+          "Refusing to send: --unsigned is not supported — `tps mail send` always signs. " +
+            "Provision the sender's Ed25519 key (~/.flair/keys/<id>.key or ~/.tps/identity/<id>.key).",
+        );
+        process.exit(1);
+      }
       const to = validateAgent(args.agent);
 
       // Build the message body. Three sources, mutually exclusive (cli#429):
@@ -231,10 +238,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
       // ship signed bodies, and so a send that cannot sign fails with nothing
       // written. cli#429.
-      args.message = signOutboundOrFail(from, to, messageBody, {
-        replyToId: args.replyTo,
-        unsigned: args.unsigned,
-      });
+      args.message = signOutboundOrFail(from, to, messageBody, { replyToId: args.replyTo });
 
       // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
       // plugin so the two cannot drift: `resolveMailRoute` owns the
@@ -312,7 +316,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
 
       // Direct Maildir send: args.message was already signed by
-      // maybeSignEnvelopeBody above; `route.kind === "local"`, or the CLI's
+      // signOutboundOrFail above; `route.kind === "local"`, or the CLI's
       // fallback for an office recipient with no maildir yet.
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
@@ -358,12 +362,10 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (args.count) {
         console.log(messages.length);
       } else if (args.json) {
-        // Bodies from new/ and dlq/ are withheld: new/ is unverified and dlq/ is
-        // quarantined, so neither is presentable mail.
-        const redacted = messages.map((m) =>
-          m.location === "new" || m.location === "dlq" ? { ...m, body: "" } : m,
-        );
-        console.log(JSON.stringify(redacted, null, 2));
+        // listMessages has already withheld every unverified record — new/
+        // (unverified), dlq/ (quarantined) and any cur/ record that cannot
+        // re-verify — body AND thread fields (withholdUnverified, cli#429).
+        console.log(JSON.stringify(messages, null, 2));
       } else {
         const limit = Math.max(0, Math.floor(args.limit ?? 20));
         const visible = messages.slice(0, limit);
@@ -451,7 +453,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       // cannot prove (and re-verify) its promotion is withheld, exactly like new/.
       const unverified = foundLoc === "new" || !(await isPresentableCurRecord(agent, found));
       if (args.json) {
-        const out = unverified ? { ...found, body: "" } : found;
+        // Unverified: body AND thread fields withheld (withholdUnverified, cli#429).
+        const out = unverified ? withholdUnverified(found) : found;
         console.log(JSON.stringify(out, null, 2));
       } else {
         if (unverified) {
