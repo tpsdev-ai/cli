@@ -291,8 +291,11 @@ if want A3; then
     fail "A3 mounts of the OpenClaw-style container: $(cat "$SCRATCH/ok.mounts" 2>/dev/null)"
   fi
   if [ -f "$SCRATCH/ok.diff" ]; then
-    persisted="$(grep -vE ' /(workspace|tmp|var/tmp|run|dev|proc|sys)(/|$)| /etc/(hosts|hostname|resolv\.conf)$' "$SCRATCH/ok.diff")"
-    [ -z "$persisted" ] && pass "A3 nothing persisted outside the worktree bind and the tmpfs mounts" || fail "A3 container filesystem changes: ${persisted}"
+    if persisted="$(node "$REPO/scripts/reviewer/filter-container-diff.mjs" <"$SCRATCH/ok.diff")"; then
+      [ -z "$persisted" ] && pass "A3 nothing persisted outside the worktree bind and the tmpfs mounts" || fail "A3 container filesystem changes: ${persisted}"
+    else
+      fail "A3 the container diff could not be filtered"
+    fi
   else
     fail "A3 the container diff was not captured"
   fi

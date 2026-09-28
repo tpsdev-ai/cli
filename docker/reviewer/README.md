@@ -64,3 +64,9 @@ reference the container engine itself resolves. The same config names the job:
 Builds on different hosts are **not** claimed to produce the same image id: the
 base is digest-pinned and every runtime is checksum-verified, but the apt
 packages are not version-pinned. Cross-host reproducibility is a follow-up.
+
+## Known limits
+
+OpenClaw's default `/tmp` tmpfs is `noexec`, as measured in the reviewer-image
+CI run. A suite that executes files from `TMPDIR` needs `/tmp:exec` in the
+reviewer's sandbox config (A15).
