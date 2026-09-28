@@ -1,0 +1,71 @@
+{
+  "id": "openclaw-github-review",
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": [
+      "github_review"
+    ]
+  },
+  "uiHints": {
+    "credentialFile": {
+      "label": "GitHub credential file",
+      "help": "Absolute path to the fine-grained personal access token for the reviewer account. Read once at gateway start; never re-read by any agent-invokable tool.",
+      "sensitive": true,
+      "advanced": true
+    },
+    "provisioningFile": {
+      "label": "Credential provisioning evidence file",
+      "help": "Absolute path to the trusted record written when the GitHub token was installed or rotated: login, repository coverage and permissions, bound to the installed credential.",
+      "advanced": true
+    },
+    "assignmentsFile": {
+      "label": "Dispatch assignment file",
+      "help": "Absolute path to the host-managed dispatch assignment store that binds each reviewer session to an immutable {repo, pr} assignment.",
+      "advanced": true
+    },
+    "signingKeyFile": {
+      "label": "Flair signing key file",
+      "help": "Absolute path to the reviewer's Flair signing key. Custody is separate from the GitHub credential; only the host-side audit path uses it.",
+      "sensitive": true,
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "allowedRepositories": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "The host-configured repository set (owner/repo). A github_review call for any other repository is refused."
+      },
+      "maxBodyBytes": {
+        "type": "number",
+        "description": "The finite UTF-8 byte limit for a review body. REQUIRED: an absent or invalid limit is a configuration failure and disables posting."
+      },
+      "credentialFile": { "type": "string" },
+      "provisioningFile": { "type": "string" },
+      "assignmentsFile": { "type": "string" },
+      "signingKeyFile": { "type": "string" },
+      "reviewerIdentity": {
+        "type": "string",
+        "description": "The reviewer agent identity the host signing key belongs to; the dispatch assignment's reviewer must match it."
+      },
+      "pendingAuditFile": {
+        "type": "string",
+        "description": "Where an audit record that failed after a confirmed GitHub post is retained for host-side retry."
+      },
+      "flairUrl": { "type": "string" },
+      "sandboxImageDigest": {
+        "type": "string",
+        "description": "The deployed reviewer sandbox image digest, recorded in every audit record."
+      },
+      "provisioningMaxAgeDays": {
+        "type": "number",
+        "description": "Provisioning evidence older than this many days is stale and disables posting. Default 90."
+      }
+    }
+  }
+}

@@ -120,6 +120,7 @@ export const REQUIRED_SUITES = [
   { suite: "pi-tps-mail", cwd: "packages/pi-tps-mail" },
   { suite: "root-test", cwd: "." },
   { suite: "plugin", cwd: "plugins/openclaw-tps-mail" },
+  { suite: "github-review", cwd: "plugins/openclaw-github-review" },
 ];
 
 /**

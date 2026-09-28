@@ -108,6 +108,14 @@ jobs:
           npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
           npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
           bun run test              # the isolated launcher (see scripts/run-tests.mjs)
+      - name: openclaw-github-review plugin tests (isolated HOME launcher)
+        # The github_review tool plugin writes its JUnit report for the cli#411
+        # guard below; it shares no code or dependency with the mail plugin.
+        working-directory: plugins/openclaw-github-review
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          bun run test
       # cli#411 — the guard runs LAST, with `if: always()`, so a failing suite
       # step cannot skip it. It is never a clause of a suite: a guard that ran
       # inside one could be taken down by dropping that suite, which is the
@@ -162,6 +170,42 @@ jobs:
         run: |
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
+
+  # Section E — the permanent gateway-boundary lane for github_review. The
+  # handler must execute in the GATEWAY process, never inside the sandbox. The
+  # lane registers the plugin through the real `api.registerTool` mechanism and
+  # dispatches across one session twice: the host context posts and reads a
+  # host-only marker; the sandbox context is refused and cannot read it. The
+  # handler's own sandboxed-context refusal is the control, shown RED in review
+  # by stubbing that check. (A real container half is a follow-up once the
+  # reviewer image lands; this lane exercises the deployment-independent
+  # contract today.)
+  github-review-gateway-boundary:
+    name: GitHub review gateway-boundary lane
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      - name: Install + build the github-review plugin
+        working-directory: plugins/openclaw-github-review
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          test -f dist/src/index.js
+      - name: Run the gateway-boundary lane
+        working-directory: plugins/openclaw-github-review
+        run: node scripts/run-tests.mjs test/gateway-boundary.test.ts
 
   audit:
     name: Dependency Audit

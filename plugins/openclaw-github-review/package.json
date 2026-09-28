@@ -1,0 +1,51 @@
+{
+  "name": "@tpsdev-ai/openclaw-github-review",
+  "version": "0.1.0",
+  "description": "OpenClaw tool plugin exposing one host-side verb, github_review, that posts a GitHub pull-request review under a trusted reviewer identity without the credential ever entering the sandbox",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "node scripts/run-tests.mjs",
+    "test:raw": "bun test test/",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "openclaw-tool",
+    "tps",
+    "github-review"
+  ],
+  "license": "Apache-2.0",
+  "openclaw": {
+    "extensions": [
+      "./dist/src/index.js"
+    ],
+    "runtimeExtensions": [
+      "./dist/src/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.7"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.3.7"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
