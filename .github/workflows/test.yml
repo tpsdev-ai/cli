@@ -108,6 +108,13 @@ jobs:
           npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
           npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
           bun run test              # the isolated launcher (see scripts/run-tests.mjs)
+      # The github-review suite includes the gateway-boundary lane, which runs
+      # OpenClaw 2026.8.1 under node (its plugin loader needs node:sqlite and
+      # node >=22.22.3 <23 || >=24.15 <25 || >=25.9). Set up here, after the
+      # mail plugin's step, so no earlier step changes node.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
       - name: openclaw-github-review plugin tests (isolated HOME launcher)
         # The github_review tool plugin writes its JUnit report for the cli#411
         # guard below; it shares no code or dependency with the mail plugin.
@@ -172,13 +179,18 @@ jobs:
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
 
-  # Section E — the permanent gateway-boundary lane for github_review. The lane
-  # loads the BUILT plugin through OpenClaw's own registration machinery with a
-  # mode=all reviewer configuration and proves the handler executes in the
-  # GATEWAY process: a sandboxed (mode=all) session is accepted and the host-only
-  # marker's contents are readable there, and the secret scans cover the success,
-  # refusal, rejected, ambiguous and audit-failure paths. The container half of
-  # the host/container contrast arrives with the reviewer image (section A).
+  # Section E — the permanent gateway-boundary lane for github_review. It runs
+  # the BUILT plugin in a node process against the pinned OpenClaw release
+  # (2026.8.1, the reviewer hosts' release): registration through OpenClaw's
+  # loader from the shipped manifest with zero diagnostics (which rejects the CI
+  # probe; the probe registers only from a lane-created overlay); a reviewer
+  # session configured sandbox mode=all that OpenClaw's default sandbox tool
+  # policy does not offer the verb and the documented alsoAllow does; dispatch
+  # through the gateway's tools.invoke path, posting through the plugin's real
+  # GitHub and Flair clients (controlled services) to `posted`; the probe's
+  # gateway process identity and host-only marker read; and secret scans of
+  # every run. No sandbox container runs: the container half of the contrast
+  # arrives with the reviewer image (section A).
   github-review-gateway-boundary:
     name: GitHub review gateway-boundary lane
     permissions:
@@ -196,6 +208,9 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
       - name: Install + build the github-review plugin
         working-directory: plugins/openclaw-github-review
         run: |

@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGithubReview } from "../src/handler.js";
+import type { RefusalReason } from "../src/types.js";
 import { makeDeps, scenario, session, TOKEN, validInput, type Scenario } from "./helpers.js";
 
 let root: string;
@@ -21,7 +22,7 @@ afterEach(() => {
 });
 const HOST = session();
 
-async function expectRefusedWith(s: Scenario, expected: string) {
+async function expectRefusedWith(s: Scenario, expected: RefusalReason) {
   const { deps, github } = makeDeps(s);
   const o = await runGithubReview(validInput(), HOST, deps);
   expect(o.ok).toBe(false);
@@ -65,6 +66,20 @@ describe("A7 — credential readiness and custody", () => {
 
   test("insufficient permissions (no pull-request write) are refused", async () => {
     await expectRefusedWith(scenario(root, {}, { evidence: { permissions: { pull_requests: "read" } } }), "scope_unverified");
+  });
+
+  test("contents:read is refused (contents may only be none)", async () => {
+    await expectRefusedWith(
+      scenario(root, {}, { evidence: { permissions: { pull_requests: "write", metadata: "read", contents: "read" } } }),
+      "scope_unverified",
+    );
+  });
+
+  test("issues:write is refused (issues may only be none)", async () => {
+    await expectRefusedWith(
+      scenario(root, {}, { evidence: { permissions: { pull_requests: "write", metadata: "read", issues: "write" } } }),
+      "scope_unverified",
+    );
   });
 
   test("excessive permissions are refused", async () => {

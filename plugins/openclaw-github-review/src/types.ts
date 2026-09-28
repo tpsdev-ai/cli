@@ -29,6 +29,7 @@ export type RefusalReason =
   | "unsupported_field"
   | "repo_not_configured"
   | "assignment_missing"
+  | "assignment_ambiguous"
   | "assignment_mismatch"
   | "assignment_expired"
   | "unsupported_event"
@@ -37,8 +38,11 @@ export type RefusalReason =
   | "credential_unavailable"
   | "signing_unavailable"
   | "scope_unverified"
-  | "pending_audit_unconfigured"
+  | "store_unconfigured"
+  | "store_unavailable"
   | "reconcile_required"
+  | "already_posted"
+  | "dispatch_in_flight"
   | "pr_unavailable"
   | "pr_not_open"
   | "commit_mismatch"
@@ -46,10 +50,13 @@ export type RefusalReason =
   | "github_rejected"
   | "github_ambiguous";
 
-/** A completed post. */
+/** A completed post. `posted` = receipt validated and audit acknowledged;
+ *  `posted_audit_pending` = the audit write failed and the record is retained
+ *  for host-side retry; `posted_audit_unretained` = the audit write failed AND
+ *  the record could not be retained (the host log names the event). */
 export interface PostedOutcome {
   ok: true;
-  status: "posted" | "posted_audit_pending";
+  status: "posted" | "posted_audit_pending" | "posted_audit_unretained";
   reviewId: number;
   reviewUrl: string;
   commitId: string;
@@ -106,8 +113,15 @@ export interface DispatchAssignment {
   active: boolean;
 }
 
+/** The result of resolving a session's dispatch assignment. More than one
+ *  entry for a session is AMBIGUOUS and is never resolved by position. */
+export type AssignmentLookup =
+  | { status: "found"; assignment: DispatchAssignment }
+  | { status: "missing" }
+  | { status: "ambiguous" };
+
 export interface AssignmentResolver {
-  resolve(sessionKey: string): DispatchAssignment | null;
+  resolve(sessionKey: string): AssignmentLookup;
 }
 
 /** The public shape of a pull request fetched from GitHub by the host. */
@@ -161,19 +175,32 @@ export interface AuditSink {
 }
 
 /** Retains an OrgEvent whose write failed after a confirmed GitHub post, so a
- *  restart can retry the audit WITHOUT reposting the review. */
+ *  restart can retry the audit WITHOUT reposting the review. Every method
+ *  THROWS when the store cannot be read or written; none of them ever replaces
+ *  a store it could not parse. */
 export interface PendingAuditStore {
   list(): OrgEventDraft[];
   save(event: OrgEventDraft): void;
   remove(id: string): void;
+  /** Prove the store is readable and writable now; throws otherwise. */
+  probe(): void;
 }
 
-/** A durable per-dispatch latch that records an outcome whose external state is
- *  not known to be clean, so a retry does not post a second review. */
+/** Why a dispatch is latched. `reconcile_required`: a post's external state is
+ *  unknown (an ambiguous GitHub response or an invalid 2xx receipt).
+ *  `posted`: the dispatch's one verdict exists on GitHub. */
+export type DispatchLatch = "reconcile_required" | "posted";
+
+/** The durable per-dispatch latch store. Once a dispatch is latched it stays
+ *  latched until the HOST clears it, so no retry can post a second review.
+ *  `get` and `add` THROW when the store cannot be read or written; `add` never
+ *  replaces a store it could not parse. */
 export interface ReconcileStore {
-  has(dispatchId: string): boolean;
-  add(dispatchId: string): void;
+  get(dispatchId: string): DispatchLatch | null;
+  add(dispatchId: string, latch: DispatchLatch): void;
   clear(dispatchId: string): void;
+  /** Prove the store is readable and writable now; throws otherwise. */
+  probe(): void;
 }
 
 /** Host-resolved runtime/attestation metadata recorded in the audit detail.

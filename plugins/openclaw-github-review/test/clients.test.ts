@@ -163,22 +163,27 @@ describe("FileAssignmentResolver — session binding", () => {
   test("returns the assignment bound to the session key", () => {
     const p = writeAssignments([{ ...validAssignment(), sessionKey: "sess-1" }]);
     const r = new FileAssignmentResolver(p);
-    expect(r.resolve("sess-1")?.reviewer).toBe("anvil");
-    expect(r.resolve("sess-2")).toBeNull();
+    const found = r.resolve("sess-1");
+    expect(found.status).toBe("found");
+    if (found.status === "found") expect(found.assignment.reviewer).toBe("anvil");
+    expect(r.resolve("sess-2")).toEqual({ status: "missing" });
   });
 
-  test("a DUPLICATE session key refuses (no positional pick)", () => {
+  test("a DUPLICATE session key is AMBIGUOUS (no positional pick)", () => {
     const p = writeAssignments([
       { ...validAssignment(), sessionKey: "sess-1", pr: 1 },
       { ...validAssignment(), sessionKey: "sess-1", pr: 2 },
     ]);
     const r = new FileAssignmentResolver(p);
-    expect(r.resolve("sess-1")).toBeNull();
+    expect(r.resolve("sess-1")).toEqual({ status: "ambiguous" });
   });
 
-  test("a malformed entry and a missing file resolve to null", () => {
+  test("a malformed entry, a missing file and a null document resolve to missing", () => {
     const p = writeAssignments([{ sessionKey: "sess-1" }]);
-    expect(new FileAssignmentResolver(p).resolve("sess-1")).toBeNull();
-    expect(new FileAssignmentResolver(join(root, "missing.json")).resolve("sess-1")).toBeNull();
+    expect(new FileAssignmentResolver(p).resolve("sess-1")).toEqual({ status: "missing" });
+    expect(new FileAssignmentResolver(join(root, "missing.json")).resolve("sess-1")).toEqual({ status: "missing" });
+    const nullDoc = join(root, "null.json");
+    writeFileSync(nullDoc, "null", { mode: 0o600 });
+    expect(new FileAssignmentResolver(nullDoc).resolve("sess-1")).toEqual({ status: "missing" });
   });
 });

@@ -7,8 +7,17 @@
  * the digest commits to the exact body bytes sent.
  */
 
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { AuditSink, OrgEventDraft, PendingAuditStore, ReconcileStore, ReviewEvent, ReviewReceipt, RuntimeEvidence } from "./types.js";
+import { probeWritable, readJsonStore, writeJsonStore } from "./durable-file.js";
+import type {
+  AuditSink,
+  DispatchLatch,
+  OrgEventDraft,
+  PendingAuditStore,
+  ReconcileStore,
+  ReviewEvent,
+  ReviewReceipt,
+  RuntimeEvidence,
+} from "./types.js";
 
 /** The minimal Flair request surface the audit sink uses. A real FlairClient
  *  satisfies it; tests inject a fake. */
@@ -89,10 +98,6 @@ export function buildOrgEvent(p: BuildOrgEventParams): OrgEventDraft {
   };
 }
 
-interface PendingFileShape {
-  events?: unknown;
-}
-
 function isDraft(v: unknown): v is OrgEventDraft {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
@@ -108,43 +113,37 @@ function isDraft(v: unknown): v is OrgEventDraft {
 
 /** A durable pending-audit store: an OrgEvent whose write failed after a
  *  confirmed GitHub post is retained here and retried on the next start WITHOUT
- *  reposting the review. */
+ *  reposting the review. The file is read on every operation; a missing file is
+ *  empty, and anything else it cannot parse THROWS — it is never replaced. */
 export class FilePendingAuditStore implements PendingAuditStore {
-  private events: OrgEventDraft[];
-
-  constructor(private readonly file: string) {
-    this.events = this.read();
-  }
-
-  private read(): OrgEventDraft[] {
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as PendingFileShape;
-      return Array.isArray(parsed.events) ? parsed.events.filter(isDraft) : [];
-    } catch {
-      return [];
-    }
-  }
-
-  private write(): void {
-    const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ events: this.events }), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, this.file);
-  }
+  constructor(private readonly file: string) {}
 
   list(): OrgEventDraft[] {
-    return [...this.events];
+    const parsed = readJsonStore(this.file);
+    if (parsed === undefined) return [];
+    const events = typeof parsed === "object" && parsed !== null ? (parsed as { events?: unknown }).events : undefined;
+    if (!Array.isArray(events) || !events.every(isDraft)) {
+      throw new Error("the pending-audit store has an unrecognised shape");
+    }
+    return events;
   }
 
   save(event: OrgEventDraft): void {
-    if (this.events.some((e) => e.id === event.id)) return;
-    this.events.push(event);
-    this.write();
+    const events = this.list();
+    if (events.some((e) => e.id === event.id)) return;
+    events.push(event);
+    writeJsonStore(this.file, { events });
   }
 
   remove(id: string): void {
-    const before = this.events.length;
-    this.events = this.events.filter((e) => e.id !== id);
-    if (this.events.length !== before) this.write();
+    const events = this.list();
+    const kept = events.filter((e) => e.id !== id);
+    if (kept.length !== events.length) writeJsonStore(this.file, { events: kept });
+  }
+
+  probe(): void {
+    this.list();
+    probeWritable(this.file);
   }
 }
 
@@ -160,61 +159,80 @@ export class MemoryPendingAuditStore implements PendingAuditStore {
   remove(id: string): void {
     this.events = this.events.filter((e) => e.id !== id);
   }
+  probe(): void {}
 }
 
-interface ReconcileFileShape {
-  dispatchIds?: unknown;
+/** One entry of the durable dispatch latch store. */
+export interface LatchEntry {
+  dispatchId: string;
+  latch: DispatchLatch;
 }
 
-/** A durable per-dispatch reconcile latch. Once a dispatch's outcome is unknown,
- *  the id stays latched until the host clears it, so a retry cannot post a
- *  second review. */
+const LATCHES: ReadonlySet<string> = new Set<DispatchLatch>(["reconcile_required", "posted"]);
+
+/** The durable per-dispatch latch store: `{"latches":[{"dispatchId","latch"}]}`.
+ *  Once a dispatch is latched it stays latched until the HOST clears it (see
+ *  latch-admin.ts), so a retry cannot post a second review. The file is read
+ *  on every operation; a missing file is empty, and anything else it cannot
+ *  parse THROWS — `add` and `clear` never replace a file they could not parse. */
 export class FileReconcileStore implements ReconcileStore {
   constructor(private readonly file: string) {}
 
-  private read(): string[] {
-    try {
-      const parsed = JSON.parse(readFileSync(this.file, "utf8")) as ReconcileFileShape;
-      return Array.isArray(parsed.dispatchIds) ? parsed.dispatchIds.filter((x): x is string => typeof x === "string") : [];
-    } catch {
-      return [];
-    }
+  list(): LatchEntry[] {
+    const parsed = readJsonStore(this.file);
+    if (parsed === undefined) return [];
+    const latches = typeof parsed === "object" && parsed !== null ? (parsed as { latches?: unknown }).latches : undefined;
+    if (!Array.isArray(latches)) throw new Error("the dispatch latch store has an unrecognised shape");
+    return latches.map((entry) => {
+      const o = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null;
+      if (!o || typeof o.dispatchId !== "string" || typeof o.latch !== "string" || !LATCHES.has(o.latch)) {
+        throw new Error("the dispatch latch store has an unrecognised entry");
+      }
+      return { dispatchId: o.dispatchId, latch: o.latch as DispatchLatch };
+    });
   }
 
-  private write(ids: string[]): void {
-    const tmp = `${this.file}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ dispatchIds: ids }), { encoding: "utf8", mode: 0o600 });
-    renameSync(tmp, this.file);
+  get(dispatchId: string): DispatchLatch | null {
+    return this.list().find((e) => e.dispatchId === dispatchId)?.latch ?? null;
   }
 
-  has(dispatchId: string): boolean {
-    return this.read().includes(dispatchId);
+  add(dispatchId: string, latch: DispatchLatch): void {
+    const entries = this.list();
+    const existing = entries.find((e) => e.dispatchId === dispatchId);
+    if (existing?.latch === latch) return;
+    if (existing) existing.latch = latch;
+    else entries.push({ dispatchId, latch });
+    writeJsonStore(this.file, { latches: entries });
   }
-  add(dispatchId: string): void {
-    const ids = this.read();
-    if (!ids.includes(dispatchId)) {
-      ids.push(dispatchId);
-      this.write(ids);
-    }
+
+  /** Remove a dispatch's latch. Returns whether one was removed. */
+  clear(dispatchId: string): boolean {
+    const entries = this.list();
+    const kept = entries.filter((e) => e.dispatchId !== dispatchId);
+    if (kept.length === entries.length) return false;
+    writeJsonStore(this.file, { latches: kept });
+    return true;
   }
-  clear(dispatchId: string): void {
-    const ids = this.read().filter((x) => x !== dispatchId);
-    this.write(ids);
+
+  probe(): void {
+    this.list();
+    probeWritable(this.file);
   }
 }
 
-/** An in-memory reconcile latch for tests. */
+/** An in-memory latch store for tests. */
 export class MemoryReconcileStore implements ReconcileStore {
-  private ids = new Set<string>();
-  has(dispatchId: string): boolean {
-    return this.ids.has(dispatchId);
+  private latches = new Map<string, DispatchLatch>();
+  get(dispatchId: string): DispatchLatch | null {
+    return this.latches.get(dispatchId) ?? null;
   }
-  add(dispatchId: string): void {
-    this.ids.add(dispatchId);
+  add(dispatchId: string, latch: DispatchLatch): void {
+    this.latches.set(dispatchId, latch);
   }
   clear(dispatchId: string): void {
-    this.ids.delete(dispatchId);
+    this.latches.delete(dispatchId);
   }
+  probe(): void {}
 }
 
 /** Retry every retained audit record once. Returns the ids that were

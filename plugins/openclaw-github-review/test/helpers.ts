@@ -17,8 +17,11 @@ import type {
   AssignmentResolver,
   AuditSink,
   DispatchAssignment,
+  DispatchLatch,
   GitHubApi,
   OrgEventDraft,
+  PendingAuditStore,
+  ReconcileStore,
   ReviewEvent,
   ReviewReceipt,
   SessionContext,
@@ -71,9 +74,9 @@ export class FakeAudit implements AuditSink {
   }
 }
 
-/** A pending-audit store whose save() throws — for the "audit retention fails
- *  after a post" case (the handler must not throw). */
-export class FailingSavePendingStore {
+/** A pending-audit store whose save() throws AFTER its probe passed — for the
+ *  "audit retention fails after a post" case (the handler must not throw). */
+export class FailingSavePendingStore implements PendingAuditStore {
   list(): OrgEventDraft[] {
     return [];
   }
@@ -82,6 +85,45 @@ export class FailingSavePendingStore {
   }
   remove(): void {
     /* noop */
+  }
+  probe(): void {
+    /* the store looked usable before the request */
+  }
+}
+
+/** A latch store that reads (empty) and probes fine but whose add() throws —
+ *  the durable latch write failing AFTER a post. */
+export class FailingAddReconcileStore implements ReconcileStore {
+  addCalls: Array<{ dispatchId: string; latch: DispatchLatch }> = [];
+  get(): DispatchLatch | null {
+    return null;
+  }
+  add(dispatchId: string, latch: DispatchLatch): void {
+    this.addCalls.push({ dispatchId, latch });
+    throw new Error("latch store path /host/secret/reconcile.json is unwritable");
+  }
+  clear(): void {
+    /* noop */
+  }
+  probe(): void {
+    /* the store looked usable before the request */
+  }
+}
+
+/** A FakeGitHub whose PR lookup waits until `open()` is called, so a test can
+ *  hold one call in flight while a second call for the same dispatch arrives. */
+export class GatedGitHub extends FakeGitHub {
+  private release: () => void = () => {};
+  private readonly gate = new Promise<void>((resolve) => {
+    this.release = resolve;
+  });
+  open(): void {
+    this.release();
+  }
+  override async fetchPull(repo: string, pr: number) {
+    this.fetchPullCalls.push({ repo, pr });
+    await this.gate;
+    return this.pull;
   }
 }
 
@@ -194,18 +236,21 @@ export function ensureDir(path: string): string {
   return path;
 }
 
-/** Build handler deps wired to the standard fakes. */
+/** Build handler deps wired to the standard fakes. Host log lines the handler
+ *  writes are collected in `logs`. */
 export function makeDeps(
   s: Scenario,
   services: HandlerServices = {},
-): { deps: HandlerDeps; github: FakeGitHub; audit: FakeAudit } {
+): { deps: HandlerDeps; github: FakeGitHub; audit: FakeAudit; logs: string[] } {
   const github = (services.github as FakeGitHub | undefined) ?? new FakeGitHub();
   const audit = (services.audit as FakeAudit | undefined) ?? new FakeAudit();
+  const logs: string[] = [];
   const deps = buildDeps(s.config, s.custody, {
     assignments: resolver([validAssignment()]),
+    log: (line) => logs.push(line),
     ...services,
     github,
     audit,
   });
-  return { deps, github, audit };
+  return { deps, github, audit, logs };
 }

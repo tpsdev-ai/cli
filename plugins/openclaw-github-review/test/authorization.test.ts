@@ -72,6 +72,18 @@ describe("A4 — local authorization refusals", () => {
     expect(o.reason).toBe("assignment_missing");
   });
 
+  test("an AMBIGUOUS assignment (two entries bind the session) is refused with its own reason", async () => {
+    const s = scenario(root);
+    const { deps, github } = makeDeps(s, {
+      assignments: resolver([validAssignment({ pr: PR }), validAssignment({ pr: PR + 1 })]),
+    });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    refused(o);
+    expect(o.reason).toBe("assignment_ambiguous");
+    expect(o.remedy).toContain("exactly one assignment");
+    expect(github.fetchPullCalls.length + github.reviewCalls.length).toBe(0);
+  });
+
   test("a session agent that does not match the assignment's reviewer is refused", async () => {
     const o = await run(scenario(root), validInput(), session({ agentId: "someone-else" }));
     refused(o);

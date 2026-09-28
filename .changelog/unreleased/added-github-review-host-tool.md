@@ -16,13 +16,18 @@
   the relevant state and a remedy — and no request leaves.
 
   **The credential stays on the host.** A fine-grained PAT is read once at
-  gateway start into a `#private` field of the custody object, reachable by no
-  method; its path is not re-read and it appears in no environment, log, tool
-  result or session. Repository coverage and permission scope are verified from
-  trusted provisioning evidence bound to the installed credential BEFORE any
-  request; unknown or stale evidence disables posting, so posting fails closed
-  rather than falling back to an online check. Credential and audit work run only
-  on a full registration.
+  gateway start into a `#private` field of the custody object; the one method
+  that returns a value built from it builds the Authorization header for the
+  plugin's own GitHub client and is called nowhere else. Its path is not
+  re-read, and neither the token nor its location appears in any environment,
+  log, tool result or session. Repository coverage and permission scope are
+  verified from trusted provisioning evidence bound to the installed credential
+  BEFORE any request; unknown or stale evidence disables posting, so posting
+  fails closed rather than falling back to an online check. Only a full
+  registration reads the credential or the signing key or retries audits; any
+  other registration mode reads no secret, never throws, and — when OpenClaw
+  executes the tool from an on-demand `tool-discovery` registration in the
+  gateway process — reuses the state the full registration loaded.
 
   **The body is opaque and the digest is faithful.** The review request is built
   internally from the validated assignment, event, commit and body, with no
@@ -32,15 +37,27 @@
   handed to the serializer, the returned review id/URL and confirmed commit, the
   review environment's runtime versions and image digest (null until the reviewer
   image supplies them), and the verified login from the provisioning record.
-  Partial outcomes are explicit: a GitHub refusal is a refusal; an ambiguous
-  outcome or a 2xx with an invalid receipt is reported as `unknown` and latches
-  the dispatch so a retry cannot post a second review; a failed audit is retained
-  as `posted_audit_pending` and retried without reposting; and a post is never
-  followed by a throw.
+  **Exactly one verdict per dispatch.** A dispatch whose review exists is
+  latched and refuses every later call (`already_posted`); a concurrent call is
+  refused while one is in flight (`dispatch_in_flight`), and the tool declares
+  `executionMode: "sequential"`. Partial outcomes are explicit: a GitHub refusal
+  is a refusal; an ambiguous outcome or a 2xx with an invalid receipt is
+  reported as `unknown` and latches the dispatch until the host reconciles it; a
+  failed audit is retained as `posted_audit_pending` and retried without
+  reposting, or reported `posted_audit_unretained` with a host log line when it
+  cannot be retained; and a post is never followed by a throw. Both durable
+  stores must be readable and writable before any request, an unparsable store
+  is never overwritten, and the host clears a latch with the shipped
+  `latch-admin` command.
 
-  **A permanent gateway-boundary lane** loads the BUILT plugin through OpenClaw's
-  own registration machinery with a `mode=all` reviewer configuration and proves
-  the handler executes in the gateway process — the host-only marker's contents
-  are readable there — and drives the secret scans over the success, refusal,
-  rejected, ambiguous and audit-failure paths. The container half of the contrast
-  is deferred to section A.
+  **A permanent gateway-boundary lane** runs the BUILT plugin in a node process
+  against the pinned OpenClaw 2026.8.1: it registers through OpenClaw's loader
+  from the shipped manifest with zero diagnostics (the shipped manifest rejects
+  the CI probe, which registers only from a lane-created overlay); under the
+  reviewer's `sandbox.mode: "all"` the verb is withheld by OpenClaw's default
+  sandbox tool policy and offered with the documented `alsoAllow`; dispatched
+  through the gateway's tools.invoke path it posts through the plugin's real
+  GitHub and Flair clients to `posted` with the audit acknowledged; the probe
+  reports the gateway process identity and reads the host-only marker there;
+  and every run is secret-scanned. The container half of the contrast is
+  deferred to section A.

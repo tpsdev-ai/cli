@@ -28,13 +28,16 @@ const root = realpathSync(mkdtempSync(join(tmpdir(), "openclaw-github-review-tes
 
 const env = { ...process.env };
 delete env.TPS_TEST_ROOT;
-Object.assign(env, { HOME: root, TPS_TEST_ROOT: root });
+// TPS_LANE_NODE: the gateway-boundary lane runs OpenClaw in a separate node
+// process (its plugin loader needs node:sqlite, which bun lacks); it uses the
+// node that launched this suite.
+Object.assign(env, { HOME: root, TPS_TEST_ROOT: root, TPS_LANE_NODE: process.execPath });
 
 console.log(`openclaw-github-review tests: isolated root ${root}`);
 
-// The gateway-boundary lane loads the BUILT plugin entry (dist/src/index.js)
-// through OpenClaw's real registration machinery, so the build must reflect the
-// current sources. Build first and refuse to run if it fails.
+// The gateway-boundary lane loads the BUILT plugin (dist/) with OpenClaw's own
+// plugin loader, and the latch-admin test runs the built command, so the build
+// must reflect the current sources. Build first and refuse to run if it fails.
 const tsc = join(pluginDir, "node_modules", "typescript", "bin", "tsc");
 const build = spawnSync(process.execPath, [tsc, "-p", "tsconfig.json"], { cwd: pluginDir, stdio: "inherit" });
 if (build.status !== 0) {

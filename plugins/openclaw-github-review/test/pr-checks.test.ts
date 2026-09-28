@@ -7,6 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runGithubReview } from "../src/handler.js";
+import type { ReviewEvent } from "../src/types.js";
 import { COMMIT, makeDeps, PR, REPO, resolver, scenario, session, validAssignment, validInput } from "./helpers.js";
 
 let root: string;
@@ -79,7 +80,7 @@ describe("A5 — host-authoritative PR checks", () => {
 });
 
 describe("A6 — exact request and opaque body", () => {
-  const events: Array<{ event: string; state: string }> = [
+  const events: Array<{ event: ReviewEvent; state: string }> = [
     { event: "APPROVE", state: "APPROVED" },
     { event: "REQUEST_CHANGES", state: "CHANGES_REQUESTED" },
     { event: "COMMENT", state: "COMMENTED" },

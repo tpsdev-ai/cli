@@ -2,8 +2,10 @@
  * credential.ts — GitHub credential custody and the literal pre-request gate.
  *
  * The token is read ONCE, at gateway start, into a #private field of this
- * object. Its path is not re-read afterwards, and no method returns or logs the
- * token. Scope (login, repository coverage, permissions) is established from
+ * object. Its path is not re-read afterwards. The only method that exposes it
+ * is authorizationHeader(), which builds the Authorization header value for the
+ * plugin's own GitHub client (github.ts) and is called nowhere else; nothing
+ * logs it, and no diagnostic here names the credential's path. Scope (login, repository coverage, permissions) is established from
  * trusted PROVISIONING EVIDENCE — recorded when the token was installed or
  * rotated and bound to the installed credential — never from the token's
  * appearance nor from a successful request. Unknown or stale evidence disables
@@ -44,6 +46,14 @@ const ALLOWED_PERMISSIONS: Record<string, readonly string[]> = {
   issues: ["none"],
 };
 
+/** A path-free description of a load failure: the errno code, or the error's
+ *  class for a parse error. Never the error message, which can carry the path. */
+function errCode(err: unknown): string {
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === "string") return code;
+  return err instanceof SyntaxError ? "invalid JSON" : "unreadable";
+}
+
 export interface CredentialLoadResult {
   custody: CredentialCustody;
   /** A human-safe diagnostic; never contains the token. */
@@ -51,8 +61,9 @@ export interface CredentialLoadResult {
 }
 
 export class CredentialCustody {
-  // A TRUE private field (#) — not reachable from outside the class body, so the
-  // token cannot be read back through the instance.
+  // A TRUE private field (#): the token is not a property of the instance, so it
+  // is not serialized, inspected or enumerated with it. authorizationHeader() is
+  // the one method that returns a value built from it.
   #token: string | null = null;
   #tokenSha256: string | null = null;
   private evidence: ProvisioningEvidence | null = null;
@@ -81,12 +92,12 @@ export class CredentialCustody {
       const st = statSync(opts.credentialFile);
       const mode = st.mode & 0o777;
       if ((mode & 0o077) !== 0) {
-        c.loadedDetail = `credential file ${opts.credentialFile} is group/other-accessible (mode ${mode.toString(8)}); refusing to load`;
+        c.loadedDetail = `the credential file is group/other-accessible (mode ${mode.toString(8)}); refusing to load`;
         return { custody: c, detail: c.loadedDetail };
       }
       bytes = readFileSync(opts.credentialFile);
     } catch (err) {
-      c.loadedDetail = `credential file unreadable: ${(err as Error).message}`;
+      c.loadedDetail = `the credential file is unreadable (${errCode(err)})`;
       return { custody: c, detail: c.loadedDetail };
     }
     const token = bytes.toString("utf8").trim();
@@ -110,7 +121,7 @@ export class CredentialCustody {
     try {
       evidence = JSON.parse(readFileSync(opts.provisioningFile, "utf8")) as ProvisioningEvidence;
     } catch (err) {
-      c.loadedDetail = `provisioning evidence unreadable: ${(err as Error).message}`;
+      c.loadedDetail = `provisioning evidence is unreadable (${errCode(err)})`;
       return { custody: c, detail: c.loadedDetail };
     }
     if (
@@ -212,9 +223,9 @@ export class CredentialCustody {
   }
 
   /**
-   * Build the Authorization header for a GitHub request. INTENDED for the
-   * internal HTTP client only; returning a header is not disclosure of the
-   * token, and callers must not log it. The token itself is never returned.
+   * Build the Authorization header value for a GitHub request. It CONTAINS the
+   * token: it exists for the plugin's own HTTP client (github.ts) and is called
+   * nowhere else. No tool input reaches it, and nothing may log its result.
    */
   authorizationHeader(): string {
     if (!this.#token) throw new Error("credential not loaded");

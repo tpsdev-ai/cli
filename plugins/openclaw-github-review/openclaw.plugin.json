@@ -59,7 +59,7 @@
       },
       "reconcileFile": {
         "type": "string",
-        "description": "Durable per-dispatch latch for outcomes whose external state is unknown (an ambiguous GitHub response or an invalid 2xx receipt). Required: posting is refused before any request when unset."
+        "description": "The durable per-dispatch latch store: a dispatch whose review exists is latched `posted` (one verdict per dispatch) and one whose post has an unknown external state (an ambiguous GitHub response or an invalid 2xx receipt) `reconcile_required`. Only the host clears a latch (dist/src/latch-admin.js). Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
       "sandboxImageDigest": {
