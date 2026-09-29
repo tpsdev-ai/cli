@@ -59,7 +59,7 @@
       },
       "reconcileFile": {
         "type": "string",
-        "description": "The durable per-dispatch latch store. A dispatch is reserved here (durably) before its review is posted, then latched `posted` (final) or `reconcile_required` (uncertain outcome); a definitive rejection removes the reservation. A reservation or `reconcile_required` latch refuses posting until the host's audited `latch-admin reconcile` releases it, which it does only when no review exists. Required: posting is refused before any request when unset."
+        "description": "The durable per-dispatch latch store (one host, local filesystem; every operation under its O_EXCL lock file). Before a review is posted the dispatch is claimed here: `reserved` plus the call's claim, held across the POST. It becomes `posted` (final) or `reconcile_required` (uncertain outcome); only a GitHub response proving no review was created, or the host's `latch-admin reconcile` proving non-creation, releases it. Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
       "sandboxImageDigest": {

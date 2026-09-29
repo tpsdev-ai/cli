@@ -68,6 +68,8 @@ import {
 } from "./gateway-lane.js";
 
 const MARKER = "HOST-ONLY-MARKER-7c21";
+/** A lane test starts a node process that loads OpenClaw: allow for a loaded host. */
+const PROCESS_TEST_TIMEOUT_MS = 60_000;
 const REVIEWER = "anvil";
 const SESSION = "agent:anvil:review-427";
 const FLAIR = "http://flair.lane.invalid";
@@ -265,15 +267,19 @@ describe("E — the gateway-boundary lane (OpenClaw loader + gateway tool dispat
           pr: PR,
           commit: COMMIT,
           login: "anvil-reviewer",
+          credentialSha256: expect.stringMatching(/^[0-9a-f]{64}$/),
           reservedAt: expect.any(String),
           reviewId: 4242,
         },
       ],
     });
+    // The fingerprint is a hash, never the token; no lock or temp file is left.
+    expect(readFileSync(host.reconcileFile, "utf8")).not.toContain(TOKEN);
+    expect(existsSync(`${host.reconcileFile}.lock`)).toBe(false);
     expect(existsSync(host.pendingAuditFile)).toBe(false);
 
     scanLaneRun(run, host);
-  });
+  }, PROCESS_TEST_TIMEOUT_MS);
 
   test("the SHIPPED manifest REJECTS the CI probe even with the CI flag set", () => {
     const host = laneHost(root, "lane-dispatch-2");
@@ -285,7 +291,7 @@ describe("E — the gateway-boundary lane (OpenClaw loader + gateway tool dispat
       { level: "error", pluginId: PLUGIN_ID, message: `plugin must declare contracts.tools for: ${CI_PROBE_TOOL_NAME}` },
     ]);
     expect(report.registryTools).toEqual([{ pluginId: PLUGIN_ID, names: [TOOL_NAME] }]);
-  });
+  }, PROCESS_TEST_TIMEOUT_MS);
 
   test("from the lane's manifest OVERLAY: the probe runs in the gateway process, reads the host-only marker, sees a sandboxed session; a concurrent pair posts ONCE", () => {
     const host = laneHost(root, "lane-dispatch-3");
@@ -322,7 +328,7 @@ describe("E — the gateway-boundary lane (OpenClaw loader + gateway tool dispat
     expect(run.stdout).not.toContain("has no host state");
 
     scanLaneRun(run, host);
-  });
+  }, PROCESS_TEST_TIMEOUT_MS);
 });
 
 describe("A11 — secret scans through registerGithubReview, every outcome path (in-process)", () => {

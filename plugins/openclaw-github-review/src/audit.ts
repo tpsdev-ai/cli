@@ -8,10 +8,13 @@
  */
 
 import { probeWritable, readJsonStore, writeJsonStore } from "./durable-file.js";
+import { withStoreLock } from "./store-lock.js";
 import type {
   AuditSink,
   DispatchLatch,
+  LatchClaim,
   LatchDetails,
+  LatchRecord,
   OrgEventDraft,
   PendingAuditStore,
   ReconcileStore,
@@ -115,7 +118,8 @@ function isDraft(v: unknown): v is OrgEventDraft {
 /** A durable pending-audit store: an OrgEvent whose write failed after a
  *  confirmed GitHub post is retained here and retried on the next start WITHOUT
  *  reposting the review. The file is read on every operation; a missing file is
- *  empty, and anything else it cannot parse THROWS — it is never replaced. */
+ *  empty, and anything else it cannot parse THROWS — it is never replaced.
+ *  Every read-modify-write runs under the store's lock (store-lock.ts). */
 export class FilePendingAuditStore implements PendingAuditStore {
   constructor(private readonly file: string) {}
 
@@ -130,16 +134,20 @@ export class FilePendingAuditStore implements PendingAuditStore {
   }
 
   save(event: OrgEventDraft): void {
-    const events = this.list();
-    if (events.some((e) => e.id === event.id)) return;
-    events.push(event);
-    writeJsonStore(this.file, { events });
+    withStoreLock(this.file, "pending-audit save", () => {
+      const events = this.list();
+      if (events.some((e) => e.id === event.id)) return;
+      events.push(event);
+      writeJsonStore(this.file, { events });
+    });
   }
 
   remove(id: string): void {
-    const events = this.list();
-    const kept = events.filter((e) => e.id !== id);
-    if (kept.length !== events.length) writeJsonStore(this.file, { events: kept });
+    withStoreLock(this.file, "pending-audit remove", () => {
+      const events = this.list();
+      const kept = events.filter((e) => e.id !== id);
+      if (kept.length !== events.length) writeJsonStore(this.file, { events: kept });
+    });
   }
 
   probe(): void {
@@ -163,18 +171,21 @@ export class MemoryPendingAuditStore implements PendingAuditStore {
   probe(): void {}
 }
 
-/** One entry of the durable dispatch latch store. */
-export interface LatchEntry extends Partial<LatchDetails> {
-  dispatchId: string;
-  latch: DispatchLatch;
-}
-
 const LATCHES: ReadonlySet<string> = new Set<DispatchLatch>(["reserved", "reconcile_required", "posted"]);
 
 /** Validate one stored entry; anything unrecognised throws. */
-function parseLatchEntry(entry: unknown): LatchEntry {
+function parseLatchEntry(entry: unknown): LatchRecord {
   const o = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null;
   const optional = (key: string, type: "string" | "number") => o![key] === undefined || typeof o![key] === type;
+  const claim = o?.claim as Record<string, unknown> | undefined;
+  const claimOk =
+    claim === undefined ||
+    (typeof claim === "object" &&
+      claim !== null &&
+      typeof claim.token === "string" &&
+      typeof claim.pid === "number" &&
+      typeof claim.host === "string" &&
+      typeof claim.at === "string");
   if (
     !o ||
     typeof o.dispatchId !== "string" ||
@@ -184,25 +195,27 @@ function parseLatchEntry(entry: unknown): LatchEntry {
     !optional("pr", "number") ||
     !optional("commit", "string") ||
     !optional("login", "string") ||
+    !optional("credentialSha256", "string") ||
     !optional("reservedAt", "string") ||
-    !(o.reviewId === undefined || o.reviewId === null || typeof o.reviewId === "number")
+    !(o.reviewId === undefined || o.reviewId === null || typeof o.reviewId === "number") ||
+    !claimOk
   ) {
     throw new Error("the dispatch latch store has an unrecognised entry");
   }
-  return o as unknown as LatchEntry;
+  return o as unknown as LatchRecord;
 }
 
-/** The durable per-dispatch latch store:
- *  `{"latches":[{"dispatchId","latch","repo","pr","commit","login","reservedAt","reviewId"}]}`.
- *  Once a dispatch is latched it stays latched until the HOST reconciles it
- *  (latch-admin.ts), so a retry cannot post a second review. The file is read
- *  on every operation; a missing file is empty, and anything else it cannot
- *  parse THROWS — `add` and `clear` never replace a file they could not parse.
- *  Every write is durable before it returns (durable-file.ts). */
+/** The durable per-dispatch latch store: `{"latches":[LatchRecord…]}`.
+ *  Reads need no lock (a replacement is atomic, so a reader sees the old file
+ *  or the new one); every read-modify-write runs under the store's exclusive
+ *  lock (store-lock.ts), which makes the gateway's claim a check-and-write
+ *  that no other process sharing the lock can interleave. A missing file is
+ *  empty; anything else it cannot parse THROWS, and no write replaces a file
+ *  it could not parse. Every write is durable before it returns. */
 export class FileReconcileStore implements ReconcileStore {
   constructor(private readonly file: string) {}
 
-  list(): LatchEntry[] {
+  list(): LatchRecord[] {
     const parsed = readJsonStore(this.file);
     if (parsed === undefined) return [];
     const latches = typeof parsed === "object" && parsed !== null ? (parsed as { latches?: unknown }).latches : undefined;
@@ -210,7 +223,7 @@ export class FileReconcileStore implements ReconcileStore {
     return latches.map(parseLatchEntry);
   }
 
-  entry(dispatchId: string): LatchEntry | null {
+  entry(dispatchId: string): LatchRecord | null {
     return this.list().find((e) => e.dispatchId === dispatchId) ?? null;
   }
 
@@ -218,22 +231,63 @@ export class FileReconcileStore implements ReconcileStore {
     return this.entry(dispatchId)?.latch ?? null;
   }
 
-  add(dispatchId: string, latch: DispatchLatch, details: Partial<LatchDetails> = {}): void {
-    const entries = this.list();
-    const index = entries.findIndex((e) => e.dispatchId === dispatchId);
-    const next: LatchEntry = { ...(index >= 0 ? entries[index] : {}), ...details, dispatchId, latch };
-    if (index >= 0) entries[index] = next;
-    else entries.push(next);
-    writeJsonStore(this.file, { latches: entries });
+  /** Run a read-modify-write of the entries under the store lock. `fn`
+   *  returns the new entry list, or null to write nothing. */
+  private update<T>(op: string, fn: (entries: LatchRecord[]) => { entries: LatchRecord[] | null; result: T }): T {
+    return withStoreLock(this.file, op, () => {
+      const { entries, result } = fn(this.list());
+      if (entries) writeJsonStore(this.file, { latches: entries });
+      return result;
+    });
   }
 
-  /** Remove a dispatch's latch. Returns whether one was removed. */
-  clear(dispatchId: string): boolean {
-    const entries = this.list();
-    const kept = entries.filter((e) => e.dispatchId !== dispatchId);
-    if (kept.length === entries.length) return false;
-    writeJsonStore(this.file, { latches: kept });
-    return true;
+  reserve(dispatchId: string, details: LatchDetails, claim: LatchClaim): LatchRecord | null {
+    return this.update("reserve", (entries) => {
+      const existing = entries.find((e) => e.dispatchId === dispatchId);
+      if (existing) return { entries: null, result: existing };
+      return { entries: [...entries, { ...details, dispatchId, latch: "reserved", claim }], result: null };
+    });
+  }
+
+  settle(dispatchId: string, claimToken: string, latch: "posted" | "reconcile_required", details: Partial<LatchDetails> = {}): void {
+    this.update(`settle ${latch}`, (entries) => {
+      const index = entries.findIndex((e) => e.dispatchId === dispatchId && e.claim?.token === claimToken);
+      if (index < 0) throw new Error("the dispatch's latch is not held by this claim");
+      const { claim: _dropped, ...rest } = entries[index]!;
+      const next = [...entries];
+      next[index] = { ...rest, ...details, dispatchId, latch };
+      return { entries: next, result: undefined };
+    });
+  }
+
+  release(dispatchId: string, claimToken: string): void {
+    this.update("release", (entries) => {
+      const held = entries.find((e) => e.dispatchId === dispatchId && e.latch === "reserved" && e.claim?.token === claimToken);
+      if (!held) throw new Error("the dispatch's reservation is not held by this claim");
+      return { entries: entries.filter((e) => e !== held), result: undefined };
+    });
+  }
+
+  /** HOST: replace a dispatch's entry (or remove it with `next === null)` only
+   *  if it is still exactly `expected` (compare-and-swap under the lock).
+   *  Returns false, writing nothing, when it changed. */
+  replaceIf(dispatchId: string, expected: LatchRecord, next: LatchRecord | null): boolean {
+    return this.update("host reconcile", (entries) => {
+      const index = entries.findIndex((e) => e.dispatchId === dispatchId);
+      if (index < 0 || JSON.stringify(entries[index]) !== JSON.stringify(expected)) return { entries: null, result: false };
+      const out = [...entries];
+      if (next) out[index] = next;
+      else out.splice(index, 1);
+      return { entries: out, result: true };
+    });
+  }
+
+  /** Write an entry as given, under the lock (tests and host repair). */
+  put(record: LatchRecord): void {
+    this.update("put", (entries) => ({
+      entries: [...entries.filter((e) => e.dispatchId !== record.dispatchId), record],
+      result: undefined,
+    }));
   }
 
   probe(): void {
@@ -242,16 +296,27 @@ export class FileReconcileStore implements ReconcileStore {
   }
 }
 
-/** An in-memory latch store for tests. */
+/** An in-memory latch store for tests, with the same claim semantics. */
 export class MemoryReconcileStore implements ReconcileStore {
-  readonly entries = new Map<string, LatchEntry>();
-  get(dispatchId: string): DispatchLatch | null {
-    return this.entries.get(dispatchId)?.latch ?? null;
+  readonly entries = new Map<string, LatchRecord>();
+  entry(dispatchId: string): LatchRecord | null {
+    return this.entries.get(dispatchId) ?? null;
   }
-  add(dispatchId: string, latch: DispatchLatch, details: Partial<LatchDetails> = {}): void {
-    this.entries.set(dispatchId, { ...this.entries.get(dispatchId), ...details, dispatchId, latch });
+  reserve(dispatchId: string, details: LatchDetails, claim: LatchClaim): LatchRecord | null {
+    const existing = this.entries.get(dispatchId);
+    if (existing) return existing;
+    this.entries.set(dispatchId, { ...details, dispatchId, latch: "reserved", claim });
+    return null;
   }
-  clear(dispatchId: string): void {
+  settle(dispatchId: string, claimToken: string, latch: "posted" | "reconcile_required", details: Partial<LatchDetails> = {}): void {
+    const e = this.entries.get(dispatchId);
+    if (!e || e.claim?.token !== claimToken) throw new Error("the dispatch's latch is not held by this claim");
+    const { claim: _dropped, ...rest } = e;
+    this.entries.set(dispatchId, { ...rest, ...details, dispatchId, latch });
+  }
+  release(dispatchId: string, claimToken: string): void {
+    const e = this.entries.get(dispatchId);
+    if (!e || e.latch !== "reserved" || e.claim?.token !== claimToken) throw new Error("the dispatch's reservation is not held by this claim");
     this.entries.delete(dispatchId);
   }
   probe(): void {}

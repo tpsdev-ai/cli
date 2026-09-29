@@ -152,6 +152,9 @@ export interface GitHubApi {
     body: string;
   }): Promise<
     | { ok: true; receipt: ReviewReceipt }
+    /** `rejected` ONLY when the response proves no review was created (see
+     *  github.ts, NO_CREATE_STATUSES); anything else that is not a 2xx is
+     *  `ambiguous`. */
     | { ok: false; kind: "rejected" | "ambiguous"; detail: string }
   >;
 }
@@ -163,6 +166,8 @@ export interface ExistingReview {
   commitId: string | null;
   state: string;
   url: string | null;
+  /** ISO time the review was submitted; null for a pending review. */
+  submittedAt: string | null;
 }
 
 /** The READ-ONLY review listing used by the host's reconciliation
@@ -204,19 +209,22 @@ export interface PendingAuditStore {
 }
 
 /** Why a dispatch is latched.
- *  - `reserved`: written durably BEFORE the review is POSTed. A reservation
- *    that is still there on a later call means an attempt started and its
- *    outcome was never recorded (a crash, or a failed outcome write): the
- *    review may exist.
- *  - `reconcile_required`: the attempt's outcome is known to be uncertain (an
- *    ambiguous GitHub response, or a 2xx whose receipt did not validate).
+ *  - `reserved`: written durably, under the store lock, BEFORE the review is
+ *    POSTed, together with the gateway's CLAIM on the dispatch. While the
+ *    claim is held the attempt is in flight; a reservation still there when
+ *    the claim is gone, or whose claim outlived its process, means the outcome
+ *    was never recorded: the review may exist.
+ *  - `reconcile_required`: the attempt's outcome is uncertain (an ambiguous
+ *    GitHub response, or a 2xx whose receipt did not validate).
  *  - `posted`: the dispatch's verdict exists on GitHub. Final.
- *  `reserved` and `reconcile_required` refuse every call until the host's
- *  audited reconciliation (latch-admin.ts) checks GitHub. */
+ *  `reserved` and `reconcile_required` refuse every call. Only two things
+ *  remove a latch: the handler, after a response that PROVES no review was
+ *  created; and the host's reconciliation (latch-admin.ts), when it PROVES
+ *  non-creation. */
 export type DispatchLatch = "reserved" | "reconcile_required" | "posted";
 
 /** What the latch store records about a dispatch's attempt, so the host's
- *  reconciliation can look for the review on GitHub. */
+ *  reconciliation can look for the review on GitHub with the SAME credential. */
 export interface LatchDetails {
   repo: string;
   pr: number;
@@ -224,22 +232,49 @@ export interface LatchDetails {
   commit: string;
   /** The verified GitHub login the review would be posted as. */
   login: string;
+  /** sha256 of the credential that made the attempt (the binding the
+   *  provisioning evidence records) — a fingerprint, never the token. */
+  credentialSha256: string;
   /** When the attempt was reserved (ISO). */
   reservedAt: string;
-  /** The review id from a 2xx receipt, when there was one. */
+  /** The review id from a 2xx receipt, when there was one: proof that a
+   *  review was created. */
   reviewId?: number | null;
 }
 
-/** The durable per-dispatch latch store. Once a dispatch is latched it stays
- *  latched until the HOST reconciles it, so no retry can post a second review.
- *  `get`, `add` and `clear` THROW when the store cannot be read or written;
- *  none of them replaces a store it could not parse. A write returns only once
- *  it is durable (see durable-file.ts). */
+/** The gateway's claim on a dispatch, held across its POST. `token` is random
+ *  and identifies the claiming call; pid and host say who holds it. */
+export interface LatchClaim {
+  token: string;
+  pid: number;
+  host: string;
+  at: string;
+}
+
+/** One dispatch's entry in the latch store. */
+export interface LatchRecord extends Partial<LatchDetails> {
+  dispatchId: string;
+  latch: DispatchLatch;
+  claim?: LatchClaim;
+}
+
+/** The durable per-dispatch latch store. Every write runs under the store's
+ *  exclusive lock (store-lock.ts) and is durable before it returns
+ *  (durable-file.ts); every method THROWS when the store cannot be read,
+ *  locked or written, and none replaces a store it could not parse. */
 export interface ReconcileStore {
-  get(dispatchId: string): DispatchLatch | null;
-  /** Set a dispatch's latch, merging any details given. */
-  add(dispatchId: string, latch: DispatchLatch, details?: Partial<LatchDetails>): void;
-  clear(dispatchId: string): void;
+  /** The dispatch's entry, or null (a read; no lock needed). */
+  entry(dispatchId: string): LatchRecord | null;
+  /** CLAIM: under the lock, if the dispatch has any entry return it and write
+   *  nothing; otherwise durably write `reserved` with the attempt details and
+   *  this claim, and return null. */
+  reserve(dispatchId: string, details: LatchDetails, claim: LatchClaim): LatchRecord | null;
+  /** Under the lock: record the outcome of the attempt holding `claimToken`
+   *  and drop its claim. Throws if the entry is not held by that claim. */
+  settle(dispatchId: string, claimToken: string, latch: "posted" | "reconcile_required", details?: Partial<LatchDetails>): void;
+  /** Under the lock: remove the reservation held by `claimToken` — only after
+   *  a response that proves no review was created. Throws if not held by it. */
+  release(dispatchId: string, claimToken: string): void;
   /** Prove the store is readable and writable now; throws otherwise. */
   probe(): void;
 }

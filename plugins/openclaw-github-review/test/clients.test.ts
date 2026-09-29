@@ -76,17 +76,39 @@ describe("HttpGitHubApi — exact request, classification and receipt", () => {
     expect(String(calls[0]!.init.body)).toBe(JSON.stringify({ commit_id: COMMIT, event: "COMMENT", body }));
   });
 
-  test("a 4xx is a definitive rejection; a 5xx or a transport failure is ambiguous", async () => {
+  test("ONLY 401/403/404/422 produced by GitHub (X-GitHub-Request-Id) are rejections; every other non-2xx and a transport failure are ambiguous", async () => {
     const { custody } = scenario(root);
-    for (const [status, kind] of [
-      [422, "rejected"],
-      [502, "ambiguous"],
-    ] as const) {
-      const { fn } = fakeFetch(() => new Response("nope", { status }));
+    const GH = { "x-github-request-id": "ABCD:1" };
+    const cases: Array<[number, Record<string, string>, "rejected" | "ambiguous"]> = [
+      [401, GH, "rejected"],
+      [403, GH, "rejected"],
+      [404, GH, "rejected"],
+      [422, GH, "rejected"],
+      // The same statuses NOT produced by GitHub (an intermediary) prove nothing.
+      [401, {}, "ambiguous"],
+      [403, {}, "ambiguous"],
+      [404, {}, "ambiguous"],
+      [422, {}, "ambiguous"],
+      // Never documented as no-create for this endpoint, even from GitHub.
+      [400, GH, "ambiguous"],
+      [407, GH, "ambiguous"],
+      [408, GH, "ambiguous"],
+      [409, GH, "ambiguous"],
+      [410, GH, "ambiguous"],
+      [429, GH, "ambiguous"],
+      [451, GH, "ambiguous"],
+      [500, GH, "ambiguous"],
+      [502, {}, "ambiguous"],
+      [503, GH, "ambiguous"],
+      [504, {}, "ambiguous"],
+      [307, GH, "ambiguous"],
+    ];
+    for (const [status, headers, kind] of cases) {
+      const { fn } = fakeFetch(() => new Response("nope", { status, headers }));
       const api = new HttpGitHubApi({ custody, baseUrl: BASE, fetchImpl: fn });
       const r = await api.createReview({ repo: REPO, pr: PR, commitId: COMMIT, event: "APPROVE", body: "x" });
       expect(r.ok).toBe(false);
-      if (!r.ok) expect(r.kind).toBe(kind);
+      if (!r.ok) expect(`${status} ${JSON.stringify(headers)} → ${r.kind}`).toBe(`${status} ${JSON.stringify(headers)} → ${kind}`);
     }
     const { fn } = fakeFetch(() => {
       throw new Error("network down");
@@ -106,6 +128,7 @@ describe("HttpGitHubApi — exact request, classification and receipt", () => {
         commit_id: COMMIT,
         state: "COMMENTED",
         html_url: `https://example.test/r/${from + i}`,
+        submitted_at: i % 2 ? "2026-09-28T01:00:00Z" : undefined,
       }));
     const { fn, calls } = fakeFetch((url) =>
       new Response(JSON.stringify(url.endsWith("page=1") ? page(100, 1) : page(3, 101)), { status: 200 }),
@@ -115,7 +138,15 @@ describe("HttpGitHubApi — exact request, classification and receipt", () => {
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.reviews.length).toBe(103);
-      expect(r.reviews[1]).toEqual({ id: 2, login: "anvil-reviewer", commitId: COMMIT, state: "COMMENTED", url: "https://example.test/r/2" });
+      expect(r.reviews[1]).toEqual({
+        id: 2,
+        login: "anvil-reviewer",
+        commitId: COMMIT,
+        state: "COMMENTED",
+        url: "https://example.test/r/2",
+        submittedAt: "2026-09-28T01:00:00Z",
+      });
+      expect(r.reviews[0]!.submittedAt).toBeNull();
     }
     expect(calls.map((c) => c.url)).toEqual([
       `${BASE}/repos/${REPO}/pulls/${PR}/reviews?per_page=100&page=1`,

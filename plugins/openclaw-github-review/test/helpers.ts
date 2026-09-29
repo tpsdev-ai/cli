@@ -20,6 +20,8 @@ import type {
   DispatchAssignment,
   DispatchLatch,
   ExistingReview,
+  LatchClaim,
+  LatchRecord,
   GitHubApi,
   GitHubReviewLister,
   LatchDetails,
@@ -95,30 +97,39 @@ export class FailingSavePendingStore implements PendingAuditStore {
   }
 }
 
-/** A latch store (in memory) that reads and probes fine but whose writes of
- *  the chosen kinds throw — a durable latch write failing mid-flow. `"clear"`
- *  fails the removal of a reservation. */
+/** A latch store (in memory, same claim semantics) that reads and probes fine
+ *  but whose chosen operations throw — a durable latch write failing mid-flow. */
 export class FlakyReconcileStore implements ReconcileStore {
   readonly inner = new MemoryReconcileStore();
-  writes: Array<{ dispatchId: string; latch: DispatchLatch | "clear" }> = [];
-  constructor(private readonly failOn: ReadonlyArray<DispatchLatch | "clear">) {}
+  writes: Array<{ dispatchId: string; op: FlakyOp }> = [];
+  constructor(private readonly failOn: ReadonlyArray<FlakyOp>) {}
   get(dispatchId: string): DispatchLatch | null {
-    return this.inner.get(dispatchId);
+    return this.inner.entry(dispatchId)?.latch ?? null;
   }
-  add(dispatchId: string, latch: DispatchLatch, details?: Partial<LatchDetails>): void {
-    this.writes.push({ dispatchId, latch });
-    if (this.failOn.includes(latch)) throw new Error("latch store path /host/secret/reconcile.json is unwritable");
-    this.inner.add(dispatchId, latch, details);
+  entry(dispatchId: string): LatchRecord | null {
+    return this.inner.entry(dispatchId);
   }
-  clear(dispatchId: string): void {
-    this.writes.push({ dispatchId, latch: "clear" });
-    if (this.failOn.includes("clear")) throw new Error("latch store path /host/secret/reconcile.json is unwritable");
-    this.inner.clear(dispatchId);
+  private attempt(dispatchId: string, op: FlakyOp): void {
+    this.writes.push({ dispatchId, op });
+    if (this.failOn.includes(op)) throw new Error("latch store path /host/secret/reconcile.json is unwritable");
+  }
+  reserve(dispatchId: string, details: LatchDetails, claim: LatchClaim): LatchRecord | null {
+    this.attempt(dispatchId, "reserve");
+    return this.inner.reserve(dispatchId, details, claim);
+  }
+  settle(dispatchId: string, claimToken: string, latch: "posted" | "reconcile_required", details?: Partial<LatchDetails>): void {
+    this.attempt(dispatchId, latch);
+    this.inner.settle(dispatchId, claimToken, latch, details);
+  }
+  release(dispatchId: string, claimToken: string): void {
+    this.attempt(dispatchId, "release");
+    this.inner.release(dispatchId, claimToken);
   }
   probe(): void {
     /* the store looked usable before the request */
   }
 }
+export type FlakyOp = "reserve" | "posted" | "reconcile_required" | "release";
 
 /** The plugin configuration object (as the gateway would pass it) for a
  *  scenario's host files. */

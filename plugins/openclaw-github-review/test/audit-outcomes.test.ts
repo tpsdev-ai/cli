@@ -9,7 +9,7 @@
  * the durable stores fail closed; and nothing after a POST throws.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,6 +18,8 @@ import { fileURLToPath } from "node:url";
 import { FilePendingAuditStore, FileReconcileStore, retryPendingAudits } from "../src/audit.js";
 import { outcomeToJson, runGithubReview } from "../src/handler.js";
 import { createGithubReviewTool } from "../src/index.js";
+import { DispatchLedger } from "../src/dispatch-ledger.js";
+import { HttpGitHubApi } from "../src/github.js";
 import { runLatchAdmin } from "../src/latch-admin.js";
 import type { ExistingReview, Outcome, ReconcileStore, RefusalReason } from "../src/types.js";
 import {
@@ -34,11 +36,14 @@ import {
   REPO,
   scenario,
   session,
+  TOKEN,
   validInput,
   type Scenario,
 } from "./helpers.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
+/** A test that runs real child processes: allow for a loaded host. */
+const PROCESS_TEST_TIMEOUT_MS = 60_000;
 
 let root: string;
 beforeEach(() => {
@@ -309,11 +314,12 @@ describe("B2 — the durable stores fail closed", () => {
 
   test("a latch store that cannot be READ at the latch check refuses store_unavailable, even if its probe passes", async () => {
     const reconcile: ReconcileStore = {
-      get: () => {
+      entry: () => {
         throw new Error("latch store path /host/secret/reconcile.json is unreadable");
       },
-      add: () => {},
-      clear: () => {},
+      reserve: () => null,
+      settle: () => {},
+      release: () => {},
       probe: () => {},
     };
     const { deps, github } = makeDeps(scenario(root), { reconcile });
@@ -339,19 +345,41 @@ describe("B2 — the durable stores fail closed", () => {
     }
   });
 
-  test("FileReconcileStore.clear removes ONLY the named dispatch", () => {
+  test("FileReconcileStore.replaceIf removes ONLY the named dispatch, and only if it is unchanged", () => {
     const store = new FileReconcileStore(join(root, "latches.json"));
-    store.add("a", "reserved", {});
-    store.add("b", "posted", {});
-    expect(store.clear("a")).toBe(true);
+    store.put({ dispatchId: "a", latch: "reserved" });
+    store.put({ dispatchId: "b", latch: "posted" });
+    expect(store.replaceIf("a", { dispatchId: "a", latch: "reconcile_required" }, null)).toBe(false);
+    expect(store.replaceIf("a", { dispatchId: "a", latch: "reserved" }, null)).toBe(true);
     expect(store.list().map((e) => [e.dispatchId, e.latch])).toEqual([["b", "posted"]]);
   });
 
-  test("FileReconcileStore.add never overwrites a file it could not parse", () => {
+  test("FileReconcileStore: settle and release act ONLY for the claim that holds the dispatch", () => {
+    const store = new FileReconcileStore(join(root, "claims.json"));
+    const details = { repo: REPO, pr: PR, commit: COMMIT, login: "l", credentialSha256: "f", reservedAt: "now" };
+    expect(store.reserve("d", details, { token: "mine", pid: 1, host: "h", at: "now" })).toBeNull();
+    // A second claim of the same dispatch gets the existing entry and writes nothing.
+    expect(store.reserve("d", details, { token: "other", pid: 2, host: "h", at: "now" })).toMatchObject({ claim: { token: "mine" } });
+    const before = readFileSync(join(root, "claims.json"), "utf8");
+    expect(() => store.settle("d", "other", "posted")).toThrow();
+    expect(() => store.release("d", "other")).toThrow();
+    expect(readFileSync(join(root, "claims.json"), "utf8")).toBe(before);
+    store.settle("d", "mine", "reconcile_required", { reviewId: 3 });
+    expect(store.entry("d")).toMatchObject({ latch: "reconcile_required", reviewId: 3 });
+    expect(store.entry("d")!.claim).toBeUndefined();
+    // Settled: the reservation is no longer the claim's to release.
+    expect(() => store.release("d", "mine")).toThrow();
+    expect(store.get("d")).toBe("reconcile_required");
+  });
+
+  test("FileReconcileStore writes never overwrite a file they could not parse", () => {
     const garbled = join(root, "garbled.json");
     writeFileSync(garbled, '{"latches":[{"dispatchId":"other","latch":"posted"}', { mode: 0o600 });
     const store = new FileReconcileStore(garbled);
-    expect(() => store.add("dispatch-new", "reconcile_required")).toThrow();
+    const claim = { token: "t", pid: 1, host: "h", at: "now" };
+    const details = { repo: REPO, pr: PR, commit: COMMIT, login: "l", credentialSha256: "f", reservedAt: "now" };
+    expect(() => store.reserve("dispatch-new", details, claim)).toThrow();
+    expect(() => store.put({ dispatchId: "dispatch-new", latch: "posted" })).toThrow();
     expect(readFileSync(garbled, "utf8")).toBe('{"latches":[{"dispatchId":"other","latch":"posted"}');
   });
 
@@ -367,48 +395,48 @@ describe("B2 — the durable stores fail closed", () => {
     expect(readFileSync(garbled, "utf8")).toBe('{"events":[{"id":1}]}');
   });
 
-  test("an ambiguous post whose outcome write fails stays RESERVED: no throw, 1 POST, reconcile_required, one path-free log line", async () => {
+  test("an ambiguous post whose outcome write fails stays RESERVED with its claim: no throw, 1 POST, then refused, one path-free log attempt", async () => {
     const reconcile = new FlakyReconcileStore(["reconcile_required"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     github.reviewResult = { ok: false, kind: "ambiguous", detail: "posting returned status 502" };
     const first = await runGithubReview(validInput(), HOST, deps);
     expect(first.ok && first.status === "unknown").toBe(true);
-    expect(reconcile.get("dispatch-1")).toBe("reserved");
-    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    expect(reconcile.entry("dispatch-1")).toMatchObject({ latch: "reserved", claim: expect.any(Object) });
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "dispatch_in_flight");
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("stays reserved");
     expect(logs[0]).not.toContain("/host/secret");
   });
 
-  test("a receipt_invalid post whose outcome write fails stays RESERVED", async () => {
+  test("a receipt_invalid post whose outcome write fails stays RESERVED with its claim", async () => {
     const reconcile = new FlakyReconcileStore(["reconcile_required"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     github.reviewResult = { ok: true, receipt: { id: 9, url: "https://example.test/r/9", commitId: COMMIT, state: "COMMENTED" } };
     const first = await runGithubReview(validInput({ event: "APPROVE" }), HOST, deps);
     expect(first.ok && first.status === "unknown").toBe(true);
-    refusedWith(await runGithubReview(validInput({ event: "APPROVE" }), HOST, deps), "reconcile_required");
+    refusedWith(await runGithubReview(validInput({ event: "APPROVE" }), HOST, deps), "dispatch_in_flight");
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
   });
 
-  test("a posted review whose `posted` write fails is still posted, stays RESERVED, and the next call is refused (reconcile_required)", async () => {
+  test("a posted review whose `posted` write fails is still posted, stays RESERVED with its claim, and the next call is refused", async () => {
     const reconcile = new FlakyReconcileStore(["posted"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     const first = await runGithubReview(validInput(), HOST, deps);
     expect(first.ok && first.status === "posted").toBe(true);
     expect(reconcile.get("dispatch-1")).toBe("reserved");
-    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "dispatch_in_flight");
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
   });
 
-  test("a rejected post whose reservation cannot be removed stays RESERVED: github_rejected, then reconcile_required", async () => {
-    const reconcile = new FlakyReconcileStore(["clear"]);
+  test("a rejected post whose reservation cannot be removed stays RESERVED: github_rejected, then refused", async () => {
+    const reconcile = new FlakyReconcileStore(["release"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     github.reviewResult = { ok: false, kind: "rejected", detail: "posting returned status 422" };
     refusedWith(await runGithubReview(validInput(), HOST, deps), "github_rejected");
-    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "dispatch_in_flight");
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("could not be removed");
@@ -417,13 +445,13 @@ describe("B2 — the durable stores fail closed", () => {
 
 describe("R5 — the durable reservation BEFORE the POST", () => {
   test("a failed reservation write means NO POST: store_unavailable, path-free", async () => {
-    const reconcile = new FlakyReconcileStore(["reserved"]);
+    const reconcile = new FlakyReconcileStore(["reserve"]);
     const { deps, github } = makeDeps(scenario(root), { reconcile });
     const o = await runGithubReview(validInput(), HOST, deps);
     refusedWith(o, "store_unavailable");
     expect(outcomeToJson(o)).not.toContain("/host/secret");
     expect(github.reviewCalls.length).toBe(0);
-    expect(reconcile.writes).toEqual([{ dispatchId: "dispatch-1", latch: "reserved" }]);
+    expect(reconcile.writes).toEqual([{ dispatchId: "dispatch-1", op: "reserve" }]);
   });
 
   test("the reservation is DURABLE on disk, with the attempt's details, when the POST leaves", async () => {
@@ -439,16 +467,28 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     const o = await runGithubReview(validInput(), HOST, deps);
     expect(o.ok && o.status === "posted").toBe(true);
     expect(seen).toEqual([
-      expect.objectContaining({ dispatchId: "dispatch-1", latch: "reserved", repo: REPO, pr: PR, commit: COMMIT, login: "anvil-reviewer" }),
+      expect.objectContaining({
+        dispatchId: "dispatch-1",
+        latch: "reserved",
+        repo: REPO,
+        pr: PR,
+        commit: COMMIT,
+        login: "anvil-reviewer",
+        credentialSha256: s.custody.bindingSha256(),
+        claim: expect.objectContaining({ pid: process.pid, token: expect.any(String) }),
+      }),
     ]);
-    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "posted", reviewId: 1 });
+    const settled = new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1");
+    expect(settled).toMatchObject({ latch: "posted", reviewId: 1, credentialSha256: s.custody.bindingSha256() });
+    expect(settled!.claim).toBeUndefined();
+    expect(JSON.stringify(settled)).not.toContain(TOKEN);
   });
 
   test("a latch that appears while the PR is being fetched is honoured at the reservation: no POST", async () => {
     const s = scenario(root);
     class LatchingGitHub extends FakeGitHub {
       override async fetchPull(repo: string, pr: number) {
-        new FileReconcileStore(s.config.reconcileFile!).add("dispatch-1", "posted", {});
+        new FileReconcileStore(s.config.reconcileFile!).put({ dispatchId: "dispatch-1", latch: "posted" });
         return super.fetchPull(repo, pr);
       }
     }
@@ -458,9 +498,9 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     expect(github.reviewCalls.length).toBe(0);
   });
 
-  test("anything unexpected after the POST is contained: a receipt that throws when read returns UNKNOWN, never a throw", async () => {
+  test("a 2xx whose receipt partly throws when read: UNKNOWN (receipt_invalid) with the readable id, latched with it, never a throw", async () => {
     const s = scenario(root);
-    const { deps, github } = makeDeps(s);
+    const { deps, github, audit } = makeDeps(s);
     const receipt = { id: 5, url: "https://example.test/r/5", state: "APPROVED" } as { id: number; url: string; state: string; commitId: string };
     Object.defineProperty(receipt, "commitId", {
       get() {
@@ -469,9 +509,133 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     });
     github.reviewResult = { ok: true, receipt };
     const o = await runGithubReview(validInput(), HOST, deps);
-    expect(o).toMatchObject({ ok: true, status: "unknown", reason: "reconcile_required", reviewId: 5 });
+    expect(o).toMatchObject({ ok: true, status: "unknown", reason: "receipt_invalid", reviewId: 5, auditEventId: null });
+    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "reconcile_required", reviewId: 5 });
+    expect(audit.events.length).toBe(0);
     refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
     expect(github.reviewCalls.length).toBe(1);
+  });
+
+  test("an injected client whose EVERY receipt getter throws — or whose result's `ok` getter throws — never makes the handler throw", async () => {
+    const throwing = (keys: string[], base: Record<string, unknown> = {}) => {
+      const o: Record<string, unknown> = { ...base };
+      for (const k of keys) {
+        Object.defineProperty(o, k, {
+          get() {
+            throw new Error(`${k} unreadable`);
+          },
+        });
+      }
+      return o;
+    };
+    const results = [
+      { result: throwing(["receipt"], { ok: true }), reason: "receipt_invalid" },
+      { result: { ok: true, receipt: throwing(["id", "url", "commitId", "state"]) }, reason: "receipt_invalid" },
+      { result: throwing(["ok"]), reason: "reconcile_required" },
+      { result: throwing(["kind", "detail"], { ok: false }), reason: "reconcile_required" },
+    ];
+    for (const [i, { result, reason }] of results.entries()) {
+      const s = scenario(join(root, `c${i}`));
+      class InjectedClient extends FakeGitHub {
+        override async createReview(input: Parameters<FakeGitHub["createReview"]>[0]) {
+          this.reviewCalls.push(input);
+          return result as never;
+        }
+      }
+      const github = new InjectedClient();
+      const { deps } = makeDeps(s, { github });
+      const o = await runGithubReview(validInput(), HOST, deps);
+      expect(o).toMatchObject({ ok: true, status: "unknown", reason, reviewId: null, reviewUrl: null, commitId: COMMIT, auditEventId: null });
+      const e = new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1");
+      expect(e).toMatchObject({ latch: "reconcile_required" });
+      expect(e!.claim).toBeUndefined();
+      expect(github.reviewCalls.length).toBe(1);
+    }
+  });
+
+  test("an injected ledger whose outcome write THROWS, with a receipt whose getters work ONCE then throw: the fallback re-reads nothing — no throw", async () => {
+    const s = scenario(root);
+    class ThrowingSettleLedger extends DispatchLedger {
+      override settle(): boolean {
+        throw new Error("settle exploded");
+      }
+    }
+    const once = (value: unknown) => {
+      let reads = 0;
+      return {
+        get() {
+          if (reads++ > 0) throw new Error("read twice");
+          return value;
+        },
+      };
+    };
+    const receipt = {};
+    Object.defineProperty(receipt, "id", once(5));
+    Object.defineProperty(receipt, "url", once("https://example.test/r/5"));
+    Object.defineProperty(receipt, "commitId", once(COMMIT));
+    Object.defineProperty(receipt, "state", once("APPROVED"));
+    const result = {};
+    Object.defineProperty(result, "ok", once(true));
+    Object.defineProperty(result, "receipt", once(receipt));
+    class InjectedClient extends FakeGitHub {
+      override async createReview(input: Parameters<FakeGitHub["createReview"]>[0]) {
+        this.reviewCalls.push(input);
+        return result as never;
+      }
+    }
+    const github = new InjectedClient();
+    const { deps } = makeDeps(s, { github, ledger: new ThrowingSettleLedger(new FileReconcileStore(s.config.reconcileFile!)) });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o).toMatchObject({ ok: true, status: "unknown", reason: "reconcile_required", reviewId: 5, reviewUrl: "https://example.test/r/5" });
+    // The outcome was not recorded, so the durable reservation and claim still hold the dispatch.
+    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "reserved", claim: expect.any(Object) });
+    expect(github.reviewCalls.length).toBe(1);
+  });
+
+  test("a final in-process release that throws does not change the returned outcome", async () => {
+    const s = scenario(root);
+    class ThrowingLeaveLedger extends DispatchLedger {
+      override leave(): void {
+        throw new Error("leave failed");
+      }
+    }
+    const { deps } = makeDeps(s, { ledger: new ThrowingLeaveLedger(new FileReconcileStore(s.config.reconcileFile!)) });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o.ok && o.status === "posted").toBe(true);
+  });
+
+  for (const status of [408, 429]) {
+    test(`a ${status} from the real client — even carrying GitHub's request id — is AMBIGUOUS: unknown, latched reconcile_required, 1 POST`, async () => {
+      const s = scenario(root);
+      const calls: string[] = [];
+      const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+        calls.push(`${init?.method ?? "GET"} ${String(url)}`);
+        if ((init?.method ?? "GET") === "GET") return new Response(JSON.stringify({ state: "open", head: { sha: COMMIT } }), { status: 200 });
+        return new Response("slow down", { status, headers: { "x-github-request-id": "ABCD:1234" } });
+      }) as unknown as typeof fetch;
+      const { deps } = makeDeps(s, { github: new HttpGitHubApi({ custody: s.custody, fetchImpl }) });
+      const o = await runGithubReview(validInput(), HOST, deps);
+      expect(o).toMatchObject({ ok: true, status: "unknown", reason: "reconcile_required" });
+      expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reconcile_required");
+      refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+      expect(calls.filter((c) => c.startsWith("POST")).length).toBe(1);
+    });
+  }
+
+  test("a 422 produced by GitHub (request id present) PROVES non-creation: github_rejected, the reservation is removed, a corrected retry posts", async () => {
+    const s = scenario(root);
+    let postStatus = 422;
+    const fetchImpl = (async (_url: unknown, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return new Response(JSON.stringify({ state: "open", head: { sha: COMMIT } }), { status: 200 });
+      if (postStatus === 422) return new Response("{}", { status: 422, headers: { "x-github-request-id": "ABCD:1" } });
+      return new Response(JSON.stringify({ id: 3, html_url: "https://example.test/r/3", commit_id: COMMIT, state: "APPROVED" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const { deps } = makeDeps(s, { github: new HttpGitHubApi({ custody: s.custody, fetchImpl }) });
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "github_rejected");
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBeNull();
+    postStatus = 200;
+    const retry = await runGithubReview(validInput(), HOST, deps);
+    expect(retry.ok && retry.status === "posted").toBe(true);
   });
 
   test("a createReview that THROWS is treated as ambiguous: unknown, and the dispatch refuses until reconciled", async () => {
@@ -514,64 +678,223 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     expect(github.reviewCalls.length).toBe(1);
   });
 
-  /** Run one call in a child process that SIGKILLs itself at `crashAt`. */
-  function crashRun(s: Scenario, crashAt: "before-post" | "after-post") {
-    const postLog = join(root, "posts.log");
-    const specFile = join(root, "crash-spec.json");
-    writeFileSync(specFile, JSON.stringify({ pluginConfig: pluginConfigOf(s), crashAt, postLog }), { mode: 0o600 });
-    const res = spawnSync(process.execPath, [join(here, "crash-child.ts"), specFile], {
-      encoding: "utf8",
-      timeout: 60_000,
-      killSignal: "SIGKILL",
-    });
-    const posts = existsSync(postLog) ? readFileSync(postLog, "utf8").split("\n").filter(Boolean).length : 0;
-    return { res, posts };
-  }
-
-  test("a CRASH between the reservation and the POST: the next call is refused reconcile_required; the host finds no review and releases; exactly ONE POST in all", async () => {
+  test("a CRASH between the reservation and the POST: the next call is refused (the claim is held); the host proves non-creation and releases; exactly ONE POST in all", async () => {
     const s = scenario(root);
-    const { res, posts } = crashRun(s, "before-post");
+    const { res, posts } = childRun(s, { mode: "crash-before-post" });
     expect(res.signal).toBe("SIGKILL");
     expect(res.stdout).toBe("");
-    expect(posts).toBe(0);
-    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+    expect(posts()).toBe(0);
+    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "reserved", claim: expect.any(Object) });
 
     const restarted = makeDeps(s);
-    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
     expect(restarted.github.reviewCalls.length).toBe(0);
 
-    expect(await hostReconcile(s, [])).toBe(0);
+    // The claim outlived its process: without --stale-claim reconcile refuses.
+    expect(await hostReconcile(s, [])).toBe(1);
+    expect(await hostReconcile(s, [], { staleClaim: true })).toBe(0);
     const after = await runGithubReview(validInput(), HOST, restarted.deps);
     expect(after.ok && after.status === "posted").toBe(true);
-    expect(posts + restarted.github.reviewCalls.length).toBe(1);
-  });
+    expect(posts() + restarted.github.reviewCalls.length).toBe(1);
+  }, PROCESS_TEST_TIMEOUT_MS);
 
-  test("a CRASH between the POST and the `posted` write: the next call is refused reconcile_required; the host finds the review and latches posted; exactly ONE POST in all", async () => {
+  test("a CRASH between the POST and the `posted` write: refused until the host finds the review and latches posted; exactly ONE POST in all", async () => {
     const s = scenario(root);
-    const { res, posts } = crashRun(s, "after-post");
+    const { res, posts } = childRun(s, { mode: "crash-after-post" });
     expect(res.signal).toBe("SIGKILL");
-    expect(posts).toBe(1);
+    expect(posts()).toBe(1);
     expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
 
     const restarted = makeDeps(s);
-    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
 
-    const review: ExistingReview = { id: 1, login: "anvil-reviewer", commitId: COMMIT, state: "APPROVED", url: "https://example.test/r/1" };
-    expect(await hostReconcile(s, [review])).toBe(0);
+    const review: ExistingReview = {
+      id: 1,
+      login: "anvil-reviewer",
+      commitId: COMMIT,
+      state: "APPROVED",
+      url: "https://example.test/r/1",
+      submittedAt: new Date().toISOString(),
+    };
+    expect(await hostReconcile(s, [review], { staleClaim: true })).toBe(0);
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "already_posted");
-    expect(posts + restarted.github.reviewCalls.length).toBe(1);
+    expect(posts() + restarted.github.reviewCalls.length).toBe(1);
+  }, PROCESS_TEST_TIMEOUT_MS);
+});
+
+describe("R6 — one lock, real processes", () => {
+  test("TWO PROCESSES claim the same dispatch at once (store read-modify-write widened): exactly ONE POST", async () => {
+    const s = scenario(root);
+    const goFile = join(root, "go");
+    const postLog = join(root, "posts.log");
+    const a = childStart(s, { mode: "race", goFile, widenMs: 400, postLog }, "a");
+    const b = childStart(s, { mode: "race", goFile, widenMs: 400, postLog }, "b");
+    writeFileSync(goFile, "go");
+    const [ra, rb] = await Promise.all([a, b]);
+    const outcomes = [ra, rb].map((r) => JSON.parse(r.stdout.trim()) as { status?: string; reason?: string });
+    const posts = readFileSync(postLog, "utf8").split("\n").filter(Boolean);
+    expect(posts.length).toBe(1);
+    expect(outcomes.filter((o) => o.status === "posted").length).toBe(1);
+    const other = outcomes.find((o) => o.status !== "posted")!;
+    expect(["dispatch_in_flight", "already_posted"]).toContain(other.reason!);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("posted");
+  }, PROCESS_TEST_TIMEOUT_MS);
+
+  test("TWO PROCESSES updating DIFFERENT dispatches at once lose neither update", async () => {
+    const store = join(root, "shared.json");
+    const script = join(root, "put.ts");
+    const go = join(root, "go2");
+    writeFileSync(
+      script,
+      [
+        `import { spyOn } from "bun:test";`,
+        `import * as fs from "node:fs";`,
+        `import { FileReconcileStore } from ${JSON.stringify(join(here, "..", "src", "audit.ts"))};`,
+        `const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+        `const realOpen = fs.openSync.bind(fs);`,
+        `spyOn(fs, "openSync").mockImplementation(((p: any, f: any, m: any) => { if (String(p).endsWith(".tmp")) sleep(300); return realOpen(p, f ?? "r", m); }) as any);`,
+        `while (!fs.existsSync(${JSON.stringify(go)})) sleep(5);`,
+        `new FileReconcileStore(${JSON.stringify(store)}).put({ dispatchId: process.argv[2]!, latch: "posted" });`,
+      ].join("\n"),
+    );
+    const pa = spawnAsync(process.execPath, [script, "d-a"]);
+    const pb = spawnAsync(process.execPath, [script, "d-b"]);
+    writeFileSync(go, "go");
+    const [ra, rb] = await Promise.all([pa, pb]);
+    expect([ra.code, rb.code]).toEqual([0, 0]);
+    expect(new FileReconcileStore(store).list().map((e) => e.dispatchId).sort()).toEqual(["d-a", "d-b"]);
+  }, PROCESS_TEST_TIMEOUT_MS);
+
+  test("TWO PROCESSES retaining DIFFERENT audit records at once lose neither (the pending-audit store is locked too)", async () => {
+    const store = join(root, "pending.json");
+    const script = join(root, "save.ts");
+    const go = join(root, "go3");
+    writeFileSync(
+      script,
+      [
+        `import { spyOn } from "bun:test";`,
+        `import * as fs from "node:fs";`,
+        `import { FilePendingAuditStore } from ${JSON.stringify(join(here, "..", "src", "audit.ts"))};`,
+        `const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);`,
+        `const realOpen = fs.openSync.bind(fs);`,
+        `spyOn(fs, "openSync").mockImplementation(((p: any, f: any, m: any) => { if (String(p).endsWith(".tmp")) sleep(300); return realOpen(p, f ?? "r", m); }) as any);`,
+        `while (!fs.existsSync(${JSON.stringify(go)})) sleep(5);`,
+        `const id = process.argv[2]!;`,
+        `new FilePendingAuditStore(${JSON.stringify(store)}).save({ id, authorId: "a", kind: "pr_review_posted", scope: "r", refId: "1", targetIds: [], summary: "s", detail: "{}", createdAt: "t" });`,
+      ].join("\n"),
+    );
+    const pa = spawnAsync(process.execPath, [script, "e-a"]);
+    const pb = spawnAsync(process.execPath, [script, "e-b"]);
+    writeFileSync(go, "go");
+    const [ra, rb] = await Promise.all([pa, pb]);
+    expect([ra.code, rb.code]).toEqual([0, 0]);
+    expect(new FilePendingAuditStore(store).list().map((e) => e.id).sort()).toEqual(["e-a", "e-b"]);
+  }, PROCESS_TEST_TIMEOUT_MS);
+
+  test("RECONCILE racing an IN-FLIGHT POST in another process is refused (claim held); after the POST the dispatch is posted and final", async () => {
+    const s = scenario(root);
+    const inPostFile = join(root, "in-post");
+    const releaseFile = join(root, "release");
+    const postLog = join(root, "posts.log");
+    const later = new Date(Date.now() + 3_600_000);
+    const child = childStart(s, { mode: "hold", inPostFile, releaseFile, postLog }, "hold");
+    await waitFor(() => existsSync(inPostFile));
+    const childPid = Number(readFileSync(inPostFile, "utf8"));
+    const errors: string[] = [];
+    // Without --stale-claim: the claim is held.
+    expect(await hostReconcile(s, [], { err: errors, now: later })).toBe(1);
+    expect(errors.join("\n")).toContain(`claim held by pid ${childPid}`);
+    // With --stale-claim: the claiming process is alive on this host.
+    expect(await hostReconcile(s, [], { staleClaim: true, err: errors, now: later })).toBe(1);
+    expect(errors.join("\n")).toContain(`pid ${childPid} is still running`);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+    writeFileSync(releaseFile, "go");
+    const r = await child;
+    expect((JSON.parse(r.stdout.trim()) as { status: string }).status).toBe("posted");
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("posted");
+    expect(await hostReconcile(s, [], { staleClaim: true, now: later })).toBe(1);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("posted");
+  }, PROCESS_TEST_TIMEOUT_MS);
+
+  test("a STALE store lock (its holder died) fails the claim closed: store_unavailable, no POST, a path-free log naming the lock and remedy", async () => {
+    const s = scenario(root);
+    const lock = `${s.config.reconcileFile!}.lock`;
+    writeFileSync(lock, JSON.stringify({ pid: 999999, host: "gone", since: "2026-01-01T00:00:00Z", op: "reserve", token: "x" }));
+    const { deps, github, logs } = makeDeps(s);
+    const o = await runGithubReview(validInput(), HOST, deps);
+    refusedWith(o, "store_unavailable");
+    expect(github.reviewCalls.length).toBe(0);
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain('reconcileFile + ".lock"');
+    expect(logs[0]).toContain("pid 999999");
+    expect(logs[0]).toContain("stale");
+    expect(logs[0]).not.toContain(root);
+    expect(existsSync(lock)).toBe(true);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBeNull();
   });
 });
 
-/** The host's audited reconciliation of dispatch-1 against a given review listing. */
-async function hostReconcile(s: Scenario, reviews: ExistingReview[]): Promise<number> {
+/** Run the gateway child synchronously (crash modes). */
+function childRun(s: Scenario, extra: Record<string, unknown>) {
+  const postLog = join(root, "posts.log");
+  const specFile = join(root, "child-spec.json");
+  writeFileSync(specFile, JSON.stringify({ pluginConfig: pluginConfigOf(s), postLog, ...extra }), { mode: 0o600 });
+  const res = spawnSync(process.execPath, [join(here, "gateway-child.ts"), specFile], {
+    encoding: "utf8",
+    timeout: 60_000,
+    killSignal: "SIGKILL",
+  });
+  const posts = () => (existsSync(postLog) ? readFileSync(postLog, "utf8").split("\n").filter(Boolean).length : 0);
+  return { res, posts };
+}
+
+/** Start the gateway child without waiting (race and hold modes). */
+function childStart(s: Scenario, extra: Record<string, unknown>, name: string) {
+  const specFile = join(root, `child-${name}.json`);
+  writeFileSync(specFile, JSON.stringify({ pluginConfig: pluginConfigOf(s), ...extra }), { mode: 0o600 });
+  return spawnAsync(process.execPath, [join(here, "gateway-child.ts"), specFile]);
+}
+
+function spawnAsync(cmd: string, args: string[]): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolvePromise) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c));
+    child.stderr.on("data", (c) => (stderr += c));
+    const timer = setTimeout(() => child.kill("SIGKILL"), 60_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolvePromise({ code, stdout, stderr });
+    });
+  });
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 30_000): Promise<void> {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("timed out waiting");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+/** The host's audited reconciliation of dispatch-1 against a given review
+ *  listing, run as if 11 minutes after the attempt unless `now` is given. */
+async function hostReconcile(
+  s: Scenario,
+  reviews: ExistingReview[],
+  opts: { staleClaim?: boolean; now?: Date; err?: string[] } = {},
+): Promise<number> {
   const configFile = join(root, "plugin-config.json");
   writeFileSync(configFile, JSON.stringify(pluginConfigOf(s)), { mode: 0o600 });
   const { fetchImpl } = fakeFlairFetch(200);
-  return runLatchAdmin(["reconcile", configFile, "dispatch-1"], () => {}, () => {}, {
-    lister: new FakeReviewLister({ ok: true, reviews }),
-    fetchImpl,
-  });
+  const now = opts.now ?? new Date(Date.now() + 11 * 60_000);
+  return runLatchAdmin(
+    ["reconcile", configFile, "dispatch-1", ...(opts.staleClaim ? ["--stale-claim"] : [])],
+    () => {},
+    (l) => opts.err?.push(l),
+    { lister: new FakeReviewLister({ ok: true, reviews }), fetchImpl, clock: () => now },
+  );
 }
 
 describe("ONE VERDICT PER DISPATCH (in flight and after a post)", () => {

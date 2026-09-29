@@ -21,6 +21,24 @@ export interface GitHubApiOptions {
 }
 
 const DEFAULT_BASE_URL = "https://api.github.com";
+
+/** The responses to "Create a review for a pull request" (POST
+ *  /repos/{owner}/{repo}/pulls/{pull_number}/reviews) that PROVE no review was
+ *  created, per GitHub's documented behaviour: 401 (bad credentials: the
+ *  request is not authenticated), 403 (forbidden, documented for this
+ *  endpoint), 404 (not found: no such repository or pull request for this
+ *  credential) and 422 (validation failed, or the endpoint has been spammed,
+ *  documented for this endpoint) — each a rejection before the review is
+ *  created. They count only when GitHub itself produced them, i.e. the
+ *  response carries GitHub's `X-GitHub-Request-Id` header; the same status
+ *  from an intermediary proves nothing about GitHub.
+ *
+ *  EVERYTHING ELSE that is not a 2xx is AMBIGUOUS — the review may exist:
+ *  408 and 429 (not documented for this endpoint, and commonly produced by an
+ *  intermediary after the request was forwarded), any other 4xx, every 5xx and
+ *  3xx, a transport failure, and a 2xx whose body cannot be read. */
+export const NO_CREATE_STATUSES: ReadonlySet<number> = new Set([401, 403, 404, 422]);
+export const GITHUB_REQUEST_ID_HEADER = "x-github-request-id";
 const REVIEWS_PER_PAGE = 100;
 /** A PR with more reviews than this is not listed to the end: the listing is
  *  reported as incomplete, never as "no review exists". */
@@ -105,6 +123,7 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
           commitId: typeof o.commit_id === "string" ? o.commit_id : null,
           state: o.state,
           url: typeof o.html_url === "string" ? o.html_url : null,
+          submittedAt: typeof o.submitted_at === "string" ? o.submitted_at : null,
         });
       }
       if (json.length < REVIEWS_PER_PAGE) return { ok: true, reviews };
@@ -141,9 +160,10 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
       return { ok: false, kind: "ambiguous", detail: "posting request failed with no definitive response" };
     }
     if (!res.ok) {
-      // A definitive rejection is 4xx (the request was understood and refused);
-      // anything else (5xx, gateway errors) may or may not have created a review.
-      const kind = res.status >= 400 && res.status < 500 ? "rejected" : "ambiguous";
+      // Only a documented no-create rejection produced by GitHub itself is
+      // definitive; everything else may have created a review.
+      const fromGitHub = res.headers.get(GITHUB_REQUEST_ID_HEADER) !== null;
+      const kind = NO_CREATE_STATUSES.has(res.status) && fromGitHub ? "rejected" : "ambiguous";
       return { ok: false, kind, detail: `posting returned status ${res.status}` };
     }
     let json: unknown;

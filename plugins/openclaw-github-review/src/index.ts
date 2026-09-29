@@ -6,10 +6,12 @@
  * calling session's trusted dispatch assignment: the caller's `repo`, `pr` and
  * `commit_id` MUST equal the host assignment and the host-fetched head. The
  * GitHub credential is read once, here, into a #private field of the custody
- * object and is never re-read or disclosed. Every post emits a signed Flair
- * OrgEvent, or reports that its audit is pending or lost. A dispatch posts at
- * most one verdict unless the host's audited reconciliation releases it (see
- * dispatch-ledger.ts).
+ * object and is never re-read or disclosed. A review created with a readable
+ * receipt gets a signed Flair OrgEvent, or a result saying its audit is
+ * pending or lost; an uncertain outcome is `unknown` (handler.ts). A dispatch
+ * posts at most one verdict — for the processes sharing the latch store's lock
+ * — unless the host's reconciliation proves non-creation (dispatch-ledger.ts,
+ * latch-admin.ts).
  *
  * This plugin depends on the mail plugin in NO way: it has its own
  * installation, deployment and rollback lifecycle.
