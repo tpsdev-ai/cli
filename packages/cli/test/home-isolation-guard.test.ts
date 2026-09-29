@@ -2,21 +2,26 @@
  * home-isolation-guard.test.ts — cli#430.
  *
  * Coverage for the suite-level HOME isolation:
- *   - scripts/test-home-guard.mjs — the environment sanitizer, the temp/report
- *     destination check, and the `~/.tps` metadata snapshot (a diagnostic);
- *   - scripts/home-isolation-preload.ts — the launch-time precondition that
- *     aborts a run whose os.homedir() is outside the isolated test root;
+ *   - scripts/test-home-guard.mjs — the environment ALLOWLIST, the throwaway
+ *     root, the temp/report destination checks, the suite-name check, the
+ *     preloads' root check, and the `~/.tps` metadata snapshot (a diagnostic);
+ *   - scripts/home-isolation-preload.ts and the plugin's test/preload-guard.ts —
+ *     the launch-time precondition, in every location a bare `bun test` can
+ *     start from;
  *   - the two launchers (scripts/test-suite.mjs and
- *     plugins/openclaw-tps-mail/scripts/run-tests.mjs) and the repo-root
- *     bunfig.toml, end to end.
+ *     plugins/openclaw-tps-mail/scripts/run-tests.mjs), end to end.
  *
  * Every end-to-end case runs against a SIMULATED operator home (a temp dir
  * passed as HOME), never the real one: a leak these cases provoke lands in a
- * throwaway directory.
+ * throwaway directory. Fixture tests receive the paths they need baked into
+ * their source, not through the environment — the launchers pass a test only
+ * their allowlist.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -35,10 +40,17 @@ import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
   IsolationRefusal,
-  assertTestDestinations,
+  PASSED_ENV,
+  ROOT_MARKER,
+  accountHome,
+  assertReportPaths,
+  assertSuiteName,
+  assertTempBase,
   diffSnapshots,
+  isolatedChildEnv,
   sanitizedTestEnv,
   snapshotTps,
+  testRootRefusal,
 } from "../../../scripts/test-home-guard.mjs";
 
 const REPO = resolve(import.meta.dir, "../../..");
@@ -49,6 +61,9 @@ const PLUGIN_LAUNCHER = join(PLUGIN_DIR, "scripts/run-tests.mjs");
 
 /** The end-to-end cases spawn a launcher that spawns bun; allow for a slow runner. */
 const E2E_TIMEOUT = 60_000;
+
+/** node, when installed: `bun run test` starts the launchers under node. */
+const NODE = Bun.which("node");
 
 let dirs: string[] = [];
 beforeEach(() => {
@@ -73,6 +88,9 @@ function envWith(overrides: Record<string, string | undefined>): Record<string, 
   }
   return env;
 }
+
+/** A string literal for fixture source: paths are baked in, never passed through the environment. */
+const q = (s: string): string => JSON.stringify(s);
 
 /** A whole-second timestamp a minute ago: utimes() can restore it exactly. */
 function wholeSecondInThePast(): Date {
@@ -175,79 +193,182 @@ describe("test-home-guard: ~/.tps metadata snapshot (a diagnostic)", () => {
   });
 });
 
-describe("test-home-guard: sanitizedTestEnv", () => {
-  test("drops every home-routing override and keeps everything else", () => {
+describe("test-home-guard: the environment ALLOWLIST", () => {
+  test("passes only the allowlisted names and drops everything else, including a variable nobody has named", () => {
     const { env, dropped } = sanitizedTestEnv({
       PATH: "/usr/bin",
-      LANG: "C",
-      NONO_BIN: "/usr/local/bin/nono",
+      LANG: "C.UTF-8",
+      LC_ALL: "C",
+      TERM: "xterm-256color",
+      NO_COLOR: "1",
+      CI: "true",
+      GITHUB_ACTIONS: "true",
+      // Path-bearing, identity or credential variables — named or not:
+      NONO_BIN: "/sentinel/nono",
       XDG_CONFIG_HOME: "/sentinel/config",
-      XDG_DATA_HOME: "/sentinel/data",
       XDG_CACHE_HOME: "/sentinel/cache",
-      XDG_STATE_HOME: "/sentinel/state",
+      TMPDIR: "/sentinel/tmp",
       TPS_ROOT: "/sentinel/tps",
-      TPS_HOME: "/sentinel",
-      TPS_MAIL_DIR: "/sentinel/mail",
-      TPS_IDENTITY_DIR: "/sentinel/identity",
-      TPS_TEST_REPORT_DIR: "/sentinel/reports",
-      TPS_AGENT_ID: "sentinel",
-      FLAIR_URL: "http://sentinel.invalid",
-      FLAIR_KEY_PATH: "/sentinel/flair.key",
-      BOB_HOME: "/sentinel/bob",
-      OPENCLAW_HOME: "/sentinel/openclaw",
-      CODEX_HOME: "/sentinel/codex",
-      CLAUDE_CONFIG_DIR: "/sentinel/claude",
-      PI_CODING_AGENT_DIR: "/sentinel/pi",
-      GIT_CONFIG_GLOBAL: "/sentinel/gitconfig",
-      USERPROFILE: "/sentinel",
       TPS_TEST_MODE: "docker",
-      TPS_TEST_NODE: "/usr/bin/node",
+      TPS_TEST_NODE: "/sentinel/node",
+      FLAIR_URL: "http://sentinel.invalid",
+      CODEX_HOME: "/sentinel/codex",
+      SSH_AUTH_SOCK: "/sentinel/agent.sock",
+      NODE_OPTIONS: "--require /sentinel/hook.js",
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: "/sentinel/bun-cache",
+      OPENAI_API_KEY: "sentinel-key",
+      CLAUDECODE: "1",
+      SOME_FUTURE_TOOL_DIR: "/sentinel/future",
     });
-    expect(Object.keys(env).sort()).toEqual(["LANG", "NONO_BIN", "PATH", "TPS_TEST_MODE", "TPS_TEST_NODE"]);
-    for (const name of ["XDG_CONFIG_HOME", "TPS_ROOT", "FLAIR_URL", "BOB_HOME", "OPENCLAW_HOME", "CODEX_HOME"]) {
+    expect(Object.keys(env).sort()).toEqual(["CI", "GITHUB_ACTIONS", "LANG", "LC_ALL", "NO_COLOR", "PATH", "TERM"]);
+    for (const name of ["NONO_BIN", "XDG_CONFIG_HOME", "TMPDIR", "TPS_ROOT", "SSH_AUTH_SOCK", "NODE_OPTIONS", "SOME_FUTURE_TOOL_DIR"]) {
       expect(dropped).toContain(name);
     }
     // Names only: the values never appear in what the launcher reports.
     expect(dropped.join(" ")).not.toContain("sentinel");
   });
+
+  test("an allowlisted name whose value is a path is dropped too (PATH excepted)", () => {
+    const { env, dropped } = sanitizedTestEnv({
+      PATH: "/usr/bin:/bin",
+      LANG: "/sentinel/locale",
+      LC_ALL: "/sentinel/locale",
+      TERM: "../sentinel",
+      CI: "true",
+    });
+    expect(Object.keys(env).sort()).toEqual(["CI", "PATH"]);
+    expect(dropped).toEqual(["LANG", "LC_ALL", "TERM"]);
+  });
+
+  test("every allowlisted name states why it is passed", () => {
+    for (const [name, reason] of Object.entries(PASSED_ENV)) {
+      expect(typeof reason, name).toBe("string");
+      expect((reason as string).length, name).toBeGreaterThan(10);
+    }
+  });
+
+  test("the child environment is the allowlist plus the launcher's own values, temp and bun cache inside the root", () => {
+    const root = "/iso/tps-root";
+    const { env, dropped } = isolatedChildEnv(
+      { PATH: "/usr/bin", HOME: "/sentinel/home", TMPDIR: "/sentinel/tmp", XDG_CACHE_HOME: "/sentinel/cache" },
+      { root, token: "tok", extra: { TPS_MAIL_DIR: `${root}/.tps/mail` } },
+    );
+    expect(Object.keys(env).sort()).toEqual([
+      "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+      "HOME",
+      "PATH",
+      "TEMP",
+      "TMP",
+      "TMPDIR",
+      "TPS_MAIL_DIR",
+      "TPS_TEST_ROOT",
+      "TPS_TEST_ROOT_TOKEN",
+    ]);
+    expect(env.HOME).toBe(root);
+    expect(env.TPS_TEST_ROOT).toBe(root);
+    for (const name of ["TMPDIR", "TMP", "TEMP", "BUN_RUNTIME_TRANSPILER_CACHE_PATH"]) {
+      expect(env[name].startsWith(`${root}/`), name).toBe(true);
+    }
+    // HOME and TMPDIR are replaced, not dropped.
+    expect(dropped).toEqual(["XDG_CACHE_HOME"]);
+  });
 });
 
-describe("test-home-guard: assertTestDestinations", () => {
+describe("test-home-guard: destinations and suite names", () => {
   let sim: string;
   beforeEach(() => {
     sim = mktmp("tps-guard-simhome-");
   });
 
-  for (const dir of [".tps", ".flair", "agents", ".config"]) {
-    test(`refuses a TMPDIR inside ~/${dir}`, () => {
-      expect(() => assertTestDestinations({ env: { HOME: sim, TMPDIR: join(sim, dir, "tmp") } })).toThrow(
-        IsolationRefusal,
-      );
+  for (const sub of ["", ".tps", ".flair", "agents", ".config", "tmp"]) {
+    test(`refuses a temp dir at ~/${sub} (the root must be made outside every operator home)`, () => {
+      expect(() => assertTempBase({ env: { HOME: sim }, tempBase: join(sim, sub) })).toThrow(IsolationRefusal);
     });
   }
 
-  test("refuses a report dir inside ~/.flair", () => {
-    expect(() => assertTestDestinations({ env: { HOME: sim }, reportDir: join(sim, ".flair", "reports") })).toThrow(
-      /TPS_TEST_REPORT_DIR resolves to .*inside the operator directory/,
-    );
-  });
-
-  test("refuses a path that reaches ~/.tps through a symlink", () => {
-    mkdirSync(join(sim, ".tps"), { recursive: true });
+  test("refuses a temp dir that reaches the operator home through a symlink", () => {
     const outside = mktmp("tps-guard-link-");
-    symlinkSync(join(sim, ".tps"), join(outside, "via"));
-    expect(() => assertTestDestinations({ env: { HOME: sim, TMPDIR: join(outside, "via", "tmp") } })).toThrow(
-      IsolationRefusal,
+    symlinkSync(sim, join(outside, "via"));
+    expect(() => assertTempBase({ env: { HOME: sim }, tempBase: join(outside, "via", "tmp") })).toThrow(IsolationRefusal);
+  });
+
+  test("accepts a temp dir outside the operator home", () => {
+    const outside = mktmp("tps-guard-outside-");
+    expect(() => assertTempBase({ env: { HOME: sim }, tempBase: outside })).not.toThrow();
+  });
+
+  test("refuses a report dir inside ~/.flair", () => {
+    expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: join(sim, ".flair", "reports") })).toThrow(
+      /the report dir resolves to .*inside/,
     );
   });
 
-  test("accepts a temp dir and report dir outside the operator directories", () => {
-    const outside = mktmp("tps-guard-outside-");
+  test("refuses a report dir that is a symlink into ~/.tps (what a default test-reports/ link would be)", () => {
+    mkdirSync(join(sim, ".tps", "reports"), { recursive: true });
+    const repo = mktmp("tps-guard-repo-");
+    symlinkSync(join(sim, ".tps", "reports"), join(repo, "test-reports"));
+    expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: join(repo, "test-reports") })).toThrow(IsolationRefusal);
+  });
+
+  test("refuses a report path that is a symlink, even a dangling one", () => {
+    const reports = mktmp("tps-guard-reports-");
+    symlinkSync(join(sim, ".tps", "identity", "victim.log"), join(reports, "cli.log"));
     expect(() =>
-      assertTestDestinations({ env: { HOME: sim, TMPDIR: outside }, reportDir: join(outside, "reports") }),
+      assertReportPaths({ env: { HOME: sim }, reportDir: reports, paths: [join(reports, "cli.log")] }),
+    ).toThrow(/is a symlink/);
+  });
+
+  test("refuses a report path that is not directly inside the report dir", () => {
+    const reports = mktmp("tps-guard-reports-");
+    expect(() =>
+      assertReportPaths({ env: { HOME: sim }, reportDir: reports, paths: [join(reports, "..", "victim.xml")] }),
+    ).toThrow(IsolationRefusal);
+  });
+
+  test("accepts a report dir and report paths outside the operator directories", () => {
+    const reports = mktmp("tps-guard-reports-");
+    expect(() =>
+      assertReportPaths({ env: { HOME: sim }, reportDir: reports, paths: [join(reports, "cli.xml"), join(reports, "cli.log")] }),
     ).not.toThrow();
   });
+
+  test("a suite name is a plain file-name token", () => {
+    for (const ok of ["cli", "agent", "pi-tps-mail", "root-test", "attested", "a.b_c-1"]) {
+      expect(() => assertSuiteName(ok), ok).not.toThrow();
+    }
+    for (const bad of ["../../../.tps/identity/key", "a/b", "a\\b", "..", ".", "a..b", "x y", "", "x;y", "é"]) {
+      expect(() => assertSuiteName(bad), bad).toThrow(IsolationRefusal);
+    }
+  });
 });
+
+describe("test-home-guard: the preloads' root check", () => {
+  test("a launcher-made root (its marker's token presented) is accepted", () => {
+    const root = mktmp("tps-guard-root-");
+    writeFileSync(join(root, ROOT_MARKER), "tok");
+    expect(testRootRefusal({ rootReal: root, homeReal: root, token: "tok" })).toBeNull();
+  });
+
+  test("a root that is the HOME this process runs under, without the launcher's token, is refused", () => {
+    const sim = mktmp("tps-guard-simhome-");
+    expect(testRootRefusal({ rootReal: sim, homeReal: sim, token: undefined })).toContain("no launcher vouched");
+  });
+
+  test("a token that does not match the root's marker does not vouch", () => {
+    const root = mktmp("tps-guard-root-");
+    writeFileSync(join(root, ROOT_MARKER), "real-token");
+    expect(testRootRefusal({ rootReal: root, homeReal: root, token: "forged" })).toContain("no launcher vouched");
+  });
+
+  test.skipIf(!accountHome())("a root that contains the account's home is refused, whatever HOME says", () => {
+    const sim = mktmp("tps-guard-simhome-");
+    expect(testRootRefusal({ rootReal: "/", homeReal: sim, token: "tok" })).toContain("account's home");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The preload, spawned
+// ---------------------------------------------------------------------------
 
 describe("home-isolation-preload: launch-time precondition", () => {
   function runPreload(env: Record<string, string | undefined>): { status: number | null; stdout: string; stderr: string } {
@@ -256,6 +377,12 @@ describe("home-isolation-preload: launch-time precondition", () => {
       env: envWith(env),
     });
     return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  }
+
+  function launcherRoot(): { root: string; token: string } {
+    const root = mktmp("tps-guard-root-");
+    writeFileSync(join(root, ROOT_MARKER), "launcher-token");
+    return { root, token: "launcher-token" };
   }
 
   test("aborts when TPS_TEST_ROOT is unset", () => {
@@ -268,54 +395,204 @@ describe("home-isolation-preload: launch-time precondition", () => {
   });
 
   test("aborts when os.homedir() is outside TPS_TEST_ROOT", () => {
-    const root = mktmp("tps-guard-root-");
+    const { root, token } = launcherRoot();
     const elsewhere = mktmp("tps-guard-elsewhere-");
-    const r = runPreload({ TPS_TEST_ROOT: root, HOME: elsewhere });
+    const r = runPreload({ TPS_TEST_ROOT: root, TPS_TEST_ROOT_TOKEN: token, HOME: elsewhere });
     expect(r.status).not.toBe(0);
     expect(r.stderr).toContain("ISOLATION GUARD");
     expect(r.stderr).toContain("OUTSIDE");
     expect(r.stdout).not.toContain("LOADED");
   });
 
-  test("passes when os.homedir() is inside TPS_TEST_ROOT", () => {
-    const root = mktmp("tps-guard-root-");
-    const r = runPreload({ TPS_TEST_ROOT: root, HOME: root });
+  test("aborts on a spoofed root: TPS_TEST_ROOT=$HOME with no launcher token", () => {
+    const sim = mktmp("tps-guard-simhome-");
+    const r = runPreload({ TPS_TEST_ROOT: sim, TPS_TEST_ROOT_TOKEN: undefined, HOME: sim });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("no launcher vouched");
+    expect(r.stdout).not.toContain("LOADED");
+  });
+
+  test("aborts on a spoofed root that CONTAINS HOME", () => {
+    const sim = mktmp("tps-guard-simhome-");
+    mkdirSync(join(sim, "inner"));
+    const r = runPreload({ TPS_TEST_ROOT: sim, TPS_TEST_ROOT_TOKEN: undefined, HOME: join(sim, "inner") });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("no launcher vouched");
+    expect(r.stdout).not.toContain("LOADED");
+  });
+
+  test("aborts when the token does not match the root's marker", () => {
+    const { root } = launcherRoot();
+    const r = runPreload({ TPS_TEST_ROOT: root, TPS_TEST_ROOT_TOKEN: "forged", HOME: root });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("no launcher vouched");
+    expect(r.stdout).not.toContain("LOADED");
+  });
+
+  test.skipIf(!accountHome())("aborts on a root that contains the account's home, even with HOME elsewhere", () => {
+    const sim = mktmp("tps-guard-simhome-");
+    const r = runPreload({ TPS_TEST_ROOT: "/", TPS_TEST_ROOT_TOKEN: "any", HOME: sim });
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("account's home");
+    expect(r.stdout).not.toContain("LOADED");
+  });
+
+  test("passes for a launcher-made root with HOME inside it", () => {
+    const { root, token } = launcherRoot();
+    const r = runPreload({ TPS_TEST_ROOT: root, TPS_TEST_ROOT_TOKEN: token, HOME: root });
+    expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
     expect(r.stdout).toContain("LOADED");
   });
 });
 
 // ---------------------------------------------------------------------------
-// End to end, against a simulated operator home
+// End to end: a bare `bun test` in every location that has a guarding bunfig
 // ---------------------------------------------------------------------------
 
-/** A test that writes into ~/.tps of whatever HOME it runs under. */
-const LEAKING_FIXTURE = `import { test, expect } from "bun:test";
+/**
+ * A leaking test whose module records that it LOADED: an imported module and the
+ * test file's own top-level body each write a marker before any test runs. The
+ * preload must abort before either.
+ */
+function markerFixture(): { dir: string; file: string; importMarker: string; bodyMarker: string } {
+  const dir = mktmp("tps-guard-fixture-");
+  const markers = mktmp("tps-guard-markers-");
+  const importMarker = join(markers, "imported");
+  const bodyMarker = join(markers, "module-body");
+  writeFileSync(
+    join(dir, "top-marker.ts"),
+    `import { writeFileSync } from "node:fs";\nwriteFileSync(${q(importMarker)}, "imported");\n`,
+  );
+  writeFileSync(
+    join(dir, "leak.test.ts"),
+    `import "./top-marker.ts";
+import { test, expect } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+writeFileSync(${q(bodyMarker)}, "module body ran");
 test("leaks into ~/.tps", () => {
   mkdirSync(join(homedir(), ".tps"), { recursive: true });
   writeFileSync(join(homedir(), ".tps", "LEAKED"), "x");
   expect(1).toBe(1);
 });
-`;
+`,
+  );
+  return { dir, file: join(dir, "leak.test.ts"), importMarker, bodyMarker };
+}
 
-/** A test that asserts none of the inherited home-routing variables reached it. */
-const ENV_FIXTURE = `import { test, expect } from "bun:test";
-test("inherited home-routing variables are absent", () => {
-  for (const name of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TPS_ROOT", "TPS_HOME",
-    "TPS_IDENTITY_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "BOB_HOME", "OPENCLAW_HOME", "CODEX_HOME", "PI_CODING_AGENT_DIR"]) {
-    expect(process.env[name]).toBeUndefined();
+const BARE_RUN_LOCATIONS = [
+  { name: "the repo root", cwd: REPO },
+  { name: "packages/agent", cwd: join(REPO, "packages/agent") },
+  { name: "packages/cli", cwd: join(REPO, "packages/cli") },
+  { name: "packages/pi-tps-mail", cwd: join(REPO, "packages/pi-tps-mail") },
+  { name: "plugins/openclaw-tps-mail", cwd: PLUGIN_DIR },
+];
+
+describe("end to end: a bare `bun test` aborts before any test module body runs", () => {
+  test(
+    "CONTROL: with no guarding bunfig, the fixture's import and module-body markers fire",
+    () => {
+      const sim = mktmp("tps-guard-simhome-");
+      const fx = markerFixture();
+      const r = spawnSync("bun", ["test", fx.file], {
+        cwd: fx.dir, // no bunfig.toml here: nothing stands in the way
+        env: envWith({ HOME: sim, TPS_TEST_ROOT: undefined, TPS_TEST_ROOT_TOKEN: undefined }),
+        encoding: "utf8",
+      });
+      expect(r.status).toBe(0);
+      expect(existsSync(fx.importMarker)).toBe(true);
+      expect(existsSync(fx.bodyMarker)).toBe(true);
+    },
+    E2E_TIMEOUT,
+  );
+
+  for (const location of BARE_RUN_LOCATIONS) {
+    const cases: Array<{ what: string; reason: string; env: (sim: string) => Record<string, string | undefined> }> = [
+      { what: "TPS_TEST_ROOT unset", reason: "TPS_TEST_ROOT is not set", env: () => ({ TPS_TEST_ROOT: undefined }) },
+      {
+        what: "a spoofed TPS_TEST_ROOT=$HOME (and an existing TPS_MAIL_DIR under it)",
+        reason: "no launcher vouched",
+        env: (sim) => {
+          // The mail dir exists, so the plugin's mail rule alone would let the run through.
+          mkdirSync(join(sim, ".tps", "mail"), { recursive: true });
+          return { TPS_TEST_ROOT: sim, TPS_MAIL_DIR: join(sim, ".tps", "mail") };
+        },
+      },
+    ];
+    for (const c of cases) {
+      test(
+        `from ${location.name}, ${c.what}`,
+        () => {
+          const sim = mktmp("tps-guard-simhome-");
+          const fx = markerFixture();
+          const r = spawnSync("bun", ["test", fx.file], {
+            cwd: location.cwd,
+            env: envWith({ TPS_TEST_ROOT_TOKEN: undefined, TPS_MAIL_DIR: undefined, ...c.env(sim), HOME: sim }),
+            encoding: "utf8",
+          });
+          expect(existsSync(fx.importMarker)).toBe(false);
+          expect(existsSync(fx.bodyMarker)).toBe(false);
+          expect(existsSync(join(sim, ".tps", "LEAKED"))).toBe(false);
+          expect(r.status).not.toBe(0);
+          expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("ISOLATION GUARD");
+          expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain(c.reason);
+        },
+        E2E_TIMEOUT,
+      );
+    }
   }
 });
-`;
 
-/** A test that records it ran, at the path in GUARD_PROBE_MARKER. */
-const RAN_FIXTURE = `import { test } from "bun:test";
-import { writeFileSync } from "node:fs";
-test("ran", () => { writeFileSync(process.env.GUARD_PROBE_MARKER as string, "ran"); });
-`;
+// ---------------------------------------------------------------------------
+// End to end: the launchers, against a simulated operator home
+// ---------------------------------------------------------------------------
+
+/** A test that records it ran, at a path baked into its source. */
+function ranFixture(marker: string): string {
+  const dir = mktmp("tps-guard-fixture-");
+  writeFileSync(
+    join(dir, "ran.test.ts"),
+    `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("ran", () => { writeFileSync(${q(marker)}, "ran"); });\n`,
+  );
+  return join(dir, "ran.test.ts");
+}
+
+/** How each launcher is invoked on one fixture file, and the suite name its report carries. */
+const LAUNCHERS = [
+  {
+    name: "scripts/test-suite.mjs",
+    suite: "guard-probe",
+    argv: (fixture: string) => [SUITE_LAUNCHER, "guard-probe", fixture],
+    cwd: (fixture: string) => dirname(fixture),
+  },
+  {
+    name: "the openclaw-tps-mail launcher",
+    suite: "plugin",
+    argv: (fixture: string) => [PLUGIN_LAUNCHER, fixture],
+    cwd: (_fixture: string) => PLUGIN_DIR,
+  },
+];
+
+/** Run a launcher under `runtime` (bun by default — this process's own). */
+function runLauncher(argv: string[], cwd: string, env: Record<string, string>, runtime: string = process.execPath) {
+  const r = spawnSync(runtime, argv, { cwd, env, encoding: "utf8" });
+  return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}`, stdout: r.stdout ?? "" };
+}
+
+/** The JUnit report a launcher wrote shows `name` as a case that passed. */
+function junitPassed(reportDir: string, suite: string, name: string): boolean {
+  const path = join(reportDir, `${suite}.xml`);
+  if (!existsSync(path)) return false;
+  const xml = readFileSync(path, "utf8");
+  const at = xml.indexOf(`name="${name}"`);
+  if (at < 0) return false;
+  const end = xml.indexOf("</testcase>", at);
+  const selfClosed = xml.slice(at, xml.indexOf(">", at) + 1).endsWith("/>");
+  const body = selfClosed ? "" : xml.slice(at, end < 0 ? undefined : end);
+  return !body.includes("<failure") && !body.includes("<skipped");
+}
 
 const SENTINEL_ENV = (sentinel: string) => ({
   XDG_CONFIG_HOME: join(sentinel, "config"),
@@ -325,63 +602,58 @@ const SENTINEL_ENV = (sentinel: string) => ({
   TPS_ROOT: join(sentinel, "tps"),
   TPS_HOME: sentinel,
   TPS_IDENTITY_DIR: join(sentinel, "identity"),
+  TPS_MAIL_DIR: join(sentinel, "mail"),
   FLAIR_URL: "http://sentinel.invalid",
   FLAIR_KEY_PATH: join(sentinel, "flair.key"),
   BOB_HOME: join(sentinel, "bob"),
   OPENCLAW_HOME: join(sentinel, "openclaw"),
   CODEX_HOME: join(sentinel, "codex"),
   PI_CODING_AGENT_DIR: join(sentinel, "pi"),
+  NONO_BIN: join(sentinel, "nono"),
+  NODE_OPTIONS: `--require ${join(sentinel, "hook.js")}`,
+  // A variable no list names: an allowlist drops it anyway.
+  GUARD_UNNAMED_TOOL_DIR: join(sentinel, "unnamed"),
 });
 
-/** How each launcher is invoked on one fixture file. */
-const LAUNCHERS = [
-  {
-    name: "scripts/test-suite.mjs",
-    argv: (fixture: string) => [SUITE_LAUNCHER, "guard-probe", fixture],
-    cwd: (fixtureDir: string) => fixtureDir,
-  },
-  {
-    name: "the openclaw-tps-mail launcher",
-    argv: (fixture: string) => [PLUGIN_LAUNCHER, fixture],
-    cwd: (_fixtureDir: string) => PLUGIN_DIR,
-  },
+/**
+ * Every name a test may see: the allowlist, the variables the launchers set,
+ * and NODE_ENV (bun test sets it).
+ */
+const EXPECTED_NAMES = [
+  ...Object.keys(PASSED_ENV),
+  "HOME",
+  "TPS_TEST_ROOT",
+  "TPS_TEST_ROOT_TOKEN",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
+  "TPS_MAIL_DIR",
+  "TPS_TEST_KEYS_DIR",
+  "TPS_MAIL_REQUIRE_EXPLICIT_DIR",
+  "NODE_ENV",
 ];
 
-// bun test prints only failures and the summary when its environment says an AI
-// agent is running it (measured on bun 1.3.10: CLAUDECODE, AGENT or REPL_ID alone;
-// AI_AGENT alongside other agent variables). The cases below read a passing test's
-// name from the output, so they clear those variables and give the same result
-// whoever runs the suite.
-const AGENT_DETECTION_VARS = ["CLAUDECODE", "AGENT", "REPL_ID", "AI_AGENT"];
-
-function runLauncher(argv: string[], cwd: string, env: Record<string, string>) {
-  const launchEnv = { ...env };
-  for (const name of AGENT_DETECTION_VARS) delete launchEnv[name];
-  const r = spawnSync(process.execPath, argv, { cwd, env: launchEnv, encoding: "utf8" });
-  return { status: r.status, out: `${r.stdout ?? ""}${r.stderr ?? ""}` };
-}
-
-describe("end to end: the repo-root bunfig guards a bare `bun test`", () => {
-  test(
-    "a bare `bun test` from the repo root aborts before a leaking test runs",
-    () => {
-      const sim = mktmp("tps-guard-simhome-");
-      const fx = mktmp("tps-guard-fixture-");
-      writeFileSync(join(fx, "leak.test.ts"), LEAKING_FIXTURE);
-      const r = spawnSync("bun", ["test", join(fx, "leak.test.ts")], {
-        cwd: REPO,
-        env: envWith({ HOME: sim, TPS_TEST_ROOT: undefined }),
-        encoding: "utf8",
-      });
-      expect(existsSync(join(sim, ".tps"))).toBe(false);
-      expect(r.status).not.toBe(0);
-      expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("HOME-ISOLATION GUARD");
-    },
-    E2E_TIMEOUT,
-  );
+/** A test that checks the environment it (and a process it spawns) got. */
+const ENV_FIXTURE = `import { test, expect } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+const EXPECTED = new Set(${JSON.stringify(EXPECTED_NAMES)});
+test("only the allowlist and the launcher variables reach a test", () => {
+  expect(Object.keys(process.env).filter((n) => !EXPECTED.has(n))).toEqual([]);
+  const child = spawnSync("/usr/bin/env", [], { encoding: "utf8" }).stdout
+    .split("\\n").filter(Boolean).map((l) => l.slice(0, l.indexOf("=")));
+  expect(child.filter((n) => !EXPECTED.has(n))).toEqual([]);
+  const root = realpathSync(process.env.TPS_TEST_ROOT);
+  const within = (p) => p === root || p.startsWith(root + "/");
+  for (const p of [homedir(), tmpdir(), process.env.TMPDIR, process.env.TMP, process.env.TEMP, process.env.BUN_RUNTIME_TRANSPILER_CACHE_PATH]) {
+    expect(within(p)).toBe(true);
+  }
 });
+`;
 
-describe("end to end: the launchers sanitize the inherited environment", () => {
+describe("end to end: the launchers give a test only the allowlisted environment", () => {
   test(
     "an inherited XDG_CONFIG_HOME is not written by the Google refresh path (auth.test.ts)",
     () => {
@@ -398,7 +670,7 @@ describe("end to end: the launchers sanitize the inherited environment", () => {
         envWith({ HOME: sim, XDG_CONFIG_HOME: sentinel, TPS_TEST_REPORT_DIR: reports }),
       );
       // The refresh path ran (auth.test.ts's Google refresh case passed)...
-      expect(out).toContain("refresh google updates access token");
+      expect(junitPassed(reports, "guard-xdg-probe", "refresh google updates access token")).toBe(true);
       expect(status).toBe(0);
       // ...and the credential file under the inherited XDG_CONFIG_HOME is untouched.
       expect(readFileSync(cred, "utf8")).toBe(seed);
@@ -409,20 +681,23 @@ describe("end to end: the launchers sanitize the inherited environment", () => {
 
   for (const launcher of LAUNCHERS) {
     test(
-      `${launcher.name}: no inherited home-routing variable reaches a test`,
+      `${launcher.name}: only the allowlist and the launcher variables reach a test`,
       () => {
         const sim = mktmp("tps-guard-simhome-");
         const sentinel = mktmp("tps-guard-sentinel-");
         const reports = mktmp("tps-guard-reports-");
         const fx = mktmp("tps-guard-fixture-");
         writeFileSync(join(fx, "env.test.ts"), ENV_FIXTURE);
-        // The launcher itself runs under the caller's environment, and on Linux bun
-        // caches its own transpiled sources under XDG_CACHE_HOME/bun before any
-        // sanitizing can happen. That write is the launcher's runtime, not a test,
-        // so it is switched off here: anything left in the sentinel came from a test.
+        // The launcher runs under bun here, with the caller's environment, and bun
+        // may cache its own transpiled sources under XDG_CACHE_HOME/bun before the
+        // launcher runs a line. That write is the launcher's runtime, not a test's,
+        // so it is switched off for the LAUNCHER only (the child gets its own cache
+        // setting from the launcher): anything left in the sentinel came from a test.
+        // The case after this one runs the launcher under node with the normal
+        // cache setting.
         const { status, out } = runLauncher(
           launcher.argv(join(fx, "env.test.ts")),
-          launcher.cwd(fx),
+          launcher.cwd(join(fx, "env.test.ts")),
           envWith({
             HOME: sim,
             TPS_TEST_REPORT_DIR: reports,
@@ -430,31 +705,74 @@ describe("end to end: the launchers sanitize the inherited environment", () => {
             ...SENTINEL_ENV(sentinel),
           }),
         );
-        expect(out).toContain("inherited home-routing variables are absent");
+        expect(junitPassed(reports, launcher.suite, "only the allowlist and the launcher variables reach a test")).toBe(
+          true,
+        );
         expect(status).toBe(0);
         expect(readdirSync(sentinel)).toEqual([]);
+        // The dropped names are reported, never their values.
+        expect(out).toContain("GUARD_UNNAMED_TOOL_DIR");
+        expect(out).not.toContain(join(sentinel, "unnamed"));
+      },
+      E2E_TIMEOUT,
+    );
+
+    test.skipIf(!NODE)(
+      `${launcher.name}: under node with the normal cache setting, the child's bun cache lands inside the root, not the caller's XDG_CACHE_HOME`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const sentinel = mktmp("tps-guard-sentinel-");
+        const reports = mktmp("tps-guard-reports-");
+        const fx = mktmp("tps-guard-fixture-");
+        // A module over bun's 50 KB transpiler-cache threshold, so the child caches it.
+        const big = Array.from({ length: 3000 }, (_, i) => `export const x${i}: number = ${i};`).join("\n");
+        writeFileSync(join(fx, "big.ts"), `${big}\n`);
+        writeFileSync(
+          join(fx, "big.test.ts"),
+          `import { test, expect } from "bun:test";\nimport { x1 } from "./big.ts";\ntest("big", () => { expect(x1).toBe(1); });\n`,
+        );
+        mkdirSync(join(sentinel, "cache"));
+        const { status, stdout } = runLauncher(
+          launcher.argv(join(fx, "big.test.ts")),
+          launcher.cwd(join(fx, "big.test.ts")),
+          envWith({
+            HOME: sim,
+            TPS_TEST_REPORT_DIR: reports,
+            XDG_CACHE_HOME: join(sentinel, "cache"),
+            BUN_RUNTIME_TRANSPILER_CACHE_PATH: undefined,
+            TPS_TEST_KEEP_ROOT: "1",
+          }),
+          NODE as string,
+        );
+        const kept = /kept isolated root (\S+)/.exec(stdout)?.[1];
+        expect(kept).toBeDefined();
+        dirs.push(kept as string);
+        expect(junitPassed(reports, launcher.suite, "big")).toBe(true);
+        expect(status).toBe(0);
+        expect(readdirSync(join(sentinel, "cache"))).toEqual([]);
+        // The launcher's cache setting: bun writes its cache files straight into it.
+        expect(readdirSync(join(kept as string, ".cache", "bun")).some((f) => f.endsWith(".pile"))).toBe(true);
       },
       E2E_TIMEOUT,
     );
   }
 });
 
-describe("end to end: the launchers refuse an operator-critical temp or report dir", () => {
+describe("end to end: the launchers refuse an operator-critical destination before creating anything", () => {
   for (const launcher of LAUNCHERS) {
     test(
-      `${launcher.name}: a TMPDIR inside ~/.tps is refused before anything is created`,
+      `${launcher.name}: a TMPDIR inside ~/.tps is refused`,
       () => {
         const sim = mktmp("tps-guard-simhome-");
         const trap = join(sim, ".tps", "tmp");
         mkdirSync(trap, { recursive: true }); // exists, so only the refusal keeps it empty
         const reports = mktmp("tps-guard-reports-");
         const marker = join(mktmp("tps-guard-marker-"), "ran");
-        const fx = mktmp("tps-guard-fixture-");
-        writeFileSync(join(fx, "ran.test.ts"), RAN_FIXTURE);
+        const fixture = ranFixture(marker);
         const { status, out } = runLauncher(
-          launcher.argv(join(fx, "ran.test.ts")),
-          launcher.cwd(fx),
-          envWith({ HOME: sim, TMPDIR: trap, TPS_TEST_REPORT_DIR: reports, GUARD_PROBE_MARKER: marker }),
+          launcher.argv(fixture),
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TMPDIR: trap, TPS_TEST_REPORT_DIR: reports }),
         );
         expect(existsSync(marker)).toBe(false); // no test ran
         expect(readdirSync(trap)).toEqual([]); // no throwaway root was created there
@@ -466,22 +784,186 @@ describe("end to end: the launchers refuse an operator-critical temp or report d
     );
 
     test(
-      `${launcher.name}: a TPS_TEST_REPORT_DIR inside ~/.flair is refused before anything is created`,
+      `${launcher.name}: a TMPDIR that IS the operator home is refused`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        writeFileSync(join(sim, "operator-file"), "x");
+        const reports = mktmp("tps-guard-reports-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { status, out } = runLauncher(
+          launcher.argv(fixture),
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TMPDIR: sim, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(existsSync(marker)).toBe(false);
+        expect(readdirSync(sim)).toEqual(["operator-file"]); // no root was made in the home
+        expect(status).not.toBe(0);
+        expect(out).toContain("the temp dir (TMPDIR) resolves");
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: a TPS_TEST_REPORT_DIR inside ~/.flair is refused`,
       () => {
         const sim = mktmp("tps-guard-simhome-");
         const reports = join(sim, ".flair", "reports");
         const marker = join(mktmp("tps-guard-marker-"), "ran");
-        const fx = mktmp("tps-guard-fixture-");
-        writeFileSync(join(fx, "ran.test.ts"), RAN_FIXTURE);
+        const fixture = ranFixture(marker);
         const { status, out } = runLauncher(
-          launcher.argv(join(fx, "ran.test.ts")),
-          launcher.cwd(fx),
-          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports, GUARD_PROBE_MARKER: marker }),
+          launcher.argv(fixture),
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
         );
         expect(existsSync(marker)).toBe(false);
         expect(existsSync(join(sim, ".flair"))).toBe(false);
         expect(status).not.toBe(0);
         expect(out).toContain("refusing to run");
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: the DEFAULT test-reports/, symlinked into ~/.tps, is refused before its report is deleted`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const target = join(sim, ".tps", "reports");
+        mkdirSync(target, { recursive: true });
+        const live = join(target, `${launcher.suite}.xml`);
+        writeFileSync(live, "operator file");
+        // A copy of the repo's launcher layout whose test-reports/ is the link.
+        const fake = mktmp("tps-guard-fakerepo-");
+        mkdirSync(join(fake, "scripts"));
+        for (const f of ["test-suite.mjs", "test-home-guard.mjs", "home-isolation-preload.ts"]) {
+          copyFileSync(join(REPO, "scripts", f), join(fake, "scripts", f));
+        }
+        mkdirSync(join(fake, "plugins/openclaw-tps-mail/scripts"), { recursive: true });
+        copyFileSync(PLUGIN_LAUNCHER, join(fake, "plugins/openclaw-tps-mail/scripts/run-tests.mjs"));
+        symlinkSync(target, join(fake, "test-reports"));
+        const argv =
+          launcher.suite === "plugin"
+            ? [join(fake, "plugins/openclaw-tps-mail/scripts/run-tests.mjs")]
+            : [join(fake, "scripts/test-suite.mjs"), launcher.suite];
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { status, out } = runLauncher(
+          [...argv, fixture],
+          launcher.suite === "plugin" ? join(fake, "plugins/openclaw-tps-mail") : dirname(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: undefined }),
+        );
+        expect(existsSync(marker)).toBe(false);
+        expect(readFileSync(live, "utf8")).toBe("operator file"); // not deleted, not rewritten
+        expect(readdirSync(target)).toEqual([`${launcher.suite}.xml`]);
+        expect(status).not.toBe(0);
+        expect(out).toContain("the report dir resolves");
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: a report path that is a symlink into ~/.tps is refused before anything is deleted or written`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        mkdirSync(join(sim, ".tps", "identity"), { recursive: true });
+        const victim = join(sim, ".tps", "identity", "victim.log");
+        const reports = mktmp("tps-guard-reports-");
+        const link = join(reports, `${launcher.suite}.log`);
+        symlinkSync(victim, link); // dangling: a write through it would create the victim
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { status, out } = runLauncher(
+          launcher.argv(fixture),
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(existsSync(marker)).toBe(false);
+        expect(existsSync(victim)).toBe(false);
+        expect(lstatSync(link).isSymbolicLink()).toBe(true); // not deleted either
+        expect(status).not.toBe(0);
+        expect(out).toContain("is a symlink");
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: a seal path a test turned into a symlink is not written through at the end`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        mkdirSync(join(sim, ".tps"), { recursive: true });
+        const victim = join(sim, ".tps", "seal-target");
+        const reports = mktmp("tps-guard-reports-");
+        const seal = join(reports, `${launcher.suite}.xml.sha256`);
+        const fx = mktmp("tps-guard-fixture-");
+        writeFileSync(
+          join(fx, "plant.test.ts"),
+          `import { test } from "bun:test";\nimport { symlinkSync } from "node:fs";\ntest("plants a link at the seal path", () => { symlinkSync(${q(victim)}, ${q(seal)}); });\n`,
+        );
+        const { status, out } = runLauncher(
+          launcher.argv(join(fx, "plant.test.ts")),
+          launcher.cwd(join(fx, "plant.test.ts")),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(lstatSync(seal).isSymbolicLink()).toBe(true); // the test did plant it
+        expect(existsSync(victim)).toBe(false); // and nothing was written through it
+        expect(status).not.toBe(0);
+        expect(out).toContain("not sealing the report");
+      },
+      E2E_TIMEOUT,
+    );
+  }
+
+  test(
+    "scripts/test-suite.mjs: a suite name that climbs out of the report dir is refused before any filesystem call",
+    () => {
+      const sim = mktmp("tps-guard-simhome-");
+      const base = mktmp("tps-guard-base-");
+      const reports = join(base, "reports");
+      mkdirSync(reports);
+      const victims = ["victim.xml", "victim.log", "victim.xml.sha256"].map((f) => join(base, f));
+      for (const v of victims) writeFileSync(v, "operator file");
+      const marker = join(mktmp("tps-guard-marker-"), "ran");
+      const fixture = ranFixture(marker);
+      const { status, out } = runLauncher(
+        [SUITE_LAUNCHER, "../victim", fixture],
+        dirname(fixture),
+        envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+      );
+      expect(existsSync(marker)).toBe(false);
+      for (const v of victims) expect(readFileSync(v, "utf8")).toBe("operator file");
+      expect(readdirSync(reports)).toEqual([]);
+      expect(status).not.toBe(0);
+      expect(out).toContain("refusing the suite name");
+    },
+    E2E_TIMEOUT,
+  );
+});
+
+describe("end to end: the ~/.tps diagnostic fails the lane", () => {
+  for (const launcher of LAUNCHERS) {
+    test(
+      `${launcher.name}: a passing test that writes the launcher's ~/.tps by an absolute path fails the lane`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        mkdirSync(join(sim, ".tps"), { recursive: true });
+        const reports = mktmp("tps-guard-reports-");
+        const fx = mktmp("tps-guard-fixture-");
+        // A simulated leak that ignores HOME: the path is baked into the test.
+        writeFileSync(
+          join(fx, "abs.test.ts"),
+          `import { test } from "bun:test";\nimport { writeFileSync } from "node:fs";\ntest("writes by absolute path", () => { writeFileSync(${q(join(sim, ".tps", "LEAKED"))}, "x"); });\n`,
+        );
+        const { status, out } = runLauncher(
+          launcher.argv(join(fx, "abs.test.ts")),
+          launcher.cwd(join(fx, "abs.test.ts")),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+        );
+        // The test itself passed...
+        expect(junitPassed(reports, launcher.suite, "writes by absolute path")).toBe(true);
+        // ...and the lane failed on the recorded difference.
+        expect(status).not.toBe(0);
+        expect(out).toContain("HOME-ISOLATION GUARD: the run changed");
+        expect(out).toContain("LEAKED");
       },
       E2E_TIMEOUT,
     );

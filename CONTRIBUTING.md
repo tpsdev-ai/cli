@@ -17,7 +17,9 @@ bun install
 # Build the CLI
 bun run build
 
-# Run tests (HOME-isolated; a bare `bun test` aborts by design, cli#430)
+# Run tests through the HOME-isolating launcher (cli#430). A bare `bun test`
+# aborts: the preload refuses a run that no launcher set up. That is a
+# launch-time check, not an OS boundary (cli#434).
 bun run test
 ```
 

@@ -3,29 +3,36 @@
  * monorepo test lanes (cli#430).
  *
  * Loaded by the suite launcher (scripts/test-suite.mjs) through bun's
- * `--preload`, so it runs BEFORE any test module. It ABORTS the run unless
- * `os.homedir()` resolves (realpath, so symlinks count) inside the throwaway
- * root the launcher created and passed as TPS_TEST_ROOT.
+ * `--preload`, and by the repo-root and per-package bunfig.toml files, so it
+ * runs BEFORE any test module. It ABORTS the run unless:
+ *   1. TPS_TEST_ROOT is set and resolves to a directory;
+ *   2. `os.homedir()` resolves (realpath, so symlinks count) inside that root;
+ *   3. the root is not, and does not contain, the account's home from the user
+ *      database (os.userInfo().homedir) — whatever HOME says;
+ *   4. the root is not, and does not contain, the HOME this process runs under
+ *      unless a launcher vouched for it: TPS_TEST_ROOT_TOKEN matches the marker
+ *      the launcher wrote in the root it created. A bare `bun test` has no
+ *      launcher, and rule 2 puts its HOME inside the root, so a bare run —
+ *      including `TPS_TEST_ROOT=$HOME bun test` — is refused.
+ * (scripts/test-home-guard.mjs `testRootRefusal` holds rules 3 and 4.)
  *
- * WHY A WHITELIST, NOT A PATCH. Reassigning `process.env.HOME` inside a test
+ * WHY A PRECONDITION, NOT A PATCH. Reassigning `process.env.HOME` inside a test
  * does NOT move `os.homedir()` under bun — bun caches the HOME it read at first
  * call — which is exactly how `~/.tps` leaks happened: a test set
  * `process.env.HOME` to a temp dir and the product code (and the test's own
  * assertions) still used the real home. So the isolation is set at LAUNCH TIME,
  * in the child's environment, before bun boots; this guard then refuses to run
- * at all unless the process actually came up under that root. Nothing to
- * intercept and nothing a product `catch` can swallow.
+ * at all unless the process actually came up under a launcher-made root.
  *
- * The launcher also drops every inherited home-routing variable (XDG_*, TPS_*,
- * FLAIR_*, …; scripts/test-home-guard.mjs `sanitizedTestEnv`), so paths that
- * would otherwise bypass HOME fall back to the temp root. Its `~/.tps` metadata
- * snapshot is a diagnostic for a persisted change, not a boundary: this guard
- * and the sanitized environment are the control. The repo-root and per-package
- * bunfig.toml files load this same preload, so a bare `bun test` aborts too.
+ * WHAT IT IS NOT. A launch-time check, not an OS boundary: a caller who forges
+ * the launcher's marker and token, or code that ignores HOME, can still reach
+ * the real home (the OS-enforced boundary is cli#434). The launcher also gives
+ * the child an allowlisted environment (scripts/test-home-guard.mjs
+ * `isolatedChildEnv`), and its `~/.tps` metadata snapshot is a diagnostic.
  */
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { sep } from "node:path";
+import { inside, testRootRefusal } from "./test-home-guard.mjs";
 
 const LAUNCHER = "node scripts/test-suite.mjs <suite>  (or `bun run test`)";
 
@@ -50,8 +57,6 @@ function realpathOrAbort(value: string, label: string): string {
   }
 }
 
-const inside = (rootReal: string, p: string): boolean => p === rootReal || p.startsWith(rootReal + sep);
-
 const root = process.env.TPS_TEST_ROOT;
 if (!root) {
   abort("TPS_TEST_ROOT is not set, so no isolated test root is known");
@@ -61,6 +66,11 @@ const rootReal = realpathOrAbort(root, "TPS_TEST_ROOT");
 const home = realpathOrAbort(homedir(), "os.homedir()");
 if (!inside(rootReal, home)) {
   abort(`os.homedir() resolves to "${home}", which is OUTSIDE the isolated test root "${rootReal}"`);
+}
+
+const refusal = testRootRefusal({ rootReal, homeReal: home, token: process.env.TPS_TEST_ROOT_TOKEN });
+if (refusal) {
+  abort(refusal);
 }
 
 // A lane that also isolates the mail dir (the plugin lane) can require it here;

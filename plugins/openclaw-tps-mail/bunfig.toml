@@ -2,13 +2,17 @@
 #
 # The test PRELOAD below is the launch-time isolation precondition for this
 # plugin's suite (cli#398 round 2). It loads before any test module and ABORTS
-# the run unless os.homedir() and TPS_MAIL_DIR both resolve inside the
-# throwaway root the launcher created. Run the suite through the launcher:
+# the run unless os.homedir() and TPS_MAIL_DIR both resolve inside
+# TPS_TEST_ROOT, that root is not and does not contain the account's home, and
+# it is the throwaway root the launcher created (its marker matches
+# TPS_TEST_ROOT_TOKEN). Run the suite through the launcher:
 #
 #   bun run --cwd plugins/openclaw-tps-mail test
 #   node plugins/openclaw-tps-mail/scripts/run-tests.mjs
 #
-# A bare `bun test` here aborts by name — that is the point.
+# A bare `bun test` here aborts by name — that is the point (a launch-time
+# check, not an OS boundary: a forged marker and token, or code that ignores
+# HOME, can still reach the real home — cli#434).
 
 [test]
 preload = ["./test/preload-guard.ts"]

@@ -103,10 +103,11 @@ jobs:
         # and assert that directory still has no `.tps` afterwards — the suite must
         # not write a `.tps` into the HOME it was given (a check of the end
         # state, not of transient writes). The control is in the lane launcher
-        # (scripts/test-suite.mjs): each child's HOME points at a throwaway root,
-        # inherited home-routing variables (XDG_*, TPS_*, FLAIR_*, …) are dropped,
-        # and a preload aborts a non-isolated run; its ~/.tps metadata snapshot
-        # is a diagnostic for a persisted change, not an OS boundary.
+        # (scripts/test-suite.mjs): each child's HOME points at a throwaway root
+        # with TMPDIR inside it, the child gets only an allowlist of named,
+        # path-free inherited variables (every other one is dropped), and a
+        # preload aborts a run no launcher set up. These are launch-time checks,
+        # not an OS boundary; the ~/.tps metadata snapshot is a diagnostic.
         run: |
           iso_home="$(mktemp -d)"
           HOME="$iso_home" bun run test

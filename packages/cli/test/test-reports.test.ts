@@ -349,6 +349,10 @@ describe("check-test-reports — the report seal (cli#414)", () => {
   });
 });
 
+// cli#430: each launcher below gets HOME=<its own throwaway dir>. Inside a lane,
+// HOME is the lane's isolated root and TMPDIR lies inside it; a launcher refuses
+// to create its throwaway root inside the HOME it runs under, so a nested
+// launcher is given a HOME of its own, as a real caller would have.
 describe("the launchers delete their own suite's report before the suite starts", () => {
   /** A report + log + seal left behind by an earlier step, in a throwaway dir. */
   function staleReportDir(prefix: string, suite: string): string {
@@ -367,7 +371,7 @@ describe("the launchers delete their own suite's report before the suite starts"
       const res = spawnSync(
         process.execPath,
         [join(REPO, "scripts/test-suite.mjs"), "agent", "--reporter=spec", join(dir, "no-such-file.test.ts")],
-        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir }, encoding: "utf8" },
+        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir }, encoding: "utf8" },
       );
       expect(res.error).toBeUndefined();
       expect(existsSync(join(dir, "agent.xml"))).toBe(false);
@@ -390,7 +394,7 @@ describe("the launchers delete their own suite's report before the suite starts"
         ],
         {
           cwd: join(REPO, "plugins/openclaw-tps-mail"),
-          env: { ...process.env, TPS_TEST_REPORT_DIR: dir },
+          env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir },
           encoding: "utf8",
         },
       );
@@ -417,7 +421,7 @@ describe("the launchers seal the report they produce (cli#414)", () => {
     const res = spawnSync(
       process.execPath,
       [join(REPO, "scripts/test-suite.mjs"), "fixture", "./sealed.test.ts"],
-      { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir }, encoding: "utf8" },
+      { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir }, encoding: "utf8" },
     );
     expect(res.error).toBeUndefined();
     return { dir, status: res.status };

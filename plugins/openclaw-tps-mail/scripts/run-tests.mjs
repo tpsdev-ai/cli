@@ -13,17 +13,23 @@
  * `import { writeFileSync } from "node:fs"`. So the isolation must be set at
  * LAUNCH TIME, in the child's environment, before bun boots.
  *
- * WHAT IT DOES. It creates a throwaway root, creates the mail + keys dirs
+ * WHAT IT DOES. It creates a fresh throwaway root, creates the mail + keys dirs
  * under it, and launches `bun test` with HOME, TPS_MAIL_DIR and
- * TPS_TEST_KEYS_DIR pointing inside that root. The inherited environment is
- * SANITIZED first (cli#430, scripts/test-home-guard.mjs `sanitizedTestEnv`):
- * every variable that routes a path around HOME — the XDG base dirs, TPS_*
- * (a stale real TPS_MAIL_DIR included), FLAIR_*, BOB_*, OPENCLAW_*, CODEX_HOME,
- * … — is dropped. The root is passed to the child as TPS_TEST_ROOT, which the
- * bun test preload (test/preload-guard.ts) whitelists against — a run that is
- * NOT under this root aborts before any test module loads. Before creating or
- * deleting anything, the launcher refuses a temp dir or TPS_TEST_REPORT_DIR that
- * resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config.
+ * TPS_TEST_KEYS_DIR pointing inside that root. The child's environment is an
+ * ALLOWLIST (cli#430, scripts/test-home-guard.mjs `isolatedChildEnv`): only the
+ * named, path-free variables in `PASSED_ENV` (plus PATH) are inherited — a stale
+ * real TPS_MAIL_DIR, the XDG base dirs and every variable nobody has named yet
+ * are dropped — and TMPDIR/TMP/TEMP and bun's transpiler cache are set inside
+ * the root. The root is passed to the child as TPS_TEST_ROOT, with the token of
+ * the marker this launcher wrote in it; the bun test preload
+ * (test/preload-guard.ts) aborts a run whose HOME or TPS_MAIL_DIR is not under
+ * that root, or whose root is or contains the account's home or is not one a
+ * launcher made — before any test module loads. Before creating or deleting
+ * anything, the launcher refuses a temp dir inside an operator home, and a
+ * report dir or report/log/seal path (the default test-reports/ included) that
+ * resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config or is a symlink. These
+ * are launch-time checks, not an OS boundary (cli#434); this launcher process
+ * itself runs under the caller's environment.
  *
  * USAGE
  *   node scripts/run-tests.mjs [bun test args…]   # default: `test/`
@@ -56,25 +62,18 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-  createWriteStream,
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  realpathSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   IsolationRefusal,
+  assertReportPaths,
   assertTestDestinations,
+  createIsolatedRoot,
   describeLeak,
   diffSnapshots,
-  sanitizedTestEnv,
+  isolatedChildEnv,
   snapshotTps,
 } from "../../../scripts/test-home-guard.mjs";
 
@@ -87,15 +86,20 @@ const reportDir = process.env.TPS_TEST_REPORT_DIR
   ? resolve(process.env.TPS_TEST_REPORT_DIR)
   : join(repoRoot, "test-reports");
 
-// cli#430: refuse BEFORE creating or deleting anything when the temp dir (the
-// throwaway root is created and removed there) or an overridden report dir
-// (stale reports are deleted there) resolves inside ~/.tps, ~/.flair, ~/agents
-// or ~/.config.
+const reportXml = join(reportDir, "plugin.xml");
+const reportLog = join(reportDir, "plugin.log");
+// cli#414: the seal this run writes when the suite exits, holding the report's
+// SHA-256 and the suite name. Written and read back on close.
+const reportSeal = join(reportDir, "plugin.xml.sha256");
+const tempBase = tmpdir();
+
+// cli#430: refuse BEFORE creating or deleting anything — the default report dir
+// included. The temp dir (the throwaway root is created and removed there) must
+// be outside every operator home; the report dir and this run's report, log and
+// seal (deleted now, written later) must resolve outside ~/.tps, ~/.flair,
+// ~/agents and ~/.config and must not be symlinks.
 try {
-  assertTestDestinations({
-    env: process.env,
-    reportDir: process.env.TPS_TEST_REPORT_DIR ? reportDir : undefined,
-  });
+  assertTestDestinations({ env: process.env, tempBase, reportDir, paths: [reportXml, reportLog, reportSeal] });
 } catch (err) {
   if (!(err instanceof IsolationRefusal)) throw err;
   console.error(`openclaw-tps-mail tests: ${err.message}`);
@@ -103,51 +107,49 @@ try {
 }
 
 // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher runs
-// under, taken before anything is written. A DIAGNOSTIC: it reports a change
-// that persists to the end of the run (path, size, mtime, ctime, inode — never
-// contents). The control is the child's HOME override + the sanitized
+// under, taken before anything is written. A DIAGNOSTIC: the run fails on a
+// recorded metadata difference at the end (path, size, mtime, ctime, inode —
+// never contents). The control is the child's HOME override + the allowlisted
 // environment + the bunfig preload.
 const guardHome = process.env.HOME || homedir();
 const tpsBefore = snapshotTps(guardHome);
 
-// realpath the root: on macOS /tmp is a symlink to /private/tmp, and the guard
-// compares realpaths so a symlinked tmpdir still counts as "inside".
-const root = realpathSync(mkdtempSync(join(tmpdir(), "openclaw-tps-mail-test-")));
-const mailDir = join(root, ".tps", "mail");
-const keysDir = join(root, "keys");
-mkdirSync(mailDir, { recursive: true });
-mkdirSync(keysDir, { recursive: true });
-
-// Child env: SANITIZE the inherited values first (cli#430 — drops every
-// home-routing override, the ambient TPS_MAIL_DIR / TPS_TEST_KEYS_DIR /
-// TPS_TEST_ROOT included), then set the launch-time ones.
-const { env, dropped } = sanitizedTestEnv(process.env);
-if (dropped.length > 0) {
-  console.error(`openclaw-tps-mail tests: not passed to the tests (inherited, would bypass HOME): ${dropped.join(", ")}`);
-}
-Object.assign(env, {
-  HOME: root,
-  TPS_MAIL_DIR: mailDir,
-  TPS_TEST_KEYS_DIR: keysDir,
-  TPS_TEST_ROOT: root,
-  // The CLI mail helpers refuse in test mode without an explicit TPS_MAIL_DIR
-  // (packages/cli/src/utils/mail.ts); make that requirement explicit here.
-  TPS_MAIL_REQUIRE_EXPLICIT_DIR: "1",
-});
-
-console.log(`openclaw-tps-mail tests: isolated root ${root}`);
-
 mkdirSync(reportDir, { recursive: true });
-const reportXml = join(reportDir, "plugin.xml");
-const reportLog = join(reportDir, "plugin.log");
-// cli#414: the seal this run writes when the suite exits, holding the report's
-// SHA-256 and the suite name. Written and read back on close.
-const reportSeal = join(reportDir, "plugin.xml.sha256");
 // Stale artifacts go first: this run's report must be the one the guard reads,
 // and this run's seal must vouch for it (not a seal left by an earlier run).
 rmSync(reportXml, { force: true });
 rmSync(reportLog, { force: true });
 rmSync(reportSeal, { force: true });
+// The log is created exclusively, before any test code runs.
+const logStream = createWriteStream("", { fd: openSync(reportLog, "wx") });
+
+// The throwaway root (realpath'd: on macOS /tmp is a symlink to /private/tmp,
+// and the guard compares realpaths so a symlinked tmpdir still counts as inside).
+const { root, token } = createIsolatedRoot(tempBase);
+const mailDir = join(root, ".tps", "mail");
+const keysDir = join(root, "keys");
+mkdirSync(mailDir, { recursive: true });
+mkdirSync(keysDir, { recursive: true });
+
+// Child env: the ALLOWLIST (cli#430) plus the launch-time values this launcher
+// owns — an ambient TPS_MAIL_DIR / TPS_TEST_KEYS_DIR / TPS_TEST_ROOT never
+// reaches the child.
+const { env, dropped } = isolatedChildEnv(process.env, {
+  root,
+  token,
+  extra: {
+    TPS_MAIL_DIR: mailDir,
+    TPS_TEST_KEYS_DIR: keysDir,
+    // The CLI mail helpers refuse in test mode without an explicit TPS_MAIL_DIR
+    // (packages/cli/src/utils/mail.ts); make that requirement explicit here.
+    TPS_MAIL_REQUIRE_EXPLICIT_DIR: "1",
+  },
+});
+if (dropped.length > 0) {
+  console.error(`openclaw-tps-mail tests: not passed to the tests (not on the allowlist): ${dropped.join(", ")}`);
+}
+
+console.log(`openclaw-tps-mail tests: isolated root ${root}`);
 
 const passthrough = process.argv.slice(2);
 const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
@@ -162,7 +164,6 @@ const child = spawn("bun", args, {
 
 // Forward the output to this process's streams AND to the suite's log. The log is
 // the console record kept for the CI step; the guard reads only the XML.
-const logStream = createWriteStream(reportLog, { flags: "w" });
 child.stdout?.on("data", (chunk) => {
   process.stdout.write(chunk);
   logStream.write(chunk);
@@ -178,9 +179,9 @@ child.on("error", (err) => {
 });
 
 child.on("close", (code, signal) => {
-  // cli#430: compare the ~/.tps snapshot before/after; a persisted change is
-  // reported and fails the lane even when every test passed (a diagnostic — see
-  // scripts/test-home-guard.mjs for what it does and does not detect).
+  // cli#430: compare the ~/.tps snapshot before/after; a recorded metadata
+  // difference is reported and fails the lane even when every test passed (a
+  // diagnostic — see scripts/test-home-guard.mjs for what it can miss).
   let exitCode = signal ? 1 : (code ?? 1);
   const changed = diffSnapshots(tpsBefore, snapshotTps(guardHome));
   if (changed.length > 0) {
@@ -202,11 +203,24 @@ child.on("close", (code, signal) => {
     // cli#414: seal the report bun just wrote, success or failure. A run that
     // died before writing one leaves none to seal, and the guard fails closed on
     // the missing report.
+    // cli#430: the seal is a write too — re-check the report dir and the report
+    // and seal paths (a test ran in between) before sealing.
+    try {
+      assertReportPaths({ env: process.env, reportDir, paths: [reportXml, reportSeal] });
+    } catch (err) {
+      if (!(err instanceof IsolationRefusal)) throw err;
+      console.error(`openclaw-tps-mail tests: not sealing the report: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
     try {
       if (existsSync(reportXml)) {
         const hash = createHash("sha256").update(readFileSync(reportXml)).digest("hex");
         const expected = `${hash}  plugin\n`;
-        writeFileSync(reportSeal, expected);
+        // Never write through whatever sits at the seal path now: remove it (rm
+        // unlinks a symlink, never its target) and create the file exclusively.
+        rmSync(reportSeal, { force: true });
+        writeFileSync(reportSeal, expected, { flag: "wx" });
         if (readFileSync(reportSeal, "utf8") !== expected) {
           throw new Error("seal did not read back as written");
         }

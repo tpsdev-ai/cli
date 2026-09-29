@@ -219,7 +219,8 @@ git clone https://github.com/tpsdev-ai/cli.git
 cd cli
 bun install
 bun run build
-bun run test    # every suite, HOME-isolated (a bare `bun test` aborts by design)
+bun run test    # every suite, through its HOME-isolating launcher; a bare `bun test` aborts
+                # (a launch-time check, not an OS boundary: see cli#434)
 ```
 
 ## License

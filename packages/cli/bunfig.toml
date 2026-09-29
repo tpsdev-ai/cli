@@ -1,8 +1,9 @@
 # bunfig.toml — packages/cli test configuration (cli#430).
 #
 # The PRELOAD below loads before any test module. It ABORTS the run unless
-# os.homedir() resolves inside the isolated test root the launcher created
-# (TPS_TEST_ROOT). Run the suite through the launcher:
+# os.homedir() resolves inside TPS_TEST_ROOT, that root is not and does not
+# contain the account's home, and it is the root a launcher created (its marker
+# matches TPS_TEST_ROOT_TOKEN). Run the suite through the launcher:
 #
 #   bun run test                      # from the repo root
 #   node ../../scripts/test-suite.mjs cli
@@ -10,6 +11,8 @@
 # A bare `bun test` here aborts by name — that is the point: the cli suite
 # resolves ~/.tps from the process HOME, so an unisolated run writes into the
 # live tree.
+# (a launch-time check, not an OS boundary: a forged marker and token, or code
+# that ignores HOME, can still reach the real home — cli#434).
 
 [test]
 preload = ["../../scripts/home-isolation-preload.ts"]
