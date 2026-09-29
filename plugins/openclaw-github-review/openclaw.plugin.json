@@ -59,7 +59,7 @@
       },
       "reconcileFile": {
         "type": "string",
-        "description": "The durable per-dispatch latch store: a dispatch whose review exists is latched `posted` (one verdict per dispatch) and one whose post has an unknown external state (an ambiguous GitHub response or an invalid 2xx receipt) `reconcile_required`. Only the host clears a latch (dist/src/latch-admin.js). Required: posting is refused before any request when unset."
+        "description": "The durable per-dispatch latch store. A dispatch is reserved here (durably) before its review is posted, then latched `posted` (final) or `reconcile_required` (uncertain outcome); a definitive rejection removes the reservation. A reservation or `reconcile_required` latch refuses posting until the host's audited `latch-admin reconcile` releases it, which it does only when no review exists. Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
       "sandboxImageDigest": {

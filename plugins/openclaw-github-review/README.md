@@ -36,37 +36,55 @@ input, none of it trusted on its own — and:
 4. **Posts exactly what was validated.** The request is built internally from the
    validated assignment, event, commit and body; there is no endpoint, header or
    method passthrough. `body` is treated as opaque text and is sent unchanged.
-5. **Publishes a signed audit record.** Every posting emits a Flair `OrgEvent`
-   (`kind: pr_review_posted`) with the reviewer identity, the canonical repo, the
-   PR number and posted commit, a host-computed `body_sha256` taken over the
-   UTF-8 body handed to the serializer, the returned review id/URL, the review
+5. **Audits every review it creates — and says when the audit is not
+   complete.** The audit record is a signed Flair `OrgEvent` (`kind:
+   pr_review_posted`) with the reviewer identity, the canonical repo, the PR
+   number and posted commit, a host-computed `body_sha256` taken over the UTF-8
+   body handed to the serializer, the returned review id/URL, the review
    environment's runtime versions and image digest, and the verified login from
    the provisioning record. The runtime versions and digest are `null` until the
    reviewer image (section A) supplies them; the gateway's own versions are never
-   presented as the review's.
-6. **Posts exactly one verdict per dispatch.** Once a dispatch's review exists
-   the dispatch is latched `posted`, and every later call refuses with
-   `already_posted` (a further review needs a fresh dispatch). While one call
-   for a dispatch is in flight, a second is refused with `dispatch_in_flight`.
-   The tool also declares `executionMode: "sequential"`; OpenClaw's runner
-   serializes a batch containing it when it sees that flag, but OpenClaw 2026.8.1
-   drops it on its cached tool descriptors, so the in-flight guard is what
-   enforces the rule.
+   presented as the review's. A created review is reported as exactly one of:
+   - `posted` — the receipt validated and Flair acknowledged the audit record;
+   - `posted_audit_pending` — Flair did not acknowledge it; the record is
+     retained in `pendingAuditFile` and retried at the next gateway start,
+     without reposting the review;
+   - `posted_audit_unretained` — Flair did not acknowledge it AND it could not
+     be retained: the review exists, its audit record is lost, and one host log
+     line names the event id so the host can record it.
+6. **Posts at most one verdict per dispatch, unless the host's reconciliation
+   releases it.** Before the review is POSTed, the dispatch is durably
+   **reserved** in `reconcileFile` (see Dispatch latches); if that write fails,
+   nothing is posted (`store_unavailable`). A validated receipt turns the
+   reservation into `posted`, and every later call refuses with
+   `already_posted` (a further review needs a fresh dispatch). A definitive
+   GitHub rejection (a 4xx: no review was created) removes the reservation. A
+   reservation that is still there on a later call — a crash, or an outcome
+   that could not be recorded — and an uncertain outcome both refuse every call
+   with `reconcile_required` until the host's audited reconciliation checks
+   GitHub; it releases the dispatch only when no review exists. While one call
+   for a dispatch is in flight in the gateway, a second is refused with
+   `dispatch_in_flight`. The tool also declares `executionMode: "sequential"`;
+   OpenClaw 2026.8.1 honours it on a freshly resolved tool but drops it on its
+   cached tool descriptors, so the guards do not depend on it. The latch file is
+   host-owned: editing it by hand bypasses all of this.
 7. **Reports partial outcomes honestly.** A GitHub refusal is a refusal. An
    ambiguous GitHub outcome, or a 2xx whose receipt does not validate, is
    reported as **`unknown`** (a review may exist) and latches the dispatch
-   `reconcile_required`, so a retry cannot post a second review. An audit
-   failure after a confirmed post is `posted_audit_pending`, retained for
-   host-side retry **without** reposting the review; if even retention fails the
-   status is `posted_audit_unretained` and one host log line names the audit
-   event. A post is never followed by a throw, and no refusal or log line names
-   a host path.
+   `reconcile_required`. Nothing after the POST throws: the event id, timestamp
+   and digest are prepared before the reservation, and every later step —
+   latch writes, the audit write, retention, host logging — is contained. No
+   refusal or log line names a host path.
 8. **Fails closed on its durable stores.** Both stores (the dispatch latch file
    and the pending-audit file) must be configured, and must be readable and
    writable before any request (`store_unconfigured` / `store_unavailable`). A
    missing store file is empty; an unreadable or unparsable one is an error and
-   is never overwritten. A latch that cannot be written after a post is held in
-   memory until the gateway restarts, and a host log line says so.
+   is never overwritten. Every write is durable before it returns: the new
+   contents go to a temp file that is fsync'ed, renamed over the store, and the
+   directory is fsync'ed. That survives the gateway being killed at any point
+   and, where the filesystem and device honour fsync (Linux), an OS crash or
+   power loss; it does not survive storage that acknowledges fsync without
+   persisting (on macOS, fsync does not flush the drive cache).
 
 `github_review` executes in the gateway process. A sandboxed (`mode=all`)
 session is not refused by the plugin: whether the session is offered the tool at
@@ -110,9 +128,13 @@ The lane below pins **OpenClaw 2026.8.1**, the release deployed to the reviewer
 hosts; the gateway runs on the Node that release requires (`>=22.22.3 <23`,
 `>=24.15 <25` or `>=25.9`). An update to any of them must pass the lane first.
 
-1. Build the plugin (`npm ci && npm run build`) and install it into the
-   gateway, e.g. with `openclaw plugins install`, or by listing its directory
-   in `plugins.load.paths`.
+1. Build the plugin (`npm ci --ignore-scripts && npm run build`) and install it
+   into the gateway, e.g. with `openclaw plugins install`, or by listing its
+   directory in `plugins.load.paths`. `--ignore-scripts`, as in CI: the plugin
+   needs no install script, while the dev dependency tree it builds against
+   carries several (openclaw, @google/genai, protobufjs, tree-sitter-bash, and
+   — new with OpenClaw 2026.8.1's tree — koffi), none of which should run on a
+   reviewer host.
 2. Allow and configure it (`openclaw.json`):
 
    ```json
@@ -150,25 +172,44 @@ hosts; the gateway runs on the Node that release requires (`>=22.22.3 <23`,
 
 ## Dispatch latches (host procedure)
 
-`reconcileFile` holds one latch per dispatch that must not post again:
+`reconcileFile` holds one latch per dispatch that has attempted a post:
 
 | Latch | Set when | Tool refusal | Host remedy |
 | --- | --- | --- | --- |
-| `posted` | the dispatch's review exists | `already_posted` | none needed: a further review is a fresh dispatch |
-| `reconcile_required` | a post's outcome is unknown (ambiguous response, or a receipt that does not match) | `reconcile_required` | reconcile the PR's reviews on GitHub, then clear the latch |
+| `reserved` | durably, BEFORE the review is POSTed; still there later means the attempt never recorded its outcome (a crash, or a failed outcome write) | `reconcile_required` | `latch-admin reconcile` |
+| `reconcile_required` | the outcome is uncertain: an ambiguous response, or a 2xx whose receipt does not match | `reconcile_required` | `latch-admin reconcile` |
+| `posted` | the dispatch's review exists | `already_posted` | none: final. A further review is a fresh dispatch |
 
-Only the host clears a latch, with the command shipped in the package, run on
-the gateway host as the gateway's service user (no agent-invokable tool can
-clear one):
+A definitive rejection removes the reservation, so a corrected retry can post.
+
+Only the host releases a dispatch, with the command shipped in the package, run
+on the gateway host as the gateway's service user, when no call for the
+dispatch is running (no agent-invokable tool can release one):
 
 ```sh
-node <plugin>/dist/src/latch-admin.js list  <reconcileFile>
-node <plugin>/dist/src/latch-admin.js clear <reconcileFile> <dispatchId>
+node <plugin>/dist/src/latch-admin.js list      <reconcileFile>
+node <plugin>/dist/src/latch-admin.js reconcile <pluginConfig.json> <dispatchId> [--audit-log <file>]
 ```
 
-A store file the command cannot parse is refused and left untouched: repair it
-by hand. A latch the gateway logged as "held in memory" is not in the file;
-reconcile, then restart the gateway to drop it.
+`<pluginConfig.json>` holds the plugin's configuration object (the same keys as
+its `plugins.entries` config). `reconcile`:
+
+1. verifies the GitHub credential exactly as the plugin does (provisioning
+   evidence, repository coverage) — the same credential, used host-side;
+2. lists the pull request's reviews and looks for the dispatch's review: the
+   review id from a 2xx receipt, or any review by the dispatch's login on the
+   dispatch's commit. A listing it cannot complete changes nothing;
+3. records the result — a signed Flair `OrgEvent` (`kind:
+   pr_review_reconciled`, signed with the reviewer key the plugin uses), or,
+   when Flair does not acknowledge it, one fsync'ed line in the local audit log
+   (`<reconcileFile>.audit.jsonl` by default) — and prints which. If neither
+   can be written, nothing changes;
+4. then latches the dispatch `posted` when a review exists, and releases it
+   only when none does.
+
+A `posted` latch is refused (`reconcile` and `clear` both), and `clear` never
+changes the store for any latch: it only points at `reconcile`. A store file the
+command cannot parse is refused and left untouched: repair it by hand.
 
 ## CI
 
@@ -201,7 +242,11 @@ installed as the global `fetch` before registration:
   the credential locations (results, logs, diagnostics, process output, launch
   data, and what reached Flair).
 
-The lane does not start a sandbox container or the embedded agent runner.
+What the lane runs is exactly the list above: OpenClaw's loader, its gateway
+tool resolution and its `tools.invoke` dispatch, in one node process, against
+controlled services. It starts no sandbox container and does not run the
+embedded agent runner, so it does not establish that sandbox execution cannot
+read the marker (the container half, see Scope).
 
 ## Scope
 

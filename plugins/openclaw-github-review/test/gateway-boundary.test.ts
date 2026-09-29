@@ -256,7 +256,20 @@ describe("E — the gateway-boundary lane (OpenClaw loader + gateway tool dispat
     // another mode; every such registration reused the full one's host state.
     expect(run.stdout).not.toContain("has no host state");
 
-    expect(JSON.parse(readFileSync(host.reconcileFile, "utf8"))).toEqual({ latches: [{ dispatchId: "lane-dispatch-1", latch: "posted" }] });
+    expect(JSON.parse(readFileSync(host.reconcileFile, "utf8"))).toEqual({
+      latches: [
+        {
+          dispatchId: "lane-dispatch-1",
+          latch: "posted",
+          repo: REPO,
+          pr: PR,
+          commit: COMMIT,
+          login: "anvil-reviewer",
+          reservedAt: expect.any(String),
+          reviewId: 4242,
+        },
+      ],
+    });
     expect(existsSync(host.pendingAuditFile)).toBe(false);
 
     scanLaneRun(run, host);

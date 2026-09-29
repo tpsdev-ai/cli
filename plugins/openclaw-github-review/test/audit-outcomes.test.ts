@@ -1,34 +1,44 @@
 /**
  * audit-outcomes.test.ts — A12 (audit fidelity), A13 (partial outcomes and
  * recovery) and A14 (attribution), plus the durable-store and one-verdict
- * semantics: ambiguous/2xx-invalid outcomes are UNKNOWN with a durable
- * per-dispatch latch; a dispatch whose review exists refuses every later call
+ * semantics: the dispatch is durably RESERVED before the POST (no reservation,
+ * no POST); ambiguous/2xx-invalid outcomes are UNKNOWN; a reservation left by a
+ * crash or a failed outcome write refuses `reconcile_required` until the host
+ * reconciles; a dispatch whose review exists refuses every later call
  * (`already_posted`) and a concurrent call is refused while one is in flight;
- * the durable stores fail closed (never read as empty, never overwritten when
- * unparsable, proved usable before any request); and a post is never followed
- * by a throw.
+ * the durable stores fail closed; and nothing after a POST throws.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { FilePendingAuditStore, FileReconcileStore, retryPendingAudits } from "../src/audit.js";
 import { outcomeToJson, runGithubReview } from "../src/handler.js";
 import { createGithubReviewTool } from "../src/index.js";
-import type { Outcome, ReconcileStore, RefusalReason } from "../src/types.js";
+import { runLatchAdmin } from "../src/latch-admin.js";
+import type { ExistingReview, Outcome, ReconcileStore, RefusalReason } from "../src/types.js";
 import {
   COMMIT,
-  FailingAddReconcileStore,
   FailingSavePendingStore,
+  FakeGitHub,
+  FakeReviewLister,
+  fakeFlairFetch,
+  FlakyReconcileStore,
   GatedGitHub,
   makeDeps,
+  pluginConfigOf,
   PR,
   REPO,
   scenario,
   session,
   validInput,
+  type Scenario,
 } from "./helpers.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 let root: string;
 beforeEach(() => {
@@ -113,8 +123,9 @@ describe("A13 — partial outcomes and recovery", () => {
     expect(audit.events.length).toBe(0);
   });
 
-  test("an ambiguous GitHub outcome is UNKNOWN and latches the dispatch", async () => {
-    const { deps, github, audit } = makeDeps(scenario(root));
+  test("an ambiguous GitHub outcome is UNKNOWN and latches the dispatch reconcile_required", async () => {
+    const s = scenario(root);
+    const { deps, github, audit } = makeDeps(s);
     github.reviewResult = { ok: false, kind: "ambiguous", detail: "posting returned status 502" };
     const o = await runGithubReview(validInput(), HOST, deps);
     expect(o.ok).toBe(true);
@@ -123,6 +134,7 @@ describe("A13 — partial outcomes and recovery", () => {
       if (o.status === "unknown") expect(o.reason).toBe("reconcile_required");
     }
     expect(audit.events.length).toBe(0);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reconcile_required");
   });
 
   test("an immediate retry after an unknown outcome does NOT post a second review", async () => {
@@ -133,6 +145,8 @@ describe("A13 — partial outcomes and recovery", () => {
     const second = await runGithubReview(validInput(), HOST, deps);
     refusedWith(second, "reconcile_required");
     expect(github.reviewCalls.length).toBe(1);
+    // The latch refuses BEFORE any request: the retry did not even look the PR up.
+    expect(github.fetchPullCalls.length).toBe(1);
   });
 
   test("a retry after a receipt_invalid outcome is refused reconcile_required, with exactly 1 POST", async () => {
@@ -145,7 +159,15 @@ describe("A13 — partial outcomes and recovery", () => {
     expect(github.reviewCalls.length).toBe(1);
   });
 
-  test("the dispatch latch is durable, and posting resumes only once the HOST clears it", async () => {
+  test("a receipt_invalid outcome records reconcile_required WITH the receipt's review id (what reconciliation matches on)", async () => {
+    const s = scenario(root);
+    const { deps, github } = makeDeps(s);
+    github.reviewResult = { ok: true, receipt: { id: 9, url: "https://example.test/r/9", commitId: "c".repeat(40), state: "APPROVED" } };
+    await runGithubReview(validInput(), HOST, deps);
+    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "reconcile_required", reviewId: 9 });
+  });
+
+  test("the dispatch latch is durable, and posting resumes only once the HOST's reconciliation finds no review", async () => {
     const s = scenario(root);
     const { deps, github } = makeDeps(s);
     github.reviewResult = { ok: false, kind: "ambiguous", detail: "posting returned status 502" };
@@ -155,8 +177,8 @@ describe("A13 — partial outcomes and recovery", () => {
     const restarted = makeDeps(s);
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
     expect(restarted.github.reviewCalls.length).toBe(0);
-    // The host reconciles and clears the latch; the next call posts.
-    expect(new FileReconcileStore(s.config.reconcileFile!).clear("dispatch-1")).toBe(true);
+    // The host reconciles: GitHub shows no review for the dispatch, so it is released.
+    expect(await hostReconcile(s, [])).toBe(0);
     const after = await runGithubReview(validInput(), HOST, restarted.deps);
     expect(after.ok && after.status === "posted").toBe(true);
     expect(restarted.github.reviewCalls.length).toBe(1);
@@ -317,6 +339,14 @@ describe("B2 — the durable stores fail closed", () => {
     }
   });
 
+  test("FileReconcileStore.clear removes ONLY the named dispatch", () => {
+    const store = new FileReconcileStore(join(root, "latches.json"));
+    store.add("a", "reserved", {});
+    store.add("b", "posted", {});
+    expect(store.clear("a")).toBe(true);
+    expect(store.list().map((e) => [e.dispatchId, e.latch])).toEqual([["b", "posted"]]);
+  });
+
   test("FileReconcileStore.add never overwrites a file it could not parse", () => {
     const garbled = join(root, "garbled.json");
     writeFileSync(garbled, '{"latches":[{"dispatchId":"other","latch":"posted"}', { mode: 0o600 });
@@ -337,22 +367,22 @@ describe("B2 — the durable stores fail closed", () => {
     expect(readFileSync(garbled, "utf8")).toBe('{"events":[{"id":1}]}');
   });
 
-  test("an ambiguous post whose durable latch write fails is still latched (in memory): no throw, 1 POST, one path-free log line", async () => {
-    const reconcile = new FailingAddReconcileStore();
+  test("an ambiguous post whose outcome write fails stays RESERVED: no throw, 1 POST, reconcile_required, one path-free log line", async () => {
+    const reconcile = new FlakyReconcileStore(["reconcile_required"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     github.reviewResult = { ok: false, kind: "ambiguous", detail: "posting returned status 502" };
     const first = await runGithubReview(validInput(), HOST, deps);
     expect(first.ok && first.status === "unknown").toBe(true);
+    expect(reconcile.get("dispatch-1")).toBe("reserved");
     refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
     expect(github.reviewCalls.length).toBe(1);
-    expect(reconcile.addCalls).toEqual([{ dispatchId: "dispatch-1", latch: "reconcile_required" }]);
     expect(logs.length).toBe(1);
-    expect(logs[0]).toContain("held in memory");
+    expect(logs[0]).toContain("stays reserved");
     expect(logs[0]).not.toContain("/host/secret");
   });
 
-  test("a receipt_invalid post whose durable latch write fails is still latched (in memory)", async () => {
-    const reconcile = new FailingAddReconcileStore();
+  test("a receipt_invalid post whose outcome write fails stays RESERVED", async () => {
+    const reconcile = new FlakyReconcileStore(["reconcile_required"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     github.reviewResult = { ok: true, receipt: { id: 9, url: "https://example.test/r/9", commitId: COMMIT, state: "COMMENTED" } };
     const first = await runGithubReview(validInput({ event: "APPROVE" }), HOST, deps);
@@ -362,18 +392,189 @@ describe("B2 — the durable stores fail closed", () => {
     expect(logs.length).toBe(1);
   });
 
-  test("a posted review whose durable latch write fails is still latched (in memory): the next call is already_posted", async () => {
-    const reconcile = new FailingAddReconcileStore();
+  test("a posted review whose `posted` write fails is still posted, stays RESERVED, and the next call is refused (reconcile_required)", async () => {
+    const reconcile = new FlakyReconcileStore(["posted"]);
     const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
     const first = await runGithubReview(validInput(), HOST, deps);
     expect(first.ok && first.status === "posted").toBe(true);
-    refusedWith(await runGithubReview(validInput(), HOST, deps), "already_posted");
+    expect(reconcile.get("dispatch-1")).toBe("reserved");
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
   });
+
+  test("a rejected post whose reservation cannot be removed stays RESERVED: github_rejected, then reconcile_required", async () => {
+    const reconcile = new FlakyReconcileStore(["clear"]);
+    const { deps, github, logs } = makeDeps(scenario(root), { reconcile });
+    github.reviewResult = { ok: false, kind: "rejected", detail: "posting returned status 422" };
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "github_rejected");
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    expect(github.reviewCalls.length).toBe(1);
+    expect(logs.length).toBe(1);
+    expect(logs[0]).toContain("could not be removed");
+  });
 });
 
-describe("EXACTLY ONE VERDICT PER DISPATCH", () => {
+describe("R5 — the durable reservation BEFORE the POST", () => {
+  test("a failed reservation write means NO POST: store_unavailable, path-free", async () => {
+    const reconcile = new FlakyReconcileStore(["reserved"]);
+    const { deps, github } = makeDeps(scenario(root), { reconcile });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    refusedWith(o, "store_unavailable");
+    expect(outcomeToJson(o)).not.toContain("/host/secret");
+    expect(github.reviewCalls.length).toBe(0);
+    expect(reconcile.writes).toEqual([{ dispatchId: "dispatch-1", latch: "reserved" }]);
+  });
+
+  test("the reservation is DURABLE on disk, with the attempt's details, when the POST leaves", async () => {
+    const s = scenario(root);
+    const seen: unknown[] = [];
+    class ObservingGitHub extends FakeGitHub {
+      override async createReview(input: Parameters<FakeGitHub["createReview"]>[0]) {
+        seen.push(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1"));
+        return super.createReview(input);
+      }
+    }
+    const { deps } = makeDeps(s, { github: new ObservingGitHub() });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o.ok && o.status === "posted").toBe(true);
+    expect(seen).toEqual([
+      expect.objectContaining({ dispatchId: "dispatch-1", latch: "reserved", repo: REPO, pr: PR, commit: COMMIT, login: "anvil-reviewer" }),
+    ]);
+    expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "posted", reviewId: 1 });
+  });
+
+  test("a latch that appears while the PR is being fetched is honoured at the reservation: no POST", async () => {
+    const s = scenario(root);
+    class LatchingGitHub extends FakeGitHub {
+      override async fetchPull(repo: string, pr: number) {
+        new FileReconcileStore(s.config.reconcileFile!).add("dispatch-1", "posted", {});
+        return super.fetchPull(repo, pr);
+      }
+    }
+    const github = new LatchingGitHub();
+    const { deps } = makeDeps(s, { github });
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "already_posted");
+    expect(github.reviewCalls.length).toBe(0);
+  });
+
+  test("anything unexpected after the POST is contained: a receipt that throws when read returns UNKNOWN, never a throw", async () => {
+    const s = scenario(root);
+    const { deps, github } = makeDeps(s);
+    const receipt = { id: 5, url: "https://example.test/r/5", state: "APPROVED" } as { id: number; url: string; state: string; commitId: string };
+    Object.defineProperty(receipt, "commitId", {
+      get() {
+        throw new Error("receipt unreadable");
+      },
+    });
+    github.reviewResult = { ok: true, receipt };
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o).toMatchObject({ ok: true, status: "unknown", reason: "reconcile_required", reviewId: 5 });
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    expect(github.reviewCalls.length).toBe(1);
+  });
+
+  test("a createReview that THROWS is treated as ambiguous: unknown, and the dispatch refuses until reconciled", async () => {
+    class ThrowingGitHub extends FakeGitHub {
+      override async createReview(input: Parameters<FakeGitHub["createReview"]>[0]): Promise<never> {
+        this.reviewCalls.push(input);
+        throw new Error("socket hang up");
+      }
+    }
+    const github = new ThrowingGitHub();
+    const { deps } = makeDeps(scenario(root), { github });
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o.ok && o.status === "unknown").toBe(true);
+    refusedWith(await runGithubReview(validInput(), HOST, deps), "reconcile_required");
+    expect(github.reviewCalls.length).toBe(1);
+  });
+
+  test("the event id and timestamp are prepared BEFORE the reservation: a failing id source aborts with no reservation and no POST", async () => {
+    const s = scenario(root);
+    const { deps, github } = makeDeps(s, {
+      newId: () => {
+        throw new Error("id source failed");
+      },
+    });
+    await expect(runGithubReview(validInput(), HOST, deps)).rejects.toThrow("id source failed");
+    expect(github.reviewCalls.length).toBe(0);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBeNull();
+  });
+
+  test("nothing after the POST throws: a throwing host logger, a failing audit and a failing retention still return posted_audit_unretained", async () => {
+    const { deps, github, audit } = makeDeps(scenario(root), {
+      pendingAudits: new FailingSavePendingStore(),
+      log: () => {
+        throw new Error("logger down");
+      },
+    });
+    audit.fail = true;
+    const o = await runGithubReview(validInput(), HOST, deps);
+    expect(o.ok && o.status === "posted_audit_unretained").toBe(true);
+    expect(github.reviewCalls.length).toBe(1);
+  });
+
+  /** Run one call in a child process that SIGKILLs itself at `crashAt`. */
+  function crashRun(s: Scenario, crashAt: "before-post" | "after-post") {
+    const postLog = join(root, "posts.log");
+    const specFile = join(root, "crash-spec.json");
+    writeFileSync(specFile, JSON.stringify({ pluginConfig: pluginConfigOf(s), crashAt, postLog }), { mode: 0o600 });
+    const res = spawnSync(process.execPath, [join(here, "crash-child.ts"), specFile], {
+      encoding: "utf8",
+      timeout: 60_000,
+      killSignal: "SIGKILL",
+    });
+    const posts = existsSync(postLog) ? readFileSync(postLog, "utf8").split("\n").filter(Boolean).length : 0;
+    return { res, posts };
+  }
+
+  test("a CRASH between the reservation and the POST: the next call is refused reconcile_required; the host finds no review and releases; exactly ONE POST in all", async () => {
+    const s = scenario(root);
+    const { res, posts } = crashRun(s, "before-post");
+    expect(res.signal).toBe("SIGKILL");
+    expect(res.stdout).toBe("");
+    expect(posts).toBe(0);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+
+    const restarted = makeDeps(s);
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
+    expect(restarted.github.reviewCalls.length).toBe(0);
+
+    expect(await hostReconcile(s, [])).toBe(0);
+    const after = await runGithubReview(validInput(), HOST, restarted.deps);
+    expect(after.ok && after.status === "posted").toBe(true);
+    expect(posts + restarted.github.reviewCalls.length).toBe(1);
+  });
+
+  test("a CRASH between the POST and the `posted` write: the next call is refused reconcile_required; the host finds the review and latches posted; exactly ONE POST in all", async () => {
+    const s = scenario(root);
+    const { res, posts } = crashRun(s, "after-post");
+    expect(res.signal).toBe("SIGKILL");
+    expect(posts).toBe(1);
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+
+    const restarted = makeDeps(s);
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
+
+    const review: ExistingReview = { id: 1, login: "anvil-reviewer", commitId: COMMIT, state: "APPROVED", url: "https://example.test/r/1" };
+    expect(await hostReconcile(s, [review])).toBe(0);
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "already_posted");
+    expect(posts + restarted.github.reviewCalls.length).toBe(1);
+  });
+});
+
+/** The host's audited reconciliation of dispatch-1 against a given review listing. */
+async function hostReconcile(s: Scenario, reviews: ExistingReview[]): Promise<number> {
+  const configFile = join(root, "plugin-config.json");
+  writeFileSync(configFile, JSON.stringify(pluginConfigOf(s)), { mode: 0o600 });
+  const { fetchImpl } = fakeFlairFetch(200);
+  return runLatchAdmin(["reconcile", configFile, "dispatch-1"], () => {}, () => {}, {
+    lister: new FakeReviewLister({ ok: true, reviews }),
+    fetchImpl,
+  });
+}
+
+describe("ONE VERDICT PER DISPATCH (in flight and after a post)", () => {
   const params = validInput();
 
   test("the tool declares executionMode sequential", () => {

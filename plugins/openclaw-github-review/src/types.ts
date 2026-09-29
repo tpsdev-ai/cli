@@ -156,12 +156,29 @@ export interface GitHubApi {
   >;
 }
 
+/** One review on a pull request, as the host's reconciliation reads it. */
+export interface ExistingReview {
+  id: number;
+  login: string | null;
+  commitId: string | null;
+  state: string;
+  url: string | null;
+}
+
+/** The READ-ONLY review listing used by the host's reconciliation
+ *  (latch-admin.ts). It is not part of the handler's GitHubApi surface. */
+export interface GitHubReviewLister {
+  listReviews(repo: string, pr: number): Promise<{ ok: true; reviews: ExistingReview[] } | { ok: false; detail: string }>;
+}
+
 /** The Flair OrgEvent draft, mapped per section D. `id` is host-generated and
  *  retained across audit retries. */
 export interface OrgEventDraft {
   id: string;
   authorId: string;
-  kind: "pr_review_posted";
+  /** `pr_review_posted` for a review; `pr_review_reconciled` for the host's
+   *  reconciliation of a dispatch latch. Values of the existing field. */
+  kind: "pr_review_posted" | "pr_review_reconciled";
   scope: string;
   refId: string;
   targetIds: string[];
@@ -186,18 +203,42 @@ export interface PendingAuditStore {
   probe(): void;
 }
 
-/** Why a dispatch is latched. `reconcile_required`: a post's external state is
- *  unknown (an ambiguous GitHub response or an invalid 2xx receipt).
- *  `posted`: the dispatch's one verdict exists on GitHub. */
-export type DispatchLatch = "reconcile_required" | "posted";
+/** Why a dispatch is latched.
+ *  - `reserved`: written durably BEFORE the review is POSTed. A reservation
+ *    that is still there on a later call means an attempt started and its
+ *    outcome was never recorded (a crash, or a failed outcome write): the
+ *    review may exist.
+ *  - `reconcile_required`: the attempt's outcome is known to be uncertain (an
+ *    ambiguous GitHub response, or a 2xx whose receipt did not validate).
+ *  - `posted`: the dispatch's verdict exists on GitHub. Final.
+ *  `reserved` and `reconcile_required` refuse every call until the host's
+ *  audited reconciliation (latch-admin.ts) checks GitHub. */
+export type DispatchLatch = "reserved" | "reconcile_required" | "posted";
+
+/** What the latch store records about a dispatch's attempt, so the host's
+ *  reconciliation can look for the review on GitHub. */
+export interface LatchDetails {
+  repo: string;
+  pr: number;
+  /** The commit the review was posted against. */
+  commit: string;
+  /** The verified GitHub login the review would be posted as. */
+  login: string;
+  /** When the attempt was reserved (ISO). */
+  reservedAt: string;
+  /** The review id from a 2xx receipt, when there was one. */
+  reviewId?: number | null;
+}
 
 /** The durable per-dispatch latch store. Once a dispatch is latched it stays
- *  latched until the HOST clears it, so no retry can post a second review.
- *  `get` and `add` THROW when the store cannot be read or written; `add` never
- *  replaces a store it could not parse. */
+ *  latched until the HOST reconciles it, so no retry can post a second review.
+ *  `get`, `add` and `clear` THROW when the store cannot be read or written;
+ *  none of them replaces a store it could not parse. A write returns only once
+ *  it is durable (see durable-file.ts). */
 export interface ReconcileStore {
   get(dispatchId: string): DispatchLatch | null;
-  add(dispatchId: string, latch: DispatchLatch): void;
+  /** Set a dispatch's latch, merging any details given. */
+  add(dispatchId: string, latch: DispatchLatch, details?: Partial<LatchDetails>): void;
   clear(dispatchId: string): void;
   /** Prove the store is readable and writable now; throws otherwise. */
   probe(): void;

@@ -97,6 +97,55 @@ describe("HttpGitHubApi — exact request, classification and receipt", () => {
     if (!r.ok) expect(r.kind).toBe("ambiguous");
   });
 
+  test("listReviews reads EVERY page with the exact GET and headers", async () => {
+    const { custody } = scenario(root);
+    const page = (n: number, from: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        id: from + i,
+        user: { login: i % 2 ? "anvil-reviewer" : "someone" },
+        commit_id: COMMIT,
+        state: "COMMENTED",
+        html_url: `https://example.test/r/${from + i}`,
+      }));
+    const { fn, calls } = fakeFetch((url) =>
+      new Response(JSON.stringify(url.endsWith("page=1") ? page(100, 1) : page(3, 101)), { status: 200 }),
+    );
+    const api = new HttpGitHubApi({ custody, baseUrl: BASE, fetchImpl: fn });
+    const r = await api.listReviews(REPO, PR);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.reviews.length).toBe(103);
+      expect(r.reviews[1]).toEqual({ id: 2, login: "anvil-reviewer", commitId: COMMIT, state: "COMMENTED", url: "https://example.test/r/2" });
+    }
+    expect(calls.map((c) => c.url)).toEqual([
+      `${BASE}/repos/${REPO}/pulls/${PR}/reviews?per_page=100&page=1`,
+      `${BASE}/repos/${REPO}/pulls/${PR}/reviews?per_page=100&page=2`,
+    ]);
+    for (const c of calls) {
+      expect(c.init.method).toBe("GET");
+      expect((c.init.headers as Record<string, string>).Authorization).toBe(`Bearer ${TOKEN}`);
+    }
+  });
+
+  test("listReviews reports an incomplete listing as a FAILURE, never as no reviews", async () => {
+    const { custody } = scenario(root);
+    const full = Array.from({ length: 100 }, (_, i) => ({ id: i, user: { login: "x" }, commit_id: COMMIT, state: "COMMENTED" }));
+    for (const handler of [
+      () => new Response("nope", { status: 502 }),
+      () => new Response("not json", { status: 200 }),
+      () => new Response(JSON.stringify({ message: "x" }), { status: 200 }),
+      () => new Response(JSON.stringify([{ state: "COMMENTED" }]), { status: 200 }),
+      () => new Response(JSON.stringify(full), { status: 200 }),
+      () => {
+        throw new Error("network down");
+      },
+    ]) {
+      const api = new HttpGitHubApi({ custody, baseUrl: BASE, fetchImpl: fakeFetch(handler).fn });
+      const r = await api.listReviews(REPO, PR);
+      expect(r.ok).toBe(false);
+    }
+  });
+
   test("a non-open PR is reported as closed", async () => {
     const { custody } = scenario(root);
     const { fn } = fakeFetch(() => new Response(JSON.stringify({ state: "closed", head: { sha: COMMIT } }), { status: 200 }));

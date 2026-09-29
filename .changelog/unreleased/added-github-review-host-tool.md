@@ -31,24 +31,32 @@
 
   **The body is opaque and the digest is faithful.** The review request is built
   internally from the validated assignment, event, commit and body, with no
-  caller-selected endpoint or header, and `body` is sent unchanged. Every
-  successful posting emits a signed Flair `OrgEvent` (`kind: pr_review_posted`)
-  whose `detail` carries the host-computed `body_sha256` over the UTF-8 body
-  handed to the serializer, the returned review id/URL and confirmed commit, the
-  review environment's runtime versions and image digest (null until the reviewer
-  image supplies them), and the verified login from the provisioning record.
-  **Exactly one verdict per dispatch.** A dispatch whose review exists is
-  latched and refuses every later call (`already_posted`); a concurrent call is
-  refused while one is in flight (`dispatch_in_flight`), and the tool declares
-  `executionMode: "sequential"`. Partial outcomes are explicit: a GitHub refusal
-  is a refusal; an ambiguous outcome or a 2xx with an invalid receipt is
-  reported as `unknown` and latches the dispatch until the host reconciles it; a
-  failed audit is retained as `posted_audit_pending` and retried without
-  reposting, or reported `posted_audit_unretained` with a host log line when it
-  cannot be retained; and a post is never followed by a throw. Both durable
-  stores must be readable and writable before any request, an unparsable store
-  is never overwritten, and the host clears a latch with the shipped
-  `latch-admin` command.
+  caller-selected endpoint or header, and `body` is sent unchanged. The audit
+  record for a created review is a signed Flair `OrgEvent` (`kind:
+  pr_review_posted`) whose `detail` carries the host-computed `body_sha256` over
+  the UTF-8 body handed to the serializer, the returned review id/URL and
+  confirmed commit, the review environment's runtime versions and image digest
+  (null until the reviewer image supplies them), and the verified login from
+  the provisioning record. A created review is reported `posted` (audit
+  acknowledged), `posted_audit_pending` (the record is retained and retried at
+  the next start, without reposting) or `posted_audit_unretained` (the review
+  exists but its audit record was lost; one host log line names it).
+
+  **At most one verdict per dispatch, unless the host's reconciliation
+  releases it.** The dispatch is durably reserved (fsync'ed temp file, atomic
+  rename, fsync'ed directory) BEFORE the review is posted, and nothing is posted
+  if that fails. A validated receipt latches the dispatch `posted` (every later
+  call: `already_posted`); a definitive rejection removes the reservation; a
+  reservation left by a crash or an unrecorded outcome, an ambiguous outcome
+  and a 2xx with an invalid receipt all refuse with `reconcile_required` until
+  the host's audited `latch-admin reconcile` checks GitHub with the same
+  credential, records the result (signed Flair event, or a local audit line
+  when Flair is down) and releases the dispatch only if no review exists. A
+  `posted` latch is final. A concurrent call is refused while one is in flight
+  (`dispatch_in_flight`). Nothing after the POST throws: fallible metadata is
+  prepared first and every post-result step is contained. Both durable stores
+  must be readable and writable before any request, and an unparsable store is
+  never overwritten.
 
   **A permanent gateway-boundary lane** runs the BUILT plugin in a node process
   against the pinned OpenClaw 2026.8.1: it registers through OpenClaw's loader
@@ -59,5 +67,7 @@
   through the gateway's tools.invoke path it posts through the plugin's real
   GitHub and Flair clients to `posted` with the audit acknowledged; the probe
   reports the gateway process identity and reads the host-only marker there;
-  and every run is secret-scanned. The container half of the contrast is
-  deferred to section A.
+  and every run is secret-scanned. The lane runs OpenClaw's loader, gateway
+  tool resolution and tools.invoke dispatch in one node process; it starts no
+  sandbox container and no embedded agent runner, so the container half of the
+  contrast is deferred to section A.

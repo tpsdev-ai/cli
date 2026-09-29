@@ -8,13 +8,20 @@
  * only when they equal the trusted dispatch assignment and the host-fetched
  * head.
  *
- * EXACTLY ONE VERDICT PER DISPATCH: a dispatch whose review exists is latched
- * `posted` and refuses every later call with `already_posted`; a dispatch whose
- * post has an unknown external state is latched `reconcile_required`; and while
- * one call for a dispatch is in flight a second is refused with
- * `dispatch_in_flight`. The tool also declares `executionMode: "sequential"`,
- * which OpenClaw's runner uses to serialize a batch that contains it — the
- * in-flight guard does not depend on that.
+ * ONE VERDICT PER DISPATCH (dispatch-ledger.ts): before the review is POSTed
+ * the dispatch is durably RESERVED — if that write fails nothing is posted.
+ * A validated receipt turns the reservation into `posted` (every later call:
+ * `already_posted`); an uncertain outcome into `reconcile_required`; a
+ * definitive rejection removes it. A reservation or `reconcile_required` latch
+ * refuses every call (`reconcile_required`) until the host's audited
+ * reconciliation checks GitHub and releases the dispatch only if no review
+ * exists. While one call for a dispatch is in flight a second is refused
+ * (`dispatch_in_flight`). The tool also declares `executionMode:
+ * "sequential"`; the guards do not depend on it.
+ *
+ * NOTHING AFTER THE POST THROWS: the fallible metadata (event id, timestamp,
+ * digest) is prepared before the reservation, and every step after the POST —
+ * latch writes, the audit write, retention, host logging — is contained.
  */
 
 import { createHash } from "node:crypto";
@@ -25,6 +32,7 @@ import {
   REVIEW_EVENTS,
   type AssignmentResolver,
   type AuditSink,
+  type DispatchAssignment,
   type DispatchLatch,
   type GitHubApi,
   type OrgEventDraft,
@@ -88,7 +96,7 @@ export async function runGithubReview(
   ctx: SessionContext,
   deps: HandlerDeps,
 ): Promise<Outcome> {
-  const { config, custody, assignments, github, pendingAudits, ledger, runtime, clock, newId } = deps;
+  const { config, assignments, ledger, clock } = deps;
 
   // ── input shape and unsupported fields ──
   if (typeof rawInput !== "object" || rawInput === null || Array.isArray(rawInput)) {
@@ -196,13 +204,34 @@ export async function runGithubReview(
     );
   }
 
-  // ── a latched dispatch refuses until the host clears it ──
-  let latched: DispatchLatch | null;
-  try {
-    latched = ledger.latchOf(assignment.dispatchId);
-  } catch {
-    return storeUnavailable(actor);
+  // ── one call per dispatch at a time. The claim is taken synchronously,
+  //    before the first await, so two calls cannot both hold it. ──
+  if (!ledger.claim(assignment.dispatchId)) {
+    return refuse(
+      "dispatch_in_flight",
+      actor,
+      "another github_review call for this dispatch is in progress",
+      "wait for that call's outcome; a dispatch posts one verdict",
+    );
   }
+  try {
+    return await reviewClaimedDispatch(deps, { repo, pr, commitId: commitIdRaw, event: reviewEvent, body, assignment });
+  } finally {
+    ledger.release(assignment.dispatchId);
+  }
+}
+
+interface ClaimedRequest {
+  repo: string;
+  pr: number;
+  commitId: string;
+  event: ReviewEvent;
+  body: string;
+  assignment: DispatchAssignment;
+}
+
+/** The refusal for a dispatch that is already latched. */
+function latchedRefusal(latched: DispatchLatch, actor: string): Outcome {
   if (latched === "posted") {
     return refuse(
       "already_posted",
@@ -211,14 +240,30 @@ export async function runGithubReview(
       "one verdict per dispatch: a further review needs a fresh dispatch from the host",
     );
   }
-  if (latched === "reconcile_required") {
-    return refuse(
-      "reconcile_required",
-      actor,
-      "a previous post for this dispatch has an unknown external state",
-      "reconcile the pull request's reviews, then have the host clear the dispatch latch",
-    );
+  return refuse(
+    "reconcile_required",
+    actor,
+    latched === "reserved"
+      ? "a previous attempt for this dispatch did not record its outcome; its review may exist"
+      : "a previous post for this dispatch has an unknown external state",
+    "the host must reconcile the dispatch (latch-admin reconcile), which checks GitHub and releases it only if no review exists",
+  );
+}
+
+async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Promise<Outcome> {
+  const { config, custody, github, pendingAudits, ledger, runtime, clock, newId } = deps;
+  const { repo, pr, event, body, assignment } = req;
+  const actor = assignment.reviewer;
+  const dispatchId = assignment.dispatchId;
+
+  // ── a latched dispatch refuses until the host reconciles it ──
+  let latched: DispatchLatch | null;
+  try {
+    latched = ledger.latchOf(dispatchId);
+  } catch {
+    return storeUnavailable(actor);
   }
+  if (latched) return latchedRefusal(latched, actor);
 
   // ── body byte limit (must be configured) ──
   if (config.maxBodyBytes === null) {
@@ -266,47 +311,62 @@ export async function runGithubReview(
     return storeUnavailable(actor);
   }
 
-  // ── one call per dispatch at a time. Everything from the latch check to
-  //    this claim is synchronous, so two calls cannot both get past it. ──
-  if (!ledger.claim(assignment.dispatchId)) {
+  // ── host-authoritative PR lookup: open + head equality ──
+  const lookupPull = await github.fetchPull(repo, pr);
+  if (!lookupPull.ok) {
+    return refuse("pr_unavailable", actor, lookupPull.detail, "retry once the PR is reachable");
+  }
+  if (lookupPull.pull.state !== "open") {
+    return refuse("pr_not_open", actor, `PR ${repo}#${pr} is ${lookupPull.pull.state}`, "review open pull requests only");
+  }
+  const head = lookupPull.pull.head;
+  if (req.commitId !== head || assignment.reviewedCommit !== head) {
     return refuse(
-      "dispatch_in_flight",
+      "commit_mismatch",
       actor,
-      "another github_review call for this dispatch is in progress",
-      "wait for that call's outcome; a dispatch posts one verdict",
+      "the submitted commit, the reviewed commit and the current head do not agree",
+      "re-review the current head",
     );
   }
+
+  // ── everything fallible is prepared BEFORE the reservation and the POST ──
+  const bodySha256 = sha256Hex(Buffer.from(body, "utf8"));
+  const auditEventId = newId();
+  const createdAt = clock().toISOString();
+
+  // ── the durable reservation is a PREREQUISITE to posting ──
+  let existing: DispatchLatch | null;
   try {
-    // ── host-authoritative PR lookup: open + head equality ──
-    const lookupPull = await github.fetchPull(repo, pr);
-    if (!lookupPull.ok) {
-      return refuse("pr_unavailable", actor, lookupPull.detail, "retry once the PR is reachable");
-    }
-    if (lookupPull.pull.state !== "open") {
-      return refuse("pr_not_open", actor, `PR ${repo}#${pr} is ${lookupPull.pull.state}`, "review open pull requests only");
-    }
-    const head = lookupPull.pull.head;
-    if (commitIdRaw !== head || assignment.reviewedCommit !== head) {
-      return refuse(
-        "commit_mismatch",
-        actor,
-        "the submitted commit, the reviewed commit and the current head do not agree",
-        "re-review the current head",
-      );
-    }
+    existing = ledger.reserve(dispatchId, { repo, pr, commit: head, login: scope.login, reservedAt: createdAt });
+  } catch {
+    return storeUnavailable(actor);
+  }
+  if (existing) return latchedRefusal(existing, actor);
 
-    // ── host-computed digest over the UTF-8 body handed to the serializer ──
-    const bodySha256 = sha256Hex(Buffer.from(body, "utf8"));
+  // ── post. A throw here is not a definitive answer: the review may exist. ──
+  let posted: Awaited<ReturnType<GitHubApi["createReview"]>>;
+  try {
+    posted = await github.createReview({ repo, pr, commitId: head, event, body });
+  } catch {
+    posted = { ok: false, kind: "ambiguous", detail: "posting failed with no definitive response" };
+  }
 
-    // ── post and validate the receipt ──
-    const posted = await github.createReview({ repo, pr, commitId: head, event: reviewEvent, body });
+  // ── from here on nothing throws ──
+  try {
     if (!posted.ok) {
       if (posted.kind === "rejected") {
+        // A definitive rejection: no review was created, so the reservation goes.
+        if (!ledger.unreserve(dispatchId)) {
+          safeLog(
+            deps,
+            `openclaw-github-review: the reservation for dispatch ${dispatchId} could not be removed after GitHub rejected the review; ` +
+              "the dispatch refuses with reconcile_required until the host reconciles it (latch-admin reconcile).",
+          );
+        }
         return refuse("github_rejected", actor, posted.detail, "correct the review and retry");
       }
-      // AMBIGUOUS: a review may exist. Report an UNKNOWN state, never a refusal,
-      // and latch the dispatch so a retry cannot post a second review.
-      latchDispatch(deps, assignment.dispatchId, "reconcile_required");
+      // AMBIGUOUS: a review may exist. Report an UNKNOWN state, never a refusal.
+      settleLatch(deps, dispatchId, "reconcile_required", {});
       return {
         ok: true,
         status: "unknown",
@@ -320,27 +380,24 @@ export async function runGithubReview(
     }
     const receipt = posted.receipt;
 
-    // A 2xx means the review EXISTS. Latch the dispatch before anything else can
-    // fail: `posted` for a validated receipt (its one verdict), and
-    // `reconcile_required` for a receipt that does not match the request.
-    const receiptValid = receipt.commitId === head && receipt.state === expectedReceiptState(reviewEvent);
-    latchDispatch(deps, assignment.dispatchId, receiptValid ? "posted" : "reconcile_required");
+    // A 2xx means the review EXISTS: `posted` for a validated receipt (its one
+    // verdict), `reconcile_required` for one that does not match the request.
+    const receiptValid = receipt.commitId === head && receipt.state === expectedReceiptState(event);
+    settleLatch(deps, dispatchId, receiptValid ? "posted" : "reconcile_required", { reviewId: receipt.id });
 
-    // ── audit record (built from the confirmed receipt) ──
-    const auditEventId = newId();
     const draft = buildOrgEvent({
       id: auditEventId,
       reviewer: actor,
       repo,
       pr,
       commitId: head,
-      event: reviewEvent,
+      event,
       bodySha256,
       receipt,
-      sessionCorrelationId: assignment.dispatchId,
+      sessionCorrelationId: dispatchId,
       runtime,
       login: scope.login,
-      createdAt: clock().toISOString(),
+      createdAt,
     });
     // The review exists either way, so the audit record is written (or retained)
     // even for a receipt that did not validate.
@@ -372,25 +429,52 @@ export async function runGithubReview(
       auditEventId,
       login: scope.login,
     };
-  } finally {
-    ledger.release(assignment.dispatchId);
+  } catch {
+    // Not reachable by any known path; if it ever is, the most conservative
+    // report: the review may exist, and the dispatch stays at least reserved.
+    return {
+      ok: true,
+      status: "unknown",
+      reason: "reconcile_required",
+      reviewId: posted.ok ? posted.receipt.id : null,
+      reviewUrl: posted.ok ? posted.receipt.url : null,
+      commitId: req.commitId,
+      auditEventId: null,
+      login: scope.login,
+    };
   }
 }
 
-/** Latch a dispatch after a post. Never throws: a latch the durable store
- *  cannot take is held in memory and ONE host log line (no path) says so. */
-function latchDispatch(deps: HandlerDeps, dispatchId: string, latch: DispatchLatch): void {
-  if (!deps.ledger.latch(dispatchId, latch)) {
-    deps.log(
-      `openclaw-github-review: the ${latch} latch for dispatch ${dispatchId} could not be written to the durable store; ` +
-        "it is held in memory until the gateway restarts. Repair the store and record the latch before restarting.",
+/** Write ONE host log line; a failing logger is contained. */
+function safeLog(deps: HandlerDeps, line: string): void {
+  try {
+    deps.log(line);
+  } catch {
+    // The log line is lost; the outcome is unaffected.
+  }
+}
+
+/** Record a post's outcome latch. Never throws: when the write fails the
+ *  durable reservation still holds the dispatch, and ONE host log line (no
+ *  path) says so. */
+function settleLatch(
+  deps: HandlerDeps,
+  dispatchId: string,
+  latch: "posted" | "reconcile_required",
+  details: { reviewId?: number },
+): void {
+  if (!deps.ledger.settle(dispatchId, latch, details)) {
+    safeLog(
+      deps,
+      `openclaw-github-review: the ${latch} latch for dispatch ${dispatchId} could not be written; the dispatch stays reserved ` +
+        "and refuses with reconcile_required until the host reconciles it (latch-admin reconcile).",
     );
   }
 }
 
 /** Write the audit record; on failure retain it for host-side retry. Never
- *  throws after a post. When even retention fails, ONE host log line (no path)
- *  names the event so the host can record it. */
+ *  throws. When even retention fails, ONE host log line (no path) names the
+ *  event so the host can record it. */
 async function recordAudit(
   deps: HandlerDeps,
   draft: OrgEventDraft,
@@ -404,7 +488,8 @@ async function recordAudit(
       deps.pendingAudits.save(draft);
       return "retained";
     } catch {
-      deps.log(
+      safeLog(
+        deps,
         `openclaw-github-review: audit record ${draft.id} (${subject}) was not acknowledged and could not be retained for retry; ` +
           "record it on the host.",
       );

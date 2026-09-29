@@ -9,7 +9,7 @@
  */
 
 import type { CredentialCustody } from "./credential.js";
-import type { GitHubApi, PullSnapshot, ReviewEvent, ReviewReceipt } from "./types.js";
+import type { ExistingReview, GitHubApi, GitHubReviewLister, PullSnapshot, ReviewEvent, ReviewReceipt } from "./types.js";
 
 export interface GitHubApiOptions {
   custody: CredentialCustody;
@@ -21,8 +21,12 @@ export interface GitHubApiOptions {
 }
 
 const DEFAULT_BASE_URL = "https://api.github.com";
+const REVIEWS_PER_PAGE = 100;
+/** A PR with more reviews than this is not listed to the end: the listing is
+ *  reported as incomplete, never as "no review exists". */
+const MAX_REVIEW_PAGES = 30;
 
-export class HttpGitHubApi implements GitHubApi {
+export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
   private readonly custody: CredentialCustody;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
@@ -67,6 +71,45 @@ export class HttpGitHubApi implements GitHubApi {
       return { ok: false, detail: "lookup response was incomplete" };
     }
     return { ok: true, pull: { state: state === "open" ? "open" : "closed", head } };
+  }
+
+  /** List every review on a PR (read-only), for the host's reconciliation.
+   *  Anything short of the complete list is a failure, never an empty list. */
+  async listReviews(repo: string, pr: number): Promise<{ ok: true; reviews: ExistingReview[] } | { ok: false; detail: string }> {
+    const reviews: ExistingReview[] = [];
+    for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
+      const url = `${this.baseUrl}/repos/${repo}/pulls/${pr}/reviews?per_page=${REVIEWS_PER_PAGE}&page=${page}`;
+      let res: Response;
+      try {
+        res = await this.fetchImpl(url, { method: "GET", headers: this.headers() });
+      } catch {
+        return { ok: false, detail: "review listing request failed" };
+      }
+      if (!res.ok) return { ok: false, detail: `review listing returned status ${res.status}` };
+      let json: unknown;
+      try {
+        json = await res.json();
+      } catch {
+        return { ok: false, detail: "review listing was not JSON" };
+      }
+      if (!Array.isArray(json)) return { ok: false, detail: "review listing was not a list" };
+      for (const item of json) {
+        const o = typeof item === "object" && item !== null ? (item as Record<string, unknown>) : null;
+        if (!o || typeof o.id !== "number" || typeof o.state !== "string") {
+          return { ok: false, detail: "review listing held an unrecognised entry" };
+        }
+        const user = typeof o.user === "object" && o.user !== null ? (o.user as Record<string, unknown>) : null;
+        reviews.push({
+          id: o.id,
+          login: typeof user?.login === "string" ? user.login : null,
+          commitId: typeof o.commit_id === "string" ? o.commit_id : null,
+          state: o.state,
+          url: typeof o.html_url === "string" ? o.html_url : null,
+        });
+      }
+      if (json.length < REVIEWS_PER_PAGE) return { ok: true, reviews };
+    }
+    return { ok: false, detail: `review listing exceeded ${MAX_REVIEW_PAGES} pages` };
   }
 
   async createReview(input: {

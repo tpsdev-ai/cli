@@ -11,6 +11,7 @@ import { probeWritable, readJsonStore, writeJsonStore } from "./durable-file.js"
 import type {
   AuditSink,
   DispatchLatch,
+  LatchDetails,
   OrgEventDraft,
   PendingAuditStore,
   ReconcileStore,
@@ -163,18 +164,41 @@ export class MemoryPendingAuditStore implements PendingAuditStore {
 }
 
 /** One entry of the durable dispatch latch store. */
-export interface LatchEntry {
+export interface LatchEntry extends Partial<LatchDetails> {
   dispatchId: string;
   latch: DispatchLatch;
 }
 
-const LATCHES: ReadonlySet<string> = new Set<DispatchLatch>(["reconcile_required", "posted"]);
+const LATCHES: ReadonlySet<string> = new Set<DispatchLatch>(["reserved", "reconcile_required", "posted"]);
 
-/** The durable per-dispatch latch store: `{"latches":[{"dispatchId","latch"}]}`.
- *  Once a dispatch is latched it stays latched until the HOST clears it (see
- *  latch-admin.ts), so a retry cannot post a second review. The file is read
+/** Validate one stored entry; anything unrecognised throws. */
+function parseLatchEntry(entry: unknown): LatchEntry {
+  const o = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null;
+  const optional = (key: string, type: "string" | "number") => o![key] === undefined || typeof o![key] === type;
+  if (
+    !o ||
+    typeof o.dispatchId !== "string" ||
+    typeof o.latch !== "string" ||
+    !LATCHES.has(o.latch) ||
+    !optional("repo", "string") ||
+    !optional("pr", "number") ||
+    !optional("commit", "string") ||
+    !optional("login", "string") ||
+    !optional("reservedAt", "string") ||
+    !(o.reviewId === undefined || o.reviewId === null || typeof o.reviewId === "number")
+  ) {
+    throw new Error("the dispatch latch store has an unrecognised entry");
+  }
+  return o as unknown as LatchEntry;
+}
+
+/** The durable per-dispatch latch store:
+ *  `{"latches":[{"dispatchId","latch","repo","pr","commit","login","reservedAt","reviewId"}]}`.
+ *  Once a dispatch is latched it stays latched until the HOST reconciles it
+ *  (latch-admin.ts), so a retry cannot post a second review. The file is read
  *  on every operation; a missing file is empty, and anything else it cannot
- *  parse THROWS — `add` and `clear` never replace a file they could not parse. */
+ *  parse THROWS — `add` and `clear` never replace a file they could not parse.
+ *  Every write is durable before it returns (durable-file.ts). */
 export class FileReconcileStore implements ReconcileStore {
   constructor(private readonly file: string) {}
 
@@ -183,25 +207,23 @@ export class FileReconcileStore implements ReconcileStore {
     if (parsed === undefined) return [];
     const latches = typeof parsed === "object" && parsed !== null ? (parsed as { latches?: unknown }).latches : undefined;
     if (!Array.isArray(latches)) throw new Error("the dispatch latch store has an unrecognised shape");
-    return latches.map((entry) => {
-      const o = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : null;
-      if (!o || typeof o.dispatchId !== "string" || typeof o.latch !== "string" || !LATCHES.has(o.latch)) {
-        throw new Error("the dispatch latch store has an unrecognised entry");
-      }
-      return { dispatchId: o.dispatchId, latch: o.latch as DispatchLatch };
-    });
+    return latches.map(parseLatchEntry);
+  }
+
+  entry(dispatchId: string): LatchEntry | null {
+    return this.list().find((e) => e.dispatchId === dispatchId) ?? null;
   }
 
   get(dispatchId: string): DispatchLatch | null {
-    return this.list().find((e) => e.dispatchId === dispatchId)?.latch ?? null;
+    return this.entry(dispatchId)?.latch ?? null;
   }
 
-  add(dispatchId: string, latch: DispatchLatch): void {
+  add(dispatchId: string, latch: DispatchLatch, details: Partial<LatchDetails> = {}): void {
     const entries = this.list();
-    const existing = entries.find((e) => e.dispatchId === dispatchId);
-    if (existing?.latch === latch) return;
-    if (existing) existing.latch = latch;
-    else entries.push({ dispatchId, latch });
+    const index = entries.findIndex((e) => e.dispatchId === dispatchId);
+    const next: LatchEntry = { ...(index >= 0 ? entries[index] : {}), ...details, dispatchId, latch };
+    if (index >= 0) entries[index] = next;
+    else entries.push(next);
     writeJsonStore(this.file, { latches: entries });
   }
 
@@ -222,15 +244,15 @@ export class FileReconcileStore implements ReconcileStore {
 
 /** An in-memory latch store for tests. */
 export class MemoryReconcileStore implements ReconcileStore {
-  private latches = new Map<string, DispatchLatch>();
+  readonly entries = new Map<string, LatchEntry>();
   get(dispatchId: string): DispatchLatch | null {
-    return this.latches.get(dispatchId) ?? null;
+    return this.entries.get(dispatchId)?.latch ?? null;
   }
-  add(dispatchId: string, latch: DispatchLatch): void {
-    this.latches.set(dispatchId, latch);
+  add(dispatchId: string, latch: DispatchLatch, details: Partial<LatchDetails> = {}): void {
+    this.entries.set(dispatchId, { ...this.entries.get(dispatchId), ...details, dispatchId, latch });
   }
   clear(dispatchId: string): void {
-    this.latches.delete(dispatchId);
+    this.entries.delete(dispatchId);
   }
   probe(): void {}
 }

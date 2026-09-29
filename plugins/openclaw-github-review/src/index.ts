@@ -7,7 +7,9 @@
  * `commit_id` MUST equal the host assignment and the host-fetched head. The
  * GitHub credential is read once, here, into a #private field of the custody
  * object and is never re-read or disclosed. Every post emits a signed Flair
- * OrgEvent. Each dispatch posts exactly one verdict (see dispatch-ledger.ts).
+ * OrgEvent, or reports that its audit is pending or lost. A dispatch posts at
+ * most one verdict unless the host's audited reconciliation releases it (see
+ * dispatch-ledger.ts).
  *
  * This plugin depends on the mail plugin in NO way: it has its own
  * installation, deployment and rollback lifecycle.

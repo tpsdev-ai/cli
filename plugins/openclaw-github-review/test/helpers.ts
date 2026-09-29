@@ -9,6 +9,7 @@ import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
+import { MemoryReconcileStore } from "../src/audit.js";
 import { CredentialCustody } from "../src/credential.js";
 import { resolveConfig, type GithubReviewConfig } from "../src/config.js";
 import { buildDeps, type HandlerServices } from "../src/index.js";
@@ -18,7 +19,10 @@ import type {
   AuditSink,
   DispatchAssignment,
   DispatchLatch,
+  ExistingReview,
   GitHubApi,
+  GitHubReviewLister,
+  LatchDetails,
   OrgEventDraft,
   PendingAuditStore,
   ReconcileStore,
@@ -91,23 +95,65 @@ export class FailingSavePendingStore implements PendingAuditStore {
   }
 }
 
-/** A latch store that reads (empty) and probes fine but whose add() throws —
- *  the durable latch write failing AFTER a post. */
-export class FailingAddReconcileStore implements ReconcileStore {
-  addCalls: Array<{ dispatchId: string; latch: DispatchLatch }> = [];
-  get(): DispatchLatch | null {
-    return null;
+/** A latch store (in memory) that reads and probes fine but whose writes of
+ *  the chosen kinds throw — a durable latch write failing mid-flow. `"clear"`
+ *  fails the removal of a reservation. */
+export class FlakyReconcileStore implements ReconcileStore {
+  readonly inner = new MemoryReconcileStore();
+  writes: Array<{ dispatchId: string; latch: DispatchLatch | "clear" }> = [];
+  constructor(private readonly failOn: ReadonlyArray<DispatchLatch | "clear">) {}
+  get(dispatchId: string): DispatchLatch | null {
+    return this.inner.get(dispatchId);
   }
-  add(dispatchId: string, latch: DispatchLatch): void {
-    this.addCalls.push({ dispatchId, latch });
-    throw new Error("latch store path /host/secret/reconcile.json is unwritable");
+  add(dispatchId: string, latch: DispatchLatch, details?: Partial<LatchDetails>): void {
+    this.writes.push({ dispatchId, latch });
+    if (this.failOn.includes(latch)) throw new Error("latch store path /host/secret/reconcile.json is unwritable");
+    this.inner.add(dispatchId, latch, details);
   }
-  clear(): void {
-    /* noop */
+  clear(dispatchId: string): void {
+    this.writes.push({ dispatchId, latch: "clear" });
+    if (this.failOn.includes("clear")) throw new Error("latch store path /host/secret/reconcile.json is unwritable");
+    this.inner.clear(dispatchId);
   }
   probe(): void {
     /* the store looked usable before the request */
   }
+}
+
+/** The plugin configuration object (as the gateway would pass it) for a
+ *  scenario's host files. */
+export function pluginConfigOf(s: Scenario, flairUrl = "http://flair.test.invalid"): Record<string, unknown> {
+  return {
+    allowedRepositories: s.config.allowedRepositories,
+    maxBodyBytes: s.config.maxBodyBytes,
+    credentialFile: s.config.credentialFile,
+    provisioningFile: s.config.provisioningFile,
+    signingKeyFile: s.config.signingKeyFile,
+    reviewerIdentity: s.config.reviewerIdentity,
+    pendingAuditFile: s.config.pendingAuditFile,
+    reconcileFile: s.config.reconcileFile,
+    flairUrl,
+  };
+}
+
+/** A review lister returning a fixed listing (or failure), counting calls. */
+export class FakeReviewLister implements GitHubReviewLister {
+  calls: Array<{ repo: string; pr: number }> = [];
+  constructor(public result: { ok: true; reviews: ExistingReview[] } | { ok: false; detail: string } = { ok: true, reviews: [] }) {}
+  async listReviews(repo: string, pr: number) {
+    this.calls.push({ repo, pr });
+    return this.result;
+  }
+}
+
+/** A fetch standing in for Flair: answers `status`, records every request. */
+export function fakeFlairFetch(status = 200): { fetchImpl: typeof fetch; requests: Array<{ url: string; init: RequestInit }> } {
+  const requests: Array<{ url: string; init: RequestInit }> = [];
+  const fetchImpl = (async (url: unknown, init?: RequestInit) => {
+    requests.push({ url: String(url), init: init ?? {} });
+    return new Response("", { status });
+  }) as unknown as typeof fetch;
+  return { fetchImpl, requests };
 }
 
 /** A FakeGitHub whose PR lookup waits until `open()` is called, so a test can
