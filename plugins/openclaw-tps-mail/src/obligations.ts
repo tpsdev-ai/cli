@@ -34,17 +34,20 @@
  * RECEIPTS (cli#389 round 3; PER-AGENT since round 5). A receipt is EITHER the
  * posted record that carries this obligation's `X-TPS-Obligation` marker (a
  * local maildir file, or the outbox record the branch drains) OR — for a route
- * that leaves no locally readable mail file — the small metadata-only receipt
- * `index.ts` persists at `<mailDir>/<agent>/.obligations/receipts/
- * <obligationId>.json`, INSIDE the replying agent's own obligation store. The
- * metadata receipt names the obligation, the reply and the inbound it answers
- * (`replyId`, `obligationId`, `replyToId`), its `route` (+ `branchId`) and
- * `ts` — never the body. The scan accepts a receipt ONLY when BOTH the
- * obligation id and the inbound it answers match, so a reused obligation id can
- * never be satisfied by an old receipt. It reads the metadata receipt by its
- * direct path and falls back to the marker scan for the posted-file case — and
- * the two are SEPARATE inputs: a receipts dir is never listed, only the route's
- * posted-record dirs are.
+ * whose delivered record this agent cannot keep (the wire, the bridge, and
+ * since cli#429 round 7 a LOCAL reply, whose record its recipient consumes) —
+ * the metadata receipt `index.ts` persists at `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`,
+ * INSIDE the replying agent's own obligation store. The metadata receipt names
+ * the obligation, the reply and the inbound it answers (`replyId`,
+ * `obligationId`, `replyToId`), its `route` (+ `branchId`) and `ts`, and —
+ * since cli#429 — carries the SIGNED reply envelope the delivery carried
+ * (`signedReply`), because the scan verifies that signature and cannot verify
+ * bytes it does not hold. The scan accepts a receipt ONLY when the obligation
+ * id and the inbound it answers match AND the reply it carries is a verified
+ * signed reply by the obligated agent for this thread (scanForReceipt). It
+ * reads the metadata receipt by its direct path and falls back to the marker
+ * scan for the posted-file case — and the two are SEPARATE inputs: a receipts
+ * dir is never listed, only the route's posted-record dirs are.
  *
  * WHY PER-AGENT (cli#389 round 5). Receipts used to live in ONE host-wide
  * directory, but obligations live in per-agent stores and a sweep can only see
@@ -82,6 +85,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import type { Envelope } from "@tpsdev-ai/agent";
 
 export type ObligationState =
   | "pending"
@@ -101,8 +105,16 @@ export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "
 
 export interface ObligationRecord {
   obligationId: string;
-  /** The mail file id this obligation is keyed on (the plugin's MessageSid). */
+  /** The mail file id this obligation is keyed on (the plugin's MessageSid).
+   *  BOOKKEEPING ONLY: a record id is local — a branch regenerates it on
+   *  delivery — so it is never the thread a reply claims (cli#429). */
   inboundId: string;
+  /** cli#429: the inbound's SIGNED envelope `messageId` — the durable thread
+   *  id. The reply (and the nack) sign it as `replyToId` inside the envelope,
+   *  and the receipt scan requires a receipt to carry it. Absent on records
+   *  written before cli#429: such an obligation's receipt carries the
+   *  inbound's record id instead, and the scan checks that (see receiptThread). */
+  inboundEnvelopeId?: string;
   inboundTimestamp: string;
   /** The VERIFIED sender — the value promote() overwrote/wrote. */
   from: string;
@@ -637,7 +649,7 @@ export function sweepTerminalObligations(
   try {
     receiptNames = readdirSync(receiptsRoot);
   } catch {
-    // No receipts directory yet (nothing was ever delivered non-locally): done.
+    // No receipts directory yet (no receipted delivery was ever made): done.
     receiptNames = [];
   }
   for (const name of receiptNames) {
@@ -712,22 +724,30 @@ export function sweepTerminalObligations(
 // ── receipts (cli#389 round 3) ───────────────────────────────────────────────
 
 /**
- * What a metadata receipt carries — and, deliberately, what it does NOT: never
- * the body. A receipt is evidence that a delivery COMMITTED, not a copy of the
- * mail, so it stays small and holds nothing that could leak the reply.
+ * What a metadata receipt carries. cli#429: it carries the signed reply
+ * envelope the delivery carried (`signedReply`) — which includes the reply's
+ * text — because a receipt is accepted only when that signature verifies, and a
+ * signature cannot be checked over bytes the receipt does not hold. It is
+ * written 0600 into the REPLYING agent's own obligation store (the same store
+ * that holds its obligations) and swept with its obligation (retention).
  */
 export interface ReceiptRecord {
   /** The delivered reply's own id. */
   replyId: string;
   /** The obligation this receipt discharges. */
   obligationId: string;
-  /** The inbound the reply answers (the obligation's `inboundId`). */
+  /** The thread the reply carries (receiptThread): the inbound's SIGNED
+   *  envelope messageId (cli#429) — for an obligation written before cli#429,
+   *  the inbound's record id. */
   replyToId: string;
   /** local | outbox | remote-branch | bridge */
   route: string;
   branchId?: string;
   /** ISO time the receipt was written. */
   ts: string;
+  /** cli#429: the signed reply envelope (JSON) exactly as the delivery carried
+   *  it — the evidence the scan verifies. */
+  signedReply: string;
 }
 
 /**
@@ -746,8 +766,9 @@ export function receiptPath(mailDir: string, agent: string, obligationId: string
 }
 
 /**
- * Persist the metadata receipt for a successful NON-LOCAL delivery (cli#389
- * round 3) into the replying agent's own store (round 5). Atomic (a dot temp +
+ * Persist the metadata receipt for a committed delivery on a receipted route
+ * (the wire, the bridge — cli#389 round 3 — and a local reply, cli#429 round 7)
+ * into the replying agent's own store (round 5). Atomic (a dot temp +
  * rename, so a concurrent scan never reads a half-written file) and 0600 AT
  * CREATION — the mode is set on the temp file, so the final name is never once
  * world/group-readable.
@@ -785,7 +806,7 @@ export type ReceiptScan =
  *
  *   - `direct` — read ONLY by the direct `<obligationId>.json` path; NEVER
  *     listed. The agent's own receipts root belongs here: it accumulates a file
- *     per non-local delivery and nothing but the retention sweep ever removes
+ *     per receipted delivery and nothing but the retention sweep ever removes
  *     one, so a listing would read and parse every retained receipt on every
  *     scan.
  *   - `posted` — LISTED for a posted record carrying the obligation marker.
@@ -814,30 +835,169 @@ const realFs: ReceiptScanFs = {
   readFileSync: (path, encoding) => readFileSync(path, encoding),
 };
 
-/** The sender an envelope body CLAIMS (its `.from`), or null when the body does
- *  not parse. A CLAIM, never a verified identity: nothing in this module checks
- *  a signature. */
-export function envelopeFrom(body: string): string | null {
+/**
+ * cli#429 — checks a receipt candidate's SIGNATURES. The caller supplies it
+ * (index.ts resolves the obligated agent's public key through the same Flair
+ * client promote() uses), so this module stays pure of that plumbing and a test
+ * can hand in a key it controls. It resolves true only when the envelope's
+ * signatures verify against the named sender's key; a throw (an unreachable
+ * Flair, for one) counts as NOT verified — the candidate is not evidence, and
+ * the obligation resolves by a later scan or at its deadline.
+ */
+export type ReceiptSignatureCheck = (envelope: Envelope) => Promise<boolean>;
+
+/** True for a value with the shape of a SIGNED v1 envelope (not yet verified). */
+function isSignedEnvelopeShape(x: unknown): x is Envelope {
+  if (x === null || typeof x !== "object" || Array.isArray(x)) return false;
+  const e = x as Record<string, unknown>;
+  return (
+    e.v === 1 &&
+    typeof e.from === "string" &&
+    typeof e.to === "string" &&
+    typeof e.body === "string" &&
+    typeof e.messageId === "string" &&
+    typeof e.timestamp === "string" &&
+    Array.isArray(e.delegationChain) &&
+    typeof e.signature === "string"
+  );
+}
+
+/**
+ * The signed reply a receipt candidate CARRIES, parsed — or null when it
+ * carries none. `signedJson` is the signed envelope JSON: a metadata receipt's
+ * `signedReply`, or an unpromoted record's `body`. Shape only — nothing is
+ * verified here.
+ */
+export function receiptEnvelope(signedJson: unknown): Envelope | null {
+  if (typeof signedJson !== "string") return null;
   try {
-    const parsed = JSON.parse(body);
-    return typeof parsed?.from === "string" ? parsed.from : null;
+    const parsed: unknown = JSON.parse(signedJson);
+    return isSignedEnvelopeShape(parsed) ? parsed : null;
   } catch {
     return null;
   }
 }
 
 /**
+ * The signed reply a DELIVERED RECORD carries (a posted record or a bridge
+ * sandbox record), BOUND to that record — or null. Two shapes:
+ *   - unpromoted: the record's `body` is the signed envelope JSON;
+ *   - promoted: the recipient's promote() stored the signed `envelope` on the
+ *     record and rewrote its `body` to the plaintext. The envelope's signature
+ *     covers ITS body, not the record's, so the record counts only when its
+ *     plaintext `body` IS the stored envelope's `body` — a valid stored
+ *     envelope beside altered plaintext is not this reply.
+ * Either way the record's `to` must be the envelope's `to`: the record claims
+ * the recipient the signature names. (The expected recipient itself is checked
+ * by isVerifiedReceiptReply.) Shape and binding only — nothing is verified here.
+ */
+export function recordReceiptEnvelope(record: any): Envelope | null {
+  let envelope: Envelope | null;
+  if (record?.envelope !== undefined) {
+    const stored: unknown = record.envelope;
+    if (!isSignedEnvelopeShape(stored)) return null;
+    if (record.body !== stored.body) return null;
+    envelope = stored;
+  } else {
+    envelope = receiptEnvelope(record?.body);
+  }
+  if (!envelope) return null;
+  if (record?.to !== envelope.to) return null;
+  return envelope;
+}
+
+/**
+ * cli#429 — THE rule that makes a candidate EVIDENCE. A record that names this
+ * obligation is a receipt only when the reply it carries is a VERIFIED signed
+ * reply by the obligated agent, to the inbound's sender, for this thread:
+ *   - it carries a signed v1 envelope (receiptEnvelope / recordReceiptEnvelope,
+ *     which also bind a delivered record's body and recipient to it);
+ *   - the envelope's sender is the obligated agent (`from === agent`) — the
+ *     signature below is checked against THAT agent's key, so the signer is the
+ *     obligated agent;
+ *   - the envelope's recipient — inside the signature — is the inbound's
+ *     verified sender (`to === recipient`), the one the reply is owed to;
+ *   - `signed` thread mode: the envelope's own `replyToId` — inside the
+ *     signature — is the inbound's verified envelope id;
+ *   - the signatures verify (`checkSignature`).
+ * A matching record that is unsigned, carries a signature that does not
+ * verify, is signed by anyone else or is addressed to anyone else is NOT a
+ * receipt. `legacy` mode (an obligation opened before cli#429, whose reply
+ * carried no thread inside its envelope) keeps the wrapper-only thread check
+ * its record allows, and is held to the same signature, signer and recipient
+ * rule.
+ */
+export async function isVerifiedReceiptReply(
+  envelope: Envelope | null,
+  agent: string,
+  recipient: string,
+  threadId: string,
+  mode: ReceiptThreadMode,
+  checkSignature: ReceiptSignatureCheck,
+): Promise<boolean> {
+  if (!envelope) return false;
+  if (envelope.from !== agent) return false;
+  if (envelope.to !== recipient) return false;
+  if (mode === "signed" && envelope.replyToId !== threadId) return false;
+  try {
+    return (await checkSignature(envelope)) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * cli#429 — WHICH thread a receipt for this obligation must carry, and how.
+ *
+ *   - `signed`: the obligation knows the inbound's SIGNED envelope messageId.
+ *     Its reply signs that id as `replyToId` INSIDE the envelope, so a receipt
+ *     must carry it on the record AND inside the verified envelope it carries
+ *     — a reply whose signed thread was changed or stripped is not accepted as
+ *     this obligation's receipt.
+ *   - `legacy`: an obligation written before cli#429 has no envelope id; its
+ *     reply carried the inbound RECORD id on the wrapper only, so that is what
+ *     its receipt is checked against. Never used for a new obligation.
+ */
+export function receiptThread(record: { inboundId: string; inboundEnvelopeId?: string }): {
+  threadId: string;
+  mode: ReceiptThreadMode;
+} {
+  return typeof record.inboundEnvelopeId === "string" && record.inboundEnvelopeId.length > 0
+    ? { threadId: record.inboundEnvelopeId, mode: "signed" }
+    : { threadId: record.inboundId, mode: "legacy" };
+}
+
+export type ReceiptThreadMode = "signed" | "legacy";
+
+/** Options for scanForReceipt beyond the obligation's identity. */
+export interface ReceiptScanOptions {
+  /** Pin (g): the reply the obligation record KNOWS it was discharged by. */
+  expectedReplyId?: string;
+  /** The filesystem the scan reads through (tests inject a spy). */
+  fs?: ReceiptScanFs;
+  /** How the thread is checked (receiptThread). Default `legacy`. */
+  threadMode?: ReceiptThreadMode;
+}
+
+/**
  * TWO receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
- * it answers, and — when the obligation record knows it — the reply itself.
+ * it answers, and — when the obligation record knows it — the reply itself;
+ * and (cli#429) the reply it carries must be a VERIFIED signed reply by the
+ * obligated agent, to `recipient` (the inbound's verified sender), for this
+ * thread (isVerifiedReceiptReply). Every form below is held to that last rule;
+ * the pins before it only choose the candidates.
  *
  *   (1) METADATA (cli#389 round 3) — `<mailDir>/<agent>/.obligations/receipts/
- *       <obligationId>.json` (per-agent since round 5): the small record
- *       `writeReceipt` persists when a NON-LOCAL delivery commits (outbox,
- *       remote-branch, bridge). Read by its DIRECT path — never by parsing the
- *       directory (cli#389 round 4, item 1: it is the `direct` input, and a
- *       `direct` dir is never listed) — and accepted when `obligationId`
- *       matches, `replyToId` is the inbound this obligation is keyed on, and
- *       (g) holds.
+ *       <obligationId>.json` (per-agent since round 5): the record
+ *       `writeReceipt` persists when a delivery on a receipted route commits
+ *       (remote-branch, bridge, local — see index.ts persistReceipt). Read by
+ *       its DIRECT path —
+ *       never by parsing the directory (cli#389 round 4, item 1: it is the
+ *       `direct` input, and a `direct` dir is never listed) — and accepted when
+ *       `obligationId` matches, `replyToId` is the thread this obligation is
+ *       keyed on, (g) holds, and its `signedReply` (the signed envelope the
+ *       delivery carried, cli#429) verifies. A metadata receipt with no signed
+ *       reply — every one written before cli#429 — is not evidence.
  *   (2) POSTED FILE — the delivered reply record itself, which carries the
  *       marker this inbound minted. Scan the reply's destination directories
  *       (the `posted` input — the only dirs that are ever listed) for a record
@@ -845,49 +1005,41 @@ export function envelopeFrom(body: string): string | null {
  *   (a) `headers["X-TPS-Obligation"] === obligationId` — the marker this inbound
  *       minted;
  *   (b) `accountId === accountId` — the SAME account that owns the obligation;
- *   (c) `record.from === agent` — the recipient agent wrote it; and
- *   (d) `envelopeFrom(record.body) === agent` — the sender the wrapped envelope
- *       CLAIMS also names that agent (so a re-wrapped body cannot attribute the
- *       reply to someone else). That is a CLAIM about a string, never a
- *       verified signature — see "what this is not" below; and
+ *   (c) `record.from === agent` — the recipient agent wrote it;
+ *   (d) the signed reply it carries verifies as this agent's reply to
+ *       `recipient` for this thread — its body as delivered, or the envelope
+ *       the recipient's promote() stored, and then ONLY when the record's
+ *       plaintext body is that envelope's body; either way the record's `to` is
+ *       the envelope's (recordReceiptEnvelope); and
  *   (e) `record.replyToId === replyToId` — the record ANSWERS this inbound, so a
  *       reused obligation id can never be satisfied by a reply to another one.
+ *       In `signed` thread mode (cli#429, see receiptThread) `replyToId` is the
+ *       inbound's SIGNED envelope id, and (d) requires the verified envelope to
+ *       carry the same `replyToId`.
  *   OR (f) — the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
  *       record `deliverToSandbox` writes, which carries the obligation ids when
  *       the caller supplies them (`record.obligationId === obligationId`,
  *       `record.replyToId === replyToId` and `record.replyId`), with the
- *       replying agent as `from` and, as the body, an envelope that CLAIMS that
- *       same agent. That record is what keeps a bridge delivery locally readable
- *       evidence when the metadata receipt above could not be written (a full
- *       disk, a permission error). It carries no headers and no `accountId` — so
+ *       replying agent as `from` and, as the body, the signed reply — which must
+ *       verify exactly as in (d). It carries no headers and no `accountId` — so
  *       of the pins above it carries (c), (d), (e) and (g), and those are the
  *       ones checked.
  *
  *   (g) THE REPLY BINDING (cli#389 round 6, item 1): when the obligation record
  *       KNOWS the reply it was discharged by (`replyId`, recorded at the posted
- *       transition), a receipt must carry the same `replyId`. A body copied from
- *       an OLDER reply, re-labelled with the current obligation id and inbound
- *       id, then needs the current reply's id too. Only the forms that carry a
- *       reply id take part: the metadata receipt (1) and the bridge record (f).
- *       A posted marker record (2) is the delivered mail itself and names no
- *       separate reply id, so there is nothing to pin there.
+ *       transition), a receipt must carry the same `replyId`. Only the forms
+ *       that carry a reply id take part: the metadata receipt (1) and the bridge
+ *       record (f). A posted marker record (2) is the delivered mail itself and
+ *       names no separate reply id, so there is nothing to pin there.
  *
- * WHAT THIS IS NOT: the receipt is NOT signature-verified here, and this scan
- * does not claim it is. Verifying the body's envelope signature would not close
- * the gap on its own, for two reasons:
- *   1. the `X-TPS-Obligation` marker rides on the mail RECORD's headers, OUTSIDE
- *      the envelope a signature covers (index.ts sets it when it writes the
- *      reply; the signature covers `body` alone) — so verifying that signature
- *      would authenticate the TEXT but would not bind the receipt to THIS
- *      inbound;
- *   2. where agents share one OS user, another agent can read BOTH the
- *      obligation record and the signing keys, so no in-band check separates
- *      them — only an OS-level boundary does (tracked separately). The
- *      obligation id is not a secret in that model: a same-user reader simply
- *      reads it, so "unguessable" is not the defence.
- * So the scan pins IDENTITY (which agent, which account), the RELATIONSHIP
- * (which obligation, which inbound, which reply) and REACHABILITY (the record's
- * destination); the marker is a routing key, not an authority.
+ * WHAT THE SIGNATURE CHECK PROVES, AND WHAT IT DOES NOT: it proves the record
+ * carries a reply signed by the obligated agent's key (the key Flair holds for
+ * it) that threads on this inbound — an unsigned record, a forged signature or
+ * another signer's reply is never evidence. The `X-TPS-Obligation` marker and
+ * the metadata receipt's ids ride OUTSIDE that signature, so they only choose
+ * which candidate to verify. Where agents share one OS user, another agent can
+ * read the signing keys, so no in-band check separates them — only an OS-level
+ * boundary does (tracked separately).
  *
  * A `.malformed-*` quarantine (drainOutbox's quarantine for an unparseable
  * record) is FAILED, never posted — its marker cannot be read, so a malformed
@@ -904,36 +1056,42 @@ export function envelopeFrom(body: string): string | null {
  * `replyId` field existed (or one that never reached `posted`) carries none, and
  * then there is nothing to pin — the scan does not invent a value.
  */
-export function scanForReceipt(
+export async function scanForReceipt(
   dirs: ReceiptScanDirs,
   obligationId: string,
   replyToId: string,
   agent: string,
   accountId: string,
-  expectedReplyId?: string,
-  fs: ReceiptScanFs = realFs,
-): ReceiptScan {
+  recipient: string,
+  checkSignature: ReceiptSignatureCheck,
+  opts: ReceiptScanOptions = {},
+): Promise<ReceiptScan> {
+  const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
+  const verified = (envelope: Envelope | null): Promise<boolean> =>
+    isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
-  //     the agent's receipts root holds a receipt per non-local delivery, so
+  //     the agent's receipts root holds a receipt per receipted delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
   for (const dir of dirs.direct) {
     const direct = resolve(dir, `${obligationId}.json`);
     if (!fs.existsSync(direct)) continue;
+    let rec: any;
     try {
-      const rec: any = JSON.parse(fs.readFileSync(direct, "utf-8"));
-      if (
-        rec !== null &&
-        typeof rec === "object" &&
-        typeof rec.replyId === "string" &&
-        (expectedReplyId === undefined || rec.replyId === expectedReplyId) &&
-        rec.obligationId === obligationId &&
-        rec.replyToId === replyToId
-      ) {
-        return { status: "found", path: direct };
-      }
+      rec = JSON.parse(fs.readFileSync(direct, "utf-8"));
     } catch {
-      // Unparseable at the direct path: nothing else in a receipts dir is read.
+      continue; // Unparseable at the direct path: nothing else in a receipts dir is read.
+    }
+    if (
+      rec !== null &&
+      typeof rec === "object" &&
+      typeof rec.replyId === "string" &&
+      (expectedReplyId === undefined || rec.replyId === expectedReplyId) &&
+      rec.obligationId === obligationId &&
+      rec.replyToId === replyToId &&
+      (await verified(receiptEnvelope(rec.signedReply)))
+    ) {
+      return { status: "found", path: direct };
     }
   }
   // (2) POSTED FILE: the marker names no path, so THESE dirs — and only these —
@@ -974,7 +1132,7 @@ export function scanForReceipt(
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
-        if (envelopeFrom(record?.body ?? "") !== agent) continue;
+        if (!(await verified(recordReceiptEnvelope(record)))) continue;
         return { status: "found", path };
       }
       // (2b) the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
@@ -982,8 +1140,7 @@ export function scanForReceipt(
       //      caller supplied. It has no headers and no accountId, so the pins it
       //      CAN carry are the ones checked — the obligation it names, the
       //      inbound it answers, the reply id (g, when the record knows one), the
-      //      replying agent as `from`, and a body whose envelope claims that same
-      //      agent.
+      //      replying agent as `from`, and the signed reply it carries (d).
       if (
         record?.obligationId === obligationId &&
         record?.replyToId === replyToId &&
@@ -991,7 +1148,7 @@ export function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
-        envelopeFrom(record?.body ?? "") === agent
+        (await verified(recordReceiptEnvelope(record)))
       ) {
         return { status: "found", path };
       }

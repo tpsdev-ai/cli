@@ -7,6 +7,11 @@ import { logEvent } from "./archive.js";
 import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
+import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+
+// cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
+// (which imports this module) applies the same rule the CLI does.
+export { isValidEnvelopeId, ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
 
 export interface MailMessage {
   id: string;
@@ -36,12 +41,20 @@ export interface MailMessage {
    * the two either breaks this envelope's signature or fails the field match.
    */
   envelope?: Envelope;
+  /**
+   * cli#429: the signed `messageId` this message replies to, stamped from the
+   * VERIFIED envelope at promotion (it is also bound to the envelope by
+   * ENVELOPE_BINDINGS.replyToId, so it cannot diverge from what was signed).
+   * Absent for a message that is not a reply, and REMOVED from every
+   * unverified presentation (see withholdUnverified).
+   */
+  replyToId?: string;
   /** Set by listMessages() for dlq records: the sidecar reason class. */
   rejectClass?: string;
   rejectReason?: string;
 }
 
-const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_INBOX_MESSAGES = 100;
 const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -649,6 +662,7 @@ export const ENVELOPE_BINDINGS = {
   body: { kind: "bind", recordField: "body" },
   messageId: { kind: "bind", recordField: "envelopeId" },
   timestamp: { kind: "bind", recordField: "timestamp" },
+  replyToId: { kind: "bind", recordField: "replyToId" },
   delegationChain: { kind: "exclude", reason: "signed as part of the envelope and verified" },
   signature: { kind: "exclude", reason: "verified by decideEnvelopeForMailbox" },
 } satisfies Record<keyof Envelope, EnvelopeBinding>;
@@ -677,6 +691,60 @@ function recordMatchesEnvelope(
   return { ok: true };
 }
 
+/** Describe a rejected id without echoing it: its type, and its length for a string. */
+function describeIdValue(value: unknown): string {
+  if (typeof value === "string") return value.length === 0 ? "an empty string" : `a ${value.length}-char string outside the rule`;
+  return value === null ? "null" : typeof value;
+}
+
+/**
+ * The fields an UNVERIFIED record may still show (cli#429): the wrapper's
+ * identity claims (id, from, to, timestamp — shown as claims, never as mail),
+ * where the record sits and why (location, dlq reject class and reason, which
+ * this CLI writes), and the local lifecycle fields `mail list --status`
+ * classifies by. An ALLOWLIST, not a blocklist: everything else on the record
+ * is dropped, so a thread claim needs no name here to be withheld.
+ */
+const UNVERIFIED_PRESENTABLE_FIELDS = [
+  "id",
+  "from",
+  "to",
+  "timestamp",
+  "read",
+  "location",
+  "rejectClass",
+  "rejectReason",
+  "ackedAt",
+  "nackedAt",
+  "nackType",
+  "checkedOutAt",
+  "checkedOutBy",
+  "deliveryAttempts",
+  "retryAfter",
+] as const satisfies ReadonlyArray<keyof MailMessage>;
+
+/**
+ * The ONE redaction for an UNVERIFIED record (cli#429): a new/ record, a dlq/
+ * record, or a cur/ record that cannot prove (and re-verify) its promotion.
+ * Its body is withheld, and so is every field outside
+ * UNVERIFIED_PRESENTABLE_FIELDS — among them the THREAD fields (`replyToId`,
+ * the `envelopeId` a reply would thread on, the stored `envelope`), its
+ * `headers` (every header on an unverified record is an unverified claim, and
+ * `X-TPS-InReplyTo`, `X-TPS-Obligation` and `X-TPS-Nack` are thread claims),
+ * and any other field the file carries (a bridge record's `obligationId` /
+ * `replyId`, for one). Every presentation of an unverified record
+ * (listMessages, `mail list` text and JSON, `mail read` text and JSON) goes
+ * through this, so a forged thread claim is never shown. Returns a copy; the
+ * input is not modified.
+ */
+export function withholdUnverified(m: MailMessage): MailMessage {
+  const out: Record<string, unknown> = {};
+  for (const field of UNVERIFIED_PRESENTABLE_FIELDS) {
+    if (m[field] !== undefined) out[field] = m[field];
+  }
+  return { ...(out as Omit<MailMessage, "body">), body: "" } as MailMessage;
+}
+
 type EnvelopePolicyResult =
   | { ok: true; envelope: Envelope }
   | { ok: false; class: PromoteRejectClass; reason: string };
@@ -691,7 +759,9 @@ type EnvelopePolicyResult =
  *   1. signature, through an ALWAYS-constructed Flair client;
  *   2. wrapper/envelope `from` binding;
  *   3. recipient binding (`envelope.to === agent`);
- *   4. `messageId` shape (present, non-empty string).
+ *   4. `messageId` shape, and `replyToId` shape when present — the ONE id
+ *      rule in envelope-id.ts, shared with the sender (cli#429);
+ *   5. `timestamp` shape.
  *
  * Callers add only their path-specific step: `promote` adds the replay gate
  * (first delivery only); `recoverPromoted` requires provenance (recovery only).
@@ -749,15 +819,28 @@ async function decideEnvelopeForMailbox(
     };
   }
 
-  // 4. `messageId` shape — the replay gate keys on it, and verifyEnvelope does
-  //    not enforce it. A malformed id is a terminal reject, not an undefined key
-  //    that silently never matches.
-  if (typeof envelope.messageId !== "string" || envelope.messageId.trim() === "") {
-    const shown = typeof envelope.messageId === "string" ? JSON.stringify(envelope.messageId) : String(envelope.messageId);
+  // 4. `messageId` shape — the replay gate keys on it, a reply threads on it,
+  //    and verifyEnvelope does not enforce it. ONE shape rule (envelope-id.ts)
+  //    for messageId AND replyToId, the same rule the sender enforces on
+  //    --reply-to (cli#429). A malformed id is a terminal reject, not an
+  //    undefined key that silently never matches. The reason never echoes the
+  //    value (it may carry control characters); it names only the type/length.
+  if (!isValidEnvelopeId(envelope.messageId)) {
     return {
       ok: false,
       class: "invalid",
-      reason: `invalid messageId (must be a non-empty string, got ${shown})`,
+      reason: `invalid messageId (must be ${ENVELOPE_ID_SHAPE_TEXT}; got ${describeIdValue(envelope.messageId)})`,
+    };
+  }
+
+  // 4b. `replyToId` shape (cli#429): optional, but when the envelope carries
+  //    the field it must satisfy the same rule — a signed value outside it is
+  //    never presented, whoever signed it.
+  if ((envelope as { replyToId?: unknown }).replyToId !== undefined && !isValidEnvelopeId(envelope.replyToId)) {
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `invalid replyToId (must be ${ENVELOPE_ID_SHAPE_TEXT}; got ${describeIdValue(envelope.replyToId)})`,
     };
   }
 
@@ -891,6 +974,10 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      // Stamp the verified reply-to (or clear it): the binding table checks
+      // record.replyToId against envelope.replyToId, so presentation cannot
+      // show a reply-to that is not the one that was signed.
+      replyToId: envelope.replyToId,
       checkedOutAt: new Date().toISOString(),
       checkedOutBy: msg.checkedOutBy ?? agent,
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
@@ -945,7 +1032,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       // best effort
     }
 
-    logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id }, promoted.body);
+    logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id, replyToId: promoted.replyToId }, promoted.body);
     return { ok: true, message: promoted, path: curPath };
   } finally {
     lock.release();
@@ -1089,6 +1176,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     body: env.body,
     timestamp: env.timestamp,
     envelopeId: env.messageId,
+    replyToId: env.replyToId,
   };
   return { ok: true, message: presented, path: curPath };
 }
@@ -1180,15 +1268,17 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
 export async function listMessages(agent: string): Promise<MailMessage[]> {
   assertValidAgentId(agent);
   const inbox = getInbox(agent);
-  const unread = readMessagesFromDir(inbox.fresh, false, "new");
-  const cur = readMessagesFromDir(inbox.cur, true, "cur");
-  const dlq = readMessagesFromDir(inbox.dlq, true, "dlq");
+  // new/ is unverified and dlq/ is quarantined: neither is presentable mail, so
+  // both are withheld — body AND thread fields (cli#429).
+  const unread = readMessagesFromDir(inbox.fresh, false, "new").map(withholdUnverified);
+  const dlq = readMessagesFromDir(inbox.dlq, true, "dlq").map(withholdUnverified);
   // Only a record that PROVES its promotion and re-verifies is presentable from
   // cur/. A self-asserted `envelopeId` is not proof — a forger sets it — so the
   // stored signed envelope is re-checked through the shared policy. Any failure
-  // (including an outage) withholds the body, like new/ and dlq/.
-  for (const m of cur) {
-    if (!(await isPresentableCurRecord(agent, m))) m.body = "";
+  // (including an outage) withholds the record like new/ and dlq/.
+  const cur: MailMessage[] = [];
+  for (const m of readMessagesFromDir(inbox.cur, true, "cur")) {
+    cur.push((await isPresentableCurRecord(agent, m)) ? m : withholdUnverified(m));
   }
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
 }

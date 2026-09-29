@@ -8,21 +8,49 @@
  * never heals. This module is shared by `tps mail send` and the agent runtimes
  * so the envelope shape cannot drift between the two.
  *
- * Two callers, two policies, one implementation:
- *   - `tps mail send` keeps the historical unsigned FALLBACK (warn + ship the
- *     raw body) so an operator with no key is not blocked, but it now resolves
- *     through the same builder.
- *   - the agent runtimes set `requireKey` and pass their configured
- *     `flairKeyPath`: a runtime that cannot sign must fail LOUDLY (it cannot
- *     deliver a usable reply anyway) instead of shipping a dead letter.
+ * Both callers set `requireKey` (cli#429): a send that cannot sign FAILS before
+ * anything is written. `tps mail send` resolves the key by agent id
+ * (agent-keys.ts: ~/.flair/keys/<id>.key and ~/.tps/identity/<id>.key; two
+ * files holding different keys are refused); the agent runtimes pass their
+ * configured `flairKeyPath`. Every refusal names the path(s) it looked at and
+ * the remedy.
  */
 
 import { randomUUID } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
-import { readAgentPrivateKey, readPrivateKeyAtPath } from "./agent-keys.js";
+import { readAgentPrivateKey, readPrivateKeyAtPath, agentKeyCandidates, AgentKeyError, AgentKeyConflictError } from "./agent-keys.js";
+import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+
+/**
+ * Throws a named error if `id` is not a valid signed-envelope messageId — the
+ * ONE shape rule (envelope-id.ts) the receipt side also enforces, so a reply-to
+ * the sender accepts is one the recipient accepts. Exported so the CLI can
+ * validate before it builds (and so a test can target the validator directly).
+ */
+export function assertValidReplyToId(id: string): void {
+  if (!isValidEnvelopeId(id)) {
+    throw new Error(
+      `invalid --reply-to id: must be the signed messageId of the message being replied to ` +
+        `(${ENVELOPE_ID_SHAPE_TEXT})`,
+    );
+  }
+}
+
+/**
+ * The refusal for a key that EXISTS but cannot be used: names the path and the
+ * remedy. The AgentKeyError text never carries key material.
+ */
+function unusableKeyError(from: string, err: AgentKeyError): Error {
+  const remedy =
+    err.kind === "unreadable"
+      ? `make ${err.path} readable by this user (mode 0600, owned by this user)`
+      : `replace ${err.path} with a valid unencrypted Ed25519 private key: a raw 32-byte seed, ` +
+        `one line of base64 PKCS8 DER, raw PKCS8 DER, or exactly one PEM "PRIVATE KEY" block`;
+  return new Error(`cannot sign for agent "${from}": ${err.message}. Remedy: ${remedy}.`);
+}
 
 export interface SignOutboundOptions {
-  /** Explicit Ed25519 key path. Falls back to ~/.flair/keys/<from>.key (or TPS_TEST_KEYS_DIR). */
+  /** Explicit Ed25519 key path. Falls back to the agent-keys search path for `from` (or TPS_TEST_KEYS_DIR). */
   keyPath?: string;
   /** Prior delegation chain to extend. Null/undefined originates a fresh one. */
   priorChain?: ChainEntry[] | null;
@@ -32,6 +60,12 @@ export interface SignOutboundOptions {
   subject?: string;
   /** Override the generated messageId (tests). */
   messageId?: string;
+  /**
+   * cli#429: the signed `messageId` this body replies to. Carried INSIDE the
+   * envelope (so it is covered by the signature and cannot be altered in
+   * transit); surfaced on receipt. Validated here so no caller can widen it.
+   */
+  replyToId?: string;
   /** When true, throw if no key is available instead of returning the raw body. */
   requireKey?: boolean;
 }
@@ -47,17 +81,27 @@ export function signOutboundBody(
   body: string,
   opts: SignOutboundOptions = {},
 ): string {
-  const privkey = opts.keyPath
-    ? readPrivateKeyAtPath(opts.keyPath)
-    : readAgentPrivateKey(from);
+  // cli#429: validate the thread id BEFORE any key is read, so an invalid
+  // --reply-to is refused the same way with or without a key.
+  if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
+
+  let privkey: Buffer | null;
+  try {
+    privkey = opts.keyPath ? readPrivateKeyAtPath(opts.keyPath) : readAgentPrivateKey(from);
+  } catch (err) {
+    if (err instanceof AgentKeyError) throw unusableKeyError(from, err);
+    if (err instanceof AgentKeyConflictError) throw new Error(`cannot sign for agent "${from}": ${err.message}`);
+    throw err;
+  }
 
   if (!privkey) {
     if (opts.requireKey) {
-      const where = opts.keyPath ? `Looked at ${opts.keyPath}.` : `Looked for ~/.flair/keys/${from}.key.`;
+      const searched = opts.keyPath ? [opts.keyPath] : agentKeyCandidates(from);
       throw new Error(
         `no Ed25519 private key for agent "${from}" — refusing to send an unsigned body: ` +
-          `a promote()-reading recipient dead-letters it terminal. ${where} ` +
-          `Provision the key (or set TPS_TEST_KEYS_DIR in tests).`,
+          `a promote()-reading recipient dead-letters it terminal. Looked at ${searched.join(", then ")}. ` +
+          `Provision the key: install the agent's Ed25519 private key at ${searched[0]} ` +
+          `(or set TPS_TEST_KEYS_DIR in tests).`,
       );
     }
     return body;
@@ -96,6 +140,12 @@ export function signOutboundBody(
     timestamp: now,
     delegationChain: chain,
   };
+
+  // cli#429: thread the reply. Validated above, before any key was read, and
+  // only set when present, so an absent --reply-to produces byte-for-byte the
+  // same envelope (and signature) as before. Set as a top-level field: JCS
+  // canonicalization in signEnvelope() then covers it with the signature.
+  if (opts.replyToId !== undefined) envelope.replyToId = opts.replyToId;
 
   return JSON.stringify(signEnvelope(envelope, { [from]: privkey }));
 }

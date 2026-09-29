@@ -277,16 +277,18 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
 
   // ── crash between promote() and ack must not lose the message ─────────────
   it("re-dispatches a genuine unacked cur/ record left by a crash (and re-verifies it)", async () => {
+    const agentId = "test-agent";
+    // cli#429: the ack needs a receipt whose SIGNED reply verifies, so Flair
+    // holds the agent's key too (the key file written below).
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
-          if (name === "flint") return { publicKey: pubkeyFromSeed(FLINT_SEED) };
+          if (name === "flint" || name === agentId) return { publicKey: pubkeyFromSeed(FLINT_SEED) };
           return null;
         },
       }),
     }));
 
-    const agentId = "test-agent";
     const curDir = resolve(tempMailDir, agentId, "cur");
     mkdirSync(curDir, { recursive: true });
     // cli#389: the reply goes to the sender; a local maildir keeps the same

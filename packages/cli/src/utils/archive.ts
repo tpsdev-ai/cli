@@ -9,6 +9,8 @@ export interface ArchiveEvent {
   from: string;
   to: string;
   messageId: string;
+  /** cli#429: the signed messageId this message replies to, when it is a reply. */
+  replyToId?: string;
   body?: string;
   bodyPreview?: string;
 }
@@ -113,6 +115,18 @@ function getDb(): any | null {
     END;
   `);
 
+  // Migration (cli#429): reply-to threading column. `CREATE TABLE IF NOT
+  // EXISTS` does not add a column to a table that already exists, so an
+  // archive.db written before this change needs an explicit ALTER. A fresh DB
+  // (created just above) already has no such column either, so the ALTER adds
+  // it there too; the second call on an already-migrated DB throws "duplicate
+  // column name", which is the idempotence guard and is swallowed.
+  try {
+    db.exec("ALTER TABLE archive ADD COLUMN replyToId TEXT");
+  } catch {
+    /* column already present */
+  }
+
   return db;
 }
 
@@ -122,10 +136,10 @@ export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string):
     db = getDb();
     if (db === null) return; // archive unavailable under this runtime (note emitted once)
     const stmt = db.prepare(`
-      INSERT INTO archive (event, timestamp, sender, recipient, messageId, body)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO archive (event, timestamp, sender, recipient, messageId, replyToId, body)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-    stmt.run(event.event, new Date().toISOString(), event.from, event.to, event.messageId, body || null);
+    stmt.run(event.event, new Date().toISOString(), event.from, event.to, event.messageId, event.replyToId ?? null, body || null);
   } catch (err) {
     // Best-effort audit logging.
   } finally {
@@ -138,7 +152,7 @@ export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
   try {
     db = getDb();
     if (db === null) return []; // archive unavailable under this runtime (note emitted once)
-    let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.body FROM archive";
+    let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.replyToId, archive.body FROM archive";
     const conditions: string[] = [];
     const params: any[] = [];
 

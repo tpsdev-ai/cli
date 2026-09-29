@@ -24,7 +24,7 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
-import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 import { hashes } from "@noble/ed25519";
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
@@ -250,6 +250,8 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
     return {
       inboundId,
+      /** cli#429: the inbound's SIGNED envelope messageId — the thread a reply/nack signs. */
+      inboundEnvelopeId: JSON.parse(signedBody).messageId as string,
       warned: warnCalls,
       startPromise,
       get dispatched() { return dispatchedArgs; },
@@ -329,11 +331,22 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(nacked, "exactly one nack mail from the verb").toBe(true);
     expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length, "and nothing else was written").toBe(1);
 
+    // cli#429: the nack is SIGNED and threads on the inbound's SIGNED envelope
+    // id, inside the signature; the inbound's record id is bookkeeping only.
+    const nack = nackMailsIn(flintNew, "empty-final-text")[0];
+    expect(nack.replyToId).toBe(h.inboundEnvelopeId);
+    expect(nack.headers["X-TPS-InReplyTo"]).toBe(h.inboundId);
+    const env: Envelope = JSON.parse(nack.body);
+    expect(env.replyToId).toBe(h.inboundEnvelopeId);
+    const anvilKeys = { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+    expect(await verifyEnvelope(env, anvilKeys)).toEqual({ ok: true });
+    expect((await verifyEnvelope({ ...env, replyToId: "changed-thread" }, anvilKeys)).ok).toBe(false);
+
     await h.stop();
   }, 15000);
 
   // ── F-S2c ──────────────────────────────────────────────────────────────────
-  it("F-S2c: a missing signing key is FAILED by name, nacked, never acked", async () => {
+  it("F-S2c: a missing signing key is FAILED by name, never acked — and NOTHING unsigned is sent, not even the nack", async () => {
     const h = await start("anvil", "flint", { localSender: true, signAgentKey: false });
     await h.deliver("final answer", "final");
     h.settle();
@@ -342,15 +355,37 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     const cur = curRecord("anvil");
     expect(cur?.ackedAt).toBeUndefined();
     expect(cur?.nackReason).toContain("missing-signing-key");
-    expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
-    // cli#389 round 9, item 2: the same is true of every other pre-call failure.
+    const ob = obligationFile("anvil", h.inboundId);
+    expect(ob?.state).toBe("failed");
+    // cli#429: the nack path NEVER falls back to an unsigned raw body. The nack
+    // cannot be signed either, so it is NOT sent: the refusal is logged by name
+    // and the record keeps the debt (nackPending) for a later start to retry.
+    await pollUntil(() => h.warned.some((w) => w.includes("nack-unsigned-refused")), 2000);
+    expect(h.warned.some((w) => w.includes("nack-unsigned-refused")), "the refusal is logged by name").toBe(true);
     const flintNew = resolve(tempMailDir, "flint", "new");
-    const nacked = await pollUntil(
-      () => nackMailsIn(flintNew, "missing-signing-key:anvil").length === 1,
-      2000,
-    );
-    expect(nacked, "exactly one nack mail from the verb").toBe(true);
-    expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length, "and nothing else was written").toBe(1);
+    expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length, "no reply and no nack was written").toBe(0);
+    expect(obligationFile("anvil", h.inboundId)?.nackPending, "the nack is still owed").toBe(true);
+
+    await h.stop();
+  }, 15000);
+
+  // ── F-S2c2 (cli#429) ───────────────────────────────────────────────────────
+  it("F-S2c2: a MALFORMED signing key is FAILED by name (never a throw, never an unsigned mail), naming the key path", async () => {
+    const keyPath = join(tempKeysDir, "anvil.key");
+    const h = await start("anvil", "flint", { localSender: true });
+    // Corrupt the key AFTER inbound promotion: the reply signer must refuse by
+    // name rather than throw out of the dispatch or fall back to a raw body.
+    writeFileSync(keyPath, "-----BEGIN PRIVATE KEY-----\nnot base64 at all\n-----END PRIVATE KEY-----\n");
+    await h.deliver("final answer", "final");
+    h.settle();
+
+    await pollUntil(() => !!curRecord("anvil")?.nackedAt, 2000);
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    expect(curRecord("anvil")?.nackReason).toContain("unusable-signing-key");
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("failed");
+    await pollUntil(() => h.warned.some((w) => w.includes("nack-unsigned-refused")), 2000);
+    expect(h.warned.some((w) => w.includes(keyPath)), "the log names the key path").toBe(true);
+    expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(0);
 
     await h.stop();
   }, 15000);
@@ -671,7 +706,11 @@ describe("cli#389 round 8 — the commit is a persisted state of the obligation 
     const flintNew = resolve(tempMailDir, "flint", "new");
     // The reply lands (creating a file only needs write+execute on the dir) but
     // the receipt cannot be LISTED, so the delivery commits and the evidence
-    // stays unreadable.
+    // stays unreadable. cli#429 round 7: a local reply also persists a metadata
+    // receipt, so that one is made unwritable too — `receipts` is a FILE — or
+    // this obligation would have evidence after all.
+    mkdirSync(resolve(tempMailDir, "anvil", ".obligations"), { recursive: true });
+    writeFileSync(resolve(tempMailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
     chmodSync(flintNew, 0o333);
     try {
       await h.deliver("the final answer", "final");

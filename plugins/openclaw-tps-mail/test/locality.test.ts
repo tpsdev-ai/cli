@@ -39,13 +39,16 @@ import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
-import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@tpsdev-ai/agent";
 // The REAL consumer: the branch relay quarantines an unparseable outbox record
 // with this exact function (packages/cli/src/commands/branch.ts imports it from
 // the same module). Imported from the built CLI so we exercise the shipped
 // artifact.
 import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as obligationsModule from "../src/obligations.js";
+// The RECIPIENT's side of a delivered reply: the real promotion and ack the CLI
+// runs on a mailbox (cli#429 round 7 — a consumed reply must still be evidence).
+import { ackMessage, promote } from "@tpsdev-ai/cli/utils/mail";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -143,7 +146,8 @@ mock.module("../src/obligations.js", () => ({
   },
   scanForReceipt: (...args: any[]) => {
     if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
-    obligations.beforeScan?.(args[5]);
+    // args: dirs, obligationId, threadId, agent, accountId, recipient, checkSignature, opts
+    obligations.beforeScan?.(args[7]?.expectedReplyId);
     return (realObligations.scanForReceipt as any)(...args);
   },
 }));
@@ -159,7 +163,7 @@ const mockApi: any = {
 };
 pluginModule.register(mockApi);
 
-function buildSignedBody(from: string, to: string, body: string): string {
+function buildSignedBody(from: string, to: string, body: string, seed: Buffer = FLINT_SEED): string {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
@@ -168,7 +172,7 @@ function buildSignedBody(from: string, to: string, body: string): string {
   return JSON.stringify(
     signEnvelope(
       { v: 1, from, to, body, messageId: `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain },
-      { [from]: FLINT_SEED },
+      { [from]: seed },
     ),
   );
 }
@@ -378,15 +382,28 @@ interface DispatchOutcome {
   sandboxRecord: any | null;
   /** Every warn the plugin logged while this route ran. */
   warns: string[];
+  /** The inbound's local record id (bookkeeping only). */
+  inboundId: string;
+  /** cli#429: the inbound's SIGNED envelope messageId — the thread a reply signs. */
+  inboundEnvelopeId: string;
 }
 
 /** Route the DISPATCHER reply path and report the full obligation outcome. */
-async function routeViaDispatcher(sender: string, bound: string[] = []): Promise<DispatchOutcome> {
+async function routeViaDispatcher(
+  sender: string,
+  bound: string[] = [],
+  opts: { flairAgentSeed?: Buffer } = {},
+): Promise<DispatchOutcome> {
+  // ONE key per principal (cli#429: the receipt scan verifies the reply's
+  // signature too): the bound agent signs with ANVIL_SEED — its inbound too,
+  // when it mails itself — and any other sender with FLINT_SEED.
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
     createMailVerifyClient: async () => ({
       async getAgent(name: string) {
+        // `flairAgentSeed`: Flair holds a DIFFERENT key for the agent than the
+        // one it signs with (cli#429 receipt-verification control).
+        if (name === bound[0]) return { publicKey: pubkeyFromSeed(opts.flairAgentSeed ?? ANVIL_SEED) };
         if (name === sender) return { publicKey: pubkeyFromSeed(FLINT_SEED) };
-        if (name === bound[0]) return { publicKey: pubkeyFromSeed(ANVIL_SEED) };
         return null;
       },
     }),
@@ -407,12 +424,14 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       id: inboundId,
       from: sender,
       to: agentId,
-      body: buildSignedBody(sender, agentId, "inbound"),
+      body: buildSignedBody(sender, agentId, "inbound", sender === agentId ? ANVIL_SEED : FLINT_SEED),
       timestamp: new Date().toISOString(),
       headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" },
       deliveryAttempts: 0,
     };
     writeFileSync(join(newDir, `2026-05-26T00-00-00-${inboundId}.json`), JSON.stringify(inbound, null, 2), "utf-8");
+    // cli#429: the durable thread id is the SIGNED envelope's messageId.
+    const inboundEnvelopeId: string = JSON.parse(inbound.body).messageId;
 
     let dispatched: any = null;
     let settleFn: (() => void) | null = null;
@@ -468,8 +487,9 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const bridgeDirs = [join(root, ".tps", "branch-office", sender, "mail", "new")];
     const isReply = (rec: any) => rec?.headers?.["X-TPS-InReplyTo"] === inboundId;
     // cli#389 round 3: a metadata receipt carries NO headers and NO body, so it
-    // is found by the ids it names — the reply, and the inbound it answers.
-    const isReceipt = (rec: any) => typeof rec?.replyId === "string" && rec?.replyToId === inboundId;
+    // is found by the ids it names — the reply, and the thread it answers
+    // (cli#429: the inbound's SIGNED envelope id, not its record id).
+    const isReceipt = (rec: any) => typeof rec?.replyId === "string" && rec?.replyToId === inboundEnvelopeId;
 
     const local = scanFor([senderNew, senderCur], isReply);
     const outbox = scanFor(outboxDirs, isReply);
@@ -494,7 +514,7 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
     const inboundRec = scanFor([join(mailDir, agentId, "cur"), newDir], (r) => r?.id === inboundId)[0];
     // cli#389 round 5, item 2: the bridge's sandbox record, carrying the
     // obligation ids deliverToSandbox was given.
-    const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundId);
+    const bridgeRecord = scanFor(bridgeDirs, (r) => typeof r?.obligationId === "string" && r?.replyToId === inboundEnvelopeId);
 
     let route: DispatchOutcome["route"] = "failure";
     let replyId: string | null = null;
@@ -537,6 +557,8 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       inboundNackReason: inboundRec?.rec?.nackReason ?? null,
       sandboxRecord: bridgeRecord[0]?.rec ?? null,
       warns,
+      inboundId,
+      inboundEnvelopeId,
     };
   } finally {
     if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
@@ -676,6 +698,33 @@ describe("cli#389 — ONE locality decision (shared with `tps mail send`)", () =
 
 // ── item 1: the remote-branch receipt closes the obligation loop ──────────────
 
+// ── cli#429: the plugin verifies the reply a receipt carries ─────────────────
+
+describe("cli#429 — a delivered reply whose signature Flair does NOT verify is not a receipt", () => {
+  const OTHER_SEED = Buffer.alloc(32, 0x3c); // the key "Flair" holds for anvil — not the one anvil signs with
+
+  for (const [route, recipient, setup] of [
+    ["local", "flint", () => maildirFor("flint")],
+    ["remote-branch", "rockit", () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    }],
+  ] as const) {
+    it(`${route}: the reply is delivered, but the obligation is NOT acked — it waits for its deadline, never failed or nacked`, async () => {
+      // CONTROL: before cli#429 the scan matched the ids and acked without
+      // checking the signature of the reply it found.
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // long: nothing resolves it here
+      const outcome = await inFreshHome(setup, () => routeViaDispatcher(recipient, ["anvil"], { flairAgentSeed: OTHER_SEED }));
+      expect(outcome.route, "the reply was delivered").toBe(route);
+      expect(outcome.obligation?.state, "NOT acked on an unverifiable receipt").toBe("posted");
+      expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
+      expect(outcome.obligation?.failure).toBeUndefined();
+      expect(outcome.inboundNackedAt).toBeNull();
+      expect(outcome.nack).toBeNull();
+    }, 20000);
+  }
+});
+
 describe("cli#389 item 1 — a remote-branch reply persists a local receipt", () => {
   it("posted → receipt found → acked, with NO nack", async () => {
     const setup = () => {
@@ -694,21 +743,26 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     expect(outcome.receiptRecord.branchId).toBe("tps-rockit");
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
-    // The receipt is METADATA-ONLY (cli#389 round 3, item 2): the ids, the route
-    // and the timestamp — never the body, never the signed envelope.
+    // The receipt names the ids, the route and the timestamp — and, since
+    // cli#429, carries the SIGNED reply exactly as it went on the wire, which
+    // is what the scan verified before acking. Nothing else.
     expect(outcome.receiptRaw).toBeTruthy();
-    expect(Object.keys(JSON.parse(outcome.receiptRaw!)).sort()).toEqual([
+    const receipt = JSON.parse(outcome.receiptRaw!);
+    expect(Object.keys(receipt).sort()).toEqual([
       "branchId",
       "obligationId",
       "replyId",
       "replyToId",
       "route",
+      "signedReply",
       "ts",
     ]);
-    expect(outcome.receiptRaw!.includes("final verdict"), "the fixture BODY text must not be in the receipt").toBe(
-      false,
-    );
-    expect(outcome.receiptRaw!.includes("delegationChain"), "nor the signed envelope").toBe(false);
+    expect(receipt.signedReply, "the signed reply is the one that went on the wire").toBe(relay.deliver[0]!.msg.body);
+    const env = JSON.parse(receipt.signedReply) as Envelope;
+    expect(env.from).toBe("anvil");
+    expect(env.replyToId, "threaded on the inbound's signed id").toBe(outcome.inboundEnvelopeId);
+    const anvilKeys = { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+    expect(await verifyEnvelope(env, anvilKeys)).toEqual({ ok: true });
     expect(outcome.receiptMode, "0600 at creation").toBe(0o600);
   }, 20000);
 
@@ -755,7 +809,8 @@ describe("cli#389 item 1 (round 3) — a bridge reply persists the same receipt"
     expect(outcome.receiptRecord.branchId).toBe("ember");
     expect(outcome.receiptRecord.obligationId).toBe(outcome.obligation?.obligationId);
     expect(typeof outcome.receiptRecord.replyId).toBe("string");
-    expect(outcome.receiptRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    // cli#429: the receipt names the THREAD — the inbound's signed envelope id.
+    expect(outcome.receiptRecord.replyToId).toBe(outcome.obligation?.inboundEnvelopeId);
     // The obligation is DISCHARGED: acked at the receipt, never nacked.
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
@@ -813,7 +868,7 @@ describe("cli#389 round 5, item 2 — a receipt write that fails AFTER the bridg
     expect(outcome.sandboxRecord, "the sandbox record is the local evidence").not.toBeNull();
     expect(outcome.sandboxRecord.obligationId).toBe(relay.bridge[0]!.msg.obligationId);
     expect(outcome.sandboxRecord.obligationId).toBe(outcome.obligation?.obligationId);
-    expect(outcome.sandboxRecord.replyToId).toBe(outcome.obligation?.inboundId);
+    expect(outcome.sandboxRecord.replyToId).toBe(outcome.obligation?.inboundEnvelopeId);
     expect(outcome.sandboxRecord.replyId).toBe(relay.bridge[0]!.msg.replyId);
   }, 20000);
 
@@ -1191,4 +1246,245 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
     expect(outcome.nack, "no nack mail").toBeNull();
     expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
   }, 20000);
+});
+
+// ── cli#429: a reply threads on the SIGNED inbound id, INSIDE the signature ──
+
+/**
+ * cli#429 (blocker 1). A dispatcher reply must claim its thread INSIDE the
+ * envelope the signature covers, and the thread is the inbound's SIGNED
+ * envelope messageId — never the inbound's local record id (a branch
+ * regenerates that on delivery). The record id stays only as bookkeeping (the
+ * obligation key and the `X-TPS-InReplyTo` header).
+ *
+ * For each route the reply leaves this host by — local maildir, outbox, wire —
+ * the delivered envelope is checked three ways: it VERIFIES as sent; a CHANGED
+ * thread id breaks the signature; a STRIPPED thread id breaks the signature.
+ * A recipient's promote() runs exactly that verification first, so a changed or
+ * stripped reply is dead-lettered there (proved end-to-end for the local route).
+ */
+describe("cli#429 — replies thread on the SIGNED inbound envelope id, inside the signature", () => {
+  const anvilKeys = { async getAgent(name: string) { return name === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+
+  async function expectThreadBound(env: Envelope, inboundEnvelopeId: string): Promise<void> {
+    expect(env.replyToId, "the envelope carries the SIGNED inbound id").toBe(inboundEnvelopeId);
+    expect(await verifyEnvelope(env, anvilKeys), "the reply verifies as sent").toEqual({ ok: true });
+    const changed = { ...env, replyToId: "a-different-thread-id" };
+    expect((await verifyEnvelope(changed, anvilKeys)).ok, "a CHANGED thread breaks the signature").toBe(false);
+    const { replyToId: _stripped, ...stripped } = env;
+    expect((await verifyEnvelope(stripped as Envelope, anvilKeys)).ok, "a STRIPPED thread breaks the signature").toBe(false);
+  }
+
+  it("LOCAL: the maildir reply signs the inbound envelope id; a changed or stripped copy is dead-lettered by the recipient's promote()", async () => {
+    const setup = () => maildirFor("flint");
+    const r = await inFreshHome(setup, async () => {
+      const o = await routeViaDispatcher("flint", ["anvil"]);
+      // End-to-end: plant a CHANGED and a STRIPPED copy of the delivered reply
+      // in the recipient's new/ and run the recipient's own enforcement point.
+      const { promote } = await import("@tpsdev-ai/cli/utils/mail");
+      const flintNew = join(mailDir, "flint", "new");
+      const results: Record<string, any> = {};
+      if (o.replyRecord) {
+        const env = JSON.parse(o.replyRecord.body);
+        const { replyToId: _gone, ...strippedEnv } = env;
+        const variants: Record<string, any> = {
+          changed: { ...env, replyToId: "a-different-thread-id" },
+          stripped: strippedEnv,
+        };
+        for (const [name, variant] of Object.entries(variants)) {
+          const rec = { ...o.replyRecord, id: `tampered-${name}`, body: JSON.stringify(variant) };
+          const p = join(flintNew, `2026-05-27T00-00-00-tampered-${name}.json`);
+          writeFileSync(p, JSON.stringify(rec, null, 2), "utf-8");
+          results[name] = await promote("flint", p);
+        }
+      }
+      return { o, results };
+    });
+    const o = r.o;
+    expect(o.route).toBe("local");
+    expect(o.obligation?.state, "the obligation is discharged by the signed-thread receipt").toBe("acked");
+    expect(o.obligation?.inboundEnvelopeId).toBe(o.inboundEnvelopeId);
+    expect(o.inboundEnvelopeId).not.toBe(o.inboundId);
+    // The wrapper claims the SAME signed thread; the record id is bookkeeping only.
+    expect(o.replyRecord.replyToId).toBe(o.inboundEnvelopeId);
+    expect(o.replyRecord.headers["X-TPS-InReplyTo"]).toBe(o.inboundId);
+    await expectThreadBound(JSON.parse(o.replyRecord.body), o.inboundEnvelopeId);
+    // The recipient's promote() dead-letters both tampered copies.
+    for (const name of ["changed", "stripped"]) {
+      expect(r.results[name]?.ok, `${name} copy is not promoted`).toBe(false);
+      expect(r.results[name]?.class, `${name} copy is rejected as invalid`).toBe("invalid");
+    }
+  }, 20000);
+
+  it("OUTBOX: the queued reply signs the inbound envelope id; changed or stripped fails verification", async () => {
+    const setup = () => {
+      branchHost();
+      maildirFor("flint");
+    };
+    const o = await inFreshHome(setup, () => routeViaDispatcher("flint", ["anvil"]));
+    expect(o.route).toBe("outbox");
+    expect(o.obligation?.state).toBe("acked");
+    expect(o.replyRecord.replyToId).toBe(o.inboundEnvelopeId);
+    expect(o.replyRecord.headers["X-TPS-InReplyTo"]).toBe(o.inboundId);
+    await expectThreadBound(JSON.parse(o.replyRecord.body), o.inboundEnvelopeId);
+  }, 20000);
+
+  it("WIRE: the delivered payload signs the inbound envelope id; changed or stripped fails verification; the receipt names the thread", async () => {
+    const setup = () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    };
+    const o = await inFreshHome(setup, () => routeViaDispatcher("rockit", ["anvil"]));
+    expect(o.route).toBe("remote-branch");
+    expect(o.obligation?.state).toBe("acked");
+    expect(relay.deliver.length).toBe(1);
+    await expectThreadBound(JSON.parse(relay.deliver[0]!.msg.body), o.inboundEnvelopeId);
+    expect(o.receiptRecord?.replyToId, "the metadata receipt names the signed thread").toBe(o.inboundEnvelopeId);
+  }, 20000);
+});
+
+// ── cli#429 round 7: a reply the RECIPIENT has consumed is still this obligation's receipt ──
+/**
+ * The turn's own scan normally acks the obligation the moment the reply is
+ * delivered. When it cannot (a crash between the post and the scan — injected
+ * here by making that one scan throw), the obligation stays OPEN (`posted`,
+ * deadline armed) and a LATER scan — the deadline's, or restart recovery's —
+ * must find the evidence. By then the recipient may already have consumed the
+ * reply: its REAL promote() rewrote the record (plaintext body, the signed
+ * envelope stored beside it) and moved it to cur/, and its ack DELETES it.
+ */
+describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this obligation's receipt (real promote())", () => {
+  const ROUTES = [
+    { route: "local", recipient: "flint", setup: () => maildirFor("flint"), box: () => join(mailDir, "flint") },
+    { route: "bridge", recipient: "ember", setup: () => branchInbox("ember"), box: () => join(root, ".tps", "branch-office", "ember", "mail") },
+  ] as const;
+
+  const obligationOf = (o: DispatchOutcome) => readJsonSafe(join(mailDir, "anvil", ".obligations", `${o.inboundId}.json`));
+
+  /** Deliver the reply with the turn's own scan failing, so the obligation stays open. */
+  async function deliverWithOpenObligation(recipient: string, route: string): Promise<DispatchOutcome> {
+    obligations.failReceiptScan = true;
+    try {
+      const o = await routeViaDispatcher(recipient, ["anvil"]);
+      expect(o.route).toBe(route);
+      expect(o.obligation?.state, "the obligation is still open after the delivery").toBe("posted");
+      return o;
+    } finally {
+      obligations.failReceiptScan = false;
+    }
+  }
+
+  /** The recipient's REAL promote() on the one delivered reply in its new/; returns the cur/ path. */
+  async function recipientPromotes(recipient: string, box: string, o: DispatchOutcome): Promise<{ curPath: string; id: string }> {
+    const newDir = join(box, "new");
+    const [name] = readdirSafe(newDir).filter((f) => f.endsWith(".json"));
+    expect(name, "the reply was delivered").toBeTruthy();
+    const promoted = await promote(recipient, join(newDir, name!));
+    expect(promoted.ok, `promote() accepted the reply (${promoted.ok ? "" : (promoted as any).reason})`).toBe(true);
+    if (!promoted.ok) throw new Error("unreachable");
+    // The shape promote() leaves: plaintext body, the signed envelope beside it, in cur/.
+    const rec = readJsonSafe(promoted.path);
+    expect(rec.body).toBe("final verdict");
+    expect(typeof rec.envelope?.signature).toBe("string");
+    // The obligation metadata rode on the delivered record and survived the
+    // recipient's promote(): the marker/account/thread (local) or the
+    // obligation ids (bridge sandbox record).
+    const obligationId = obligationOf(o)?.obligationId;
+    expect(rec.replyToId, "the signed thread").toBe(o.inboundEnvelopeId);
+    if (recipient === "flint") {
+      expect(rec.headers?.["X-TPS-Obligation"]).toBe(obligationId);
+      expect(rec.accountId).toBe("default");
+    } else {
+      expect(rec.obligationId).toBe(obligationId);
+      expect(typeof rec.replyId).toBe("string");
+    }
+    // …and the PROMOTED RECORD ALONE is evidence: the posted-record scan, with
+    // no metadata receipt in play, finds it (the round-6 binding holds for a
+    // genuine promote(): plaintext body and recipient are the stored envelope's).
+    const alone = await realObligations.scanForReceipt(
+      { direct: [], posted: [join(box, "new"), join(box, "cur")] },
+      obligationId,
+      o.inboundEnvelopeId,
+      "anvil",
+      "default",
+      recipient,
+      async (env: Envelope) =>
+        (await verifyEnvelope(env, { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } })).ok,
+      { threadMode: "signed" },
+    );
+    expect(alone.status, "the promoted record is found by the posted-record scan alone").toBe("found");
+    return { curPath: promoted.path, id: rec.id };
+  }
+
+  /** The recipient's REAL ack: the CLI deletes the record from cur/. */
+  function recipientAcks(recipient: string, id: string, curPath: string): void {
+    const prev = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = mailDir; // the CLI resolves the mailbox from the env, like the recipient's own shell
+    try {
+      expect(ackMessage(recipient, id)?.id).toBe(id);
+    } finally {
+      if (prev === undefined) delete process.env.TPS_MAIL_DIR;
+      else process.env.TPS_MAIL_DIR = prev;
+    }
+    expect(existsSync(curPath), "the recipient's ack deleted the reply").toBe(false);
+  }
+
+  for (const r of ROUTES) {
+    it(`${r.route}: the recipient PROMOTES the reply → the RESTART scan finds it → acked, no nack`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // only the restart decides it
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        await recipientPromotes(r.recipient, r.box(), o);
+        await restartAccount("anvil");
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 20000);
+
+    it(`${r.route}: the recipient PROMOTES the reply → the DEADLINE scan finds it → acked, no nack`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "5000"; // fires after the turn has returned
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        await recipientPromotes(r.recipient, r.box(), o);
+        await waitFor(() => obligationOf(o)?.state === "acked", 8000);
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 25000);
+
+    it(`${r.route}: the recipient PROMOTES and ACKS (deletes) the reply → the RESTART scan still finds this obligation's receipt → acked`, async () => {
+      // CONTROL (local): before round 7 the recipient's maildir record was the
+      // ONLY local evidence, so once the recipient acked (deleted) it, a later
+      // scan found nothing and the committed reply ended `unconfirmed`.
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
+        recipientAcks(r.recipient, id, curPath);
+        await restartAccount("anvil");
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 20000);
+
+    it(`${r.route}: the recipient PROMOTES and ACKS the reply → the DEADLINE scan still finds this obligation's receipt → acked`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
+        recipientAcks(r.recipient, id, curPath);
+        await waitFor(() => ["acked", "unconfirmed", "failed"].includes(obligationOf(o)?.state), 8000);
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 25000);
+  }
 });

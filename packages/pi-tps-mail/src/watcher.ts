@@ -1,47 +1,133 @@
 // Watcher core logic
+//
+// cli#429 — THE INBOUND IS VERIFIED BEFORE ANY FIELD OF IT IS USED. The watcher
+// never reads new/ as mail. Each check runs `tps mail check <agent> --json` as
+// the agent: the CLI's own promotion path (promote()) verifies every new/
+// record — signature, sender binding, recipient, replay, id shape — moves it to
+// cur/, and dead-letters what fails; it also re-verifies and re-presents a
+// cur/ record whose processing lease expired without an ack. The watcher acts
+// ONLY on the verified records that command prints: the sender, the body the
+// launcher sees and the thread the reply signs (the envelope's messageId) all
+// come from the verified envelope. An unsigned or forged inbound is never
+// dispatched and never answered.
+//
+// THE REPLY JOURNAL. Before a reply is first sent, the watcher writes it to
+// `<mail>/<agent>/.pi-tps-mail/replies/<inbound id>.json` (0600): the verified
+// sender and thread, the reply text, and the envelope messageId the reply is
+// signed with. Every later step is driven from that entry:
+//   - a send whose outcome is UNKNOWN (non-zero exit or timeout — the CLI may
+//     have delivered before it failed) is re-sent after a backoff with the
+//     SAME text, thread and envelope messageId (`--message-id`), never a new
+//     launcher run: if the first attempt had in fact been delivered, the
+//     recipient gets a second copy of the same message, which a
+//     promote()-reading recipient dead-letters as a replay;
+//   - a send that SUCCEEDED marks the entry `sent`; the inbound is then acked,
+//     and an ack that fails is retried on the next check without re-sending;
+//   - the journal is re-read on every check, so a restart finishes whatever a
+//     crash interrupted — re-send (same messageId) or re-ack.
+// What the journal cannot cover, stated: a crash while the launcher runs
+// (before the entry exists) leaves the inbound unacked in cur/; the CLI
+// re-presents it when its lease expires and the launcher runs again
+// (at-least-once). A journal entry that cannot be written blocks the send (the
+// same re-presentation applies), so every reply that leaves has an entry.
 import { spawn } from "node:child_process";
-import { readdir, readFile, rename } from "node:fs/promises";
-import { join, basename, resolve } from "node:path";
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 
 import type { MailMessage, MailWatcher, WatchOptions } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 1_800_000; // 30 minutes
 const POLL_INTERVAL_MS = 5000;
+const RESCAN_INTERVAL_MS = 60_000; // run the verified check even when new/ is empty
+const RETRY_BACKOFF_MS = 60_000; // first re-send after an unknown send outcome
+const RETRY_BACKOFF_MAX_MS = 1_800_000; // backoff cap (30 minutes)
+const CLI_TIMEOUT_MS = 30_000; // `tps mail check`
+const SEND_TIMEOUT_MS = 30_000; // `tps mail send` (signing + delivery)
+const ACK_TIMEOUT_MS = 10_000; // `tps mail ack`
 
 const VALID_AGENT_ID = /^[a-zA-Z0-9_-]+$/;
 
-function getAgentPaths(inboxRoot: string, options: WatchOptions): {
+/**
+ * The signed-envelope id rule the CLI enforces on every envelope it promotes and
+ * on `--reply-to` / `--message-id` (packages/cli/src/utils/envelope-id.ts),
+ * mirrored so the watcher never hands the CLI a value it would refuse. The
+ * local record id (the ack key and the journal file name) is held to it too.
+ */
+const ENVELOPE_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
+
+/** One reply the watcher owes, from its first send until the inbound is acked. */
+interface ReplyJournalEntry {
+  v: 1;
+  /** The inbound's local record id — the `tps mail ack` key. */
+  inboundId: string;
+  /** The VERIFIED sender: the reply's recipient. */
+  to: string;
+  /** The inbound's VERIFIED envelope messageId: the thread the reply signs. */
+  threadId: string;
+  /** The reply text (sent on stdin). */
+  reply: string;
+  /** The envelope messageId every attempt signs with (`--message-id`). */
+  replyMessageId: string;
+  /** `prepared`: not known to be delivered. `sent`: delivered; the ack is owed. */
+  state: "prepared" | "sent";
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface Paths {
+  mailRoot: string;
   inboxNew: string;
-  inboxCur: string;
+  journalDir: string;
   launcher: string;
   tpsVaultKey: string;
   tpsBin: string;
   agentId: string;
-} {
+}
+
+/** In-memory schedule for re-sends (the journal holds everything else). */
+type Backoff = Map<string, { nextAttemptAt: number; backoffMs: number }>;
+
+interface WatcherState {
+  inboxRoot: string;
+  options: WatchOptions;
+  paths: Paths;
+  backoff: Backoff;
+  lastCheckAt: number;
+  /** Set by stop(): no further CLI run or launcher run is started. */
+  stopped: boolean;
+}
+
+function ts(): string {
+  return new Date().toISOString();
+}
+
+function getAgentPaths(inboxRoot: string, options: WatchOptions): Paths {
   const agent = options.agent ?? "ember";
-  
+
   // Validate agent ID to prevent path traversal
   if (!VALID_AGENT_ID.test(agent)) {
     throw new Error(`Invalid agent ID: ${agent}`);
   }
-  
+
   const launcher = options.launcher ?? join(inboxRoot, "agents", agent, "bin", agent);
-  const inboxNew = join(inboxRoot, ".tps", "mail", agent, "new");
-  const inboxCur = join(inboxRoot, ".tps", "mail", agent, "cur");
-  
+  const mailRoot = join(inboxRoot, ".tps", "mail");
+
   // Require TPS_VAULT_KEY env var — no fallback credential
   const tpsVaultKey = process.env.TPS_VAULT_KEY;
   if (!tpsVaultKey) {
     throw new Error("TPS_VAULT_KEY is required");
   }
-  
+
   // Use installed CLI on PATH, or env var override
   const tpsBin = process.env.TPS_BIN || "tps";
-  
+
   return {
-    inboxNew,
-    inboxCur,
+    mailRoot,
+    inboxNew: join(mailRoot, agent, "new"),
+    journalDir: join(mailRoot, agent, ".pi-tps-mail", "replies"),
     launcher,
     tpsVaultKey,
     tpsBin,
@@ -49,48 +135,286 @@ function getAgentPaths(inboxRoot: string, options: WatchOptions): {
   };
 }
 
-async function dispatchMessage(
-  filePath: string,
-  inboxRoot: string,
-  options: WatchOptions
-): Promise<void> {
-  const paths = getAgentPaths(inboxRoot, options);
-  const id = basename(filePath);
-  
-  // Parse message JSON
-  let msg: MailMessage;
+/**
+ * Run the CLI as the agent, against the mail root this watcher watches. Resolves
+ * to the exit code (non-zero on a timeout) with stdout and a bounded stderr.
+ */
+async function runTps(
+  paths: Paths,
+  args: string[],
+  opts: { stdin?: string; timeoutMs: number; label: string },
+): Promise<{ code: number; timedOut: boolean; stdout: string; stderr: string }> {
+  const child = spawn(paths.tpsBin, args, {
+    env: {
+      ...process.env,
+      TPS_VAULT_KEY: paths.tpsVaultKey,
+      TPS_AGENT_ID: paths.agentId,
+      TPS_MAIL_DIR: paths.mailRoot,
+    },
+    stdio: [opts.stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout!.setEncoding("utf8");
+  child.stderr!.setEncoding("utf8");
+  child.stdout!.on("data", (d) => { stdout += d; });
+  child.stderr!.on("data", (d) => { if (stderr.length < 4096) stderr += d; });
+  if (opts.stdin !== undefined) {
+    // A child that exits before reading stdin makes the write fail (EPIPE):
+    // that is a failed run, reported by the exit code — never an uncaught error.
+    child.stdin!.on("error", () => {});
+    child.stdin!.end(opts.stdin, "utf8");
+  }
+
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    console.error(`[${ts()}] tps ${opts.label} TIMEOUT — killing pid ${child.pid}`);
+    try { child.kill("SIGTERM"); } catch {}
+    setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 5_000).unref();
+  }, opts.timeoutMs);
+  timer.unref();
+
+  const code = await new Promise<number>((r) => {
+    child.on("error", () => r(127));
+    child.on("close", (c) => r(c ?? 1));
+  });
+  clearTimeout(timer);
+  return { code: timedOut && code === 0 ? 1 : code, timedOut, stdout, stderr: stderr.trim() };
+}
+
+// ─── the reply journal ──────────────────────────────────────────────────────
+
+function journalPath(paths: Paths, inboundId: string): string {
+  return join(paths.journalDir, `${inboundId}.json`);
+}
+
+async function writeJournal(paths: Paths, entry: ReplyJournalEntry): Promise<void> {
+  await mkdir(paths.journalDir, { recursive: true, mode: 0o700 });
+  const target = journalPath(paths, entry.inboundId);
+  const tmp = join(paths.journalDir, `.${entry.inboundId}.${process.pid}.tmp`);
+  await writeFile(tmp, JSON.stringify({ ...entry, updatedAt: ts() }, null, 2), { encoding: "utf8", mode: 0o600 });
+  await rename(tmp, target);
+}
+
+function isJournalEntry(x: unknown): x is ReplyJournalEntry {
+  if (x === null || typeof x !== "object") return false;
+  const e = x as Record<string, unknown>;
+  return (
+    e.v === 1 &&
+    typeof e.inboundId === "string" && ENVELOPE_ID_SHAPE.test(e.inboundId) &&
+    typeof e.to === "string" && VALID_AGENT_ID.test(e.to) &&
+    typeof e.threadId === "string" && ENVELOPE_ID_SHAPE.test(e.threadId) &&
+    typeof e.replyMessageId === "string" && ENVELOPE_ID_SHAPE.test(e.replyMessageId) &&
+    typeof e.reply === "string" &&
+    (e.state === "prepared" || e.state === "sent") &&
+    typeof e.attempts === "number"
+  );
+}
+
+async function readJournal(paths: Paths): Promise<ReplyJournalEntry[]> {
+  let names: string[];
   try {
-    const raw = await readFile(filePath, "utf8");
-    msg = JSON.parse(raw) as MailMessage;
-  } catch (err: unknown) {
-    const msgId = (err instanceof SyntaxError) ? `parse error: ${err.message}` : `unknown error`;
-    console.error(`[${new Date().toISOString()}] bad JSON in ${id}: ${msgId}`);
+    names = await readdir(paths.journalDir);
+  } catch {
+    return [];
+  }
+  const out: ReplyJournalEntry[] = [];
+  for (const name of names) {
+    if (name.startsWith(".") || !name.endsWith(".json")) continue;
+    try {
+      const entry: unknown = JSON.parse(await readFile(join(paths.journalDir, name), "utf8"));
+      if (isJournalEntry(entry) && name === `${entry.inboundId}.json`) out.push(entry);
+      else console.error(`[${ts()}] reply journal entry ${name} is malformed; left in place, not acted on`);
+    } catch (err: unknown) {
+      console.error(`[${ts()}] reply journal entry ${name} is unreadable (${(err as Error).message}); left in place`);
+    }
+  }
+  return out;
+}
+
+async function hasJournal(paths: Paths, inboundId: string): Promise<boolean> {
+  try {
+    await readFile(journalPath(paths, inboundId), "utf8");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── send / ack ─────────────────────────────────────────────────────────────
+
+/**
+ * One send attempt for a journal entry: the reply ON STDIN (never argv),
+ * threaded to the verified inbound (`--reply-to`), signed with the entry's own
+ * envelope messageId (`--message-id`) so every attempt is the same message. The
+ * CLI signs with the agent's key and refuses (non-zero, nothing written) when it
+ * cannot.
+ */
+async function attemptSend(state: WatcherState, entry: ReplyJournalEntry): Promise<void> {
+  const { paths, backoff, options } = state;
+  const due = backoff.get(entry.inboundId);
+  if (due && Date.now() < due.nextAttemptAt) return; // backing off
+
+  const attempt = entry.attempts + 1;
+  const sent = await runTps(
+    paths,
+    ["mail", "send", entry.to, "--stdin", "--reply-to", entry.threadId, "--message-id", entry.replyMessageId],
+    { stdin: entry.reply, timeoutMs: options.sendTimeoutMs ?? SEND_TIMEOUT_MS, label: "mail send" },
+  );
+  if (sent.code !== 0) {
+    // The OUTCOME IS UNKNOWN: the CLI may have delivered before it failed or
+    // was killed. Keep the entry `prepared` and re-send the same message later.
+    const backoffMs = due
+      ? Math.min(due.backoffMs * 2, RETRY_BACKOFF_MAX_MS)
+      : (options.retryBackoffMs ?? RETRY_BACKOFF_MS);
+    backoff.set(entry.inboundId, { nextAttemptAt: Date.now() + backoffMs, backoffMs });
+    try {
+      await writeJournal(paths, { ...entry, attempts: attempt });
+    } catch { /* the attempt count is diagnostic only */ }
+    console.error(
+      `[${ts()}] tps mail send exited ${sent.code}${sent.timedOut ? " (timed out)" : ""} for the reply to ${entry.inboundId}` +
+        `${sent.stderr ? `: ${sent.stderr}` : ""} — outcome unknown, NOT acknowledged; the same message ` +
+        `(messageId ${entry.replyMessageId}) is re-sent in ${backoffMs}ms`,
+    );
     return;
   }
-
-  const sender = msg.from ?? "flint";
-  const body = msg.body ?? "";
-  const msgId = msg.id ?? id;
-
-  console.log(`[${new Date().toISOString()}] dispatching ${msgId} from ${sender}`);
-
-  // Move to cur/ before invoking (so we don't double-process)
-  const curPath = join(paths.inboxCur, id);
+  backoff.delete(entry.inboundId);
+  const done: ReplyJournalEntry = { ...entry, attempts: attempt, state: "sent" };
   try {
-    await rename(filePath, curPath);
+    await writeJournal(paths, done);
   } catch (err: unknown) {
-    const errno = (err as NodeJS.ErrnoException).code;
-    if (errno === "ENOENT") {
-      console.log(`[${new Date().toISOString()}] ${id} already moved, skipping`);
-      return;
-    }
-    if (errno === "EEXIST") {
-      console.warn(`[${new Date().toISOString()}] ${id} already exists in cur/, skipping`);
-      return;
-    }
-    throw err;
+    // The reply went out but the journal still says `prepared`: a later check
+    // re-sends the SAME message, which the recipient discards as a replay.
+    console.error(
+      `[${ts()}] reply journal write failed after a successful send for ${entry.inboundId} (${(err as Error).message}); ` +
+        `a later check may re-send the same message (messageId ${entry.replyMessageId})`,
+    );
   }
+  console.log(`[${ts()}] replied to ${entry.to} (${entry.reply.length} chars, reply-to ${entry.threadId}, messageId ${entry.replyMessageId})`);
+  await attemptAck(state, done);
+}
 
+/** Ack the inbound; on success the journal entry is done and removed. */
+async function attemptAck(state: WatcherState, entry: ReplyJournalEntry): Promise<void> {
+  const { paths, options } = state;
+  const ack = await runTps(paths, ["mail", "ack", entry.inboundId], {
+    timeoutMs: options.ackTimeoutMs ?? ACK_TIMEOUT_MS,
+    label: "mail ack",
+  });
+  if (ack.code !== 0) {
+    console.error(
+      `[${ts()}] tps mail ack exited ${ack.code}${ack.timedOut ? " (timed out)" : ""} for ${entry.inboundId}` +
+        `${ack.stderr ? `: ${ack.stderr}` : ""} — the reply was sent; the ack is retried on the next check (no re-send)`,
+    );
+    return;
+  }
+  console.log(`[${ts()}] acked ${entry.inboundId}`);
+  try {
+    await rm(journalPath(paths, entry.inboundId), { force: true });
+  } catch (err: unknown) {
+    console.error(`[${ts()}] could not remove the reply journal entry for ${entry.inboundId}: ${(err as Error).message}`);
+  }
+}
+
+/** Finish every reply the journal still owes: re-send `prepared`, re-ack `sent`. */
+async function recoverJournal(state: WatcherState): Promise<void> {
+  for (const entry of await readJournal(state.paths)) {
+    if (state.stopped) return;
+    if (entry.state === "sent") await attemptAck(state, entry);
+    else await attemptSend(state, entry);
+  }
+}
+
+// ─── verified inbound ───────────────────────────────────────────────────────
+
+/**
+ * `tps mail check <agent> --json`: the CLI's promotion path. Returns ONLY the
+ * records it verified (and re-verified cur/ records whose lease expired). A
+ * failed or unparseable run returns nothing — no inbound is ever read any
+ * other way.
+ */
+async function checkVerified(state: WatcherState): Promise<MailMessage[]> {
+  const res = await runTps(state.paths, ["mail", "check", state.paths.agentId, "--json"], {
+    timeoutMs: state.options.checkTimeoutMs ?? CLI_TIMEOUT_MS,
+    label: "mail check",
+  });
+  if (res.code !== 0) {
+    console.error(`[${ts()}] tps mail check exited ${res.code}${res.stderr ? `: ${res.stderr}` : ""}; nothing dispatched`);
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(res.stdout);
+  } catch {
+    console.error(`[${ts()}] tps mail check printed no JSON array; nothing dispatched`);
+    return [];
+  }
+  return Array.isArray(parsed) ? (parsed as MailMessage[]) : [];
+}
+
+async function newHasMail(paths: Paths): Promise<boolean> {
+  try {
+    return (await readdir(paths.inboxNew)).some((f) => !f.startsWith("."));
+  } catch {
+    return false;
+  }
+}
+
+/** Dispatch ONE verified inbound: launcher → journal → send → ack. */
+async function dispatchVerified(state: WatcherState, msg: MailMessage): Promise<void> {
+  const { paths, inboxRoot, options } = state;
+  const id = msg?.id;
+  const threadId = msg?.envelopeId;
+  if (
+    typeof id !== "string" || !ENVELOPE_ID_SHAPE.test(id) ||
+    typeof msg.from !== "string" || !VALID_AGENT_ID.test(msg.from) ||
+    typeof threadId !== "string" || !ENVELOPE_ID_SHAPE.test(threadId) ||
+    typeof msg.body !== "string"
+  ) {
+    console.error(`[${ts()}] a verified record lacks a usable id, sender or envelope id; not dispatched`);
+    return;
+  }
+  // A reply already produced for this inbound is finished from the journal
+  // (re-send or re-ack) — never produced a second time.
+  if (await hasJournal(paths, id)) return;
+  if (state.stopped) return;
+
+  console.log(`[${ts()}] dispatching ${id} from ${msg.from} (verified, envelope ${threadId})`);
+  const reply = await runLauncher(paths, inboxRoot, options, msg.body, id);
+  const entry: ReplyJournalEntry = {
+    v: 1,
+    inboundId: id,
+    to: msg.from,
+    threadId,
+    reply,
+    replyMessageId: randomUUID(),
+    state: "prepared",
+    attempts: 0,
+    createdAt: ts(),
+    updatedAt: ts(),
+  };
+  try {
+    await writeJournal(paths, entry);
+  } catch (err: unknown) {
+    console.error(
+      `[${ts()}] reply journal write failed for ${id} (${(err as Error).message}); NOT sending — ` +
+        `the inbound stays unacked and is re-presented when its lease expires`,
+    );
+    return;
+  }
+  if (state.stopped) return; // journaled: the next start sends it
+  await attemptSend(state, entry);
+}
+
+/** Run the agent launcher on the inbound body; resolves to the reply text. */
+async function runLauncher(
+  paths: Paths,
+  inboxRoot: string,
+  options: WatchOptions,
+  body: string,
+  msgId: string,
+): Promise<string> {
   // Validate launcher path to prevent arbitrary exec
   const expectedDir = join(inboxRoot, "agents", paths.agentId, "bin");
   const resolvedLauncher = resolve(paths.launcher);
@@ -119,7 +443,7 @@ async function dispatchMessage(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const timer = setTimeout(() => {
     timedOut = true;
-    console.error(`[${new Date().toISOString()}] launcher dispatch TIMEOUT after ${timeoutMs}ms for ${msgId} — killing pid ${child.pid}`);
+    console.error(`[${ts()}] launcher dispatch TIMEOUT after ${timeoutMs}ms for ${msgId} — killing pid ${child.pid}`);
     try { child.kill("SIGTERM"); } catch {}
     setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 5_000).unref();
   }, timeoutMs);
@@ -127,81 +451,33 @@ async function dispatchMessage(
 
   const code = await new Promise<number>((r) => child.on("close", r));
   clearTimeout(timer);
-  
+
   if (code !== 0) {
-    console.error(`[${new Date().toISOString()}] launcher exited ${code} for ${msgId}${timedOut ? " (timed out)" : ""}`);
+    console.error(`[${ts()}] launcher exited ${code} for ${msgId}${timedOut ? " (timed out)" : ""}`);
   }
 
-  const reply = timedOut
+  return timedOut
     ? `(launcher dispatch timed out after ${timeoutMs}ms — partial stdout ${stdout.length}B, stderr: ${stderr.slice(0, 500)})`
     : (stdout.trim() || `(no output, stderr: ${stderr.slice(0, 500)})`);
-
-  // Send reply via TPS mail CLI with timeout
-  const send = spawn(paths.tpsBin, ["mail", "send", sender, reply], {
-    env: { ...process.env, TPS_VAULT_KEY: paths.tpsVaultKey, TPS_AGENT_ID: paths.agentId },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  
-  let sendTimedOut = false;
-  const sendTimer = setTimeout(() => {
-    sendTimedOut = true;
-    console.error(`[${new Date().toISOString()}] tps mail send TIMEOUT — killing pid ${send.pid}`);
-    try { send.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { send.kill("SIGKILL"); } catch {} }, 5_000).unref();
-  }, 5_000);
-  sendTimer.unref();
-  
-  const sendCode = await new Promise<number>((r) => send.on("close", r));
-  clearTimeout(sendTimer);
-  if (sendCode !== 0) {
-    console.error(`[${new Date().toISOString()}] tps mail send failed with ${sendCode} for ${msgId}${sendTimedOut ? " (timed out)" : ""}`);
-  } else {
-    console.log(`[${new Date().toISOString()}] replied to ${sender} (${reply.length} chars)`);
-  }
-
-  // Ack the original message with timeout
-  const ack = spawn(paths.tpsBin, ["mail", "ack", msgId, paths.agentId], {
-    env: { ...process.env, TPS_VAULT_KEY: paths.tpsVaultKey, TPS_AGENT_ID: paths.agentId },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  
-  let ackTimedOut = false;
-  const ackTimer = setTimeout(() => {
-    ackTimedOut = true;
-    console.error(`[${new Date().toISOString()}] tps mail ack TIMEOUT — killing pid ${ack.pid}`);
-    try { ack.kill("SIGTERM"); } catch {}
-    setTimeout(() => { try { ack.kill("SIGKILL"); } catch {} }, 5_000).unref();
-  }, 5_000);
-  ackTimer.unref();
-  
-  const ackCode = await new Promise<number>((r) => ack.on("close", r));
-  clearTimeout(ackTimer);
-  if (ackCode !== 0) {
-    console.error(`[${new Date().toISOString()}] tps mail ack failed with ${ackCode} for ${msgId}${ackTimedOut ? " (timed out)" : ""}`);
-  } else {
-    console.log(`[${new Date().toISOString()}] acked ${msgId}`);
-  }
 }
 
-async function pollInbox(inboxRoot: string, options: WatchOptions): Promise<void> {
-  const paths = getAgentPaths(inboxRoot, options);
-  
-  try {
-    const files = await readdir(paths.inboxNew);
-    for (const f of files) {
-      if (f.startsWith(".")) continue;
-      try {
-        await dispatchMessage(join(paths.inboxNew, f), inboxRoot, options);
-      } catch (err: unknown) {
-        console.error(`[${new Date().toISOString()}] dispatch error on ${f}: ${(err as Error).message}`);
-      }
-    }
-  } catch (err: unknown) {
-    const errno = (err as NodeJS.ErrnoException).code;
-    if (errno === "ENOENT") {
-      console.warn(`[${new Date().toISOString()}] inbox ${paths.inboxNew} missing; waiting`);
-    } else {
-      console.error(`[${new Date().toISOString()}] poll error: ${(err as Error).message}`);
+/**
+ * One poll: finish the journal, then — when new/ holds anything, or the rescan
+ * interval has passed (lease-expired cur/ records, a retryable dlq/ entry) —
+ * run the verified check and dispatch what it returns.
+ */
+async function pollOnce(state: WatcherState): Promise<void> {
+  await recoverJournal(state);
+  const rescanDue = Date.now() - state.lastCheckAt >= (state.options.rescanIntervalMs ?? RESCAN_INTERVAL_MS);
+  if (!rescanDue && !(await newHasMail(state.paths))) return;
+  if (state.stopped) return;
+  state.lastCheckAt = Date.now();
+  for (const msg of await checkVerified(state)) {
+    if (state.stopped) return;
+    try {
+      await dispatchVerified(state, msg);
+    } catch (err: unknown) {
+      console.error(`[${ts()}] dispatch error: ${(err as Error).message}`);
     }
   }
 }
@@ -211,15 +487,19 @@ export function watchMail(options: WatchOptions = {}): MailWatcher {
   const paths = getAgentPaths(inboxRoot, options);
   console.log(`pi-tps-mail watcher starting for agent=${paths.agentId}, inbox=${paths.inboxNew}`);
 
-  let stopped = false;
-  
-  const processMsg = async () => {
-    if (stopped) return;
-    await pollInbox(inboxRoot, options);
-    
-    if (!stopped) {
-      setTimeout(processMsg, POLL_INTERVAL_MS);
-    }
+  const state: WatcherState = { inboxRoot, options, paths, backoff: new Map(), lastCheckAt: 0, stopped: false };
+
+  // The poll in flight, so drain() can wait for it after stop().
+  let inflight: Promise<void> = Promise.resolve();
+  const processMsg = () => {
+    if (state.stopped) return;
+    inflight = pollOnce(state)
+      .catch((err: unknown) => {
+        console.error(`[${ts()}] poll error: ${(err as Error).message}`);
+      })
+      .then(() => {
+        if (!state.stopped) setTimeout(processMsg, options.pollIntervalMs ?? POLL_INTERVAL_MS);
+      });
   };
 
   // Start polling
@@ -227,8 +507,11 @@ export function watchMail(options: WatchOptions = {}): MailWatcher {
 
   return {
     stop() {
-      stopped = true;
+      state.stopped = true;
       console.log("pi-tps-mail watcher stopped.");
+    },
+    drain() {
+      return inflight;
     },
   };
 }

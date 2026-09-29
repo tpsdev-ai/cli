@@ -172,6 +172,14 @@ const cli = meow(
       spec: { type: "string" },
       output: { type: "string" },
       taskContext: { type: "string" },
+      // cli#429: mail send --stdin / --reply-to. `--unsigned` is parsed only so
+      // that `mail send` can REFUSE it by name (there is no unsigned send).
+      stdin: { type: "boolean", default: false },
+      unsigned: { type: "boolean", default: false },
+      replyTo: { type: "string" },
+      // mail send --message-id: sign with a caller-chosen envelope messageId,
+      // so a re-send after an unknown outcome is the same message.
+      messageId: { type: "string" },
     },
   }
 );
@@ -708,7 +716,7 @@ async function main() {
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
       if (cli.flags.help || !action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send mail to a local or remote agent\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox for new messages [--exec cmd args] [--daemon install|uninstall|status]\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox for new messages [--exec cmd args] [--daemon install|uninstall|status]\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(cli.flags.help ? 0 : 1);
       }
@@ -784,6 +792,12 @@ async function main() {
           priority: cli.flags.priority as string | undefined,
           output: cli.flags.output as string | undefined,
           taskContext: cli.flags.taskContext as string | undefined,
+          // cli#429: stdin body / reply-to threading (send only); `unsigned` is
+          // passed through only so `mail send` refuses it by name.
+          stdin: action === "send" ? Boolean(cli.flags.stdin) : undefined,
+          replyTo: action === "send" ? ((cli.flags.replyTo as string | undefined) ?? getFlag("reply-to")) : undefined,
+          sendMessageId: action === "send" ? ((cli.flags.messageId as string | undefined) ?? getFlag("message-id")) : undefined,
+          unsigned: action === "send" ? Boolean(cli.flags.unsigned) : undefined,
         });
       }
       break;
