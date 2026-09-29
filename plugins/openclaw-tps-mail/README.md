@@ -237,9 +237,14 @@ plugin sweeps the store:
 
 ## Metadata receipts and the delivery residual
 
-A reply delivered over a route that leaves **no locally readable mail file** —
-the wire to a remote branch, or the branch-office bridge — is receipted so the
-obligation loop can see that it committed. The receipt names the reply id, the
+A reply delivered over a route whose delivered record this agent **cannot
+keep** — the wire to a remote branch, the branch-office bridge, and (cli#429
+round 7) a **local** reply, whose record lives in the recipient's maildir where
+the recipient's `promote()` moves it, its ack deletes it and its gc purges it —
+is receipted so the obligation loop can see that it committed, even after the
+recipient has consumed the reply. An outbox reply is not: its record stays in
+this host's outbox (`new/` → `sent/`), and the drain quarantining it is a
+definitive non-delivery verdict the scan must see. The receipt names the reply id, the
 obligation id, the thread it answers, the route and the branch, plus a
 timestamp, and — since cli#429 — carries the **signed reply envelope** exactly as
 the delivery carried it (`signedReply`, which includes the reply text): the scan

@@ -503,3 +503,92 @@ describe("--stdin --json prints delivery METADATA — the body never reaches std
     expectNoBody(r);
   }, 20000);
 });
+
+// ─── the SIGNED envelope is size-checked before any route ────────────────────
+
+describe("a body just under 64 KiB whose SIGNED envelope is over it is refused by name before any route (cli#429)", () => {
+  /** ~65,000 bytes: under MAX_BODY_BYTES (65,536) as plaintext, over it once signed. */
+  const MARK = "oversize-body-9d41e2";
+  const BIG = `${MARK}:${"y".repeat(65_000 - MARK.length - 1)}`;
+
+  async function sendBig(to: string, body: string, extra: string[] = []): Promise<{ status: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", to, "--stdin", ...extra], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: home,
+        TPS_MAIL_DIR: mailDir,
+        TPS_TEST_KEYS_DIR: keysDir,
+        TPS_AGENT_ID: "flint",
+        TPS_VAULT_KEY: "test-passphrase",
+        TPS_IDENTITY_DIR: join(home, ".tps", "identity"),
+        TPS_REGISTRY_DIR: join(home, ".tps", "registry"),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    proc.stdin.write(body);
+    proc.stdin.end();
+    const timer = setTimeout(() => proc.kill(), 15000);
+    const [stdout, stderr, status] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timer);
+    return { status, stdout, stderr };
+  }
+
+  function expectRefusedByName(r: { status: number; stdout: string; stderr: string }): void {
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain("Refusing to send: the signed message is too large to send");
+    expect(r.stderr).toContain("the body plus its signature");
+    for (const out of [r.stdout, r.stderr]) {
+      expect(out.includes(MARK), "the body is never echoed").toBe(false);
+      expect(out.includes("y".repeat(64)), "no run of the body is echoed").toBe(false);
+    }
+  }
+
+  test("premise: the plaintext is UNDER the 64 KiB limit (the stdin reader accepts it)", () => {
+    expect(Buffer.byteLength(BIG, "utf8")).toBe(65_000);
+    expect(Buffer.byteLength(BIG, "utf8")).toBeLessThan(64 * 1024);
+  });
+
+  for (const [route, to] of [
+    ["local", "kern"],
+    ["bridge", "ember"],
+    ["remote-branch", "rbranch"],
+  ] as const) {
+    test(`${route}: refused by name, nothing written, no connection to the wire, the body never echoed`, async () => {
+      // CONTROL: before this change the local route threw the maildir writer's
+      // own size error after signing, and the remote and bridge routes their
+      // own — each a different, unnamed failure.
+      await officeFixtures();
+      writeKeyFile(keysDir, "flint", FLINT_SEED);
+      for (const extra of [[], ["--json"]]) {
+        const r = await sendBig(to, BIG, extra);
+        expectRefusedByName(r);
+      }
+      expect(destinations()).toEqual([]);
+      expect(connections).toBe(0);
+    }, 30000);
+  }
+
+  test("outbox (branch host): refused by name, the outbox stays empty, the body never echoed", async () => {
+    branchFixture();
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendBig("host", BIG, ["--json"]);
+    expectRefusedByName(r);
+    expect(destinations()).toEqual([]);
+    expect(existsSync(join(home, ".tps", "outbox"))).toBe(false);
+  }, 30000);
+
+  test("CONTROL: a body well under the limit is sent on the same route (the refusal is about size)", async () => {
+    await officeFixtures();
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendBig("kern", `${MARK}:${"y".repeat(60_000)}`);
+    expect(r.status).toBe(0);
+    expect(destinations().length).toBe(1);
+  }, 30000);
+});

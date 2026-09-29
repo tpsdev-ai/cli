@@ -12,6 +12,9 @@
   64 KiB envelope body limit, with distinct errors for empty input and for a
   stdin that never delivers — and never through `process.stdin` (under bun a
   regular-file or memfd stdin reads as 0 bytes once `process.stdin` exists).
+  The 64 KiB limit is enforced on the SIGNED message (the body plus its
+  signature and envelope fields) before any route: a body just under the limit
+  whose signed envelope is over it is refused by name, and nothing is written.
   The command never prints the body: `--json` prints delivery metadata only
   (`status`, `route`, `to`, `from`, the signed `messageId`, `replyToId`,
   `signedAt`, and on the local route the record `id` and `timestamp`) on every
@@ -68,7 +71,11 @@
   envelope's. An unsigned, badly signed, foreign-signed or misaddressed record
   never acks an obligation. The
   metadata receipt now carries the signed reply it attests (`signedReply`),
-  0600 in the replying agent's own obligation store.
+  0600 in the replying agent's own obligation store, and a LOCAL reply now
+  writes one too: its delivered record lives in the recipient's maildir, which
+  the recipient consumes (its ack deletes it), so without its own receipt a
+  later scan — the deadline's, or restart recovery's — found no evidence and
+  the committed reply ended `unconfirmed`.
 
   **pi-tps-mail: the watcher answers only verified mail, and a reply is sent as
   one message.** Each check runs `tps mail check <agent> --json` and acts only

@@ -34,8 +34,9 @@
  * RECEIPTS (cli#389 round 3; PER-AGENT since round 5). A receipt is EITHER the
  * posted record that carries this obligation's `X-TPS-Obligation` marker (a
  * local maildir file, or the outbox record the branch drains) OR — for a route
- * that leaves no locally readable mail file — the metadata receipt `index.ts`
- * persists at `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`,
+ * whose delivered record this agent cannot keep (the wire, the bridge, and
+ * since cli#429 round 7 a LOCAL reply, whose record its recipient consumes) —
+ * the metadata receipt `index.ts` persists at `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json`,
  * INSIDE the replying agent's own obligation store. The metadata receipt names
  * the obligation, the reply and the inbound it answers (`replyId`,
  * `obligationId`, `replyToId`), its `route` (+ `branchId`) and `ts`, and —
@@ -648,7 +649,7 @@ export function sweepTerminalObligations(
   try {
     receiptNames = readdirSync(receiptsRoot);
   } catch {
-    // No receipts directory yet (nothing was ever delivered non-locally): done.
+    // No receipts directory yet (no receipted delivery was ever made): done.
     receiptNames = [];
   }
   for (const name of receiptNames) {
@@ -765,8 +766,9 @@ export function receiptPath(mailDir: string, agent: string, obligationId: string
 }
 
 /**
- * Persist the metadata receipt for a successful NON-LOCAL delivery (cli#389
- * round 3) into the replying agent's own store (round 5). Atomic (a dot temp +
+ * Persist the metadata receipt for a committed delivery on a receipted route
+ * (the wire, the bridge — cli#389 round 3 — and a local reply, cli#429 round 7)
+ * into the replying agent's own store (round 5). Atomic (a dot temp +
  * rename, so a concurrent scan never reads a half-written file) and 0600 AT
  * CREATION — the mode is set on the temp file, so the final name is never once
  * world/group-readable.
@@ -804,7 +806,7 @@ export type ReceiptScan =
  *
  *   - `direct` — read ONLY by the direct `<obligationId>.json` path; NEVER
  *     listed. The agent's own receipts root belongs here: it accumulates a file
- *     per non-local delivery and nothing but the retention sweep ever removes
+ *     per receipted delivery and nothing but the retention sweep ever removes
  *     one, so a listing would read and parse every retained receipt on every
  *     scan.
  *   - `posted` — LISTED for a posted record carrying the obligation marker.
@@ -987,8 +989,9 @@ export interface ReceiptScanOptions {
  *
  *   (1) METADATA (cli#389 round 3) — `<mailDir>/<agent>/.obligations/receipts/
  *       <obligationId>.json` (per-agent since round 5): the record
- *       `writeReceipt` persists when a delivery that leaves no locally readable
- *       mail file commits (remote-branch, bridge). Read by its DIRECT path —
+ *       `writeReceipt` persists when a delivery on a receipted route commits
+ *       (remote-branch, bridge, local — see index.ts persistReceipt). Read by
+ *       its DIRECT path —
  *       never by parsing the directory (cli#389 round 4, item 1: it is the
  *       `direct` input, and a `direct` dir is never listed) — and accepted when
  *       `obligationId` matches, `replyToId` is the thread this obligation is
@@ -1068,7 +1071,7 @@ export async function scanForReceipt(
   const verified = (envelope: Envelope | null): Promise<boolean> =>
     isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
-  //     the agent's receipts root holds a receipt per non-local delivery, so
+  //     the agent's receipts root holds a receipt per receipted delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
   for (const dir of dirs.direct) {
     const direct = resolve(dir, `${obligationId}.json`);

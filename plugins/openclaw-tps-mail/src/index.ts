@@ -336,18 +336,23 @@ function writeOutboxFile(message: TpsMailBody): string {
  * verifies before it accepts the receipt (a signature cannot be checked over
  * bytes the receipt does not hold).
  *
- * SCOPE: only a route that leaves NO locally readable mail file needs one. A
- * LOCAL reply lives in the recipient's maildir and an OUTBOX reply in the file
- * the branch drain carries, each carrying the obligation marker — those records
- * ARE their receipts, and the scan still reads them (cli#398 T4 pins that a
- * posted record the scan cannot see is a NAMED failure, so minting a second,
- * always-readable receipt for them would change adjudicated behaviour).
+ * SCOPE: every route whose delivered record this agent cannot keep. The wire
+ * and the bridge leave none (or one the sandbox agent consumes). A LOCAL reply
+ * does leave one — in the RECIPIENT's maildir, which the recipient consumes:
+ * its promote() rewrites and moves it, its ack DELETES it, its gc purges it —
+ * so once the recipient has acked, a later scan (the deadline's, or restart
+ * recovery's) found no evidence and a committed reply ended `unconfirmed`
+ * (cli#429 round 7). The local route therefore gets the same receipt; its
+ * posted record is still scanned too. The OUTBOX route does NOT: its record
+ * stays in this host's outbox (new/ → sent/, never consumed here), and the
+ * drain QUARANTINING that record is a definitive non-delivery verdict the scan
+ * must see (cli#398 T4) — an always-readable receipt beside it would mask it.
  *
  * A message with no `X-TPS-Obligation` marker owes no obligation (a nack, or an
  * ordinary outbound send), so nothing is written for it: a receipt is evidence
  * of a discharged obligation, never a mail copy.
  */
-function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, route: "remote-branch" | "bridge", branchId?: string): void {
+function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, route: ReceiptRoute, branchId?: string): void {
   const obligationId = message.headers?.["X-TPS-Obligation"];
   if (typeof obligationId !== "string" || obligationId.length === 0) return;
   // The receipt must answer a specific inbound: without a replyToId it could
@@ -373,15 +378,19 @@ function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, ro
  * logged by name and swallowed, on every route.
  *
  * Nothing is lost: the bridge's sandbox record carries the same ids (see
- * obligationMetadata), so the scan still finds that delivery; for the wire the
+ * obligationMetadata) and a local reply is its own posted record, so the scan
+ * still finds those deliveries while the record is unconsumed; for the wire the
  * receipt is the only local evidence, so that obligation resolves at its
  * deadline instead of immediately (stated in the README).
  */
+/** The routes that persist a metadata receipt (see persistReceipt's SCOPE). */
+type ReceiptRoute = "local" | "remote-branch" | "bridge";
+
 function persistReceiptAfterCommit(
   mailDir: string,
   agent: string,
   message: TpsMailBody,
-  route: "remote-branch" | "bridge",
+  route: ReceiptRoute,
   branchId: string | undefined,
   log?: any,
 ): void {
@@ -725,16 +734,17 @@ const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
 function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
-  // TWO receipt forms (cli#389 round 3): the metadata receipt every NON-LOCAL
-  // route persists — found by its DIRECT path — and, for a route that also
-  // writes a mail file, the posted record itself.
+  // TWO receipt forms (cli#389 round 3): the metadata receipt the wire, the
+  // bridge and (cli#429 round 7) a local reply persist — found by its DIRECT
+  // path — and, for a route that also writes a mail file, the posted record
+  // itself.
   //
   // The receipt lives in the REPLYING agent's OWN obligation store (round 5),
   // so the agent that owes the obligation is the one whose sweep owns it.
   //
   // SPLIT BY HOW A SCAN MAY READ EACH DIR (cli#389 round 4, item 1): the agent's
   // receipts root is the `direct` input — probed once at `<obligationId>.json`
-  // and NEVER listed (it accumulates a receipt per non-local delivery, so a
+  // and NEVER listed (it accumulates a receipt per receipted delivery, so a
   // listing would parse every retained receipt on every scan). The route's own
   // posted-record dirs are the `posted` input — the only dirs a scan lists: a
   // local reply lives in the recipient's maildir, a bridge delivery in the
@@ -1887,14 +1897,24 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                     `tps-mail: reply ${reply.id} from ${recipient} to ${msg.from} (via dispatcher, route=${where}; delivery committed)`,
                   ),
               );
-              if (r.kind === "remote-branch" || r.kind === "bridge") {
+              if (r.kind === "local" || r.kind === "remote-branch" || r.kind === "bridge") {
                 // persistReceiptAfterCommit never throws: it logs
-                // receipt-write-failed by name and cannot fail the send.
+                // receipt-write-failed by name and cannot fail the send. The
+                // local route too (cli#429 round 7): its posted record lives in
+                // the recipient's maildir, which the recipient consumes.
                 postCommit(
                   log,
                   "receipt-write-failed",
                   `the ${r.kind} reply ${reply.id} committed but its receipt was not written`,
-                  () => persistReceiptAfterCommit(account.mailDir, recipient, reply, r.kind, r.branchId, log),
+                  () =>
+                    persistReceiptAfterCommit(
+                      account.mailDir,
+                      recipient,
+                      reply,
+                      r.kind,
+                      r.kind === "local" ? undefined : r.branchId,
+                      log,
+                    ),
                 );
               }
             }

@@ -335,7 +335,11 @@ describe("cli#398 T2 — a raw NO_REPLY final is an immediate empty-final-text, 
     const h = await start("anvil", "flint", { localSender: true });
     const flintNew = resolve(tempMailDir, "flint", "new");
     // The receipt dir is UNREADABLE: the reply write lands (write+execute) but
-    // the scan cannot list it, so the receipt is absent.
+    // the scan cannot list it, so the receipt is absent. cli#429 round 7: a
+    // local reply also persists a metadata receipt, so that one is made
+    // unwritable too (`receipts` is a FILE) — both forms of evidence are absent.
+    mkdirSync(resolve(tempMailDir, "anvil", ".obligations"), { recursive: true });
+    writeFileSync(resolve(tempMailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
     chmodSync(flintNew, 0o333);
     try {
       await h.deliver("verdict");

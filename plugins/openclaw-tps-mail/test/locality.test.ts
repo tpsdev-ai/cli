@@ -46,6 +46,9 @@ import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@t
 // artifact.
 import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as obligationsModule from "../src/obligations.js";
+// The RECIPIENT's side of a delivered reply: the real promotion and ack the CLI
+// runs on a mailbox (cli#429 round 7 — a consumed reply must still be evidence).
+import { ackMessage, promote } from "@tpsdev-ai/cli/utils/mail";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -1338,4 +1341,150 @@ describe("cli#429 — replies thread on the SIGNED inbound envelope id, inside t
     await expectThreadBound(JSON.parse(relay.deliver[0]!.msg.body), o.inboundEnvelopeId);
     expect(o.receiptRecord?.replyToId, "the metadata receipt names the signed thread").toBe(o.inboundEnvelopeId);
   }, 20000);
+});
+
+// ── cli#429 round 7: a reply the RECIPIENT has consumed is still this obligation's receipt ──
+/**
+ * The turn's own scan normally acks the obligation the moment the reply is
+ * delivered. When it cannot (a crash between the post and the scan — injected
+ * here by making that one scan throw), the obligation stays OPEN (`posted`,
+ * deadline armed) and a LATER scan — the deadline's, or restart recovery's —
+ * must find the evidence. By then the recipient may already have consumed the
+ * reply: its REAL promote() rewrote the record (plaintext body, the signed
+ * envelope stored beside it) and moved it to cur/, and its ack DELETES it.
+ */
+describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this obligation's receipt (real promote())", () => {
+  const ROUTES = [
+    { route: "local", recipient: "flint", setup: () => maildirFor("flint"), box: () => join(mailDir, "flint") },
+    { route: "bridge", recipient: "ember", setup: () => branchInbox("ember"), box: () => join(root, ".tps", "branch-office", "ember", "mail") },
+  ] as const;
+
+  const obligationOf = (o: DispatchOutcome) => readJsonSafe(join(mailDir, "anvil", ".obligations", `${o.inboundId}.json`));
+
+  /** Deliver the reply with the turn's own scan failing, so the obligation stays open. */
+  async function deliverWithOpenObligation(recipient: string, route: string): Promise<DispatchOutcome> {
+    obligations.failReceiptScan = true;
+    try {
+      const o = await routeViaDispatcher(recipient, ["anvil"]);
+      expect(o.route).toBe(route);
+      expect(o.obligation?.state, "the obligation is still open after the delivery").toBe("posted");
+      return o;
+    } finally {
+      obligations.failReceiptScan = false;
+    }
+  }
+
+  /** The recipient's REAL promote() on the one delivered reply in its new/; returns the cur/ path. */
+  async function recipientPromotes(recipient: string, box: string, o: DispatchOutcome): Promise<{ curPath: string; id: string }> {
+    const newDir = join(box, "new");
+    const [name] = readdirSafe(newDir).filter((f) => f.endsWith(".json"));
+    expect(name, "the reply was delivered").toBeTruthy();
+    const promoted = await promote(recipient, join(newDir, name!));
+    expect(promoted.ok, `promote() accepted the reply (${promoted.ok ? "" : (promoted as any).reason})`).toBe(true);
+    if (!promoted.ok) throw new Error("unreachable");
+    // The shape promote() leaves: plaintext body, the signed envelope beside it, in cur/.
+    const rec = readJsonSafe(promoted.path);
+    expect(rec.body).toBe("final verdict");
+    expect(typeof rec.envelope?.signature).toBe("string");
+    // The obligation metadata rode on the delivered record and survived the
+    // recipient's promote(): the marker/account/thread (local) or the
+    // obligation ids (bridge sandbox record).
+    const obligationId = obligationOf(o)?.obligationId;
+    expect(rec.replyToId, "the signed thread").toBe(o.inboundEnvelopeId);
+    if (recipient === "flint") {
+      expect(rec.headers?.["X-TPS-Obligation"]).toBe(obligationId);
+      expect(rec.accountId).toBe("default");
+    } else {
+      expect(rec.obligationId).toBe(obligationId);
+      expect(typeof rec.replyId).toBe("string");
+    }
+    // …and the PROMOTED RECORD ALONE is evidence: the posted-record scan, with
+    // no metadata receipt in play, finds it (the round-6 binding holds for a
+    // genuine promote(): plaintext body and recipient are the stored envelope's).
+    const alone = await realObligations.scanForReceipt(
+      { direct: [], posted: [join(box, "new"), join(box, "cur")] },
+      obligationId,
+      o.inboundEnvelopeId,
+      "anvil",
+      "default",
+      recipient,
+      async (env: Envelope) =>
+        (await verifyEnvelope(env, { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } })).ok,
+      { threadMode: "signed" },
+    );
+    expect(alone.status, "the promoted record is found by the posted-record scan alone").toBe("found");
+    return { curPath: promoted.path, id: rec.id };
+  }
+
+  /** The recipient's REAL ack: the CLI deletes the record from cur/. */
+  function recipientAcks(recipient: string, id: string, curPath: string): void {
+    const prev = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = mailDir; // the CLI resolves the mailbox from the env, like the recipient's own shell
+    try {
+      expect(ackMessage(recipient, id)?.id).toBe(id);
+    } finally {
+      if (prev === undefined) delete process.env.TPS_MAIL_DIR;
+      else process.env.TPS_MAIL_DIR = prev;
+    }
+    expect(existsSync(curPath), "the recipient's ack deleted the reply").toBe(false);
+  }
+
+  for (const r of ROUTES) {
+    it(`${r.route}: the recipient PROMOTES the reply → the RESTART scan finds it → acked, no nack`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // only the restart decides it
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        await recipientPromotes(r.recipient, r.box(), o);
+        await restartAccount("anvil");
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 20000);
+
+    it(`${r.route}: the recipient PROMOTES the reply → the DEADLINE scan finds it → acked, no nack`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "5000"; // fires after the turn has returned
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        await recipientPromotes(r.recipient, r.box(), o);
+        await waitFor(() => obligationOf(o)?.state === "acked", 8000);
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 25000);
+
+    it(`${r.route}: the recipient PROMOTES and ACKS (deletes) the reply → the RESTART scan still finds this obligation's receipt → acked`, async () => {
+      // CONTROL (local): before round 7 the recipient's maildir record was the
+      // ONLY local evidence, so once the recipient acked (deleted) it, a later
+      // scan found nothing and the committed reply ended `unconfirmed`.
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
+        recipientAcks(r.recipient, id, curPath);
+        await restartAccount("anvil");
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 20000);
+
+    it(`${r.route}: the recipient PROMOTES and ACKS the reply → the DEADLINE scan still finds this obligation's receipt → acked`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+      const out = await inFreshHome(r.setup, async () => {
+        const o = await deliverWithOpenObligation(r.recipient, r.route);
+        const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
+        recipientAcks(r.recipient, id, curPath);
+        await waitFor(() => ["acked", "unconfirmed", "failed"].includes(obligationOf(o)?.state), 8000);
+        return { o, ob: obligationOf(o) };
+      });
+      expect(out.ob?.state).toBe("acked");
+      expect(out.ob?.failure).toBeUndefined();
+      expect(out.o.nack).toBeNull();
+    }, 25000);
+  }
 });

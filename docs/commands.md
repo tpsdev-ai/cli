@@ -145,7 +145,7 @@ tps mail log [agent] [--since YYYY-MM-DD] [--limit N]
 
 **Commands:**
 - `send <agent> <message>`: Send a signed text message to an agent.
-  - `--stdin` reads the body from stdin (UTF-8, at most 64 KiB) instead of argv. The command never prints the body: not in its text output, not with `--json`, not in an error.
+  - `--stdin` reads the body from stdin (UTF-8) instead of argv. The 64 KiB limit applies to the SIGNED message — the body plus its signature and envelope fields — so the body itself must be somewhat smaller; an over-limit message is refused by name (`Refusing to send: the signed message is too large to send…`) before any route, and nothing is written. The command never prints the body: not in its text output, not with `--json`, not in an error.
   - `--reply-to <messageId>` threads the message to the signed `messageId` it answers. The id is carried inside the signed envelope; it must be 1-128 letters, digits, dots, underscores or hyphens.
   - `--message-id <id>` signs the envelope with that `messageId` instead of a fresh UUID (same rule as `--reply-to`). A sender that re-sends after an unknown outcome passes the same id, so a recipient's replay gate discards the second copy.
   - `--json` prints delivery metadata only, on every route: `status`, `route` (`local`, `outbox`, `bridge` or `remote-branch`), `to`, `from`, the signed `messageId`, `replyToId` when set, `signedAt`, and, on the local route, the record `id` and `timestamp`.

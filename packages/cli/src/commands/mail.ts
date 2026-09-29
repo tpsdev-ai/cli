@@ -186,13 +186,27 @@ function signOutboundOrFail(
     if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
       throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
     }
-    return signOutboundBody(from, to, body, {
+    const signed = signOutboundBody(from, to, body, {
       requireKey: true,
       replyToId: opts.replyToId,
       messageId: opts.messageId,
       rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
       priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
     });
+    // cli#429: every route limits the SIGNED envelope (the body plus its
+    // signature, chain and envelope fields) to MAX_BODY_BYTES, not the
+    // plaintext — so check it HERE, before any route, and refuse by name. A body
+    // just under the limit passes the plaintext check (e.g. --stdin) and would
+    // otherwise fail later, with a different error, inside a route.
+    try {
+      assertValidBody(signed);
+    } catch (err) {
+      throw new Error(
+        `the signed message is too large to send: ${(err as Error).message} The limit covers the signed envelope — ` +
+          `the body plus its signature, delegation chain and envelope fields — so shorten the body. Nothing was written.`,
+      );
+    }
+    return signed;
   } catch (err) {
     console.error(`Refusing to send: ${(err as Error).message}`);
     process.exit(1);

@@ -706,7 +706,11 @@ describe("cli#389 round 8 — the commit is a persisted state of the obligation 
     const flintNew = resolve(tempMailDir, "flint", "new");
     // The reply lands (creating a file only needs write+execute on the dir) but
     // the receipt cannot be LISTED, so the delivery commits and the evidence
-    // stays unreadable.
+    // stays unreadable. cli#429 round 7: a local reply also persists a metadata
+    // receipt, so that one is made unwritable too — `receipts` is a FILE — or
+    // this obligation would have evidence after all.
+    mkdirSync(resolve(tempMailDir, "anvil", ".obligations"), { recursive: true });
+    writeFileSync(resolve(tempMailDir, "anvil", ".obligations", "receipts"), "not a directory", "utf-8");
     chmodSync(flintNew, 0o333);
     try {
       await h.deliver("the final answer", "final");

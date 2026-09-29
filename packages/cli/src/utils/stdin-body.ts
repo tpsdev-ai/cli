@@ -90,7 +90,10 @@ export class StdinTimeoutError extends Error {
 
 /**
  * Read all of fd 0 as UTF-8, capped at `maxBytes` (default: the envelope body
- * cap, `MAX_BODY_BYTES`). Throws EmptyStdinError on zero bytes,
+ * cap, `MAX_BODY_BYTES`). That cap bounds the PLAINTEXT read; `tps mail send`
+ * then checks the SIGNED envelope — the body plus its signature, chain and
+ * envelope fields, so a little larger — against the same limit before any
+ * route (commands/mail.ts signOutboundOrFail). Throws EmptyStdinError on zero bytes,
  * StdinTooLargeError past the cap, and StdinTimeoutError when the fd stays
  * EAGAIN past the budget. Never touches `process.stdin`.
  */
