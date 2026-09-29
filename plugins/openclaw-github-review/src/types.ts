@@ -53,7 +53,8 @@ export type RefusalReason =
 /** A completed post. `posted` = receipt validated and audit acknowledged;
  *  `posted_audit_pending` = the audit write failed and the record is retained
  *  for host-side retry; `posted_audit_unretained` = the audit write failed AND
- *  the record could not be retained (the host log names the event). */
+ *  its retention was not durably confirmed (a retention write may have become
+ *  visible before failing); a host log line naming the event is attempted. */
 export interface PostedOutcome {
   ok: true;
   status: "posted" | "posted_audit_pending" | "posted_audit_unretained";
@@ -217,10 +218,11 @@ export interface PendingAuditStore {
  *  - `reconcile_required`: the attempt's outcome is uncertain (an ambiguous
  *    GitHub response, or a 2xx whose receipt did not validate).
  *  - `posted`: the dispatch's verdict exists on GitHub. Final.
- *  `reserved` and `reconcile_required` refuse every call. Only two things
- *  remove a latch: the handler, after a response that PROVES no review was
- *  created; and the host's reconciliation (latch-admin.ts), when it PROVES
- *  non-creation. */
+ *  `reserved` and `reconcile_required` refuse every call. Only ONE thing
+ *  removes a latch: the handler, after a response that PROVES its own POST
+ *  created no review (github.ts). The host's reconciliation (latch-admin.ts)
+ *  never releases: it latches `posted` when the recorded receipt id is listed;
+ *  otherwise the dispatch stays latched and a fresh dispatch reviews again. */
 export type DispatchLatch = "reserved" | "reconcile_required" | "posted";
 
 /** What the latch store records about a dispatch's attempt, so the host's

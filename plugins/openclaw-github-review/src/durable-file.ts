@@ -90,26 +90,19 @@ export function writeJsonStore(file: string, value: unknown): void {
   }
 }
 
-/** Append one JSON line to a log file and fsync it. When the call CREATES the
- *  file (mode 0600), the directory is fsync'ed too, so the new entry — and
- *  with it the line — survives a crash. Throws when any step fails. */
+/** Append one JSON line to a log file (created with mode 0600 when absent),
+ *  fsync it, and fsync its directory — before EVERY append returns, not only
+ *  the one that created the file: another writer may have created it and not
+ *  yet persisted the directory entry. Throws when any step fails. */
 export function appendJsonLine(file: string, value: unknown): void {
-  let fd: number;
-  let created = true;
-  try {
-    fd = openSync(file, "ax", 0o600);
-  } catch (err) {
-    if ((err as { code?: unknown }).code !== "EEXIST") throw err;
-    created = false;
-    fd = openSync(file, "a", 0o600);
-  }
+  const fd = openSync(file, "a", 0o600);
   try {
     writeSync(fd, `${JSON.stringify(value)}\n`);
     fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
-  if (created) fsyncPath(dirname(file), "r");
+  fsyncPath(dirname(file), "r");
 }
 
 /** Prove the store's directory accepts the write its atomic replace performs,

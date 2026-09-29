@@ -11,9 +11,13 @@
  *   node dist/src/latch-admin.js reconcile <pluginConfig.json> <dispatchId> [--audit-log <file>] [--stale-claim]
  *   node dist/src/latch-admin.js clear     <reconcileFile> <dispatchId>      (always refuses; see below)
  *
- * `reconcile` is the host's ONLY way to release a dispatch, and it releases
- * only on PROOF that the attempt created no review (see decideReconciliation).
- * For a `reserved` or `reconcile_required` latch it:
+ * `reconcile` NEVER RELEASES a dispatch: nothing independent can prove that a
+ * POST which may have started created no review, and an empty listing is not
+ * proof. It has two outcomes (see decideReconciliation): latch `posted` when
+ * the attempt's RECORDED receipt id is listed, or leave the entry latched and
+ * tell the operator to issue a FRESH dispatch (a new dispatchId) — the same
+ * retry path as after a credential rotation. For a `reserved` or
+ * `reconcile_required` latch it:
  *   1. refuses while the gateway's CLAIM is held (the attempt may be in
  *      flight). `--stale-claim` declares the claiming process gone; it is still
  *      refused when that process is alive on this host;
@@ -23,16 +27,18 @@
  *      attempt) with the attempt's login — a rotated or different credential
  *      is refused by name;
  *   4. lists the pull request's reviews with that credential (an incomplete
- *      listing changes nothing) and decides: `posted` on proof of creation,
- *      release on proof of non-creation, otherwise RETAIN;
+ *      listing changes nothing) and decides: `posted` when the recorded
+ *      receipt id is listed, otherwise RETAIN;
  *   5. RECORDS the decision before changing anything — a signed Flair OrgEvent
  *      (`kind: pr_review_reconciled`), or, when Flair does not acknowledge it,
- *      an fsync'ed line in a local audit log (its directory fsync'ed when the
- *      file is new) — and says which. If neither can be written, nothing
+ *      an fsync'ed line in a local audit log (its directory fsync'ed before the
+ *      append returns) — and says which. If neither can be written, nothing
  *      changes;
- *   6. applies it under the store lock, only if the entry is unchanged since
- *      step 1 (compare-and-swap).
- * A `posted` latch is final. `clear` exists only to refuse.
+ *   6. applies a `posted` decision under the store lock, only if the entry is
+ *      unchanged since step 1 (compare-and-swap).
+ * A `posted` latch is final. `clear` exists only to refuse. The only release
+ * of a dispatch anywhere is the handler's, on a response that proves its own
+ * POST created nothing (github.ts).
  *
  * ATTRIBUTION. The plugin configures no host principal: the reconciliation
  * event is signed with the REVIEWER's Flair key (signingKeyFile) and its
@@ -63,13 +69,9 @@ export const LATCH_ADMIN_USAGE = [
   "       latch-admin clear     <reconcileFile> <dispatchId>   (refuses: use reconcile)",
 ].join("\n");
 
-/** An attempt younger than this is never released: a review it created may
+/** An attempt younger than this is not reconciled: a review it created may
  *  not be listed yet. */
 export const RECONCILE_MIN_AGE_MS = 10 * 60_000;
-/** A review by the attempt's login on ANOTHER commit is treated as possibly
- *  the attempt's unless it was submitted this long before the reservation. */
-export const SUBMITTED_AT_SKEW_MS = 10 * 60_000;
-
 /** Injection points (tests). Production uses the global fetch and clock. */
 export interface LatchAdminDeps {
   fetchImpl?: typeof fetch;
@@ -84,66 +86,43 @@ type Line = (line: string) => void;
 
 export type ReconcileDecision =
   | { decision: "latch_posted"; matching: ExistingReview[]; reasons: string[] }
-  | { decision: "release"; matching: []; reasons: string[] }
   | { decision: "retain"; matching: []; reasons: string[] };
+
+/** The operator's remedy for a dispatch that stays latched. */
+export const FRESH_DISPATCH_REMEDY =
+  "non-creation cannot be proven, so this dispatch stays latched: to review this pull request again, issue a FRESH dispatch (a new dispatchId)";
 
 type Attempt = LatchRecord & LatchDetails;
 
 /** Decide a reconciliation from a COMPLETE review listing read with the
- *  attempt's own credential.
- *  - PROOF OF CREATION → `latch_posted`: the review id from the attempt's 2xx
- *    receipt, or a submitted review by the attempt's login on its commit.
- *  - Anything that leaves creation possible → `retain`: the attempt is younger
- *    than RECONCILE_MIN_AGE_MS (or its time is unreadable); a receipt id was
- *    recorded (a 2xx proves creation) but is not listed; a pending review; a
- *    review on the attempt's commit by another login; a review with no login;
- *    or a review by the attempt's login on another commit submitted within
- *    SUBMITTED_AT_SKEW_MS before the reservation or later (or with no time).
- *  - Only when none of these holds → `release` (proof of non-creation). */
-export function decideReconciliation(attempt: Attempt, reviews: ExistingReview[], now: Date): ReconcileDecision {
-  const created = reviews.filter(
-    (r) =>
-      (typeof attempt.reviewId === "number" && r.id === attempt.reviewId) ||
-      (r.login === attempt.login && r.commitId === attempt.commit && r.state !== "PENDING"),
-  );
+ *  attempt's own credential. There are two outcomes and NO release:
+ *  - `latch_posted` — the ONE proof: the review id recorded from the attempt's
+ *    2xx receipt is in the listing (whatever its login or commit);
+ *  - `retain` — everything else: an empty listing, an attempt that recorded no
+ *    receipt id, a recorded id that is not listed, and a same-login,
+ *    same-commit review without the recorded id (it may predate the attempt).
+ *  `now` is kept for the record; age is enforced before listing. */
+export function decideReconciliation(attempt: Attempt, reviews: ExistingReview[], _now: Date): ReconcileDecision {
+  const created = typeof attempt.reviewId === "number" ? reviews.filter((r) => r.id === attempt.reviewId) : [];
   if (created.length > 0) {
     return {
       decision: "latch_posted",
       matching: created,
-      reasons: created.map((r) => `review ${r.id} (${r.state}) by ${r.login ?? "?"} on ${r.commitId ?? "?"} is the attempt's`),
+      reasons: created.map((r) => `review ${r.id} (${r.state}) is the one the attempt's 2xx receipt recorded`),
     };
   }
   const reasons: string[] = [];
-  const reservedMs = Date.parse(attempt.reservedAt);
-  if (!Number.isFinite(reservedMs)) reasons.push("the attempt's reservation time is unreadable");
-  else if (now.getTime() - reservedMs < RECONCILE_MIN_AGE_MS) {
-    reasons.push(`the attempt is younger than ${RECONCILE_MIN_AGE_MS / 60_000} minutes: a review it created may not be listed yet`);
-  }
   if (typeof attempt.reviewId === "number") {
-    reasons.push(`the attempt's 2xx receipt proves review ${attempt.reviewId} was created, but the listing does not return it`);
+    reasons.push(`the attempt's 2xx receipt recorded review ${attempt.reviewId}, but the listing does not return it`);
+  } else {
+    reasons.push("the attempt recorded no receipt id, so no listing can show what it created");
   }
   for (const r of reviews) {
-    if (r.state === "PENDING") reasons.push(`review ${r.id} is pending`);
-    else if (r.login === null) reasons.push(`review ${r.id} has no login`);
-    else if (r.commitId === attempt.commit && r.login !== attempt.login) {
-      reasons.push(`review ${r.id} on the attempt's commit is by another login (${r.login})`);
-    } else if (r.login === attempt.login) {
-      const submitted = r.submittedAt === null ? Number.NaN : Date.parse(r.submittedAt);
-      if (!Number.isFinite(submitted) || !Number.isFinite(reservedMs) || submitted >= reservedMs - SUBMITTED_AT_SKEW_MS) {
-        reasons.push(`review ${r.id} by ${r.login} on another commit was submitted around or after the attempt`);
-      }
+    if (r.login === attempt.login && r.commitId === attempt.commit) {
+      reasons.push(`review ${r.id} by ${r.login} on the attempt's commit may be the attempt's, but only the recorded receipt id proves it`);
     }
   }
-  if (reasons.length > 0) return { decision: "retain", matching: [], reasons };
-  return {
-    decision: "release",
-    matching: [],
-    reasons: [
-      `none of the ${reviews.length} listed review(s) is the attempt's or could be: no receipt was recorded, no review is pending, ` +
-        `none on the attempt's commit is by another login, none by ${attempt.login} is recent, and the attempt is older than ` +
-        `${RECONCILE_MIN_AGE_MS / 60_000} minutes`,
-    ],
-  };
+  return { decision: "retain", matching: [], reasons };
 }
 
 function defaultPidAlive(pid: number): boolean {
@@ -231,8 +210,9 @@ function clear(file: string, dispatchId: string, out: Line, err: Line): number {
     return 1;
   }
   err(
-    `latch-admin: refused: dispatch ${dispatchId} is latched ${entry.latch}; only \`latch-admin reconcile <pluginConfig.json> <dispatchId>\` ` +
-      "releases it, and only on proof that no review was created",
+    `latch-admin: refused: dispatch ${dispatchId} is latched ${entry.latch}; nothing releases it — ` +
+      "`latch-admin reconcile <pluginConfig.json> <dispatchId>` latches it posted when its recorded receipt is listed; " +
+      `otherwise ${FRESH_DISPATCH_REMEDY}`,
   );
   return 1;
 }
@@ -409,19 +389,15 @@ async function reconcile(
 
   if (result.decision === "retain") {
     out(recorded);
-    err(`latch-admin: retained: dispatch ${dispatchId} stays ${entry.latch}; non-creation is not proven: ${result.reasons.join("; ")}`);
+    err(`latch-admin: retained: dispatch ${dispatchId} stays ${entry.latch} (${result.reasons.join("; ")}); ${FRESH_DISPATCH_REMEDY}`);
     return 1;
   }
 
-  // 6. Apply under the store lock, only if the entry is unchanged.
+  // 6. Apply `posted` under the store lock, only if the entry is unchanged.
   let applied: boolean;
   try {
-    if (result.decision === "latch_posted") {
-      const { claim: _dropped, ...rest } = entry;
-      applied = store.replaceIf(dispatchId, entry, { ...rest, latch: "posted", reviewId: result.matching[0]!.id });
-    } else {
-      applied = store.replaceIf(dispatchId, entry, null);
-    }
+    const { claim: _dropped, ...rest } = entry;
+    applied = store.replaceIf(dispatchId, entry, { ...rest, latch: "posted", reviewId: result.matching[0]!.id });
   } catch (e) {
     out(recorded);
     return lockFailure(e, err, "the decision was recorded but the latch store could not be updated");
@@ -431,11 +407,7 @@ async function reconcile(
     err(`latch-admin: the latch for ${dispatchId} changed during reconciliation; the decision was recorded but NOT applied — rerun`);
     return 1;
   }
-  out(
-    result.decision === "latch_posted"
-      ? `dispatch ${dispatchId}: ${result.matching.length} review(s) (${result.matching.map((r) => r.id).join(", ")}) prove creation; latched posted`
-      : `dispatch ${dispatchId}: non-creation proven among ${listing.reviews.length} review(s); released`,
-  );
+  out(`dispatch ${dispatchId}: the recorded receipt's review ${result.matching[0]!.id} is listed; latched posted`);
   return 0;
 }
 

@@ -34,9 +34,11 @@ import {
   pluginConfigOf,
   PR,
   REPO,
+  resolver,
   scenario,
   session,
   TOKEN,
+  validAssignment,
   validInput,
   type Scenario,
 } from "./helpers.js";
@@ -172,7 +174,7 @@ describe("A13 — partial outcomes and recovery", () => {
     expect(new FileReconcileStore(s.config.reconcileFile!).entry("dispatch-1")).toMatchObject({ latch: "reconcile_required", reviewId: 9 });
   });
 
-  test("the dispatch latch is durable, and posting resumes only once the HOST's reconciliation finds no review", async () => {
+  test("the dispatch latch is durable and NEVER released by the host's reconciliation of an empty listing: the retry path is a FRESH dispatch", async () => {
     const s = scenario(root);
     const { deps, github } = makeDeps(s);
     github.reviewResult = { ok: false, kind: "ambiguous", detail: "posting returned status 502" };
@@ -180,13 +182,20 @@ describe("A13 — partial outcomes and recovery", () => {
     expect(github.reviewCalls.length).toBe(1);
     // A "restart" reads the same durable latch.
     const restarted = makeDeps(s);
+    const refused = await runGithubReview(validInput(), HOST, restarted.deps);
+    refusedWith(refused, "reconcile_required");
+    if (!refused.ok) expect(refused.remedy).toContain("fresh dispatch");
+    expect(restarted.github.reviewCalls.length).toBe(0);
+    // The host reconciles: an empty listing proves nothing, so the entry stays latched.
+    const errors: string[] = [];
+    expect(await hostReconcile(s, [], { err: errors })).toBe(1);
+    expect(errors.join("\n")).toContain("FRESH dispatch");
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
     expect(restarted.github.reviewCalls.length).toBe(0);
-    // The host reconciles: GitHub shows no review for the dispatch, so it is released.
-    expect(await hostReconcile(s, [])).toBe(0);
-    const after = await runGithubReview(validInput(), HOST, restarted.deps);
-    expect(after.ok && after.status === "posted").toBe(true);
-    expect(restarted.github.reviewCalls.length).toBe(1);
+    // A fresh dispatch (a new dispatchId from the host) reviews again.
+    const fresh = makeDeps(s, { assignments: resolver([validAssignment({ dispatchId: "dispatch-2" })]) });
+    const posted = await runGithubReview(validInput(), HOST, fresh.deps);
+    expect(posted.ok && posted.status === "posted").toBe(true);
   });
 
   test("a 2xx with an invalid receipt is UNKNOWN and the review is RETAINED for the audit", async () => {
@@ -227,7 +236,7 @@ describe("A13 — partial outcomes and recovery", () => {
     expect(github.reviewCalls.length).toBe(1);
     expect(outcomeToJson(o)).not.toContain("/host/secret");
     expect(logs.length).toBe(1);
-    expect(logs[0]).toContain("could not be retained");
+    expect(logs[0]).toContain("not durably confirmed");
     if (o.ok && o.status !== "unknown") expect(logs[0]).toContain(o.auditEventId);
     expect(logs[0]).not.toContain("/host/secret");
   });
@@ -406,6 +415,7 @@ describe("B2 — the durable stores fail closed", () => {
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("stays reserved");
+    expect(logs[0]).toContain("fresh dispatch");
     expect(logs[0]).not.toContain("/host/secret");
   });
 
@@ -440,6 +450,7 @@ describe("B2 — the durable stores fail closed", () => {
     expect(github.reviewCalls.length).toBe(1);
     expect(logs.length).toBe(1);
     expect(logs[0]).toContain("could not be removed");
+    expect(logs[0]).toContain("fresh dispatch");
   });
 });
 
@@ -678,7 +689,7 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     expect(github.reviewCalls.length).toBe(1);
   });
 
-  test("a CRASH between the reservation and the POST: the next call is refused (the claim is held); the host proves non-creation and releases; exactly ONE POST in all", async () => {
+  test("a CRASH between the reservation and the POST: refused (the claim is held); the host's reconciliation keeps it latched; a FRESH dispatch reviews again; no POST for the crashed dispatch", async () => {
     const s = scenario(root);
     const { res, posts } = childRun(s, { mode: "crash-before-post" });
     expect(res.signal).toBe("SIGKILL");
@@ -690,15 +701,21 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
     expect(restarted.github.reviewCalls.length).toBe(0);
 
-    // The claim outlived its process: without --stale-claim reconcile refuses.
+    // The claim outlived its process: without --stale-claim reconcile refuses;
+    // with it, an empty listing proves nothing and the entry stays latched.
     expect(await hostReconcile(s, [])).toBe(1);
-    expect(await hostReconcile(s, [], { staleClaim: true })).toBe(0);
-    const after = await runGithubReview(validInput(), HOST, restarted.deps);
-    expect(after.ok && after.status === "posted").toBe(true);
-    expect(posts() + restarted.github.reviewCalls.length).toBe(1);
+    const errors: string[] = [];
+    expect(await hostReconcile(s, [], { staleClaim: true, err: errors })).toBe(1);
+    expect(errors.join("\n")).toContain("FRESH dispatch");
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
+    expect(posts() + restarted.github.reviewCalls.length).toBe(0);
+    const fresh = makeDeps(s, { assignments: resolver([validAssignment({ dispatchId: "dispatch-2" })]) });
+    const posted = await runGithubReview(validInput(), HOST, fresh.deps);
+    expect(posted.ok && posted.status === "posted").toBe(true);
   }, PROCESS_TEST_TIMEOUT_MS);
 
-  test("a CRASH between the POST and the `posted` write: refused until the host finds the review and latches posted; exactly ONE POST in all", async () => {
+  test("a CRASH between the POST and the `posted` write: no receipt id was recorded, so a same-login same-commit review is NOT proof — the entry stays latched; exactly ONE POST", async () => {
     const s = scenario(root);
     const { res, posts } = childRun(s, { mode: "crash-after-post" });
     expect(res.signal).toBe("SIGKILL");
@@ -716,8 +733,11 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
       url: "https://example.test/r/1",
       submittedAt: new Date().toISOString(),
     };
-    expect(await hostReconcile(s, [review], { staleClaim: true })).toBe(0);
-    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "already_posted");
+    const errors: string[] = [];
+    expect(await hostReconcile(s, [review], { staleClaim: true, err: errors })).toBe(1);
+    expect(errors.join("\n")).toContain("FRESH dispatch");
+    expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
+    refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
     expect(posts() + restarted.github.reviewCalls.length).toBe(1);
   }, PROCESS_TEST_TIMEOUT_MS);
 });

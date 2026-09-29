@@ -101,7 +101,41 @@ describe("durable-file — fsync of the file, atomic rename, fsync of the direct
     expect(JSON.parse(readFileSync(file, "utf8"))).toEqual({ v: 2 });
   });
 
-  test("appendJsonLine fsyncs the log; the FIRST append (which creates it) also fsyncs the directory", () => {
+  test("TWO WRITERS: A creates the log and stalls before its directory fsync; B appends — B does not return before a directory fsync", () => {
+    const file = join(root, "audit.jsonl");
+    const events: string[] = [];
+    const paths = new Map<number, string>();
+    let stalled = false;
+    const open = spyOn(fs, "openSync").mockImplementation(((p: fs.PathLike, flags?: fs.OpenMode, mode?: fs.Mode) => {
+      if (String(p) === root && !stalled) {
+        // Writer A is about to fsync the directory: stall it here and let B run.
+        stalled = true;
+        events.push("A stalls before its directory fsync");
+        appendJsonLine(file, { writer: "B" });
+        events.push("B returned");
+      }
+      const fd = realOpen(p, flags ?? "r", mode);
+      paths.set(fd, String(p));
+      return fd;
+    }) as typeof fs.openSync);
+    const fsync = spyOn(fs, "fsyncSync").mockImplementation(((fd: number) => {
+      events.push(paths.get(fd) === root ? "fsync dir" : "fsync log");
+      realFsync(fd);
+    }) as typeof fs.fsyncSync);
+    try {
+      appendJsonLine(file, { writer: "A" });
+    } finally {
+      open.mockRestore();
+      fsync.mockRestore();
+    }
+    const stall = events.indexOf("A stalls before its directory fsync");
+    const bReturned = events.indexOf("B returned");
+    expect(stall).toBeGreaterThanOrEqual(0);
+    expect(events.slice(stall, bReturned)).toContain("fsync dir");
+    expect(readFileSync(file, "utf8")).toBe('{"writer":"A"}\n{"writer":"B"}\n');
+  });
+
+  test("appendJsonLine fsyncs the log AND its directory before EVERY append returns", () => {
     const file = join(root, "audit.jsonl");
     const synced: string[] = [];
     const paths = new Map<number, string>();
@@ -118,7 +152,7 @@ describe("durable-file — fsync of the file, atomic rename, fsync of the direct
       appendJsonLine(file, { a: 1 });
       expect(synced).toEqual(["log", "dir"]);
       appendJsonLine(file, { a: 2 });
-      expect(synced).toEqual(["log", "dir", "log"]);
+      expect(synced).toEqual(["log", "dir", "log", "dir"]);
     } finally {
       open.mockRestore();
       fsync.mockRestore();

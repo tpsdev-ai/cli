@@ -3,11 +3,11 @@
  * `clear` never changes the store. `reconcile` refuses while the gateway's
  * claim is held (and `--stale-claim` while its process is alive here), refuses
  * a recent attempt, requires the credential and login that made the attempt,
- * and decides from a complete listing: `posted` on proof of creation, release
- * ONLY on proof of non-creation, otherwise retain. It RECORDS the decision (a
- * signed Flair OrgEvent, or a durable local audit line when Flair does not
- * acknowledge) before changing anything, and applies it only if the entry is
- * unchanged.
+ * and NEVER RELEASES: it latches `posted` only when the attempt's RECORDED
+ * receipt id is listed, and otherwise leaves the entry latched and prints the
+ * fresh-dispatch remedy. It RECORDS the decision (a signed Flair OrgEvent, or
+ * a durable local audit line when Flair does not acknowledge) before changing
+ * anything, and applies it only if the entry is unchanged.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -113,7 +113,7 @@ describe("latch-admin list / clear", () => {
   });
 });
 
-describe("decideReconciliation — release ONLY on proof of non-creation", () => {
+describe("decideReconciliation — `posted` ONLY on the recorded receipt id; NEVER a release", () => {
   const attempt = {
     dispatchId: "d-1",
     latch: "reserved" as const,
@@ -127,47 +127,39 @@ describe("decideReconciliation — release ONLY on proof of non-creation", () =>
   const decide = (reviews: ExistingReview[], extra: Partial<typeof attempt & { reviewId: number }> = {}, now = LATER) =>
     decideReconciliation({ ...attempt, ...extra }, reviews, now);
 
-  test("no reviews, no receipt, old enough → release", () => {
-    expect(decide([]).decision).toBe("release");
+  test("an EMPTY listing keeps the latch — with or without a recorded receipt id", () => {
+    expect(decide([]).decision).toBe("retain");
+    expect(decide([], { reviewId: 91 }).decision).toBe("retain");
   });
-  test("reviews that cannot be the attempt's (other commits, other logins, ours long before) → release", () => {
+  test("reviews that cannot be the attempt's still keep the latch: an absent review proves nothing", () => {
     const old = new Date(Date.parse(RESERVED_AT) - 3_600_000).toISOString();
-    expect(decide([review({ id: 1, login: "someone", commitId: OTHER }), review({ id: 2, commitId: OTHER, submittedAt: old })]).decision).toBe("release");
+    expect(decide([review({ id: 1, login: "someone", commitId: OTHER }), review({ id: 2, commitId: OTHER, submittedAt: old })]).decision).toBe("retain");
   });
-  test("the attempt's login on its commit → latch_posted (proof of creation)", () => {
-    expect(decide([review()])).toMatchObject({ decision: "latch_posted", matching: [{ id: 77 }] });
-  });
-  test("the recorded receipt id, whatever its login or commit → latch_posted", () => {
-    expect(decide([review({ id: 91, login: "someone", commitId: OTHER })], { reviewId: 91 })).toMatchObject({ decision: "latch_posted" });
-  });
-  test("a recorded receipt id MISSING from the listing → retain (a 2xx proves creation)", () => {
-    const d = decide([], { reviewId: 91 });
+  test("a same-login, same-commit review WITHOUT the recorded receipt id is uncertain: the latch stays", () => {
+    const d = decide([review()]);
     expect(d.decision).toBe("retain");
+    expect(d.reasons.join()).toContain("77");
+    // Even with a receipt id recorded, a different id on the commit proves nothing.
+    expect(decide([review()], { reviewId: 91 }).decision).toBe("retain");
+  });
+  test("the RECORDED receipt id in the listing — whatever its login or commit — is the one proof: latch_posted", () => {
+    expect(decide([review({ id: 91, login: "someone", commitId: OTHER })], { reviewId: 91 })).toMatchObject({
+      decision: "latch_posted",
+      matching: [{ id: 91 }],
+    });
+  });
+  test("a recorded receipt id MISSING from the listing keeps the latch, naming the id", () => {
+    const d = decide([], { reviewId: 91 });
     expect(d.reasons.join()).toContain("91");
   });
-  test("a review on the attempt's commit by ANOTHER login → retain", () => {
-    const d = decide([review({ login: "someone-else" })]);
-    expect(d.decision).toBe("retain");
-    expect(d.reasons.join()).toContain("another login");
-  });
-  test("a PENDING review → retain — whoever it is by and whichever commit it is on", () => {
-    expect(decide([review({ state: "PENDING", submittedAt: null })]).decision).toBe("retain");
-    const d = decide([review({ state: "PENDING", submittedAt: null, login: "someone", commitId: OTHER })]);
-    expect(d.decision).toBe("retain");
-    expect(d.reasons.join()).toContain("pending");
-  });
-  test("a review with no login → retain", () => {
-    expect(decide([review({ login: null, commitId: OTHER })]).decision).toBe("retain");
-  });
-  test("the attempt's login on ANOTHER commit around or after the attempt (or with no time) → retain", () => {
-    expect(decide([review({ commitId: OTHER })]).decision).toBe("retain");
-    expect(decide([review({ commitId: OTHER, submittedAt: null })]).decision).toBe("retain");
-    const justBefore = new Date(Date.parse(RESERVED_AT) - 60_000).toISOString();
-    expect(decide([review({ commitId: OTHER, submittedAt: justBefore })]).decision).toBe("retain");
-  });
-  test("an attempt younger than the minimum age, or with an unreadable time → retain", () => {
-    expect(decide([], {}, new Date(Date.parse(RESERVED_AT) + 60_000)).decision).toBe("retain");
-    expect(decide([], { reservedAt: "not a time" }).decision).toBe("retain");
+  test("no decision is ever a release", () => {
+    const cases: Array<[ExistingReview[], Partial<typeof attempt & { reviewId: number }>]> = [
+      [[], {}],
+      [[review({ login: "someone-else" })], {}],
+      [[review({ state: "PENDING", submittedAt: null })], {}],
+      [[review({ commitId: OTHER })], { reviewId: 5 }],
+    ];
+    for (const [reviews, extra] of cases) expect(decide(reviews, extra).decision).not.toBe("release");
   });
 });
 
@@ -206,13 +198,14 @@ describe("latch-admin reconcile — refusals before anything is requested", () =
     expect(r.err[0]).toContain("pid 1 is still running");
   });
 
-  test("--stale-claim with the claiming process gone: proceeds, and the record says the claim was overridden", async () => {
+  test("--stale-claim with the claiming process gone: proceeds, records the override — and the entry STAYS latched", async () => {
     const h = host("reserved", { claim: { token: "t", pid: 4242, host: "gw-other", at: RESERVED_AT } });
+    const before = h.before();
     const r = await reconcile(h, [], ["--stale-claim"]);
-    expect(r.code).toBe(0);
+    expect(r.code).toBe(1);
     const detail = JSON.parse((JSON.parse(String(r.flair.requests[0]!.init.body)) as { detail: string }).detail) as Record<string, unknown>;
     expect(detail.stale_claim_overridden).toMatchObject({ pid: 4242, host: "gw-other" });
-    expect(h.store.entry("d-1")).toBeNull();
+    expect(h.before()).toBe(before);
   });
 
   test("an attempt too recent to reconcile: refused with the time to retry after", async () => {
@@ -281,22 +274,24 @@ describe("latch-admin reconcile — refusals before anything is requested", () =
 });
 
 describe("latch-admin reconcile — decisions, records, application", () => {
-  test("proof of non-creation: a signed pr_review_reconciled OrgEvent is acknowledged, THEN the dispatch is released", async () => {
+  test("an EMPTY listing: the decision is recorded (signed pr_review_reconciled), the entry STAYS latched, and the fresh-dispatch remedy is printed", async () => {
     const h = host("reserved");
-    const r = await reconcile(h, [review({ id: 1, login: "someone", commitId: OTHER })]);
-    expect(r.code).toBe(0);
+    const before = h.before();
+    const r = await reconcile(h, []);
+    expect(r.code).toBe(1);
     expect(r.lister.calls).toEqual([{ repo: REPO, pr: PR }]);
     expect(r.out[0]).toContain("signed with the reviewer's key");
-    expect(r.out[1]).toContain("released");
-    expect(h.store.entry("d-1")).toBeNull();
+    expect(r.err[0]).toContain("stays reserved");
+    expect(r.err[0]).toContain("FRESH dispatch");
+    expect(h.before()).toBe(before);
     const event = JSON.parse(String(r.flair.requests[0]!.init.body)) as { id: string; kind: string; authorId: string; detail: string };
     expect(event).toMatchObject({ id: "evt-r", kind: "pr_review_reconciled", authorId: "anvil" });
     const detail = JSON.parse(event.detail) as Record<string, unknown>;
     expect(detail).toMatchObject({
       dispatch_id: "d-1",
       latch_before: "reserved",
-      decision: "release",
-      reviews_listed: 1,
+      decision: "retain",
+      reviews_listed: 0,
       credential_matches_attempt: true,
       command: "latch-admin reconcile",
     });
@@ -306,26 +301,38 @@ describe("latch-admin reconcile — decisions, records, application", () => {
     expect(JSON.stringify(detail)).not.toContain(h.s.custody.bindingSha256()!);
   });
 
-  test("a review by ANOTHER login on the attempt's commit: RETAINED — recorded, not released", async () => {
+  test("a same-login, same-commit review WITHOUT the recorded receipt id: the entry STAYS latched, fresh-dispatch remedy printed", async () => {
+    for (const latch of ["reserved", "reconcile_required"] as const) {
+      rmSync(root, { recursive: true, force: true });
+      root = mkdtempSync(join(tmpdir(), "gr-latch-"));
+      const h = host(latch);
+      const before = h.before();
+      const r = await reconcile(h, [review()]);
+      expect(r.code).toBe(1);
+      expect(r.err[0]).toContain("FRESH dispatch");
+      expect(h.before()).toBe(before);
+    }
+  });
+
+  test("a review by ANOTHER login on the attempt's commit: the entry STAYS latched", async () => {
     const h = host("reserved");
     const before = h.before();
     const r = await reconcile(h, [review({ login: "someone-else" })]);
     expect(r.code).toBe(1);
-    expect(r.err[0]).toContain("retained");
     expect(h.before()).toBe(before);
     expect(JSON.parse((JSON.parse(String(r.flair.requests[0]!.init.body)) as { detail: string }).detail)).toMatchObject({ decision: "retain" });
   });
 
-  test("the dispatch's review exists: recorded, then latched POSTED — never released", async () => {
-    const h = host("reserved");
+  test("the RECORDED receipt id is listed: recorded, then latched POSTED", async () => {
+    const h = host("reconcile_required", { reviewId: 77 });
     const r = await reconcile(h, [review()]);
     expect(r.code).toBe(0);
     expect(r.out[1]).toContain("latched posted");
     expect(h.store.entry("d-1")).toMatchObject({ latch: "posted", reviewId: 77 });
   });
 
-  test("Flair does not acknowledge: the decision goes to the LOCAL audit log (file AND new directory entry fsync'ed) BEFORE the release", async () => {
-    const h = host("reserved");
+  test("Flair does not acknowledge: the decision goes to the LOCAL audit log (file AND directory fsync'ed) BEFORE the latch changes", async () => {
+    const h = host("reconcile_required", { reviewId: 77 });
     const auditLog = join(root, "latch-audit.jsonl");
     const steps: string[] = [];
     const realOpen = fs.openSync.bind(fs);
@@ -350,7 +357,7 @@ describe("latch-admin reconcile — decisions, records, application", () => {
     let r: Awaited<ReturnType<typeof run>>;
     try {
       r = await run(["reconcile", h.configFile, "d-1", "--audit-log", auditLog], {
-        lister: new FakeReviewLister(),
+        lister: new FakeReviewLister({ ok: true, reviews: [review()] }),
         fetchImpl: fakeFlairFetch(503).fetchImpl,
         newId: () => "evt-local",
       });
@@ -366,14 +373,14 @@ describe("latch-admin reconcile — decisions, records, application", () => {
     const line = JSON.parse(readFileSync(auditLog, "utf8").trim()) as { flair_failure: string; event: { id: string; kind: string; detail: string } };
     expect(line.flair_failure).toContain("503");
     expect(line.event).toMatchObject({ id: "evt-local", kind: "pr_review_reconciled" });
-    expect(h.store.entry("d-1")).toBeNull();
+    expect(h.store.get("d-1")).toBe("posted");
   });
 
-  test("neither Flair nor the local audit log can record it: NOTHING changes", async () => {
-    const h = host("reserved");
+  test("neither Flair nor the local audit log can record it: NOTHING changes — even when the recorded receipt id is listed", async () => {
+    const h = host("reconcile_required", { reviewId: 77 });
     const before = h.before();
     const r = await run(["reconcile", h.configFile, "d-1", "--audit-log", join(root, "no-such-dir", "audit.jsonl")], {
-      lister: new FakeReviewLister(),
+      lister: new FakeReviewLister({ ok: true, reviews: [review()] }),
       fetchImpl: fakeFlairFetch(503).fetchImpl,
     });
     expect(r.code).toBe(1);
@@ -382,21 +389,24 @@ describe("latch-admin reconcile — decisions, records, application", () => {
   });
 
   test("the entry CHANGED between the check and the apply: recorded, NOT applied", async () => {
-    const h = host("reserved");
+    const h = host("reconcile_required", { reviewId: 77 });
     class ChangingLister extends FakeReviewLister {
       override async listReviews(repo: string, pr: number) {
-        h.store.put({ ...h.store.entry("d-1")!, latch: "reconcile_required" });
+        h.store.put({ ...h.store.entry("d-1")!, login: "changed" });
         return super.listReviews(repo, pr);
       }
     }
-    const r = await run(["reconcile", h.configFile, "d-1"], { lister: new ChangingLister(), fetchImpl: fakeFlairFetch(200).fetchImpl });
+    const r = await run(["reconcile", h.configFile, "d-1"], {
+      lister: new ChangingLister({ ok: true, reviews: [review()] }),
+      fetchImpl: fakeFlairFetch(200).fetchImpl,
+    });
     expect(r.code).toBe(1);
     expect(r.err[0]).toContain("NOT applied");
     expect(h.store.get("d-1")).toBe("reconcile_required");
   });
 
   test("a stale store lock at apply time: recorded, nothing changed, the lock path and remedy printed", async () => {
-    const h = host("reserved");
+    const h = host("reconcile_required", { reviewId: 77 });
     const lock = `${h.s.config.reconcileFile!}.lock`;
     class LockingLister extends FakeReviewLister {
       override async listReviews(repo: string, pr: number) {
@@ -404,11 +414,14 @@ describe("latch-admin reconcile — decisions, records, application", () => {
         return super.listReviews(repo, pr);
       }
     }
-    const r = await run(["reconcile", h.configFile, "d-1"], { lister: new LockingLister(), fetchImpl: fakeFlairFetch(200).fetchImpl });
+    const r = await run(["reconcile", h.configFile, "d-1"], {
+      lister: new LockingLister({ ok: true, reviews: [review()] }),
+      fetchImpl: fakeFlairFetch(200).fetchImpl,
+    });
     expect(r.code).toBe(1);
     expect(r.err[0]).toContain(lock);
     expect(r.err[0]).toContain("remove");
-    expect(h.store.get("d-1")).toBe("reserved");
+    expect(h.store.get("d-1")).toBe("reconcile_required");
   });
 
   test("the reconciliation event's Ed25519 signature verifies with the REVIEWER's key", async () => {

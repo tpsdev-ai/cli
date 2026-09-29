@@ -15,8 +15,9 @@
  * fails nothing is posted. A validated receipt settles it `posted` (every
  * later call: `already_posted`); an uncertain outcome settles it
  * `reconcile_required`; a response that PROVES no review was created
- * (github.ts) removes it. Any other latch refuses every call until the host's
- * reconciliation proves non-creation. The tool also declares `executionMode:
+ * (github.ts) removes it — the ONLY release. Any other latch refuses every
+ * call: the host's reconciliation can only confirm `posted` from a recorded
+ * receipt, and a further review is a fresh dispatch. The tool also declares `executionMode:
  * "sequential"`; the guards do not depend on it.
  *
  * NO THROW AFTER THE POST: the fallible metadata (event id, timestamp,
@@ -228,7 +229,7 @@ function inFlightRefusal(actor: string): Outcome {
     "dispatch_in_flight",
     actor,
     "another github_review call holds this dispatch's claim (in this or another gateway process), or one stopped without recording its outcome",
-    "wait for that call's outcome; if none is running, the host reconciles the dispatch (latch-admin reconcile)",
+    "wait for that call's outcome; if none is running, the dispatch stays latched: a further review needs a fresh dispatch from the host",
   );
 }
 
@@ -259,7 +260,7 @@ function latchedRefusal(record: LatchRecord, actor: string): Outcome {
     latched === "reserved"
       ? "a previous attempt for this dispatch did not record its outcome; its review may exist"
       : "a previous post for this dispatch has an unknown external state",
-    "the host must reconcile the dispatch (latch-admin reconcile), which releases it only when it proves no review was created",
+    "the dispatch stays latched (the host's latch-admin reconcile only confirms a recorded receipt): a further review needs a fresh dispatch from the host",
   );
 }
 
@@ -382,7 +383,7 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
         safeLog(
           deps,
           `openclaw-github-review: the reservation for dispatch ${dispatchId} could not be removed after a response proving no review was ` +
-            "created; it stays reserved with this call's claim. Restart the gateway, then reconcile it (latch-admin reconcile --stale-claim).",
+            "created; it stays reserved with this call's claim, and refuses every call: a further review needs a fresh dispatch.",
         );
       }
       return refuse("github_rejected", actor, result.detail, "correct the review and retry");
@@ -443,7 +444,7 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
     }
     // Complete success only when the audit write was acknowledged. A failed
     // audit is `posted_audit_pending` when retained for host-side retry and
-    // `posted_audit_unretained` when even retention failed.
+    // `posted_audit_unretained` when retention was not durably confirmed.
     const status =
       auditState === "acknowledged" ? "posted" : auditState === "retained" ? "posted_audit_pending" : "posted_audit_unretained";
     return { ok: true, status, reviewId: receipt.id, reviewUrl: receipt.url, commitId: head, auditEventId, login };
@@ -531,13 +532,13 @@ function settleLatch(
     safeLog(
       deps,
       `openclaw-github-review: the ${latch} latch for dispatch ${dispatchId} could not be written; the dispatch stays reserved with ` +
-        "this call's claim and refuses every call. Restart the gateway, then reconcile it (latch-admin reconcile --stale-claim).",
+        "this call's claim and refuses every call: a further review needs a fresh dispatch.",
     );
   }
 }
 
 /** Write the audit record; on failure retain it for host-side retry. Never
- *  throws. When even retention fails, one host log line (no path) naming the
+ *  throws. When retention is not durably confirmed, one host log line (no path) naming the
  *  event is attempted so the host can record it. */
 async function recordAudit(
   deps: HandlerDeps,
@@ -554,8 +555,8 @@ async function recordAudit(
     } catch {
       safeLog(
         deps,
-        `openclaw-github-review: audit record ${draft.id} (${subject}) was not acknowledged and could not be retained for retry; ` +
-          "record it on the host.",
+        `openclaw-github-review: audit record ${draft.id} (${subject}) was not acknowledged and its retention for retry was not ` +
+          "durably confirmed; check pendingAuditFile and record it on the host if it is absent.",
       );
       return "unretained";
     }

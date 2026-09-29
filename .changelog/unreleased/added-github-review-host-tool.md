@@ -40,34 +40,37 @@
   can only be built from a readable 2xx receipt. A validated receipt is
   reported `posted` (audit acknowledged), `posted_audit_pending` (retained and
   retried at the next start, without reposting) or `posted_audit_unretained`
-  (the review exists, its audit record is lost, a host log line is attempted).
+  (the review exists; the audit was not acknowledged and its retention for
+  retry was not durably confirmed; a host log line is attempted).
   A 2xx whose receipt does not match is `unknown` (`receipt_invalid`) with the
   audit attempted; one whose receipt cannot be read, and an ambiguous
   response, are `unknown` with NO audit record. Every `unknown` leaves the
-  dispatch latched for the host's reconciliation.
+  dispatch latched.
 
   **At most one verdict per dispatch, for the processes that share the latch
-  store's lock, unless the host's reconciliation proves non-creation.** Every
-  latch-store operation runs under one exclusive O_EXCL lock per store file
-  (one host, local filesystem; a stale lock fails closed with its path and the
-  remedy). Before the review is posted the dispatch is claimed — `reserved`
-  plus this call's claim, one atomic check-and-write, durable (unique
-  exclusive temp file, fsync, atomic rename, fsync'ed directory) — and nothing
-  is posted if that fails. The claim is held across the POST. A validated
-  receipt latches `posted` (final: `already_posted`); an uncertain outcome
-  latches `reconcile_required`. Exactly two things release a dispatch: the
-  handler, on a response proving no review was created (401/403/404/422 that
-  carry GitHub's request id — 408, 429, other 4xx, 5xx and transport failures
-  are ambiguous); and the host's `latch-admin reconcile`, which refuses while
-  the claim is held, refuses a recent attempt, requires the credential (by
-  fingerprint) and login that made the attempt, lists the pull request's
-  reviews with it, and releases only when no review can be the attempt's —
-  retaining on any uncertain match — after recording its decision as a Flair
-  event signed with the reviewer's key (the OS account that ran it recorded as
-  `invoked_by`), or as a durable local audit line when Flair does not
-  acknowledge. After the POST the handler returns an outcome without throwing.
-  Both durable stores must be readable and writable before any request, and
-  an unparsable store is never overwritten.
+  store's lock.** Every read-modify-write of a store runs under one exclusive
+  O_EXCL lock per store file (one host, local filesystem; a stale lock fails
+  closed with its path and the remedy). Before the review is posted the
+  dispatch is claimed — `reserved` plus this call's claim, one atomic
+  check-and-write, durable (unique exclusive temp file, fsync, atomic rename,
+  fsync'ed directory) — and nothing is posted if that fails. The claim is held
+  across the POST. A validated receipt latches `posted` (final:
+  `already_posted`); an uncertain outcome latches `reconcile_required`.
+  Exactly ONE thing releases a dispatch: the handler, on a response proving
+  its own POST created no review (401/403/404/422 that carry GitHub's request
+  id — 408, 429, other 4xx, 5xx and transport failures are ambiguous). The
+  host's `latch-admin reconcile` never releases: it refuses while the claim is
+  held and on a recent attempt, requires the credential (by fingerprint) and
+  login that made the attempt, lists the pull request's reviews with it, and
+  latches `posted` only when the attempt's recorded receipt id is listed;
+  otherwise — an empty listing, or a same-login same-commit review without
+  that id — the dispatch stays latched and it tells the operator to issue a
+  fresh dispatch. It records its decision first, as a Flair event signed with
+  the reviewer's key (the OS account that ran it recorded as `invoked_by`), or
+  as a local audit line whose file and directory are fsync'ed before every
+  append returns. After the POST the handler returns an outcome without
+  throwing. Both durable stores must be readable and writable before any
+  request, and an unparsable store is never overwritten.
 
   **A permanent gateway-boundary lane** runs the BUILT plugin in a node process
   against the pinned OpenClaw 2026.8.1: it registers through OpenClaw's loader

@@ -50,15 +50,14 @@ input, none of it trusted on its own — and:
    | --- | --- | --- | --- |
    | `posted` | 2xx, receipt validates | acknowledged by Flair | `posted` (final) |
    | `posted_audit_pending` | 2xx, receipt validates | not acknowledged; retained in `pendingAuditFile` and retried at the next gateway start, without reposting | `posted` |
-   | `posted_audit_unretained` | 2xx, receipt validates | not acknowledged AND not retained: lost; one host log line naming the event id is attempted | `posted` |
+   | `posted_audit_unretained` | 2xx, receipt validates | not acknowledged, and its retention for retry not durably confirmed (a retention write may have become visible before failing); one host log line naming the event id is attempted | `posted` |
    | `unknown` (`receipt_invalid`) | 2xx, receipt does not match the request | attempted as for a validated receipt; the result carries its id only when acknowledged | `reconcile_required` |
    | `unknown` (`receipt_invalid`) | 2xx, receipt unreadable | none (no receipt to build it from) | `reconcile_required`, with the review id when readable |
    | `unknown` (`reconcile_required`) | ambiguous (see 7) | none | `reconcile_required` |
    | refused `github_rejected` | a response that proves no review was created (see 7) | none | released |
 
 6. **Posts at most one verdict per dispatch — for the processes that share the
-   latch store's lock — unless the host's reconciliation proves the attempt
-   created nothing.** Before the review is POSTed the dispatch is CLAIMED: under
+   latch store's lock.** Before the review is POSTed the dispatch is CLAIMED: under
    the store's exclusive lock, one check-and-write records `reserved` together
    with this call's claim, so of two calls or processes claiming one dispatch
    exactly one succeeds (see Dispatch latches); if the claim cannot be made
@@ -67,9 +66,13 @@ input, none of it trusted on its own — and:
    `already_posted`; a further review needs a fresh dispatch); an uncertain
    outcome settles it `reconcile_required`. A dispatch whose claim is still
    held — in flight, or left by a process that stopped — is refused with
-   `dispatch_in_flight`; any other latch is refused. Exactly two things
-   release a dispatch: the handler, on a response that proves no review was
-   created; and the host's `latch-admin reconcile`, on proof of non-creation.
+   `dispatch_in_flight`; any other latch is refused. Exactly ONE thing
+   releases a dispatch: the handler, on a response that proves its own POST
+   created no review (see 7). Nothing independent can prove that a POST which
+   may have started created nothing, so the host's `latch-admin reconcile`
+   never releases: it latches `posted` when the recorded receipt id is listed,
+   and otherwise the dispatch stays latched — a further review is a FRESH
+   dispatch.
    The tool also declares `executionMode: "sequential"`; OpenClaw 2026.8.1
    honours it on a freshly resolved tool but drops it on its cached tool
    descriptors, so the guards do not depend on it. The latch file is
@@ -92,7 +95,8 @@ input, none of it trusted on its own — and:
    and the pending-audit file) must be configured, and must be readable and
    writable before any request (`store_unconfigured` / `store_unavailable`). A
    missing store file is empty; an unreadable or unparsable one is an error and
-   is never overwritten. Every read-modify-write runs under the store's
+   is never overwritten. Every read-modify-write (not every read, and not the
+   pre-request probes) runs under the store's
    exclusive lock (an O_EXCL lock file, `<store>.lock`); the lock serializes
    the processes on ONE host that use the same file on a LOCAL filesystem —
    that is its scope. A lock whose holder died is stale: operations fail
@@ -200,8 +204,8 @@ a 2xx receipt, and — while the gateway holds it — the claim (pid, host, time
 
 | Latch | Set when | Tool refusal | Who can release it |
 | --- | --- | --- | --- |
-| `reserved` + claim | durably, BEFORE the review is POSTed; the claim is held across the POST | `dispatch_in_flight` | the handler, on a proved rejection; the host, on proved non-creation once the claim is gone |
-| `reconcile_required` | the outcome is uncertain: an ambiguous response, or a 2xx whose receipt does not match or cannot be read | `reconcile_required` | the host, on proved non-creation |
+| `reserved` + claim | durably, BEFORE the review is POSTed; the claim is held across the POST | `dispatch_in_flight` | only the handler that holds the claim, on a proved rejection (401/403/404/422 with GitHub's request id). Nobody else — not after the claim is gone, and not after `--stale-claim` overrides a claim still stored on the entry. A further review is a fresh dispatch |
+| `reconcile_required` | the outcome is uncertain: an ambiguous response, or a 2xx whose receipt does not match or cannot be read | `reconcile_required` | nobody. `reconcile` latches it `posted` when its recorded receipt id is listed; a further review is a fresh dispatch |
 | `posted` | the dispatch's review exists | `already_posted` | nobody: final. A further review is a fresh dispatch |
 
 The host's command, shipped in the package, run on the gateway host as the
@@ -227,28 +231,31 @@ its `plugins.entries` config). `reconcile`:
    (`credential_mismatch`, `login_mismatch`), and such a dispatch stays latched
    — a further review needs a fresh dispatch;
 4. lists every review on the pull request with that credential (a listing it
-   cannot complete changes nothing) and decides:
-   - **latch `posted`** on proof of creation: the review id from the attempt's
-     2xx receipt, or a submitted review by the attempt's login on its commit;
-   - **retain** when creation remains possible: a recorded receipt id that is
-     not listed; a pending review; a review on the attempt's commit by another
-     login; a review without a login; a review by the attempt's login on
-     another commit submitted within 10 minutes before the attempt or later;
-   - **release** only when none of the above holds;
+   cannot complete changes nothing) and decides — there is NO release:
+   - **latch `posted`** only on proof: the review id recorded from the
+     attempt's 2xx receipt is in the listing;
+   - **retain** in every other case — an empty listing, an attempt that
+     recorded no receipt id, a recorded id that is not listed, a review by the
+     attempt's login on its commit WITHOUT the recorded id (it may predate the
+     attempt) — and print the remedy: the dispatch stays latched; to review the
+     pull request again, issue a FRESH dispatch (a new dispatchId). That is
+     also the retry path after a credential rotation;
 5. RECORDS the decision before changing anything: a Flair `OrgEvent` (`kind:
    pr_review_reconciled`), or — when Flair does not acknowledge it — one line
-   in the local audit log (`<reconcileFile>.audit.jsonl` by default), fsync'ed,
-   with its directory fsync'ed when the file is new; it prints which. If
-   neither can be written, nothing changes;
-6. applies the decision under the store lock, only if the entry is unchanged
-   since step 1.
+   in the local audit log (`<reconcileFile>.audit.jsonl` by default), with the
+   line AND its directory fsync'ed before every append returns (another writer
+   may have created the file); it prints which. If neither can be written,
+   nothing changes;
+6. applies a `posted` decision under the store lock, only if the entry is
+   unchanged since step 1.
 
 ATTRIBUTION. The plugin configures no host principal: the reconciliation event
 is signed with the REVIEWER's Flair key (`signingKeyFile`) and its `authorId` is
 the reviewer. The only operator identity the command knows is the OS account
 that ran it (user, uid, host, pid), recorded as `invoked_by`.
 
-`clear` never changes the store: it points at `reconcile`. A store file the
+`clear` never changes the store: it points at `reconcile` and the fresh-dispatch
+remedy. A store file the
 command cannot parse is refused and left untouched: repair it by hand. A stale
 lock is reported with its path and the remedy.
 

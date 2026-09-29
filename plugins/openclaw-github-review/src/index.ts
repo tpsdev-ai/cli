@@ -8,10 +8,10 @@
  * GitHub credential is read once, here, into a #private field of the custody
  * object and is never re-read or disclosed. A review created with a readable
  * receipt gets a signed Flair OrgEvent, or a result saying its audit is
- * pending or lost; an uncertain outcome is `unknown` (handler.ts). A dispatch
- * posts at most one verdict — for the processes sharing the latch store's lock
- * — unless the host's reconciliation proves non-creation (dispatch-ledger.ts,
- * latch-admin.ts).
+ * pending or not durably confirmed; an uncertain outcome is `unknown`
+ * (handler.ts). A dispatch posts at most one verdict, for the processes
+ * sharing the latch store's lock; only a response proving its own POST created
+ * nothing releases it (dispatch-ledger.ts, latch-admin.ts).
  *
  * This plugin depends on the mail plugin in NO way: it has its own
  * installation, deployment and rollback lifecycle.
