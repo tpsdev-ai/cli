@@ -3,6 +3,11 @@
  * workflow, with the jobs it `needs`, into the review build's plan, or refuse by
  * name.
  *
+ * The plan feeds review-build-ok, which is advisory evidence for the reviewer,
+ * not a merge gate (CI stays the gate). Where a workflow feature cannot be
+ * reproduced faithfully and cheaply, it is refused rather than approximated;
+ * the fidelity limits that remain are named in docker/reviewer/README.md.
+ *
  * The host names the workflow, the job and the pull request's base branch (see
  * reviewer-launch.mjs); nothing about which job runs is inferred from the
  * workflow's text. The workflow is bounded before and after parsing (bytes,
@@ -20,22 +25,26 @@
  * schedule or by hand is refused.
  *
  * JOBS. The named job and its `needs` closure are planned, dependencies first.
- * A job runs only if every job it needs succeeded (or its `if:` is `always()`);
- * the build passes only if every job in the closure ran and succeeded.
+ * Every job must begin with actions/checkout (a CI runner starts empty) and
+ * run on a verified runner label (RUNNER_LABELS). A job runs only if every job
+ * it needs succeeded (or its `if:` is `always()`); the build passes only if
+ * every job in the closure ran and succeeded.
  *
  * WHAT IS HONOURED in a job: `run:` steps, with `working-directory`,
  * `shell: bash`, plain `env:` values (workflow, job and step level) and
  * `defaults.run` (shell/working-directory); `if:` when it is absent, `true`,
- * `success()` or `always()`; `needs`; `runs-on:` an x86_64
- * `ubuntu-latest` / `ubuntu-<version>` runner.
+ * `success()` or `always()`; `needs`; `timeout-minutes` on the job (default
+ * 360) and on steps, which the launcher enforces.
  *
  * WHAT IS SKIPPED (named in the plan, with the reason): the actions in
  * SKIPPED_ACTIONS, each only at a reviewed immutable ref (a full commit SHA whose
- * release tag and action.yml inputs were checked) and only with inputs whose
- * skip semantics were checked. Any other ref of those actions is refused.
- * Ignored job keys: name, permissions (scopes a token the sandbox never has),
- * concurrency, outputs (consumed only through `${{ }}`, which is refused) and
- * timeout-minutes (a hung step never exits 0, so it can never pass).
+ * release tag and action.yml inputs were checked), only with every input the
+ * real action needs, and only with input values whose skip is equivalent.
+ * checkout only as a job's first step, on a worktree the launcher verifies is
+ * the fresh clone checkout would produce. Any other ref of those actions is
+ * refused. Ignored job keys: name, permissions (scopes a token the sandbox
+ * never has), concurrency and outputs (consumed only through `${{ }}`, which is
+ * refused).
  *
  * WHAT IS REFUSED (anything else): any other action or ref (including local
  * `./` and `docker://` actions), a `${{ }}` expression in a script, env value or
@@ -57,6 +66,14 @@ export const BRANCH_RE = /^(?!\/)(?!.*\/$)(?!.*\.\.)[A-Za-z0-9._/-]+$/;
 export const MAX_WORKFLOW_BYTES = 256 * 1024;
 export const MAX_YAML_NODES = 50_000;
 export const MAX_YAML_DEPTH = 32;
+/** GitHub-hosted runners stop a job at 360 minutes; it is also the default job timeout. */
+export const MAX_JOB_MINUTES = 360;
+/**
+ * The runner labels the image stands in for: GitHub-hosted x86_64 Ubuntu 24.04.
+ * ubuntu-latest is what tpsdev-ai/cli and tpsdev-ai/flair use; the cli CI log
+ * of 2026-09-27 shows it resolving to "Image: ubuntu-24.04".
+ */
+export const RUNNER_LABELS = new Set(["ubuntu-latest", "ubuntu-24.04"]);
 
 const refuse = (kind, message) => ({ ok: false, refusal: { kind, message } });
 const isPlainObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -64,8 +81,8 @@ const hasExpression = (v) => typeof v === "string" && v.includes("${{");
 const PRINTABLE_ASCII_KEY_RE = /^[\x20-\x7e]+$/;
 
 const TOP_KEYS = new Set(["name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"]);
-const JOB_KEYS_HONOURED = new Set(["runs-on", "if", "env", "defaults", "steps", "continue-on-error", "needs"]);
-const JOB_KEYS_IGNORED = new Set(["name", "permissions", "concurrency", "outputs", "timeout-minutes"]);
+const JOB_KEYS_HONOURED = new Set(["runs-on", "if", "env", "defaults", "steps", "continue-on-error", "needs", "timeout-minutes"]);
+const JOB_KEYS_IGNORED = new Set(["name", "permissions", "concurrency", "outputs"]);
 const STEP_KEYS = new Set([
   "name",
   "id",
@@ -166,18 +183,45 @@ export function forbiddenEnvReason(key) {
 
 // ─── the actions a review build skips ────────────────────────────────────────
 
-/** Root files the resolver already reads: a *-version-file naming one adds nothing new. */
-const NODE_VERSION_FILES = new Set([".nvmrc", ".node-version", ".tool-versions"]);
-const BUN_VERSION_FILES = new Set([".bun-version", ".tool-versions", "package.json"]);
+// Input rules. A rule returns null when the value's skip is equivalent to what
+// the real action does with it, or the reason it is not. Only the "anything"
+// rule admits `${{ }}` (for inputs the real action cannot fail on and a skipped
+// step never evaluates).
+const EXACT_VERSION_RE = /^\d+\.\d+\.\d+$/;
+const anything = () => null;
+const literal = (text) => (hasExpression(text) ? "uses a ${{ }} expression, which only the Actions runner can evaluate" : null);
+const oneOf =
+  (...allowed) =>
+  (text) =>
+    allowed.includes(text) ? null : `is ${JSON.stringify(text)}; a skipped step reproduces only ${allowed.join(" or ")}`;
+const intBetween = (lo, hi) => (text) =>
+  /^\d+$/.test(text) && Number(text) >= lo && Number(text) <= hi ? null : `is ${JSON.stringify(text)}; the action accepts only an integer from ${lo} to ${hi}`;
+const exactVersion = (text) =>
+  EXACT_VERSION_RE.test(text)
+    ? null
+    : `is ${JSON.stringify(text)}; CI resolves a range or alias at run time, so only an exact version (X.Y.Z) is reproduced`;
+const nonEmpty = (text) => (text.trim() === "" ? "is empty; the action requires it" : null);
+/** actions/cache rejects a key longer than 512 characters or containing a comma. */
+const cacheKey = (text) => {
+  if (text.trim() === "") return "is empty; the action requires it";
+  if (hasExpression(text)) return null;
+  return text.length > 512 || text.includes(",") ? "is a key actions/cache rejects (longer than 512 characters or containing a comma)" : null;
+};
+/** upload-artifact v4 rejects these characters in an artifact name. */
+const artifactName = (text) =>
+  hasExpression(text)
+    ? "uses a ${{ }} expression; the name's uniqueness in the run cannot be checked"
+    : /[":<>|*?\r\n\\/]/.test(text) || text.trim() === ""
+      ? `is ${JSON.stringify(text)}, a name upload-artifact rejects`
+      : null;
 
 /**
  * Each skipped action is accepted ONLY at a reviewed immutable ref: a full
  * commit SHA whose release tag (noted beside it) and action.yml inputs were
- * checked. `inputs` is the accepted `with:` key set; `values` restricts a key to
- * the values whose skip semantics were checked; `expressions` lists the inputs
- * that may carry `${{ }}` because a skipped step never evaluates them. `pin`
- * turns inputs into runtime requirements; `shim` names a wrapper the image
- * provides in the action's place.
+ * checked. `inputs` maps every accepted `with:` key to its rule; `required`
+ * lists the inputs without which the real action fails; `pin` turns inputs into
+ * runtime requirements; `shim` names a wrapper the image provides in the
+ * action's place. An input not listed is refused.
  */
 export const SKIPPED_ACTIONS = {
   "actions/checkout": {
@@ -185,54 +229,44 @@ export const SKIPPED_ACTIONS = {
       "11bd71901bbe5b1630ceea73d27597364c9af683": "v4.2.2",
       "34e114876b0b11c390a56381ad16ebd13914f8d5": "v4.3.1",
     },
-    reason: "the workspace is the host-created worktree at the assigned head",
-    // persist-credentials only decides whether a token is written to .git/config
-    // (the sandbox has none); fetch-depth, clean and show-progress do not change
-    // the checked-out tree.
-    inputs: new Set(["persist-credentials", "fetch-depth", "clean", "show-progress"]),
+    reason: "the workspace is the host-created clone at the assigned head, verified fresh before the job",
+    // Accepted only as a job's first step; the launcher then requires a fresh
+    // clone: no modified, untracked or ignored file, and history shaped as the
+    // fetch-depth asks (1: a one-commit shallow clone; 0: a full clone).
+    // persist-credentials only decides whether CI writes a token into
+    // .git/config (the review never has one); clean is what a fresh clone
+    // already is; show-progress is logging.
+    inputs: {
+      "persist-credentials": oneOf("true", "false"),
+      "fetch-depth": oneOf("0", "1"),
+      clean: oneOf("true", "false"),
+      "show-progress": oneOf("true", "false"),
+    },
   },
   "oven-sh/setup-bun": {
     refs: {
       "735343b667d3e6f658f44d0eca948eb6282f2b76": "v2.0.2",
       "0c5077e51419868618aeaa5fe8019c62421857d6": "v2.2.0",
     },
-    reason: "the image provides bun; the pin is verified against the actual runtime",
-    inputs: new Set(["bun-version", "bun-version-file", "no-cache"]),
-    pin(withInputs, source) {
-      if (withInputs["bun-version"] !== undefined) {
-        return { ok: true, pins: [{ tool: "bun", range: String(withInputs["bun-version"]), source: `${source} bun-version` }] };
-      }
-      const file = withInputs["bun-version-file"];
-      if (file !== undefined) {
-        if (BUN_VERSION_FILES.has(String(file))) return { ok: true, pins: [] };
-        return refuse("ci-unhonourable", `${source} reads bun-version-file "${file}", which the resolver does not read; pin bun-version`);
-      }
-      return refuse("ambiguous", `${source} sets no bun-version, so CI installs whatever bun is latest; pin bun-version`);
-    },
+    reason: "the image provides bun; the exact pin is verified against the actual runtime",
+    inputs: { "bun-version": exactVersion, "no-cache": oneOf("true", "false") },
+    required: ["bun-version"],
+    pin: (withInputs, source) => [{ tool: "bun", range: String(withInputs["bun-version"]), source: `${source} bun-version` }],
   },
   "actions/setup-node": {
     refs: { "49933ea5288caeca8642d1e84afbd3f7d6820020": "v4.4.0" },
-    reason: "the image provides node; the pin is verified against the actual runtime",
-    inputs: new Set(["node-version", "node-version-file", "cache", "cache-dependency-path", "check-latest"]),
-    values: { "check-latest": ["false"] },
-    pin(withInputs, source) {
-      if (withInputs["node-version"] !== undefined) {
-        return { ok: true, pins: [{ tool: "node", range: String(withInputs["node-version"]), source: `${source} node-version` }] };
-      }
-      const file = withInputs["node-version-file"];
-      if (file !== undefined && !NODE_VERSION_FILES.has(String(file))) {
-        return refuse("ci-unhonourable", `${source} reads node-version-file "${file}", which the resolver does not read; pin node-version`);
-      }
-      return { ok: true, pins: [] };
-    },
+    reason: "the image provides node; the exact pin is verified against the actual runtime",
+    inputs: { "node-version": exactVersion, "check-latest": oneOf("false") },
+    required: ["node-version"],
+    pin: (withInputs, source) => [{ tool: "node", range: String(withInputs["node-version"]), source: `${source} node-version` }],
   },
   "socketdev/action": {
     refs: { ba6de6cc0565af1f42295590380973573297e31f: "v1.3.2" },
     reason: "Socket Firewall is not reproduced in the sandbox; `sfw <cmd>` runs <cmd> unwrapped",
     // firewall-free installs the `sfw` wrapper and nothing else; `patch` mode
     // rewrites dependencies and cannot be skipped.
-    inputs: new Set(["mode"]),
-    values: { mode: ["firewall-free"] },
+    inputs: { mode: oneOf("firewall-free") },
+    required: ["mode"],
     shim: "sfw",
   },
   "actions/cache": {
@@ -241,18 +275,34 @@ export const SKIPPED_ACTIONS = {
       "0057852bfaa89a56745cba8c7296529d2fc39830": "v4.3.0",
     },
     reason: "a cold build is never greener than a cached one",
-    inputs: new Set(["path", "key", "restore-keys", "enableCrossOsArchive", "lookup-only", "save-always", "upload-chunk-size", "fail-on-cache-miss"]),
-    // fail-on-cache-miss: true fails CI on a miss; a skipped cache cannot reproduce that.
-    values: { "fail-on-cache-miss": ["false"] },
-    expressions: new Set(["path", "key", "restore-keys"]),
+    // path and key are required (the action fails without them); a miss must
+    // not fail the job, since a skipped cache always misses.
+    inputs: {
+      path: nonEmpty,
+      key: cacheKey,
+      "restore-keys": anything,
+      enableCrossOsArchive: oneOf("true", "false"),
+      "lookup-only": oneOf("true", "false"),
+      "fail-on-cache-miss": oneOf("false"),
+      "upload-chunk-size": literal,
+    },
+    required: ["path", "key"],
   },
   "actions/upload-artifact": {
     refs: { ea165f8d65b6e75b540449e92b4886f43607fa02: "v4.6.2" },
     reason: "publishing an artifact does not change the build",
-    inputs: new Set(["name", "path", "if-no-files-found", "retention-days", "compression-level", "overwrite", "include-hidden-files"]),
-    // if-no-files-found: error fails CI when the build produced nothing; a skip cannot check that.
-    values: { "if-no-files-found": ["warn", "ignore"] },
-    expressions: new Set(["name", "path"]),
+    // path is required; a missing file must not fail the job; the name must be
+    // valid and unique in the workflow run (v4 fails a second upload of a name).
+    inputs: {
+      name: artifactName,
+      path: nonEmpty,
+      "if-no-files-found": oneOf("warn", "ignore"),
+      "retention-days": intBetween(1, 90),
+      "compression-level": intBetween(0, 9),
+      overwrite: oneOf("true", "false"),
+      "include-hidden-files": oneOf("true", "false"),
+    },
+    required: ["path"],
   },
 };
 
@@ -319,7 +369,7 @@ function workingDirectory(value, where) {
 }
 
 /** Classify one `uses:` step: skipped (with any pins/shim) or a refusal. */
-function usesStep(step, where) {
+function usesStep(step, where, ctx) {
   const ref = typeof step.uses === "string" ? step.uses.trim() : "";
   const at = ref.lastIndexOf("@");
   if (ref === "" || ref.startsWith("./") || ref.startsWith("docker://") || at <= 0) {
@@ -345,22 +395,59 @@ function usesStep(step, where) {
   if (step.with !== undefined && step.with !== null && !isPlainObject(step.with)) {
     return refuse("ci-unhonourable", `${where} with: is not a mapping`);
   }
-  const withInputs = step.with ?? {};
-  for (const [key, value] of Object.entries(withInputs)) {
-    if (!action.inputs.has(key)) return refuse("ci-unhonourable", `${where} passes ${name} the input "${key}", which the review launcher cannot reproduce`);
+  const withInputs = {};
+  for (const [key, value] of Object.entries(step.with ?? {})) {
+    if (!Object.hasOwn(action.inputs, key)) {
+      return refuse("ci-unhonourable", `${where} passes ${name} the input "${key}", which the review launcher cannot reproduce`);
+    }
     if (value !== null && typeof value === "object") return refuse("ci-unhonourable", `${where} input ${key} is not a scalar`);
     const text = value === null ? "" : String(value);
-    if (hasExpression(text) && !action.expressions?.has(key)) {
-      return refuse("ci-unhonourable", `${where} input ${key} uses a \${{ }} expression, which only the Actions runner can evaluate`);
-    }
-    const allowed = action.values?.[key];
-    if (allowed && !allowed.includes(text)) {
-      return refuse("ci-unhonourable", `${where} sets ${name} ${key}: ${JSON.stringify(text)}; a skipped step reproduces only ${allowed.join(" or ")}`);
+    const problem = action.inputs[key](text);
+    if (problem) return refuse("ci-unhonourable", `${where} ${name} input ${key} ${problem}`);
+    withInputs[key] = text;
+  }
+  for (const key of action.required ?? []) {
+    if (withInputs[key] === undefined) {
+      return refuse("ci-unhonourable", `${where} gives ${name} no ${key}; the real action fails or floats without it, so skipping it is not equivalent`);
     }
   }
-  const pinned = action.pin ? action.pin(withInputs, where) : { ok: true, pins: [] };
-  if (!pinned.ok) return pinned;
-  return { ok: true, skipped: { uses: ref, tag: action.refs[sha], reason: action.reason }, pins: pinned.pins, shim: action.shim ?? null };
+  if (name === "actions/upload-artifact") {
+    const artifact = withInputs.name ?? "artifact";
+    if ((ctx.uploadNames.get(artifact) ?? 0) > 1) {
+      return refuse("ci-unhonourable", `${where} uploads "${artifact}", a name the workflow uploads more than once; upload-artifact v4 fails the second upload`);
+    }
+  }
+  return {
+    ok: true,
+    name,
+    skipped: { uses: ref, tag: action.refs[sha], reason: action.reason },
+    pins: action.pin ? action.pin(withInputs, where) : [],
+    shim: action.shim ?? null,
+    fetchDepth: name === "actions/checkout" ? Number(withInputs["fetch-depth"] ?? "1") : null,
+  };
+}
+
+/** Artifact names every upload-artifact step in the workflow uses, counted (literal names; default "artifact"). */
+function uploadNameCounts(doc) {
+  const counts = new Map();
+  for (const job of Object.values(doc.jobs)) {
+    for (const step of Array.isArray(job?.steps) ? job.steps : []) {
+      if (!isPlainObject(step) || typeof step.uses !== "string" || !step.uses.trim().toLowerCase().startsWith("actions/upload-artifact@")) continue;
+      const n = isPlainObject(step.with) && step.with.name !== undefined && step.with.name !== null ? String(step.with.name) : "artifact";
+      counts.set(n, (counts.get(n) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/** A timeout-minutes value: a positive number of minutes, capped at GitHub-hosted runners' 360. */
+function readTimeout(value, where) {
+  if (value === undefined) return { ok: true, minutes: null };
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : Number.NaN;
+  if (!Number.isFinite(n) || n <= 0) {
+    return refuse("ci-unhonourable", `${where} timeout-minutes ${JSON.stringify(value)} is not a positive number of minutes the launcher can enforce`);
+  }
+  return { ok: true, minutes: Math.min(n, MAX_JOB_MINUTES) };
 }
 
 // ─── the document ────────────────────────────────────────────────────────────
@@ -463,7 +550,7 @@ function needsOf(job, where) {
 }
 
 /** Plan one job's own steps (not its needs). */
-function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults) {
+function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) {
   const job = doc.jobs[jobId];
   const where = `${workflowFile} job "${jobId}"`;
   if (!isPlainObject(job)) return refuse("no-ci-job", `${where} is not a mapping`);
@@ -473,9 +560,14 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults) {
     }
   }
   const runsOn = job["runs-on"];
-  if (typeof runsOn !== "string" || !/^ubuntu-(latest|\d+\.\d+)$/.test(runsOn)) {
-    return refuse("ci-unhonourable", `${where} runs-on ${JSON.stringify(runsOn)} is not an x86_64 ubuntu runner the linux/amd64 image stands in for`);
+  if (typeof runsOn !== "string" || !RUNNER_LABELS.has(runsOn)) {
+    return refuse(
+      "ci-unhonourable",
+      `${where} runs-on ${JSON.stringify(runsOn)} is not a runner label the image stands in for (${[...RUNNER_LABELS].join(", ")})`,
+    );
   }
+  const jobTimeout = readTimeout(job["timeout-minutes"], where);
+  if (!jobTimeout.ok) return jobTimeout;
   const when = condition(job.if);
   if (when === null) {
     return refuse("ci-unhonourable", `${where} if: ${JSON.stringify(job.if)} cannot be honoured (only absent, true, success() and always() can)`);
@@ -498,6 +590,7 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults) {
   const skipped = [];
   const pins = [];
   const shims = new Set();
+  let fetchDepth = null;
   for (const [i, step] of job.steps.entries()) {
     const index = i + 1;
     const label = typeof step?.name === "string" ? step.name : null;
@@ -517,9 +610,20 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults) {
     const hasRun = step.run !== undefined;
     if (hasUses === hasRun) return refuse("ci-unhonourable", `${at} must have exactly one of uses: and run:`);
 
+    const stepTimeout = readTimeout(step["timeout-minutes"], at);
+    if (!stepTimeout.ok) return stepTimeout;
+    const isCheckout = hasUses && typeof step.uses === "string" && step.uses.trim().toLowerCase().startsWith("actions/checkout@");
+    if (index === 1 && !isCheckout) {
+      return refuse("ci-unhonourable", `${where} does not begin with actions/checkout; on a CI runner its steps would run in an empty workspace`);
+    }
+    if (index > 1 && isCheckout) {
+      return refuse("ci-unhonourable", `${at} checks out again after earlier steps; the launcher skips checkout only as a job's first step`);
+    }
+
     if (hasUses) {
-      const u = usesStep(step, at);
+      const u = usesStep(step, at, ctx);
       if (!u.ok) return u;
+      if (u.name === "actions/checkout") fetchDepth = u.fetchDepth;
       skipped.push({ index, ...u.skipped });
       pins.push(...u.pins);
       if (u.shim) shims.add(u.shim);
@@ -547,10 +651,16 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults) {
       workingDirectory: dir.dir,
       env: { ...wfEnv, ...jobEnv.env, ...stepEnv.env },
       always: stepWhen === "always",
+      timeoutMinutes: stepTimeout.minutes,
     });
   }
   if (steps.length === 0) return refuse("no-ci-plan", `${where} has no run: steps; nothing would be built or tested`);
-  return { ok: true, job: { id: jobId, needs: needs.needs, when, steps, skipped }, pins, shims: [...shims] };
+  return {
+    ok: true,
+    job: { id: jobId, needs: needs.needs, when, steps, skipped, fetchDepth, timeoutMinutes: jobTimeout.minutes ?? MAX_JOB_MINUTES },
+    pins,
+    shims: [...shims],
+  };
 }
 
 /**
@@ -594,6 +704,7 @@ export function planJob({ workflowText, workflowFile, jobId, baseBranch, reserve
   if (!wfEnv.ok) return wfEnv;
   const wfDefaults = readDefaults(doc.defaults, `${workflowFile} workflow`);
   if (!wfDefaults.ok) return wfDefaults;
+  const ctx = { uploadNames: uploadNameCounts(doc) };
 
   // The needs closure, dependencies first (depth-first post-order).
   const ordered = [];
@@ -605,7 +716,7 @@ export function planJob({ workflowText, workflowFile, jobId, baseBranch, reserve
     if (state.get(id) === "visiting") return refuse("ci-unhonourable", `${workflowFile} job "${id}" is part of a needs cycle`);
     if (!Object.hasOwn(doc.jobs, id)) return refuse("no-ci-job", `${workflowFile} job "${from}" needs "${id}", which the workflow does not define`);
     state.set(id, "visiting");
-    const planned = planOneJob(doc, id, workflowFile, reserved, wfEnv.env, wfDefaults);
+    const planned = planOneJob(doc, id, workflowFile, reserved, wfEnv.env, wfDefaults, ctx);
     if (!planned.ok) return planned;
     for (const need of planned.job.needs) {
       const r = visit(need, id);

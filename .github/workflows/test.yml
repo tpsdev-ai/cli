@@ -168,7 +168,9 @@ jobs:
   # integrity, the image's own resolver refusals and the build-path fixtures (an
   # out-of-matrix pin, a pin for another image, a caller naming another job and a
   # --workspace argument run nothing; an in-matrix pin runs the host-named job
-  # while impostor binaries on the caller's PATH never run), A3 hermetic defaults
+  # while impostor binaries on the caller's PATH never run; a step's
+  # timeout-minutes is enforced; a worktree that is not a fresh clone and a git
+  # core.fsmonitor are refused before anything runs), A3 hermetic defaults
   # observed inside a build run the way OpenClaw runs the sandbox (read-only
   # root, tmpfs, no network, `sleep infinity` + exec), and A9 tokenless gh plus
   # the launcher refusing a worktree git auth header and a workflow GH_TOKEN. The

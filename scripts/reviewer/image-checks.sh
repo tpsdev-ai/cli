@@ -62,18 +62,22 @@ if [ -z "$envdump" ]; then fail "environment inspection produced no output"; fi
 CHECKOUT_REF="actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"
 SETUP_BUN_REF="oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76"
 
-# A reviewed-commit workspace: package.json pins bun and the given node range;
-# the named job (on pull_request into main) records the effective environment,
-# then writes the marker. Options: git (a clean git repository), gitcred (a git
-# repository whose config carries a FAKE auth header), envtoken (the job's env
-# sets a FAKE GH_TOKEN), evil (node/bun/touch impostors in /workspace/evil that
-# leave evil-ran if anything runs them).
-make_fixture() { # <name> <engines.node range> [git|gitcred|envtoken|evil ...]
-  local name="$1" range="$2" dir="$SCRATCH/$1" opt
+# A reviewed-commit workspace, mounted the way the launcher requires: a depth-1
+# clone of one commit, as actions/checkout gives CI. package.json pins bun and
+# the given node range; the named job (on pull_request into main) records the
+# effective environment, then writes the marker. Options before the commit:
+# envtoken (the job's env sets a FAKE GH_TOKEN), evil (node/bun/touch impostors
+# in /workspace/evil that leave evil-ran if anything runs them), timeout (the
+# marker step sleeps past a 3-second timeout-minutes). Options on the clone:
+# gitcred (its config carries a FAKE auth header), fsmonitor (its config names
+# an fsmonitor program that would leave fsmonitor-ran), dirty (an untracked
+# file, so it is not the clean clone checkout gives CI).
+make_fixture() { # <name> <engines.node range> [envtoken|evil|timeout|gitcred|fsmonitor|dirty ...]
+  local name="$1" range="$2" src="$SCRATCH/$1.src" dir="$SCRATCH/$1" opt
   shift 2
-  mkdir -p "$dir/.github/workflows"
-  printf '{"name":"reviewer-fixture","private":true,"packageManager":"bun@%s","engines":{"node":"%s"}}\n' "$BUN_V" "$range" >"$dir/package.json"
-  cat >"$dir/.github/workflows/review.yml" <<'YAML'
+  mkdir -p "$src/.github/workflows"
+  printf '{"name":"reviewer-fixture","private":true,"packageManager":"bun@%s","engines":{"node":"%s"}}\n' "$BUN_V" "$range" >"$src/package.json"
+  cat >"$src/.github/workflows/review.yml" <<'YAML'
 name: reviewer fixture
 on:
   pull_request:
@@ -111,19 +115,26 @@ jobs:
       - name: marker
         run: echo ran > review-marker
 YAML
-  sed -i -e "s/@BUN_V@/${BUN_V}/" -e "s#@CHECKOUT@#${CHECKOUT_REF}#" -e "s#@SETUP_BUN@#${SETUP_BUN_REF}#" "$dir/.github/workflows/review.yml"
+  sed -i -e "s/@BUN_V@/${BUN_V}/" -e "s#@CHECKOUT@#${CHECKOUT_REF}#" -e "s#@SETUP_BUN@#${SETUP_BUN_REF}#" "$src/.github/workflows/review.yml"
   for opt in "$@"; do
     case "$opt" in
-      git) git -C "$dir" init -q ;;
-      gitcred)
-        git -C "$dir" init -q
-        git -C "$dir" config http.https://github.com/.extraheader "AUTHORIZATION: basic RkFLRS1BOS1GSVhUVVJF"
-        ;;
-      envtoken) sed -i 's/^    runs-on: ubuntu-latest$/    runs-on: ubuntu-latest\n    env:\n      GH_TOKEN: fake-a9-fixture-token/' "$dir/.github/workflows/review.yml" ;;
+      envtoken) sed -i 's/^    runs-on: ubuntu-latest$/    runs-on: ubuntu-latest\n    env:\n      GH_TOKEN: fake-a9-fixture-token/' "$src/.github/workflows/review.yml" ;;
       evil)
-        mkdir -p "$dir/evil"
-        for b in node bun touch; do printf '#!/bin/sh\necho evil > /workspace/evil-ran\n' >"$dir/evil/$b"; chmod 0755 "$dir/evil/$b"; done
+        mkdir -p "$src/evil"
+        for b in node bun touch; do printf '#!/bin/sh\necho evil > /workspace/evil-ran\n' >"$src/evil/$b"; chmod 0755 "$src/evil/$b"; done
         ;;
+      timeout) sed -i 's/^        run: echo ran > review-marker$/        run: sleep 60 \&\& echo ran > review-marker\n        timeout-minutes: 0.05/' "$src/.github/workflows/review.yml" ;;
+    esac
+  done
+  git -C "$src" init -q -b main
+  git -C "$src" add -A
+  git -C "$src" -c user.name=fixture -c user.email=fixture@example.invalid commit -q -m fixture
+  git clone -q --depth 1 "file://$src" "$dir"
+  for opt in "$@"; do
+    case "$opt" in
+      gitcred) git -C "$dir" config http.https://github.com/.extraheader "AUTHORIZATION: basic RkFLRS1BOS1GSVhUVVJF" ;;
+      fsmonitor) git -C "$dir" config core.fsmonitor "touch /workspace/fsmonitor-ran" ;;
+      dirty) echo stray >"$dir/stray" ;;
     esac
   done
   # The container user (uid 1000) must be able to write the marker into the bind.
@@ -265,7 +276,7 @@ fi
 
 # The in-matrix run feeds both A2 (it builds) and A3 (what it saw).
 if want A2 || want A3; then
-  make_fixture ok "${NODE_V%%.*}.x" git evil
+  make_fixture ok "${NODE_V%%.*}.x" evil
   EXEC_EXTRA=(-e "PATH=/workspace/evil:/usr/local/bin:/usr/bin:/bin")
   openclaw_launch ok
   OK_RC=$LAUNCH_RC
@@ -309,6 +320,33 @@ if want A2; then
     pass "A2 the launcher takes no --workspace: the worktree is always /workspace"
   else
     fail "A2 --workspace: $(why wsflag)"
+  fi
+
+  # Round-6 proofs in the container: timeout-minutes is enforced; checkout's
+  # skip needs the clean clone CI would get; git settings outside the safe
+  # baseline refuse before git runs anything.
+  make_fixture timeout "${NODE_V%%.*}.x" timeout
+  t0=$(date +%s)
+  openclaw_launch timeout
+  took=$(($(date +%s) - t0))
+  if refused_with timeout "timed out (timeout-minutes)" && [ "$took" -lt 40 ]; then
+    pass "A2 a step's timeout-minutes is enforced in the sandbox (killed at 3 s; the launch took ${took} s)"
+  else
+    fail "A2 timeout-minutes: took ${took}s $(why timeout)"
+  fi
+  make_fixture dirty "${NODE_V%%.*}.x" dirty
+  openclaw_launch dirty
+  if refused_with dirty "refused: not-fresh"; then
+    pass "A2 a worktree that is not the clean clone checkout gives CI is refused (not-fresh); nothing runs"
+  else
+    fail "A2 not-fresh: $(why dirty)"
+  fi
+  make_fixture fsmon "${NODE_V%%.*}.x" fsmonitor
+  openclaw_launch fsmon
+  if refused_with fsmon "core.fsmonitor" && [ ! -e "$SCRATCH/fsmon/fsmonitor-ran" ]; then
+    pass "A2 a git setting outside the safe baseline (core.fsmonitor) is refused before git runs it"
+  else
+    fail "A2 git baseline: fsmonitor-ran=$([ -e "$SCRATCH/fsmon/fsmonitor-ran" ] && echo present || echo absent) $(why fsmon)"
   fi
 fi
 
@@ -399,7 +437,7 @@ if want A9; then
   # The mounted worktree and the workflow cannot hand a step a credential either.
   make_fixture gitcred "${NODE_V%%.*}.x" gitcred
   openclaw_launch gitcred
-  if refused_with gitcred "refused: git-credential-config" && ! grep -qF "RkFLRS1BOS1GSVhUVVJF" "$SCRATCH/gitcred.out" "$SCRATCH/gitcred.err"; then
+  if refused_with gitcred "refused: git-config" && ! grep -qF "RkFLRS1BOS1GSVhUVVJF" "$SCRATCH/gitcred.out" "$SCRATCH/gitcred.err"; then
     pass "A9 launcher: a worktree whose git config carries an auth header is refused before any step, without repeating the value"
   else
     fail "A9 launcher git credential: $(why gitcred)"

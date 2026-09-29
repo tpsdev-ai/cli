@@ -2,11 +2,13 @@
  * reviewer-launch.test.ts — the trusted launcher (cli#425 acceptance A2, A3,
  * A9): the host assignment and its override refusal, the allowlisted child
  * environment with a fixed PATH, runtime verification with fixed binaries, the
- * worktree checks (symlinked lockfiles and directories, bounded reads, git
- * credential settings, resolved working directories), and the review build end
- * to end — the needs closure, fresh worktree per job, real bash steps — using
- * temporary trusted/workspace/scratch directories in place of /opt/reviewer,
- * /workspace and /tmp/review.
+ * worktree checks (symlinked lockfiles and directories before and after every
+ * job, bounded reads, the git configuration baseline and hooks, the fresh-clone
+ * check checkout's skip relies on, resolved working directories), timeouts and
+ * leftover processes, and the review build end to end — the needs closure,
+ * real bash steps — on depth-1 clones of a temporary source repository, with
+ * temporary trusted/scratch directories in place of /opt/reviewer and
+ * /tmp/review.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -27,9 +29,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildArgsFor, loadTable } from "../../../../scripts/reviewer/build-reviewer-image.mjs";
 import {
+  checkFreshClone,
   checkStepEnv,
   containedDirectory,
-  gitAuthFindings,
+  gitConfigFindings,
   guardStep,
   HERMETIC,
   HERMETIC_KEYS,
@@ -281,8 +284,64 @@ describe("A2 — step execution order", () => {
   });
 });
 
-describe("git credential and auth settings", () => {
-  test("gitAuthFindings names keys and origins, never values, and masks userinfo — each rule on its own", () => {
+describe("git configuration: the safe baseline", () => {
+  test("a fresh clone's configuration and an identity are the baseline", () => {
+    const listing = [
+      "file:.git/config\tcore.repositoryformatversion=0",
+      "file:.git/config\tcore.filemode=true",
+      "file:.git/config\tcore.bare=false",
+      "file:.git/config\tcore.logallrefupdates=true",
+      "file:.git/config\tcore.ignorecase=true",
+      "file:.git/config\tcore.precomposeunicode=true",
+      "file:.git/config\tremote.origin.url=https://github.com/tpsdev-ai/cli",
+      "file:.git/config\tremote.origin.fetch=+refs/heads/*:refs/remotes/origin/*",
+      "file:.git/config\tbranch.main.remote=origin",
+      "file:.git/config\tbranch.main.merge=refs/heads/main",
+      "file:.git/config\tuser.name=ci",
+      "file:.git/config\tuser.email=ci@example.invalid",
+      "command line:\tsafe.directory=/workspace",
+      "command line:\tcore.fsmonitor=false",
+    ].join("\n");
+    expect(gitConfigFindings(listing)).toEqual([]);
+  });
+
+  test("executable, transport-changing and credential keys outside the baseline are named", () => {
+    const keys = [
+      "core.fsmonitor=touch x",
+      "core.hookspath=/tmp/h",
+      "core.pager=less",
+      "core.editor=vi",
+      "core.worktree=/elsewhere",
+      "protocol.file.allow=always",
+      "protocol.ext.allow=always",
+      "uploadpack.allowfilter=true",
+      "url.https://mirror.example/.insteadof=https://github.com/",
+      "url.https://mirror.example/.pushinsteadof=https://github.com/",
+      "filter.lfs.clean=git-lfs clean -- %f",
+      "diff.external=/tmp/d",
+      "remote.origin.uploadpack=/tmp/u",
+      "remote.origin.receivepack=/tmp/r",
+      "gpg.program=/tmp/g",
+      "safe.directory=*",
+    ];
+    const findings = gitConfigFindings(keys.map((k) => `file:.git/config\t${k}`).join("\n"));
+    expect(findings).toEqual(keys.map((k) => `${k.slice(0, k.indexOf("="))} (file:.git/config)`));
+  });
+
+  test("a baseline key whose value carries a credential or picks a transport helper is named", () => {
+    const findings = gitConfigFindings(
+      [
+        "file:.git/config\tremote.origin.url=https://x:ghp_SECRET@github.com/o/r",
+        "file:.git/config\tremote.evil.url=ext::sh -c touch% /tmp/pwned",
+        "file:.git/config\tremote.opt.url=--upload-pack=touch",
+        "file:.git/config\tbranch.main.merge=refs/heads/main",
+      ].join("\n"),
+    );
+    expect(findings).toEqual(["remote.origin.url (file:.git/config)", "remote.evil.url (file:.git/config)", "remote.opt.url (file:.git/config)"]);
+    expect(findings.join(" ")).not.toContain("SECRET");
+  });
+
+  test("gitConfigFindings names keys and origins, never values, and masks userinfo — each rule on its own", () => {
     const listing = [
       "file:.git/config\tcore.bare=false",
       "file:.git/config\thttp.https://github.com/.extraheader=X-Trace: 1",
@@ -299,7 +358,7 @@ describe("git credential and auth settings", () => {
       "file:.git/config\talias.x=!curl -H 'Authorization: Basic c2VjcmV0'",
       "command line:\tsafe.directory=/workspace",
     ].join("\n");
-    const findings = gitAuthFindings(listing);
+    const findings = gitConfigFindings(listing);
     expect(findings).toEqual([
       "http.https://github.com/.extraheader (file:.git/config)",
       "url.https://***@github.com/.insteadof (file:.git/config)",
@@ -323,30 +382,47 @@ describe("git credential and auth settings", () => {
 
 let root: string;
 let trusted: string;
+let src: string;
 let workspace: string;
 let scratch: string;
 let outside: string;
 
 const actual22 = () => ({ node: "22.22.1", bun: "1.3.10" });
-const git = (...args: string[]) => spawnSync("/usr/bin/git", args, { cwd: workspace, encoding: "utf8", env: { PATH: "/usr/bin:/bin", HOME: root } });
-/** The real inspector, with the host machine's own system git config excluded. */
+const GIT_ENV = () => ({ PATH: "/usr/bin:/bin", HOME: root, GIT_CONFIG_NOSYSTEM: "1" });
+const gitIn = (cwd: string, ...args: string[]) => spawnSync("/usr/bin/git", args, { cwd, encoding: "utf8", env: GIT_ENV() });
+const git = (...args: string[]) => gitIn(workspace, ...args);
+/** The real inspectors, with the host machine's own system git config excluded. */
 const inspectNoSystem = (a: { workspace: string; env: Record<string, string> }) =>
   inspectGitConfig({ ...a, env: { ...a.env, GIT_CONFIG_NOSYSTEM: "1" } });
+const freshNoSystem = (a: { workspace: string; env: Record<string, string>; fetchDepth: number }) =>
+  checkFreshClone({ ...a, env: { ...a.env, GIT_CONFIG_NOSYSTEM: "1" } });
+/** A checkout step, for jobs added before `review`. */
+const CO = `      - uses: ${CHECKOUT}\n`;
 
-/** A pull_request workflow whose `review` job runs the given step lines; `jobs` adds jobs before it. */
-function writeWorkspace(nodeRange: string, steps: string, { jobExtra = "", jobs = "", env = "" } = {}) {
+/** A pull_request workflow whose `review` job runs the given step lines; `jobs` adds jobs before it. Written to the source repo. */
+function writeWorkspace(nodeRange: string, steps: string, { jobExtra = "", jobs = "", env = "", checkoutWith = "" } = {}) {
+  writeFileSync(join(src, "package.json"), JSON.stringify({ name: "fixture", private: true, packageManager: "bun@1.3.10", engines: { node: nodeRange } }));
+  mkdirSync(join(src, ".github", "workflows"), { recursive: true });
   writeFileSync(
-    join(workspace, "package.json"),
-    JSON.stringify({ name: "fixture", private: true, packageManager: "bun@1.3.10", engines: { node: nodeRange } }),
-  );
-  mkdirSync(join(workspace, ".github", "workflows"), { recursive: true });
-  writeFileSync(
-    join(workspace, ".github", "workflows", "ci.yml"),
-    `on:\n  pull_request:\n    branches: [main]\n${env}jobs:\n${jobs}  review:\n    runs-on: ubuntu-latest\n${jobExtra}    steps:\n      - uses: ${CHECKOUT}\n      - uses: ${SETUP_BUN}\n        with:\n          bun-version: "1.3.10"\n${steps}`,
+    join(src, ".github", "workflows", "ci.yml"),
+    `on:\n  pull_request:\n    branches: [main]\n${env}jobs:\n${jobs}  review:\n    runs-on: ubuntu-latest\n${jobExtra}    steps:\n      - uses: ${CHECKOUT}\n${checkoutWith}      - uses: ${SETUP_BUN}\n        with:\n          bun-version: "1.3.10"\n${steps}`,
   );
 }
 
-function build(overrides: Record<string, unknown> = {}) {
+/** Commit the source repo and mount a fresh clone of it as the worktree: depth 1 (checkout's default) or full. */
+function publish(depth: 0 | 1 = 1) {
+  gitIn(src, "add", "-A");
+  gitIn(src, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "--allow-empty", "-m", "fixture");
+  rmSync(workspace, { recursive: true, force: true });
+  const args = depth === 1 ? ["clone", "-q", "--depth", "1", `file://${src}`, workspace] : ["clone", "-q", `file://${src}`, workspace];
+  const r = spawnSync("/usr/bin/git", args, { encoding: "utf8", env: GIT_ENV() });
+  if (r.status !== 0) throw new Error(`clone failed: ${r.stderr}`);
+}
+
+function build(overrides: Record<string, unknown> & { afterPublish?: () => void; depth?: 0 | 1 } = {}) {
+  const { afterPublish, depth = 1, ...rest } = overrides;
+  publish(depth);
+  afterPublish?.();
   return reviewBuild({
     workspace,
     trustedDir: trusted,
@@ -355,19 +431,23 @@ function build(overrides: Record<string, unknown> = {}) {
     creationEnv: HOST,
     probe: actual22,
     inspectGit: inspectNoSystem,
-    ...overrides,
+    checkFresh: freshNoSystem,
+    ...rest,
   });
 }
 
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "reviewer-launch-")));
   trusted = join(root, "opt-reviewer");
+  src = join(root, "src");
   workspace = join(root, "workspace");
   scratch = join(root, "tmp-review");
   outside = join(root, "outside");
   mkdirSync(join(trusted, "shims"), { recursive: true });
   mkdirSync(workspace);
   mkdirSync(outside);
+  mkdirSync(src);
+  gitIn(src, "init", "-q", "-b", "main");
   copyFileSync(resolve(repo, "docker", "reviewer", "runtime-matrix.json"), join(trusted, "runtime-matrix.json"));
   copyFileSync(resolve(repo, "docker", "reviewer", "shims", "sfw"), join(trusted, "shims", "sfw"));
   chmodSync(join(trusted, "shims", "sfw"), 0o755);
@@ -380,7 +460,8 @@ afterEach(() => {
 
 describe("A2/A3 — the review build", () => {
   test("an in-matrix pin for THIS image runs every step, in order, in its directory, with the allowlisted env and fixed PATH", async () => {
-    mkdirSync(join(workspace, "sub"));
+    mkdirSync(join(src, "sub"));
+    writeFileSync(join(src, "sub", ".keep"), "");
     writeWorkspace(
       "22.x",
       [
@@ -501,7 +582,7 @@ describe("A2/A3 — the review build", () => {
   });
 
   test("a build that changes or creates a lockfile is not a frozen install", async () => {
-    writeFileSync(join(workspace, "bun.lock"), "{}\n");
+    writeFileSync(join(src, "bun.lock"), "{}\n");
     writeWorkspace("22.x", "      - run: echo '// drift' >> bun.lock\n");
     const r = await build();
     expect(r.ok).toBe(false);
@@ -509,7 +590,6 @@ describe("A2/A3 — the review build", () => {
       expect(r.refusal.kind).toBe("unfrozen-install");
       expect(r.refusal.message).toContain("bun.lock (changed)");
     }
-    writeFileSync(join(workspace, "bun.lock"), "{}\n");
     writeWorkspace("22.x", "      - run: mkdir -p pkg && echo '{}' > pkg/package-lock.json\n");
     const created = await build();
     expect(created.ok).toBe(false);
@@ -518,7 +598,7 @@ describe("A2/A3 — the review build", () => {
 
   test("a symlinked lockfile or a symlinked directory refuses before any step runs", async () => {
     writeFileSync(join(outside, "bun.lock"), "{}\n");
-    symlinkSync(join(outside, "bun.lock"), join(workspace, "bun.lock"));
+    symlinkSync(join(outside, "bun.lock"), join(src, "bun.lock"));
     writeWorkspace("22.x", "      - run: echo changed >> bun.lock && echo ran > review-marker\n");
     const lock = await build();
     expect(lock.ok).toBe(false);
@@ -527,8 +607,8 @@ describe("A2/A3 — the review build", () => {
       expect(lock.refusal.message).toContain("a symlinked lockfile bun.lock");
     }
     expect(readFileSync(join(outside, "bun.lock"), "utf8")).toBe("{}\n");
-    rmSync(join(workspace, "bun.lock"));
-    symlinkSync(outside, join(workspace, "pkg"));
+    rmSync(join(src, "bun.lock"));
+    symlinkSync(outside, join(src, "pkg"));
     const alias = await build();
     expect(alias.ok).toBe(false);
     if (!alias.ok) expect(alias.refusal.message).toContain("a symlinked directory pkg");
@@ -536,7 +616,7 @@ describe("A2/A3 — the review build", () => {
   });
 
   test("a lockfile the build turns into a symlink is drift", async () => {
-    writeFileSync(join(workspace, "bun.lock"), "{}\n");
+    writeFileSync(join(src, "bun.lock"), "{}\n");
     writeFileSync(join(outside, "bun.lock"), "{}\n");
     writeWorkspace("22.x", `      - run: rm bun.lock && ln -s "${join(outside, "bun.lock")}" bun.lock\n`);
     const r = await build();
@@ -561,28 +641,49 @@ describe("A2/A3 — the review build", () => {
     expect(existsSync(join(outside, "marker"))).toBe(false);
   });
 
-  test("a symlinked directory that stays inside the worktree runs in its resolved path", async () => {
-    mkdirSync(join(workspace, "real"));
+  test("a symlinked directory a job creates runs in its resolved path, and the post-job scan refuses it", async () => {
+    mkdirSync(join(src, "real"));
+    writeFileSync(join(src, "real", ".keep"), "");
     writeWorkspace("22.x", ["      - run: ln -s real alias", "      - run: pwd -P > ../cwd\n        working-directory: alias"].join("\n") + "\n");
     const r = await build();
-    expect(r.ok).toBe(true);
     expect(readFileSync(join(workspace, "cwd"), "utf8").trim()).toBe(join(workspace, "real"));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("symlinked-path");
+      expect(r.refusal.message).toContain("job review left symlinked directories (alias)");
+    }
   });
 
   test("git credential or auth settings in the worktree refuse before any step, without repeating the value", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
-    git("init", "-q");
-    git("config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic ZmFrZS1yZWQtcHJvb2Y=");
-    const r = await build();
+    const r = await build({ afterPublish: () => git("config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic ZmFrZS1yZWQtcHJvb2Y=") });
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.refusal.kind).toBe("git-credential-config");
+      expect(r.refusal.kind).toBe("git-config");
       expect(r.refusal.message).toContain("http.https://github.com/.extraheader (file:.git/config)");
       expect(r.refusal.message).not.toContain("ZmFrZS1yZWQtcHJvb2Y=");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-    git("config", "--unset", "http.https://github.com/.extraheader");
     expect((await build()).ok).toBe(true);
+  });
+
+  test("an executable git setting (core.fsmonitor) refuses before git runs anything in the worktree", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    const r = await build({ afterPublish: () => git("config", "core.fsmonitor", `touch ${join(root, "fsmonitor-ran")}`) });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("git-config");
+      expect(r.refusal.message).toContain("core.fsmonitor (file:.git/config)");
+    }
+    expect(existsSync(join(root, "fsmonitor-ran"))).toBe(false);
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a git hook a fresh clone would not have refuses", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    const r = await build({ afterPublish: () => writeFileSync(join(workspace, ".git", "hooks", "post-checkout"), "#!/bin/sh\n", { mode: 0o755 }) });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("git hooks a fresh clone does not (post-checkout)");
   });
 
   test("a git configuration git cannot read, or a missing git, refuses rather than passes", () => {
@@ -597,6 +698,13 @@ describe("A2/A3 — the review build", () => {
     const missing = inspectGitConfig({ workspace, env: hermeticEnv({}, scratch), git: join(root, "no-such-git") });
     expect(missing.ok).toBe(false);
     if (!missing.ok) expect(missing.refusal.kind).toBe("git-config-unreadable");
+  });
+
+  test("checkFreshClone cannot verify a worktree whose git metadata is unreachable, and refuses", () => {
+    writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
+    const r = checkFreshClone({ workspace, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("not reachable in the sandbox");
   });
 
   test("a worktree whose git metadata is outside the sandbox is not an error", () => {
@@ -616,23 +724,23 @@ describe("A2/A3 — the review build", () => {
   test("a job whose needed guard fails does not run, and the build is not ok", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
       jobExtra: "    needs: guard\n",
-      jobs: "  guard:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n",
+      jobs: `  guard:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: exit 3\n`,
     });
     const r = await build();
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.refusal.kind).toBe("stage-failed");
-      expect(r.refusal.message).toBe("job guard: step 1 (run 1) exited 3");
+      expect(r.refusal.message).toBe("job guard: step 2 (run 2) exited 3");
       expect(r.jobs.at(-1)).toEqual({ job: "review", skipped: "needs guard, which did not succeed" });
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
   });
 
   test("the closure runs dependencies first, each job from the worktree as the build found it", async () => {
-    writeFileSync(join(workspace, "kept"), "pre-existing\n");
-    writeWorkspace("22.x", "      - run: |\n          test ! -e left-behind\n          test ! -e made-dir\n          test -e kept\n          echo ran > review-marker\n", {
+    writeFileSync(join(src, "kept"), "pre-existing\n");
+    writeWorkspace("22.x", "      - run: |\n          test ! -e left-behind\n          test ! -e made-dir\n          test -e kept\n          test ! -e \"$HOME/job-home\"\n          echo ran > review-marker\n", {
       jobExtra: "    needs: build\n",
-      jobs: "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: |\n          echo x > left-behind\n          mkdir -p made-dir/sub && echo y > made-dir/sub/f\n",
+      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: |\n          echo x > left-behind\n          mkdir -p made-dir/sub && echo y > made-dir/sub/f\n          echo job-home > "$HOME/job-home"\n`,
     });
     const r = await build();
     expect(r.ok).toBe(true);
@@ -644,19 +752,134 @@ describe("A2/A3 — the review build", () => {
   test("a job-level always() still runs after a failed need, and the build is still not ok", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
       jobExtra: "    needs: guard\n    if: always()\n",
-      jobs: "  guard:\n    runs-on: ubuntu-latest\n    steps:\n      - run: exit 3\n",
+      jobs: `  guard:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: exit 3\n`,
     });
     const r = await build();
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.refusal.message).toContain("job guard: step 1");
+    if (!r.ok) expect(r.refusal.message).toContain("job guard: step 2");
     expect(existsSync(join(workspace, "review-marker"))).toBe(true);
+  });
+
+  test("checkout is skipped only on a fresh clone: an untracked, ignored or modified path refuses before any step", async () => {
+    writeFileSync(join(src, ".gitignore"), "dist/\n");
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    for (const dirty of [
+      () => writeFileSync(join(workspace, "stray"), "x"),
+      () => {
+        mkdirSync(join(workspace, "dist"));
+        writeFileSync(join(workspace, "dist", "old.js"), "x");
+      },
+      () => writeFileSync(join(workspace, "tracked"), "v2\n"),
+    ]) {
+      const r = await build({ afterPublish: dirty });
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.refusal.kind).toBe("not-fresh");
+        expect(r.refusal.message).toContain("not the clean clone actions/checkout gives CI");
+      }
+      expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+    }
+  });
+
+  test("checkout's history shape: depth 1 needs a shallow one-commit clone without tags; fetch-depth 0 needs a full clone", async () => {
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    const full = await build({ depth: 0 });
+    expect(full.ok).toBe(false);
+    if (!full.ok) expect(full.refusal.message).toContain("is not a shallow clone");
+    const tagged = await build({ afterPublish: () => git("tag", "v1") });
+    expect(tagged.ok).toBe(false);
+    if (!tagged.ok) expect(tagged.refusal.message).toContain("has tags");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", { checkoutWith: "        with:\n          fetch-depth: 0\n" });
+    expect((await build({ depth: 0 })).ok).toBe(true);
+    const shallowForFull = await build({ depth: 1 });
+    expect(shallowForFull.ok).toBe(false);
+    if (!shallowForFull.ok) expect(shallowForFull.refusal.message).toContain("fetch-depth: 0");
+  });
+
+  test("a needed job that modifies a tracked file leaves the next job no fresh clone: refused, the next job never runs", async () => {
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+      jobExtra: "    needs: build\n",
+      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: echo v2 > tracked\n`,
+    });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("not-fresh");
+      expect(r.refusal.message).toContain("tracked");
+    }
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a step's timeout-minutes is enforced: the step is killed at the limit and the build fails", async () => {
+    writeWorkspace("22.x", "      - run: |\n          sleep 5\n          touch late\n        timeout-minutes: 0.01\n");
+    const t0 = Date.now();
+    const r = await build();
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toBe("job review: step 3 (run 3) timed out (timeout-minutes)");
+    expect(existsSync(join(workspace, "late"))).toBe(false);
+  });
+
+  test("a job's timeout-minutes bounds every step, always() ones included", async () => {
+    writeWorkspace(
+      "22.x",
+      ["      - run: sleep 5", "      - run: touch second", "      - run: touch always-ran\n        if: always()"].join("\n") + "\n",
+      { jobExtra: "    timeout-minutes: 0.01\n" },
+    );
+    const t0 = Date.now();
+    const r = await build();
+    expect(Date.now() - t0).toBeLessThan(4000);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("timed out");
+    expect(existsSync(join(workspace, "second"))).toBe(false);
+    expect(existsSync(join(workspace, "always-ran"))).toBe(false);
+  });
+
+  test("the step runner is given the smaller of the step's and the job's remaining time", async () => {
+    writeWorkspace("22.x", "      - run: a\n        timeout-minutes: 2\n      - run: b\n", { jobExtra: "    timeout-minutes: 5\n" });
+    const seen: number[] = [];
+    const r = await build({
+      runStep: async ({ timeoutMs }: { timeoutMs: number }) => {
+        seen.push(timeoutMs);
+        return 0;
+      },
+    });
+    expect(r.ok).toBe(true);
+    expect(seen[0]).toBe(120_000);
+    expect(seen[1]).toBeGreaterThan(290_000);
+    expect(seen[1]).toBeLessThanOrEqual(300_000);
+  });
+
+  test("once the job's time is up, no further step is started, always() ones included", async () => {
+    writeWorkspace("22.x", "      - run: a\n      - run: b\n        if: always()\n", { jobExtra: "    timeout-minutes: 0.0005\n" });
+    const started: number[] = [];
+    const r = await build({
+      runStep: async ({ step }: { step: { index: number } }) => {
+        started.push(step.index);
+        await new Promise((done) => setTimeout(done, 80));
+        return { code: 124, timedOut: true };
+      },
+    });
+    expect(r.ok).toBe(false);
+    expect(started).toEqual([3]);
+    if (!r.ok) expect(r.jobs[0].steps.map((s: { timedOut?: boolean }) => s.timedOut)).toEqual([true, true]);
+  });
+
+  test("what a job's steps leave running is killed when the job ends", async () => {
+    writeWorkspace("22.x", `      - run: (sleep 1; touch "${join(root, "orphan-ran")}") > /dev/null 2>&1 &\n`);
+    const r = await build();
+    expect(r.ok).toBe(true);
+    await new Promise((done) => setTimeout(done, 1600));
+    expect(existsSync(join(root, "orphan-ran"))).toBe(false);
   });
 
   test("a job using socketdev/action gets the sfw shim, which runs its command unwrapped", async () => {
     writeWorkspace("22.x", "      - run: |\n          command -v sfw > sfw-path\n          sfw sh -c 'echo shimmed > sfw-out'\n");
-    const text = readFileSync(join(workspace, ".github", "workflows", "ci.yml"), "utf8");
+    const text = readFileSync(join(src, ".github", "workflows", "ci.yml"), "utf8");
     writeFileSync(
-      join(workspace, ".github", "workflows", "ci.yml"),
+      join(src, ".github", "workflows", "ci.yml"),
       text.replace(`      - uses: ${CHECKOUT}\n`, `      - uses: ${CHECKOUT}\n      - uses: ${SOCKET}\n        with:\n          mode: firewall-free\n`),
     );
     const r = await build();
@@ -674,10 +897,10 @@ describe("A2/A3 — the review build", () => {
 
   test("a symlinked workflow file refuses", async () => {
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
-    const wf = join(workspace, ".github", "workflows", "ci.yml");
-    copyFileSync(wf, join(workspace, "real-ci.yml"));
+    const wf = join(src, ".github", "workflows", "ci.yml");
+    copyFileSync(wf, join(src, "real-ci.yml"));
     rmSync(wf);
-    symlinkSync(join(workspace, "real-ci.yml"), wf);
+    symlinkSync("../../real-ci.yml", wf);
     const r = await build();
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal.message).toContain("reached through a symlink");

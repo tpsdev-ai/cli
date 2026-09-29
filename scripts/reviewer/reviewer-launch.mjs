@@ -1,10 +1,17 @@
 /**
  * reviewer-launch.mjs — the trusted launcher for a review build.
  *
+ * review-build-ok is ADVISORY EVIDENCE for the reviewer, not a merge gate: CI
+ * stays the gate on every PR. What the launcher must hold is the trust
+ * boundary — no credential and no host access reachable from the review. How
+ * closely a review build predicts CI is best effort, with its known limits
+ * named in docker/reviewer/README.md.
+ *
  * In the image it is /opt/reviewer/bin/reviewer-launch: an explicit command,
  * never the entrypoint (OpenClaw starts the sandbox as `<image> sleep infinity`
- * with a read-only root and tmpfs on /tmp, /var/tmp and /run). It builds the
- * worktree the host mounted at /workspace; no argument or variable moves it.
+ * with a read-only root and tmpfs on /tmp, /var/tmp and /run). Build mode takes
+ * no arguments and builds the worktree the host mounted at /workspace; only
+ * `--self-check` is accepted besides.
  *
  * Before ANY repository code runs it:
  *   1. reads the trusted runtime table (/opt/reviewer/runtime-matrix.json — no
@@ -12,7 +19,10 @@
  *   2. reads the host's assignment — REVIEWER_CI_WORKFLOW, REVIEWER_CI_JOB and
  *      REVIEWER_CI_BASE — from the environment the HOST gave the sandbox when it
  *      created it (the container init's environment, /proc/1/environ), and
- *      refuses if its own caller supplied different values;
+ *      refuses if its own caller supplied different values. That process runs
+ *      as the same user as the sandbox; the assignment's integrity relies on the
+ *      deployed sandbox denying same-user process-memory writes (ptrace), a
+ *      host-integration check that belongs to PR 3;
  *   3. refuses symlinked lockfiles and symlinked directories in the worktree
  *      (outside node_modules/ and .git/) and hashes every lockfile;
  *   4. plans the named job and its `needs` closure (ci-job.mjs), refusing what it
@@ -27,15 +37,20 @@
  *   7. runs the image's own node and bun (fixed paths) and verifies their
  *      versions against the image entry and every resolved requirement.
  * Then, per job in dependency order: it removes what earlier jobs of this build
- * created (so each job starts from the worktree as the build found it), refuses
- * a worktree whose git configuration carries credentials or auth settings, and
- * runs each `run:` step as one script under `/bin/bash --noprofile --norc -eo
- * pipefail`, after re-checking the step's effective environment and the
- * RESOLVED working directory (it must stay inside the worktree). A job runs
- * only if the jobs it needs succeeded (or its `if:` is always()). It reports
+ * created, gives the job a fresh HOME/TMPDIR/cache root, refuses a worktree
+ * whose effective git configuration leaves the safe baseline or whose
+ * repository holds hooks, and refuses unless the worktree is the fresh clone
+ * actions/checkout would give CI (no modified, untracked or ignored path;
+ * history shaped as fetch-depth asks). It runs each `run:` step as one script
+ * under `/bin/bash --noprofile --norc -eo pipefail`, in its own process group,
+ * after re-checking the step's effective environment and the RESOLVED working
+ * directory (it must stay inside the worktree); it kills a step at its
+ * timeout-minutes, and the job's steps at the job's (default 360), and kills
+ * what the job left running when it ends. A job runs only if the jobs it needs
+ * succeeded (or its `if:` is always()). After every job it refuses symlinked
+ * lockfiles and symlinked directories and any lockfile change. It reports
  * review-build-ok only when every job in the closure ran and every step exited
- * 0, and no lockfile in the worktree (outside node_modules/ and .git/) changed,
- * appeared or disappeared.
+ * 0.
  *
  * stdout carries exactly one JSON line (the verdict); step output and refusals
  * go to stderr. Exit 0 = review-build-ok, 1 = refused or failed, 2 = usage.
@@ -263,7 +278,10 @@ export function readCreationEnv(path = CREATION_ENV_PATH) {
 /**
  * The host's assignment: taken ONLY from the environment the host gave the
  * sandbox at creation. The launcher's own caller may repeat a value but never
- * change or add one.
+ * change or add one. The init process holding that environment runs as the
+ * sandbox's own user: the value is only as immutable as the deployed sandbox
+ * makes same-user process memory (no ptrace capability, Yama ptrace_scope >= 1),
+ * which PR 3's host-integration lane must check against the real run config.
  */
 export function hostAssignment(creationEnv, processEnv = {}) {
   if (!creationEnv) {
@@ -456,69 +474,146 @@ export function removeCreatedPaths(workspace, beforePaths, nowPaths) {
   return removed;
 }
 
-/** Git config keys that carry or fetch credentials or auth. */
-const GIT_AUTH_KEY_RES = [
-  /^credential\./,
-  /(^|\.)extraheader$/,
-  /^core\.askpass$/,
-  /^core\.sshcommand$/,
-  /^include\.path$/,
-  /^includeif\./,
-  /(^|\.)cookiefile$/,
-  /^http\.(.*\.)?ssl(cert|key)$/,
-  /pass(word)?$/, // e.g. sendemail.smtppass, a proxy password
-];
+/**
+ * The SAFE BASELINE of git configuration: what a plain `git clone` (and a
+ * user identity) writes, and nothing that runs a program, changes a transport
+ * or carries a credential. Every other key — core.fsmonitor, core.hooksPath,
+ * core.pager, core.editor, core.sshCommand, core.askPass, protocol.*,
+ * uploadpack.*, url.*.insteadOf/pushInsteadOf, credential.*, http.*, include*,
+ * filter.*, diff.*, alias.*, remote.*.uploadpack/receivepack/proxy, ... — is
+ * refused wherever it comes from (system, global or the worktree's own config).
+ */
+const GIT_BASELINE_KEYS = new Set([
+  "core.repositoryformatversion",
+  "core.filemode",
+  "core.bare",
+  "core.logallrefupdates",
+  "core.ignorecase",
+  "core.precomposeunicode",
+  "core.symlinks",
+  "extensions.objectformat",
+  "user.name",
+  "user.email",
+  "init.defaultbranch",
+]);
+const GIT_BASELINE_PATTERNS = [/^remote\.[^\s=]+\.(url|fetch|tagopt|promisor|partialclonefilter)$/, /^branch\.[^\s=]+\.(remote|merge)$/];
 const USERINFO_RE = /:\/\/[^/@\s]+@/;
 
 /**
- * Credential or auth settings in `git config --list --show-origin` output, by
- * key and origin only (a value is never repeated; userinfo in a key is masked).
+ * Git configuration outside the safe baseline, or a baseline key whose value
+ * carries credentials in a URL or picks a transport helper, from `git config --list
+ * --show-origin` output — by key and origin only (a value is never repeated;
+ * userinfo in a key is masked).
  */
-export function gitAuthFindings(listing) {
+export function gitConfigFindings(listing) {
   const findings = new Set();
   for (const line of String(listing).split("\n")) {
     if (line.trim() === "") continue;
     const tab = line.indexOf("\t");
     const origin = tab >= 0 ? line.slice(0, tab) : "";
     const entry = tab >= 0 ? line.slice(tab + 1) : line;
-    if (origin === "command line:") continue; // the launcher's own -c safe.directory
+    if (origin === "command line:") continue; // the launcher's own -c options
     const eq = entry.indexOf("=");
     const key = (eq >= 0 ? entry.slice(0, eq) : entry).toLowerCase();
     const value = eq >= 0 ? entry.slice(eq + 1) : "";
-    const flagged =
-      GIT_AUTH_KEY_RES.some((re) => re.test(key)) ||
+    const baseline = GIT_BASELINE_KEYS.has(key) || GIT_BASELINE_PATTERNS.some((re) => re.test(key));
+    const unsafeValue =
       USERINFO_RE.test(key) ||
       USERINFO_RE.test(value) ||
-      /authorization:|bearer\s/i.test(value);
-    if (flagged) findings.add(`${key.replace(/:\/\/[^/@\s]+@/g, "://***@")} (${origin.replace(/:$/, "")})`);
+      (/^remote\..+\.url$/.test(key) && (value.includes("::") || value.startsWith("-")));
+    if (!baseline || unsafeValue) findings.add(`${key.replace(/:\/\/[^/@\s]+@/g, "://***@")} (${origin.replace(/:$/, "")})`);
   }
   return [...findings];
 }
 
-/**
- * What git would see in the worktree before a job runs: `git config --list
- * --show-origin` with the step environment (fresh HOME), never climbing above
- * the worktree. Refuses when it carries credentials or auth settings.
- */
-export function inspectGitConfig({ workspace, env, git = GIT }) {
-  const root = realpathSync(workspace);
-  const r = spawnSync(git, ["-c", `safe.directory=${root}`, "config", "--list", "--show-origin"], {
+const gitArgs = (root, args) => ["-c", `safe.directory=${root}`, "-c", "core.fsmonitor=false", "--no-optional-locks", ...args];
+function runGit(git, root, env, args) {
+  return spawnSync(git, gitArgs(root, args), {
     cwd: root,
     env: { ...env, GIT_CEILING_DIRECTORIES: dirname(root) },
     encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
+    maxBuffer: 16 * 1024 * 1024,
   });
+}
+const unreachable = (r) => /not a git repository/.test(r.stderr ?? "");
+
+/**
+ * What git would see in the worktree before a job runs: `git config --list
+ * --show-origin` with the step environment (fresh HOME), never climbing above
+ * the worktree, must stay inside the safe baseline; and the repository's hooks
+ * directory may hold only git's *.sample files (a fresh clone's).
+ */
+export function inspectGitConfig({ workspace, env, git = GIT }) {
+  const root = realpathSync(workspace);
+  const r = runGit(git, root, env, ["config", "--list", "--show-origin"]);
   if (r.error) return refuse("git-config-unreadable", `git could not be run to inspect the worktree's configuration (${r.error.code ?? "error"})`);
   if (r.status !== 0) {
     // A worktree whose git metadata lives outside the sandbox: git in a step cannot read it either.
-    if (/not a git repository/.test(r.stderr ?? "")) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
+    if (unreachable(r)) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
     return refuse("git-config-unreadable", `git could not read the worktree's configuration: ${(r.stderr ?? "").split("\n")[0]}`);
   }
-  const findings = gitAuthFindings(r.stdout);
+  const findings = gitConfigFindings(r.stdout);
   if (findings.length > 0) {
     return refuse(
-      "git-credential-config",
-      `the worktree's git configuration carries credential or auth settings: ${findings.join(", ")}; the review sandbox runs no step with them`,
+      "git-config",
+      `the worktree's git configuration has settings outside the safe baseline (a credential, a program git would run, or a transport change): ${findings.join(", ")}; no step runs with them`,
+    );
+  }
+  const gitDir = runGit(git, root, env, ["rev-parse", "--absolute-git-dir"]);
+  if (gitDir.status === 0) {
+    const hooks = join(gitDir.stdout.trim(), "hooks");
+    let names = [];
+    try {
+      names = readdirSync(hooks);
+    } catch {
+      names = [];
+    }
+    const live = names.filter((n) => !n.endsWith(".sample"));
+    if (live.length > 0) {
+      return refuse("git-config", `the worktree's repository has git hooks a fresh clone does not (${live.join(", ")}); no step runs with them`);
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * actions/checkout is skipped only when the worktree already is what it would
+ * produce: a clean clone of one commit — no modified, untracked or ignored file
+ * — with history shaped as `fetch-depth` asks (1: a shallow one-commit clone
+ * without tags, as checkout's default fetch makes; 0: a full clone).
+ */
+export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
+  const root = realpathSync(workspace);
+  const head = runGit(git, root, env, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
+  if (head.error || head.status !== 0) {
+    return refuse(
+      "not-fresh",
+      unreachable(head)
+        ? "the worktree's git metadata is not reachable in the sandbox, so the clean checkout that actions/checkout gives CI cannot be verified"
+        : "the worktree has no checked-out commit, so the clean checkout that actions/checkout gives CI cannot be verified",
+    );
+  }
+  const status = runGit(git, root, env, ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"]);
+  if (status.status !== 0) return refuse("not-fresh", `git status failed in the worktree: ${(status.stderr ?? "").split("\n")[0]}`);
+  const entries = status.stdout.split("\0").filter((e) => e !== "");
+  if (entries.length > 0) {
+    const shown = entries.slice(0, 5).map((e) => e.slice(3));
+    return refuse(
+      "not-fresh",
+      `the worktree is not the clean clone actions/checkout gives CI: ${entries.length} modified, untracked or ignored path(s), e.g. ${shown.join(", ")}`,
+    );
+  }
+  const shallow = runGit(git, root, env, ["rev-parse", "--is-shallow-repository"]).stdout?.trim();
+  if (fetchDepth === 0) {
+    if (shallow !== "false") return refuse("not-fresh", "the job checks out full history (fetch-depth: 0) but the worktree is a shallow clone");
+    return { ok: true };
+  }
+  const count = runGit(git, root, env, ["rev-list", "--count", "HEAD"]).stdout?.trim();
+  const tags = runGit(git, root, env, ["for-each-ref", "--count=1", "--format=%(refname)", "refs/tags"]).stdout?.trim();
+  if (shallow !== "true" || count !== "1" || tags) {
+    return refuse(
+      "not-fresh",
+      `the job uses checkout's default one-commit fetch, but the worktree ${shallow !== "true" ? "is not a shallow clone" : count !== "1" ? `reaches ${count} commits` : "has tags"}; mount a depth-1 clone of the assigned head`,
     );
   }
   return { ok: true };
@@ -577,19 +672,52 @@ export function guardStep(step, env, workspace) {
   return { ok: true, env: effective, cwd: cwd.dir };
 }
 
-/** Run one step as a script file under /bin/bash, the way the Actions runner does. */
-export function bashStep({ step, scriptDir, env }) {
+/** The exit code a timed-out step is given (as timeout(1) does). */
+export const TIMEOUT_CODE = 124;
+
+/** Kill a step's whole process group; a group already gone is fine. */
+export function killGroup(pid) {
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // already exited
+  }
+}
+
+/**
+ * Run one step as a script file under /bin/bash, the way the Actions runner
+ * does, in its own process group. At `timeoutMs` the whole group is killed and
+ * the step fails as timed out. The group is added to `groups` so the job can
+ * kill what the step left running when the job ends, as the runner does.
+ */
+export function bashStep({ step, scriptDir, env, timeoutMs = null, groups = null }) {
   const script = join(scriptDir, `step-${step.job}-${String(step.index).padStart(2, "0")}.sh`);
   writeFileSync(script, step.script, { mode: 0o600 });
-  return new Promise((resolveCode) => {
+  return new Promise((resolveResult) => {
     const child = spawn(BASH, ["--noprofile", "--norc", "-eo", "pipefail", script], {
       cwd: step.cwd,
       env,
+      detached: true,
       // stdout of a step goes to stderr: the launcher's stdout is its verdict.
       stdio: ["ignore", 2, 2],
     });
-    child.on("error", () => resolveCode(127));
-    child.on("close", (code) => resolveCode(code ?? 1));
+    if (child.pid) groups?.add(child.pid);
+    let timedOut = false;
+    const timer =
+      timeoutMs === null
+        ? null
+        : setTimeout(() => {
+            timedOut = true;
+            if (child.pid) killGroup(child.pid);
+          }, Math.max(0, timeoutMs));
+    child.on("error", () => {
+      if (timer) clearTimeout(timer);
+      resolveResult({ code: 127 });
+    });
+    child.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolveResult(timedOut ? { code: TIMEOUT_CODE, timedOut: true } : { code: code ?? 1 });
+    });
   });
 }
 
@@ -605,10 +733,11 @@ export async function runSteps(steps, runStep) {
       results.push({ step: step.index, name: step.name, skipped: "an earlier step failed" });
       continue;
     }
-    const code = await runStep(step);
-    if (code !== null && typeof code === "object" && code.refusal) return { ok: false, refusal: code.refusal, results };
-    results.push({ step: step.index, name: step.name, code });
-    if (code !== 0 && !failed) failed = { step: step.index, name: step.name, code };
+    const r = await runStep(step);
+    if (r !== null && typeof r === "object" && r.refusal) return { ok: false, refusal: r.refusal, results };
+    const { code, timedOut } = r !== null && typeof r === "object" ? r : { code: r };
+    results.push(timedOut ? { step: step.index, name: step.name, code, timedOut } : { step: step.index, name: step.name, code });
+    if (code !== 0 && !failed) failed = timedOut ? { step: step.index, name: step.name, code, timedOut } : { step: step.index, name: step.name, code };
   }
   return failed ? { ok: false, results, failed } : { ok: true, results };
 }
@@ -616,8 +745,8 @@ export async function runSteps(steps, runStep) {
 /**
  * The review build. Every input that decides WHAT runs is read here, in order,
  * before anything is spawned. `workspace`, `trustedDir`, `hermeticRoot`,
- * `creationEnv`, `probe`, `inspectGit` and `runStep` are injectable for host
- * tests only; the CLI passes none of them.
+ * `creationEnv`, `probe`, `inspectGit`, `checkFresh` and `runStep` are
+ * injectable for host tests only; the CLI passes none of them.
  */
 export async function reviewBuild({
   workspace = WORKSPACE,
@@ -627,6 +756,7 @@ export async function reviewBuild({
   creationEnv = readCreationEnv(),
   probe = probeActualVersions,
   inspectGit = inspectGitConfig,
+  checkFresh = checkFreshClone,
   runStep = bashStep,
 }) {
   const identity = readIdentity(trustedDir, parentEnv);
@@ -693,22 +823,39 @@ export async function reviewBuild({
       continue;
     }
     if (i > 0) {
-      // Each job starts from the worktree as the build found it, as on a fresh runner.
+      // Remove what earlier jobs created; the fresh-clone check below then
+      // refuses anything else they left behind.
       const now = scanWorkspace(workspace);
       if (!now.ok) return stop(now.refusal);
       removeCreatedPaths(workspace, before.paths, now.paths);
     }
+    // Each job gets a fresh HOME/TMPDIR/caches, as on a fresh runner.
+    prepareHermeticRoot(hermeticRoot);
     const git = inspectGit({ workspace, env });
     if (!git.ok) return stop(git.refusal);
+    const fresh = checkFresh({ workspace, env, fetchDepth: job.fetchDepth });
+    if (!fresh.ok) return stop(fresh.refusal);
 
-    const outcome = await runSteps(
-      job.steps.map((s) => ({ ...s, job: job.id })),
-      (step) => {
-        const guard = guardStep(step, env, workspace);
-        if (!guard.ok) return guard;
-        return runStep({ step: { ...step, cwd: guard.cwd }, workspace, scriptDir, env: guard.env });
-      },
-    );
+    // timeout-minutes: the job's (default 360) bounds every step; a step's own bounds it further.
+    const deadline = Date.now() + job.timeoutMinutes * 60_000;
+    const groups = new Set();
+    let outcome;
+    try {
+      outcome = await runSteps(
+        job.steps.map((s) => ({ ...s, job: job.id })),
+        (step) => {
+          const guard = guardStep(step, env, workspace);
+          if (!guard.ok) return guard;
+          const remaining = deadline - Date.now();
+          if (remaining <= 0) return { code: TIMEOUT_CODE, timedOut: true };
+          const timeoutMs = step.timeoutMinutes === null ? remaining : Math.min(step.timeoutMinutes * 60_000, remaining);
+          return runStep({ step: { ...step, cwd: guard.cwd }, workspace, scriptDir, env: guard.env, timeoutMs, groups });
+        },
+      );
+    } finally {
+      // What the job's steps left running ends with the job, as on the runner.
+      for (const pid of groups) killGroup(pid);
+    }
     jobs.push({ job: job.id, steps: outcome.results, skipped: job.skipped });
     if (outcome.refusal) return stop(outcome.refusal);
 
@@ -716,6 +863,12 @@ export async function reviewBuild({
     if (!after.ok) return stop(after.refusal);
     if (after.symlinkedLockfiles.length > 0) {
       return stop({ kind: "unfrozen-install", message: `job ${job.id} left symlinked lockfiles (${after.symlinkedLockfiles.join(", ")})` });
+    }
+    if (after.directoryAliases.length > 0) {
+      return stop({
+        kind: "symlinked-path",
+        message: `job ${job.id} left symlinked directories (${after.directoryAliases.join(", ")}); lockfile drift cannot be verified through a symlink`,
+      });
     }
     const drift = lockfileDrift(before.lockfiles, after.lockfiles);
     if (drift.length > 0) {
@@ -732,7 +885,9 @@ export async function reviewBuild({
   if (notOk) {
     const entry = jobs.find((j) => j.job === notOk.id);
     const why = entry?.failed
-      ? `step ${entry.failed.step} (${entry.failed.name}) exited ${entry.failed.code}`
+      ? entry.failed.timedOut
+        ? `step ${entry.failed.step} (${entry.failed.name}) timed out (timeout-minutes)`
+        : `step ${entry.failed.step} (${entry.failed.name}) exited ${entry.failed.code}`
       : entry?.skipped ?? "it did not run";
     return stop({ kind: "stage-failed", message: `job ${notOk.id}: ${why}` });
   }
