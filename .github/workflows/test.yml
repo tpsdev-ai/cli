@@ -126,6 +126,26 @@ jobs:
           npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
           npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
           bun run test              # the isolated launcher (see scripts/run-tests.mjs)
+      # The github-review suite includes the gateway-boundary lane, which runs
+      # OpenClaw 2026.8.1 under node (its plugin loader needs node:sqlite and
+      # node >=22.22.3 <23 || >=24.15 <25 || >=25.9). Set up here, after the
+      # mail plugin's step, so no earlier step changes node. The version is
+      # exact: the reviewer planner (scripts/reviewer/ci-job.mjs) reproduces
+      # only an exact node-version, and 24.21.0 is the node of the trusted
+      # runtime table's reviewer-node24-bun1310 image, the one image this job
+      # resolves to (package.json engines.node is "22.x || 24.x").
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - name: openclaw-github-review plugin tests (isolated HOME launcher)
+        # The github_review tool plugin writes its JUnit report for the cli#411
+        # guard below; it shares no code or dependency with the mail plugin.
+        working-directory: plugins/openclaw-github-review
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          npm run typecheck:test
+          bun run test
       # cli#411 — the guard runs LAST, with `if: always()`, so a failing suite
       # step cannot skip it. It is never a clause of a suite: a guard that ran
       # inside one could be taken down by dropping that suite, which is the
@@ -180,6 +200,99 @@ jobs:
         run: |
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
+
+  # Section E — the permanent gateway-boundary lane for github_review. It runs
+  # the BUILT plugin in a node process against the pinned OpenClaw release
+  # (2026.8.1, the reviewer hosts' release): registration through OpenClaw's
+  # loader from the shipped manifest with zero diagnostics (which rejects the CI
+  # probe; the probe registers only from a lane-created overlay); a reviewer
+  # session configured sandbox mode=all that OpenClaw's default sandbox tool
+  # policy does not offer the verb and the documented alsoAllow does; dispatch
+  # through the gateway's tools.invoke path, posting through the plugin's real
+  # GitHub and Flair clients (controlled services) to `posted`; the probe's
+  # gateway process identity and host-only marker read; and secret scans of
+  # every run. No sandbox container runs: the container half of the contrast
+  # arrives with the reviewer image (section A).
+  github-review-gateway-boundary:
+    name: GitHub review gateway-boundary lane
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      # The same exact node as the test job's github-review suite.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - name: Install + build the github-review plugin
+        working-directory: plugins/openclaw-github-review
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+          npm run typecheck:test
+          test -f dist/src/index.js
+      - name: Run the gateway-boundary lane
+        working-directory: plugins/openclaw-github-review
+        run: node scripts/run-tests.mjs test/gateway-boundary.test.ts
+
+  # cli#425 section A — the reviewer sandbox image matrix (linux/amd64). Builds
+  # every trusted runtime image and runs the image-level acceptance checks: A2
+  # integrity, the image's own resolver refusals and the build-path fixtures (an
+  # out-of-matrix pin, a pin for another image, a caller naming another job and a
+  # --workspace argument run nothing; an in-matrix pin runs the host-named job
+  # while impostor binaries on the caller's PATH never run; a run: step's
+  # timeout-minutes is enforced; a worktree that fails the clean-clone check and
+  # a git core.fsmonitor are refused before anything runs), A3 hermetic defaults
+  # observed inside a build run the way OpenClaw runs the sandbox (read-only
+  # root, tmpfs, no network, `sleep infinity` + exec), and A9 tokenless gh plus
+  # the launcher refusing a worktree git auth header and a workflow GH_TOKEN. The
+  # A9 red proofs then require the same A9 checks to FAIL on derived images
+  # carrying planted fake credentials, so the lane proves A9 fires on every run.
+  # No registry: the local image ids are recorded as evidence of this build only
+  # (a host builds its own at install time). The host unit tests for the
+  # planner/resolver/launcher run in the cli suite.
+  reviewer-image:
+    name: Reviewer sandbox image (A2/A3/A9)
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - name: Build and check each matrix image
+        run: |
+          set -euo pipefail
+          ids="$(node -e 'const t=require("./docker/reviewer/runtime-matrix.json"); process.stdout.write(t.images.map((i)=>i.id).join(" "))')"
+          count=0
+          for id in $ids; do
+            count=$((count+1))
+            tag="reviewer-image:${id}"
+            node scripts/reviewer/build-reviewer-image.mjs "$id" --tag "$tag" | tee "build-${id}.json"
+            bash scripts/reviewer/image-checks.sh "$tag" "$id" docker/reviewer/runtime-matrix.json | tee "checks-${id}.log"
+          done
+          test "$count" -ge 1   # an empty matrix must not read as a pass
+      - name: A9 red proofs (the A9 checks must fail on credential-bearing derived images)
+        run: |
+          set -euo pipefail
+          id="$(node -e 'process.stdout.write(require("./docker/reviewer/runtime-matrix.json").images[0].id)')"
+          bash scripts/reviewer/a9-red-proofs.sh "reviewer-image:${id}" "$id" docker/reviewer/runtime-matrix.json
+      - name: Record the local image ids of this build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reviewer-image-ids
+          path: build-*.json
+          if-no-files-found: error
 
   audit:
     name: Dependency Audit
