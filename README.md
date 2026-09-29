@@ -219,7 +219,7 @@ git clone https://github.com/tpsdev-ai/cli.git
 cd cli
 bun install
 bun run build
-bun test        # 430+ tests
+bun run test    # every suite, HOME-isolated (a bare `bun test` aborts by design)
 ```
 
 ## License

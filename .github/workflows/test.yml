@@ -101,10 +101,12 @@ jobs:
         # agents, run, mail); on a host that runs production agents under the same
         # user that is a real write. Run it with HOME pointed at an EMPTY directory
         # and assert that directory still has no `.tps` afterwards — the suite must
-        # not write into the HOME it was given. The lane launcher
-        # (scripts/test-suite.mjs) additionally points each child's HOME at a
-        # throwaway root, preloads a guard that aborts a non-isolated run, and
-        # snapshots the real ~/.tps before/after (fail on any change).
+        # not write a `.tps` into the HOME it was given (a check of the end
+        # state, not of transient writes). The control is in the lane launcher
+        # (scripts/test-suite.mjs): each child's HOME points at a throwaway root,
+        # inherited home-routing variables (XDG_*, TPS_*, FLAIR_*, …) are dropped,
+        # and a preload aborts a non-isolated run; its ~/.tps metadata snapshot
+        # is a diagnostic for a persisted change, not an OS boundary.
         run: |
           iso_home="$(mktemp -d)"
           HOME="$iso_home" bun run test

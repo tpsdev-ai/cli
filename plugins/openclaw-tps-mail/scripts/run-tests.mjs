@@ -15,11 +15,15 @@
  *
  * WHAT IT DOES. It creates a throwaway root, creates the mail + keys dirs
  * under it, and launches `bun test` with HOME, TPS_MAIL_DIR and
- * TPS_TEST_KEYS_DIR pointing inside that root. Any inherited TPS_MAIL_DIR is
- * UNSET first (so a stale real one cannot leak back in). The root is passed to
- * the child as TPS_TEST_ROOT, which the bun test preload
- * (test/preload-guard.ts) whitelists against — a run that is NOT under this
- * root aborts before any test module loads.
+ * TPS_TEST_KEYS_DIR pointing inside that root. The inherited environment is
+ * SANITIZED first (cli#430, scripts/test-home-guard.mjs `sanitizedTestEnv`):
+ * every variable that routes a path around HOME — the XDG base dirs, TPS_*
+ * (a stale real TPS_MAIL_DIR included), FLAIR_*, BOB_*, OPENCLAW_*, CODEX_HOME,
+ * … — is dropped. The root is passed to the child as TPS_TEST_ROOT, which the
+ * bun test preload (test/preload-guard.ts) whitelists against — a run that is
+ * NOT under this root aborts before any test module loads. Before creating or
+ * deleting anything, the launcher refuses a temp dir or TPS_TEST_REPORT_DIR that
+ * resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config.
  *
  * USAGE
  *   node scripts/run-tests.mjs [bun test args…]   # default: `test/`
@@ -32,18 +36,19 @@
  * under TPS_TEST_REPORT_DIR when set. It DELETES its own report and log BEFORE
  * launching, so a file left by an earlier step or run cannot stand in for this
  * run's; and the guard reads the XML only, so a test that prints a path-shaped
- * line cannot put a file into the executed set. The flags are set here rather
- * than imported from the monorepo's scripts/test-suite.mjs so this launcher
- * stays self-contained (it ships inside the plugin's own package), and a
- * caller's own --reporter argument is left alone.
+ * line cannot put a file into the executed set. The reporter flags are set here
+ * (a caller's own --reporter argument is left alone). This launcher runs only
+ * inside the monorepo — the plugin's tests import packages/cli/dist, and it
+ * imports the shared HOME guard from scripts/test-home-guard.mjs; scripts/ is
+ * not part of the published plugin package.
  *
  * cli#414: once bun exits, this launcher SEALS the report it produced —
  * test-reports/plugin.xml.sha256, holding the report's SHA-256 and the suite
  * name "plugin", read back once — so a later suite cannot replace it after the
  * suite ended. The seal format is the one check-test-reports.mjs parses and
- * scripts/test-suite.mjs writes; it is spelled out here because this launcher
- * is self-contained. A stale seal is deleted with the report and log before the
- * run starts.
+ * scripts/test-suite.mjs writes; it is spelled out here rather than imported,
+ * so the two must agree. A stale seal is deleted with the report and log before
+ * the run starts.
  * The limit, stated: the seal defeats an ACCIDENTAL overwrite by a later step in
  * the same job; it is not a defence against code in the same job that rewrites
  * the report and the seal together — that code shares the job's filesystem, and
@@ -64,15 +69,44 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describeLeak, diffSnapshots, snapshotTps } from "../../../scripts/test-home-guard.mjs";
+import {
+  IsolationRefusal,
+  assertTestDestinations,
+  describeLeak,
+  diffSnapshots,
+  sanitizedTestEnv,
+  snapshotTps,
+} from "../../../scripts/test-home-guard.mjs";
 
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const keep = process.env.TPS_TEST_KEEP_ROOT === "1";
 
-// cli#430: the real ~/.tps (the HOME this launcher runs under) is snapshotted
-// before and after the run; a change fails the lane. This is the backstop for a
-// leak that hard-codes the real home — the child's HOME override + the bunfig
-// preload cover everything that resolves through the process HOME.
+// cli#411: test-reports/<suite>.xml + .log, beside the other suites' reports.
+const repoRoot = resolve(pluginDir, "..", "..");
+const reportDir = process.env.TPS_TEST_REPORT_DIR
+  ? resolve(process.env.TPS_TEST_REPORT_DIR)
+  : join(repoRoot, "test-reports");
+
+// cli#430: refuse BEFORE creating or deleting anything when the temp dir (the
+// throwaway root is created and removed there) or an overridden report dir
+// (stale reports are deleted there) resolves inside ~/.tps, ~/.flair, ~/agents
+// or ~/.config.
+try {
+  assertTestDestinations({
+    env: process.env,
+    reportDir: process.env.TPS_TEST_REPORT_DIR ? reportDir : undefined,
+  });
+} catch (err) {
+  if (!(err instanceof IsolationRefusal)) throw err;
+  console.error(`openclaw-tps-mail tests: ${err.message}`);
+  process.exit(1);
+}
+
+// cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher runs
+// under, taken before anything is written. A DIAGNOSTIC: it reports a change
+// that persists to the end of the run (path, size, mtime, ctime, inode — never
+// contents). The control is the child's HOME override + the sanitized
+// environment + the bunfig preload.
 const guardHome = process.env.HOME || homedir();
 const tpsBefore = snapshotTps(guardHome);
 
@@ -84,11 +118,13 @@ const keysDir = join(root, "keys");
 mkdirSync(mailDir, { recursive: true });
 mkdirSync(keysDir, { recursive: true });
 
-// Child env: UNSET the ambient values first, then set the launch-time ones.
-const env = { ...process.env };
-delete env.TPS_MAIL_DIR;
-delete env.TPS_TEST_KEYS_DIR;
-delete env.TPS_TEST_ROOT;
+// Child env: SANITIZE the inherited values first (cli#430 — drops every
+// home-routing override, the ambient TPS_MAIL_DIR / TPS_TEST_KEYS_DIR /
+// TPS_TEST_ROOT included), then set the launch-time ones.
+const { env, dropped } = sanitizedTestEnv(process.env);
+if (dropped.length > 0) {
+  console.error(`openclaw-tps-mail tests: not passed to the tests (inherited, would bypass HOME): ${dropped.join(", ")}`);
+}
 Object.assign(env, {
   HOME: root,
   TPS_MAIL_DIR: mailDir,
@@ -101,11 +137,6 @@ Object.assign(env, {
 
 console.log(`openclaw-tps-mail tests: isolated root ${root}`);
 
-// cli#411: test-reports/<suite>.xml + .log, beside the other suites' reports.
-const repoRoot = resolve(pluginDir, "..", "..");
-const reportDir = process.env.TPS_TEST_REPORT_DIR
-  ? resolve(process.env.TPS_TEST_REPORT_DIR)
-  : join(repoRoot, "test-reports");
 mkdirSync(reportDir, { recursive: true });
 const reportXml = join(reportDir, "plugin.xml");
 const reportLog = join(reportDir, "plugin.log");
@@ -147,8 +178,9 @@ child.on("error", (err) => {
 });
 
 child.on("close", (code, signal) => {
-  // cli#430: compare the real ~/.tps before/after; a change is a leak and fails
-  // the lane even when every test passed. Paths + sizes + mtimes only.
+  // cli#430: compare the ~/.tps snapshot before/after; a persisted change is
+  // reported and fails the lane even when every test passed (a diagnostic — see
+  // scripts/test-home-guard.mjs for what it does and does not detect).
   let exitCode = signal ? 1 : (code ?? 1);
   const changed = diffSnapshots(tpsBefore, snapshotTps(guardHome));
   if (changed.length > 0) {

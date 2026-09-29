@@ -16,9 +16,12 @@
  * at all unless the process actually came up under that root. Nothing to
  * intercept and nothing a product `catch` can swallow.
  *
- * The real-`~/.tps` before/after snapshot (scripts/test-home-guard.mjs, driven
- * by the launcher) is the second half: this guard ensures resolution goes to the
- * temp root; the snapshot catches a leak that hard-codes the real path.
+ * The launcher also drops every inherited home-routing variable (XDG_*, TPS_*,
+ * FLAIR_*, …; scripts/test-home-guard.mjs `sanitizedTestEnv`), so paths that
+ * would otherwise bypass HOME fall back to the temp root. Its `~/.tps` metadata
+ * snapshot is a diagnostic for a persisted change, not a boundary: this guard
+ * and the sanitized environment are the control. The repo-root and per-package
+ * bunfig.toml files load this same preload, so a bare `bun test` aborts too.
  */
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";

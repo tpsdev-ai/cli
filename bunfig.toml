@@ -1,0 +1,16 @@
+# bunfig.toml — repo-root test configuration (cli#430).
+#
+# The PRELOAD below loads before any test module. It ABORTS the run unless
+# os.homedir() resolves inside the isolated test root the launcher created
+# (TPS_TEST_ROOT). Run the suite through the launcher:
+#
+#   bun run test                          # all lanes
+#   node scripts/test-suite.mjs <suite>   # one lane (also: targeted files, e.g.
+#                                         # the Docker `attested` service)
+#
+# A bare `bun test` here aborts by name — that is the point: the cli suite
+# resolves ~/.tps (identity, credentials, auth, agents, run, mail) from the
+# process HOME, so an unisolated run writes into the live tree.
+
+[test]
+preload = ["./scripts/home-isolation-preload.ts"]

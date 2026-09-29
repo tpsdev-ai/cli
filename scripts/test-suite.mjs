@@ -53,6 +53,14 @@
  * true. A stale seal is deleted with the report and log before the suite starts,
  * so a seal left by an earlier run cannot vouch for a report this run never made.
  *
+ * HOME ISOLATION (cli#430). The child runs with HOME and TPS_TEST_ROOT pointed
+ * at a throwaway root, an environment with every home-routing override removed
+ * (scripts/test-home-guard.mjs `sanitizedTestEnv`), and a `--preload` that aborts
+ * a child whose os.homedir() is outside that root. The launcher refuses to start
+ * when its temp dir or an overridden report dir resolves inside ~/.tps, ~/.flair,
+ * ~/agents or ~/.config, and reports (and fails on) a persisted change to the
+ * ~/.tps of the HOME it runs under — a metadata diagnostic, not an OS boundary.
+ *
  * USAGE
  *   node scripts/test-suite.mjs <suite> [bun test args…]
  *
@@ -66,7 +74,14 @@ import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, re
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describeLeak, diffSnapshots, snapshotTps } from "./test-home-guard.mjs";
+import {
+  IsolationRefusal,
+  assertTestDestinations,
+  describeLeak,
+  diffSnapshots,
+  sanitizedTestEnv,
+  snapshotTps,
+} from "./test-home-guard.mjs";
 
 /** The repo root, from this file's own location: `<root>/scripts/test-suite.mjs`. */
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -77,10 +92,13 @@ export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
  */
 export const HOME_ISOLATION_PRELOAD = join(REPO, "scripts", "home-isolation-preload.ts");
 
+/** The in-repo report directory, used unless TPS_TEST_REPORT_DIR is set. */
+export const DEFAULT_REPORT_DIR = join(REPO, "test-reports");
+
 /** Where the reports go: `<root>/test-reports`, or TPS_TEST_REPORT_DIR when set. */
 export const REPORT_DIR = process.env.TPS_TEST_REPORT_DIR
   ? resolve(process.env.TPS_TEST_REPORT_DIR)
-  : join(REPO, "test-reports");
+  : DEFAULT_REPORT_DIR;
 
 /** The two files a suite writes: its JUnit XML (the guard's record), its console log (the CI record). */
 export function reportPaths(suite, reportDir = REPORT_DIR) {
@@ -98,7 +116,8 @@ export function sealPath(suite, reportDir = REPORT_DIR) {
 /**
  * The seal's text: the report's SHA-256 (hex) and the suite name, on one line.
  * This is the format `check-test-reports.mjs` parses and the plugin's own
- * launcher writes (it is self-contained, so the two must agree).
+ * launcher writes (it spells the format out rather than importing it, so the
+ * two must agree).
  */
 export function sealText(suite, hash) {
   return `${hash}  ${suite}\n`;
@@ -131,6 +150,20 @@ export function sealReport(suite, reportDir = REPORT_DIR) {
  * are deleted first: this run's report must be the one that gets read.
  */
 export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.env, reportDir = REPORT_DIR }) {
+  // cli#430: refuse BEFORE creating or deleting anything when the temp dir (where
+  // the throwaway root is created and later removed) or an overridden report dir
+  // (where stale reports are deleted) resolves inside ~/.tps, ~/.flair, ~/agents
+  // or ~/.config. Throws IsolationRefusal.
+  assertTestDestinations({ env, reportDir: reportDir === DEFAULT_REPORT_DIR ? undefined : reportDir });
+
+  // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher
+  // runs under, taken before this launcher writes anything. A DIAGNOSTIC: it
+  // reports a change that persists to the end of the lane (path, size, mtime,
+  // ctime, inode — never contents); the control is the HOME redirection and the
+  // sanitized environment below (scripts/test-home-guard.mjs).
+  const guardHome = env.HOME || homedir();
+  const tpsBefore = snapshotTps(guardHome);
+
   const { xml, log } = reportPaths(suite, reportDir);
   const seal = sealPath(suite, reportDir);
   mkdirSync(reportDir, { recursive: true });
@@ -143,20 +176,21 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
 
   // cli#430: isolate HOME for the whole lane. The suite used to resolve the
   // real ~/.tps (identity, credentials, auth, agents, run, mail, outbox) from the
-  // operator HOME. Create a throwaway root, point the child's HOME and
-  // TPS_TEST_ROOT at it, DROP any ambient mail/keys dir so a real one cannot
-  // leak back in, and pass the isolation PRELOAD so a child that did not come up
-  // under the root aborts before any test module loads. The real ~/.tps (the HOME
-  // this launcher runs under) is snapshotted before and after: a change fails the
-  // lane even if every test passed (scripts/test-home-guard.mjs).
+  // operator HOME. Create a throwaway root and point the child's HOME and
+  // TPS_TEST_ROOT at it. SANITIZE the inherited environment first: every
+  // variable that routes a path around HOME (XDG_CONFIG_HOME and the other XDG
+  // base dirs, TPS_*, FLAIR_*, BOB_*, OPENCLAW_*, CODEX_HOME, …) is dropped, so
+  // the code falls back to the child's HOME. Pass the isolation PRELOAD so a
+  // child that did not come up under the root aborts before any test module
+  // loads.
   const isoRoot = realpathSync(mkdtempSync(join(tmpdir(), `tps-test-${suite}-`)));
   mkdirSync(join(isoRoot, ".tps", "mail"), { recursive: true });
   mkdirSync(join(isoRoot, "keys"), { recursive: true });
-  const childEnv = { ...env, HOME: isoRoot, TPS_TEST_ROOT: isoRoot };
-  delete childEnv.TPS_MAIL_DIR;
-  delete childEnv.TPS_TEST_KEYS_DIR;
-  const guardHome = env.HOME || homedir();
-  const tpsBefore = snapshotTps(guardHome);
+  const { env: sanitized, dropped } = sanitizedTestEnv(env);
+  if (dropped.length > 0) {
+    process.stderr.write(`tps-test-${suite}: not passed to the tests (inherited, would bypass HOME): ${dropped.join(", ")}\n`);
+  }
+  const childEnv = { ...sanitized, HOME: isoRoot, TPS_TEST_ROOT: isoRoot };
 
   const reporters = args.filter((arg) => arg.startsWith("--reporter"));
   const bunArgs = [
@@ -182,9 +216,9 @@ export function runSuite({ suite, args = [], cwd = process.cwd(), env = process.
     });
     child.on("close", (code) => {
       let exitCode = code ?? 1;
-      // cli#430: compare the real ~/.tps before/after. A change is a leak and
-      // fails the lane even when every test passed. Paths + sizes + mtimes only,
-      // never contents.
+      // cli#430: compare the ~/.tps snapshot before/after. A persisted change is
+      // reported and fails the lane even when every test passed (a diagnostic —
+      // see scripts/test-home-guard.mjs for what it does and does not detect).
       const changed = diffSnapshots(tpsBefore, snapshotTps(guardHome));
       if (changed.length > 0) {
         process.stderr.write(`\n${describeLeak(guardHome, changed)}\n`);
@@ -229,6 +263,11 @@ async function main() {
   try {
     process.exitCode = await runSuite({ suite, args });
   } catch (err) {
+    if (err instanceof IsolationRefusal) {
+      process.stderr.write(`${suite}: ${err.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
     const what = err instanceof SealError ? "could not seal the report" : "could not launch bun test";
     process.stderr.write(`${suite}: ${what}: ${err.message}\n`);
     process.exitCode = 1;
