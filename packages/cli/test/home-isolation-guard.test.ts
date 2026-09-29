@@ -990,10 +990,13 @@ describe("end to end: the launchers refuse a caller-supplied --reporter-outfile"
           envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
          );
         expect(existsSync(marker)).toBe(false);
-        expect(readdirSync(mkdirSync(join(sim, ".tps"), { recursive: true, mode: 0o700 })).length).toBe(0);
+        expect(existsSync(join(sim, ".tps"))).toBe(false);
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(out).not.toContain("isolated root");
+        expect(readdirSync(reports)).toEqual([]);
        },
       E2E_TIMEOUT,
      );
@@ -1011,10 +1014,14 @@ describe("end to end: the launchers refuse a caller-supplied --reporter-outfile"
           launcher.cwd(fixture),
           envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
          );
+        expect(existsSync(join(sim, "agents"))).toBe(false);
         expect(existsSync(marker)).toBe(false);
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(out).not.toContain("isolated root");
+        expect(readdirSync(reports)).toEqual([]);
        },
       E2E_TIMEOUT,
      );
@@ -1035,6 +1042,9 @@ describe("end to end: the launchers refuse a caller-supplied --reporter-outfile"
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(out).not.toContain("isolated root");
+        expect(readdirSync(reports)).toEqual([]);
        },
       E2E_TIMEOUT,
      );

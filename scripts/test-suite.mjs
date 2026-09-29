@@ -189,20 +189,17 @@ export function runSuite({
   const seal = sealPath(suite, reportDir);
   assertTestDestinations({ env, tempBase, reportDir, paths: [xml, log, seal] });
 
-  // cli#430: refuse --reporter-outfile in caller args - the launcher
-  // owns the report destination. The check runs before mkdir/rm so
-  // nothing touches the filesystem if the caller hands us one
-  // (accepts --reporter=<name>).
+  // cli#430: the launcher owns the report destination. A caller-supplied
+  // --reporter-outfile would pick a path none of the checks above saw, so it is
+  // refused before anything is created (--reporter=<name> stays allowed).
   for (const arg of args) {
-    if (arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile=')) {
+    if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
       process.stderr.write(
-         `${suite}: refusing --reporter-outfile: the launcher owns the
-          report destination (set TPS_TEST_REPORT_DIR instead)\n`,
-       );
+        `${suite}: refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)\n`,
+      );
       process.exit(1);
-      return;
-       }
-     }
+    }
+  }
 
   // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher
   // runs under, taken before this launcher writes anything. A DIAGNOSTIC: the
@@ -323,12 +320,12 @@ async function main() {
   } catch (err) {
     if (err instanceof IsolationRefusal) {
       process.stderr.write(`${suite}: ${err.message}\n`);
-      process.exit(1);
+      process.exitCode = 1;
       return;
     }
     const what = err instanceof SealError ? "could not seal the report" : "could not launch bun test";
     process.stderr.write(`${suite}: ${what}: ${err.message}\n`);
-    process.exit(1);
+    process.exitCode = 1;
   }
 }
 

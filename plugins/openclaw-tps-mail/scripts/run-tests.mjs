@@ -106,6 +106,16 @@ try {
   console.error(`openclaw-tps-mail tests: ${err.message}`);
   process.exit(1);
 }
+// cli#430: the launcher owns the report destination (see scripts/test-suite.mjs);
+// refused here, before the throwaway root or any report file is created.
+for (const arg of process.argv.slice(2)) {
+  if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
+    console.error(
+      "openclaw-tps-mail tests: refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)",
+    );
+    process.exit(1);
+  }
+}
 
 // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher runs
 // under, taken before anything is written. A DIAGNOSTIC: the run fails on a
@@ -154,17 +164,6 @@ console.log(`openclaw-tps-mail tests: isolated root ${root}`);
 
 const passthrough = process.argv.slice(2);
 const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
-// cli#430: refuse --reporter-outfile in caller args - the
-// launcher owns the report destination (accepts --reporter=<name>).
-for (const arg of passthrough) {
-  if (arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile=')) {
-    console.error(
-      `openclaw-tps-mail tests: refusing --reporter-outfile: the launcher owns
-         the report destination (set TPS_TEST_REPORT_DIR instead)`
-     );
-    process.exit(1);
-  }
-}
 
 if (!args.some((arg) => arg.startsWith("--reporter"))) {
   args.push("--reporter=junit", `--reporter-outfile=${reportXml}`);
