@@ -862,14 +862,11 @@ function isSignedEnvelopeShape(x: unknown): x is Envelope {
 
 /**
  * The signed reply a receipt candidate CARRIES, parsed — or null when it
- * carries none. `stored` is the `envelope` object the recipient's promote()
- * persists on a record it consumed (it then rewrites the record's body to the
- * plaintext); it is preferred when present. Otherwise `signedJson` is parsed:
- * the delivered record's `body`, or a metadata receipt's `signedReply`. Shape
- * only — nothing is verified here.
+ * carries none. `signedJson` is the signed envelope JSON: a metadata receipt's
+ * `signedReply`, or an unpromoted record's `body`. Shape only — nothing is
+ * verified here.
  */
-export function receiptEnvelope(signedJson: unknown, stored?: unknown): Envelope | null {
-  if (isSignedEnvelopeShape(stored)) return stored;
+export function receiptEnvelope(signedJson: unknown): Envelope | null {
   if (typeof signedJson !== "string") return null;
   try {
     const parsed: unknown = JSON.parse(signedJson);
@@ -880,31 +877,65 @@ export function receiptEnvelope(signedJson: unknown, stored?: unknown): Envelope
 }
 
 /**
+ * The signed reply a DELIVERED RECORD carries (a posted record or a bridge
+ * sandbox record), BOUND to that record — or null. Two shapes:
+ *   - unpromoted: the record's `body` is the signed envelope JSON;
+ *   - promoted: the recipient's promote() stored the signed `envelope` on the
+ *     record and rewrote its `body` to the plaintext. The envelope's signature
+ *     covers ITS body, not the record's, so the record counts only when its
+ *     plaintext `body` IS the stored envelope's `body` — a valid stored
+ *     envelope beside altered plaintext is not this reply.
+ * Either way the record's `to` must be the envelope's `to`: the record claims
+ * the recipient the signature names. (The expected recipient itself is checked
+ * by isVerifiedReceiptReply.) Shape and binding only — nothing is verified here.
+ */
+export function recordReceiptEnvelope(record: any): Envelope | null {
+  let envelope: Envelope | null;
+  if (record?.envelope !== undefined) {
+    const stored: unknown = record.envelope;
+    if (!isSignedEnvelopeShape(stored)) return null;
+    if (record.body !== stored.body) return null;
+    envelope = stored;
+  } else {
+    envelope = receiptEnvelope(record?.body);
+  }
+  if (!envelope) return null;
+  if (record?.to !== envelope.to) return null;
+  return envelope;
+}
+
+/**
  * cli#429 — THE rule that makes a candidate EVIDENCE. A record that names this
  * obligation is a receipt only when the reply it carries is a VERIFIED signed
- * reply by the obligated agent for this thread:
- *   - it carries a signed v1 envelope (receiptEnvelope);
+ * reply by the obligated agent, to the inbound's sender, for this thread:
+ *   - it carries a signed v1 envelope (receiptEnvelope / recordReceiptEnvelope,
+ *     which also bind a delivered record's body and recipient to it);
  *   - the envelope's sender is the obligated agent (`from === agent`) — the
  *     signature below is checked against THAT agent's key, so the signer is the
  *     obligated agent;
+ *   - the envelope's recipient — inside the signature — is the inbound's
+ *     verified sender (`to === recipient`), the one the reply is owed to;
  *   - `signed` thread mode: the envelope's own `replyToId` — inside the
  *     signature — is the inbound's verified envelope id;
  *   - the signatures verify (`checkSignature`).
  * A matching record that is unsigned, carries a signature that does not
- * verify, or is signed by anyone else is NOT a receipt. `legacy` mode (an
- * obligation opened before cli#429, whose reply carried no thread inside its
- * envelope) keeps the wrapper-only thread check its record allows, and is held
- * to the same signature and signer rule.
+ * verify, is signed by anyone else or is addressed to anyone else is NOT a
+ * receipt. `legacy` mode (an obligation opened before cli#429, whose reply
+ * carried no thread inside its envelope) keeps the wrapper-only thread check
+ * its record allows, and is held to the same signature, signer and recipient
+ * rule.
  */
 export async function isVerifiedReceiptReply(
   envelope: Envelope | null,
   agent: string,
+  recipient: string,
   threadId: string,
   mode: ReceiptThreadMode,
   checkSignature: ReceiptSignatureCheck,
 ): Promise<boolean> {
   if (!envelope) return false;
   if (envelope.from !== agent) return false;
+  if (envelope.to !== recipient) return false;
   if (mode === "signed" && envelope.replyToId !== threadId) return false;
   try {
     return (await checkSignature(envelope)) === true;
@@ -950,8 +981,9 @@ export interface ReceiptScanOptions {
  * TWO receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
  * it answers, and — when the obligation record knows it — the reply itself;
  * and (cli#429) the reply it carries must be a VERIFIED signed reply by the
- * obligated agent for this thread (isVerifiedReceiptReply). Every form below
- * is held to that last rule; the pins before it only choose the candidates.
+ * obligated agent, to `recipient` (the inbound's verified sender), for this
+ * thread (isVerifiedReceiptReply). Every form below is held to that last rule;
+ * the pins before it only choose the candidates.
  *
  *   (1) METADATA (cli#389 round 3) — `<mailDir>/<agent>/.obligations/receipts/
  *       <obligationId>.json` (per-agent since round 5): the record
@@ -971,9 +1003,11 @@ export interface ReceiptScanOptions {
  *       minted;
  *   (b) `accountId === accountId` — the SAME account that owns the obligation;
  *   (c) `record.from === agent` — the recipient agent wrote it;
- *   (d) the signed reply it carries (its body as delivered, or the envelope the
- *       recipient's promote() stored) verifies as this agent's reply for this
- *       thread; and
+ *   (d) the signed reply it carries verifies as this agent's reply to
+ *       `recipient` for this thread — its body as delivered, or the envelope
+ *       the recipient's promote() stored, and then ONLY when the record's
+ *       plaintext body is that envelope's body; either way the record's `to` is
+ *       the envelope's (recordReceiptEnvelope); and
  *   (e) `record.replyToId === replyToId` — the record ANSWERS this inbound, so a
  *       reused obligation id can never be satisfied by a reply to another one.
  *       In `signed` thread mode (cli#429, see receiptThread) `replyToId` is the
@@ -1025,13 +1059,14 @@ export async function scanForReceipt(
   replyToId: string,
   agent: string,
   accountId: string,
+  recipient: string,
   checkSignature: ReceiptSignatureCheck,
   opts: ReceiptScanOptions = {},
 ): Promise<ReceiptScan> {
   const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
   const verified = (envelope: Envelope | null): Promise<boolean> =>
-    isVerifiedReceiptReply(envelope, agent, replyToId, threadMode, checkSignature);
+    isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
   //     the agent's receipts root holds a receipt per non-local delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
@@ -1094,7 +1129,7 @@ export async function scanForReceipt(
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
-        if (!(await verified(receiptEnvelope(record?.body, record?.envelope)))) continue;
+        if (!(await verified(recordReceiptEnvelope(record)))) continue;
         return { status: "found", path };
       }
       // (2b) the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
@@ -1110,7 +1145,7 @@ export async function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
-        (await verified(receiptEnvelope(record?.body, record?.envelope)))
+        (await verified(recordReceiptEnvelope(record)))
       ) {
         return { status: "found", path };
       }

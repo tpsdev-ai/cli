@@ -73,7 +73,7 @@ process.on("SIGTERM", () => watcher.stop());
 
 ### `watchMail` behavior
 
-Every step below runs the `tps` CLI as the agent (`TPS_AGENT_ID={agent}`,
+Every `tps` invocation below runs as the agent (`TPS_AGENT_ID={agent}`,
 `TPS_MAIL_DIR={inboxRoot}/.tps/mail`).
 
 1. Every 5 seconds (`pollIntervalMs`) it first finishes any reply its journal

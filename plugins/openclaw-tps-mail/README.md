@@ -132,21 +132,27 @@ and stays owed (`nackPending`) for the next start.
 **A receipt is evidence only when its reply VERIFIES (cli#429).** Every receipt
 form — the posted record, the bridge sandbox record, the metadata receipt — is
 accepted only when the reply it carries is a signed envelope whose sender is the
-obligated agent, whose signatures verify against the key Flair holds for that
-agent (the same verification `promote()` runs), and — for an obligation this
-version opened — whose own signed `replyToId` is the inbound's verified envelope
-id. A record that matches the obligation's ids but is unsigned, carries a
-signature that does not verify, or was signed by anyone else never acks the
+obligated agent, whose recipient is the inbound's verified sender, whose
+signatures verify against the key Flair holds for that agent (the same
+verification `promote()` runs), and — for an obligation this version opened —
+whose own signed `replyToId` is the inbound's verified envelope id. A record the
+recipient already promoted (plaintext body, signed envelope stored beside it)
+counts only when its plaintext body and its recipient are the stored envelope's.
+A record that matches the obligation's ids but is unsigned, carries a signature
+that does not verify, was signed by anyone else, is addressed to anyone else, or
+presents a body or recipient its stored envelope does not carry never acks the
 obligation. A verification that cannot run (Flair unreachable) is logged
 `receipt-verify-unavailable` and is not evidence: the obligation resolves on a
 later scan or at its deadline (`unconfirmed` for a committed reply — never
 failed). An obligation opened before cli#429 keeps the wrapper-only thread check
-its records allow, and is held to the same signature and signer rule.
+its records allow, and is held to the same signature, signer and recipient
+rule.
 
 **Not signed by this plugin: the outbound adapter.** `outbound.sendText` (an
-agent's own explicit send through the channel) still writes `ctx.text` unsigned,
-with an unsigned wrapper `replyToId`; a `promote()`-reading recipient
-dead-letters it. Routing it through the signer is tracked in tpsdev-ai/cli#433.
+agent's own explicit send through the channel) does not sign the body itself: it
+writes `ctx.text` as given, with an unsigned wrapper `replyToId`, and a
+`promote()`-reading recipient dead-letters an unsigned body. Routing it through
+the signer is tracked in tpsdev-ai/cli#433.
 
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
 the only writer of `failed` or `nackedAt` — and the only sender of the nack mail:

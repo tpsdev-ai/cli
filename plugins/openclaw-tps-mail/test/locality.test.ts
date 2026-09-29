@@ -143,8 +143,8 @@ mock.module("../src/obligations.js", () => ({
   },
   scanForReceipt: (...args: any[]) => {
     if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
-    // args: dirs, obligationId, threadId, agent, accountId, checkSignature, opts
-    obligations.beforeScan?.(args[6]?.expectedReplyId);
+    // args: dirs, obligationId, threadId, agent, accountId, recipient, checkSignature, opts
+    obligations.beforeScan?.(args[7]?.expectedReplyId);
     return (realObligations.scanForReceipt as any)(...args);
   },
 }));

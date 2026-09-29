@@ -61,9 +61,12 @@
   an owed nack stays pending for the next start). The obligation receipt scan
   accepts a receipt — the posted record, the bridge sandbox record or the
   metadata receipt — only when the reply it carries is a signed envelope from
-  the obligated agent whose signatures verify against the key Flair holds for
-  it and whose signed `replyToId` is the inbound's verified envelope id; an
-  unsigned, badly signed or foreign-signed record never acks an obligation. The
+  the obligated agent, addressed to the inbound's sender, whose signatures
+  verify against the key Flair holds for it and whose signed `replyToId` is the
+  inbound's verified envelope id; a record the recipient already promoted
+  counts only when its plaintext body and recipient are the stored signed
+  envelope's. An unsigned, badly signed, foreign-signed or misaddressed record
+  never acks an obligation. The
   metadata receipt now carries the signed reply it attests (`signedReply`),
   0600 in the replying agent's own obligation store.
 
@@ -84,7 +87,9 @@
   catch-up, hire onboarding, roster invites, bootstrap, branch handler replies,
   the plugin's outbound adapter (`sendText`) and the channel bridge (all tracked
   in tpsdev-ai/cli#433), and the `@tpsdev-ai/agent` runtime's
-  `MailClient.sendMail`, still write unsigned mail, which a verifying recipient
-  dead-letters.
+  `MailClient.sendMail` do not sign bodies themselves, and a verifying
+  recipient dead-letters an unsigned body. (A writer that passes a supplied
+  body through — a relay, a branch forward — can preserve an envelope that was
+  already signed.)
 
   (Refs #429)

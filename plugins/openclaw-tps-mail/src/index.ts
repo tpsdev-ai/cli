@@ -1208,6 +1208,9 @@ function scanObligationReceipt(
     thread.threadId,
     ctx.agent,
     ctx.accountId,
+    // The reply is owed to the inbound's VERIFIED sender: the receipt's signed
+    // envelope must be addressed to it (cli#429).
+    ctx.sender,
     receiptSignatureCheck(ctx),
     { expectedReplyId, threadMode: thread.mode },
   );

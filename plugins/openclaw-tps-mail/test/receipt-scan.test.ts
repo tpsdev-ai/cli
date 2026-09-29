@@ -19,10 +19,14 @@
  *     `deliverToSandbox` writes into its reduced record and the record `from`.
  *
  * Every form is then held to the SIGNATURE rule (cli#429): a candidate whose
- * reply is unsigned, whose signature does not verify, or that another agent
- * signed is NOT a receipt. The signature check here is the real verifyEnvelope
- * against a key table this suite controls (the plugin hands the scan the same
- * check, backed by Flair).
+ * reply is unsigned, whose signature does not verify, that another agent
+ * signed, or that is addressed to anyone but the inbound's sender is NOT a
+ * receipt — and a promoted record counts only when its plaintext body and its
+ * recipient are the stored signed envelope's. The signature check here is the
+ * real verifyEnvelope against a key table this suite controls (the plugin hands
+ * the scan the same check, backed by Flair). The POSITIVE fixtures are genuinely
+ * signed; the negative ones are deliberately unsigned, badly signed, foreign or
+ * plaintext.
  *
  * The `replyToId` rows below are cli#389 round 3, item 3; the `replyId` rows are
  * cli#389 round 6, item 1 (the obligation record's own `replyId`, when it has
@@ -56,6 +60,8 @@ import {
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
 const AGENT = "anvil";
+/** The inbound's verified sender: the one the reply is owed to. */
+const RECIPIENT = "flint";
 const ACCOUNT = "default";
 const OB_ID = "ob-1";
 const INBOUND = "inbound-1";
@@ -82,14 +88,15 @@ const check: ReceiptSignatureCheck = async (env) =>
   ).ok;
 
 /**
- * A reply envelope, as JSON. By default a GENUINE signed reply by AGENT (legacy
- * shape: no thread inside). `replyToId` puts a thread inside the signature;
- * `from`/`seed` choose the claimed sender and the key that actually signs;
- * `unsigned` returns the envelope with no signatures at all; `tamper` changes
- * the body AFTER signing, so the signature no longer verifies.
+ * A reply envelope, as JSON. By default a GENUINE signed reply by AGENT to
+ * RECIPIENT (legacy shape: no thread inside). `replyToId` puts a thread inside
+ * the signature; `from`/`seed` choose the claimed sender and the key that
+ * actually signs; `to` the recipient the signature names; `unsigned` returns
+ * the envelope with no signatures at all; `tamper` changes the body AFTER
+ * signing, so the signature no longer verifies.
  */
 function replyJson(
-  over: { from?: string; seed?: Buffer; replyToId?: string; unsigned?: boolean; tamper?: boolean } = {},
+  over: { from?: string; to?: string; seed?: Buffer; replyToId?: string; unsigned?: boolean; tamper?: boolean } = {},
 ): string {
   const from = over.from ?? AGENT;
   const now = new Date().toISOString();
@@ -97,7 +104,7 @@ function replyJson(
     { agent: "system", kind: "human", timestamp: now, rationale: "tps-mail dispatcher reply", signature: null },
     { agent: from, kind: "agent", timestamp: now, rationale: `agent ${from} dispatcher reply`, signature: null },
   ];
-  const env: Envelope = { v: 1, from, to: "flint", body: "the answer", messageId: randomUUID(), timestamp: now, delegationChain: chain };
+  const env: Envelope = { v: 1, from, to: over.to ?? RECIPIENT, body: "the answer", messageId: randomUUID(), timestamp: now, delegationChain: chain };
   if (over.replyToId !== undefined) env.replyToId = over.replyToId;
   if (over.unsigned) return JSON.stringify(env);
   const signed = signEnvelope(env, { [from]: over.seed ?? AGENT_SEED });
@@ -121,7 +128,7 @@ const receiptsRoot = (): string => join(home, "mail", AGENT, ".obligations", "re
 
 /** Scan with the suite's signature check. Legacy thread mode unless `opts` says otherwise. */
 async function scan(dirs: ReceiptScanDirs, thread = INBOUND, opts: ReceiptScanOptions = {}) {
-  return scanForReceipt(dirs, OB_ID, thread, AGENT, ACCOUNT, check, opts);
+  return scanForReceipt(dirs, OB_ID, thread, AGENT, ACCOUNT, RECIPIENT, check, opts);
 }
 const posted = (thread = INBOUND, opts: ReceiptScanOptions = {}) => scan({ direct: [], posted: [dir] }, thread, opts).then((s) => s.status);
 const direct = (thread = INBOUND, opts: ReceiptScanOptions = {}) => scan({ direct: [receiptsRoot()], posted: [] }, thread, opts).then((s) => s.status);
@@ -263,6 +270,60 @@ describe("receipt scan — cli#429: a matching record is evidence ONLY when its 
     expect(await posted()).toBe("absent");
   });
 
+  // ── a promoted record is bound to its stored signed envelope ──────────────
+
+  /** A record as the recipient's promote() leaves it: plaintext body, the signed envelope beside it. */
+  const promoted = (base: any, env: Envelope, over: Record<string, unknown> = {}) => ({ ...base, body: env.body, envelope: env, ...over });
+
+  for (const [form, base] of [
+    ["POSTED FILE", () => reply()],
+    ["BRIDGE SANDBOX RECORD", () => sandboxRecord()],
+  ] as const) {
+    it(`${form}: a VALID signed stored envelope beside ALTERED plaintext → NOT found`, async () => {
+      // CONTROL: before this change the scan verified the stored envelope and
+      // never compared it with the plaintext the record presents.
+      const env = JSON.parse(replyJson()) as Envelope;
+      expect(await check(env), "the stored envelope itself is genuine").toBe(true);
+      writeReply(promoted(base(), env, { body: "an answer nobody signed" }));
+      expect(await posted()).toBe("absent");
+      writeReply(promoted(base(), env)); // the same envelope with its own plaintext
+      expect(await posted()).toBe("found");
+    });
+
+    it(`${form}: a VALID signed stored envelope beside an ALTERED record recipient → NOT found`, async () => {
+      const env = JSON.parse(replyJson()) as Envelope;
+      writeReply(promoted(base(), env, { to: "mallory" }));
+      expect(await posted()).toBe("absent");
+    });
+  }
+
+  // ── the signed recipient must be the inbound's sender ──────────────────────
+
+  it("POSTED FILE: a GENUINE signature addressed to the WRONG recipient (record and envelope agree) → NOT found", async () => {
+    // CONTROL: before this change the scan never compared the signed `to` with
+    // the sender the reply is owed to.
+    const wrong = replyJson({ to: "mallory" });
+    expect(await check(JSON.parse(wrong)), "the signature itself is genuine").toBe(true);
+    writeReply({ ...reply({ body: wrong }), to: "mallory" });
+    expect(await posted()).toBe("absent");
+  });
+
+  it("POSTED FILE, promoted: a genuine stored envelope addressed to the WRONG recipient → NOT found", async () => {
+    const env = JSON.parse(replyJson({ to: "mallory" })) as Envelope;
+    writeReply(promoted(reply(), env, { to: "mallory" }));
+    expect(await posted()).toBe("absent");
+  });
+
+  it("BRIDGE SANDBOX RECORD: a genuine signature addressed to the WRONG recipient → NOT found", async () => {
+    writeReply({ ...sandboxRecord({ body: replyJson({ to: "mallory" }) }), to: "mallory" });
+    expect(await posted()).toBe("absent");
+  });
+
+  it("METADATA receipt: a genuine signature addressed to the WRONG recipient → NOT found", async () => {
+    writeMetadataReceipt(metadata({ signedReply: replyJson({ to: "mallory" }) }));
+    expect(await direct()).toBe("absent");
+  });
+
   it("METADATA receipt with NO signed reply (the pre-cli#429 shape) → NOT found", async () => {
     const { signedReply: _omit, ...legacyShape } = metadata();
     writeMetadataReceipt(legacyShape);
@@ -274,7 +335,7 @@ describe("receipt scan — cli#429: a matching record is evidence ONLY when its 
     const unreachable: ReceiptSignatureCheck = async () => {
       throw new Error("Flair unreachable");
     };
-    expect((await scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, unreachable)).status).toBe("absent");
+    expect((await scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, RECIPIENT, unreachable)).status).toBe("absent");
     expect(await posted()).toBe("found");
   });
 
@@ -286,7 +347,7 @@ describe("receipt scan — cli#429: a matching record is evidence ONLY when its 
       seen.push(env.messageId);
       return check(env);
     };
-    expect((await scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, spy)).status).toBe("found");
+    expect((await scanForReceipt({ direct: [], posted: [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, RECIPIENT, spy)).status).toBe("found");
     expect(seen).toEqual([JSON.parse(body).messageId]);
   });
 });
