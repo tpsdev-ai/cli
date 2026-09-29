@@ -6,8 +6,9 @@
  * (there is no unsigned opt-in: `--unsigned` is refused by name).
  *
  * Every behaviour here has a CONTROL that fails without the change it guards
- * (the mutation list is reported with the PR). All spawns run with an isolated
- * HOME — never the real ~/.tps (cli#430).
+ * (the mutation list is reported with the PR). Every spawn in this file —
+ * including the fd-0 harness probe — runs with HOME inside the test's temp
+ * root, never the real ~/.tps (cli#430).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -178,7 +179,7 @@ describe("mail send: stdin body, reply-to, PEM keys, refuse-unsigned (cli#429)",
       const r = spawnSync(
         "bun",
         ["-e", "process.stdout.write(String(require('node:fs').fstatSync(0).isFile()))"],
-        { encoding: "utf-8", stdio: [fd, "pipe", "pipe"] },
+        { encoding: "utf-8", cwd: tmpdir(), env: baseEnv(), stdio: [fd, "pipe", "pipe"] },
       );
       expect(r.stdout).toBe("true");
     } finally {
@@ -353,6 +354,33 @@ describe("mail send: stdin body, reply-to, PEM keys, refuse-unsigned (cli#429)",
     expect(read.status).toBe(0);
     expect(read.stdout).toContain(`Reply-to: ${replyId}`);
     expect(read.stdout).toContain("threaded reply");
+  });
+
+  // ─── --message-id: a re-send is the same message ─────────────────────────
+
+  test("--message-id signs with that envelope messageId, so a re-send is the SAME message", async () => {
+    // CONTROL: without the flag every send gets a fresh UUID, so a sender that
+    // re-sends after an unknown outcome produces a second, different message.
+    const id = "reply-msg.0001_a";
+    for (let i = 0; i < 2; i++) {
+      const r = runSendWithFileStdin(["kern", "--stdin", "--message-id", id, "--reply-to", "prior-001"], "same reply");
+      expect(r.status).toBe(0);
+    }
+    const envs = readNewEnvelopes(mailDir, "kern");
+    expect(envs.map((e) => e.messageId)).toEqual([id, id]);
+    for (const env of envs) {
+      expect(env.replyToId).toBe("prior-001");
+      expect(await verifyEnvelope(env, mockFlairByPubkey({ flint: pubkeyFromSeed(FLINT_SEED) }))).toEqual({ ok: true });
+    }
+  });
+
+  test("an invalid --message-id is refused by name and nothing is written", () => {
+    for (const bad of ["has space", "semi;colon", "x".repeat(129), "bell\u0007"]) {
+      const r = runSendWithFileStdin(["kern", "--stdin", "--message-id", bad], "x");
+      expect(r.status).not.toBe(0);
+      expect(r.stderr).toContain("invalid --message-id");
+    }
+    expect(readNewEnvelopes(mailDir, "kern").length).toBe(0);
   });
 
   // ─── --reply-to: invalid shape refused ────────────────────────────────────

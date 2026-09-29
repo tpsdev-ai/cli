@@ -11,9 +11,12 @@
  *     the local send is local-only, and the remote send reaches the wire.
  *
  * Plus: a key provisioned by `tps init` or `tps agent create`
- * (~/.tps/identity/<id>.key) is the key `tps mail send` signs with.
+ * (~/.tps/identity/<id>.key) is the key `tps mail send` signs with; and
+ * `--stdin --json` prints delivery metadata only — the body never reaches
+ * stdout or stderr on any route, succeeding or failing.
  *
- * Every spawn runs with an isolated HOME — never the real ~/.tps (cli#430).
+ * Every CLI spawn here runs with HOME inside the test's temp root — never the
+ * real ~/.tps (cli#430).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -21,8 +24,14 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import net from "node:net";
+import { createServer, type Server as HttpServer } from "node:http";
+import { WebSocketServer } from "ws";
+import Noise from "noise-handshake/noise.js";
+import Cipher from "noise-handshake/cipher.js";
 import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { generateKeyPair, registerBranch, saveKeyPair } from "../src/utils/identity.js";
+import { MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
+import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile, pubkeyFromSeed } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -278,4 +287,219 @@ describe("a key provisioned by `tps init` / `tps agent create` is the key mail s
     expect(pub.length).toBe(32);
     await sendAndVerify("createprobe", pub);
   }, 30000);
+
+  test("a DIFFERENT valid key at ~/.flair/keys beside the registered identity key → refused by name, nothing written; the same key → signs", async () => {
+    // CONTROL: the previous head signed with the ~/.flair/keys key and exited
+    // 0 — a signature the registered key does not verify.
+    const created = await cli(["agent", "create", "--id", "twokeys"]);
+    expect(created.status).toBe(0);
+    const identity = join(home, ".tps", "identity", "twokeys.key");
+    const registeredPub = readFileSync(join(home, ".tps", "identity", "twokeys.pub"));
+    const flairKey = join(home, ".flair", "keys", "twokeys.key");
+    mkdirSync(join(home, ".flair", "keys"), { recursive: true });
+    writeFileSync(flairKey, Buffer.alloc(32, 0x5a), { mode: 0o600 }); // valid, but not the registered key
+    mkdirSync(join(mailDir, "kern"), { recursive: true });
+
+    const refused = await cli(["mail", "send", "kern", "--stdin"], { TPS_AGENT_ID: "twokeys" }, "must not ship");
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain("two different Ed25519 private keys");
+    expect(refused.stderr).toContain(flairKey);
+    expect(refused.stderr).toContain(identity);
+    expect(refused.stderr).toContain("Remedy:");
+    expect(existsSync(join(mailDir, "kern", "new")) ? readdirSync(join(mailDir, "kern", "new")) : []).toEqual([]);
+
+    // The remedy: both files hold the registered key → it signs, and verifies against the registered key.
+    writeFileSync(flairKey, readFileSync(identity), { mode: 0o600 });
+    await sendAndVerify("twokeys", registeredPub);
+  }, 30000);
+});
+
+// ─── `--stdin --json`: metadata only, on every route ─────────────────────────
+
+describe("--stdin --json prints delivery METADATA — the body never reaches stdout or stderr (cli#429)", () => {
+  /** A distinctive body: if any byte sequence of it is printed, the test sees it. */
+  const BODY = "stdin-secret-7f3a9c: the body a program piped in";
+  let branchServer: { http: HttpServer; wss: WebSocketServer } | null = null;
+  const delivered: any[] = [];
+
+  afterEach(async () => {
+    if (branchServer) {
+      branchServer.wss.close();
+      await new Promise<void>((r) => branchServer!.http.close(() => r()));
+    }
+    branchServer = null;
+    delivered.length = 0;
+  });
+
+  /** A remote branch that completes the Noise IK handshake and ACKS each delivery. */
+  async function ackingRemoteBranch(name: string): Promise<void> {
+    const identityDir = join(home, ".tps", "identity");
+    const registryDir = join(home, ".tps", "registry");
+    mkdirSync(identityDir, { recursive: true });
+    mkdirSync(registryDir, { recursive: true });
+    const branchKp = generateKeyPair();
+    const prev = { id: process.env.TPS_IDENTITY_DIR, reg: process.env.TPS_REGISTRY_DIR };
+    process.env.TPS_IDENTITY_DIR = identityDir;
+    process.env.TPS_REGISTRY_DIR = registryDir;
+    try {
+      saveKeyPair(generateKeyPair(), identityDir, "host");
+      registerBranch(name, branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
+    } finally {
+      if (prev.id === undefined) delete process.env.TPS_IDENTITY_DIR;
+      else process.env.TPS_IDENTITY_DIR = prev.id;
+      if (prev.reg === undefined) delete process.env.TPS_REGISTRY_DIR;
+      else process.env.TPS_REGISTRY_DIR = prev.reg;
+    }
+    const http = createServer();
+    const wss = new WebSocketServer({ server: http, path: "/tps/wire" });
+    wss.on("connection", (ws) => {
+      const responder = new Noise("IK", false, {
+        publicKey: Buffer.from(branchKp.encryption.publicKey),
+        secretKey: Buffer.from(branchKp.encryption.privateKey),
+      });
+      responder.initialise(Buffer.from("tps-v1"));
+      ws.on("message", (data) => {
+        const raw = Buffer.from(data as any);
+        if (!responder.rx) {
+          responder.recv(raw);
+          ws.send(Buffer.from(responder.send()));
+          return;
+        }
+        const msg = decodeWireMessage(Buffer.from(new Cipher(responder.rx).decrypt(raw)));
+        if (msg.type !== MSG_MAIL_DELIVER) return;
+        delivered.push(msg.body);
+        const ack = { type: MSG_MAIL_ACK, seq: 0, ts: new Date().toISOString(), body: { id: (msg.body as any).id, accepted: true } };
+        ws.send(Buffer.from(new Cipher(responder.tx).encrypt(encodeWireMessage(ack))));
+      });
+    });
+    await new Promise<void>((r) => http.listen(0, "127.0.0.1", () => r()));
+    branchServer = { http, wss };
+    const branchDir = join(home, ".tps", "branch-office", name);
+    mkdirSync(branchDir, { recursive: true });
+    const { port: listening } = http.address() as net.AddressInfo;
+    writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "127.0.0.1", port: listening, transport: "ws" }));
+  }
+
+  /** `tps mail send <to> --stdin --json` with BODY on stdin; stdout and stderr captured whole. */
+  async function sendJson(to: string, extra: string[] = []): Promise<{ status: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", to, "--stdin", "--json", ...extra], {
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: home,
+        TPS_MAIL_DIR: mailDir,
+        TPS_TEST_KEYS_DIR: keysDir,
+        TPS_AGENT_ID: "flint",
+        TPS_VAULT_KEY: "test-passphrase",
+        TPS_IDENTITY_DIR: join(home, ".tps", "identity"),
+        TPS_REGISTRY_DIR: join(home, ".tps", "registry"),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    proc.stdin.write(BODY);
+    proc.stdin.end();
+    const timer = setTimeout(() => proc.kill(), 15000);
+    const [stdout, stderr, status] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timer);
+    return { status, stdout, stderr };
+  }
+
+  function expectNoBody(r: { stdout: string; stderr: string }): void {
+    for (const fragment of [BODY, "stdin-secret-7f3a9c"]) {
+      expect(r.stdout.includes(fragment), "the body is not on stdout").toBe(false);
+      expect(r.stderr.includes(fragment), "the body is not on stderr").toBe(false);
+    }
+    expect(r.stdout.includes("delegationChain"), "nor is the signed envelope that carries it").toBe(false);
+  }
+
+  /** The metadata every route prints: its route, the signed messageId, and no body field. */
+  function expectMetadata(stdout: string, route: string, to: string): Record<string, unknown> {
+    const out = JSON.parse(stdout) as Record<string, unknown>;
+    expect(out.route).toBe(route);
+    expect(out.to).toBe(to);
+    expect(out.from).toBe("flint");
+    expect(typeof out.messageId).toBe("string");
+    expect("body" in out).toBe(false);
+    return out;
+  }
+
+  /** The body really was delivered (so its absence from the output means something). */
+  function deliveredEnvelope(file: string): Envelope {
+    const env = JSON.parse(JSON.parse(readFileSync(file, "utf-8")).body) as Envelope;
+    expect(env.body).toBe(BODY);
+    return env;
+  }
+
+  test("local: metadata only (route, ids, timestamps) — the delivered envelope carries the body", async () => {
+    // CONTROL: before this change the local route printed the whole record,
+    // whose body is the signed envelope carrying the stdin text.
+    await officeFixtures();
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendJson("kern", ["--reply-to", "11111111-2222-3333-4444-555555555555"]);
+    expect(r.status).toBe(0);
+    expectNoBody(r);
+    const out = expectMetadata(r.stdout, "local", "kern");
+    const [file] = destinations();
+    const env = deliveredEnvelope(file!);
+    expect(out.messageId).toBe(env.messageId);
+    expect(out.replyToId).toBe("11111111-2222-3333-4444-555555555555");
+    expect(out.id).toBe(JSON.parse(readFileSync(file!, "utf-8")).id);
+    expect(typeof out.timestamp).toBe("string");
+  }, 20000);
+
+  test("bridge: metadata only", async () => {
+    await officeFixtures();
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendJson("ember");
+    expect(r.status).toBe(0);
+    expectNoBody(r);
+    const out = expectMetadata(r.stdout, "bridge", "ember");
+    expect(out.messageId).toBe(deliveredEnvelope(destinations()[0]!).messageId);
+  }, 20000);
+
+  test("outbox: metadata only", async () => {
+    branchFixture();
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendJson("host");
+    expect(r.status).toBe(0);
+    expectNoBody(r);
+    const out = expectMetadata(r.stdout, "outbox", "host");
+    expect(out.messageId).toBe(deliveredEnvelope(destinations()[0]!).messageId);
+  }, 20000);
+
+  test("remote-branch (delivered and ACKed): metadata only", async () => {
+    await ackingRemoteBranch("rbranch");
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendJson("rbranch");
+    expect(r.status).toBe(0);
+    expectNoBody(r);
+    const out = expectMetadata(r.stdout, "remote-branch", "rbranch");
+    expect(delivered.length, "the branch received the delivery").toBe(1);
+    const env = JSON.parse(delivered[0].content) as Envelope;
+    expect(env.body).toBe(BODY);
+    expect(out.messageId).toBe(env.messageId);
+  }, 20000);
+
+  test("remote-branch (the wire FAILS): the error does not carry the body either", async () => {
+    await officeFixtures(); // a listener that drops every connection
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    const r = await sendJson("rbranch");
+    expect(r.status).not.toBe(0);
+    expect(connections).toBeGreaterThan(0);
+    expectNoBody(r);
+  }, 20000);
+
+  test("a refused send (no key) does not carry the body either", async () => {
+    await officeFixtures();
+    const r = await sendJson("kern");
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('no Ed25519 private key for agent "flint"');
+    expectNoBody(r);
+  }, 20000);
 });

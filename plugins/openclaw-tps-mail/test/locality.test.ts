@@ -143,7 +143,8 @@ mock.module("../src/obligations.js", () => ({
   },
   scanForReceipt: (...args: any[]) => {
     if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
-    obligations.beforeScan?.(args[5]);
+    // args: dirs, obligationId, threadId, agent, accountId, checkSignature, opts
+    obligations.beforeScan?.(args[6]?.expectedReplyId);
     return (realObligations.scanForReceipt as any)(...args);
   },
 }));
@@ -159,7 +160,7 @@ const mockApi: any = {
 };
 pluginModule.register(mockApi);
 
-function buildSignedBody(from: string, to: string, body: string): string {
+function buildSignedBody(from: string, to: string, body: string, seed: Buffer = FLINT_SEED): string {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
@@ -168,7 +169,7 @@ function buildSignedBody(from: string, to: string, body: string): string {
   return JSON.stringify(
     signEnvelope(
       { v: 1, from, to, body, messageId: `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain },
-      { [from]: FLINT_SEED },
+      { [from]: seed },
     ),
   );
 }
@@ -385,12 +386,21 @@ interface DispatchOutcome {
 }
 
 /** Route the DISPATCHER reply path and report the full obligation outcome. */
-async function routeViaDispatcher(sender: string, bound: string[] = []): Promise<DispatchOutcome> {
+async function routeViaDispatcher(
+  sender: string,
+  bound: string[] = [],
+  opts: { flairAgentSeed?: Buffer } = {},
+): Promise<DispatchOutcome> {
+  // ONE key per principal (cli#429: the receipt scan verifies the reply's
+  // signature too): the bound agent signs with ANVIL_SEED — its inbound too,
+  // when it mails itself — and any other sender with FLINT_SEED.
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
     createMailVerifyClient: async () => ({
       async getAgent(name: string) {
+        // `flairAgentSeed`: Flair holds a DIFFERENT key for the agent than the
+        // one it signs with (cli#429 receipt-verification control).
+        if (name === bound[0]) return { publicKey: pubkeyFromSeed(opts.flairAgentSeed ?? ANVIL_SEED) };
         if (name === sender) return { publicKey: pubkeyFromSeed(FLINT_SEED) };
-        if (name === bound[0]) return { publicKey: pubkeyFromSeed(ANVIL_SEED) };
         return null;
       },
     }),
@@ -411,7 +421,7 @@ async function routeViaDispatcher(sender: string, bound: string[] = []): Promise
       id: inboundId,
       from: sender,
       to: agentId,
-      body: buildSignedBody(sender, agentId, "inbound"),
+      body: buildSignedBody(sender, agentId, "inbound", sender === agentId ? ANVIL_SEED : FLINT_SEED),
       timestamp: new Date().toISOString(),
       headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" },
       deliveryAttempts: 0,
@@ -685,6 +695,33 @@ describe("cli#389 — ONE locality decision (shared with `tps mail send`)", () =
 
 // ── item 1: the remote-branch receipt closes the obligation loop ──────────────
 
+// ── cli#429: the plugin verifies the reply a receipt carries ─────────────────
+
+describe("cli#429 — a delivered reply whose signature Flair does NOT verify is not a receipt", () => {
+  const OTHER_SEED = Buffer.alloc(32, 0x3c); // the key "Flair" holds for anvil — not the one anvil signs with
+
+  for (const [route, recipient, setup] of [
+    ["local", "flint", () => maildirFor("flint")],
+    ["remote-branch", "rockit", () => {
+      galEntry("rockit", "tps-rockit");
+      remoteBranch("tps-rockit");
+    }],
+  ] as const) {
+    it(`${route}: the reply is delivered, but the obligation is NOT acked — it waits for its deadline, never failed or nacked`, async () => {
+      // CONTROL: before cli#429 the scan matched the ids and acked without
+      // checking the signature of the reply it found.
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // long: nothing resolves it here
+      const outcome = await inFreshHome(setup, () => routeViaDispatcher(recipient, ["anvil"], { flairAgentSeed: OTHER_SEED }));
+      expect(outcome.route, "the reply was delivered").toBe(route);
+      expect(outcome.obligation?.state, "NOT acked on an unverifiable receipt").toBe("posted");
+      expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
+      expect(outcome.obligation?.failure).toBeUndefined();
+      expect(outcome.inboundNackedAt).toBeNull();
+      expect(outcome.nack).toBeNull();
+    }, 20000);
+  }
+});
+
 describe("cli#389 item 1 — a remote-branch reply persists a local receipt", () => {
   it("posted → receipt found → acked, with NO nack", async () => {
     const setup = () => {
@@ -703,21 +740,26 @@ describe("cli#389 item 1 — a remote-branch reply persists a local receipt", ()
     expect(outcome.receiptRecord.branchId).toBe("tps-rockit");
     expect(outcome.obligation?.state).toBe("acked");
     expect(outcome.nack).toBeNull();
-    // The receipt is METADATA-ONLY (cli#389 round 3, item 2): the ids, the route
-    // and the timestamp — never the body, never the signed envelope.
+    // The receipt names the ids, the route and the timestamp — and, since
+    // cli#429, carries the SIGNED reply exactly as it went on the wire, which
+    // is what the scan verified before acking. Nothing else.
     expect(outcome.receiptRaw).toBeTruthy();
-    expect(Object.keys(JSON.parse(outcome.receiptRaw!)).sort()).toEqual([
+    const receipt = JSON.parse(outcome.receiptRaw!);
+    expect(Object.keys(receipt).sort()).toEqual([
       "branchId",
       "obligationId",
       "replyId",
       "replyToId",
       "route",
+      "signedReply",
       "ts",
     ]);
-    expect(outcome.receiptRaw!.includes("final verdict"), "the fixture BODY text must not be in the receipt").toBe(
-      false,
-    );
-    expect(outcome.receiptRaw!.includes("delegationChain"), "nor the signed envelope").toBe(false);
+    expect(receipt.signedReply, "the signed reply is the one that went on the wire").toBe(relay.deliver[0]!.msg.body);
+    const env = JSON.parse(receipt.signedReply) as Envelope;
+    expect(env.from).toBe("anvil");
+    expect(env.replyToId, "threaded on the inbound's signed id").toBe(outcome.inboundEnvelopeId);
+    const anvilKeys = { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+    expect(await verifyEnvelope(env, anvilKeys)).toEqual({ ok: true });
     expect(outcome.receiptMode, "0600 at creation").toBe(0o600);
   }, 20000);
 

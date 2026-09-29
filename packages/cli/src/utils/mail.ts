@@ -698,18 +698,51 @@ function describeIdValue(value: unknown): string {
 }
 
 /**
+ * The fields an UNVERIFIED record may still show (cli#429): the wrapper's
+ * identity claims (id, from, to, timestamp — shown as claims, never as mail),
+ * where the record sits and why (location, dlq reject class and reason, which
+ * this CLI writes), and the local lifecycle fields `mail list --status`
+ * classifies by. An ALLOWLIST, not a blocklist: everything else on the record
+ * is dropped, so a thread claim needs no name here to be withheld.
+ */
+const UNVERIFIED_PRESENTABLE_FIELDS = [
+  "id",
+  "from",
+  "to",
+  "timestamp",
+  "read",
+  "location",
+  "rejectClass",
+  "rejectReason",
+  "ackedAt",
+  "nackedAt",
+  "nackType",
+  "checkedOutAt",
+  "checkedOutBy",
+  "deliveryAttempts",
+  "retryAfter",
+] as const satisfies ReadonlyArray<keyof MailMessage>;
+
+/**
  * The ONE redaction for an UNVERIFIED record (cli#429): a new/ record, a dlq/
  * record, or a cur/ record that cannot prove (and re-verify) its promotion.
- * Such a record's body is withheld, and so are its THREAD fields — `replyToId`,
- * the `envelopeId` a reply would thread on, and the stored `envelope` that
- * carries both (and the body) — because none of them is verified. Every
- * presentation of an unverified record (listMessages, `mail list` text and
- * JSON, `mail read --json`) goes through this, so a forged thread claim is
- * never shown. Returns a copy; the input is not modified.
+ * Its body is withheld, and so is every field outside
+ * UNVERIFIED_PRESENTABLE_FIELDS — among them the THREAD fields (`replyToId`,
+ * the `envelopeId` a reply would thread on, the stored `envelope`), its
+ * `headers` (every header on an unverified record is an unverified claim, and
+ * `X-TPS-InReplyTo`, `X-TPS-Obligation` and `X-TPS-Nack` are thread claims),
+ * and any other field the file carries (a bridge record's `obligationId` /
+ * `replyId`, for one). Every presentation of an unverified record
+ * (listMessages, `mail list` text and JSON, `mail read` text and JSON) goes
+ * through this, so a forged thread claim is never shown. Returns a copy; the
+ * input is not modified.
  */
 export function withholdUnverified(m: MailMessage): MailMessage {
-  const { replyToId: _replyToId, envelopeId: _envelopeId, envelope: _envelope, ...rest } = m;
-  return { ...rest, body: "" };
+  const out: Record<string, unknown> = {};
+  for (const field of UNVERIFIED_PRESENTABLE_FIELDS) {
+    if (m[field] !== undefined) out[field] = m[field];
+  }
+  return { ...(out as Omit<MailMessage, "body">), body: "" } as MailMessage;
 }
 
 type EnvelopePolicyResult =

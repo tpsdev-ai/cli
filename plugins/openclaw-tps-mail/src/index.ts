@@ -56,9 +56,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFile
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
-import { signEnvelope } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { isValidEnvelopeId, promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
 import {
@@ -73,6 +74,7 @@ import {
   receiptsDir,
   scanForReceipt,
   sweepTerminalObligations,
+  type ReceiptSignatureCheck,
   transitionObligation,
   writeReceipt,
   type ObligationRecord,
@@ -326,11 +328,13 @@ function writeOutboxFile(message: TpsMailBody): string {
  * cli#389: a NON-LOCAL delivery can leave no locally readable mail file, so the
  * obligation scan could never find a receipt for it and a delivered reply was
  * later marked failed and nacked — the wire case (round 1, item 1) and the
- * bridge case (round 3, item 1) are the same defect. Persist the metadata-only
+ * bridge case (round 3, item 1) are the same defect. Persist the metadata
  * receipt those routes owe, into the REPLYING agent's own obligation store at
  * `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` (per-agent since
- * cli#389 round 5): the ids, the route, the branch and the timestamp — NEVER
- * the body.
+ * cli#389 round 5): the ids, the route, the branch, the timestamp and — since
+ * cli#429 — the signed reply envelope the delivery carried, which the scan
+ * verifies before it accepts the receipt (a signature cannot be checked over
+ * bytes the receipt does not hold).
  *
  * SCOPE: only a route that leaves NO locally readable mail file needs one. A
  * LOCAL reply lives in the recipient's maildir and an OUTBOX reply in the file
@@ -356,6 +360,7 @@ function persistReceipt(mailDir: string, agent: string, message: TpsMailBody, ro
     route,
     ...(branchId ? { branchId } : {}),
     ts: typeof message.timestamp === "string" && message.timestamp.length > 0 ? message.timestamp : new Date().toISOString(),
+    signedReply: message.body,
   };
   writeReceipt(mailDir, agent, record);
 }
@@ -520,7 +525,8 @@ type SignedReply = { ok: true; body: string } | { ok: false; reason: string; det
 /**
  * Sign a dispatcher reply (or a nack) as a v1 signed envelope, like `tps mail
  * send` (packages/cli/src/utils/mail-sign.ts). The key is resolved by the CLI's
- * agent-keys search path (~/.flair/keys/<id>.key, then ~/.tps/identity/<id>.key).
+ * agent-keys search path (~/.flair/keys/<id>.key and ~/.tps/identity/<id>.key;
+ * two files holding different keys are refused, never one silently chosen).
  *
  * cli#429: `replyToId` is the inbound's SIGNED envelope messageId — the durable
  * thread id — and it is carried INSIDE the envelope, so the signature covers it:
@@ -540,8 +546,11 @@ function signReplyEnvelope(from: string, to: string, body: string, replyToId: st
   try {
     privkey = readAgentPrivateKey(from);
   } catch (err: any) {
-    // AgentKeyError: names the path and the defect, never key material.
-    return { ok: false, reason: `unusable-signing-key:${from}`, detail: String(err?.message ?? err) };
+    // AgentKeyError / AgentKeyConflictError: names the path(s) and the defect,
+    // never key material. Two DIFFERENT key files for one agent are refused
+    // rather than one silently chosen (cli#429).
+    const reason = err?.name === "AgentKeyConflictError" ? "conflicting-signing-keys" : "unusable-signing-key";
+    return { ok: false, reason: `${reason}:${from}`, detail: String(err?.message ?? err) };
   }
   if (!privkey) {
     return { ok: false, reason: `missing-signing-key:${from}`, detail: `no Ed25519 private key for ${from}` };
@@ -1116,7 +1125,7 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
-  const receipt = scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
+  const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
   // record) is a definitive non-delivery: the obligation fails and nacks even
@@ -1153,11 +1162,38 @@ function makeYieldCtx(
 }
 
 /**
+ * cli#429: the signature check a receipt must pass — the SAME verification
+ * promote() runs (verifyEnvelope through the always-constructed Flair client,
+ * authenticated as the mailbox's own agent), so a receipt is accepted only when
+ * the reply it carries is signed by the key Flair holds for its sender. The
+ * scan itself requires that sender to be the obligated agent. A Flair outage
+ * is logged by name and the candidate is NOT evidence: the obligation resolves
+ * on a later scan or at its deadline (a committed one as `unconfirmed`, never
+ * failed).
+ */
+function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
+  let client: ReturnType<typeof createMailVerifyClient> | null = null;
+  return async (envelope) => {
+    try {
+      client ??= createMailVerifyClient(ctx.agent);
+      const verdict = await verifyEnvelope(envelope, await client);
+      return verdict.ok;
+    } catch (err: any) {
+      ctx.log?.warn?.(
+        `tps-mail: receipt-verify-unavailable: the reply carried by a receipt for ${ctx.inboundId} could not be verified ` +
+          `(${err?.message ?? err}); it is not evidence until a later scan verifies it`,
+      );
+      return false;
+    }
+  };
+}
+
+/**
  * The receipt scan for one obligation, with the thread its receipt must carry
  * taken from the obligation RECORD (cli#429, receiptThread): the inbound's
  * signed envelope id for a current record, its record id for a pre-cli#429
  * one. Every scan (the turn's own, the deadline's, recovery's) goes through
- * this, so all three check the same thread.
+ * this, so all three check the same thread AND verify the same signature.
  */
 function scanObligationReceipt(
   ctx: YieldContext,
@@ -1172,9 +1208,8 @@ function scanObligationReceipt(
     thread.threadId,
     ctx.agent,
     ctx.accountId,
-    expectedReplyId,
-    undefined,
-    thread.mode,
+    receiptSignatureCheck(ctx),
+    { expectedReplyId, threadMode: thread.mode },
   );
 }
 
@@ -1210,7 +1245,7 @@ async function reconcileObligation(
       return;
     }
   }
-  const receipt = scanObligationReceipt(ctx, rec.obligationId, rec, rec.replyId);
+  const receipt = await scanObligationReceipt(ctx, rec.obligationId, rec, rec.replyId);
   if (receipt.status === "found") {
     await settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
     return;
@@ -1877,7 +1912,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
         // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
-        const receipt = scanObligationReceipt(yieldCtx, obId, created.record, postedReplyId ?? undefined);
+        const receipt = await scanObligationReceipt(yieldCtx, obId, created.record, postedReplyId ?? undefined);
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";
           await settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });

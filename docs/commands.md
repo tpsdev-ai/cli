@@ -137,7 +137,7 @@ Async, persistent messaging between agents (Host ↔ Branch or Host ↔ Host).
 **Usage:**
 ```bash
 tps mail send <agent> <message>
-printf '%s' "$body" | tps mail send <agent> --stdin [--reply-to <messageId>]
+printf '%s' "$body" | tps mail send <agent> --stdin [--reply-to <messageId>] [--message-id <id>] [--json]
 tps mail check [agent]
 tps mail list [agent]
 tps mail log [agent] [--since YYYY-MM-DD] [--limit N]
@@ -145,12 +145,15 @@ tps mail log [agent] [--since YYYY-MM-DD] [--limit N]
 
 **Commands:**
 - `send <agent> <message>`: Send a signed text message to an agent.
-  - `--stdin` reads the body from stdin (UTF-8, at most 64 KiB) instead of argv; it is never echoed.
+  - `--stdin` reads the body from stdin (UTF-8, at most 64 KiB) instead of argv. The command never prints the body: not in its text output, not with `--json`, not in an error.
   - `--reply-to <messageId>` threads the message to the signed `messageId` it answers. The id is carried inside the signed envelope; it must be 1-128 letters, digits, dots, underscores or hyphens.
-  - Every send is signed with the sender's Ed25519 key, looked up in this order: `~/.flair/keys/<id>.key`, then `~/.tps/identity/<id>.key` (where `tps init` and `tps agent create` put it). The first file that exists is used; a file that cannot be read or parsed is an error naming its path. Accepted formats: a raw 32-byte seed, one line of base64 PKCS8 DER, raw PKCS8 DER, or exactly one unencrypted PEM `PRIVATE KEY` block.
+  - `--message-id <id>` signs the envelope with that `messageId` instead of a fresh UUID (same rule as `--reply-to`). A sender that re-sends after an unknown outcome passes the same id, so a recipient's replay gate discards the second copy.
+  - `--json` prints delivery metadata only, on every route: `status`, `route` (`local`, `outbox`, `bridge` or `remote-branch`), `to`, `from`, the signed `messageId`, `replyToId` when set, `signedAt`, and, on the local route, the record `id` and `timestamp`.
+  - Every send is signed with the sender's Ed25519 key. Both `~/.flair/keys/<id>.key` and `~/.tps/identity/<id>.key` (where `tps init` and `tps agent create` put it) are read: when both exist they must hold the same key, and two different keys are refused with both paths and the remedy. A file that cannot be read or parsed is an error naming its path. Accepted formats: a raw 32-byte seed, one line of base64 PKCS8 DER, raw PKCS8 DER, or exactly one unencrypted PEM `PRIVATE KEY` block.
   - With no usable key the send fails (non-zero exit, the paths it looked at and the remedy) and nothing is written. There is no unsigned mode.
+  - What signs today: `tps mail send` (all four routes), the openclaw-tps-mail plugin's dispatcher replies and nacks, and the codex/gemini runtimes' replies (runtime mail). Every other writer of mail still writes UNSIGNED mail, which a verifying recipient dead-letters: pulse, topic fan-out and catch-up, hire onboarding, roster invites, bootstrap, branch handler replies, the plugin's outbound adapter (`sendText`) and the channel bridge (all tracked in tpsdev-ai/cli#433), and the `@tpsdev-ai/agent` runtime's `MailClient.sendMail`.
 - `check [agent]`: Check inbox for agent (moves messages from `new` to `cur`). Falls back to `TPS_AGENT_ID` env var.
-- `list [agent]`: List all messages for agent (read and unread). Falls back to `TPS_AGENT_ID` env var. A message that has not been verified shows no body and no thread (`replyToId`/`envelopeId`).
+- `list [agent]`: List all messages for agent (read and unread). Falls back to `TPS_AGENT_ID` env var. A message that has not been verified shows no body, no thread (`replyToId`/`envelopeId`) and no headers — only its id, claimed sender and recipient, timestamp, location and lifecycle fields.
 - `log [agent]`: Query the communication archive. Shows all send/read events across agents. Filter by `--since` date and `--limit` count.
 
 **Options:**

@@ -12,6 +12,34 @@ import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../ut
 import { parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
+import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
+
+/**
+ * cli#429: what `tps mail send --json` prints — delivery METADATA only, the
+ * same shape on every route: never the body (which may have come from
+ * `--stdin`) and never the signed envelope that carries it. `messageId` is the
+ * signed envelope's id (the id a reply threads on); `id` and `timestamp` are
+ * the local record's, present only where this process wrote one.
+ */
+function sendReceiptJson(
+  route: "local" | "outbox" | "remote-branch" | "bridge",
+  signedBody: string,
+  fields: Record<string, unknown>,
+): string {
+  let env: { messageId?: unknown; replyToId?: unknown; timestamp?: unknown } = {};
+  try {
+    env = JSON.parse(signedBody);
+  } catch {
+    /* the body was signed above; unreachable */
+  }
+  return JSON.stringify({
+    ...fields,
+    route,
+    messageId: env.messageId,
+    ...(typeof env.replyToId === "string" ? { replyToId: env.replyToId } : {}),
+    signedAt: env.timestamp,
+  });
+}
 
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
@@ -31,6 +59,13 @@ interface MailArgs {
   stdin?: boolean;
   /** cli#429: the signed messageId this message replies to. */
   replyTo?: string;
+  /**
+   * cli#429: the envelope `messageId` to sign this message with, instead of a
+   * fresh UUID. A sender that must RE-SEND a message whose first attempt had an
+   * unknown outcome passes the same id, so a recipient's replay gate discards
+   * a second copy. Held to the one id rule (envelope-id.ts).
+   */
+  sendMessageId?: string;
   /**
    * cli#429: `--unsigned` is NOT supported — every send is signed. The flag is
    * still parsed so that passing it is REFUSED by name (exit 1, nothing
@@ -145,12 +180,16 @@ function signOutboundOrFail(
   from: string,
   to: string,
   body: string,
-  opts: { replyToId?: string },
+  opts: { replyToId?: string; messageId?: string },
 ): string {
   try {
+    if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
+      throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
+    }
     return signOutboundBody(from, to, body, {
       requireKey: true,
       replyToId: opts.replyToId,
+      messageId: opts.messageId,
       rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
       priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
     });
@@ -238,7 +277,10 @@ export async function runMail(args: MailArgs): Promise<void> {
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
       // ship signed bodies, and so a send that cannot sign fails with nothing
       // written. cli#429.
-      args.message = signOutboundOrFail(from, to, messageBody, { replyToId: args.replyTo });
+      args.message = signOutboundOrFail(from, to, messageBody, {
+        replyToId: args.replyTo,
+        messageId: args.sendMessageId,
+      });
 
       // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
       // plugin so the two cannot drift: `resolveMailRoute` owns the
@@ -253,7 +295,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         assertValidBody(args.message);
         queueOutboxMessage(to, args.message, from);
         if (args.json) {
-          console.log(JSON.stringify({ status: "queued", to, queue: "outbox" }));
+          console.log(sendReceiptJson("outbox", args.message, { status: "queued", to, from, queue: "outbox" }));
         } else {
           console.log("Queued for delivery to host.");
         }
@@ -265,7 +307,15 @@ export async function runMail(args: MailArgs): Promise<void> {
         assertValidBody(args.message);
         await deliverToRemoteBranch(route.branchId, { to, from, body: args.message });
         if (args.json) {
-          console.log(JSON.stringify({ status: "sent", to, transport: "remote", resolvedBranch: route.branchId }));
+          console.log(
+            sendReceiptJson("remote-branch", args.message, {
+              status: "sent",
+              to,
+              from,
+              transport: "remote",
+              resolvedBranch: route.branchId,
+            }),
+          );
         } else {
           const resolvedNote = route.branchId !== to ? ` (via GAL: ${route.branchId})` : "";
           console.log(`Mail delivered to remote branch '${to}'${resolvedNote}.`);
@@ -283,7 +333,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           body: args.message,
         });
         if (args.json) {
-          console.log(JSON.stringify({ status: "sent", to, bridge: "branch-office" }));
+          console.log(sendReceiptJson("bridge", args.message, { status: "sent", to, from, bridge: "branch-office" }));
         } else {
           console.log(`Message sent to branch office ${to}`);
         }
@@ -320,7 +370,11 @@ export async function runMail(args: MailArgs): Promise<void> {
       // fallback for an office recipient with no maildir yet.
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
-        console.log(JSON.stringify(msg, null, 2));
+        // Metadata only (cli#429): `sendMessage` returns the whole record, whose
+        // body is the signed envelope carrying the plaintext — never print it.
+        console.log(
+          sendReceiptJson("local", args.message, { status: "sent", to, from, id: msg.id, timestamp: msg.timestamp }),
+        );
       } else {
         console.log(`Message sent to ${to} (${msg.id})`);
       }
@@ -364,7 +418,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       } else if (args.json) {
         // listMessages has already withheld every unverified record — new/
         // (unverified), dlq/ (quarantined) and any cur/ record that cannot
-        // re-verify — body AND thread fields (withholdUnverified, cli#429).
+        // re-verify — body, thread fields and headers (withholdUnverified,
+        // cli#429).
         console.log(JSON.stringify(messages, null, 2));
       } else {
         const limit = Math.max(0, Math.floor(args.limit ?? 20));
@@ -453,14 +508,16 @@ export async function runMail(args: MailArgs): Promise<void> {
       // cannot prove (and re-verify) its promotion is withheld, exactly like new/.
       const unverified = foundLoc === "new" || !(await isPresentableCurRecord(agent, found));
       if (args.json) {
-        // Unverified: body AND thread fields withheld (withholdUnverified, cli#429).
+        // Unverified: body, thread fields and headers withheld (withholdUnverified, cli#429).
         const out = unverified ? withholdUnverified(found) : found;
         console.log(JSON.stringify(out, null, 2));
       } else {
         if (unverified) {
-          // New/cur content without a verified envelope — never present its body.
-          console.log(`⏳ [pending verify] ${found.from} → ${found.to}  ${found.timestamp}`);
-          console.log(`ID: ${found.id}`);
+          // New/cur content without a verified envelope — never present its
+          // body, thread or headers: the same redaction as the JSON view.
+          const shown = withholdUnverified(found);
+          console.log(`⏳ [pending verify] ${shown.from} → ${shown.to}  ${shown.timestamp}`);
+          console.log(`ID: ${shown.id}`);
           console.log("(body withheld until the envelope is verified)");
           return;
         }

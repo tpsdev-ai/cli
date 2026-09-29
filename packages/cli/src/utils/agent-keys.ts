@@ -1,7 +1,7 @@
 /**
  * agent-keys.ts — resolve and read Ed25519 private key seeds for TPS agents.
  *
- * WHERE A KEY IS LOOKED FOR (cli#429). One precedence, used by every signer
+ * WHERE A KEY IS LOOKED FOR (cli#429). One search path, used by every signer
  * that resolves a key by agent id (`tps mail send`, the openclaw-tps-mail
  * plugin's replies and nacks):
  *
@@ -11,11 +11,13 @@
  *                                   `tps agent create` generate (and register
  *                                   with Flair).
  *
- * The FIRST file that exists is the key; a later location is never consulted
- * once an earlier one exists, so an agent that signs today keeps signing with
- * the same key. A file that exists but cannot be read or parsed is an ERROR
- * naming that path (AgentKeyError) — never a silent fall-through to the next
- * location. TPS_TEST_KEYS_DIR (tests) REPLACES the whole search path with
+ * EVERY location that holds a file is read. One key is used when every file
+ * found holds the SAME key; two files holding DIFFERENT keys are REFUSED
+ * (AgentKeyConflictError, naming both paths and the remedy) rather than one
+ * silently chosen: a signer that picked the wrong one would sign with a key its
+ * recipients do not verify against. A file that exists but cannot be read or
+ * parsed is an ERROR naming that path (AgentKeyError) — never skipped.
+ * TPS_TEST_KEYS_DIR (tests) REPLACES the whole search path with
  * `<dir>/<id>.key`, so a test can never resolve a real key.
  *
  * FORMATS. Every accepted format is normalized to the 32-byte seed that
@@ -70,8 +72,25 @@ export class AgentKeyError extends Error {
 }
 
 /**
- * The paths searched for an agent's key, in precedence order (see the header).
- * Under TPS_TEST_KEYS_DIR the list is that one directory's file only.
+ * Two key files for one agent hold DIFFERENT keys (cli#429). Names both paths
+ * and the remedy; never carries key material.
+ */
+export class AgentKeyConflictError extends Error {
+  readonly paths: string[];
+  constructor(agentName: string, paths: string[]) {
+    super(
+      `two different Ed25519 private keys for agent "${agentName}": ${paths.join(" and ")}. ` +
+        `Remedy: keep the key registered with Flair for "${agentName}" (the one its recipients verify against) ` +
+        `and move the other file away, or make both files hold that same key.`,
+    );
+    this.name = "AgentKeyConflictError";
+    this.paths = paths;
+  }
+}
+
+/**
+ * The paths searched for an agent's key, in the order they are read (see the
+ * header). Under TPS_TEST_KEYS_DIR the list is that one directory's file only.
  */
 export function agentKeyCandidates(agentName: string): string[] {
   const file = `${agentName}.key`;
@@ -82,23 +101,42 @@ export function agentKeyCandidates(agentName: string): string[] {
   return [join(home, ".flair", "keys", file), join(home, ".tps", "identity", file)];
 }
 
-/** The first existing key file in agentKeyCandidates() order, or null when none exists. */
+/** Every existing key file, in agentKeyCandidates() order (empty when none exists). */
+export function existingAgentKeyPaths(agentName: string): string[] {
+  return agentKeyCandidates(agentName).filter((candidate) => existsSync(candidate));
+}
+
+/**
+ * The key file that signs for `agentName`: the first existing candidate, once
+ * every existing candidate has been read and found to hold the SAME key. Null
+ * when none exists. Throws AgentKeyError (a file cannot be read or parsed) or
+ * AgentKeyConflictError (two files hold different keys) — never picks one.
+ */
 export function resolveAgentKeyPath(agentName: string): string | null {
-  for (const candidate of agentKeyCandidates(agentName)) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
+  return resolveAgentKey(agentName)?.path ?? null;
 }
 
 /**
  * Read an agent's Ed25519 private key and return the 32-byte signing seed.
- * Returns null when NO candidate file exists; throws AgentKeyError when the
- * resolved file cannot be read or is not a valid key.
+ * Returns null when NO candidate file exists; throws AgentKeyError when a file
+ * that exists cannot be read or is not a valid key, and AgentKeyConflictError
+ * when two files hold different keys.
  */
 export function readAgentPrivateKey(agentName: string): Buffer | null {
-  const path = resolveAgentKeyPath(agentName);
-  if (path === null) return null;
-  return readPrivateKeyAtPath(path);
+  return resolveAgentKey(agentName)?.seed ?? null;
+}
+
+function resolveAgentKey(agentName: string): { path: string; seed: Buffer } | null {
+  const found: Array<{ path: string; seed: Buffer }> = [];
+  for (const path of existingAgentKeyPaths(agentName)) {
+    const seed = readPrivateKeyAtPath(path);
+    if (seed) found.push({ path, seed });
+  }
+  if (found.length === 0) return null;
+  const first = found[0]!;
+  const differing = found.find((k) => !k.seed.equals(first.seed));
+  if (differing) throw new AgentKeyConflictError(agentName, [first.path, differing.path]);
+  return first;
 }
 
 /**

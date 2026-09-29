@@ -116,16 +116,37 @@ deadline never downgrades a committed record: `delivering` and `posted` keep
 their state and only gain `deadlineAt`.
 
 **Replies and nacks are signed and threaded (cli#429).** The dispatcher's reply
-and every nack sign the inbound's verified envelope `messageId` as `replyToId`
-INSIDE the envelope, so the signature covers the thread; the inbound's local
-record id stays only in the plugin's bookkeeping (the obligation key and the
-`X-TPS-InReplyTo` header). The key is resolved like `tps mail send`'s
-(`~/.flair/keys/<id>.key`, then `~/.tps/identity/<id>.key`). A reply or nack that
-cannot be signed is NOT sent — there is no unsigned fallback: a reply becomes a
-named failure (`missing-signing-key:<id>`, `unusable-signing-key:<id>`), and a
-nack is logged `nack-unsigned-refused` and stays owed (`nackPending`) for the
-next start. The receipt scan requires the signed thread, on the record and in
-the envelope it wraps.
+signs the inbound's verified envelope `messageId` as `replyToId` INSIDE the
+envelope, so the signature covers the thread, and so does the nack for every
+obligation this version opens. An obligation opened by an earlier version
+records no envelope id, so its nack is signed but carries no thread. The
+inbound's local record id stays only in the plugin's bookkeeping (the obligation
+key and the `X-TPS-InReplyTo` header). The key is resolved like `tps mail
+send`'s (`~/.flair/keys/<id>.key` and `~/.tps/identity/<id>.key`; two files
+holding different keys are refused). A reply or nack that cannot be signed is
+NOT sent — there is no unsigned fallback: a reply becomes a named failure
+(`missing-signing-key:<id>`, `unusable-signing-key:<id>`,
+`conflicting-signing-keys:<id>`), and a nack is logged `nack-unsigned-refused`
+and stays owed (`nackPending`) for the next start.
+
+**A receipt is evidence only when its reply VERIFIES (cli#429).** Every receipt
+form — the posted record, the bridge sandbox record, the metadata receipt — is
+accepted only when the reply it carries is a signed envelope whose sender is the
+obligated agent, whose signatures verify against the key Flair holds for that
+agent (the same verification `promote()` runs), and — for an obligation this
+version opened — whose own signed `replyToId` is the inbound's verified envelope
+id. A record that matches the obligation's ids but is unsigned, carries a
+signature that does not verify, or was signed by anyone else never acks the
+obligation. A verification that cannot run (Flair unreachable) is logged
+`receipt-verify-unavailable` and is not evidence: the obligation resolves on a
+later scan or at its deadline (`unconfirmed` for a committed reply — never
+failed). An obligation opened before cli#429 keeps the wrapper-only thread check
+its records allow, and is held to the same signature and signer rule.
+
+**Not signed by this plugin: the outbound adapter.** `outbound.sendText` (an
+agent's own explicit send through the channel) still writes `ctx.text` unsigned,
+with an unsigned wrapper `replyToId`; a `promote()`-reading recipient
+dead-letters it. Routing it through the signer is tracked in tpsdev-ai/cli#433.
 
 ONE verb settles an obligation (`settleObligation` in `src/index.ts`) and it is
 the only writer of `failed` or `nackedAt` — and the only sender of the nack mail:
@@ -212,11 +233,16 @@ plugin sweeps the store:
 
 A reply delivered over a route that leaves **no locally readable mail file** —
 the wire to a remote branch, or the branch-office bridge — is receipted so the
-obligation loop can see that it committed. The receipt is a small metadata-only
-record: the reply id, the obligation id, the inbound it answers, the route and
-the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
+obligation loop can see that it committed. The receipt names the reply id, the
+obligation id, the thread it answers, the route and the branch, plus a
+timestamp, and — since cli#429 — carries the **signed reply envelope** exactly as
+the delivery carried it (`signedReply`, which includes the reply text): the scan
+accepts the receipt only when that signature verifies, and a signature cannot be
+checked over bytes the receipt does not hold. It is written 0600 at
 `<mailDir>/<agent>/.obligations/receipts/<obligationId>.json` — inside the
-**replying agent's own** obligation store.
+**replying agent's own** obligation store — and swept with its obligation. A
+metadata receipt written before cli#429 carries no signed reply and is not
+evidence; its obligation resolves at its deadline.
 
 - **The replying agent owns its receipts.** They live beside the obligations
   that owe them, so a startup sweep sees only its own agent's receipts and keys
@@ -224,13 +250,15 @@ the branch, plus a timestamp, and **never the mail body**. It is written 0600 at
   receipt, a terminal obligation's receipt goes, and a receipt with no
   obligation left in the store goes once it has aged past the retention window
   (an orphan). A receipt with no readable timestamp is never aged out.
-- **A receipt is matched by what it NAMES, never by a signature.** The scan pins
-  the obligation id, the inbound the receipt answers, and — when the obligation
-  record knows the reply it was discharged by — the reply id too, so a body
-  copied from an older reply under the current ids needs the matching reply id as
-  well. The envelope `from` the scan reads is the CLAIM the body carries, not a
-  verified identity: no signature is checked here (that boundary is tracked
-  separately, and a signature alone would not bind the receipt to one inbound).
+- **A receipt is chosen by what it NAMES and accepted by what it PROVES.** The
+  scan pins the obligation id, the thread the receipt answers, and — when the
+  obligation record knows the reply it was discharged by — the reply id too, so
+  a body copied from an older reply under the current ids needs the matching
+  reply id as well. Those ids ride outside the signature, so they only choose
+  the candidate: the candidate is accepted only when its signed reply verifies
+  as the obligated agent's reply for this thread (above). Where agents share one
+  OS user, another agent can read the signing keys, so no in-band check
+  separates them — only an OS-level boundary does (tracked separately).
 - **A bridge delivery is readable in the sandbox too.** The bridge's reduced
   sandbox record carries the obligation, inbound and reply ids when an
   obligation supplies them, so that delivery stays locally readable evidence

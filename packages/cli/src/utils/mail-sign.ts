@@ -10,14 +10,15 @@
  *
  * Both callers set `requireKey` (cli#429): a send that cannot sign FAILS before
  * anything is written. `tps mail send` resolves the key by agent id
- * (agent-keys.ts: ~/.flair/keys/<id>.key, then ~/.tps/identity/<id>.key); the
- * agent runtimes pass their configured `flairKeyPath`. Every refusal names the
- * path(s) it looked at and the remedy.
+ * (agent-keys.ts: ~/.flair/keys/<id>.key and ~/.tps/identity/<id>.key; two
+ * files holding different keys are refused); the agent runtimes pass their
+ * configured `flairKeyPath`. Every refusal names the path(s) it looked at and
+ * the remedy.
  */
 
 import { randomUUID } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
-import { readAgentPrivateKey, readPrivateKeyAtPath, agentKeyCandidates, AgentKeyError } from "./agent-keys.js";
+import { readAgentPrivateKey, readPrivateKeyAtPath, agentKeyCandidates, AgentKeyError, AgentKeyConflictError } from "./agent-keys.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
 
 /**
@@ -89,6 +90,7 @@ export function signOutboundBody(
     privkey = opts.keyPath ? readPrivateKeyAtPath(opts.keyPath) : readAgentPrivateKey(from);
   } catch (err) {
     if (err instanceof AgentKeyError) throw unusableKeyError(from, err);
+    if (err instanceof AgentKeyConflictError) throw new Error(`cannot sign for agent "${from}": ${err.message}`);
     throw err;
   }
 

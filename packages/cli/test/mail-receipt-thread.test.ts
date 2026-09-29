@@ -266,3 +266,131 @@ describe("receipt: every UNVERIFIED presentation drops the thread fields (cli#42
     expect(existsSync(dlq) ? readdirSync(dlq).filter((f) => f.endsWith(".json")) : []).toEqual([]);
   }, 30000);
 });
+
+describe("receipt: an UNVERIFIED record shows no headers and no other thread claim (cli#429)", () => {
+  /** Forged thread claims: in the headers, and as extra top-level fields. */
+  const FORGED_HEADERS = {
+    "X-TPS-InReplyTo": "forged-hdr-inreplyto",
+    "X-TPS-Obligation": "forged-hdr-obligation",
+    "X-TPS-Nack": "forged-hdr-nack",
+    "In-Reply-To": "forged-hdr-rfc",
+  };
+  const FORGED_FIELDS = { obligationId: "forged-field-obligation", replyId: "forged-field-replyid", inReplyTo: "forged-field-inreplyto" };
+  const FORGED = [...Object.values(FORGED_HEADERS), ...Object.values(FORGED_FIELDS)];
+
+  function expectNoClaims(row: Record<string, unknown> | undefined): void {
+    expectWithheld(row);
+    expect("headers" in row!, "its headers are withheld").toBe(false);
+    for (const f of Object.keys(FORGED_FIELDS)) expect(f in row!, `its ${f} is withheld`).toBe(false);
+  }
+
+  /** Every unverified view of `id`: list JSON + text, and (new/, cur/) read JSON + text. */
+  async function expectEveryViewClean(id: string, readable: boolean): Promise<void> {
+    const listJson = await cli(["mail", "list", "kern", "--json"]);
+    expect(listJson.status).toBe(0);
+    expectNoClaims((JSON.parse(listJson.stdout) as Array<Record<string, unknown>>).find((r) => r.id === id));
+    expectNoForgery(listJson.stdout, FORGED);
+    const listText = await cli(["mail", "list", "kern"]);
+    expect(listText.status).toBe(0);
+    expect(listText.stdout).toContain(id.slice(0, 8));
+    expectNoForgery(listText.stdout, FORGED);
+    if (!readable) return;
+    const readJson = await cli(["mail", "read", "kern", id, "--json"]);
+    expect(readJson.status).toBe(0);
+    expectNoClaims(JSON.parse(readJson.stdout));
+    expectNoForgery(readJson.stdout, FORGED);
+    const readText = await cli(["mail", "read", "kern", id]);
+    expect(readText.status).toBe(0);
+    expect(readText.stdout).toContain(id);
+    expectNoForgery(readText.stdout, FORGED);
+  }
+
+  test("new/: forged thread headers and fields are withheld in every view", async () => {
+    // CONTROL: before this change `mail list --json` / `mail read --json`
+    // printed an unverified record's headers — X-TPS-InReplyTo among them.
+    plant("new", wrapper("hn-1", signed("pending body"), { headers: FORGED_HEADERS, ...FORGED_FIELDS }));
+    await expectEveryViewClean("hn-1", true);
+  }, 30000);
+
+  test("dlq/: forged thread headers and fields are withheld in every view", async () => {
+    const p = plant("new", wrapper("hd-1", signed("dead body"), { headers: FORGED_HEADERS, ...FORGED_FIELDS }));
+    // Move it where promote() puts a rejected record: dlq/ with its sidecar.
+    const dlq = join(mailDir, "kern", "dlq");
+    mkdirSync(dlq, { recursive: true });
+    const name = p.split("/").pop()!;
+    writeFileSync(join(dlq, name), readFileSync(p));
+    rmSync(p);
+    writeFileSync(join(dlq, `${name}.reason`), "class: invalid\nReason: test fixture\n");
+    await expectEveryViewClean("hd-1", false);
+  }, 30000);
+
+  test("cur/: a record that cannot re-verify has its forged thread headers and fields withheld in every view", async () => {
+    plant("cur", {
+      id: "hc-1",
+      from: "flint",
+      to: "kern",
+      body: "unverifiable cur body",
+      timestamp: new Date().toISOString(),
+      read: false,
+      envelopeId: "forged-envelope-id",
+      headers: FORGED_HEADERS,
+      ...FORGED_FIELDS,
+    });
+    await expectEveryViewClean("hc-1", true);
+  }, 30000);
+
+  test("CONTROL: a VERIFIED cur/ record is presented whole — its headers included", async () => {
+    // The redaction is scoped to UNVERIFIED records: a record that proves its
+    // promotion keeps its (wrapper) headers, so the tests above are not passing
+    // because headers are dropped everywhere.
+    plant("new", wrapper("hv-1", signed("verified body"), { headers: { "X-TPS-InReplyTo": "bookkeeping-record-id" } }));
+    expect(JSON.parse((await cli(["mail", "check", "kern", "--json"])).stdout).length).toBe(1);
+    const rows = JSON.parse((await cli(["mail", "list", "kern", "--json"])).stdout) as Array<Record<string, any>>;
+    const row = rows.find((r) => r.id === "hv-1")!;
+    expect(row.body).toBe("verified body");
+    expect(row.headers["X-TPS-InReplyTo"]).toBe("bookkeeping-record-id");
+    expect(JSON.parse((await cli(["mail", "read", "kern", "hv-1", "--json"])).stdout).headers["X-TPS-InReplyTo"]).toBe(
+      "bookkeeping-record-id",
+    );
+  }, 30000);
+});
+
+describe("receipt: `mail log` shows the VERIFIED thread (cli#429)", () => {
+  test("a verified reply's thread is logged at promotion and shown by `mail log` (text and JSON)", async () => {
+    // CONTROL: without the reply-to column (or the log line's reply-to), the
+    // archive holds the read event but not the thread it answers.
+    const thread = "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9";
+    plant("new", wrapper("lg-1", signed("logged reply", { replyToId: thread })));
+    expect(JSON.parse((await cli(["mail", "check", "kern", "--json"])).stdout).length).toBe(1);
+
+    const text = await cli(["mail", "log", "kern"]);
+    expect(text.status).toBe(0);
+    const readLine = text.stdout.split("\n").find((l) => l.includes("[read]") && l.includes("flint → kern"));
+    expect(readLine, "the promotion is logged").toBeTruthy();
+    expect(readLine).toContain(`↳ reply-to: ${thread}`);
+
+    const json = await cli(["mail", "log", "kern", "--json"]);
+    expect(json.status).toBe(0);
+    const events = JSON.parse(json.stdout) as Array<Record<string, unknown>>;
+    const read = events.find((e) => e.event === "read" && e.messageId === "lg-1");
+    expect(read?.replyToId).toBe(thread);
+  }, 30000);
+
+  test("an UNVERIFIED record's thread claim never reaches the log", async () => {
+    // A wrapper claiming a thread over an unsigned body: dead-lettered at
+    // promotion, so no read event — and no thread — is logged for it.
+    plant("new", {
+      id: "lg-2",
+      from: "flint",
+      to: "kern",
+      body: JSON.stringify({ v: 1, from: "flint", to: "kern", body: "x", messageId: "m-2", replyToId: "forged-log-thread" }),
+      timestamp: new Date().toISOString(),
+      read: false,
+      replyToId: "forged-log-thread",
+    });
+    expect(JSON.parse((await cli(["mail", "check", "kern", "--json"])).stdout)).toEqual([]);
+    const text = await cli(["mail", "log", "kern"]);
+    expect(text.stdout).not.toContain("forged-log-thread");
+    expect((await cli(["mail", "log", "kern", "--json"])).stdout).not.toContain("forged-log-thread");
+  }, 30000);
+});

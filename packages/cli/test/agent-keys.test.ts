@@ -12,6 +12,7 @@ import {
   resolveAgentKeyPath,
   agentKeyCandidates,
   AgentKeyError,
+  AgentKeyConflictError,
   KeyFormatError,
 } from "../src/utils/agent-keys.js";
 
@@ -251,14 +252,58 @@ describe("agent key resolution precedence (cli#429)", () => {
     });
   });
 
-  test("when both exist, ~/.flair/keys wins (an agent that signs today keeps its key)", () => {
+  test("two DIFFERENT valid keys → refused, naming BOTH paths and the remedy — never one silently chosen", () => {
+    // CONTROL: the previous head returned the ~/.flair/keys key silently, so a
+    // stale Flair key signed mail its recipients verify against another key.
     withHome(() => {
       const flair = makeKey();
       const ident = makeKey();
       put(flairKey("kern"), flair.b64Pkcs8);
       put(identityKey("kern"), ident.seed);
+      let caught: unknown = null;
+      try {
+        readAgentPrivateKey("kern");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(AgentKeyConflictError);
+      expect((caught as AgentKeyConflictError).paths).toEqual([flairKey("kern"), identityKey("kern")]);
+      const msg = (caught as Error).message;
+      expect(msg).toContain(flairKey("kern"));
+      expect(msg).toContain(identityKey("kern"));
+      expect(msg).toContain("Remedy:");
+      // Never key material, in any of its forms.
+      for (const k of [flair, ident]) {
+        expect(msg).not.toContain(k.b64Pkcs8);
+        expect(msg).not.toContain(k.seed.toString("base64"));
+        expect(msg).not.toContain(k.seed.toString("hex"));
+      }
+      expect(() => resolveAgentKeyPath("kern")).toThrow(AgentKeyConflictError);
+    });
+  });
+
+  test("the SAME key in both places (even in different formats) is fine — it is the key", () => {
+    withHome(() => {
+      const k = makeKey();
+      put(flairKey("kern"), k.b64Pkcs8);
+      put(identityKey("kern"), k.seed);
+      expect(readAgentPrivateKey("kern")!.equals(k.seed)).toBe(true);
       expect(resolveAgentKeyPath("kern")).toBe(flairKey("kern"));
-      expect(readAgentPrivateKey("kern")!.equals(flair.seed)).toBe(true);
+    });
+  });
+
+  test("a MALFORMED second key is an error naming it — a key file is never skipped", () => {
+    withHome(() => {
+      put(flairKey("kern"), makeKey().seed);
+      put(identityKey("kern"), "not a key at all");
+      let caught: unknown = null;
+      try {
+        readAgentPrivateKey("kern");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(AgentKeyError);
+      expect((caught as AgentKeyError).path).toBe(identityKey("kern"));
     });
   });
 
