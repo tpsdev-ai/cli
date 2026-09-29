@@ -34,21 +34,25 @@
  * `shell: bash`, plain `env:` values (workflow, job and step level) and
  * `defaults.run` (shell/working-directory); `if:` when it is absent, `true`,
  * `success()` or `always()`; `needs`; `timeout-minutes` on the job (default
- * 360) and on steps, which the launcher enforces.
+ * 360) and on planned `run:` steps, which the launcher enforces (on a skipped
+ * `uses:` step it is refused).
  *
  * WHAT IS SKIPPED (named in the plan, with the reason): the actions in
  * SKIPPED_ACTIONS, each only at a reviewed immutable ref (a full commit SHA whose
  * release tag and action.yml inputs were checked), only with every input the
  * real action needs, and only with input values whose skip is equivalent.
- * checkout only as a job's first step, on a worktree the launcher verifies is
- * the fresh clone checkout would produce. Any other ref of those actions is
- * refused. Ignored job keys: name, permissions (scopes a token the sandbox
+ * checkout only as a job's first step, on a worktree that passes the
+ * launcher's clean-clone check (see checkFreshClone). No input of a skipped
+ * action may carry `${{ }}`. Any other ref of those actions is refused. Ignored job keys: name, permissions (scopes a token the sandbox
  * never has), concurrency and outputs (consumed only through `${{ }}`, which is
  * refused).
  *
  * WHAT IS REFUSED (anything else): any other action or ref (including local
- * `./` and `docker://` actions), a `${{ }}` expression in a script, env value or
- * checked input, any other `if:`, `continue-on-error: true`, a non-bash shell,
+ * `./` and `docker://` actions), a `${{ }}` expression anywhere the launcher
+ * would have to evaluate it (a script, an env value, a working directory, a
+ * runner label, a timeout, any input of a skipped action — the only expressions
+ * accepted are `if:` conditions that are exactly `success()` or `always()`),
+ * any other `if:`, `continue-on-error: true`, a non-bash shell,
  * `strategy`, `container`, `services`, `environment`, reusable-workflow jobs, an
  * env key the launcher owns (HOME, PATH, ...) or that is credential-shaped or
  * redirects configuration (see forbiddenEnvReason), a working directory that is
@@ -184,12 +188,12 @@ export function forbiddenEnvReason(key) {
 // ─── the actions a review build skips ────────────────────────────────────────
 
 // Input rules. A rule returns null when the value's skip is equivalent to what
-// the real action does with it, or the reason it is not. Only the "anything"
-// rule admits `${{ }}` (for inputs the real action cannot fail on and a skipped
-// step never evaluates).
+// the real action does with it, or the reason it is not. No input of a skipped
+// action may carry `${{ }}`: the skipped step never evaluates it, so neither
+// its value nor the real action's reaction to that value can be checked (usesStep
+// refuses it before any rule runs).
 const EXACT_VERSION_RE = /^\d+\.\d+\.\d+$/;
-const anything = () => null;
-const literal = (text) => (hasExpression(text) ? "uses a ${{ }} expression, which only the Actions runner can evaluate" : null);
+const digits = (text) => (/^\d+$/.test(text) ? null : `is ${JSON.stringify(text)}; the action accepts only an integer`);
 const oneOf =
   (...allowed) =>
   (text) =>
@@ -201,19 +205,24 @@ const exactVersion = (text) =>
     ? null
     : `is ${JSON.stringify(text)}; CI resolves a range or alias at run time, so only an exact version (X.Y.Z) is reproduced`;
 const nonEmpty = (text) => (text.trim() === "" ? "is empty; the action requires it" : null);
-/** actions/cache rejects a key longer than 512 characters or containing a comma. */
+/** actions/cache rejects a key (primary or restore) longer than 512 characters or containing a comma. */
+const badCacheKey = (key) => key.length > 512 || key.includes(",");
 const cacheKey = (text) => {
   if (text.trim() === "") return "is empty; the action requires it";
-  if (hasExpression(text)) return null;
-  return text.length > 512 || text.includes(",") ? "is a key actions/cache rejects (longer than 512 characters or containing a comma)" : null;
+  return badCacheKey(text) ? "is a key actions/cache rejects (longer than 512 characters or containing a comma)" : null;
 };
+/** restore-keys: one key per line, each held to the same rule as the primary key. */
+const restoreKeys = (text) =>
+  text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .some(badCacheKey)
+    ? "has a key actions/cache rejects (longer than 512 characters or containing a comma)"
+    : null;
 /** upload-artifact v4 rejects these characters in an artifact name. */
 const artifactName = (text) =>
-  hasExpression(text)
-    ? "uses a ${{ }} expression; the name's uniqueness in the run cannot be checked"
-    : /[":<>|*?\r\n\\/]/.test(text) || text.trim() === ""
-      ? `is ${JSON.stringify(text)}, a name upload-artifact rejects`
-      : null;
+  /[":<>|*?\r\n\\/]/.test(text) || text.trim() === "" ? `is ${JSON.stringify(text)}, a name upload-artifact rejects` : null;
 
 /**
  * Each skipped action is accepted ONLY at a reviewed immutable ref: a full
@@ -229,10 +238,11 @@ export const SKIPPED_ACTIONS = {
       "11bd71901bbe5b1630ceea73d27597364c9af683": "v4.2.2",
       "34e114876b0b11c390a56381ad16ebd13914f8d5": "v4.3.1",
     },
-    reason: "the workspace is the host-created clone at the assigned head, verified fresh before the job",
-    // Accepted only as a job's first step; the launcher then requires a fresh
-    // clone: no modified, untracked or ignored file, and history shaped as the
-    // fetch-depth asks (1: a one-commit shallow clone; 0: a full clone).
+    reason: "the workspace is the host-created clone at the assigned head, checked before the job",
+    // Accepted only as a job's first step; the launcher then requires the
+    // worktree to pass its clean-clone check (reviewer-launch.mjs
+    // checkFreshClone), with history shaped as the fetch-depth asks (1: a
+    // one-commit shallow clone; 0: a full clone).
     // persist-credentials only decides whether CI writes a token into
     // .git/config (the review never has one); clean is what a fresh clone
     // already is; show-progress is logging.
@@ -280,11 +290,11 @@ export const SKIPPED_ACTIONS = {
     inputs: {
       path: nonEmpty,
       key: cacheKey,
-      "restore-keys": anything,
+      "restore-keys": restoreKeys,
       enableCrossOsArchive: oneOf("true", "false"),
       "lookup-only": oneOf("true", "false"),
       "fail-on-cache-miss": oneOf("false"),
-      "upload-chunk-size": literal,
+      "upload-chunk-size": digits,
     },
     required: ["path", "key"],
   },
@@ -402,6 +412,12 @@ function usesStep(step, where, ctx) {
     }
     if (value !== null && typeof value === "object") return refuse("ci-unhonourable", `${where} input ${key} is not a scalar`);
     const text = value === null ? "" : String(value);
+    if (hasExpression(text)) {
+      return refuse(
+        "ci-unhonourable",
+        `${where} ${name} input ${key} uses a \${{ }} expression; a skipped action never evaluates it, so its value and the real action's reaction to it cannot be checked`,
+      );
+    }
     const problem = action.inputs[key](text);
     if (problem) return refuse("ci-unhonourable", `${where} ${name} input ${key} ${problem}`);
     withInputs[key] = text;
@@ -610,6 +626,9 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
     const hasRun = step.run !== undefined;
     if (hasUses === hasRun) return refuse("ci-unhonourable", `${at} must have exactly one of uses: and run:`);
 
+    if (hasUses && step["timeout-minutes"] !== undefined) {
+      return refuse("ci-unhonourable", `${at} sets timeout-minutes on a skipped action; how the real action behaves at that limit cannot be reproduced`);
+    }
     const stepTimeout = readTimeout(step["timeout-minutes"], at);
     if (!stepTimeout.ok) return stepTimeout;
     const isCheckout = hasUses && typeof step.uses === "string" && step.uses.trim().toLowerCase().startsWith("actions/checkout@");

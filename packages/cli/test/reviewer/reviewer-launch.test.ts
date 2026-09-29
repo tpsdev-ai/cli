@@ -40,6 +40,7 @@ import {
   hostAssignment,
   inspectGitConfig,
   PASSTHROUGH_KEYS,
+  pinDrift,
   probeActualVersions,
   readBoundedFile,
   readCreationEnv,
@@ -700,6 +701,16 @@ describe("A2/A3 — the review build", () => {
     if (!missing.ok) expect(missing.refusal.kind).toBe("git-config-unreadable");
   });
 
+  test("pinDrift names HEAD and each remote key whose values changed, and nothing else", () => {
+    const before = { head: "a", remotes: ["remote.origin.fetch +refs/heads/main:refs/remotes/origin/main", "remote.origin.url file:///src"] };
+    expect(pinDrift(before, { ...before })).toEqual([]);
+    expect(pinDrift(before, { ...before, head: "b" })).toEqual(["HEAD"]);
+    expect(pinDrift(before, { head: "a", remotes: [before.remotes[0], "remote.origin.url ssh://x"] })).toEqual(["remote.origin.url"]);
+    expect(pinDrift(before, { head: "a", remotes: [...before.remotes, "remote.origin.fetch +refs/*:refs/*"] })).toEqual(["remote.origin.fetch"]);
+    expect(pinDrift(before, { head: "a", remotes: [...before.remotes, "remote.evil.url file:///x"] })).toEqual(["remote.evil.url"]);
+    expect(pinDrift(before, { head: "a", remotes: [before.remotes[1]] })).toEqual(["remote.origin.fetch"]);
+  });
+
   test("checkFreshClone cannot verify a worktree whose git metadata is unreachable, and refuses", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
     const r = checkFreshClone({ workspace, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
@@ -810,6 +821,98 @@ describe("A2/A3 — the review build", () => {
       expect(r.refusal.message).toContain("tracked");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a tracked file carrying the assume-unchanged or skip-worktree bit refuses (either hides an edit from git status)", async () => {
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    for (const bit of ["--assume-unchanged", "--skip-worktree"]) {
+      const r = await build({
+        afterPublish: () => {
+          git("update-index", bit, "tracked");
+          writeFileSync(join(workspace, "tracked"), "v2\n");
+        },
+      });
+      expect(git("status", "--porcelain").stdout).toBe(""); // what git status alone would say
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.refusal.kind).toBe("not-fresh");
+        expect(r.refusal.message).toContain("carry the assume-unchanged or skip-worktree bit");
+        expect(r.refusal.message).toContain("tracked");
+      }
+      expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+    }
+  });
+
+  test("a needed job that hides an edit behind assume-unchanged leaves the next job refused", async () => {
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+      jobExtra: "    needs: build\n",
+      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: git update-index --assume-unchanged tracked && echo v2 > tracked\n`,
+    });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("assume-unchanged or skip-worktree bit");
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a needed job that moves HEAD (an amend keeps git status clean) leaves the next job refused", async () => {
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+      jobExtra: "    needs: build\n",
+      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: echo v2 > tracked && git -c user.name=a -c user.email=a@example.invalid commit -q --amend -a -m amended\n`,
+    });
+    const r = await build();
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("not-fresh");
+      expect(r.refusal.message).toContain("the worktree's HEAD changed since the build started");
+    }
+    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a needed job that changes a remote URL or refspec leaves the next job refused, naming the key only", async () => {
+    for (const change of [
+      "git remote set-url origin ssh://example.invalid/fixture.git", // passes the baseline value rules; only the pin catches it
+      "git config --add remote.origin.fetch '+refs/*:refs/*'",
+    ]) {
+      writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
+        jobExtra: "    needs: build\n",
+        jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: ${change}\n`,
+      });
+      const r = await build();
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.refusal.kind).toBe("not-fresh");
+        expect(r.refusal.message).toMatch(/the worktree's remote\.origin\.(url|fetch) changed since the build started/);
+        expect(r.refusal.message).not.toContain("example.invalid");
+      }
+      expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+    }
+  });
+
+  test("a refs/replace substitute cannot make an edited tree look clean", async () => {
+    writeFileSync(join(src, "tracked"), "v1\n");
+    writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
+    const r = await build({
+      afterPublish: () => {
+        writeFileSync(join(workspace, "tracked"), "v2\n");
+        git("add", "tracked");
+        const tree = git("write-tree").stdout.trim();
+        const commit = spawnSync("/usr/bin/git", ["-c", "user.name=a", "-c", "user.email=a@example.invalid", "commit-tree", tree, "-m", "replacement"], {
+          cwd: workspace,
+          encoding: "utf8",
+          env: GIT_ENV(),
+        }).stdout.trim();
+        git("replace", git("rev-parse", "HEAD").stdout.trim(), commit);
+      },
+    });
+    expect(git("status", "--porcelain").stdout).toBe(""); // clean, as far as git with replacements can tell
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("not-fresh");
+      expect(r.refusal.message).toContain("tracked");
+    }
   });
 
   test("a step's timeout-minutes is enforced: the step is killed at the limit and the build fails", async () => {

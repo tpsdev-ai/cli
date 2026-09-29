@@ -39,6 +39,9 @@ listed under [Known limits](#known-limits).
   `REVIEWER_CI_WORKFLOW`, `REVIEWER_CI_JOB`, `REVIEWER_CI_BASE` — from the
   environment the **host** gave the sandbox when it created it (the container
   init's, `/proc/1/environ`); a caller that passes different values is refused.
+  That integrity is conditional: it holds only if the host denies same-user
+  process-memory writes, which is not yet verified (tpsdev-ai/cli#436; see
+  [Known limits](#known-limits)).
   It refuses symlinked lockfiles and symlinked directories in the worktree
   (outside `node_modules/` and `.git/`) before the build and again after every
   job, plans the job and the jobs it needs, resolves the declarations and pins
@@ -48,12 +51,13 @@ listed under [Known limits](#known-limits).
   what earlier jobs of the build created, gives the job a fresh
   `HOME`/`TMPDIR`/cache root, refuses a worktree whose effective git
   configuration leaves the safe baseline (below) or whose repository holds
-  hooks, and refuses unless the worktree is the fresh clone `actions/checkout`
-  would give CI. It runs every `run:` step as one script under `/bin/bash
+  hooks, and refuses unless the worktree passes the clean-clone check
+  (below). It runs every `run:` step as one script under `/bin/bash
   --noprofile --norc -eo pipefail`, after re-checking the step's effective
   environment and that its resolved working directory stays inside the
   worktree; it enforces `timeout-minutes` (the job's, default 360, and each
-  step's) and kills what a job left running when the job ends.
+  planned `run:` step's; on a skipped `uses:` step it is refused) and kills
+  what a job left running when the job ends.
   `review-build-ok` only if every job in the closure ran, every step exited 0,
   and no lockfile in the worktree (outside `node_modules/` and `.git/`)
   changed, appeared or disappeared.
@@ -69,8 +73,14 @@ listed under [Known limits](#known-limits).
   0), setup-bun and setup-node (an exact version, which becomes a verified pin),
   socketdev (firewall-free), cache (path and key required; a miss may not fail
   the job) and upload-artifact (path required; a missing file may not fail the
-  job; a valid name unique in the workflow). Refused: any other action or ref,
-  `${{ }}` expressions, other `if:` conditions, `continue-on-error`,
+  job; a valid name unique in the workflow). Refused: any other action or ref;
+  a `${{ }}` expression anywhere the launcher would have to evaluate it —
+  scripts, env values, working directories, runner labels, timeouts and every
+  input of a skipped action (a skipped action never evaluates it, so a value
+  the real action would reject, such as a cache key with a comma, cannot be
+  ruled out); the only expressions accepted are `if:` conditions that are
+  exactly `success()` or `always()`. Also refused: `timeout-minutes` on a
+  skipped `uses:` step, other `if:` conditions, `continue-on-error`,
   `strategy`, containers/services, non-bash shells, launcher-owned env keys,
   and credential-shaped or config-redirecting env such as `GH_TOKEN`,
   `*_TOKEN`, `GIT_*`, `NPM_CONFIG_*`, `NODE_OPTIONS`, `BASH_ENV`, `LD_*`.
@@ -105,6 +115,34 @@ else — `core.fsmonitor`, `core.hooksPath`, `core.pager`, `core.editor`,
 `filter.*`, `diff.*`, `alias.*`, ... — is refused by key (never by value). A
 repository `hooks/` directory may hold only git's `*.sample` files.
 
+The baseline is an allowlist of **keys**. It does not approve the **values**
+of `remote.<name>.url` and `remote.<name>.fetch`: those are whatever the host's
+clone wrote, and the launcher trusts them as the host's choice. It pins them
+before the first job and refuses any change before each later job (see below),
+so a transport or refspec change made by the build itself is refused.
+
+### The clean-clone check
+
+`actions/checkout` is skipped only when, before each job, the worktree passes
+these checks (and only these):
+
+- a commit is checked out; for every job after the first, HEAD and every
+  `remote.<name>.url` / `remote.<name>.fetch` value are what they were before
+  the first job;
+- no tracked file carries the assume-unchanged or skip-worktree index bit
+  (`git ls-files -v`: a lowercase tag or `S`), since either hides an edit from
+  `git status`;
+- `git status`, with replace objects ignored, reports no modified, untracked or
+  ignored path;
+- history is shaped as `fetch-depth` asks: a shallow one-commit clone without
+  tags for the default, a full clone for `fetch-depth: 0`.
+
+It is not a byte-for-byte comparison with a host-pinned commit: a change `git
+status` does not report (for example a line-ending-only change under a text
+attribute) and state inside `.git/` beyond HEAD, the index bits and the remote
+settings are not detected. Giving each job an independent tree at a
+host-pinned commit is tracked in tpsdev-ai/cli#435.
+
 ## Building and installing on a reviewer host
 
 ```bash
@@ -134,15 +172,18 @@ Trust boundary (host integration, PR 3):
   the same user as the sandbox. Its integrity relies on the deployed sandbox
   denying same-user process-memory writes (no ptrace capability; Yama
   `ptrace_scope` ≥ 1). That is a host-integration check against the real run
-  configuration, not something this image can prove.
+  configuration, not something this image can prove, and it is not in place
+  yet: until tpsdev-ai/cli#436 lands, "a caller cannot change the assignment"
+  holds only against a caller that sets its own environment, not against one
+  that can write the init process's memory.
 
 CI fidelity (`review-build-ok` may disagree with CI):
 
 - Jobs of a `needs` closure run one after another in the one worktree. Before
   each job the launcher removes what earlier jobs created and requires the
-  fresh clone checkout would give; it does not reset what lives inside `.git/`,
-  and it keeps a `node_modules/` that existed before the build whole (a fresh
-  clone has none, so the first job's check refuses it).
+  clean-clone check above; it keeps a `node_modules/` that existed before the
+  build whole (a fresh clone has none, so the first job's check refuses it).
+  What that check cannot see carries over (tpsdev-ai/cli#435).
 - On `pull_request`, CI checks out the merge of the head into the base; the
   review builds the assigned head.
 - CI's runner image carries its own Node (e.g. 22.23.2 today) where a workflow

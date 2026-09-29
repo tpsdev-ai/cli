@@ -132,7 +132,7 @@ describe("the reviewed allowlist of skipped-action refs", () => {
 
   test("a reviewed SHA is skipped and named with its tag", () => {
     const t = jobOf(plan(bare(`      - uses: ${CHECKOUT}\n        with:\n          persist-credentials: false\n          fetch-depth: 0\n      - run: a\n`)));
-    expect(t.skipped).toEqual([{ index: 1, uses: CHECKOUT, tag: "v4.2.2", reason: "the workspace is the host-created clone at the assigned head, verified fresh before the job" }]);
+    expect(t.skipped).toEqual([{ index: 1, uses: CHECKOUT, tag: "v4.2.2", reason: "the workspace is the host-created clone at the assigned head, checked before the job" }]);
   });
 });
 
@@ -410,7 +410,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: 22.22.1\n          check-latest: true\n      - run: a\n`)).message).toContain("check-latest");
     expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: 22.22.1\n          cache: npm\n      - run: a\n`)).message).toContain('input "cache"');
     expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          registry-url: https://r\n      - run: a\n`)).kind).toBe("ci-unhonourable");
-    expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: \${{ matrix.node }}\n      - run: a\n`)).message).toContain("only an exact version");
+    expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: \${{ matrix.node }}\n      - run: a\n`)).message).toContain("uses a ${{ }} expression");
     expect(refused(job(`      - uses: ${SETUP_NODE}\n      - run: a\n`)).message).toContain("no node-version");
   });
 
@@ -421,7 +421,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
   });
 
   test("cache: path and key are required, a key the action rejects refuses, a miss may not fail the job", () => {
-    const t = jobOf(plan(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: \${{ runner.os }}-x\n          restore-keys: |\n            \${{ runner.os }}-\n      - run: a\n`)));
+    const t = jobOf(plan(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: linux-x\n          restore-keys: |\n            linux-\n            any-\n      - run: a\n`)));
     expect(t.skipped.map((s: { tag: string }) => s.tag)).toEqual(["v4.2.2", "v4.3.0"]);
     expect(refused(job(`      - uses: ${CACHE}\n      - run: a\n`)).message).toContain("no path");
     expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n      - run: a\n`)).message).toContain("no key");
@@ -431,6 +431,24 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: ""\n          key: k\n      - run: a\n`)).message).toContain("is empty");
     expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: k\n          fail-on-cache-miss: true\n      - run: a\n`)).message).toContain("fail-on-cache-miss");
     expect(plan(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: k\n          lookup-only: true\n      - run: a\n`)).ok).toBe(true);
+    expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: k\n          restore-keys: |\n            ok-\n            a,b\n      - run: a\n`)).message).toContain("restore-keys has a key actions/cache rejects");
+  });
+
+  test("a skipped action's inputs may carry no ${{ }} expression: the value (e.g. a cache key the real action rejects) cannot be checked", () => {
+    // The counterexample: evaluates to "Linux,bad", which actions/cache rejects.
+    const bad = refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: \${{ runner.os }},bad\n      - run: a\n`));
+    expect(bad.message).toContain("actions/cache input key uses a ${{ }} expression; a skipped action never evaluates it");
+    expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: bun-\${{ hashFiles('bun.lock') }}\n      - run: a\n`)).message).toContain("input key uses a ${{ }}");
+    expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: \${{ runner.temp }}/x\n          key: k\n      - run: a\n`)).message).toContain("input path uses a ${{ }}");
+    expect(refused(job(`      - uses: ${CACHE}\n        with:\n          path: x\n          key: k\n          restore-keys: \${{ runner.os }}-\n      - run: a\n`)).message).toContain("input restore-keys uses a ${{ }}");
+    expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: \${{ runner.temp }}/out\n`)).message).toContain("input path uses a ${{ }}");
+  });
+
+  test("timeout-minutes on a skipped uses: step refuses: its failure behaviour at that limit cannot be reproduced", () => {
+    const r = refused(job(`      - uses: ${CACHE}\n        timeout-minutes: 5\n        with:\n          path: x\n          key: k\n      - run: a\n`));
+    expect(r.message).toContain("sets timeout-minutes on a skipped action");
+    expect(refused(bare(`      - uses: ${CHECKOUT}\n        timeout-minutes: 1\n      - run: a\n`)).message).toContain("timeout-minutes on a skipped action");
+    expect(plan(job("      - run: a\n        timeout-minutes: 1\n")).ok).toBe(true);
   });
 
   test("upload-artifact: path required; a missing file may not fail the job; the name must be valid and unique in the workflow", () => {
@@ -438,7 +456,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          name: out\n`)).message).toContain("no path");
     expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n          if-no-files-found: error\n`)).message).toContain("if-no-files-found");
     expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          name: a/b\n          path: out\n`)).message).toContain("rejects");
-    expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          name: \${{ github.sha }}\n          path: out\n`)).message).toContain("uniqueness");
+    expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          name: \${{ github.sha }}\n          path: out\n`)).message).toContain("input name uses a ${{ }}");
     expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n          retention-days: 91\n`)).message).toContain("retention-days");
     expect(refused(job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n          compression-level: 10\n`)).message).toContain("compression-level");
     const twice = job(`      - run: a\n      - uses: ${UPLOAD}\n        with:\n          path: out\n      - uses: ${UPLOAD}\n        with:\n          path: other\n`);

@@ -22,7 +22,7 @@
  *      refuses if its own caller supplied different values. That process runs
  *      as the same user as the sandbox; the assignment's integrity relies on the
  *      deployed sandbox denying same-user process-memory writes (ptrace), a
- *      host-integration check that belongs to PR 3;
+ *      host-integration check not yet in place (tpsdev-ai/cli#436);
  *   3. refuses symlinked lockfiles and symlinked directories in the worktree
  *      (outside node_modules/ and .git/) and hashes every lockfile;
  *   4. plans the named job and its `needs` closure (ci-job.mjs), refusing what it
@@ -39,12 +39,15 @@
  * Then, per job in dependency order: it removes what earlier jobs of this build
  * created, gives the job a fresh HOME/TMPDIR/cache root, refuses a worktree
  * whose effective git configuration leaves the safe baseline or whose
- * repository holds hooks, and refuses unless the worktree is the fresh clone
- * actions/checkout would give CI (no modified, untracked or ignored path;
- * history shaped as fetch-depth asks). It runs each `run:` step as one script
+ * repository holds hooks, and refuses unless the worktree passes the
+ * clean-clone check actions/checkout's skip relies on (checkFreshClone: HEAD and
+ * remote URLs/refspecs unchanged since the build started, no assume-unchanged
+ * or skip-worktree bits, git status clean, history shaped as fetch-depth asks —
+ * not a byte comparison with a host-pinned commit; per-job isolation is
+ * tpsdev-ai/cli#435). It runs each `run:` step as one script
  * under `/bin/bash --noprofile --norc -eo pipefail`, in its own process group,
  * after re-checking the step's effective environment and the RESOLVED working
- * directory (it must stay inside the worktree); it kills a step at its
+ * directory (it must stay inside the worktree); it kills a `run:` step at its
  * timeout-minutes, and the job's steps at the job's (default 360), and kills
  * what the job left running when it ends. A job runs only if the jobs it needs
  * succeeded (or its `if:` is always()). After every job it refuses symlinked
@@ -526,7 +529,8 @@ export function gitConfigFindings(listing) {
   return [...findings];
 }
 
-const gitArgs = (root, args) => ["-c", `safe.directory=${root}`, "-c", "core.fsmonitor=false", "--no-optional-locks", ...args];
+// --no-replace-objects: compare against the objects the refs really name, never a refs/replace/ substitute.
+const gitArgs = (root, args) => ["-c", `safe.directory=${root}`, "-c", "core.fsmonitor=false", "--no-optional-locks", "--no-replace-objects", ...args];
 function runGit(git, root, env, args) {
   return spawnSync(git, gitArgs(root, args), {
     cwd: root,
@@ -576,13 +580,50 @@ export function inspectGitConfig({ workspace, env, git = GIT }) {
   return { ok: true };
 }
 
+/** The git state a build pins before its first job: HEAD and every remote URL and fetch refspec. */
+function readPins(git, root, env, head) {
+  const r = runGit(git, root, env, ["config", "--get-regexp", "^remote\\..+\\.(url|fetch)$"]);
+  if (r.error || (r.status !== 0 && r.status !== 1)) return null; // 1 = no remote configured
+  const remotes = (r.stdout ?? "")
+    .split("\n")
+    .filter((l) => l !== "")
+    .sort();
+  return { head, remotes };
+}
+
+/** What changed between two pin sets, by name only (HEAD, or a remote key). */
+export function pinDrift(before, now) {
+  const drift = [];
+  if (before.head !== now.head) drift.push("HEAD");
+  const keyOf = (line) => line.split(" ")[0];
+  const group = (lines) => {
+    const m = new Map();
+    for (const l of lines) m.set(keyOf(l), [...(m.get(keyOf(l)) ?? []), l].sort());
+    return m;
+  };
+  const a = group(before.remotes);
+  const b = group(now.remotes);
+  for (const key of new Set([...a.keys(), ...b.keys()])) {
+    if (JSON.stringify(a.get(key) ?? []) !== JSON.stringify(b.get(key) ?? [])) drift.push(key);
+  }
+  return drift.sort();
+}
+
 /**
- * actions/checkout is skipped only when the worktree already is what it would
- * produce: a clean clone of one commit — no modified, untracked or ignored file
- * — with history shaped as `fetch-depth` asks (1: a shallow one-commit clone
- * without tags, as checkout's default fetch makes; 0: a full clone).
+ * The clean-clone check that actions/checkout's skip relies on. It is what the
+ * launcher can check, not a byte-for-byte comparison with a host-pinned commit
+ * (per-job isolation is tpsdev-ai/cli#435):
+ *   - a commit is checked out, and — for every job after the first — HEAD and
+ *     every remote.<name>.url / .fetch are what they were before the first job;
+ *   - no tracked file carries the assume-unchanged or skip-worktree index bit
+ *     (either would hide an edit from git status);
+ *   - `git status` (replace objects ignored) reports no modified, untracked or
+ *     ignored path;
+ *   - history is shaped as `fetch-depth` asks (1: a shallow one-commit clone
+ *     without tags, as checkout's default fetch makes; 0: a full clone).
+ * Returns { ok, pins } so the caller can pin the first job's state.
  */
-export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
+export function checkFreshClone({ workspace, env, fetchDepth, pinned = null, git = GIT }) {
   const root = realpathSync(workspace);
   const head = runGit(git, root, env, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
   if (head.error || head.status !== 0) {
@@ -591,6 +632,26 @@ export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
       unreachable(head)
         ? "the worktree's git metadata is not reachable in the sandbox, so the clean checkout that actions/checkout gives CI cannot be verified"
         : "the worktree has no checked-out commit, so the clean checkout that actions/checkout gives CI cannot be verified",
+    );
+  }
+  const pins = readPins(git, root, env, head.stdout.trim());
+  if (!pins) return refuse("not-fresh", "the worktree's remote configuration could not be read");
+  if (pinned) {
+    const drift = pinDrift(pinned, pins);
+    if (drift.length > 0) {
+      return refuse("not-fresh", `the worktree's ${drift.join(", ")} changed since the build started; an earlier job rewrote what checkout gave it`);
+    }
+  }
+  const bits = runGit(git, root, env, ["ls-files", "-v", "-z"]);
+  if (bits.status !== 0) return refuse("not-fresh", `git ls-files failed in the worktree: ${(bits.stderr ?? "").split("\n")[0]}`);
+  const hidden = bits.stdout
+    .split("\0")
+    .filter((e) => e.length > 2 && (e[0] === "S" || (e[0] >= "a" && e[0] <= "z")))
+    .map((e) => e.slice(2));
+  if (hidden.length > 0) {
+    return refuse(
+      "not-fresh",
+      `${hidden.length} tracked path(s) carry the assume-unchanged or skip-worktree bit, which hides edits from git status (e.g. ${hidden.slice(0, 5).join(", ")})`,
     );
   }
   const status = runGit(git, root, env, ["status", "--porcelain=v1", "-z", "--ignored=matching", "--untracked-files=all"]);
@@ -606,7 +667,7 @@ export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
   const shallow = runGit(git, root, env, ["rev-parse", "--is-shallow-repository"]).stdout?.trim();
   if (fetchDepth === 0) {
     if (shallow !== "false") return refuse("not-fresh", "the job checks out full history (fetch-depth: 0) but the worktree is a shallow clone");
-    return { ok: true };
+    return { ok: true, pins };
   }
   const count = runGit(git, root, env, ["rev-list", "--count", "HEAD"]).stdout?.trim();
   const tags = runGit(git, root, env, ["for-each-ref", "--count=1", "--format=%(refname)", "refs/tags"]).stdout?.trim();
@@ -616,7 +677,7 @@ export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
       `the job uses checkout's default one-commit fetch, but the worktree ${shallow !== "true" ? "is not a shallow clone" : count !== "1" ? `reaches ${count} commits` : "has tags"}; mount a depth-1 clone of the assigned head`,
     );
   }
-  return { ok: true };
+  return { ok: true, pins };
 }
 
 /** Recreate the hermetic root and every directory the layout names (mode 0700). */
@@ -812,6 +873,7 @@ export async function reviewBuild({
   if (!verified.ok) return verified;
 
   const scriptDir = join(hermeticRoot, "steps");
+  let pinned = null;
   const status = new Map();
   const jobs = [];
   const stop = (refusal) => ({ ok: false, refusal, jobs });
@@ -823,8 +885,8 @@ export async function reviewBuild({
       continue;
     }
     if (i > 0) {
-      // Remove what earlier jobs created; the fresh-clone check below then
-      // refuses anything else they left behind.
+      // Remove what earlier jobs created; the clean-clone check below then
+      // refuses what it can see of anything else they left behind.
       const now = scanWorkspace(workspace);
       if (!now.ok) return stop(now.refusal);
       removeCreatedPaths(workspace, before.paths, now.paths);
@@ -833,8 +895,10 @@ export async function reviewBuild({
     prepareHermeticRoot(hermeticRoot);
     const git = inspectGit({ workspace, env });
     if (!git.ok) return stop(git.refusal);
-    const fresh = checkFresh({ workspace, env, fetchDepth: job.fetchDepth });
+    const fresh = checkFresh({ workspace, env, fetchDepth: job.fetchDepth, pinned });
     if (!fresh.ok) return stop(fresh.refusal);
+    // HEAD and the remotes' URLs and refspecs are pinned before the first job.
+    pinned ??= fresh.pins;
 
     // timeout-minutes: the job's (default 360) bounds every step; a step's own bounds it further.
     const deadline = Date.now() + job.timeoutMinutes * 60_000;
