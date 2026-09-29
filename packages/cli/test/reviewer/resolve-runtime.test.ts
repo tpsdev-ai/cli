@@ -85,7 +85,9 @@ describe("A2 — requirement resolution", () => {
     if (!plan.ok) return;
     const r = resolveRuntime({ table, manifest, runtimeFiles: {}, ciConstraints: plan.pins });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.image.id).toBe("reviewer-node22-bun1310");
+    // engines.node "22.x || 24.x" admits both images; the test job's exact
+    // setup-node 24.21.0 (for the github-review suite) selects one.
+    if (r.ok) expect(r.image.id).toBe("reviewer-node24-bun1310");
   });
 
   test("a runtime outside the matrix refuses and NAMES the missing image by its requirements", () => {

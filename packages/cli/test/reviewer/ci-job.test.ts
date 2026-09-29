@@ -72,7 +72,7 @@ describe("this repository's test job", () => {
     if (p.ok) expect(p.jobs.map((j: { id: string; needs: string[] }) => [j.id, j.needs])).toEqual([["build", []], ["test", ["build"]]]);
   });
 
-  test("every run: step of test, in order, in its working directory — including the plugin launcher and the report guard", () => {
+  test("every run: step of test, in order, in its working directory — including both plugin launchers and the report guard", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
       [4, ".", false],
@@ -80,12 +80,15 @@ describe("this repository's test job", () => {
       [6, ".", false],
       [7, ".", false],
       [8, "plugins/openclaw-tps-mail", false],
-      [9, ".", true],
+      [10, "plugins/openclaw-github-review", false],
+      [11, ".", true],
     ]);
     expect(t.steps[0].script).toBe("sfw bun install --frozen-lockfile");
     expect(t.steps[3].script).toBe("bun run test");
     expect(t.steps[4].script).toContain("npm ci --ignore-scripts");
-    expect(t.steps[5].script).toBe("node scripts/check-test-reports.mjs");
+    expect(t.steps[5].script).toContain("npm ci --ignore-scripts");
+    expect(t.steps[5].script).toContain("bun run test");
+    expect(t.steps[6].script).toBe("node scripts/check-test-reports.mjs");
   });
 
   test("the setup actions are skipped by name at their reviewed tags, their pins kept, and sfw is shimmed", () => {
@@ -94,9 +97,10 @@ describe("this repository's test job", () => {
       "actions/checkout@v4.2.2",
       "oven-sh/setup-bun@v2.0.2",
       "socketdev/action@v1.3.2",
+      "actions/setup-node@v4.4.0",
     ]);
     if (!p.ok) return;
-    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["1.3.10", "1.3.10"]);
+    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["1.3.10", "1.3.10", "24.21.0"]);
     expect(p.shims).toEqual(["sfw"]);
   });
 

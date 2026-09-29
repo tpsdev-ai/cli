@@ -272,6 +272,7 @@ describe("check-test-reports", () => {
     expect([...REQUIRED_SUITES].map((s) => s.suite).sort()).toEqual([
       "agent",
       "cli",
+      "github-review",
       "pi-tps-mail",
       "plugin",
       "root-test",

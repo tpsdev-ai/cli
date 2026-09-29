@@ -92,8 +92,10 @@
   baseline allowlists keys; remote URL and refspec values are the host clone's
   and are pinned for the build, not approved.
 
-  This repository now declares `engines.node: "22.x"` (the Node major its CI
-  runs), so it resolves to exactly one reviewer image.
+  This repository now declares `engines.node: "22.x || 24.x"` (the Node majors
+  its CI runs: the runner's 22, and the exact 24.21.0 its `test` job sets up
+  for the github-review plugin suite), so with that pin its `test` job resolves
+  to exactly one reviewer image, `reviewer-node24-bun1310`.
 
   A dedicated CI job builds every matrix image and runs the image-level checks
   (A2 integrity and build-path refusals, including a caller naming another job,
