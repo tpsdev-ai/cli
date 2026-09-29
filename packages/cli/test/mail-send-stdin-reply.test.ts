@@ -190,7 +190,9 @@ describe("mail send: stdin body, reply-to, PEM keys, refuse-unsigned (cli#429)",
     // CONTROL: a stream reader (`process.stdin`) reads a regular-file stdin as
     // 0 bytes under bun once `process.stdin` exists, so the body would be lost.
     const body = "body via regular-file stdin: line1\nline2\tpi";
-    const r = runSendWithFileStdin(["kern", "--stdin"], body);
+    // --quiet-nono-check: a host without nono (CI) gets the CLI's availability
+    // warning on stderr; this case asserts that stdin handling adds nothing there.
+    const r = runSendWithFileStdin(["kern", "--stdin", "--quiet-nono-check"], body);
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
 
