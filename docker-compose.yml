@@ -26,17 +26,27 @@ services:
   # skips itself when no real nono is reachable, so this service is only
   # meaningful with the mount — which is exactly how the Docker Integration job
   # runs it.
+  #
+  # cli#430: the targeted files run through the suite launcher, like every other
+  # lane: HOME-isolated, an allowlisted environment, and the repo-root bunfig
+  # preload (which aborts a bare `bun test` here). /app is root-owned and this
+  # service runs as the non-root `tps` user, so the report goes to the writable
+  # tmpfs. The launcher does not pass NONO_BIN or TPS_TEST_MODE to the tests
+  # (neither is on its allowlist; NONO_BIN is a path): the fixtures resolve the
+  # mounted binary at /usr/local/bin/nono, the first of the pinned locations
+  # (DEFAULT_NONO_PATHS in packages/cli/src/utils/launch-attestation.ts).
   attested:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: bun test packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts
+    command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts
     user: tps
     working_dir: /app
     environment:
       - HOME=/home/tps
       - NONO_BIN=/usr/local/bin/nono
       - TPS_TEST_MODE=docker
+      - TPS_TEST_REPORT_DIR=/tmp/test-reports
     tmpfs:
       - /tmp:exec,size=64M
 

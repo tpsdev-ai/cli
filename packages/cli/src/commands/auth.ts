@@ -14,12 +14,19 @@
  * tokens, it writes updated credentials back to both its own store AND the
  * original CLI's credential file to prevent split-brain token invalidation.
  */
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { homeDir } from "../utils/home.js";
 
-const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+/**
+ * The TPS auth store, `~/.tps/auth`, resolved on every call from the HOME in
+ * effect then (cli#430): a path fixed at import time would keep the HOME of
+ * whichever caller loaded this module first.
+ */
+function authDir(): string {
+  return join(homeDir(), ".tps", "auth");
+}
 
 const ANTHROPIC_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
@@ -42,11 +49,11 @@ export interface StoredCredentials {
 }
 
 function authPath(provider: string): string {
-  return join(AUTH_DIR, `${provider}.json`);
+  return join(authDir(), `${provider}.json`);
 }
 
 function ensureAuthDir(): void {
-  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(authDir(), { recursive: true, mode: 0o700 });
 }
 
 function saveCredentials(provider: string, creds: StoredCredentials): void {
@@ -144,7 +151,7 @@ async function loginGoogle(): Promise<void> {
 }
 
 function readClaudeCodeCredentials(): StoredCredentials | null {
-  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  const credPath = join(homeDir(), ".claude", ".credentials.json");
   if (!existsSync(credPath)) return null;
 
   try {
@@ -166,7 +173,7 @@ function readClaudeCodeCredentials(): StoredCredentials | null {
 }
 
 function readGeminiCredentials(): StoredCredentials | null {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
   const candidates = [
     join(home, ".gemini", "oauth_creds.json"),
@@ -196,7 +203,7 @@ function readGeminiCredentials(): StoredCredentials | null {
 }
 
 function syncToClaudeCode(creds: StoredCredentials): void {
-  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  const credPath = join(homeDir(), ".claude", ".credentials.json");
   if (!existsSync(credPath)) return;
 
   try {
@@ -214,7 +221,7 @@ function syncToClaudeCode(creds: StoredCredentials): void {
 }
 
 function syncToGeminiCli(creds: StoredCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
   const candidates = [
     join(home, ".gemini", "oauth_creds.json"),
@@ -296,7 +303,7 @@ async function loginOpenAI(): Promise<void> {
  * Format: { accessToken, refreshToken, expiresAt, clientId, scopes, ... }
  */
 function readCodexCredentials(): StoredCredentials | null {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const codexHome = process.env.CODEX_HOME || join(home, ".codex");
   const candidates = [
     join(codexHome, "auth.json"),
@@ -346,7 +353,7 @@ function readCodexCredentials(): StoredCredentials | null {
  * Atomic write: write to .tmp then rename to prevent partial reads.
  */
 function syncToCodexCli(creds: StoredCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const codexHome = process.env.CODEX_HOME || join(home, ".codex");
   const candidates = [
     join(codexHome, "auth.json"),

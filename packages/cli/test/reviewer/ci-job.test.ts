@@ -18,6 +18,17 @@ import {
   SKIPPED_ACTIONS,
 } from "../../../../scripts/reviewer/ci-job.mjs";
 import { RESERVED_ENV_KEYS } from "../../../../scripts/reviewer/reviewer-launch.mjs";
+import yaml from "js-yaml";
+
+const SUITE_STEP = "Unit + integration tests, HOME-isolated (cli#430)";
+
+/** Whether this repository's HOME-isolated suite step declares an env key, read with the planner's YAML schema. */
+function suiteStepDeclaresEnv(workflowText: string): boolean {
+  const wf = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA }) as { jobs: { test: { steps: Array<Record<string, unknown>> } } };
+  const step = wf.jobs.test.steps.find((s) => s.name === SUITE_STEP);
+  if (!step) throw new Error(`no step named ${SUITE_STEP}`);
+  return Object.hasOwn(step, "env");
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..", "..", "..", "..");
@@ -72,7 +83,7 @@ describe("this repository's test job", () => {
     if (p.ok) expect(p.jobs.map((j: { id: string; needs: string[] }) => [j.id, j.needs])).toEqual([["build", []], ["test", ["build"]]]);
   });
 
-  test("every run: step of test, in order, in its working directory — including both plugin launchers and the report guard", () => {
+  test("every run: step of test, in order, in its working directory — including the HOME-isolated suite, both plugin launchers and the report guard", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
       [4, ".", false],
@@ -84,11 +95,42 @@ describe("this repository's test job", () => {
       [11, ".", true],
     ]);
     expect(t.steps[0].script).toBe("sfw bun install --frozen-lockfile");
-    expect(t.steps[3].script).toBe("bun run test");
+    // cli#430: the monorepo suite runs with HOME at an empty mktemp dir, and the
+    // step fails if that dir gains a `.tps`. Pinned whole: the planner hands the
+    // script to bash unchanged, so every line of it is what the review build
+    // runs. HOME is set inside the script, not by an env: key (the launcher owns
+    // HOME and refuses a workflow that sets it), so the step carries no env.
+    expect(t.steps[3].name).toBe("Unit + integration tests, HOME-isolated (cli#430)");
+    expect(t.steps[3].script).toBe(
+      [
+        `iso_home="$(mktemp -d)"`,
+        `HOME="$iso_home" bun run test`,
+        `if [ -e "$iso_home/.tps" ]; then`,
+        `  echo "::error::the suite wrote $iso_home/.tps — HOME is not isolated"`,
+        "  exit 1",
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    expect(t.steps[3].env).toEqual({});
+    // The planner maps an absent env: and an empty `env: {}` to the same {}, so
+    // the planned env alone cannot show the step declares none: parse the
+    // workflow the way the planner does and require no env key on the step.
+    expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(false);
     expect(t.steps[4].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("bun run test");
     expect(t.steps[6].script).toBe("node scripts/check-test-reports.mjs");
+  });
+
+  test("the no-env check on the HOME-isolated step sees every YAML spelling of an env key", () => {
+    const base = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
+    const at = "        run: |\n          iso_home=";
+    expect(base.split(at).length).toBe(2);
+    expect(suiteStepDeclaresEnv(base)).toBe(false);
+    for (const spelling of ["env: {}", '"env": {}', "env : {}", "'env': {}", "env: {FOO: bar}"]) {
+      expect(suiteStepDeclaresEnv(base.replace(at, `        ${spelling}\n${at}`))).toBe(true);
+    }
   });
 
   test("the setup actions are skipped by name at their reviewed tags, their pins kept, and sfw is shimmed", () => {

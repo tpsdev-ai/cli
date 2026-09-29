@@ -86,8 +86,10 @@ export const REPORT_DIR = process.env.TPS_TEST_REPORT_DIR
 /**
  * The seal a suite writes beside its report when it exits (cli#414):
  * `test-reports/<suite>.xml.sha256`, holding the report's SHA-256 and the suite
- * name. `scripts/test-suite.mjs` and the plugin's own self-contained launcher
- * both write this format; this script is its reader.
+ * name. `scripts/test-suite.mjs` and the plugins' own launchers
+ * (plugins/openclaw-tps-mail/scripts/run-tests.mjs and
+ * plugins/openclaw-github-review/scripts/run-tests.mjs) all write this format;
+ * this script is its reader.
  */
 export const sealPath = (suite, reportDir = REPORT_DIR) => join(reportDir, `${suite}.xml.sha256`);
 

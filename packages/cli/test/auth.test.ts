@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -123,6 +123,45 @@ describe("tps auth", () => {
     expect(refreshed.accessToken).toBe("g-new");
     expect(refreshed.expiresAt).toBeGreaterThan(Date.now());
     globalThis.fetch = originalFetch;
+  });
+
+  // cli#430: the tests above import a fresh copy of auth.ts per test with
+  // `?x=${Date.now()}`. Two tests that import within the same millisecond get
+  // ONE module instance. auth.ts used to fix ~/.tps/auth at import time, so the
+  // second test's revoke looked in the first test's (deleted) home and left its
+  // own file behind. This case imports one instance under one HOME and uses it
+  // under another, so it does not depend on timing.
+  test("one module instance follows the HOME in effect at each call (revoke and status)", async () => {
+    const mod = await import("../src/commands/auth.js?one-instance-two-homes");
+    const other = mkdtempSync(join(tmpdir(), "tps-auth-test-other-"));
+    const creds = JSON.stringify({
+      provider: "anthropic",
+      refreshToken: "r1",
+      accessToken: "a1",
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      clientId: "id",
+      scopes: "scope",
+    });
+    try {
+      // `other` first: the module was imported under `root` (or an earlier
+      // HOME), so an import-time path would never point at `other`.
+      for (const home of [other, root]) {
+        process.env.HOME = home;
+        const file = join(home, ".tps", "auth", "anthropic.json");
+        mkdirSync(join(home, ".tps", "auth"), { recursive: true });
+
+        writeFileSync(file, creds);
+        await mod.runAuth({ action: "revoke", provider: "anthropic" });
+        expect(existsSync(file)).toBe(false);
+
+        writeFileSync(file, creds);
+        logs.length = 0;
+        mod.showStatus();
+        expect(logs.join("\n")).toContain("expires in");
+      }
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
   });
 
 });

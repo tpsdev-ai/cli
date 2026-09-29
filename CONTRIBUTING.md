@@ -17,8 +17,10 @@ bun install
 # Build the CLI
 bun run build
 
-# Run tests
-bun test
+# Run tests through the HOME-isolating launcher (cli#430). A bare `bun test`
+# aborts: the preload refuses a run that no launcher set up. That is a
+# launch-time check, not an OS boundary (cli#434).
+bun run test
 ```
 
 ## Architecture Notes
@@ -33,7 +35,7 @@ When modifying the branch daemon or transport layers, keep the following securit
 ## Code Quality
 
 - We use Biome for linting. Run `bun run lint` before committing.
-- Ensure all tests pass (`bun test`). We aim for high test coverage, especially in `src/utils/identity.ts`, `src/utils/relay.ts`, and the transport layers.
+- Ensure all tests pass (`bun run test`). We aim for high test coverage, especially in `src/utils/identity.ts`, `src/utils/relay.ts`, and the transport layers.
 - Write tests for new features.
 
 ## Submitting a Pull Request
