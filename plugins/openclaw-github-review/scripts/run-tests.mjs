@@ -57,7 +57,9 @@ rmSync(reportSeal, { force: true });
 
 const passthrough = process.argv.slice(2);
 const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
-if (!args.some((a) => a.startsWith("--reporter"))) {
+// A caller-supplied --reporter is the ONE accepted reason for no JUnit report.
+const callerReporter = args.some((a) => a.startsWith("--reporter"));
+if (!callerReporter) {
   args.push("--reporter=junit", `--reporter-outfile=${reportXml}`);
 }
 const child = spawn("bun", args, { cwd: pluginDir, env, stdio: ["inherit", "pipe", "pipe"] });
@@ -94,6 +96,11 @@ child.on("close", (code, signal) => {
       }
     } catch (err) {
       console.error(`openclaw-github-review tests: could not seal the report: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+    if (!callerReporter && !signal && code === 0 && !existsSync(reportXml)) {
+      console.error(`openclaw-github-review tests: bun exited 0 but wrote no report at ${reportXml}; failing the run`);
       process.exitCode = 1;
       return;
     }

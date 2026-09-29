@@ -9,6 +9,7 @@
  */
 
 import type { CredentialCustody } from "./credential.js";
+import { fetchWithTimeout, REQUEST_TIMEOUT_MS } from "./request-timeout.js";
 import type { ExistingReview, GitHubApi, GitHubReviewLister, PullSnapshot, ReviewEvent, ReviewReceipt } from "./types.js";
 
 export interface GitHubApiOptions {
@@ -18,6 +19,8 @@ export interface GitHubApiOptions {
   baseUrl?: string;
   /** Injected for tests; defaults to the global fetch. */
   fetchImpl?: typeof fetch;
+  /** Per-request timeout; defaults to REQUEST_TIMEOUT_MS (tests shorten it). */
+  timeoutMs?: number;
 }
 
 const DEFAULT_BASE_URL = "https://api.github.com";
@@ -48,11 +51,13 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
   private readonly custody: CredentialCustody;
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(opts: GitHubApiOptions) {
     this.custody = opts.custody;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/$/, "");
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.timeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
   }
 
   private headers(): Record<string, string> {
@@ -71,8 +76,9 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
     const url = `${this.baseUrl}/repos/${repo}/pulls/${pr}`;
     let res: Response;
     try {
-      res = await this.fetchImpl(url, { method: "GET", headers: this.headers() });
+      res = await fetchWithTimeout(this.fetchImpl, url, { method: "GET", headers: this.headers() }, this.timeoutMs);
     } catch {
+      // A transport failure or a timeout: the lookup failed, and nothing was posted.
       return { ok: false, detail: "lookup request failed" };
     }
     if (!res.ok) return { ok: false, detail: `lookup returned status ${res.status}` };
@@ -99,7 +105,7 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
       const url = `${this.baseUrl}/repos/${repo}/pulls/${pr}/reviews?per_page=${REVIEWS_PER_PAGE}&page=${page}`;
       let res: Response;
       try {
-        res = await this.fetchImpl(url, { method: "GET", headers: this.headers() });
+        res = await fetchWithTimeout(this.fetchImpl, url, { method: "GET", headers: this.headers() }, this.timeoutMs);
       } catch {
         return { ok: false, detail: "review listing request failed" };
       }
@@ -151,12 +157,15 @@ export class HttpGitHubApi implements GitHubApi, GitHubReviewLister {
     });
     let res: Response;
     try {
-      res = await this.fetchImpl(url, {
-        method: "POST",
-        headers: { ...this.headers(), "Content-Type": "application/json" },
-        body: payload,
-      });
+      res = await fetchWithTimeout(
+        this.fetchImpl,
+        url,
+        { method: "POST", headers: { ...this.headers(), "Content-Type": "application/json" }, body: payload },
+        this.timeoutMs,
+      );
     } catch {
+      // A transport failure or a TIMEOUT: the request may have reached GitHub
+      // and created a review — AMBIGUOUS, never a rejection.
       return { ok: false, kind: "ambiguous", detail: "posting request failed with no definitive response" };
     }
     if (!res.ok) {

@@ -136,6 +136,18 @@ describe("A1 — independent plugin loading", () => {
     expect(res.status).toBe(0);
   });
 
+  test("the declared OpenClaw floor — peer range and compat.pluginApi — is the release the gateway lane verifies", () => {
+    const pkg = JSON.parse(readFileSync(join(pluginRoot, "package.json"), "utf8")) as {
+      peerDependencies: Record<string, string>;
+      devDependencies: Record<string, string>;
+      openclaw: { compat: { pluginApi: string } };
+    };
+    const tested = pkg.devDependencies.openclaw;
+    expect(tested).toBe("2026.8.1");
+    expect(pkg.peerDependencies.openclaw).toBe(`>=${tested}`);
+    expect(pkg.openclaw.compat.pluginApi).toBe(`>=${tested}`);
+  });
+
   test("the manifest declares exactly this one tool and activates on startup", () => {
     const manifest = JSON.parse(readFileSync(join(pluginRoot, "openclaw.plugin.json"), "utf8")) as {
       contracts?: { tools?: string[] };

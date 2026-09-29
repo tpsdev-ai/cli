@@ -40,11 +40,11 @@
       "./dist/src/index.js"
     ],
     "compat": {
-      "pluginApi": ">=2026.5.7"
+      "pluginApi": ">=2026.8.1"
     }
   },
   "peerDependencies": {
-    "openclaw": ">=2026.3.7"
+    "openclaw": ">=2026.8.1"
   },
   "engines": {
     "node": ">=22"

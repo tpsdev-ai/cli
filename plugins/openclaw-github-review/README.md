@@ -84,7 +84,10 @@ input, none of it trusted on its own — and:
    validation failed) — AND carries GitHub's `X-GitHub-Request-Id` header (the
    same status from an intermediary proves nothing). Everything else is
    ambiguous — a review may exist: 408 and 429, any other 4xx, every 5xx and
-   3xx, a transport failure, a 2xx whose body cannot be read. After the POST
+   3xx, a transport failure or a request that exceeds the 30 s request
+   timeout (every outbound request — the GitHub GETs and POST and the Flair
+   audit write — is bounded by it; a timed-out audit write is retained like any
+   failed one), a 2xx whose body cannot be read. After the POST
    the handler returns an outcome and does not throw: the event id, timestamp
    and digest are prepared before the claim; the POST's result is read once,
    field by field, into checked values; every later step (latch writes, the
@@ -151,6 +154,10 @@ registration of that configuration in the process, it refuses
 The lane below pins **OpenClaw 2026.8.1**, the release deployed to the reviewer
 hosts; the gateway runs on the Node that release requires (`>=22.22.3 <23`,
 `>=24.15 <25` or `>=25.9`). An update to any of them must pass the lane first.
+The package declares that release as its floor — `peerDependencies.openclaw`
+and `openclaw.compat.pluginApi` are both `>=2026.8.1` — because it is the only
+release the lane verifies (the plugin relies on its loader and tool-discovery
+behaviour); a newer release must pass the lane before rollout.
 
 1. Build the plugin (`npm ci --ignore-scripts && npm run build`) and install it
    into the gateway, e.g. with `openclaw plugins install`, or by listing its
@@ -262,7 +269,9 @@ lock is reported with its path and the remedy.
 ## CI
 
 The suite runs through an isolated launcher (`scripts/run-tests.mjs`) and writes
-`test-reports/github-review.xml`, which the repository's coverage guard reads.
+`test-reports/github-review.xml`, which the repository's coverage guard reads; a
+run that exits 0 without that report fails (only a caller-supplied `--reporter`
+may skip it).
 `npm run typecheck:test` typechecks the tests as well as the sources.
 
 The dedicated **gateway-boundary lane** (`test/gateway-boundary.test.ts`) runs

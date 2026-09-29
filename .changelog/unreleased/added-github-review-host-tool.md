@@ -58,7 +58,8 @@
   `already_posted`); an uncertain outcome latches `reconcile_required`.
   Exactly ONE thing releases a dispatch: the handler, on a response proving
   its own POST created no review (401/403/404/422 that carry GitHub's request
-  id — 408, 429, other 4xx, 5xx and transport failures are ambiguous). The
+  id — 408, 429, other 4xx, 5xx, transport failures and requests past the
+  30 s timeout that bounds every outbound request are ambiguous). The
   host's `latch-admin reconcile` never releases: it refuses while the claim is
   held and on a recent attempt, requires the credential (by fingerprint) and
   login that made the attempt, lists the pull request's reviews with it, and

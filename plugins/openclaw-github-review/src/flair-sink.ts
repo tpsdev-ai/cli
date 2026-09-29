@@ -9,6 +9,7 @@
 
 import { createPrivateKey, randomUUID, sign as ed25519Sign, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { fetchWithTimeout, REQUEST_TIMEOUT_MS } from "./request-timeout.js";
 import type { AuditSink, OrgEventDraft } from "./types.js";
 
 /** Load an Ed25519 private key from PEM, a raw 32-byte seed, or base64 PKCS8
@@ -39,6 +40,8 @@ export class FlairHttpAuditSink implements AuditSink {
     baseUrl: string,
     keyPath: string,
     private readonly fetchImpl: typeof fetch = fetch,
+    /** Per-request timeout; defaults to REQUEST_TIMEOUT_MS (tests shorten it). */
+    private readonly timeoutMs: number = REQUEST_TIMEOUT_MS,
   ) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.key = loadEd25519Key(keyPath);
@@ -54,7 +57,8 @@ export class FlairHttpAuditSink implements AuditSink {
 
   async record(event: OrgEventDraft): Promise<void> {
     const path = "/OrgEvent/";
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+    // A timeout rejects like any failed write, so the handler retains the record.
+    const res = await fetchWithTimeout(this.fetchImpl, `${this.baseUrl}${path}`, {
       method: "POST",
       headers: {
         Authorization: this.authHeader("POST", path),
@@ -71,7 +75,7 @@ export class FlairHttpAuditSink implements AuditSink {
         detail: event.detail,
         createdAt: event.createdAt,
       }),
-    });
+    }, this.timeoutMs);
     if (!res.ok) {
       // No upstream body is surfaced: only a status.
       throw new Error(`audit write failed (status ${res.status})`);
