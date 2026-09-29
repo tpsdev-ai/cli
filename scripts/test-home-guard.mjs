@@ -17,9 +17,10 @@
  *     dropped, including ones nobody has named yet;
  *   - `assertTestDestinations` refuses — before anything is created or deleted —
  *     a temp dir inside an operator home, a report dir inside an operator-critical
- *     directory (`~/.tps`, `~/.flair`, `~/agents`, `~/.config`), and a report,
- *     log or seal path that resolves there or is a symlink; `assertSuiteName`
- *     refuses a suite name that is not a plain file-name token;
+ *     directory (`~/.tps`, `~/.flair`, `~/agents`, `~/.config`) or that is or
+ *     contains an operator home (`$HOME` itself, `/`), and a report, log or seal
+ *     path that resolves inside an operator-critical directory or is a symlink;
+ *     `assertSuiteName` refuses a suite name that is not a plain file-name token;
  *   - `testRootRefusal` is the preloads' root check: a TPS_TEST_ROOT that is or
  *     contains the account's home, or that no launcher vouched for and that is or
  *     contains the HOME the process runs under, aborts the run.
@@ -261,10 +262,13 @@ function refuse(label, real, hit, remedy) {
 
 /**
  * Refuse — throw IsolationRefusal — when the report dir resolves inside an
- * operator-critical directory, or when one of `paths` (the report, log and seal
- * this run will delete and write) does, or is a symlink (even a dangling one:
- * writing through it would land wherever it points). Call it before the first
- * delete and again before any later write.
+ * operator-critical directory, or is or contains an operator home (the home
+ * itself, or a directory above it such as `/`: the launcher deletes and writes
+ * `<suite>.xml`, `<suite>.log` and `<suite>.xml.sha256` directly in the report
+ * dir), or when one of `paths` (the report, log and seal this run will delete
+ * and write) resolves inside an operator-critical directory, or is a symlink
+ * (even a dangling one: writing through it would land wherever it points). Call
+ * it before the first delete and again before any later write.
  */
 export function assertReportPaths({ env = process.env, reportDir, paths = [] }) {
   const critical = operatorCriticalDirs(env);
@@ -273,6 +277,17 @@ export function assertReportPaths({ env = process.env, reportDir, paths = [] }) 
   const dirReal = realpathLoose(reportDir);
   const dirHit = critical.find((dir) => inside(dir, dirReal));
   if (dirHit) throw refuse("the report dir", dirReal, dirHit, remedy);
+  // The report dir may not BE an operator home or lie above one (realpath'd, as
+  // above): TPS_TEST_REPORT_DIR=$HOME would delete and write $HOME/<suite>.xml.
+  const homeHit = operatorHomes(env).find((home) => inside(dirReal, home));
+  if (homeHit) {
+    throw new IsolationRefusal(
+      [
+        `HOME-ISOLATION GUARD: refusing to run — the report dir resolves to "${dirReal}", which is or contains the operator home "${homeHit}".`,
+        "  The launcher deletes and writes its report, log and seal (<suite>.xml, <suite>.log, <suite>.xml.sha256) directly in the report dir, so it may not be an operator home or a directory above one. Point TPS_TEST_REPORT_DIR (or the repo's test-reports/) at a directory of its own and re-run.",
+      ].join("\n"),
+    );
+  }
   for (const path of paths) {
     if (dirname(resolve(path)) !== resolve(reportDir)) {
       throw new IsolationRefusal(`HOME-ISOLATION GUARD: refusing to run — the report path "${path}" is not directly inside the report dir "${reportDir}".`);

@@ -35,7 +35,7 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import {
@@ -56,6 +56,7 @@ import {
 const REPO = resolve(import.meta.dir, "../../..");
 const PRELOAD = join(REPO, "scripts/home-isolation-preload.ts");
 const SUITE_LAUNCHER = join(REPO, "scripts/test-suite.mjs");
+const GUARD_MODULE = join(REPO, "scripts/test-home-guard.mjs");
 const PLUGIN_DIR = join(REPO, "plugins/openclaw-tps-mail");
 const PLUGIN_LAUNCHER = join(PLUGIN_DIR, "scripts/run-tests.mjs");
 
@@ -330,6 +331,55 @@ describe("test-home-guard: destinations and suite names", () => {
     expect(() =>
       assertReportPaths({ env: { HOME: sim }, reportDir: reports, paths: [join(reports, "cli.xml"), join(reports, "cli.log")] }),
     ).not.toThrow();
+  });
+
+  test("refuses a report dir that IS the operator home (its report, log and seal would be deleted and written there)", () => {
+    expect(() =>
+      assertReportPaths({ env: { HOME: sim }, reportDir: sim, paths: [join(sim, "cli.xml"), join(sim, "cli.log"), join(sim, "cli.xml.sha256")] }),
+    ).toThrow(`the report dir resolves to "${sim}", which is or contains the operator home "${sim}"`);
+  });
+
+  test("refuses a report dir that resolves to the operator home through a symlink or a `..`", () => {
+    const outside = mktmp("tps-guard-link-");
+    symlinkSync(sim, join(outside, "home-link"));
+    mkdirSync(join(sim, "sub"));
+    for (const dir of [join(outside, "home-link"), `${join(sim, "sub")}/..`]) {
+      expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: dir }), dir).toThrow(
+        `the report dir resolves to "${sim}", which is or contains the operator home "${sim}"`,
+      );
+    }
+  });
+
+  test("refuses a report dir that is an ancestor of the operator home (its parent, and /)", () => {
+    for (const dir of [dirname(sim), "/"]) {
+      expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: dir }), dir).toThrow(
+        `the report dir resolves to "${dir}", which is or contains the operator home "${sim}"`,
+      );
+    }
+  });
+
+  test.skipIf(!accountHome())("refuses the account's home, and its parent, as the report dir whatever HOME says", () => {
+    const account = accountHome() as string;
+    expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: account })).toThrow(
+      `the report dir resolves to "${account}", which is or contains the operator home "${account}"`,
+    );
+    expect(() => assertReportPaths({ env: { HOME: sim }, reportDir: dirname(account) })).toThrow(
+      "which is or contains the operator home",
+    );
+  });
+
+  test("still accepts a report dir below the operator home, beside it, or sharing its name as a string prefix", () => {
+    const base = mktmp("tps-guard-base-");
+    const home = join(base, "home");
+    mkdirSync(home);
+    // Below the home but outside its operator directories: where a repo checked
+    // out under $HOME keeps its default test-reports/.
+    for (const dir of [join(home, "work", "cli", "test-reports"), join(base, "reports"), `${home}-reports`, join(base, "hom")]) {
+      expect(
+        () => assertReportPaths({ env: { HOME: home }, reportDir: dir, paths: [join(dir, "cli.xml"), join(dir, "cli.log")] }),
+        dir,
+      ).not.toThrow();
+    }
   });
 
   test("a suite name is a plain file-name token", () => {
@@ -758,8 +808,106 @@ describe("end to end: the launchers give a test only the allowlisted environment
   }
 });
 
+/**
+ * A launcher run as its real lane: the monorepo launcher under suite `cli`, the
+ * plugin launcher under its fixed suite `plugin`. The report, log and seal it
+ * deletes and writes are `<suite>.xml`, `<suite>.log` and `<suite>.xml.sha256`.
+ */
+function asLane(launcher: (typeof LAUNCHERS)[number], fixture: string): { suite: string; argv: string[] } {
+  return launcher.suite === "plugin"
+    ? { suite: "plugin", argv: launcher.argv(fixture) }
+    : { suite: "cli", argv: [SUITE_LAUNCHER, "cli", fixture] };
+}
+
+/** Operator files at the names a lane's launcher deletes and writes in `dir`; returns each path with its bytes. */
+function seedReportNames(dir: string, suite: string): Map<string, Buffer> {
+  const seeded = new Map<string, Buffer>();
+  for (const name of [`${suite}.xml`, `${suite}.log`, `${suite}.xml.sha256`]) {
+    const bytes = Buffer.from(`operator file ${name}\n`);
+    writeFileSync(join(dir, name), bytes);
+    seeded.set(join(dir, name), bytes);
+  }
+  return seeded;
+}
+
 describe("end to end: the launchers refuse an operator-critical destination before creating anything", () => {
   for (const launcher of LAUNCHERS) {
+    test(
+      `${launcher.name}: a TPS_TEST_REPORT_DIR that IS the operator home is refused; the report, log and seal names already there are byte-identical afterwards`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const tmp = mktmp("tps-guard-tmp-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { suite, argv } = asLane(launcher, fixture);
+        const seeded = seedReportNames(sim, suite);
+        const { status, out } = runLauncher(
+          argv,
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: sim }),
+        );
+        // The operator's files first: each still there, byte for byte.
+        for (const [path, bytes] of seeded) {
+          expect(existsSync(path), path).toBe(true);
+          expect(readFileSync(path).toString("hex"), path).toBe(bytes.toString("hex"));
+        }
+        expect(readdirSync(sim).sort()).toEqual([...seeded.keys()].map((p) => basename(p)).sort()); // nothing added
+        expect(existsSync(marker)).toBe(false); // no test ran
+        expect(readdirSync(tmp)).toEqual([]); // no throwaway root was made
+        expect(status).not.toBe(0);
+        expect(out).toContain(`the report dir resolves to "${sim}", which is or contains the operator home "${sim}"`);
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: a TPS_TEST_REPORT_DIR above the operator home is refused; the report, log and seal names already there are byte-identical afterwards`,
+      () => {
+        const base = mktmp("tps-guard-base-");
+        const sim = join(base, "home");
+        mkdirSync(sim);
+        const tmp = mktmp("tps-guard-tmp-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { suite, argv } = asLane(launcher, fixture);
+        const seeded = seedReportNames(base, suite);
+        const { status, out } = runLauncher(
+          argv,
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: base }),
+        );
+        // The operator's files first: each still there, byte for byte.
+        for (const [path, bytes] of seeded) {
+          expect(existsSync(path), path).toBe(true);
+          expect(readFileSync(path).toString("hex"), path).toBe(bytes.toString("hex"));
+        }
+        expect(readdirSync(base).sort()).toEqual(["home", ...[...seeded.keys()].map((p) => basename(p))].sort());
+        expect(readdirSync(sim)).toEqual([]);
+        expect(existsSync(marker)).toBe(false); // no test ran
+        expect(readdirSync(tmp)).toEqual([]); // no throwaway root was made
+        expect(status).not.toBe(0);
+        expect(out).toContain(`the report dir resolves to "${base}", which is or contains the operator home "${sim}"`);
+      },
+      E2E_TIMEOUT,
+    );
+
+    test(
+      `${launcher.name}: a TPS_TEST_REPORT_DIR below the operator home, outside its operator directories, still works`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const reports = join(sim, "work", "cli", "test-reports");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { suite, argv } = asLane(launcher, fixture);
+        const { status } = runLauncher(argv, launcher.cwd(fixture), envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }));
+        expect(existsSync(marker)).toBe(true);
+        expect(junitPassed(reports, suite, "ran")).toBe(true);
+        expect(readdirSync(reports).sort()).toEqual([`${suite}.log`, `${suite}.xml`, `${suite}.xml.sha256`]);
+        expect(status).toBe(0);
+      },
+      E2E_TIMEOUT,
+    );
+
     test(
       `${launcher.name}: a TMPDIR inside ~/.tps is refused`,
       () => {
@@ -1059,4 +1207,85 @@ describe("end to end: the launchers refuse a caller-supplied --reporter-outfile"
       E2E_TIMEOUT,
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// runSuite, called directly: a refused --reporter-outfile is a catchable refusal
+// ---------------------------------------------------------------------------
+
+const OUTFILE_REFUSAL =
+  "refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)";
+
+describe("scripts/test-suite.mjs: a refused --reporter-outfile is an IsolationRefusal, not an exit", () => {
+  const runtimes: Array<[string, string | null]> = [
+    ["bun", process.execPath],
+    ["node", NODE],
+  ];
+  for (const [runtime, exe] of runtimes) {
+    test.skipIf(!exe)(
+      `under ${runtime}, a direct caller of runSuite catches the refusal (both forms) and keeps running; nothing is created`,
+      () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const tmp = mktmp("tps-guard-tmp-");
+        const reports = mktmp("tps-guard-reports-");
+        const fx = mktmp("tps-guard-fixture-");
+        const target = join(sim, ".tps", "x.xml");
+        // A caller in its own process: it imports runSuite and the refusal class
+        // by absolute path and prints what each call did, then that it went on.
+        writeFileSync(
+          join(fx, "caller.mjs"),
+          `import { runSuite } from ${q(SUITE_LAUNCHER)};
+import { IsolationRefusal } from ${q(GUARD_MODULE)};
+for (const args of [[${q(`--reporter-outfile=${target}`)}], ["--reporter-outfile", ${q(target)}]]) {
+  try {
+    runSuite({ suite: "cli", args, cwd: ${q(fx)}, env: { HOME: ${q(sim)} }, reportDir: ${q(reports)}, tempBase: ${q(tmp)} });
+    console.log("RETURNED");
+  } catch (err) {
+    console.log(err instanceof IsolationRefusal ? "CAUGHT IsolationRefusal: " + err.message : "CAUGHT other: " + err);
+  }
+}
+console.log("CONTINUED");
+`,
+        );
+        const r = spawnSync(exe as string, [join(fx, "caller.mjs")], {
+          cwd: fx,
+          env: envWith({ HOME: sim }),
+          encoding: "utf8",
+        });
+        expect(r.stdout).toBe(`CAUGHT IsolationRefusal: ${OUTFILE_REFUSAL}\nCAUGHT IsolationRefusal: ${OUTFILE_REFUSAL}\nCONTINUED\n`);
+        expect(r.status).toBe(0);
+        expect(readdirSync(tmp)).toEqual([]); // no throwaway root
+        expect(readdirSync(reports)).toEqual([]); // no report, log or seal
+        expect(existsSync(join(sim, ".tps"))).toBe(false);
+      },
+      E2E_TIMEOUT,
+    );
+  }
+
+  test(
+    "the CLI still exits 1 with the one-line refusal on stderr (both forms), and nothing is created",
+    () => {
+      const sim = mktmp("tps-guard-simhome-");
+      const tmp = mktmp("tps-guard-tmp-");
+      const reports = mktmp("tps-guard-reports-");
+      const marker = join(mktmp("tps-guard-marker-"), "ran");
+      const fixture = ranFixture(marker);
+      const target = join(sim, ".tps", "x.xml");
+      for (const form of [[`--reporter-outfile=${target}`], ["--reporter-outfile", target]]) {
+        const r = spawnSync(process.execPath, [SUITE_LAUNCHER, "cli", fixture, ...form], {
+          cwd: dirname(fixture),
+          env: envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: reports }),
+          encoding: "utf8",
+        });
+        expect(r.stderr, form.join(" ")).toBe(`cli: ${OUTFILE_REFUSAL}\n`);
+        expect(r.stdout, form.join(" ")).toBe("");
+        expect(r.status, form.join(" ")).toBe(1);
+      }
+      expect(existsSync(marker)).toBe(false);
+      expect(readdirSync(tmp)).toEqual([]);
+      expect(readdirSync(reports)).toEqual([]);
+      expect(existsSync(join(sim, ".tps"))).toBe(false);
+    },
+    E2E_TIMEOUT,
+  );
 });

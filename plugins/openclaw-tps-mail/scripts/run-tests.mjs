@@ -25,10 +25,11 @@
  * (test/preload-guard.ts) aborts a run whose HOME or TPS_MAIL_DIR is not under
  * that root, or whose root is or contains the account's home or is not one a
  * launcher made — before any test module loads. Before creating or deleting
- * anything, the launcher refuses a temp dir inside an operator home, and a
- * report directory that resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config
- * (the default test-reports/ included), and also refuses report, log and seal
- * files that are symlinks. These
+ * anything, the launcher refuses a temp dir inside an operator home, a report
+ * directory that is or contains an operator home, and a report directory that
+ * resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config (the default
+ * test-reports/ included), and also refuses report, log and seal files that
+ * are symlinks. These
  * are launch-time checks, not an OS boundary (cli#434); this launcher process
  * itself runs under the caller's environment.
  *
@@ -98,9 +99,10 @@ const tempBase = tmpdir();
 
 // cli#430: refuse BEFORE creating or deleting anything — the default report dir
 // included. The temp dir (the throwaway root is created and removed there) must
-// be outside every operator home; the report dir and this run's report, log and
-// seal (deleted now, written later) must resolve outside ~/.tps, ~/.flair,
-// ~/agents and ~/.config and must not be symlinks.
+// be outside every operator home; the report dir must not be or contain an
+// operator home; the report dir and this run's report, log and seal (deleted
+// now, written later) must resolve outside ~/.tps, ~/.flair, ~/agents and
+// ~/.config and must not be symlinks.
 try {
   assertTestDestinations({ env: process.env, tempBase, reportDir, paths: [reportXml, reportLog, reportSeal] });
 } catch (err) {

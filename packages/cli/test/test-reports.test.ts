@@ -353,7 +353,13 @@ describe("check-test-reports — the report seal (cli#414)", () => {
 // cli#430: each launcher below gets HOME=<its own throwaway dir>. Inside a lane,
 // HOME is the lane's isolated root and TMPDIR lies inside it; a launcher refuses
 // to create its throwaway root inside the HOME it runs under, so a nested
-// launcher is given a HOME of its own, as a real caller would have.
+// launcher is given a HOME of its own, as a real caller would have. That HOME is
+// a separate directory, never the report dir or one above it: a launcher also
+// refuses a report dir that is or contains the HOME it runs under.
+function throwawayHome(): string {
+  return mkdtempSync(join(tmpdir(), "cli430-home-"));
+}
+
 describe("the launchers delete their own suite's report before the suite starts", () => {
   /** A report + log + seal left behind by an earlier step, in a throwaway dir. */
   function staleReportDir(prefix: string, suite: string): string {
@@ -366,13 +372,14 @@ describe("the launchers delete their own suite's report before the suite starts"
 
   test("scripts/test-suite.mjs removes its own report, log and seal first", () => {
     const dir = staleReportDir("cli411-launcher-", "agent");
+    const home = throwawayHome();
     try {
       // `--reporter=spec` is a caller's own reporter, so this run writes no JUnit
       // report at all: if `agent.xml` is gone afterwards, the launcher deleted it.
       const res = spawnSync(
         process.execPath,
         [join(REPO, "scripts/test-suite.mjs"), "agent", "--reporter=spec", join(dir, "no-such-file.test.ts")],
-        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir }, encoding: "utf8" },
+        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: home }, encoding: "utf8" },
       );
       expect(res.error).toBeUndefined();
       expect(existsSync(join(dir, "agent.xml"))).toBe(false);
@@ -380,11 +387,13 @@ describe("the launchers delete their own suite's report before the suite starts"
       expect(readFileSync(join(dir, "agent.log"), "utf8")).not.toContain("STALE-MARKER");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
     }
   });
 
   test("the plugin launcher removes its own report, log and seal first", () => {
     const dir = staleReportDir("cli411-plugin-launcher-", "plugin");
+    const home = throwawayHome();
     try {
       const res = spawnSync(
         process.execPath,
@@ -395,7 +404,7 @@ describe("the launchers delete their own suite's report before the suite starts"
         ],
         {
           cwd: join(REPO, "plugins/openclaw-tps-mail"),
-          env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir },
+          env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: home },
           encoding: "utf8",
         },
       );
@@ -407,6 +416,7 @@ describe("the launchers delete their own suite's report before the suite starts"
       expect(readFileSync(join(dir, "plugin.log"), "utf8")).not.toContain("STALE-MARKER");
     } finally {
       rmSync(dir, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
@@ -419,13 +429,18 @@ describe("the launchers seal the report they produce (cli#414)", () => {
       join(dir, "sealed.test.ts"),
       'import { test, expect } from "bun:test";\ntest("ok", () => { expect(1).toBe(1); });\n',
     );
-    const res = spawnSync(
-      process.execPath,
-      [join(REPO, "scripts/test-suite.mjs"), "fixture", "./sealed.test.ts"],
-      { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: dir }, encoding: "utf8" },
-    );
-    expect(res.error).toBeUndefined();
-    return { dir, status: res.status };
+    const home = throwawayHome();
+    try {
+      const res = spawnSync(
+        process.execPath,
+        [join(REPO, "scripts/test-suite.mjs"), "fixture", "./sealed.test.ts"],
+        { cwd: dir, env: { ...process.env, TPS_TEST_REPORT_DIR: dir, HOME: home }, encoding: "utf8" },
+      );
+      expect(res.error).toBeUndefined();
+      return { dir, status: res.status };
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   }
 
   test("scripts/test-suite.mjs seals its report with the report's own hash and the suite name", () => {

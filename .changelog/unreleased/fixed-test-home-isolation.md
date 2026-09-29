@@ -34,8 +34,10 @@
 
   Before creating or deleting anything, the monorepo launcher refuses a suite name that
   is not a plain file-name token (`[A-Za-z0-9._-]`, no `..`), a temp dir inside
-  an operator home, and a report directory that resolves inside `~/.tps`, `~/.flair`,
-  `~/agents` or `~/.config` — the default `test-reports/` included. Report,
+  an operator home, a report directory that is or contains an operator home
+  (`TPS_TEST_REPORT_DIR=$HOME`, or `/`), and a report directory that resolves
+  inside `~/.tps`, `~/.flair`, `~/agents` or `~/.config` — the default
+  `test-reports/` included. Report,
   log and seal files that are symlinks are also refused; the seal path is checked again
   before the seal is written. Each launcher also refuses a caller-supplied `--reporter-outfile` argument, owning the report destination. The Docker `attested` service runs its targeted
   files through the launcher, with its report on the container's writable
