@@ -102,6 +102,15 @@ describe("this repository's test job", () => {
       ].join("\n"),
     );
     expect(t.steps[3].env).toEqual({});
+    // The planner maps an absent env: and an empty `env: {}` to the same {}, so
+    // the planned env alone cannot show the step declares none: read the step's
+    // own block in the workflow (up to the next step) and require no env: key.
+    const workflowText = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
+    const start = workflowText.indexOf("      - name: Unit + integration tests, HOME-isolated (cli#430)\n");
+    expect(start).toBeGreaterThan(-1);
+    const next = workflowText.indexOf("\n      - ", start + 1);
+    const block = workflowText.slice(start, next === -1 ? undefined : next);
+    expect(block).not.toMatch(/^ {8}env:/m);
     expect(t.steps[4].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("bun run test");

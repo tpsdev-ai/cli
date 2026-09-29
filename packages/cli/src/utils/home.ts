@@ -2,7 +2,7 @@
  * home.ts — the home directory, resolved when it is needed (cli#430).
  *
  * `homeDir()` returns `process.env.HOME` when it is set and not empty, and
- * otherwise `os.homedir()`, the account's home. That is the rule Node documents
+ * otherwise `os.homedir()`. That is the rule Node documents
  * for `os.homedir()` on POSIX (HOME first, then the user database). It is spelled
  * out here because under bun `os.homedir()` keeps returning the HOME the process
  * started with, even after `process.env.HOME` is changed.

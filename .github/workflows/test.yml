@@ -105,7 +105,7 @@ jobs:
         # state, not of transient writes). The control is in the lane launcher
         # (scripts/test-suite.mjs): each child's HOME points at a throwaway root
         # with TMPDIR inside it, the child gets only an allowlist of named,
-        # path-free inherited variables (every other one is dropped), and a
+        # path-free inherited variables except PATH (every other one is dropped), and a
         # preload aborts a run no launcher set up. These are launch-time checks,
         # not an OS boundary; the ~/.tps metadata snapshot is a diagnostic.
         run: |
