@@ -59,4 +59,13 @@
   A CI step runs the suite with `HOME` pointed at an empty directory and asserts
   that directory still has no `.tps` afterwards.
 
+  `tps auth` now builds its `~/.tps/auth` path each time it is used, instead of
+  once when the module loads. Every home-relative path in `tps auth` goes
+  through one helper, `homeDir()`: `HOME` when it is set and not empty,
+  otherwise `os.homedir()`, read on every call. Nothing in the CLI changes HOME
+  while it runs, so a CLI run uses the same paths as before. In the test suite,
+  two tests that loaded `tps auth` within the same millisecond shared one copy of
+  it, and the second test's `revoke` looked in the first test's home, an
+  intermittent `auth.test.ts` failure.
+
   (Refs #430)
