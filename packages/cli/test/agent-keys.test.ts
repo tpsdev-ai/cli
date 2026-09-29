@@ -196,7 +196,7 @@ describe("toEd25519Seed is strict (cli#429)", () => {
   test("refuses other algorithms by name (X25519, EC P-256, RSA) in PEM and DER", () => {
     const x = generateKeyPairSync("x25519").privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
     const ec = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
-    const rsa = generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
+    const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ format: "der", type: "pkcs8" }) as Buffer;
     for (const der of [x, ec, rsa]) {
       expectRejected(der, [der.toString("hex").slice(0, 40)], /not an Ed25519 key/);
       expectRejected(Buffer.from(pemOf(der)), [der.toString("base64").slice(0, 40)], /not an Ed25519 key/);
