@@ -32,12 +32,12 @@
   that ignores HOME, can still reach the real home; the OS-enforced boundary is
   tracked in #434.
 
-  Before creating or deleting anything, each launcher refuses a suite name that
+  Before creating or deleting anything, the monorepo launcher refuses a suite name that
   is not a plain file-name token (`[A-Za-z0-9._-]`, no `..`), a temp dir inside
-  an operator home, and a report dir or report/log/seal path — the default
-  `test-reports/` included — that resolves inside `~/.tps`, `~/.flair`,
-  `~/agents` or `~/.config` or is a symlink; the seal path is checked again
-  before the seal is written. The Docker `attested` service runs its targeted
+  an operator home, and a report directory that resolves inside `~/.tps`, `~/.flair`,
+  `~/agents` or `~/.config` — the default `test-reports/` included. Report,
+  log and seal files that are symlinks are also refused; the seal path is checked again
+  before the seal is written. Each launcher also refuses a caller-supplied `--reporter-outfile` argument, owning the report destination. The Docker `attested` service runs its targeted
   files through the launcher, with its report on the container's writable
   tmpfs. The `openclaw-tps-mail` plugin's launcher (which runs only inside this
   monorepo) uses the same shared helper for its environment, destination checks

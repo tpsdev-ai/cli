@@ -26,8 +26,9 @@
  * that root, or whose root is or contains the account's home or is not one a
  * launcher made — before any test module loads. Before creating or deleting
  * anything, the launcher refuses a temp dir inside an operator home, and a
- * report dir or report/log/seal path (the default test-reports/ included) that
- * resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config or is a symlink. These
+ * report directory that resolves inside ~/.tps, ~/.flair, ~/agents or ~/.config
+ * (the default test-reports/ included), and also refuses report, log and seal
+ * files that are symlinks. These
  * are launch-time checks, not an OS boundary (cli#434); this launcher process
  * itself runs under the caller's environment.
  *
@@ -153,6 +154,18 @@ console.log(`openclaw-tps-mail tests: isolated root ${root}`);
 
 const passthrough = process.argv.slice(2);
 const args = ["test", ...(passthrough.length ? passthrough : ["test/"])];
+// cli#430: refuse --reporter-outfile in caller args - the
+// launcher owns the report destination (accepts --reporter=<name>).
+for (const arg of passthrough) {
+  if (arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile=')) {
+    console.error(
+      `openclaw-tps-mail tests: refusing --reporter-outfile: the launcher owns
+         the report destination (set TPS_TEST_REPORT_DIR instead)`
+     );
+    process.exit(1);
+  }
+}
+
 if (!args.some((arg) => arg.startsWith("--reporter"))) {
   args.push("--reporter=junit", `--reporter-outfile=${reportXml}`);
 }

@@ -189,6 +189,21 @@ export function runSuite({
   const seal = sealPath(suite, reportDir);
   assertTestDestinations({ env, tempBase, reportDir, paths: [xml, log, seal] });
 
+  // cli#430: refuse --reporter-outfile in caller args - the launcher
+  // owns the report destination. The check runs before mkdir/rm so
+  // nothing touches the filesystem if the caller hands us one
+  // (accepts --reporter=<name>).
+  for (const arg of args) {
+    if (arg === '--reporter-outfile' || arg.startsWith('--reporter-outfile=')) {
+      process.stderr.write(
+         `${suite}: refusing --reporter-outfile: the launcher owns the
+          report destination (set TPS_TEST_REPORT_DIR instead)\n`,
+       );
+      process.exit(1);
+      return;
+       }
+     }
+
   // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher
   // runs under, taken before this launcher writes anything. A DIAGNOSTIC: the
   // lane fails on a recorded metadata difference at the end (path, size, mtime,
@@ -212,7 +227,7 @@ export function runSuite({
   // operator HOME. Create a throwaway root and give the child an ALLOWLISTED
   // environment: HOME and TPS_TEST_ROOT at the root, TMPDIR and bun's cache
   // inside it, and only the named, path-free inherited variables — so every
-  // path the code derives falls back to the root. Pass the isolation PRELOAD so
+  // every environment-derived path falls back to the root. Pass the isolation PRELOAD so
   // a child that did not come up under a launcher-made root aborts before any
   // test module loads.
   const { root: isoRoot, token } = createIsolatedRoot(tempBase);
@@ -308,12 +323,12 @@ async function main() {
   } catch (err) {
     if (err instanceof IsolationRefusal) {
       process.stderr.write(`${suite}: ${err.message}\n`);
-      process.exitCode = 1;
+      process.exit(1);
       return;
     }
     const what = err instanceof SealError ? "could not seal the report" : "could not launch bun test";
     process.stderr.write(`${suite}: ${what}: ${err.message}\n`);
-    process.exitCode = 1;
+    process.exit(1);
   }
 }
 

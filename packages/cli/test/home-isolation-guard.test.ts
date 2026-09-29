@@ -969,3 +969,74 @@ describe("end to end: the ~/.tps diagnostic fails the lane", () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// End to end: the launchers refuse a caller-supplied --reporter-outfile
+// ---------------------------------------------------------------------------
+
+describe("end to end: the launchers refuse a caller-supplied --reporter-outfile", () => {
+  for (const launcher of LAUNCHERS) {
+    test(
+       `${launcher.name}: --reporter-outfile=<sim home> is refused (equals form)`,
+       () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const reports = mktmp("tps-guard-reports-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const reportPath = join(sim, ".tps", "x.xml");
+        const { status, out } = runLauncher(
+           [...launcher.argv(fixture), `--reporter-outfile=${reportPath}`],
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+         );
+        expect(existsSync(marker)).toBe(false);
+        expect(readdirSync(mkdirSync(join(sim, ".tps"), { recursive: true, mode: 0o700 })).length).toBe(0);
+        expect(status).not.toBe(0);
+        expect(out).toContain("--reporter-outfile");
+        expect(out).toContain("the launcher owns");
+       },
+      E2E_TIMEOUT,
+     );
+
+    test(
+       `${launcher.name}: --reporter-outfile <sim home> is refused (space form)`,
+       () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const reports = mktmp("tps-guard-reports-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const reportPath = join(sim, "agents", "x.xml");
+        const { status, out } = runLauncher(
+           [...launcher.argv(fixture), "--reporter-outfile", reportPath],
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+         );
+        expect(existsSync(marker)).toBe(false);
+        expect(status).not.toBe(0);
+        expect(out).toContain("--reporter-outfile");
+        expect(out).toContain("the launcher owns");
+       },
+      E2E_TIMEOUT,
+     );
+
+    test(
+       `${launcher.name}: --reporter-outfile to an outside path is still refused`,
+       () => {
+        const sim = mktmp("tps-guard-simhome-");
+        const reports = mktmp("tps-guard-reports-");
+        const marker = join(mktmp("tps-guard-marker-"), "ran");
+        const fixture = ranFixture(marker);
+        const { status, out } = runLauncher(
+           [...launcher.argv(fixture), "--reporter-outfile=/some/path.xml"],
+          launcher.cwd(fixture),
+          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
+         );
+        expect(existsSync(marker)).toBe(false);
+        expect(status).not.toBe(0);
+        expect(out).toContain("--reporter-outfile");
+        expect(out).toContain("the launcher owns");
+       },
+      E2E_TIMEOUT,
+     );
+   }
+});
