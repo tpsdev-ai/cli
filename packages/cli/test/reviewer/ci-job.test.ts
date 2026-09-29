@@ -18,6 +18,17 @@ import {
   SKIPPED_ACTIONS,
 } from "../../../../scripts/reviewer/ci-job.mjs";
 import { RESERVED_ENV_KEYS } from "../../../../scripts/reviewer/reviewer-launch.mjs";
+import yaml from "js-yaml";
+
+const SUITE_STEP = "Unit + integration tests, HOME-isolated (cli#430)";
+
+/** Whether this repository's HOME-isolated suite step declares an env key, read with the planner's YAML schema. */
+function suiteStepDeclaresEnv(workflowText: string): boolean {
+  const wf = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA }) as { jobs: { test: { steps: Array<Record<string, unknown>> } } };
+  const step = wf.jobs.test.steps.find((s) => s.name === SUITE_STEP);
+  if (!step) throw new Error(`no step named ${SUITE_STEP}`);
+  return Object.hasOwn(step, "env");
+}
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..", "..", "..", "..");
@@ -103,18 +114,23 @@ describe("this repository's test job", () => {
     );
     expect(t.steps[3].env).toEqual({});
     // The planner maps an absent env: and an empty `env: {}` to the same {}, so
-    // the planned env alone cannot show the step declares none: read the step's
-    // own block in the workflow (up to the next step) and require no env: key.
-    const workflowText = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
-    const start = workflowText.indexOf("      - name: Unit + integration tests, HOME-isolated (cli#430)\n");
-    expect(start).toBeGreaterThan(-1);
-    const next = workflowText.indexOf("\n      - ", start + 1);
-    const block = workflowText.slice(start, next === -1 ? undefined : next);
-    expect(block).not.toMatch(/^ {8}env:/m);
+    // the planned env alone cannot show the step declares none: parse the
+    // workflow the way the planner does and require no env key on the step.
+    expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(false);
     expect(t.steps[4].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("npm ci --ignore-scripts");
     expect(t.steps[5].script).toContain("bun run test");
     expect(t.steps[6].script).toBe("node scripts/check-test-reports.mjs");
+  });
+
+  test("the no-env check on the HOME-isolated step sees every YAML spelling of an env key", () => {
+    const base = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
+    const at = "        run: |\n          iso_home=";
+    expect(base.split(at).length).toBe(2);
+    expect(suiteStepDeclaresEnv(base)).toBe(false);
+    for (const spelling of ["env: {}", '"env": {}', "env : {}", "'env': {}", "env: {FOO: bar}"]) {
+      expect(suiteStepDeclaresEnv(base.replace(at, `        ${spelling}\n${at}`))).toBe(true);
+    }
   });
 
   test("the setup actions are skipped by name at their reviewed tags, their pins kept, and sfw is shimmed", () => {
