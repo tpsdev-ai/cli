@@ -975,78 +975,88 @@ describe("end to end: the ~/.tps diagnostic fails the lane", () => {
 // ---------------------------------------------------------------------------
 
 describe("end to end: the launchers refuse a caller-supplied --reporter-outfile", () => {
+  // Each case gives the launcher a dedicated, empty TMPDIR. The launcher makes its
+  // throwaway root under its temp dir (os.tmpdir(), which reads TMPDIR), so that
+  // directory still being empty afterwards shows no root was created: a listing of
+  // the file system, not the launcher's console output.
   for (const launcher of LAUNCHERS) {
     test(
-       `${launcher.name}: --reporter-outfile=<sim home> is refused (equals form)`,
-       () => {
+      `${launcher.name}: --reporter-outfile=<sim home> is refused (equals form)`,
+      () => {
         const sim = mktmp("tps-guard-simhome-");
+        const tmp = mktmp("tps-guard-tmp-");
         const reports = mktmp("tps-guard-reports-");
         const marker = join(mktmp("tps-guard-marker-"), "ran");
         const fixture = ranFixture(marker);
         const reportPath = join(sim, ".tps", "x.xml");
         const { status, out } = runLauncher(
-           [...launcher.argv(fixture), `--reporter-outfile=${reportPath}`],
+          [...launcher.argv(fixture), `--reporter-outfile=${reportPath}`],
           launcher.cwd(fixture),
-          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
-         );
-        expect(existsSync(marker)).toBe(false);
+          envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(existsSync(marker)).toBe(false); // no test ran
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(readdirSync(tmp)).toEqual([]);
+        expect(readdirSync(reports)).toEqual([]);
         expect(existsSync(join(sim, ".tps"))).toBe(false);
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
-        // Refused before the launcher created its throwaway root or any report file.
         expect(out).not.toContain("isolated root");
-        expect(readdirSync(reports)).toEqual([]);
-       },
+      },
       E2E_TIMEOUT,
-     );
+    );
 
     test(
-       `${launcher.name}: --reporter-outfile <sim home> is refused (space form)`,
-       () => {
+      `${launcher.name}: --reporter-outfile <sim home> is refused (space form)`,
+      () => {
         const sim = mktmp("tps-guard-simhome-");
+        const tmp = mktmp("tps-guard-tmp-");
         const reports = mktmp("tps-guard-reports-");
         const marker = join(mktmp("tps-guard-marker-"), "ran");
         const fixture = ranFixture(marker);
         const reportPath = join(sim, "agents", "x.xml");
         const { status, out } = runLauncher(
-           [...launcher.argv(fixture), "--reporter-outfile", reportPath],
+          [...launcher.argv(fixture), "--reporter-outfile", reportPath],
           launcher.cwd(fixture),
-          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
-         );
+          envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(existsSync(marker)).toBe(false); // no test ran
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(readdirSync(tmp)).toEqual([]);
+        expect(readdirSync(reports)).toEqual([]);
         expect(existsSync(join(sim, "agents"))).toBe(false);
-        expect(existsSync(marker)).toBe(false);
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
-        // Refused before the launcher created its throwaway root or any report file.
         expect(out).not.toContain("isolated root");
-        expect(readdirSync(reports)).toEqual([]);
-       },
+      },
       E2E_TIMEOUT,
-     );
+    );
 
     test(
-       `${launcher.name}: --reporter-outfile to an outside path is still refused`,
-       () => {
+      `${launcher.name}: --reporter-outfile to an outside path is still refused`,
+      () => {
         const sim = mktmp("tps-guard-simhome-");
+        const tmp = mktmp("tps-guard-tmp-");
         const reports = mktmp("tps-guard-reports-");
         const marker = join(mktmp("tps-guard-marker-"), "ran");
         const fixture = ranFixture(marker);
         const { status, out } = runLauncher(
-           [...launcher.argv(fixture), "--reporter-outfile=/some/path.xml"],
+          [...launcher.argv(fixture), "--reporter-outfile=/some/path.xml"],
           launcher.cwd(fixture),
-          envWith({ HOME: sim, TPS_TEST_REPORT_DIR: reports }),
-         );
-        expect(existsSync(marker)).toBe(false);
+          envWith({ HOME: sim, TMPDIR: tmp, TPS_TEST_REPORT_DIR: reports }),
+        );
+        expect(existsSync(marker)).toBe(false); // no test ran
+        // Refused before the launcher created its throwaway root or any report file.
+        expect(readdirSync(tmp)).toEqual([]);
+        expect(readdirSync(reports)).toEqual([]);
         expect(status).not.toBe(0);
         expect(out).toContain("--reporter-outfile");
         expect(out).toContain("the launcher owns");
-        // Refused before the launcher created its throwaway root or any report file.
         expect(out).not.toContain("isolated root");
-        expect(readdirSync(reports)).toEqual([]);
-       },
+      },
       E2E_TIMEOUT,
-     );
-   }
+    );
+  }
 });

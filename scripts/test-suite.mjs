@@ -73,8 +73,12 @@
  *   node scripts/test-suite.mjs <suite> [bun test args…]
  *
  * The suite name is the report base name; the args are passed to `bun test`
- * unchanged (e.g. `root-test ./test`). Anything already naming a reporter is
- * left alone, so a caller can choose its own path.
+ * unchanged (e.g. `root-test ./test`). The launcher owns the report
+ * destination: a caller-supplied `--reporter-outfile`, in either the
+ * `--reporter-outfile=<path>` or the `--reporter-outfile <path>` form, is
+ * refused before anything is created or deleted (TPS_TEST_REPORT_DIR moves the
+ * reports). A caller's `--reporter=<name>` is passed on, and the launcher then
+ * adds none of its own reporter flags.
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -223,10 +227,9 @@ export function runSuite({
   // real ~/.tps (identity, credentials, auth, agents, run, mail, outbox) from the
   // operator HOME. Create a throwaway root and give the child an ALLOWLISTED
   // environment: HOME and TPS_TEST_ROOT at the root, TMPDIR and bun's cache
-  // inside it, and only the named, path-free inherited variables — so every
-  // every environment-derived path falls back to the root. Pass the isolation PRELOAD so
-  // a child that did not come up under a launcher-made root aborts before any
-  // test module loads.
+  // inside it, and only the named inherited variables, each path-free except
+  // PATH. Pass the isolation PRELOAD so a child that did not come up under a
+  // launcher-made root aborts before any test module loads.
   const { root: isoRoot, token } = createIsolatedRoot(tempBase);
   mkdirSync(join(isoRoot, ".tps", "mail"), { recursive: true });
   mkdirSync(join(isoRoot, "keys"), { recursive: true });

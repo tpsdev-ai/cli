@@ -43,11 +43,13 @@
  * under TPS_TEST_REPORT_DIR when set. It DELETES its own report and log BEFORE
  * launching, so a file left by an earlier step or run cannot stand in for this
  * run's; and the guard reads the XML only, so a test that prints a path-shaped
- * line cannot put a file into the executed set. The reporter flags are set here
- * (a caller's own --reporter argument is left alone). This launcher runs only
- * inside the monorepo — the plugin's tests import packages/cli/dist, and it
- * imports the shared HOME guard from scripts/test-home-guard.mjs; scripts/ is
- * not part of the published plugin package.
+ * line cannot put a file into the executed set. The reporter flags are set here:
+ * a caller's `--reporter=<name>` is passed on (the launcher then adds none of
+ * its own), and a caller-supplied `--reporter-outfile`, in either the `=` or the
+ * space form, is refused before anything is created or deleted. This launcher
+ * runs only inside the monorepo — the plugin's tests import packages/cli/dist,
+ * and it imports the shared HOME guard from scripts/test-home-guard.mjs;
+ * scripts/ is not part of the published plugin package.
  *
  * cli#414: once bun exits, this launcher SEALS the report it produced —
  * test-reports/plugin.xml.sha256, holding the report's SHA-256 and the suite
