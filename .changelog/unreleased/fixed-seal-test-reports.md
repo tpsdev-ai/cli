@@ -1,10 +1,12 @@
-- **A suite's JUnit report is sealed the moment the suite ends, so a report replaced by a later step fails the build (cli#414).**
+- **A suite's JUnit report is checked against a checksum saved when the suite ends, to detect accidental changes after completion (cli#414).**
 
-  Every launcher now writes `test-reports/<suite>.xml.sha256` when its suite
-  exits — the SHA-256 of the report's bytes and the suite's own name — and reads
-  it back once to confirm the write; the coverage guard verifies each required
-  suite's seal before it uses that suite's report, so a report changed after
-  the suite ended, a report with no seal, or a seal naming another suite fails
-  the build, naming the suite and which condition failed.
+  Every launcher writes `test-reports/<suite>.xml.sha256` when its suite exits
+  — the SHA-256 of the report's bytes and the suite's own name — and reads it
+  back once to confirm the write. The coverage guard checks each report against
+  its suite's saved checksum to detect accidental changes after completion; the
+  checksum is a consistency check within the job's shared filesystem. A report
+  changed after its suite ended, a report with no checksum file, or a checksum
+  file naming another suite fails the build, naming the suite and which
+  condition failed.
 
   (Refs #414)

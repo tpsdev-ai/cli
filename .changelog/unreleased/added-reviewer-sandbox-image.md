@@ -1,20 +1,23 @@
-- **A checksum-pinned reviewer sandbox image, a trusted runtime table and a launcher that builds a PR the way its CI job would, as advisory evidence for the reviewer, without any credential or host access reachable from the review (Refs #425).**
+- **A reviewer sandbox image with a digest-pinned base and checksum-verified runtimes, a trusted runtime table and a launcher that builds a PR the way its CI job would, as advisory evidence for the reviewer; the image bundles no credentials, and isolation from the host depends on the deployed sandbox configuration (Refs #425).**
 
   The reviewer environment now has its own image and launch path, defined in
   this repository. Its verdict, `review-build-ok`, is advisory evidence for the
-  reviewer, not a merge gate: CI remains the gate on every PR. The boundary it
-  holds is that no credential and no host access are reachable from the review;
-  how well it predicts CI is best effort, with its known limits documented in
-  `docker/reviewer/README.md`.
+  reviewer, not a merge gate: CI remains the gate on every PR. The image
+  bundles no credentials, and the launcher restricts its child environment and
+  Git configuration. Isolation from the host depends on the deployed sandbox
+  configuration. How well the build predicts CI is best effort, with its known
+  limits documented in `docker/reviewer/README.md`.
 
-  **The image** (`docker/reviewer/Dockerfile`, linux/amd64) is built `FROM`
-  debian:bookworm-slim pinned by digest — OpenClaw publishes no digest-pinnable
-  sandbox base; its documented sandbox build is a local `FROM
-  debian:bookworm-slim`, and this image carries the same package set (python3 is
-  what OpenClaw's sandbox write/edit helpers run) — plus `git`, a `gh` with no
-  credential of its own, Bun and Node, each at an exact version verified against
-  a checksum from the trusted table. It has no entrypoint and its CMD is `sleep
-  infinity`, matching how OpenClaw starts sandboxes (read-only root, tmpfs on
+  **The image** (`docker/reviewer/Dockerfile`, linux/amd64) uses a
+  digest-pinned Debian base (`debian:bookworm-slim`) and checksum-verified Node,
+  Bun and `gh` releases, each at the exact version and checksum the trusted
+  table gives; `gh` carries no credential of its own. Git and the other system
+  packages are installed through Debian's package manager: the package set of
+  OpenClaw's documented sandbox build, which uses the floating
+  `debian:bookworm-slim` tag (python3 is what OpenClaw's sandbox write/edit
+  helpers run), plus the download and unpack tools and procps. It has no
+  entrypoint and its CMD is `sleep infinity`, matching how OpenClaw starts
+  sandboxes (read-only root, tmpfs on
   `/tmp`, `/var/tmp`, `/run`). Its default `HOME`, `USERPROFILE`, `TMPDIR` and
   Bun/npm caches point under `/tmp/review`, a tmpfs discarded with the sandbox.
   It carries no credentials and no configured credential helpers.
@@ -55,7 +58,8 @@
   pipefail` after re-checking the step's effective environment and that its
   resolved working directory stays inside the worktree, enforces
   `timeout-minutes` (the job's, default 360, and each planned `run:` step's),
-  and kills what a job left running when it ends. After every job it
+  and sends `SIGKILL` to the tracked step process groups when the job ends.
+  After every job it
   refuses symlinked lockfiles and symlinked directories. It reports
   `review-build-ok` only when every job in the closure ran, every step exited 0,
   and no lockfile in the worktree (outside `node_modules/` and `.git/`)
