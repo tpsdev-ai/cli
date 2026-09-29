@@ -1,0 +1,4 @@
+#!/bin/sh
+# The review build (cli#425 A). OpenClaw starts the sandbox as
+# `<image> sleep infinity`; the reviewer runs this command explicitly.
+exec /usr/local/bin/node /opt/reviewer/lib/reviewer-launch.mjs "$@"

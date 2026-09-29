@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stand-in for Socket Firewall's `sfw` wrapper (cli#425 A). The launcher puts
+# this on PATH only for a CI job that uses socketdev/action. The review sandbox
+# does NOT reproduce Socket's download firewall: it runs the wrapped command
+# unchanged, and the launcher's verdict names socketdev/action as skipped.
+exec "$@"
