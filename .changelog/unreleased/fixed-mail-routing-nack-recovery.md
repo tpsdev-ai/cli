@@ -13,9 +13,8 @@
   hold window is retained regardless of retry completion order. Each retry is
   bounded by one overall timeout spanning the connection and the ACK wait; on
   expiry the transport is closed and `nack-retry-timeout` is logged by name.
-  Delivery is at-least-once, not exactly-once: a crash after the hand-off but
-  before `nackSentAt` is recorded retries it, so the sender may see the nack
-  twice.
+  A retry may duplicate a nack. Delivery is not guaranteed: debt still owed
+  after the configured hold may be abandoned.
 
   **The hold is bounded by age.** While a record owes its nack and is inside
   the hold window, the retention sweep keeps it and reports how many it held.

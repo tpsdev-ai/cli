@@ -1,12 +1,10 @@
-- **`bun run test` runs every lane under a throwaway HOME with an allowlisted environment, and fails a lane that changes the caller's `~/.tps` metadata (cli#430).**
+- **`bun run test` runs every lane under a throwaway HOME with an allowlisted environment, and fails a lane on a detected change to the caller's `~/.tps` metadata (cli#430).**
 
   The monorepo and openclaw-tps-mail test launchers use isolated homes,
   restrict inherited environment variables, validate write destinations and
   fail a lane on a detected change to the caller's `~/.tps` metadata. The
   openclaw-github-review launcher gives its suite an isolated HOME, and its
-  preload aborts a run outside that root; the environment allowlist,
-  destination checks, `--reporter-outfile` refusal and `~/.tps` snapshot below
-  do not apply to it.
+  preload aborts a run outside that root.
 
   The control is HOME redirection plus an allowlisted environment, applied at
   launch time in one shared place (`scripts/test-home-guard.mjs`), because under
@@ -43,19 +41,9 @@
   helper for its environment, destination checks and snapshot, and its preload
   applies the same root check.
 
-  The monorepo and openclaw-tps-mail launchers also take a metadata snapshot of
-  the `~/.tps` under the HOME they run under — path, size, mtime, ctime and
-  inode, never contents — before and after the lane, and fail the lane on a
-  recorded metadata difference at the end. It is a diagnostic, not a boundary:
-  an entry it cannot stat or list, or a change that leaves every recorded
-  signature as it was, can be missed, and it does not see reads, writes outside
-  `~/.tps`, or a transient write gone by the end (a `~/.tps` created and removed
-  again within the run).
-
-  The launcher process itself runs under the caller's environment: only its
-  child gets the allowlisted one. A launcher started under bun (rather than
-  node, which `bun run test` uses) may write bun's own transpiler cache under
-  the caller's `XDG_CACHE_HOME` before any of this runs.
+  The monorepo and mail-plugin launchers compare the caller's `.tps` metadata
+  before and after a suite as a diagnostic, and fail the lane on a detected
+  change; OS isolation is tracked in #434.
 
   A CI step runs the suite with `HOME` pointed at an empty directory and asserts
   that directory still has no `.tps` afterwards.
