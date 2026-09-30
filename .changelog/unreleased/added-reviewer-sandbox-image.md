@@ -2,7 +2,8 @@
 
   The reviewer environment now has its own image and launch path, defined in
   this repository. Its verdict, `review-build-ok`, is advisory evidence for the
-  reviewer, not a merge gate: CI remains the gate on every PR. The image
+  reviewer, not a merge gate; the CI workflow runs for pull requests that target
+  `main`. The image
   bundles no credentials, and the launcher restricts its child environment and
   Git configuration. Isolation from the host depends on the deployed sandbox
   configuration. How well the build predicts CI is best effort, with its known

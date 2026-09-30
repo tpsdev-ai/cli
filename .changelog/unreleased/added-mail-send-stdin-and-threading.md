@@ -23,9 +23,9 @@
 
   **`--message-id <id>`: a re-send is the same message.** The envelope is
   signed with that `messageId` instead of a fresh UUID, so a sender that
-  re-sends after an unknown outcome produces the same message. If the
-  recipient accepted the first attempt, its replay gate discards the re-send;
-  otherwise the re-send is the first delivery.
+  re-sends after an unknown outcome produces the same message. A recipient
+  that still finds that id recorded as consumed dead-letters the re-send as a
+  replay; otherwise the copy may be delivered.
 
   **Keys: one search path, strict formats, no silent choice.** A signer
   resolving a key by agent id reads `~/.flair/keys/<id>.key` and
@@ -42,8 +42,8 @@
   out on stdin with `--reply-to` the inbound's verified envelope id, and is
   journaled first with the envelope `messageId` it is signed with. A send whose
   outcome is unknown (a non-zero exit or a timeout) is re-sent later as the
-  same message: a recipient that accepted the first attempt dead-letters it as
-  a replay, and otherwise it is the first delivery. Recovery retries
+  same message: a recipient that still finds that id recorded as consumed
+  dead-letters it as a replay, and otherwise the copy may be delivered. Recovery retries
   acknowledgement without resending when the journal records `sent`; if that
   write did not persist, it may resend using the same envelope message ID. If
   the watcher stops before journaling a reply, the unacknowledged inbound can be
