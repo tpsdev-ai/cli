@@ -5,15 +5,18 @@
   The root `test` script runs the root `./test` directory through the suite
   runner (`node scripts/test-suite.mjs root-test ./test`), so
   `test/security-properties.test.ts`, and anything added beside it, runs in the
-  `Unit & Integration Tests` job on every PR targeting `main`.
+  `Unit & Integration Tests` job for PRs targeting `main`. That job runs after a
+  successful build, the root suite runs after the preceding suites succeed, and
+  the report guard fails when a required suite leaves no report.
 
   The workspace and root suites use `scripts/test-suite.mjs`; the mail and
   GitHub-review plugins use their own launchers. All produce the required
   reports and logs: bun's JUnit report at a known path per suite
   (`test-reports/<suite>.xml`, the record the guard reads) and the suite's
   console output beside it (`test-reports/<suite>.log`, the CI record). Each
-  launcher deletes its own suite's report and log BEFORE that suite starts, so a
-  file left by an earlier step or run cannot stand in for this one. The guard,
+  launcher that starts deletes its own suite's report and log before that suite
+  runs, so a file left by an earlier step or run is not read as that suite's
+  result. The guard,
   `scripts/check-test-reports.mjs`, then reads every required report, collects
   the test files those reports show executed, discovers the test files on disk
   (every form bun discovers), and fails naming each discovered file that no
