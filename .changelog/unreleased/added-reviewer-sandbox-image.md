@@ -1,23 +1,27 @@
-- **A checksum-pinned reviewer sandbox image, a trusted runtime table and a launcher that builds a PR the way its CI job would, as advisory evidence for the reviewer, without any credential or host access reachable from the review (Refs #425).**
+- **A reviewer sandbox image with a digest-pinned base and checksum-verified runtimes, a trusted runtime table and a launcher that builds a PR the way its CI job would, as advisory evidence for the reviewer; the image bundles no credentials, and isolation from the host depends on the deployed sandbox configuration (Refs #425).**
 
   The reviewer environment now has its own image and launch path, defined in
   this repository. Its verdict, `review-build-ok`, is advisory evidence for the
-  reviewer, not a merge gate: CI remains the gate on every PR. The boundary it
-  holds is that no credential and no host access are reachable from the review;
-  how well it predicts CI is best effort, with its known limits documented in
-  `docker/reviewer/README.md`.
+  reviewer, not a merge gate; the CI workflow runs for pull requests that target
+  `main`. The image
+  bundles no credentials, and the launcher restricts its child environment and
+  Git configuration. Isolation from the host depends on the deployed sandbox
+  configuration. How well the build predicts CI is best effort, with its known
+  limits documented in `docker/reviewer/README.md`.
 
-  **The image** (`docker/reviewer/Dockerfile`, linux/amd64) is built `FROM`
-  debian:bookworm-slim pinned by digest — OpenClaw publishes no digest-pinnable
-  sandbox base; its documented sandbox build is a local `FROM
-  debian:bookworm-slim`, and this image carries the same package set (python3 is
-  what OpenClaw's sandbox write/edit helpers run) — plus `git`, a `gh` with no
-  credential of its own, Bun and Node, each at an exact version verified against
-  a checksum from the trusted table. It has no entrypoint and its CMD is `sleep
-  infinity`, matching how OpenClaw starts sandboxes (read-only root, tmpfs on
-  `/tmp`, `/var/tmp`, `/run`). Its default `HOME`, `USERPROFILE`, `TMPDIR` and
-  Bun/npm caches point under `/tmp/review`, a tmpfs discarded with the sandbox.
-  It carries no credentials and no configured credential helpers.
+  **The image** (`docker/reviewer/Dockerfile`, linux/amd64) uses a
+  digest-pinned Debian base (`debian:bookworm-slim`) and checksum-verified Node,
+  Bun and `gh` releases, each at the exact version and checksum the trusted
+  table gives; `gh` carries no credential of its own. Git and the other system
+  packages are installed through Debian's package manager: the package set of
+  OpenClaw's documented sandbox build, which uses the floating
+  `debian:bookworm-slim` tag (python3 is what OpenClaw's sandbox write/edit
+  helpers run), plus the download and unpack tools and procps. It has no
+  entrypoint and its CMD is `sleep infinity`, matching how OpenClaw starts
+  sandboxes. Its default `HOME`, `USERPROFILE`, `TMPDIR` and Bun/npm caches
+  point under `/tmp/review`, which is discarded with the sandbox when the
+  deployed sandbox mounts `/tmp` as a tmpfs, as OpenClaw's sandbox creation
+  does. It carries no credentials and no configured credential helpers.
 
   **The trusted table** (`docker/reviewer/runtime-matrix.json`) is maintained
   here and installed on the host. The reviewed checkout can neither extend it
@@ -30,9 +34,7 @@
   reads the fixed table and the image's baked identity; takes the workflow, job
   and base branch only from the environment the HOST gave the sandbox at
   creation (`REVIEWER_CI_WORKFLOW`, `REVIEWER_CI_JOB`, `REVIEWER_CI_BASE`),
-  refusing a caller that passes different values (that integrity holds only if
-  the host denies same-user process-memory writes, not yet verified:
-  tpsdev-ai/cli#436); refuses symlinked lockfiles
+  refusing a caller that passes different values; refuses symlinked lockfiles
   and symlinked directories in the worktree; plans the job and the jobs it
   `needs`; resolves the reviewed commit's declarations (`packageManager`,
   `engines`, `.nvmrc`, `.node-version`, `.bun-version`, `.tool-versions`, each
@@ -46,20 +48,16 @@
   refuses a worktree whose effective git configuration leaves a documented safe
   baseline (no `core.fsmonitor`, `core.hooksPath`, `core.pager`, `protocol.*`,
   `url.*.insteadOf`, credential helpers, auth headers, ...) or whose repository
-  holds hooks, and refuses unless the worktree passes a clean-clone check (HEAD
-  and remote URLs/refspecs unchanged since the build started, no
-  assume-unchanged or skip-worktree index bits, `git status` clean with replace
-  objects ignored, history shaped as `fetch-depth` asks — not a byte comparison
-  with a host-pinned commit; per-job isolation is tpsdev-ai/cli#435). It runs
-  every `run:` step as one script under `/bin/bash --noprofile --norc -eo
+  holds hooks, and refuses unless the worktree passes a clean-clone check. It
+  runs every `run:` step as one script under `/bin/bash --noprofile --norc -eo
   pipefail` after re-checking the step's effective environment and that its
   resolved working directory stays inside the worktree, enforces
   `timeout-minutes` (the job's, default 360, and each planned `run:` step's),
-  and kills what a job left running when it ends. After every job it
-  refuses symlinked lockfiles and symlinked directories. It reports
-  `review-build-ok` only when every job in the closure ran, every step exited 0,
-  and no lockfile in the worktree (outside `node_modules/` and `.git/`)
-  changed, appeared or disappeared.
+  and sends `SIGKILL` to the tracked step process groups when the job ends.
+  After every job it refuses symlinked lockfiles and symlinked directories. It
+  reports `review-build-ok` only when every job in the closure ran, every step
+  exited 0, and no lockfile in the worktree (outside `node_modules/` and
+  `.git/`) changed, appeared or disappeared.
 
   **The planner** (`scripts/reviewer/ci-job.mjs`) bounds the workflow (bytes,
   YAML nodes counting every alias use, depth) before trusting it, requires
@@ -84,13 +82,9 @@
   out-of-matrix refusal names the missing image (e.g. `missing image: node >=25
   with bun 1.3.10`).
 
-  The "no credential" statements cover the image, the environments the launcher
-  builds and the worktree's git configuration; a credential that repository
-  code itself supplies is outside them. The host assignment's integrity relies
-  on the deployed sandbox denying same-user process-memory writes; that
-  host-integration check is not in place yet (tpsdev-ai/cli#436). The git
-  baseline allowlists keys; remote URL and refspec values are the host clone's
-  and are pinned for the build, not approved.
+  The host supplies the assignment; its integrity and sandbox isolation depend
+  on deployed host controls (#436), and per-job isolation within a build is
+  tracked in #435. The build verdict is advisory.
 
   This repository now declares `engines.node: "22.x || 24.x"` (the Node majors
   its CI runs: the runner's 22, and the exact 24.21.0 its `test` job sets up

@@ -1,1 +1,37 @@
-- **One locality decision for outbound mail (cli#389): a maildir no longer silently reclassifies a REMOTE peer as local.** The openclaw-tps-mail plugin decided locality with "a `~/.tps/mail/<to>/` directory exists, or the recipient is bound", while `tps mail send` used the branch/office + GAL rule and `deliverOutboundMail` a third rule (bindings only). A maildir created for archiving, inspection, or by accident for a peer on another host therefore made the plugin write the reply there — where nothing would ever read it. Both plugin paths (the dispatcher reply and the outbound adapter) now go through the SAME decision `tps mail send` makes, extracted to `packages/cli/src/utils/mail-routing.ts` and IMPORTED by both rather than mirrored: a BRANCH relays every non-bound recipient to `~/.tps/outbox/new/` (directory existence never matters there); the OFFICE decides in ONE order, and the order is the point: the GAL is consulted FIRST, so a GAL-listed recipient whose branch is registered remotely (a GAL entry plus `~/.tps/branch-office/<branch>/remote.json`) is sent over the wire via `deliverToRemoteBranch`, while one whose branch has NO remote registration is `gal-without-remote` — a named failure, never a fall-through to a local write, even when a local maildir exists. Only a recipient with NO GAL entry reaches the rest, in this order: `remote.json` under the recipient's own name goes over the wire; a branch-office inbox (`~/.tps/branch-office/<to>/mail/inbox`) takes the BRIDGE route; a binding or an existing local maildir is written locally; and anything else is a NAMED failure for BOTH importers — `tps mail send` refuses it with a named error naming the fix, exits non-zero, and writes nothing (and creates no directory), while the plugin records the same named failure in the log and the obligation record — never a silent write.
+- **One routing decision for outbound mail, shared by `tps mail send` and the openclaw-tps-mail plugin (cli#389).**
+
+  Outbound mail uses a shared resolver that applies branch routing and office
+  GAL precedence before local-maildir fallback. It lives in
+  `packages/cli/src/utils/mail-routing.ts`, and `tps mail send` and both plugin
+  paths (the dispatcher reply and the outbound adapter) import it rather than
+  keep their own rules:
+
+  - On a BRANCH, a recipient bound to this gateway is local and every other
+    recipient is relayed through `~/.tps/outbox/new/`; directory existence never
+    matters there.
+  - On the OFFICE, the GAL is consulted first. A GAL-listed recipient whose
+    branch is registered remotely (a GAL entry plus
+    `~/.tps/branch-office/<branch>/remote.json`) is sent over the wire with
+    `deliverToRemoteBranch`; one whose branch has no remote registration is the
+    named failure `gal-without-remote`, whatever maildirs exist.
+  - Only a recipient with no GAL entry reaches the rest, in this order:
+    `remote.json` under the recipient's own name goes over the wire; a
+    branch-office inbox (`~/.tps/branch-office/<to>/mail/inbox`) takes the
+    `bridge` route, delivered through the CLI's own `deliverToSandbox`; a binding
+    or an existing local maildir is written locally; anything else is the named
+    failure `unknown`.
+
+  A named failure is never a silent write. `tps mail send` exits non-zero with
+  an error naming the fix and writes nothing (and creates no directory). The
+  plugin's dispatcher reply records the failure in its log and in the
+  obligation record as a definitive non-delivery; its outbound adapter throws a
+  named error.
+
+  A plugin reply sent over the wire keeps its identity: the dispatcher passes
+  the reply `id` and `timestamp` to `deliverToRemoteBranch`, so the wire payload
+  and the branch's ACK correlation use the id the plugin reports as the reply
+  id. CLI sends carry a signed envelope message ID, optionally supplied with
+  `--message-id`; the remote relay independently generates their transport
+  record ID.
+
+  (Refs #389)

@@ -20,10 +20,11 @@
   that returns a value built from it builds the Authorization header for the
   plugin's own GitHub client and is called nowhere else. Its path is not
   re-read, and neither the token nor its location appears in any environment,
-  log, tool result or session. Repository coverage and permission scope are
-  verified from trusted provisioning evidence bound to the installed credential
-  BEFORE any request; unknown or stale evidence disables posting, so posting
-  fails closed rather than falling back to an online check. Only a full
+  log, tool result or session. Credential binding and evidence freshness are
+  checked at full registration; repository coverage and permission scope are
+  checked before posting using the loaded evidence. Evidence that is missing,
+  not bound to the installed credential or stale at registration leaves posting
+  disabled, with no fallback to an online check. Only a full
   registration reads the credential or the signing key or retries audits; any
   other registration mode reads no secret, never throws, and — when OpenClaw
   executes the tool from an on-demand `tool-discovery` registration in the
@@ -82,7 +83,6 @@
   through the gateway's tools.invoke path it posts through the plugin's real
   GitHub and Flair clients to `posted` with the audit acknowledged; the probe
   reports the gateway process identity and reads the host-only marker there;
-  and every run is secret-scanned. The lane runs OpenClaw's loader, gateway
-  tool resolution and tools.invoke dispatch in one node process; it starts no
-  sandbox container and no embedded agent runner, so the container half of the
-  contrast is deferred to section A.
+  and the lane runs that invoke the tool are secret-scanned. The lane runs
+  OpenClaw's loader, gateway tool resolution and tools.invoke dispatch in one
+  node process.
