@@ -5,7 +5,7 @@
   The root `test` script runs the root `./test` directory through the suite
   runner (`node scripts/test-suite.mjs root-test ./test`), so
   `test/security-properties.test.ts`, and anything added beside it, runs in the
-  `Unit & Integration Tests` job on every PR.
+  `Unit & Integration Tests` job on every PR targeting `main`.
 
   The workspace and root suites use `scripts/test-suite.mjs`; the mail and
   GitHub-review plugins use their own launchers. All produce the required
