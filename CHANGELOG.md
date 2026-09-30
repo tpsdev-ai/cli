@@ -2,6 +2,628 @@
 
 All notable changes to the TPS CLI are recorded here.
 
+## [0.8.0] — 2026-09-30
+
+**Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.
+
+### Added
+
+- **A host-side `github_review` verb posts pull-request reviews without the GitHub credential ever entering the sandbox (Refs #425).**
+
+  A new, independently versioned OpenClaw plugin, `openclaw-github-review`,
+  registers exactly ONE production tool through `api.registerTool` — no
+  passthrough, no generic shell/`gh`/HTTP access — and offers it only to the
+  configured reviewer agent. It shares no code, deployment unit or dependency
+  with `openclaw-tps-mail`.
+
+  **The tool is bound to the session's trusted dispatch assignment.** `repo`,
+  `pr` and `commit_id` ARE caller input and are accepted only when they equal the
+  host's immutable `{repo, pr}` assignment and the head the host itself fetches;
+  the session's agent, and the assignment's reviewer, must match the host signing
+  identity. A missing, expired, inactive or mismatched assignment, an unsupported
+  field, an unsupported event, a repository outside the configured set and an
+  oversized body are all refused with a stable reason, the safely resolved actor,
+  the relevant state and a remedy — and no request leaves.
+
+  **The credential stays on the host.** A fine-grained PAT is read once at
+  gateway start into a `#private` field of the custody object; the one method
+  that returns a value built from it builds the Authorization header for the
+  plugin's own GitHub client and is called nowhere else. Its path is not
+  re-read, and neither the token nor its location appears in any environment,
+  log, tool result or session. Credential binding and evidence freshness are
+  checked at full registration; repository coverage and permission scope are
+  checked before posting using the loaded evidence. Evidence that is missing,
+  not bound to the installed credential or stale at registration leaves posting
+  disabled, with no fallback to an online check. Only a full
+  registration reads the credential or the signing key or retries audits; any
+  other registration mode reads no secret, never throws, and — when OpenClaw
+  executes the tool from an on-demand `tool-discovery` registration in the
+  gateway process — reuses the state the full registration loaded.
+
+  **The body is opaque and the digest is faithful.** The review request is built
+  internally from the validated assignment, event, commit and body, with no
+  caller-selected endpoint or header, and `body` is sent unchanged. The audit
+  record — a signed Flair `OrgEvent` (`kind: pr_review_posted`) whose `detail`
+  carries the host-computed `body_sha256` over the UTF-8 body handed to the
+  serializer, the returned review id/URL and confirmed commit, the review
+  environment's runtime versions and image digest (null until the reviewer
+  image supplies them), and the verified login from the provisioning record —
+  can only be built from a readable 2xx receipt. A validated receipt is
+  reported `posted` (audit acknowledged), `posted_audit_pending` (retained and
+  retried at the next start, without reposting) or `posted_audit_unretained`
+  (the review exists; the audit was not acknowledged and its retention for
+  retry was not durably confirmed; a host log line is attempted).
+  A 2xx whose receipt does not match is `unknown` (`receipt_invalid`) with the
+  audit attempted; one whose receipt cannot be read, and an ambiguous
+  response, are `unknown` with NO audit record. Every `unknown` leaves the
+  dispatch latched.
+
+  **At most one verdict per dispatch, for the processes that share the latch
+  store's lock.** Every read-modify-write of a store runs under one exclusive
+  O_EXCL lock per store file (one host, local filesystem; a stale lock fails
+  closed with its path and the remedy). Before the review is posted the
+  dispatch is claimed — `reserved` plus this call's claim, one atomic
+  check-and-write, durable (unique exclusive temp file, fsync, atomic rename,
+  fsync'ed directory) — and nothing is posted if that fails. The claim is held
+  across the POST. A validated receipt latches `posted` (final:
+  `already_posted`); an uncertain outcome latches `reconcile_required`.
+  Exactly ONE thing releases a dispatch: the handler, on a response proving
+  its own POST created no review (401/403/404/422 that carry GitHub's request
+  id — 408, 429, other 4xx, 5xx, transport failures and requests past the
+  30 s timeout that bounds every outbound request are ambiguous). The
+  host's `latch-admin reconcile` never releases: it refuses while the claim is
+  held and on a recent attempt, requires the credential (by fingerprint) and
+  login that made the attempt, lists the pull request's reviews with it, and
+  latches `posted` only when the attempt's recorded receipt id is listed;
+  otherwise — an empty listing, or a same-login same-commit review without
+  that id — the dispatch stays latched and it tells the operator to issue a
+  fresh dispatch. It records its decision first, as a Flair event signed with
+  the reviewer's key (the OS account that ran it recorded as `invoked_by`), or
+  as a local audit line whose file and directory are fsync'ed before every
+  append returns. After the POST the handler returns an outcome without
+  throwing. Both durable stores must be readable and writable before any
+  request, and an unparsable store is never overwritten.
+
+  **A permanent gateway-boundary lane** runs the BUILT plugin in a node process
+  against the pinned OpenClaw 2026.8.1: it registers through OpenClaw's loader
+  from the shipped manifest with zero diagnostics (the shipped manifest rejects
+  the CI probe, which registers only from a lane-created overlay); under the
+  reviewer's `sandbox.mode: "all"` the verb is withheld by OpenClaw's default
+  sandbox tool policy and offered with the documented `alsoAllow`; dispatched
+  through the gateway's tools.invoke path it posts through the plugin's real
+  GitHub and Flair clients to `posted` with the audit acknowledged; the probe
+  reports the gateway process identity and reads the host-only marker there;
+  and the lane runs that invoke the tool are secret-scanned. The lane runs
+  OpenClaw's loader, gateway tool resolution and tools.invoke dispatch in one
+  node process.
+
+- **The CLI package now exports `@tpsdev-ai/cli/utils/mail-routing` and `@tpsdev-ai/cli/utils/relay` for integrations.**
+
+  `utils/mail-routing` is the outbound routing decision `tps mail send` makes,
+  and `utils/relay` holds the remote-branch and branch-office bridge delivery
+  it uses; the openclaw-tps-mail plugin imports both instead of keeping its own
+  copies.
+
+  (Refs #389)
+
+- **`tps mail send` takes its body on stdin, threads replies inside the signature, can re-send a message under the same id, and reads the keys `bob onboard` and `tps init` write (cli#429).**
+
+  Mail send supports stdin input and signed reply threading, accepts the
+  documented Ed25519 key formats, and requires successful signing before
+  delivery. What signing now requires of existing callers is in the Breaking
+  entry for `tps mail send`.
+
+  **`--stdin`: the body is read from stdin, never from argv.** The reader uses
+  fd 0 directly, caps input at 64 KiB, distinguishes empty input, and bounds
+  consecutive EAGAIN retries on nonblocking stdin. It never goes through
+  `process.stdin`, so a regular-file, memfd or pipe stdin yields the same bytes
+  under bun. The 64 KiB limit is enforced on the SIGNED message (the body plus
+  its signature and envelope fields) before any route: a body just under the
+  limit whose signed envelope is over it is refused by name, and nothing is
+  written. The command never prints the body, and no error carries it.
+
+  **`--reply-to <messageId>`: threading covered by the signature.** The signed
+  `messageId` being answered is carried inside the envelope, so the signature
+  covers it. One id rule — letters, digits, dot, underscore or hyphen, 1-128
+  characters — applies to `--reply-to` and `--message-id`. The thread is shown
+  by `mail check`, `mail list`, `mail read` and `mail log` for verified mail
+  only.
+
+  **`--message-id <id>`: a re-send is the same message.** The envelope is
+  signed with that `messageId` instead of a fresh UUID, so a sender that
+  re-sends after an unknown outcome produces the same message. A recipient
+  that still finds that id recorded as consumed dead-letters the re-send as a
+  replay; otherwise the copy may be delivered.
+
+  **Keys: one search path, strict formats, no silent choice.** A signer
+  resolving a key by agent id reads `~/.flair/keys/<id>.key` and
+  `~/.tps/identity/<id>.key` (where `tps init` and `tps agent create` put it).
+  When both exist they must hold the same key: two different keys are refused,
+  naming both paths and the remedy, instead of one being chosen. A file that
+  cannot be read or parsed is an error naming its path. Accepted formats: a raw
+  32-byte seed, one line of base64 PKCS8 DER, raw PKCS8 DER, or exactly one
+  unencrypted PEM `PRIVATE KEY` block — each parsed strictly (the whole input
+  must be the one key; encrypted keys and other algorithms are refused by name;
+  errors never contain key material).
+
+  **pi-tps-mail: the watcher sends each reply as one message.** The reply goes
+  out on stdin with `--reply-to` the inbound's verified envelope id, and is
+  journaled first with the envelope `messageId` it is signed with. A send whose
+  outcome is unknown (a non-zero exit or a timeout) is re-sent later as the
+  same message: a recipient that still finds that id recorded as consumed
+  dead-letters it as a replay, and otherwise the copy may be delivered. Recovery retries
+  acknowledgement without resending when the journal records `sent`; if that
+  write did not persist, it may resend using the same envelope message ID. If
+  the watcher stops before journaling a reply, the unacknowledged inbound can be
+  re-presented after lease expiry. A launcher timeout produces a diagnostic
+  reply.
+
+  (Refs #429)
+
+- **A reviewer sandbox image with a digest-pinned base and checksum-verified runtimes, a trusted runtime table and a launcher that builds a PR the way its CI job would, as advisory evidence for the reviewer; the image bundles no credentials, and isolation from the host depends on the deployed sandbox configuration (Refs #425).**
+
+  The reviewer environment now has its own image and launch path, defined in
+  this repository. Its verdict, `review-build-ok`, is advisory evidence for the
+  reviewer, not a merge gate; the CI workflow runs for pull requests that target
+  `main`. The image
+  bundles no credentials, and the launcher restricts its child environment and
+  Git configuration. Isolation from the host depends on the deployed sandbox
+  configuration. How well the build predicts CI is best effort, with its known
+  limits documented in `docker/reviewer/README.md`.
+
+  **The image** (`docker/reviewer/Dockerfile`, linux/amd64) uses a
+  digest-pinned Debian base (`debian:bookworm-slim`) and checksum-verified Node,
+  Bun and `gh` releases, each at the exact version and checksum the trusted
+  table gives; `gh` carries no credential of its own. Git and the other system
+  packages are installed through Debian's package manager: the package set of
+  OpenClaw's documented sandbox build, which uses the floating
+  `debian:bookworm-slim` tag (python3 is what OpenClaw's sandbox write/edit
+  helpers run), plus the download and unpack tools and procps. It has no
+  entrypoint and its CMD is `sleep infinity`, matching how OpenClaw starts
+  sandboxes. Its default `HOME`, `USERPROFILE`, `TMPDIR` and Bun/npm caches
+  point under `/tmp/review`, which is discarded with the sandbox when the
+  deployed sandbox mounts `/tmp` as a tmpfs, as OpenClaw's sandbox creation
+  does. It carries no credentials and no configured credential helpers.
+
+  **The trusted table** (`docker/reviewer/runtime-matrix.json`) is maintained
+  here and installed on the host. The reviewed checkout can neither extend it
+  nor choose a download source.
+
+  **The launcher** (`/opt/reviewer/bin/reviewer-launch`, from
+  `scripts/reviewer/reviewer-launch.mjs`) is run explicitly. Build mode takes no
+  arguments and always builds the worktree the host mounted at `/workspace`
+  (`--self-check` is the only other mode). Before any repository code runs it
+  reads the fixed table and the image's baked identity; takes the workflow, job
+  and base branch only from the environment the HOST gave the sandbox at
+  creation (`REVIEWER_CI_WORKFLOW`, `REVIEWER_CI_JOB`, `REVIEWER_CI_BASE`),
+  refusing a caller that passes different values; refuses symlinked lockfiles
+  and symlinked directories in the worktree; plans the job and the jobs it
+  `needs`; resolves the reviewed commit's declarations (`packageManager`,
+  `engines`, `.nvmrc`, `.node-version`, `.bun-version`, `.tool-versions`, each
+  read with size bounds and inside the worktree) and every planned job's runtime
+  pins to ONE matrix image with npm-semver range semantics; refuses unless that
+  image is the one it is running in; builds the child environment from an
+  allowlist (hermetic values, a fixed `PATH`, `LANG`, `LC_ALL`, `TERM`, `TZ`,
+  `CI=true`); and runs the image's own Node and Bun at fixed paths to verify
+  their versions. Then, job by job in dependency order, it removes what earlier
+  jobs of the build created, gives each job a fresh `HOME`/`TMPDIR`/cache root,
+  refuses a worktree whose effective git configuration leaves a documented safe
+  baseline (no `core.fsmonitor`, `core.hooksPath`, `core.pager`, `protocol.*`,
+  `url.*.insteadOf`, credential helpers, auth headers, ...) or whose repository
+  holds hooks, and refuses unless the worktree passes a clean-clone check. It
+  runs every `run:` step as one script under `/bin/bash --noprofile --norc -eo
+  pipefail` after re-checking the step's effective environment and that its
+  resolved working directory stays inside the worktree, enforces
+  `timeout-minutes` (the job's, default 360, and each planned `run:` step's),
+  and sends `SIGKILL` to the tracked step process groups when the job ends.
+  After every job it refuses symlinked lockfiles and symlinked directories. It
+  reports `review-build-ok` only when every job in the closure ran, every step
+  exited 0, and no lockfile in the worktree (outside `node_modules/` and
+  `.git/`) changed, appeared or disappeared.
+
+  **The planner** (`scripts/reviewer/ci-job.mjs`) bounds the workflow (bytes,
+  YAML nodes counting every alias use, depth) before trusting it, requires
+  printable-ASCII keys, and requires a `pull_request` trigger that covers the
+  host-named base branch; a workflow CI would not run for the review is refused.
+  Every job must begin with `actions/checkout` and run on `ubuntu-latest` or
+  `ubuntu-24.04`. It skips checkout (first step only), setup-bun and setup-node
+  (exact versions only), socketdev (firewall-free), cache (path and key
+  required) and upload-artifact (path required; unique, valid name) only at
+  reviewed commit SHAs, with every input the real action needs and only input
+  values whose skip is equivalent; it names them in the verdict and refuses
+  every other action, ref or input. It refuses what it cannot reproduce: a
+  `${{ }}` expression anywhere it would have to be evaluated (scripts, env
+  values, working directories, runner labels, timeouts and every input of a
+  skipped action — the only expressions accepted are `if:` conditions that are
+  exactly `success()` or `always()`), `timeout-minutes` on a skipped `uses:`
+  step, conditions other than success/always, `continue-on-error`, matrices and
+  containers; and credential-shaped or config-redirecting workflow env
+  (`GH_TOKEN`, `*_TOKEN`, `*_SECRET`, `*_KEY`, `GIT_*`, `NPM_CONFIG_*`, `SSH_*`,
+  `NODE_OPTIONS`, `BASH_ENV`, `LD_*`, proxies, ...). Ambiguous, conflicting,
+  malformed and out-of-matrix runtime requirements are refused by name; an
+  out-of-matrix refusal names the missing image (e.g. `missing image: node >=25
+  with bun 1.3.10`).
+
+  The host supplies the assignment; its integrity and sandbox isolation depend
+  on deployed host controls (#436), and per-job isolation within a build is
+  tracked in #435. The build verdict is advisory.
+
+  This repository now declares `engines.node: "22.x || 24.x"` (the Node majors
+  its CI runs: the runner's 22, and the exact 24.21.0 its `test` job sets up
+  for the github-review plugin suite), so with that pin its `test` job resolves
+  to exactly one reviewer image, `reviewer-node24-bun1310`.
+
+  A dedicated CI job builds every matrix image and runs the image-level checks
+  (A2 integrity and build-path refusals, including a caller naming another job,
+  a `--workspace` argument, impostor binaries on the caller's `PATH`, an
+  enforced `timeout-minutes`, a worktree that fails the clean-clone check and a git
+  `core.fsmonitor`; A3 hermetic defaults observed inside a build run the way
+  OpenClaw runs the sandbox; A9 tokenless `gh`, a worktree git auth header and a
+  workflow `GH_TOKEN`), then requires the A9 checks to fail on derived images
+  carrying planted fake credentials.
+
+### Changed
+
+- **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).**
+
+  **Breaking:** `tps mail send` requires a usable sender signing key; provision
+  it before upgrading callers. `--unsigned` is unsupported. With no usable key
+  the command exits non-zero, names the key path(s) it looked at (or the path
+  of the unusable key) and the remedy, and writes nothing to any maildir,
+  outbox, sandbox or wire, on every route; `--unsigned` is refused by name.
+  To upgrade: give each agent id that sends mail an Ed25519 key at
+  `~/.flair/keys/<id>.key` or `~/.tps/identity/<id>.key` in one of the accepted
+  formats, make sure Flair holds its public key (recipients verify against it),
+  and remove `--unsigned` from any caller.
+
+  **Breaking: a recipient with no route is refused.** On an office host, a
+  recipient with no GAL entry, no branch-office registration and no local
+  maildir is refused with an error naming the fix, and a GAL entry whose branch
+  has no `remote.json` is refused as `gal-without-remote`, whatever maildirs or
+  branch-office inboxes exist. Either refusal exits non-zero, writes nothing and
+  creates no directory. To upgrade: create the recipient agent, or add it to the
+  GAL with a registered branch, before sending to it.
+
+  **Breaking: `--json` prints delivery metadata only.** On every route the
+  output is one line of JSON: `status`, `route`, `to`, `from`, the signed
+  `messageId`, `replyToId` when the message is a reply, `signedAt`, and the
+  route's own details (on the local route, the record `id` and `timestamp`).
+  The body and the rest of the stored record are not printed. To upgrade: read
+  only those fields from the output.
+
+  (Refs #429, #389)
+
+- **Renovate uses the shared TPS preset and excludes `@tpsdev-ai/**` dependencies from automated updates.**
+
+  Maintainer note: `.github/renovate.json` extends the shared tpsdev-ai preset,
+  and Renovate does not bump `@tpsdev-ai/**` dependencies, which are this
+  repository's own release packages: the release workflow checks all six
+  versions and attempts to stage all six, and approval and promotion are
+  separate maintainer steps. Its configuration is reviewed separately from the Semgrep scan: the
+  Semgrep step excludes `.github/renovate.json`, and Renovate configuration is
+  checked in pull-request review.
+
+  (Refs #423)
+
+### Fixed
+
+- **Failures persist pending nack notifications for startup retries; retries can duplicate a notification, and aged debt is subject to the configured abandonment policy (cli#389).**
+
+  **The nack is owed on the record.** The write that sets `failed` also sets
+  `nackPending`. The verb awaits the send, and a nack that reaches a route
+  records `nackSentAt` and clears `nackPending` in one further write. When that
+  write fails it is logged `obligation-write-failed`, naming the inbound; the
+  record keeps `nackPending`, and a later start may send the nack again. The
+  `nackedAt` stamp on the inbound is written before the send and is not
+  evidence that the sender was told.
+
+  **Startup retries owed nacks in the background.** Startup schedules bounded
+  background nack retries before running retention; pending debt inside the
+  hold window is retained regardless of retry completion order. Each retry is
+  bounded by one overall timeout spanning the connection and the ACK wait; on
+  expiry the transport is closed and `nack-retry-timeout` is logged by name.
+  A retry may duplicate a nack. Delivery is not guaranteed: debt still owed
+  after the configured hold may be abandoned.
+
+  **The hold is bounded by age.** While a record owes its nack and is inside
+  the hold window, the retention sweep keeps it and reports how many it held.
+  The window is a configurable multiple of `obligationRetentionDays` (key
+  `obligationNackHoldMultiple`, in the plugin or channel config; default 4,
+  i.e. 28 days on the default 7-day window). A multiple below 1 is rejected
+  with a named log (`obligation-nack-hold-multiple-invalid`) and the default is
+  used. Past the bound, retention attempts to clear the debt and logs
+  `nack-abandoned`; unsuccessful persistence can cause that attempt and log to
+  repeat. A successful abandonment write clears `nackPending` and records
+  `nackAbandonedAt`, preventing subsequent startup retries for that debt, and
+  normal retention then applies to the record.
+
+  (Refs #389)
+
+- **A reply obligation is settled from its persisted delivery state by one verb, which also owns the nack mail; a closed obligation refuses a late final (cli#389).**
+
+  **Delivery state is persisted.** The obligation record is written
+  `delivering` before the delivery call and `posted` when the call returns, so
+  the turn, the deadline timer and restart recovery all read the same state,
+  and one verb settles the obligation from it. Persisted delivery state
+  prevents uncertain delivery and evidence-maintenance errors from becoming
+  failure verdicts; attributable quarantine remains a definitive failure.
+
+  **Outcomes.** Receipt evidence gives `acked`. A committed record
+  (`delivering` or `posted`) with no evidence at its deadline becomes the
+  terminal state `unconfirmed`, logged by name, with no failed state and no
+  nack, because non-delivery cannot be shown. A definitive non-delivery verdict
+  fails the obligation and nacks the sender, even after commit: a refusal
+  decided before the delivery call (no route, or a named route failure such as
+  `gal-without-remote`), or the outbox drain quarantining this reply's own
+  record, attributed by the reply id in the quarantined name. A quarantined
+  record that cannot be attributed to this reply is not a verdict and resolves
+  by the deadline rule.
+
+  **Uncertain and post-commit errors.** A delivery call that throws after
+  `delivering` was persisted may have thrown after the bytes left, so it is
+  logged `delivery-uncertain:` and resolves by evidence or deadline, never
+  `failed`. Every step after a delivery call returns (the `posted` transition,
+  the receipt write, the log line) runs under its own guard that logs by name,
+  such as `receipt-write-failed`, and records no failure. An error in a later
+  step of a committed turn, such as the receipt scan, is logged
+  `post-commit-error:<step>` and arms the normal deadline. When the obligation
+  store cannot be written as an outcome is recorded, the plugin makes one
+  attempt, logs `obligation-write-failed`, and the obligation resolves on a
+  later start once the store can be written.
+
+  **One nack path.** Every transition to `failed` goes through the verb, which
+  sends the nack mail, so the same verdict gives the same sender-visible
+  outcome wherever it is found and no caller mails on its own; how an owed nack
+  is retried is in the nack-recovery entry. A terminal record refuses later
+  transitions: a final that arrives after the obligation closed, as `acked`,
+  `failed` or `unconfirmed`, is logged `late-final-refused` and not delivered,
+  and a refused `unconfirmed` or `failed` transition stamps nothing and sends no
+  nack. A `nackedAt` stamp on the inbound does not fail an obligation whose
+  record says the delivery committed; recovery decides those by evidence and
+  deadline.
+
+  `posted` means the reply was handed to its route: sent over the wire to a
+  remote branch, delivered into a local maildir, or queued in the outbox for
+  the branch drain.
+
+  (Refs #389)
+
+- **A reply obligation is acked only on a receipt whose signed reply verifies, and receipts live in the replying agent's own store (cli#389, cli#429).**
+
+  **Receipts.** Local, bridge and remote-branch reply receipts include the
+  signed reply envelope and are created with mode 0600 in the replying agent's
+  obligation store, at
+  `<mailDir>/<agent>/.obligations/receipts/<obligation-id>.json`. A receipt
+  also names the reply, the obligation, the inbound it answers, the route, the
+  branch (for the wire and bridge routes) and the time it was written. The
+  outbox route writes none: its record stays in this host's outbox, where the
+  scan reads it. A bridge delivery's sandbox record carries the obligation ids
+  too, so it is evidence in its own right.
+
+  **What counts as a receipt.** The scan accepts three forms: the metadata
+  receipt, the posted reply record carrying the obligation marker, and the
+  bridge sandbox record. Each must name this obligation and the inbound it
+  answers, and the reply it carries must be a signed envelope from the
+  obligated agent, addressed to the inbound's sender, whose signatures verify
+  against the key Flair holds for that agent and whose signed `replyToId` is the
+  inbound's verified envelope id. For legacy obligations without an inbound
+  envelope ID, the scan checks wrapper threading against the inbound record ID
+  while still verifying the signed reply's sender and recipient. A record the
+  recipient already promoted counts only when its plaintext body and recipient
+  are the stored signed envelope's. Metadata and bridge receipts also match the
+  recorded reply ID when one is known; all accepted receipt forms must pass
+  signature, sender, recipient and applicable thread checks. An unsigned, badly
+  signed, foreign-signed or misaddressed record never acks an obligation. When
+  Flair cannot be reached to verify a candidate, that is logged
+  (`receipt-verify-unavailable`) and the obligation is left to a later scan or
+  its deadline.
+
+  **How the store is read.** The receipts store is read ONLY by its direct
+  `<obligation-id>.json` path and never listed; the route's posted-record
+  directories (the maildir `new`/`cur`, the bridge sandbox, the outbox) are the
+  only ones walked. An unreadable file in the receipts store is never read as a
+  failed delivery.
+
+  **Retention.** The agent's obligation retention sweep owns its receipts and
+  keys each one on the obligation id: a live obligation keeps its receipt, a
+  terminal obligation's receipt goes, and a receipt whose obligation is gone (an
+  orphan) goes once it has aged past the retention window. An orphan with no
+  readable timestamp, and a receipt that names no obligation id, stay in place.
+  While any obligation record in the store is unreadable or malformed, the
+  sweep deletes no orphan receipt in that pass (terminal-rule deletions,
+  decided from records it did read, still apply) and reports the count.
+
+  (Refs #389, #429)
+
+- **One routing decision for outbound mail, shared by `tps mail send` and the openclaw-tps-mail plugin (cli#389).**
+
+  Outbound mail uses a shared resolver that applies branch routing and office
+  GAL precedence before local-maildir fallback. It lives in
+  `packages/cli/src/utils/mail-routing.ts`, and `tps mail send` and both plugin
+  paths (the dispatcher reply and the outbound adapter) import it rather than
+  keep their own rules:
+
+  - On a BRANCH, a recipient bound to this gateway is local and every other
+    recipient is relayed through `~/.tps/outbox/new/`; directory existence never
+    matters there.
+  - On the OFFICE, the GAL is consulted first. A GAL-listed recipient whose
+    branch is registered remotely (a GAL entry plus
+    `~/.tps/branch-office/<branch>/remote.json`) is sent over the wire with
+    `deliverToRemoteBranch`; one whose branch has no remote registration is the
+    named failure `gal-without-remote`, whatever maildirs exist.
+  - Only a recipient with no GAL entry reaches the rest, in this order:
+    `remote.json` under the recipient's own name goes over the wire; a
+    branch-office inbox (`~/.tps/branch-office/<to>/mail/inbox`) takes the
+    `bridge` route, delivered through the CLI's own `deliverToSandbox`; a binding
+    or an existing local maildir is written locally; anything else is the named
+    failure `unknown`.
+
+  A named failure is never a silent write. `tps mail send` exits non-zero with
+  an error naming the fix and writes nothing (and creates no directory). The
+  plugin's dispatcher reply records the failure in its log and in the
+  obligation record as a definitive non-delivery; its outbound adapter throws a
+  named error.
+
+  A plugin reply sent over the wire keeps its identity: the dispatcher passes
+  the reply `id` and `timestamp` to `deliverToRemoteBranch`, so the wire payload
+  and the branch's ACK correlation use the id the plugin reports as the reply
+  id. CLI sends carry a signed envelope message ID, optionally supplied with
+  `--message-id`; the remote relay independently generates their transport
+  record ID.
+
+  (Refs #389)
+
+- **The root `test/` directory now runs in CI, with a guard that compares discovered test files to the suites' JUnit reports (cli#411).**
+
+  The root `test` script runs `./test` through the suite runner
+  (`node scripts/test-suite.mjs root-test ./test`), so
+  `test/security-properties.test.ts` runs in the `Unit & Integration Tests` job
+  for PRs targeting `main`. The job's last step, `scripts/check-test-reports.mjs`,
+  compares the test files discovered on disk with the file names in the suites'
+  sealed JUnit reports, and fails on a missing required report and on a
+  discovered file that no report names. bun's JUnit reporter omits a file with
+  zero test cases, so a placeholder or platform-only file needs a registered case
+  (`test.skip`, `test.todo`, `describe.if` or `test.skipIf`).
+
+  (Refs #411)
+
+- **A suite's JUnit report is checked against a checksum saved when the suite ends, to detect accidental changes after completion (cli#414).**
+
+  Each launcher saves a checksum when its suite produces a JUnit report. The
+  coverage guard fails if a required report or checksum is missing, or if the
+  report does not match its saved checksum.
+
+  (Refs #414)
+
+- **`bun run test` runs every lane under a throwaway HOME with an allowlisted environment, and fails a lane on a detected change to the caller's `~/.tps` metadata (cli#430).**
+
+  The monorepo and openclaw-tps-mail test launchers use isolated homes,
+  restrict inherited environment variables, validate write destinations and
+  fail a lane on a detected change to the caller's `~/.tps` metadata. The
+  openclaw-github-review launcher gives its suite an isolated HOME, and its
+  preload aborts a run outside that root.
+
+  The control is HOME redirection plus an allowlisted environment, applied at
+  launch time in one shared place (`scripts/test-home-guard.mjs`), because under
+  bun `os.homedir()` keeps the HOME it read at first call. Every lane of
+  `bun run test` runs through `scripts/test-suite.mjs`, which creates a fresh
+  throwaway root and gives the child its whole environment: `HOME` and
+  `TPS_TEST_ROOT` at the root, `TMPDIR`/`TMP`/`TEMP` and bun's transpiler cache
+  inside it, and only these inherited variables — `PATH`, the locale
+  (`LANG`, `LANGUAGE`, `LC_ALL`, `LC_CTYPE`, `LC_COLLATE`, `LC_MESSAGES`),
+  `TERM`, `NO_COLOR`, `FORCE_COLOR`, `CI` and `GITHUB_ACTIONS`, each only when
+  its value holds no `/` (PATH excepted). Every other inherited variable is
+  dropped, including ones nobody has named yet; the launcher prints the dropped
+  names, never their values. A preload (`bun --preload`, and the `bunfig.toml`
+  preloads at the repo root and in `packages/agent`, `packages/cli` and
+  `packages/pi-tps-mail`) aborts the run before any test module loads unless
+  `os.homedir()` is inside `TPS_TEST_ROOT`, the root is not and does not
+  contain the account's home, and the root is one a launcher made (its marker
+  matches `TPS_TEST_ROOT_TOKEN`). So a bare `bun test` — including one run with
+  `TPS_TEST_ROOT=$HOME` — aborts by name. This is a launch-time check, not an
+  OS boundary; the OS-enforced boundary is tracked in #434.
+
+  Before creating or deleting anything, the monorepo launcher refuses a suite
+  name that is not a plain file-name token (`[A-Za-z0-9._-]`, no `..`), a temp
+  dir inside an operator home, a report directory that is or contains an
+  operator home (`TPS_TEST_REPORT_DIR=$HOME`, or `/`), and a report directory
+  that resolves inside `~/.tps`, `~/.flair`, `~/agents` or `~/.config` — the
+  default `test-reports/` included. Report, log and seal files that are
+  symlinks are also refused; the seal path is checked again before the seal is
+  written. The monorepo and openclaw-tps-mail launchers also refuse a
+  caller-supplied `--reporter-outfile` argument, owning the report destination.
+  The Docker `attested` service runs its targeted files through the launcher,
+  with its report on the container's writable tmpfs. The `openclaw-tps-mail`
+  plugin's launcher (which runs only inside this monorepo) uses the same shared
+  helper for its environment, destination checks and snapshot, and its preload
+  applies the same root check.
+
+  The monorepo and mail-plugin launchers compare the caller's `.tps` metadata
+  before and after a suite as a diagnostic, and fail the lane on a detected
+  change; OS isolation is tracked in #434.
+
+  A CI step runs the suite with `HOME` pointed at an empty directory and asserts
+  that directory still has no `.tps` afterwards.
+
+  `tps auth` now builds its `~/.tps/auth` path each time it is used, instead of
+  once when the module loads. Every home-relative path in `tps auth` goes
+  through one helper, `homeDir()`: `HOME` when it is set and not empty,
+  otherwise `os.homedir()`, read on every call. Nothing in the CLI changes HOME
+  while it runs, so a CLI run uses the same paths as before; in the test suite,
+  each test's `tps auth` calls use that test's home.
+
+  (Refs #430)
+
+- **A guard now fails CI if the test workflow's least privilege slips: a job that declares no `permissions` block of its own, a `write` scope with no comment naming the step that needs it, a checkout that keeps its token, or a top level that grants anything.**
+
+  `packages/cli/test/workflow-permissions.test.ts` reads
+  `.github/workflows/test.yml` and holds the shape cli#415 gave it: the top
+  level grants nothing, every job declares its own block, every `write` sits
+  beside a comment naming the step that uses it, and every `actions/checkout`
+  sets `persist-credentials: false`. It also pins the set of workflows that run
+  PR-controlled code, so a new one cannot appear without a decision recorded
+  there. Every failure names the job or step responsible.
+
+  (Refs #416)
+
+### Security
+
+- **Mail verification covers reply threads and message ids, unverified mail is shown as metadata only, and the mail runtimes sign their replies and answer only verified mail (cli#429).**
+
+  **One id rule on receipt.** Every received envelope's `messageId` and
+  `replyToId` must satisfy the id rule `tps mail send` applies (letters,
+  digits, dot, underscore or hyphen, 1-128 characters); an envelope outside it
+  is dead-lettered.
+
+  **Unverified mail is metadata only.** Every unverified presentation (new/,
+  dlq/, a cur/ record that does not re-verify) shows only the record's id,
+  claimed sender and recipient, timestamp, location and lifecycle fields: the
+  body, the thread fields (`replyToId`, `envelopeId`, the stored envelope), the
+  headers (`X-TPS-InReplyTo`, `X-TPS-Obligation` and `X-TPS-Nack` among them)
+  and every other field are withheld.
+
+  **openclaw-tps-mail: replies and nacks are signed and threaded.** A
+  dispatcher reply signs the inbound's verified envelope `messageId` as its
+  `replyToId` inside the envelope, and so does the nack for an obligation that
+  records the inbound's envelope id. Legacy obligations without an inbound
+  envelope ID receive a signed, unthreaded nack. A reply or nack that
+  cannot be signed is not sent: the failure is logged by name, and an owed nack
+  stays pending for a later start. A reply receipt counts only when the signed
+  reply it carries verifies (see the reply-receipt entry).
+
+  **pi-tps-mail: the watcher answers only verified mail.** Each check runs
+  `tps mail check <agent> --json` and acts only on the records it verified; an
+  unsigned or forged inbound is dead-lettered by the CLI and never answered.
+
+  **Which producers sign.** `tps mail send` (and so pi-tps-mail's watcher
+  replies), the openclaw-tps-mail plugin's dispatcher replies and nacks, and the
+  codex, gemini and claude-code runtimes' mail sign through the shared signing
+  path. Other producer paths, including the `@tpsdev-ai/agent` runtime's
+  `MailClient.sendMail`, do not sign yet; the CLI and plugin producers among
+  them are tracked in tpsdev-ai/cli#433.
+
+  (Refs #429)
+
+- **Each job in the release workflow is granted only what its steps use, and only the publishing job can mint an OIDC token.**
+
+  The top level of `.github/workflows/release.yml` grants nothing, and each job
+  declares its own block, read from its steps: `contents: read` for the
+  preflight, the binary build, the smoke test and the publishing job;
+  `id-token: write` ONLY on the publishing job, whose
+  `npm stage publish` step is the one call that trades an OIDC token for an npm
+  credential; and `contents: write` ONLY on the job whose
+  `softprops/action-gh-release` step creates the release. Artifact upload and
+  download transfer within the run, so they need no scope of their own. A test
+  reads the workflow and fails if the top level grants anything, if a job other
+  than the publishing one holds `id-token`, if a job's grants widen, or if a job
+  appears with no permissions block of its own.
+
+  (Refs tpsdev-ai/flair#1890)
+
+- **Jobs in `.github/workflows/test.yml` declare explicit permissions and disable checkout credential persistence; CodeQL alone receives SARIF-upload write permission.**
+
+  (Refs tpsdev-ai/cli#412)
+
 ## [0.7.0] — 2026-09-24
 
 **Release following `0.6.0` (2026-09-17).** 10 commits: 1 `feat`, 9 `fix`, no breaking changes. The version is a minor bump rather than a patch because the range carries a feature; nothing in it is breaking.
