@@ -4,7 +4,12 @@
     "noEmit": true,
     "declaration": false,
     "sourceMap": false,
-    "types": ["bun-types"]
+    "types": ["bun-types"],
+    // test/preload-guard.ts imports the repo's shared test-home-guard.mjs, which
+    // ships no types: allowJs lets the checker resolve it, and rootDir covers the
+    // repo root that file lives in (cli#438).
+    "allowJs": true,
+    "rootDir": "../.."
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],
   "exclude": ["node_modules", "dist"]
