@@ -242,6 +242,16 @@ describe("docker-image-tags.sh — the npm checks and the tags (cli#420)", () =>
         "npm error code E404",
       ],
       ["E404 naming another version", e404("0.7.0-rc.1"), "npm error code E404"],
+      [
+        "E503 with this version's 404 message",
+        { rc: 1, err: "npm error code E503\nnpm error 404 No match found for version 0.7.0\n" },
+        "npm error code E503",
+      ],
+      [
+        "conflicting E404 and E503 codes with this version's 404 message",
+        { rc: 1, err: "npm ERR! code E503\nnpm error code E404\nnpm error 404 No match found for version 0.7.0\n" },
+        "npm ERR! code E503",
+      ],
       ["a failure with no error output", { rc: 1 }, "npm exited 1 with no error output"],
       ["exit 0 with nothing printed", { out: "" }, "npm exited 0 and printed ''"],
       ["exit 0 with another version printed", { out: "0.7.1\n" }, "npm exited 0 and printed 0.7.1"],

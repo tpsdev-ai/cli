@@ -10,7 +10,8 @@
 #   tps_version     the version
 #   tags            the image tags to push, one per line
 # Exit 1, with a ::error:: line, when the version does not have the required
-# shape, npm answers E404 for it, or an npm lookup fails in any other way.
+# shape, the version lookup does not confirm publication, or the latest lookup
+# exits nonzero.
 #
 # `npm` is taken from PATH. test/docker-image-tags.test.ts runs this script
 # with a stub npm first on PATH.
@@ -32,7 +33,7 @@ fi
 errf="$(mktemp)"
 trap 'rm -f "$errf"' EXIT
 
-# The first error line npm wrote to $errf, for a "could not verify" message.
+# Diagnostic from npm's stderr, exit status, or stdout for "could not verify".
 # Arguments: npm's exit status and what it printed on stdout.
 lookup_error() {
   local line
@@ -46,13 +47,13 @@ lookup_error() {
   printf '%s' "$line"
 }
 
-# 2. npm must have published the version. A Release run's packages are staged
-#    until the 2FA approval publishes them; run 36250170717 (v0.7.0) built the
+# 2. npm must have published the version. A newly staged agent version is not
+#    public until 2FA approval publishes it; run 36250170717 (v0.7.0) built the
 #    image before that, and its `npm install` failed with ETARGET ("No matching
 #    version found for @tpsdev-ai/agent@0.7.0.").
-#    E404 "No match found for version <version>" gets the staged-release
-#    remedy; any other failure (a network error, a registry 5xx) is reported
-#    as "could not verify". Both exit 1.
+#    An E404 code and matching "No match found for version <version>" message,
+#    with no conflicting code, gets the staged-release remedy. Every other
+#    unverifiable lookup is reported as "could not verify". Both exit 1.
 set +e
 published="$(npm view "${PKG}@${V}" version 2>"$errf")"
 rc=$?
@@ -60,9 +61,14 @@ set -e
 if [ "$rc" -ne 0 ] || [ "$published" != "$V" ]; then
   cat "$errf" >&2
   if [ "$rc" -ne 0 ] && {
-    grep -qxF "npm error 404 No match found for version ${V}" "$errf" ||
-      grep -qxF "npm ERR! 404 No match found for version ${V}" "$errf"
-  }; then
+    { grep -qxF "npm error code E404" "$errf" &&
+      grep -qxF "npm error 404 No match found for version ${V}" "$errf"; } ||
+      { grep -qxF "npm ERR! code E404" "$errf" &&
+        grep -qxF "npm ERR! 404 No match found for version ${V}" "$errf"; }
+  } && awk '
+    /^npm (error|ERR!) code / &&
+      $0 != "npm error code E404" && $0 != "npm ERR! code E404" { exit 1 }
+  ' "$errf"; then
     echo "::error::${PKG}@${V} is not public on npm (E404): approve the staged release, then re-run this workflow with version=${V}"
   else
     echo "::error::could not verify ${PKG}@${V} on npm: $(lookup_error "$rc" "$published"); re-run the workflow"
