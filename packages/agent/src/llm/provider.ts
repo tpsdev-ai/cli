@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
   LLMConfig,
@@ -82,7 +81,7 @@ export async function refreshAnthropicOAuthToken(creds: OAuthCredentials): Promi
  * Keep Claude Code's credentials in sync after TPS refreshes the token.
  */
 function syncToClaudeCode(creds: OAuthCredentials): void {
-  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  const credPath = join(homeDir(), ".claude", ".credentials.json");
   if (!existsSync(credPath)) return;
   try {
     const data = JSON.parse(readFileSync(credPath, "utf-8"));
@@ -132,7 +131,7 @@ export async function refreshGoogleOAuthToken(creds: OAuthCredentials): Promise<
 }
 
 function syncToGeminiCli(creds: OAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
   const candidates = [
     join(home, ".gemini", "oauth_creds.json"),
@@ -431,7 +430,7 @@ export class ProviderManager {
     const nonce = crypto.randomUUID();
     const signPayload = `${this.agentId}:${ts}:${nonce}:POST:${providerPath}`;
 
-    const keyPath = join(homedir(), ".tps", "identity", `${this.agentId}.key`);
+    const keyPath = join(homeDir(), ".tps", "identity", `${this.agentId}.key`);
     let authHeader = "";
     try {
       const rawBuf = readFileSync(keyPath);

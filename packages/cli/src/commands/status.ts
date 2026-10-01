@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import {
   appendFileSync,
   existsSync,
@@ -321,7 +320,7 @@ export function extractModelFromHeartbeatEvent(event: OrgEvent): string | null {
 
 async function resolveModelFromHeartbeat(agentId: string): Promise<string | null> {
   try {
-    const flair = createFlairClient(agentId, undefined, join(homedir(), ".tps", "identity", `${agentId}.key`));
+    const flair = createFlairClient(agentId, undefined, join(homeDir(), ".tps", "identity", `${agentId}.key`));
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const events = await flair.getEventsSince(agentId, since);
     const heartbeat = events

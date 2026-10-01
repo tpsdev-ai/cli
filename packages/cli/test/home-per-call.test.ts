@@ -1,15 +1,15 @@
 /**
  * home-per-call.test.ts — cli#439.
  *
- * Every module below used to build its `~/.tps` paths once, when the module
- * loaded. Each case imports the module and then uses it under a *different*
- * HOME than the import saw: the path the module acts on must follow the HOME in
- * effect at the call, so no test and no long-lived process depends on the HOME
- * seen at import time.
+ * Each module in the first block below built at least one home-relative path
+ * once, when the module loaded. Each case imports the module and then uses it
+ * under a *different* HOME than the import saw: the path the module acts on must
+ * follow the HOME in effect at the call.
  *
  * Both homes are temp dirs; nothing here reads or writes a real home.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
@@ -320,4 +320,140 @@ exit 0
     expect(existsSync(join(homeB, ".tps", "bootstrap-state", agentId, ".bootstrap-complete"))).toBe(true);
     expect(existsSync(join(homeA, ".tps", "bootstrap-state"))).toBe(false);
   }, 60_000);
+});
+
+/**
+ * cli#439 round 2: a directory and the file written into it resolve under the
+ * same home.
+ *
+ * Under bun, `os.homedir()` keeps returning the HOME the process started with
+ * after `process.env.HOME` changes; `homeDir()` reads HOME on each call. A module
+ * that creates a parent with one and writes the file through the other puts the
+ * two under different homes. Each case below runs a child bun that STARTS under
+ * one home (so `os.homedir()` is pinned to it), imports the module there,
+ * switches HOME to a fresh second home, and calls the creation path: the parent
+ * and the file must both be under the second home, and nothing under the first.
+ * Running it in a child keeps the starting home a temp dir.
+ */
+const SRC = join(import.meta.dir, "..", "src");
+const childDirs: string[] = [];
+
+afterAll(() => {
+  for (const d of childDirs) rmSync(d, { recursive: true, force: true });
+});
+
+/** Start a child bun under a fresh home, import `module`, switch HOME to a second fresh home, run `body`. */
+function runAfterHomeSwitch(module: string, body: (homeB: string) => string) {
+  const startHome = mkdtempSync(join(tmpdir(), "tps-home-start-"));
+  const homeB = mkdtempSync(join(tmpdir(), "tps-home-switched-"));
+  childDirs.push(startHome, homeB);
+  const script = [
+    `const mod = await import(${JSON.stringify(join(SRC, module))});`,
+    `process.env.HOME = ${JSON.stringify(homeB)};`,
+    body(homeB),
+    "process.exit(0);",
+  ].join("\n");
+  const r = spawnSync(process.execPath, ["-e", script], {
+    env: { ...process.env, HOME: startHome },
+    encoding: "utf-8",
+    timeout: 30_000, // bounded: the child exits itself, or is killed here
+  });
+  return { startHome, homeB, status: r.status, pid: r.pid, stderr: r.stderr };
+}
+
+/** The child exited 0; otherwise fail with its stderr, which names the path it could not write. */
+function expectCleanExit(r: { status: number | null; stderr: string }): void {
+  if (r.status !== 0) throw new Error(`child exited ${r.status}:\n${r.stderr}`);
+}
+
+describe("cli#439: each creation path makes the parent under the HOME it writes the file under", () => {
+  test("commands/flair-sync.ts: saveConfig creates ~/.tps under the current HOME and writes the config there", () => {
+    const keyDir = mkdtempSync(join(tmpdir(), "tps-flair-sync-key-"));
+    childDirs.push(keyDir);
+    const keyPath = join(keyDir, "anvil.key");
+    writeFileSync(keyPath, Buffer.alloc(32, 7)); // raw Ed25519 seed, outside both homes
+
+    // One local memory, absent on the remote, is pushed; the sync then saves its
+    // config (the default one, since neither home has a config yet).
+    const r = runAfterHomeSwitch(
+      "commands/flair-sync.ts",
+      () => `
+globalThis.fetch = async (input, init) => {
+  const url = String(input);
+  const method = init?.method ?? "GET";
+  if (url.endsWith("/Health")) return new Response("ok", { status: 200 });
+  if (method === "GET" && url.includes("/Memory/?agentId=anvil")) {
+    return Response.json([{ id: "m1", agentId: "anvil", content: "c", createdAt: "2026-01-02T00:00:00.000Z" }]);
+  }
+  if (method === "GET" && url.endsWith("/Memory/m1")) return new Response("", { status: 404 });
+  if (method === "PUT" && url.endsWith("/Memory/m1")) return new Response(null, { status: 204 });
+  throw new Error("unexpected fetch: " + method + " " + url);
+};
+console.log = () => {};
+await mod.runFlairSync({ once: true, keyPath: ${JSON.stringify(keyPath)} });`,
+    );
+
+    expectCleanExit(r);
+    const saved = JSON.parse(readFileSync(join(r.homeB, ".tps", "flair-sync.json"), "utf-8"));
+    expect(saved.lastSyncTimestamp).not.toBe(new Date(0).toISOString());
+    expect(existsSync(join(r.startHome, ".tps"))).toBe(false);
+  }, 40_000);
+
+  test("utils/llm-proxy.ts: startProxyDaemon creates ~/.tps/run under the current HOME and writes the pid file there", () => {
+    // Port 0: the listener takes a free port, never the default 6459.
+    const r = runAfterHomeSwitch("utils/llm-proxy.ts", () => "mod.startProxyDaemon(0);");
+
+    expectCleanExit(r);
+    expect(readFileSync(join(r.homeB, ".tps", "run", "llm-proxy.pid"), "utf-8")).toBe(`${r.pid}\n`);
+    expect(existsSync(join(r.startHome, ".tps"))).toBe(false);
+  }, 40_000);
+
+  test("utils/mail-relay.ts: runRelayDaemon creates ~/.tps under the current HOME and writes the pid file there", () => {
+    // The pid write happens before the daemon's first await: a failure rejects
+    // the promise at once; otherwise the child exits after 50 ms.
+    const r = runAfterHomeSwitch(
+      "utils/mail-relay.ts",
+      (homeB) => `
+const daemon = mod.runRelayDaemon(${JSON.stringify(join(homeB, "no-mail-dir"))});
+await Promise.race([daemon, new Promise((resolve) => setTimeout(resolve, 50))]);`,
+    );
+
+    expectCleanExit(r);
+    expect(readFileSync(join(r.homeB, ".tps", "relay.pid"), "utf-8")).toBe(`${r.pid}\n`);
+    expect(existsSync(join(r.startHome, ".tps"))).toBe(false);
+  }, 40_000);
+});
+
+/**
+ * The modules this change touches resolve the home only through the helper
+ * (`src/utils/home.ts`, and the agent package's `src/home.ts`): a direct
+ * `homedir()` call or `process.env.HOME` read in one of them fails here, so the
+ * two cannot be mixed again in the same module.
+ */
+const TOUCHED_MODULES = [
+  "src/commands/bootstrap.ts",
+  "src/commands/flair-sync.ts",
+  "src/commands/flair.ts",
+  "src/commands/office-health.ts",
+  "src/commands/pat-rotate.ts",
+  "src/commands/pulse.ts",
+  "src/commands/status.ts",
+  "src/utils/auth-proxy.ts",
+  "src/utils/flair-task-loop.ts",
+  "src/utils/llm-proxy.ts",
+  "src/utils/mail-relay.ts",
+  "../agent/src/llm/provider.ts",
+];
+
+test("cli#439: no touched module calls homedir() or reads process.env.HOME outside the helper", () => {
+  const direct = /\bhomedir\s*\(|process\.env\.HOME\b|process\.env\[\s*["'`]HOME["'`]\s*\]/;
+  const found: string[] = [];
+  for (const rel of TOUCHED_MODULES) {
+    // readFileSync throws on a moved or renamed module, so the list cannot go stale silently.
+    const lines = readFileSync(join(import.meta.dir, "..", rel), "utf-8").split("\n");
+    lines.forEach((line, i) => {
+      if (direct.test(line)) found.push(`${rel}:${i + 1}: ${line.trim()}`);
+    });
+  }
+  expect(found).toEqual([]);
 });

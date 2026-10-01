@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { sanitizeIdentifier, sanitizeFreeText, sanitizeModelIdentifier } from "../schema/sanitizer.js";
 import { workspacePath as resolveWorkspacePath, resolveTeamId, branchRoot as workspaceRoot } from "../utils/workspace.js";
 import { runCommandUnderNono } from "../utils/nono.js";
@@ -71,7 +70,7 @@ function resolveOpenClawConfigPath(teamRoot: string, workspace: string, explicit
     join(teamRoot, ".openclaw", "openclaw.json"),
     findOpenClawConfig(workspace),
     join(teamRoot, "openclaw.json"),
-    join(process.env.HOME || homedir(), ".openclaw", "openclaw.json"),
+    join(homeDir(), ".openclaw", "openclaw.json"),
   ].filter((p): p is string => Boolean(p));
 
   for (const c of candidates) {

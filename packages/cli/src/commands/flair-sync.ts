@@ -15,7 +15,6 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { homeDir } from "../utils/home.js";
@@ -54,7 +53,7 @@ function loadConfig(): FlairSyncConfig {
 }
 
 function saveConfig(cfg: FlairSyncConfig): void {
-  mkdirSync(join(homedir(), ".tps"), { recursive: true });
+  mkdirSync(join(homeDir(), ".tps"), { recursive: true });
   const tmp = configPath() + ".tmp";
   writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", "utf-8");
   renameSync(tmp, configPath());

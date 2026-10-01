@@ -21,7 +21,6 @@ import {
   renameSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { homeDir } from "../utils/home.js";
 
@@ -63,7 +62,7 @@ export interface FlairConfigFile {
 const DEFAULT_LOCAL_PORT = 9926;
 
 function tpsRoot(): string {
-  return process.env.TPS_ROOT || join(process.env.HOME || homedir(), ".tps");
+  return process.env.TPS_ROOT || join(homeDir(), ".tps");
 }
 
 function flairConfigPath(): string {
@@ -120,7 +119,7 @@ function getFlairDir(opts: HarperOpts): string {
   const dir =
     opts.flairDir ??
     process.env.FLAIR_DIR ??
-    join(homedir(), "ops/flair");
+    join(homeDir(), "ops/flair");
   const resolved = resolve(dir);
   if (!existsSync(resolved)) {
     throw new Error(
@@ -214,7 +213,7 @@ function buildPlist(flairDir: string, _dev: boolean, harperDataDir: string): str
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
-    <string>${homedir()}</string>
+    <string>${homeDir()}</string>
     <key>HARPER_SET_CONFIG</key>
     <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"],"domainSocket":"${harperDataDir}/operations-server"}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
   </dict>
@@ -266,7 +265,7 @@ export async function flairCommand(
     case "install": {
       const flairDir = getFlairDir(opts);
       mkdirSync(logDir(), { recursive: true });
-      const harperDataDir = join(homedir(), ".harper/flair");
+      const harperDataDir = join(homeDir(), ".harper/flair");
       mkdirSync(harperDataDir, { recursive: true });
       const adminToken = ensureAdminToken();
       const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir);

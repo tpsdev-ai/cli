@@ -20,7 +20,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import crypto from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
@@ -48,7 +47,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 
   if (Math.abs(now - ts) > WINDOW_MS) return null; // replay window
 
-  const pubPath = join(homedir(), ".tps", "identity", `${agentId}.pub`);
+  const pubPath = join(homeDir(), ".tps", "identity", `${agentId}.pub`);
   if (!existsSync(pubPath)) return null;
 
   try {
@@ -90,7 +89,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 type Provider = "anthropic" | "openai" | "openai-oauth" | "claude-oauth";
 
 function readSecretFile(name: string): string | null {
-  const p = join(homedir(), ".tps", "secrets", name);
+  const p = join(homeDir(), ".tps", "secrets", name);
   return existsSync(p) ? readFileSync(p, "utf-8").trim() : null;
 }
 
@@ -212,7 +211,7 @@ interface OpenAIOAuthCredentials {
 }
 
 function readOpenAIOAuthCredentials(): OpenAIOAuthCredentials | null {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const authPath = join(home, ".tps", "auth", "openai.json");
   if (!existsSync(authPath)) return null;
   try {
@@ -230,7 +229,7 @@ function readOpenAIOAuthCredentials(): OpenAIOAuthCredentials | null {
 }
 
 function writeOpenAIOAuthCredentials(creds: OpenAIOAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const authPath = join(home, ".tps", "auth", "openai.json");
   try {
     // Read existing file to preserve all fields (StoredCredentials format)
@@ -291,7 +290,7 @@ async function refreshOpenAIOAuthToken(creds: OpenAIOAuthCredentials): Promise<O
 }
 
 function syncOpenAIToCodexCli(creds: OpenAIOAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const codexHome = process.env.CODEX_HOME || join(home, ".codex");
   const candidates = [
     join(codexHome, "auth.json"),
@@ -517,7 +516,7 @@ export function startProxyDaemon(port = DEFAULT_PORT): void {
   });
 
   const { mkdirSync } = require("node:fs") as typeof import("node:fs");
-  mkdirSync(join(homedir(), ".tps", "run"), { recursive: true });
+  mkdirSync(join(homeDir(), ".tps", "run"), { recursive: true });
   writeFileSync(proxyPidPath(), `${process.pid}\n`, "utf-8");
 
   process.once("SIGTERM", () => {

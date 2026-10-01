@@ -18,7 +18,6 @@ import {
   rmSync,
 } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
@@ -97,7 +96,7 @@ export function deliverPendingMail(mailDir: string): number {
  */
 export async function runRelayDaemon(mailDir: string): Promise<void> {
   // Write PID file
-  mkdirSync(join(homedir(), ".tps"), { recursive: true });
+  mkdirSync(join(homeDir(), ".tps"), { recursive: true });
   writeFileSync(relayPidPath(), `${process.pid}\n`, "utf-8");
 
   process.on("SIGTERM", () => {
