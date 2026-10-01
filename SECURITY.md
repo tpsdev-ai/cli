@@ -16,7 +16,7 @@ TPS is a security-focused project. The following components are in scope for our
 - The cryptographic identity primitives (`packages/cli/src/utils/identity.ts`)
 - Mail signing and verification
 - The branch daemon connection state and mail handler isolation boundaries
-- Input sanitization (`packages/cli/src/utils/sanitizer.ts`) and path traversal protections
+- Input sanitization (`packages/cli/src/schema/sanitizer.ts`) and path traversal protections
 
 ## Out of Scope
 
