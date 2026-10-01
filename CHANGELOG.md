@@ -1,7 +1,7 @@
 # Changelog
 
 All notable changes to the TPS CLI are recorded here.
-All notable changes to the TPS CLI are recorded here.
+
 ## [Unreleased]
 
 ### Fixed
