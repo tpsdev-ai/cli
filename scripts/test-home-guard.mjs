@@ -20,6 +20,7 @@
  *     directory (`~/.tps`, `~/.flair`, `~/agents`, `~/.config`) or that is or
  *     contains an operator home (`$HOME` itself, `/`), and a report, log or seal
  *     path that resolves inside an operator-critical directory or is a symlink;
+ *     `assertNoReporterOutfile` refuses a caller-supplied `--reporter-outfile`;
  *     `assertSuiteName` refuses a suite name that is not a plain file-name token;
  *   - `testRootRefusal` is the preloads' root check: a TPS_TEST_ROOT that is or
  *     contains the account's home, or that no launcher vouched for and that is or
@@ -169,7 +170,7 @@ export function isolatedChildEnv(inherited, { root, token, extra = {} }) {
 /** The operator-critical directories under a home that no test run may create or delete inside. */
 export const OPERATOR_DIRS = [".tps", ".flair", "agents", ".config"];
 
-/** A refusal to run: a destination or a suite name that the launcher will not use. */
+/** A refusal to run: a destination, a suite name or a bun test argument that the launcher will not use. */
 export class IsolationRefusal extends Error {}
 
 /**
@@ -334,6 +335,23 @@ export function assertTempBase({ env = process.env, tempBase }) {
 export function assertTestDestinations({ env = process.env, tempBase, reportDir, paths = [] }) {
   assertTempBase({ env, tempBase });
   assertReportPaths({ env, reportDir, paths });
+}
+
+/**
+ * Refuse — throw IsolationRefusal — a caller-supplied `--reporter-outfile`, in
+ * either the `--reporter-outfile=<path>` or the `--reporter-outfile <path>`
+ * form: the launcher owns the report destination, and the destination checks
+ * do not check that path. `--reporter=<name>` is not refused. Call it on the
+ * bun test arguments before creating anything.
+ */
+export function assertNoReporterOutfile(args) {
+  for (const arg of args) {
+    if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
+      throw new IsolationRefusal(
+        "refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)",
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

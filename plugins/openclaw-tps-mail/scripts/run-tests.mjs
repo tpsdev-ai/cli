@@ -72,6 +72,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   IsolationRefusal,
+  assertNoReporterOutfile,
   assertReportPaths,
   assertTestDestinations,
   createIsolatedRoot,
@@ -99,26 +100,20 @@ const tempBase = tmpdir();
 
 // cli#430: refuse BEFORE creating or deleting anything — the default report dir
 // included. The temp dir (the throwaway root is created and removed there) must
-// be outside every operator home; the report dir must not be or contain an
-// operator home; the report dir and this run's report, log and seal (deleted
-// now, written later) must resolve outside ~/.tps, ~/.flair, ~/agents and
-// ~/.config and must not be symlinks.
+// be outside every operator home; the report dir is resolved (symlinks
+// followed) and refused when it resolves at or above an operator home or inside
+// ~/.tps, ~/.flair, ~/agents or ~/.config; this run's report, log and seal files
+// (deleted now, written later) must not be symlinks or resolve inside those
+// four. The launcher owns the report destination, so a caller-supplied
+// --reporter-outfile is refused too (the shared check scripts/test-suite.mjs
+// makes).
 try {
   assertTestDestinations({ env: process.env, tempBase, reportDir, paths: [reportXml, reportLog, reportSeal] });
+  assertNoReporterOutfile(process.argv.slice(2));
 } catch (err) {
   if (!(err instanceof IsolationRefusal)) throw err;
   console.error(`openclaw-tps-mail tests: ${err.message}`);
   process.exit(1);
-}
-// cli#430: the launcher owns the report destination (see scripts/test-suite.mjs);
-// refused here, before the throwaway root or any report file is created.
-for (const arg of process.argv.slice(2)) {
-  if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
-    console.error(
-      "openclaw-tps-mail tests: refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)",
-    );
-    process.exit(1);
-  }
 }
 
 // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher runs

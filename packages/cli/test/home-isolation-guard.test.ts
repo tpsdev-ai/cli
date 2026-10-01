@@ -43,6 +43,7 @@ import {
   PASSED_ENV,
   ROOT_MARKER,
   accountHome,
+  assertNoReporterOutfile,
   assertReportPaths,
   assertSuiteName,
   assertTempBase,
@@ -390,6 +391,15 @@ describe("test-home-guard: destinations and suite names", () => {
     }
     for (const bad of ["../../../.tps/identity/key", "a/b", "a\\b", "..", ".", "a..b", "x y", "", "x;y", "é"]) {
       expect(() => assertSuiteName(bad), bad).toThrow(IsolationRefusal);
+    }
+  });
+
+  test("assertNoReporterOutfile refuses both --reporter-outfile forms and passes other bun test arguments", () => {
+    for (const refused of [["--reporter-outfile=/x.xml"], ["--reporter-outfile", "/x.xml"], ["test/", "--reporter-outfile="]]) {
+      expect(() => assertNoReporterOutfile(refused), refused.join(" ")).toThrow(IsolationRefusal);
+    }
+    for (const passed of [[], ["test/"], ["--reporter=junit"], ["--reporter", "dots"], ["./x.test.ts", "--timeout", "5000"]]) {
+      expect(() => assertNoReporterOutfile(passed), passed.join(" ")).not.toThrow();
     }
   });
 });

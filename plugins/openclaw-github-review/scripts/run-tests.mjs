@@ -3,37 +3,41 @@
  * run-tests.mjs — the isolated launcher for the openclaw-github-review suite.
  *
  * WHAT IT DOES. It creates a fresh throwaway root and launches `bun test` with
- * HOME and TPS_TEST_ROOT pointing inside it. The child's environment is an
- * ALLOWLIST (cli#430, scripts/test-home-guard.mjs `isolatedChildEnv`): only the
- * named, path-free variables in `PASSED_ENV` (plus PATH) are inherited, and
- * TMPDIR/TMP/TEMP and bun's transpiler cache are set inside the root. The root is
- * passed as TPS_TEST_ROOT, with the token of the marker this launcher wrote in
- * it; the bun test preload (test/preload-guard.ts) aborts a run whose
- * os.homedir() is not under that root, or whose root is or contains the
- * account's home or is not one a launcher made — before any test module loads.
- * Before creating or deleting anything, this launcher refuses a temp dir inside
- * an operator home, a report dir that is or contains an operator home, and a
- * report dir, report, log or seal path that resolves inside ~/.tps, ~/.flair,
- * ~/agents or ~/.config or is a symlink — the default test-reports/ included —
- * and a caller-supplied `--reporter-outfile`, in either the `=` or the space
- * form (cli#438). It fails the lane on a recorded metadata difference in the
- * ~/.tps of the HOME it runs under — a diagnostic. These are launch-time checks,
- * not an OS boundary (cli#434); this launcher process itself runs under the
- * caller's environment.
+ * HOME and TPS_TEST_ROOT pointing at it. The child's environment is an
+ * ALLOWLIST (cli#430, scripts/test-home-guard.mjs `isolatedChildEnv`): the
+ * `PASSED_ENV` variables whose values are path-free, and PATH; HOME and
+ * TPS_TEST_ROOT at the root; TPS_TEST_ROOT_TOKEN, the token of the marker this
+ * launcher wrote in the root; TMPDIR/TMP/TEMP and bun's transpiler cache inside
+ * the root; and TPS_LANE_NODE (below). The bun test preload
+ * (test/preload-guard.ts) aborts a run whose os.homedir() is not under that
+ * root, whose root is or contains the account's home, or whose root has no
+ * marker matching TPS_TEST_ROOT_TOKEN — before any test module loads.
+ *
+ * Before creating or deleting anything, this launcher makes the shared checks
+ * from scripts/test-home-guard.mjs (cli#438). An operator home is the HOME it
+ * started with or the account's home. The temp dir is refused when it resolves
+ * inside an operator home. The report directory — the default test-reports/
+ * included — is resolved (symlinks followed) and refused when it resolves at or
+ * above an operator home or inside ~/.tps, ~/.flair, ~/agents or ~/.config; the
+ * report, log and seal files themselves must not be symlinks or resolve inside
+ * those four. A caller-supplied `--reporter-outfile`, in either the `=` or the
+ * space form, is refused. It fails the lane on a recorded metadata difference in
+ * the ~/.tps of the HOME it started with — a diagnostic. These are launch-time
+ * checks, not an OS boundary (cli#434); this launcher process itself runs under
+ * the caller's environment.
  *
  * USAGE
  *   node scripts/run-tests.mjs [bun test args…]   # default: `test/`
  *   TPS_TEST_KEEP_ROOT=1 node scripts/run-tests.mjs   # keep the temp root
  *
  * THE BUILD. The gateway-boundary lane loads the BUILT plugin (dist/) with
- * OpenClaw's own plugin loader, and the latch-admin test runs the built command,
- * so the build must reflect the current sources. When the plugin's
- * devDependencies are installed (its own `npm ci`), this launcher builds first
- * and refuses to run if the build fails. A tree without them — the repo's own
- * guard tests run this launcher from the cli lane, whose job installs the
- * plugin's dependencies in a later step — runs the requested tests without a
- * build; a tree that has a dist/ but no toolchain to refresh it is refused
- * rather than run against it.
+ * OpenClaw's own plugin loader, and the latch-admin test runs the built command.
+ * When the plugin's TypeScript compiler (node_modules/typescript/bin/tsc) is
+ * there, this launcher builds first and refuses to run if the build fails. When
+ * it is not, the launcher skips the build only if neither node_modules/ nor
+ * dist/ exists in the plugin directory — the tree the cli lane has when the
+ * repo's guard tests run this launcher, before the job's `npm ci` step for this
+ * plugin — and otherwise refuses to run, naming the missing compiler.
  *
  * cli#411: the run writes a JUnit report (test-reports/github-review.xml, bun
  * --reporter=junit) — the record the coverage guard reads — and the suite's
@@ -43,11 +47,11 @@
  *
  * cli#414: once bun exits, this launcher SEALS the report —
  * test-reports/github-review.xml.sha256, holding the report's SHA-256 and the
- * suite name "github-review", read back once — so a later suite cannot replace
- * it after the suite ended. The seal format is the one check-test-reports.mjs
- * parses and scripts/test-suite.mjs writes; it is spelled out here rather than
- * imported, so the two must agree. A stale seal is deleted with the report and
- * log before the run starts.
+ * suite name "github-review", read back once — so the coverage guard can detect
+ * a later overwrite of the report alone. The seal format is the one
+ * check-test-reports.mjs parses and scripts/test-suite.mjs writes; it is spelled
+ * out here rather than imported, so the two must agree. A stale seal is deleted
+ * with the report and log before the run starts.
  * The limit, stated: the seal defeats an ACCIDENTAL overwrite by a later step in
  * the same job; it is not a defence against code in the same job that rewrites
  * the report and the seal together — that code shares the job's filesystem, and
@@ -59,12 +63,13 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   IsolationRefusal,
+  assertNoReporterOutfile,
   assertReportPaths,
   assertTestDestinations,
   createIsolatedRoot,
@@ -90,32 +95,26 @@ const tempBase = tmpdir();
 
 // cli#438 (cli#430's checks): refuse BEFORE creating or deleting anything — the
 // default report dir included. The temp dir (the throwaway root is created and
-// removed there) must be outside every operator home; the report dir must not be
-// or contain an operator home; the report dir and this run's report, log and
-// seal (deleted now, written later) must resolve outside ~/.tps, ~/.flair,
-// ~/agents and ~/.config and must not be symlinks.
+// removed there) must be outside every operator home; the report dir is resolved
+// (symlinks followed) and refused when it resolves at or above an operator home
+// or inside ~/.tps, ~/.flair, ~/agents or ~/.config; this run's report, log and
+// seal files (deleted now, written later) must not be symlinks or resolve inside
+// those four. The launcher owns the report destination, so a caller-supplied
+// --reporter-outfile is refused too (the shared check scripts/test-suite.mjs
+// makes).
 try {
   assertTestDestinations({ env: process.env, tempBase, reportDir, paths: [reportXml, reportLog, reportSeal] });
+  assertNoReporterOutfile(process.argv.slice(2));
 } catch (err) {
   if (!(err instanceof IsolationRefusal)) throw err;
   console.error(`openclaw-github-review tests: ${err.message}`);
   process.exit(1);
 }
-// cli#430: the launcher owns the report destination (see scripts/test-suite.mjs);
-// refused here, before the throwaway root or any report file is created.
-for (const arg of process.argv.slice(2)) {
-  if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
-    console.error(
-      "openclaw-github-review tests: refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)",
-    );
-    process.exit(1);
-  }
-}
 
-// cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher runs
-// under, taken before anything is written. A DIAGNOSTIC: the run fails on a
-// recorded metadata difference at the end (path, size, mtime, ctime, inode —
-// never contents).
+// cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher
+// started with, taken before anything is written. A DIAGNOSTIC: the run fails
+// on a recorded metadata difference at the end (path, size, mtime, ctime, inode
+// — never contents).
 const guardHome = process.env.HOME || homedir();
 const tpsBefore = snapshotTps(guardHome);
 
@@ -128,8 +127,21 @@ rmSync(reportSeal, { force: true });
 // The log is created exclusively, before any test code runs.
 const logStream = createWriteStream("", { fd: openSync(reportLog, "wx") });
 
-const tsc = join(pluginDir, "node_modules", "typescript", "bin", "tsc");
-const distEntry = join(pluginDir, "dist", "src", "index.js");
+// THE BUILD (see the header). With tsc: build, and refuse a failed build.
+// Without it: skip the build only when neither node_modules/ nor dist/ exists
+// (anything at either path counts, a dangling symlink included); otherwise
+// refuse, naming what is missing.
+const nodeModules = join(pluginDir, "node_modules");
+const dist = join(pluginDir, "dist");
+const tsc = join(nodeModules, "typescript", "bin", "tsc");
+const present = (path) => {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
 if (existsSync(tsc)) {
   const build = spawnSync(process.execPath, [tsc, "-p", "tsconfig.json"], { cwd: pluginDir, stdio: "inherit" });
   if (build.status !== 0) {
@@ -137,22 +149,23 @@ if (existsSync(tsc)) {
     console.error(`openclaw-github-review tests: build failed (exit ${build.status}); refusing to run the suite`);
     process.exit(1);
   }
-} else if (existsSync(distEntry)) {
-  logStream.end();
-  console.error(
-    `openclaw-github-review tests: ${tsc} is missing, so the build cannot be refreshed; refusing to run the suite against ${distEntry}. Install the plugin's devDependencies (npm ci) and re-run.`,
-  );
-  process.exit(1);
 } else {
-  console.error(`openclaw-github-review tests: no plugin install at ${join(pluginDir, "node_modules")}: running the requested tests without a build`);
+  const found = [nodeModules, dist].filter(present);
+  if (found.length > 0) {
+    logStream.end();
+    console.error(
+      `openclaw-github-review tests: refusing to run the suite — the TypeScript compiler ${tsc} is missing, but ${found.join(" and ")} ${found.length > 1 ? "exist" : "exists"}, so the build cannot run. The build is skipped only when neither node_modules/ nor dist/ exists. Install the plugin's devDependencies (npm ci in ${pluginDir}) and re-run.`,
+    );
+    process.exit(1);
+  }
+  console.error(`openclaw-github-review tests: neither ${nodeModules} nor ${dist} exists: running the requested tests without a build`);
 }
 
 // The throwaway root (realpath'd: on macOS /tmp is a symlink to /private/tmp,
-// and the guard compares realpaths so a symlinked tmpdir still counts as inside).
+// and the guards compare realpaths).
 const { root, token } = createIsolatedRoot(tempBase);
 
-// Child env: the ALLOWLIST (cli#430) plus the launch-time values this launcher
-// owns — an ambient TPS_TEST_ROOT or TPS_LANE_NODE never reaches the child.
+// Child env: the ALLOWLIST (cli#430) plus the values this launcher sets.
 const { env, dropped } = isolatedChildEnv(process.env, { root, token, extra: { TPS_LANE_NODE: process.execPath } });
 if (dropped.length > 0) {
   console.error(`openclaw-github-review tests: not passed to the tests (not on the allowlist): ${dropped.join(", ")}`);

@@ -8,17 +8,17 @@
  *   2. `os.homedir()` resolves (realpath, so symlinks count) inside that root;
  *   3. the root is not, and does not contain, the account's home from the user
  *      database (os.userInfo().homedir) — whatever HOME says;
- *   4. the root is not, and does not contain, the HOME this process runs under
- *      unless the launcher (scripts/run-tests.mjs) vouched for it:
- *      TPS_TEST_ROOT_TOKEN matches the marker it wrote in the root it created.
+ *   4. the root is not, and does not contain, the HOME this process runs
+ *      under, unless the root has a marker matching TPS_TEST_ROOT_TOKEN (the
+ *      launcher, scripts/run-tests.mjs, writes one in the root it creates).
  *      So a bare `bun test` — including one with TPS_TEST_ROOT=$HOME — is
  *      refused.
- * (Rules 3 and 4 are the shared scripts/test-home-guard.mjs `testRootRefusal`;
- * this plugin's tests run only inside the monorepo.)
+ * (Rules 3 and 4 are the shared `testRootRefusal` from the monorepo's
+ * scripts/test-home-guard.mjs.)
  *
  * WHAT IT IS NOT. A launch-time check, not an OS boundary: a caller who forges
- * the launcher's marker and token, or code that ignores HOME, can still reach
- * the real home (the OS-enforced boundary is cli#434).
+ * the marker and token, or code that ignores HOME, can still reach an operator
+ * home (the OS-enforced boundary is cli#434).
  */
 import { realpathSync } from "node:fs";
 import { homedir } from "node:os";

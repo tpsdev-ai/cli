@@ -88,6 +88,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   IsolationRefusal,
+  assertNoReporterOutfile,
   assertReportPaths,
   assertSuiteName,
   assertTestDestinations,
@@ -185,26 +186,21 @@ export function runSuite({
   // report's file name (reportPaths/sealPath check it too). Then every
   // destination, the default report dir included: the temp dir (where the
   // throwaway root is created and later removed) must be outside every operator
-  // home; the report dir must not be or contain an operator home; the report dir
-  // and this suite's report, log and seal (deleted now, written later) must
-  // resolve outside ~/.tps, ~/.flair, ~/agents and ~/.config and must not be
-  // symlinks. Throws IsolationRefusal.
+  // home; the report dir is resolved (symlinks followed) and refused when it
+  // resolves at or above an operator home or inside ~/.tps, ~/.flair, ~/agents
+  // or ~/.config; this suite's report, log and seal files (deleted now, written
+  // later) must not be symlinks or resolve inside those four. Throws
+  // IsolationRefusal.
   assertSuiteName(suite);
   const { xml, log } = reportPaths(suite, reportDir);
   const seal = sealPath(suite, reportDir);
   assertTestDestinations({ env, tempBase, reportDir, paths: [xml, log, seal] });
 
   // cli#430: the launcher owns the report destination. A caller-supplied
-  // --reporter-outfile would pick a path none of the checks above saw, so it is
-  // refused before anything is created (--reporter=<name> stays allowed). Thrown,
-  // not exited on, so a direct caller of runSuite can catch it; main() prints it.
-  for (const arg of args) {
-    if (arg === "--reporter-outfile" || arg.startsWith("--reporter-outfile=")) {
-      throw new IsolationRefusal(
-        "refusing --reporter-outfile: the launcher owns the report destination (set TPS_TEST_REPORT_DIR instead)",
-      );
-    }
-  }
+  // --reporter-outfile is refused before anything is created, by the shared
+  // check (--reporter=<name> stays allowed). Thrown, not exited on, so a direct
+  // caller of runSuite can catch it; main() prints it.
+  assertNoReporterOutfile(args);
 
   // cli#430: the metadata snapshot of the ~/.tps under the HOME this launcher
   // runs under, taken before this launcher writes anything. A DIAGNOSTIC: the
