@@ -1,26 +1,39 @@
 /**
- * mail-watch — watch an agent's inbox for new messages and run exec hooks.
+ * mail-watch — watch an agent's inbox and run exec hooks on new mail.
  *
- * OPS-121: mail watcher using fs.watch + debounce for low-latency delivery,
- * backed by a low-frequency poll fallback. fs.watch (FSEvents on macOS) goes
- * deaf after uptime, so it can't be the sole trigger — the poll guarantees
- * delivery and lets a (re)start recover any mail stranded in new/. Near-zero
- * idle CPU; reliability over strictly-zero-CPU.
+ * OPS-121: fs.watch + debounce for low-latency delivery, backed by a
+ * low-frequency poll fallback. fs.watch (FSEvents on macOS) goes deaf after
+ * uptime, so it can't be the sole trigger — the poll keeps delivery going.
+ * Near-zero idle CPU.
  *
  * Security mitigations (K&S):
  * - exec hooks use args[] array, no shell interpolation
  * - agent IDs validated: ^[a-zA-Z0-9._-]+$
- * - ENOENT grace on metadata read (file may move to cur/ before read)
  * - max 3 concurrent handlers
+ *
+ * NON-CONSUMING (cli#375): the watcher verifies each record in `new/` IN PLACE
+ * with the same verification `promote()` applies, and presents ONLY records
+ * that verify. It calls no consumer path — no promote, no lease, no ack, no
+ * `checkMessages` — and never moves a record out of `new/`. A record that does
+ * not verify is skipped and logged; it is never presented.
+ *
+ * Hook contract:
+ * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
+ *   written to the hook as UTF-8);
+ * - the four mail variables the watcher sets come from VERIFIED fields:
+ *   TPS_MAIL_ID (the verified envelope id), TPS_MAIL_FROM, TPS_MAIL_TO (the
+ *   watched agent) and TPS_MAIL_TIMESTAMP. The hook process also inherits the
+ *   watcher's environment (plus any `env` on the hook), so those four are the
+ *   only mail variables this module vouches for.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch as fsWatch, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { homedir, platform } from "node:os";
 import { execSync, spawn } from "node:child_process";
+import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, platform } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getInbox } from "../utils/mail.js";
 import type { MailMessage } from "../utils/mail.js";
+import { getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +69,18 @@ export interface MailWatchOptions {
    * swallowed: a heartbeat failure must never crash the mail loop.
    */
   onPoll?: () => void | Promise<void>;
+  /**
+   * Test seam: awaited before each record's `verifyRecordForMailbox` call. It can
+   * delay that call but not replace it: its return value is ignored, and a throw
+   * withholds the record as a verification error does.
+   */
+  beforeVerify?: () => Promise<void>;
+  /**
+   * Test seam: the fs.watch implementation. Defaults to node's `fs.watch`. A
+   * test that must prove the POLL path alone passes a no-op here, so no fs
+   * event can deliver the mail it writes.
+   */
+  watchImpl?: (dir: string, listener: () => void) => { close(): void };
 }
 
 // ---------------------------------------------------------------------------
@@ -73,34 +98,75 @@ export function validateAgentId(agentId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Message reading (ENOENT-safe)
+// Reading `new/` for verification (cli#375)
 // ---------------------------------------------------------------------------
+//
+// `new/` is listed and each record is verified IN PLACE through
+// `verifyRecordForMailbox` — the same policy `promote()` applies — so an
+// unverified record is never handed on.
 
-function readMessageSafe(filePath: string): MailMessage | null {
+/**
+ * Filenames (`*.json`) directly under `dir`; `[]` when `dir` is absent, and
+ * `null` when the LISTING FAILS (a read error). The two are distinct: an absent
+ * or empty `new/` means no files, but a failed listing must not be read as
+ * "every file left" (see processNew).
+ */
+function listNewFiles(dir: string): string[] | null {
   try {
-    const raw = readFileSync(filePath, "utf-8");
-    return JSON.parse(raw) as MailMessage;
-  } catch (err: unknown) {
-    // ENOENT: file moved to cur/ between readdir and read — expected race
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    // JSON parse error: corrupt file — log and skip instead of crashing
-    if (err instanceof SyntaxError) {
-      console.error(`[mail-watch] skipping corrupt message ${filePath}: ${err.message}`);
-      return null;
-    }
-    throw err;
+    return readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
   }
 }
 
-function listNewFiles(freshDir: string): string[] {
-  if (!existsSync(freshDir)) return [];
+/**
+ * Read one `new/` record. `gone` when the file no longer exists (ENOENT after
+ * the listing), `read-error` for any other failure to read it, and `corrupt`
+ * when its contents are not a JSON object.
+ */
+type NewRecordRead =
+  | { kind: "record"; record: MailMessage }
+  | { kind: "gone" }
+  | { kind: "read-error"; detail: string }
+  | { kind: "corrupt" };
+
+function readNewRecord(filePath: string): NewRecordRead {
+  let raw: string;
   try {
-    return readdirSync(freshDir)
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => join(freshDir, f));
-  } catch {
-    return [];
+    raw = readFileSync(filePath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "gone" };
+    return { kind: "read-error", detail: code ?? (err instanceof Error ? err.message : String(err)) };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "corrupt" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "corrupt" };
+  return { kind: "record", record: parsed as MailMessage };
+}
+
+/**
+ * Project a VERIFIED message to the fields a hook/onMessage may see: the
+ * verified envelope fields, plus the local `read` flag (always false here). `id`
+ * is the VERIFIED envelope id (never the unsigned wrapper id), and the unsigned
+ * wrapper fields the source file carried — `headers` above all — are dropped.
+ */
+function projectVerified(m: MailMessage): MailMessage {
+  const out: MailMessage = {
+    id: m.envelopeId as string,
+    from: m.from,
+    to: m.to,
+    body: m.body,
+    timestamp: m.timestamp,
+    read: false,
+  };
+  if (m.envelopeId !== undefined) out.envelopeId = m.envelopeId;
+  if (m.replyToId !== undefined) out.replyToId = m.replyToId;
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +174,9 @@ function listNewFiles(freshDir: string): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Run a hook for a single message.
- * Passes message metadata via env vars; body via stdin.
+ * Run a hook for a single VERIFIED message.
+ * Writes the verified body to stdin and sets the four TPS_MAIL_* variables from
+ * verified fields (the rest of the environment is inherited).
  * No shell interpolation — args passed directly to spawn().
  */
 function runHook(hook: WatchExecHook, msg: MailMessage): Promise<void> {
@@ -156,43 +223,144 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   let stopped = false;
   let activeHandlers = 0;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  const seen = new Set<string>();
 
   const inbox = getInbox(opts.agent);
 
-  // NOTE: we intentionally do NOT pre-populate `seen` with files already in
-  // new/. new/ holds UNDELIVERED mail — the exec hook moves delivered mail to
-  // cur/ on ack — so anything present at (re)start must be delivered. Marking
-  // it seen on boot is what made a mail-watch kickstart silently strand stuck
-  // dispatches (and forced re-dispatches, which double-posted K&S reviews).
-  const processNew = async () => {
-    if (stopped) return;
-    for (const filePath of listNewFiles(inbox.fresh)) {
-      if (seen.has(filePath)) continue;
-      // Check the concurrency cap BEFORE marking seen. If we're at the limit,
-      // leave the file UNSEEN so the next pass (poll or fs event) retries it.
-      // The old order marked it seen and THEN dropped it → never delivered.
-      if (activeHandlers >= maxConcurrent) continue;
-      seen.add(filePath);
+  // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
+  // came from. Within ONE watcher instance an entry is dropped only when a scan
+  // observes that file absent from `new/`; while the file stays, it is presented
+  // once.
+  const presented = new Map<string, string>();
+  // Files already classified this residence (presented, or skipped as
+  // unverifiable), keyed on the filename, so a later pass does not re-verify or
+  // re-log a file still sitting in `new/`. Dropped when the file leaves `new/`.
+  const classified = new Map<string, string>();
 
-      const msg = readMessageSafe(filePath);
-      if (!msg) continue; // moved to cur/ before we could read — skip
+  // Verified records waiting for a free slot. The concurrency cap must hold
+  // WITHOUT dropping the rest, so over-cap records wait here and are delivered
+  // as slots free.
+  const pending: MailMessage[] = [];
+  let checking = false;
+  // A processNew call while a scan is active sets ONE pending rescan (a flag,
+  // not a queue), run when that scan finishes.
+  let rescan = false;
+
+  const drain = () => {
+    while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
+      const msg = pending.shift();
+      if (msg === undefined) break;
+      // The callback and the hook each get their own copy, so the callback
+      // cannot change what the hook receives.
+      const forCallback = structuredClone(msg);
+      const forHook = structuredClone(msg);
       activeHandlers++;
-
       (async () => {
         try {
-          if (opts.onMessage) await opts.onMessage(msg);
+          if (opts.onMessage) await opts.onMessage(forCallback);
         } catch { /* callback errors don't crash the watcher */ }
         try {
-          if (opts.hook) await runHook(opts.hook, msg);
+          if (opts.hook) await runHook(opts.hook, forHook);
         } catch { /* hook errors don't crash the watcher */ }
       })().finally(() => {
         activeHandlers--;
-        // A slot just freed — immediately re-check for mail that was over the
-        // concurrency cap on a prior pass, so a burst drains as slots cycle
-        // instead of waiting for the next fs event or poll.
-        if (!stopped) void processNew();
+        if (!stopped) drain();
       });
+    }
+  };
+
+  // Verify each record in `new/` IN PLACE and queue ONLY the records that
+  // verify. Nothing is moved, leased or acked. A record that does not verify is
+  // logged and skipped, never presented.
+  const processNew = async () => {
+    if (stopped) return;
+    if (checking) { rescan = true; return; }
+    checking = true;
+    try {
+      const files = listNewFiles(inbox.fresh);
+      if (files === null) {
+        // The listing FAILED. A failed read is not "every file left": keep the
+        // dedup state so a still-present file is not presented twice when the
+        // listing recovers.
+        console.error("[mail-watch] cannot list new/; keeping the current dedup state");
+        return;
+      }
+      const present = new Set(files);
+      // Forget records whose file has left `new/`.
+      for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
+      for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
+
+      for (const file of files) {
+        if (classified.has(file)) continue;
+        const path = join(inbox.fresh, file);
+        const read = readNewRecord(path);
+        // Removed after the listing: nothing to present, and not classified.
+        if (read.kind === "gone") continue;
+        if (read.kind === "read-error") {
+          // A read ERROR is not a verdict: withhold it WITHOUT classifying it.
+          console.error(
+            `[mail-watch] ${opts.agent}: ${file} not presented — cannot read ${path} (${read.detail}); ` +
+              "the file is left untouched and is retried on the next scan if it remains in new/. " +
+              "Remedy: make that path readable by this user.",
+          );
+          continue;
+        }
+        if (read.kind === "corrupt") {
+          classified.set(file, "corrupt");
+          console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
+          continue;
+        }
+        const record = read.record;
+        let result: VerifyRecordResult;
+        try {
+          if (opts.beforeVerify) await opts.beforeVerify();
+          result = await verifyRecordForMailbox(opts.agent, record);
+        } catch (err) {
+          // A verification ERROR — Flair unreachable, or a malformed envelope
+          // structure — is not a verdict. The record is withheld and logged, and
+          // the next pass tries again (do NOT mark it classified).
+          console.error(
+            `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
+          );
+          continue;
+        }
+        if (!result.ok) {
+          classified.set(file, `refused:${result.class}`);
+          console.error(`[mail-watch] ${record.id}: not presented (${result.class}: ${result.reason})`);
+          continue;
+        }
+        const envId = result.message.envelopeId;
+        if (envId === undefined) {
+          classified.set(file, "refused:no-envelope-id");
+          continue;
+        }
+        // Skip a verified record whose id the consumed history holds. When that
+        // history cannot be read, withhold the record WITHOUT classifying it.
+        let consumed: boolean;
+        try {
+          consumed = isConsumedForMailbox(opts.agent, envId);
+        } catch (err) {
+          console.error(
+            `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
+              "the file is left untouched and is retried on the next scan if it remains in new/. " +
+              "Remedy: make that path readable by this user.",
+          );
+          continue;
+        }
+        if (consumed) {
+          classified.set(file, "already-consumed");
+          console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
+          continue;
+        }
+        classified.set(file, "presented");
+        // Dedup on the VERIFIED envelope id.
+        if (presented.has(envId)) continue;
+        presented.set(envId, file);
+        pending.push(projectVerified(result.message));
+      }
+    } finally {
+      checking = false;
+      drain();
+      if (rescan && !stopped) { rescan = false; void processNew(); }
     }
   };
 
@@ -204,11 +372,11 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   };
 
   // fs.watch on new/ fires on file create/rename — low-latency, but fs.watch
-  // (FSEvents on macOS) silently stops emitting after uptime, which strands
-  // mail. So treat fs.watch as a latency optimization, NOT the source of truth:
-  // a low-frequency poll guarantees delivery even if the watcher goes deaf.
-  // Reliability > idle CPU for the review/mail pipeline.
-  const watcher = fsWatch(inbox.fresh, onFsEvent);
+  // (FSEvents on macOS) silently stops emitting after uptime. So treat fs.watch
+  // as a latency optimization, NOT the source of truth: the low-frequency poll
+  // keeps delivery going even if the watcher goes deaf.
+  const watchImpl = opts.watchImpl ?? ((dir: string, listener: () => void) => fsWatch(dir, listener));
+  const watcher = watchImpl(inbox.fresh, onFsEvent);
   const pollMs = opts.pollMs ?? 15_000;
 
   // Liveness heartbeat — fire once per GUARANTEED poll cycle (not the fs-event

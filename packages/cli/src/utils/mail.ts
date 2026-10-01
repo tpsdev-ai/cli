@@ -1,17 +1,17 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
-import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
+import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
-import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
 // (which imports this module) applies the same rule the CLI does.
-export { isValidEnvelopeId, ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+export { ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 
 export interface MailMessage {
   id: string;
@@ -80,8 +80,13 @@ export function assertValidBody(body: string): void {
   }
 }
 
+/** The mail directory path, without creating it. */
+function mailDirPath(): string {
+  return process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+}
+
 export function getMailDir(): string {
-  const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const dir = mailDirPath();
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -103,14 +108,19 @@ export function inboxExists(agent: string): boolean {
   return existsSync(join(getMailDir(), agent));
 }
 
-export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
+/** The mailbox root `getInbox` uses, resolved without creating anything. */
+function mailboxRoot(agent: string): string {
   assertValidAgentId(agent);
 
   // Branch-office compatibility: if this agent has a local branch-office mail root,
   // prefer that over ~/.tps/mail/<agent>. This keeps `tps mail check <agent>` aligned
   // with branch delivery paths used by relay/deliverToSandbox.
   const branchMailRoot = join(process.env.HOME || homedir(), ".tps", "branch-office", agent, "mail");
-  const root = existsSync(branchMailRoot) ? branchMailRoot : join(getMailDir(), agent);
+  return existsSync(branchMailRoot) ? branchMailRoot : join(mailDirPath(), agent);
+}
+
+export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
+  const root = mailboxRoot(agent);
   const tmp = join(root, "tmp");
   const fresh = join(root, "new");
   const cur = join(root, "cur");
@@ -535,23 +545,12 @@ function recordConsumedMessageId(root: string, messageId: string): void {
 }
 
 /**
- * Read the durable ledger, dropping entries older than the retention. Returns
- * the live id set. When pruning actually removed something the ledger is
- * rewritten in place (atomic replace) so the file stays bounded by age.
+ * Parse ledger text into the live id set (entries older than `cutoff` are
+ * dropped), the lines to keep, and how many lines were dropped. Both ledger
+ * readers use it, so they agree on which ids are live.
  */
-function readConsumedLedger(root: string): Set<string> {
-  const path = consumedLedgerPath(root);
+function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
-  if (!existsSync(path)) return ids;
-
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch {
-    return ids;
-  }
-
-  const cutoff = Date.now() - CONSUMED_LEDGER_RETENTION_MS;
   const kept: string[] = [];
   let pruned = 0;
   for (const line of raw.split("\n")) {
@@ -588,7 +587,30 @@ function readConsumedLedger(root: string): Set<string> {
     ids.add(id);
     kept.push(line);
   }
+  return { ids, kept, pruned };
+}
 
+/**
+ * Read the durable ledger, dropping entries older than the retention. Returns
+ * the live id set. When pruning actually removed something the ledger is
+ * rewritten in place (atomic replace) so the file stays bounded by age.
+ *
+ * The replace drops any line appended between the read and the rename, so call
+ * this only while holding the mailbox lock (as promote() does). A reader that
+ * does not hold the lock uses peekConsumedLedger.
+ */
+function readConsumedLedger(root: string): Set<string> {
+  const path = consumedLedgerPath(root);
+  if (!existsSync(path)) return new Set<string>();
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return new Set<string>();
+  }
+
+  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
   if (pruned > 0) {
     try {
       const tmp = `${path}.tmp`;
@@ -601,6 +623,46 @@ function readConsumedLedger(root: string): Set<string> {
   return ids;
 }
 
+/** A read error on consumed history, naming the path that could not be read. */
+function unreadableHistory(path: string, err: unknown): Error {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  const detail = code ?? (err instanceof Error ? err.message : String(err));
+  return new Error(`consumed history at ${path} is unreadable (${detail})`);
+}
+
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/**
+ * Read the ledger without changing it: the live id set readConsumedLedger would
+ * return, or null when there is no ledger file. Throws when the ledger exists
+ * but cannot be read. It never writes, renames or prunes.
+ */
+function peekConsumedLedger(root: string): Set<string> | null {
+  const path = consumedLedgerPath(root);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    if (isMissing(err)) return null;
+    throw unreadableHistory(path, err);
+  }
+  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
+}
+
+/**
+ * Does this maildir record carry the envelope messageId? Counts both the
+ * persisted `envelopeId` and, for legacy records, a body that is itself a
+ * signed envelope.
+ */
+function recordCarriesMessageId(msg: MailMessage, messageId: string): boolean {
+  if (msg.envelopeId === messageId) return true;
+  const parsed = tryParseEnvelope(msg.body);
+  if (parsed === "json-parse-error" || parsed === "missing-fields") return false;
+  return (parsed as { messageId?: unknown }).messageId === messageId;
+}
+
 /**
  * Has this envelope messageId already been consumed?
  *
@@ -610,6 +672,9 @@ function readConsumedLedger(root: string): Set<string> {
  * upgrade does not open a window for records already on disk. Counts both the
  * persisted `envelopeId` and, for legacy records, a body that is itself a
  * signed envelope. This is the gate on replay of consumed history.
+ *
+ * It reads the ledger through readConsumedLedger, which may rewrite the ledger:
+ * call it only while holding the mailbox lock.
  */
 function isConsumedMessageId(root: string, messageId: string): boolean {
   if (readConsumedLedger(root).has(messageId)) return true;
@@ -627,17 +692,66 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
       if (!entry.name.endsWith(".json")) continue;
       try {
         const msg = JSON.parse(readFileSync(full, "utf-8")) as MailMessage;
-        if (msg.envelopeId === messageId) return true;
-        const parsed = tryParseEnvelope(msg.body);
-        if (parsed !== "json-parse-error" && parsed !== "missing-fields") {
-          if ((parsed as { messageId?: unknown }).messageId === messageId) return true;
-        }
+        if (recordCarriesMessageId(msg, messageId)) return true;
       } catch {
         // skip corrupt records
       }
     }
   }
   return false;
+}
+
+/**
+ * The maildir fallback of isConsumedMessageId: a directory or record that does
+ * not exist is skipped, a corrupt record is skipped (as
+ * isConsumedMessageId skips it), and any other read error throws.
+ */
+function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
+  const stack = [join(root, "cur"), join(root, "archive")];
+  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (isMissing(err)) continue;
+      throw unreadableHistory(dir, err);
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".json")) continue;
+      let raw: string;
+      try {
+        raw = readFileSync(full, "utf-8");
+      } catch (err) {
+        if (isMissing(err)) continue; // removed after the listing
+        throw unreadableHistory(full, err);
+      }
+      try {
+        if (recordCarriesMessageId(JSON.parse(raw) as MailMessage, messageId)) return true;
+      } catch {
+        // corrupt record — skipped, as isConsumedMessageId skips it
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Replay lookup for a reader that does not hold the mailbox lock (mail watch):
+ * true when this envelope messageId is in the consumed ledger or, failing that,
+ * in the maildir fallback — the history isConsumedMessageId consults. It writes,
+ * renames, prunes and creates nothing. A missing ledger file counts as an empty
+ * ledger; a ledger or maildir that cannot be read THROWS, and the caller must
+ * withhold the record.
+ */
+export function isConsumedForMailbox(agent: string, messageId: string): boolean {
+  const root = mailboxRoot(agent);
+  if (peekConsumedLedger(root)?.has(messageId)) return true;
+  return maildirHistoryHasMessageId(root, messageId);
 }
 
 type EnvelopeBinding =
@@ -859,6 +973,55 @@ async function decideEnvelopeForMailbox(
   return { ok: true, envelope };
 }
 
+export type VerifyRecordResult =
+  | { ok: true; message: MailMessage }
+  | { ok: false; class: PromoteRejectClass; reason: string };
+
+/**
+ * Verify ONE record IN PLACE: the checks `promote()` applies to a `new/`
+ * record — the inner signed envelope, plus the shared `decideEnvelopeForMailbox`
+ * bindings (the wrapper SENDER against the signed sender, and the signed
+ * recipient against the mailbox; not every wrapper field is compared). It moves,
+ * leases and writes NOTHING.
+ *
+ * Returns the verified message, or the refusal class and reason. Throws on a
+ * verification ERROR — Flair unreachable, or a malformed envelope structure —
+ * which callers withhold and retry, not a verdict.
+ */
+export async function verifyRecordForMailbox(
+  agent: string,
+  record: MailMessage,
+  verify: MailVerifyConfig = {},
+): Promise<VerifyRecordResult> {
+  const parsed = tryParseEnvelope(record.body);
+  if (parsed === "json-parse-error") {
+    return { ok: false, class: "invalid", reason: "body is not JSON (signed envelope required)" };
+  }
+  if (parsed === "missing-fields") {
+    return { ok: false, class: "invalid", reason: "body is not a v1 signed envelope" };
+  }
+  if (typeof parsed.body !== "string") {
+    return { ok: false, class: "invalid", reason: "envelope body is not a string" };
+  }
+  const envelope = parsed as unknown as Envelope;
+  const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, verify);
+  if (!decision.ok) return { ok: false, class: decision.class, reason: decision.reason };
+  return {
+    ok: true,
+    message: {
+      ...record,
+      from: envelope.from,
+      to: envelope.to,
+      body: envelope.body,
+      timestamp: envelope.timestamp,
+      read: false,
+      envelopeId: envelope.messageId,
+      envelope,
+      replyToId: envelope.replyToId,
+    },
+  };
+}
+
 /**
  * THE enforcer. Move one record to cur/ ONLY if its envelope verifies AND is
  * addressed to this mailbox AND has not already been consumed. Otherwise
@@ -884,26 +1047,15 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     return { ok: false, class: "invalid", reason };
   }
 
-  // Step 1: parse wrapper → parse envelope.
-  const parsed = tryParseEnvelope(msg.body);
-  if (parsed === "json-parse-error") {
-    const reason = "body is not JSON (signed envelope required)";
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-  if (parsed === "missing-fields") {
-    const reason = "body is not a v1 signed envelope";
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-  const envelope = parsed as unknown as Envelope;
-
-  // Step 2: run the SHARED mailbox policy (signature, wrapper→envelope from
-  // binding, recipient binding, messageId shape). This is the SAME list
-  // recoverPromoted runs, so the two paths cannot diverge.
-  let decision: EnvelopePolicyResult;
+  // Step 1+2: the SHARED record verification (parse the envelope, and run the
+  // ONE mailbox policy: signature, wrapper-sender↔signed-sender binding,
+  // recipient binding, messageId/replyToId shapes, timestamp shape). The wrapper
+  // was parsed above.
+  // This is the SAME function the non-consuming `mail watch` reader calls, so
+  // the two cannot diverge. `promote` adds the move below.
+  let verified: VerifyRecordResult;
   try {
-    decision = await decideEnvelopeForMailbox(agent, envelope, msg.from, verify);
+    verified = await verifyRecordForMailbox(agent, msg, verify);
   } catch (err: any) {
     // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
     // later check re-drive it, so an outage self-heals when Flair returns.
@@ -911,10 +1063,11 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     rejectToDlq(dirs, filename, filePath, "verify-unavailable", reason);
     return { ok: false, class: "verify-unavailable", reason };
   }
-  if (!decision.ok) {
-    rejectToDlq(dirs, filename, filePath, decision.class, decision.reason);
-    return { ok: false, class: decision.class, reason: decision.reason };
+  if (!verified.ok) {
+    rejectToDlq(dirs, filename, filePath, verified.class, verified.reason);
+    return { ok: false, class: verified.class, reason: verified.reason };
   }
+  const envelope = verified.message.envelope as Envelope;
 
   // Step 3: acquire the per-mailbox lock. It spans the replay check AND the
   // promotion commit/rollback (the ledger prune and append included): two
