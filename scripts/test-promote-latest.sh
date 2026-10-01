@@ -80,8 +80,8 @@ argv: <stderr-file> <command> [args...]
 The command's stdout is the pty slave (a TTY), its stderr is the given file and
 its stdin is inherited. The pty's bytes are forwarded to this process's stdout,
 and this process exits with the command's status. When PTY_PIDFILE is set, the
-command's pid is written there before it runs, so a caller can signal the command
-itself instead of this wrapper.
+command's pid is written there first, so a caller can signal the command itself
+rather than this wrapper.
 """
 import os
 import subprocess

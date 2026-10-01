@@ -141,8 +141,8 @@ together; the script refuses if any is not published at VERSION.
                       downgrade) or a pre-release. `--yes` does NOT imply this.
   --help              Show this help.
 
-Each package's move runs `npm dist-tag add` with this terminal attached, so npm
-can open a browser 2FA prompt; approve each package as it appears.
+Each move runs `npm dist-tag add` with this terminal attached, so npm may open a
+browser 2FA prompt; approve each prompt as it appears.
 
 Environment: NPM_BIN (default `npm`); NPM_REGISTRY (default
 https://registry.npmjs.org) pins every npm call.
