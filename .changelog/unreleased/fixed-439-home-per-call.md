@@ -4,8 +4,9 @@
   `process.env.HOME || homedir()`, and `flair`, `flair-sync`, `pat-rotate`,
   `pulse`, `flair-task-loop`, `llm-proxy` and `mail-relay` from `homedir()`, so
   a test or a long-lived process that changed `HOME` afterwards kept the path
-  from the import. These modules now ask the shared `homeDir()` helper — `HOME`
-  when set and non-empty, else `os.homedir()` — where they use a path, and no
+  from the import. The CLI modules now ask the CLI `homeDir()` helper, and
+  `llm/provider` asks the matching agent helper — each returns `HOME` when set
+  and non-empty, else `os.homedir()` — where they use a path, and no
   longer call `homedir()` or read `HOME` themselves: `flair-sync`, `llm-proxy`
   and `mail-relay` now create a directory under the same home as the file they
   write into it.
