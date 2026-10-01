@@ -23,8 +23,8 @@
  * CODE and have adopted the shape cli#415 gave `test.yml`:
  *
  *   - `test.yml` — guarded (runs on `pull_request`).
- *   - `docker.yml` — NOT guarded: triggered by `workflow_dispatch` only, so it
- *     never runs on a pull request.
+ *   - `docker.yml` — NOT guarded: its only trigger is `workflow_dispatch`; it
+ *     has no `pull_request` trigger.
  *   - `release.yml` — NOT guarded: triggered by a `push` of `v*` tags, not by a
  *     pull request, and it already has its own guard
  *     (`release-workflow-permissions.test.ts`).
@@ -81,7 +81,7 @@ const PR_EXCLUDED: Record<string, string> = {
 
 /** Workflows that do not run PR-controlled code, and why they are out of scope. */
 const NOT_PR: Record<string, string> = {
-  "docker.yml": "triggered by `workflow_dispatch` only, never `pull_request`",
+  "docker.yml": "its only trigger is `workflow_dispatch`; no `pull_request` trigger",
   "release.yml": "triggered by a `push` of `v*` tags, never `pull_request`",
 };
 

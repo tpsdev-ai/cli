@@ -18,64 +18,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # The version is the whole input, so it must be a full semver: an
-      # open-ended match would let a suffix through to the build (cli#420).
-      - name: Determine version
-        id: version
+      # Before any build: the required version shape, whether npm has
+      # published @tpsdev-ai/agent at that version, and the tags to push
+      # (cli#420). The script and its tests: .github/scripts/docker-image-tags.sh,
+      # test/docker-image-tags.test.ts.
+      - name: Check the version and compute the tags
+        id: image
         env:
           INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if ! printf '%s\n' "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
-            echo "::error::invalid version '$INPUT_VERSION': expected MAJOR.MINOR.PATCH with an optional -prerelease"
-            exit 1
-          fi
-          echo "tps_version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
-
-      # A Release run's packages are STAGED until the 2FA approval publishes
-      # them, so a build before that only yields npm's ETARGET (cli#420).
-      # Refuse here, with the remedy, instead of failing inside the build.
-      - name: The version must be public on npm
-        env:
-          TPS_VERSION: ${{ steps.version.outputs.tps_version }}
-        run: |
-          set -euo pipefail
-          set +e
-          published="$(npm view "@tpsdev-ai/agent@${TPS_VERSION}" version)"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ] || [ "$published" != "$TPS_VERSION" ]; then
-            echo "::error::@tpsdev-ai/agent@${TPS_VERSION} is not public on npm yet: approve the staged release, then re-run this workflow with version=${TPS_VERSION}"
-            exit 1
-          fi
-          echo "✅ @tpsdev-ai/agent@${TPS_VERSION} is public on npm"
-
-      # :latest follows npm's latest, so re-running an older version never
-      # moves the tag back (cli#420).
-      - name: Compute the tags to push
-        id: tags
-        env:
-          TPS_VERSION: ${{ steps.version.outputs.tps_version }}
-        run: |
-          set -euo pipefail
-          printf 'ghcr.io/tpsdev-ai/tps-office:%s\n' "$TPS_VERSION" > "$RUNNER_TEMP/tags.txt"
-          set +e
-          latest="$(npm view @tpsdev-ai/agent dist-tags.latest)"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            echo "ℹ️ could not read npm's latest for @tpsdev-ai/agent — pushing :${TPS_VERSION} only"
-          elif [ "$latest" = "$TPS_VERSION" ]; then
-            printf 'ghcr.io/tpsdev-ai/tps-office:latest\n' >> "$RUNNER_TEMP/tags.txt"
-            echo "✅ ${TPS_VERSION} is npm's latest for @tpsdev-ai/agent — pushing :${TPS_VERSION} and :latest"
-          else
-            echo "ℹ️ ${TPS_VERSION} is not npm's latest for @tpsdev-ai/agent — pushing :${TPS_VERSION} only"
-          fi
-          {
-            echo "tags<<TAGS"
-            cat "$RUNNER_TEMP/tags.txt"
-            echo "TAGS"
-          } >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/docker-image-tags.sh
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -101,7 +52,7 @@ jobs:
           push: false
           load: true
           build-args: |
-            TPS_VERSION=${{ steps.version.outputs.tps_version }}
+            TPS_VERSION=${{ steps.image.outputs.tps_version }}
           tags: |
             tps-office-verify:latest
           cache-from: type=gha
@@ -203,7 +154,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            TPS_VERSION=${{ steps.version.outputs.tps_version }}
-          tags: ${{ steps.tags.outputs.tags }}
+            TPS_VERSION=${{ steps.image.outputs.tps_version }}
+          tags: ${{ steps.image.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
