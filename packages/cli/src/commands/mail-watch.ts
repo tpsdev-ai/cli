@@ -119,13 +119,34 @@ function listNewFiles(dir: string): string[] | null {
   }
 }
 
-/** Parse one `new/` record, or null when it is unreadable/corrupt. */
-function readNewRecord(filePath: string): MailMessage | null {
+/**
+ * Read one `new/` record. `gone` when the file no longer exists (ENOENT after
+ * the listing), `read-error` for any other failure to read it, and `corrupt`
+ * when its contents are not a JSON object.
+ */
+type NewRecordRead =
+  | { kind: "record"; record: MailMessage }
+  | { kind: "gone" }
+  | { kind: "read-error"; detail: string }
+  | { kind: "corrupt" };
+
+function readNewRecord(filePath: string): NewRecordRead {
+  let raw: string;
   try {
-    return JSON.parse(readFileSync(filePath, "utf-8")) as MailMessage;
-  } catch {
-    return null;
+    raw = readFileSync(filePath, "utf-8");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "gone" };
+    return { kind: "read-error", detail: code ?? (err instanceof Error ? err.message : String(err)) };
   }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "corrupt" };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "corrupt" };
+  return { kind: "record", record: parsed as MailMessage };
 }
 
 /**
@@ -270,12 +291,25 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
       for (const file of files) {
         if (classified.has(file)) continue;
-        const record = readNewRecord(join(inbox.fresh, file));
-        if (record === null) {
-          classified.set(file, "unreadable");
-          console.error(`[mail-watch] ${file}: not presented (unreadable record)`);
+        const path = join(inbox.fresh, file);
+        const read = readNewRecord(path);
+        // Removed after the listing: nothing to present, and not classified.
+        if (read.kind === "gone") continue;
+        if (read.kind === "read-error") {
+          // A read ERROR is not a verdict: withhold it WITHOUT classifying it.
+          console.error(
+            `[mail-watch] ${opts.agent}: ${file} not presented — cannot read ${path} (${read.detail}); ` +
+              "the file is left untouched and is retried on the next scan if it remains in new/. " +
+              "Remedy: make that path readable by this user.",
+          );
           continue;
         }
+        if (read.kind === "corrupt") {
+          classified.set(file, "corrupt");
+          console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
+          continue;
+        }
+        const record = read.record;
         let result: VerifyRecordResult;
         try {
           if (opts.beforeVerify) await opts.beforeVerify();

@@ -223,20 +223,22 @@ describe("watchMail (verified-only, non-consuming)", () => {
   }
 
   /**
-   * Make one node:fs read fail with an EACCES-coded error for `target` only,
-   * while `fault.armed` is true. Injected rather than set up with chmod, which
-   * does not stop a root reader. `fault.injected` counts the failures thrown.
+   * Make one node:fs read fail with a `code`-coded error (EACCES by default) for
+   * `target` only, while `fault.armed` is true. Injected rather than set up with
+   * chmod, which does not stop a root reader. `fault.injected` counts the
+   * failures thrown.
    */
-  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string) {
+  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string, code: "EACCES" | "ENOENT" = "EACCES") {
     const real = fs[fn] as (...a: unknown[]) => unknown;
     const syscall = fn === "readdirSync" ? "scandir" : "open";
+    const text = code === "EACCES" ? "permission denied" : "no such file or directory";
     const fault = { armed: true, injected: 0 };
     const spy = spyOn(fs, fn).mockImplementation(((...a: unknown[]) => {
       if (fault.armed && a[0] === target) {
         fault.injected++;
-        throw Object.assign(new Error(`EACCES: permission denied, ${syscall} '${target}'`), {
-          code: "EACCES",
-          errno: -13,
+        throw Object.assign(new Error(`${code}: ${text}, ${syscall} '${target}'`), {
+          code,
+          errno: code === "EACCES" ? -13 : -2,
           syscall,
           path: target,
         });
@@ -476,6 +478,109 @@ describe("watchMail (verified-only, non-consuming)", () => {
       restore();
       log.restore();
     }
+  }, 10_000);
+
+  /** A signed envelope wrapped in a record written to new/<id>.json by the test. */
+  function signedRecord(id: string, body: string) {
+    const env = buildSignedEnvelope("flint", AGENT, body, SEEDS);
+    return {
+      env,
+      record: { id, from: "flint", to: AGENT, body: JSON.stringify(env), timestamp: env.timestamp, read: false },
+      path: join(getInbox(AGENT).fresh, `${id}.json`),
+    };
+  }
+
+  it("a read error on one record is not classified: the record is presented on a later scan once the read works", async () => {
+    const received: string[] = [];
+    const { env, record, path } = signedRecord("read-retry", "read on retry");
+    const log = captureErrors();
+    const injected = failReadsOf("readFileSync", path);
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+      writeRecord(record);
+      const readErrors = () =>
+        log.lines.filter(
+          (l) => l.includes(`read-retry.json not presented — cannot read ${path} (EACCES)`) && l.includes("Remedy:"),
+        ).length;
+      // Withheld and logged on more than one scan: never classified.
+      await waitFor(() => readErrors() >= 2 || received.length > 0, 5000);
+      expect(received).toEqual([]);
+      expect(readErrors()).toBeGreaterThanOrEqual(2);
+      expect(injected.fault.injected).toBeGreaterThanOrEqual(2); // the failure came from the injection
+
+      // The read works again: the next scan presents it.
+      injected.fault.armed = false;
+      await waitFor(() => received.length > 0, 5000);
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+      injected.restore();
+      log.restore();
+    }
+  }, 10_000);
+
+  it("a corrupt record is classified once: logged on one scan only", async () => {
+    let polls = 0;
+    const log = captureErrors();
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+      });
+      await sleep(60);
+      writeFileSync(join(getInbox(AGENT).fresh, "corrupt-1.json"), "{not json");
+      const start = polls;
+      await waitFor(() => polls - start >= 6, 5000); // several scans see the file
+    } finally {
+      watcher?.stop();
+      log.restore();
+    }
+    expect(log.lines.filter((l) => l.includes("corrupt-1.json: not presented (corrupt record)"))).toHaveLength(1);
+  }, 10_000);
+
+  it("ENOENT on a listed record is not classified: a later scan reads and presents it", async () => {
+    const received: string[] = [];
+    const { env, record, path } = signedRecord("gone-race", "listed then gone");
+    const log = captureErrors();
+    // The read finds no file, as when a consumer takes it between the listing and the read.
+    const injected = failReadsOf("readFileSync", path, "ENOENT");
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+      writeRecord(record);
+      await waitFor(() => injected.fault.injected >= 2 || received.length > 0, 5000);
+      expect(received).toEqual([]);
+      expect(injected.fault.injected).toBeGreaterThanOrEqual(2); // read again on a later scan: not classified
+
+      injected.fault.armed = false;
+      await waitFor(() => received.length > 0, 5000);
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+      injected.restore();
+      log.restore();
+    }
+    // Not logged as a read error or as corrupt.
+    expect(log.lines.filter((l) => l.includes("gone-race.json"))).toEqual([]);
   }, 10_000);
 
   it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
