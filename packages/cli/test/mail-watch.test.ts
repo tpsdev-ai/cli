@@ -186,13 +186,6 @@ describe("watchMail (verified-only, non-consuming)", () => {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
     }
-    // A case that failed early can leave cur/ unreadable; restore it so the
-    // temp root can be removed.
-    try {
-      chmodSync(join(tempRoot, "mail", AGENT, "cur"), 0o755);
-    } catch {
-      /* absent */
-    }
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
@@ -683,11 +676,36 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(readFileSync(ledger, "utf-8")).toBe(expired + appended);
   }, 10_000);
 
+  /**
+   * Make one node:fs read fail with an EACCES-coded error for `target` only,
+   * while `fault.armed` is true. Injected rather than set up with chmod, which
+   * does not stop a root reader. `fault.injected` counts the failures thrown.
+   */
+  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string) {
+    const real = fs[fn] as (...a: unknown[]) => unknown;
+    const syscall = fn === "readdirSync" ? "scandir" : "open";
+    const fault = { armed: true, injected: 0 };
+    const spy = spyOn(fs, fn).mockImplementation(((...a: unknown[]) => {
+      if (fault.armed && a[0] === target) {
+        fault.injected++;
+        throw Object.assign(new Error(`EACCES: permission denied, ${syscall} '${target}'`), {
+          code: "EACCES",
+          errno: -13,
+          syscall,
+          path: target,
+        });
+      }
+      return real(...a);
+    }) as never);
+    return { fault, restore: () => spy.mockRestore() };
+  }
+
   it("an unreadable consumed ledger withholds a replay, logs it and retries it, after the consumed record has left the maildir", async () => {
     const { env, file, bytes } = await consumeAndDropRecord("ledger unreadable");
     const inbox = getInbox(AGENT);
     const ledger = join(inbox.root, "consumed.jsonl");
     const log = captureErrors();
+    const { fault, restore } = failReadsOf("readFileSync", ledger);
     const received: string[] = [];
     let watcher: MailWatcher | undefined;
     try {
@@ -698,26 +716,27 @@ describe("watchMail (verified-only, non-consuming)", () => {
         watchImpl: NO_FS_EVENTS,
         onMessage: (msg) => { received.push(msg.id); },
       });
-      chmodSync(ledger, 0o000);
       writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
 
       // Withheld and logged on more than one scan: never classified, so retried.
       const withheld = () =>
         log.lines.filter(
-          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${ledger} is unreadable`) && l.includes("Remedy:"),
+          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${ledger} is unreadable (EACCES)`) && l.includes("Remedy:"),
         ).length;
       await waitFor(() => withheld() >= 2 || received.length > 0, 5000);
       expect(received).toEqual([]);
+      expect(withheld()).toBeGreaterThanOrEqual(2);
+      expect(fault.injected).toBeGreaterThanOrEqual(2); // the failure came from the injection
 
       // Readable again: the retry reaches the replay verdict, still not presented.
-      chmodSync(ledger, 0o644);
+      fault.armed = false;
       await waitFor(() => log.lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`)), 5000);
       await sleep(100);
       expect(received).toEqual([]);
     } finally {
       watcher?.stop();
+      restore();
       log.restore();
-      chmodSync(ledger, 0o644);
     }
   }, 15_000);
 
@@ -726,7 +745,10 @@ describe("watchMail (verified-only, non-consuming)", () => {
     const inbox = getInbox(AGENT);
     const ledger = join(inbox.root, "consumed.jsonl");
     const aside = join(tempRoot, "consumed.jsonl.aside");
+    // No ledger file, so the lookup falls back to the maildir — whose cur/ listing fails.
+    renameSync(ledger, aside);
     const log = captureErrors();
+    const { fault, restore } = failReadsOf("readdirSync", inbox.cur);
     const received: string[] = [];
     let watcher: MailWatcher | undefined;
     try {
@@ -737,28 +759,27 @@ describe("watchMail (verified-only, non-consuming)", () => {
         watchImpl: NO_FS_EVENTS,
         onMessage: (msg) => { received.push(msg.id); },
       });
-      // No ledger file, so the lookup falls back to the maildir — which cannot be listed.
-      renameSync(ledger, aside);
-      chmodSync(inbox.cur, 0o000);
       writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
 
       const withheld = () =>
         log.lines.filter(
-          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${inbox.cur} is unreadable`) && l.includes("Remedy:"),
+          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${inbox.cur} is unreadable (EACCES)`) && l.includes("Remedy:"),
         ).length;
       await waitFor(() => withheld() >= 2 || received.length > 0, 5000);
       expect(received).toEqual([]);
+      expect(withheld()).toBeGreaterThanOrEqual(2);
+      expect(fault.injected).toBeGreaterThanOrEqual(2); // the failure came from the injection
 
       // History restored: the retry reaches the replay verdict, still not presented.
       renameSync(aside, ledger);
-      chmodSync(inbox.cur, 0o755);
+      fault.armed = false;
       await waitFor(() => log.lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`)), 5000);
       await sleep(100);
       expect(received).toEqual([]);
     } finally {
       watcher?.stop();
+      restore();
       log.restore();
-      chmodSync(inbox.cur, 0o755);
       if (existsSync(aside)) renameSync(aside, ledger);
     }
   }, 15_000);
