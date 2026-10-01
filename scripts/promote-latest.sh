@@ -364,9 +364,9 @@ rollback_moved() {
   # binaries — so there is no window with a new CLI beside previous platform tags.
   for ((i = NPKG - 1; i >= 0; i--)); do
     [ "${moved[i]}" = 1 ] || continue
-    # The rollback add also runs with the script's own stdin/stdout/stderr (not
-    # captured): captured output loses stdout's TTY, and npm then cannot prompt
-    # for 2FA.
+    # When a changing tag's registry operation requires 2FA, the rollback add
+    # also needs the script's own stdin/stdout/stderr (not captured): captured
+    # output loses stdout's TTY, so npm cannot prompt for 2FA.
     set +e
     "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
@@ -441,6 +441,8 @@ for ((i = 0; i < NPKG; i++)); do
   # Mark the attempt BEFORE the mutation: a signal (or a crash) landing between
   # the tag change and any later flag would otherwise leave a moved-but-unflagged
   # package that the rollback skips.
+  # The EOTP case described below is a changing tag whose registry operation
+  # requires 2FA.
   moved[i]=1
   printf '\n-> %s: npm dist-tag add %s@%s latest\n' "${names[i]}" "${names[i]}" "$version"
   # The add runs with the script's own stdin/stdout/stderr (not captured): no

@@ -24,11 +24,11 @@
 #   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
 #     which --yes does NOT satisfy
 #   * every npm call is pinned with --registry
-#   * the fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout
-#     are both TTYs (installed npm prompts for 2FA only then): every fixture runs
-#     the tool with stdin and stdout on a pty, fixture R pins that each add had
-#     both, and fixture S pins that an add with stdout on the pty but stdin not is
-#     refused
+#   * the fake npm intentionally refuses every `dist-tag add` lacking a TTY on
+#     stdin or stdout, returning EOTP. The runner normally supplies both TTYs;
+#     fixture S overrides tool stdin with /dev/null while keeping stdout on the
+#     pty. Fixture R pins both TTYs on each add, and S pins refusal when stdin
+#     is not a TTY
 #   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
 #     trap, the pre-add attempt flag, and the trap-clear branch, and restore the
 #     command substitution around `dist-tag add`; confirm a fixture catches each —
@@ -40,8 +40,9 @@
 # constructs that have already bitten. The real control for the bash-3.2 class is
 # the `macos-14` CI leg, which runs this whole harness under /bin/bash (3.2.57).
 #
-# Every invocation runs the tool with its stdin and stdout on a pseudo-terminal,
-# because the fake npm refuses a `dist-tag add` with EOTP unless both are TTYs. The
+# The runner normally gives the tool a pseudo-terminal for stdin and stdout.
+# Fixture S overrides tool stdin with /dev/null while keeping stdout on the pty.
+# The fake npm intentionally returns EOTP for every add lacking either TTY. The
 # pty runner (python3) forwards its own stdin to the pty, keeps the tool's stderr
 # in a file, leaves the tool signalable, and exits with its status; the tool's own
 # pid is recorded first, so a signal fixture signals the tool and not the runner.
@@ -64,9 +65,10 @@ printf 'test-promote-latest: harness under bash %s; tool under %s\n' \
   "$BASH_VERSION" "$("$BASH_BIN" --version | head -n1)"
 
 # ── pseudo-terminal runner ───────────────────────────────────────────────────
-# The fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout are
-# both TTYs. Every invocation below runs the tool through this runner, so the
-# tool's stdin and stdout are the pty and an add that inherits them has both.
+# The fake npm intentionally refuses every `dist-tag add` lacking a TTY on stdin
+# or stdout, returning EOTP. Every invocation below uses this runner, which
+# normally supplies both TTYs to the tool; fixture S overrides tool stdin with
+# /dev/null while keeping stdout on the pty.
 command -v python3 >/dev/null 2>&1 || {
   printf 'test-promote-latest: python3 is required to run the tool under a pty\n' >&2
   exit 1
@@ -208,12 +210,12 @@ if (cmd === 'view') {
   }
   fail('npm error unknown field: ' + field);
 } else if (cmd === 'dist-tag' && sub === 'add') {
-  // Installed npm's otplease (lib/utils/auth.js) prompts for 2FA only when
-  // process.stdin.isTTY and process.stdout.isTTY are both true; otherwise the add
-  // fails (#445 saw EOTP) and the tag does not move. This stub refuses every add
-  // with EOTP unless both are TTYs. (npm skips 2FA for an add that sets a tag to
-  // its current value; this stub does not, so it also refuses the rollback of a
-  // tag that never moved.)
+  // For a changing tag whose registry operation requires 2FA, installed npm's
+  // otplease (lib/utils/auth.js) can prompt only when stdin and stdout are TTYs;
+  // without both, npm can return EOTP without moving the tag (#445). This stub
+  // intentionally refuses every add lacking either TTY with EOTP, including an
+  // add that leaves a tag at its current value; installed npm skips 2FA for that
+  // no-op add, so this stub also refuses its rollback.
   if (!(stdinTTY && stdoutTTY)) {
     fail(
       'npm error code EOTP\nnpm error fake npm: 2FA needs stdin and stdout to be TTYs (stdin_tty=' +
@@ -610,10 +612,11 @@ else
 fi
 
 # ── R. each dist-tag add inherits the tool's stdin and stdout (npm's 2FA gate) ──
-# The fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout are
-# both TTYs. This fixture gives the tool both on the pty and pins that each add
-# had both. A script that captures the add's output (the pre-fix shape) gets EOTP
-# on the first add and the tag does not move; this fixture and M6 are that control.
+# The fake npm intentionally refuses every `dist-tag add` lacking either TTY,
+# returning EOTP. This fixture gives the tool both on the pty and pins that each
+# add had both. A script that captures the add's output (the pre-fix shape) gets
+# EOTP from the fake npm on the first add, and the tag does not move; this fixture
+# and M6 are that control.
 d="$(new_fixture tty-2fa)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 invoke "$d" 0.5.4 --yes
@@ -624,10 +627,11 @@ assert_eq "R tty-2fa: no add without both TTYs" 0 "$(grep '^dist-tag add ' "$LOG
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "R tty-2fa: registry moved" "latest=0.5.4 for all six"; else bad "R tty-2fa: registry moved" "not all 0.5.4"; fi
 
 # ── S. stdout on the pty but stdin not: the add is refused ───────────────────
-# npm prompts for 2FA only when stdin AND stdout are TTYs, so a run with stdin
-# redirected cannot pass 2FA even with stdout on a terminal. The first add exits
-# EOTP and its tag does not move. The stub refuses the rollback add of that
-# unmoved tag too (see its note), so here the tool reports ROLLBACK FAILED (exit 5)
+# For a changing tag whose registry operation requires 2FA, npm can prompt only
+# with TTYs on stdin and stdout. This fixture overrides tool stdin with /dev/null
+# while keeping stdout on the pty. The fake npm refuses the first add with EOTP,
+# leaving its tag unmoved. It also refuses the rollback add of that unmoved tag,
+# so here the tool reports ROLLBACK FAILED (exit 5)
 # with the registry unchanged. A stub that checks only stdout lets these adds
 # through, and this fixture fails.
 d="$(new_fixture stdin-not-tty)"
