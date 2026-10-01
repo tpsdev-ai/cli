@@ -14,6 +14,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  HEARTBEAT_INTERVAL_MS,
   publishRuntimePresence,
   resolveRuntimeKeyPath,
   runCodexRuntime,
@@ -22,6 +23,7 @@ import {
   startPresenceHeartbeat,
 } from "../src/utils/codex-runtime.js";
 import { FlairClient } from "../src/utils/flair-client.js";
+import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -305,6 +307,82 @@ describe("codex runtime presence (cli#444)", () => {
       await client.presence();
       expect(calls[1]).toBe("POST /Presence {}");
       expect(calls.some((c) => c.includes("/Agent/"))).toBe(false);
+    },
+    10_000,
+  );
+
+  it(
+    "cleans up Presence heartbeat and signal listeners when startup rejects",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "cli444-startup-"));
+      const workspace = join(dir, "workspace");
+      mkdirSync(workspace);
+      const keyPath = join(dir, "testbot.key");
+      writeFileSync(keyPath, keySeed().seed);
+      const startupError = new Error("workspace reset failed");
+      const state = { ref: "fixture", timestamp: new Date().toISOString(), provider: "test" };
+      const workspaceProvider: WorkspaceProvider = {
+        type: "test",
+        snapshot: async () => state,
+        reset: async () => { throw startupError; },
+        checkpoint: async () => state,
+        diff: async () => ({ summary: "" }),
+        baseline: async () => state,
+      };
+      const savedFetch = globalThis.fetch;
+      const savedSetInterval = globalThis.setInterval;
+      const savedMailDir = process.env.TPS_MAIL_DIR;
+      const savedSigterm = process.listeners("SIGTERM");
+      const savedSigint = process.listeners("SIGINT");
+      const sigtermCount = process.listenerCount("SIGTERM");
+      const sigintCount = process.listenerCount("SIGINT");
+      const presenceBodies: string[] = [];
+      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+      process.env.TPS_MAIL_DIR = join(dir, "mail");
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const path = String(input).replace(/^https?:\/\/[^/]+/, "");
+        if (init?.method === "POST" && path === "/Presence") presenceBodies.push(String(init.body ?? ""));
+        if (path === "/Health") return new Response("ok", { status: 200 });
+        if (init?.method === "GET" && (path.startsWith("/Soul") || path.startsWith("/OrgEventCatchup"))) {
+          return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response("", { status: 204 });
+      }) as typeof globalThis.fetch;
+      globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+        if (args[1] === HEARTBEAT_INTERVAL_MS) {
+          args[1] = 20;
+          heartbeatTimer = savedSetInterval(...args);
+          return heartbeatTimer;
+        }
+        return savedSetInterval(...args);
+      }) as typeof setInterval;
+
+      try {
+        await expect(runCodexRuntime({
+          agentId: "testbot",
+          workspace,
+          mailDir: join(dir, "mail", "testbot"),
+          flairUrl: "http://127.0.0.1:9931",
+          flairKeyPath: keyPath,
+          workspaceProvider,
+        })).rejects.toBe(startupError);
+        await waitFor(() => presenceBodies.length >= 1, 1000);
+        expect(process.listenerCount("SIGTERM")).toBe(sigtermCount);
+        expect(process.listenerCount("SIGINT")).toBe(sigintCount);
+        const beatsAtRejection = presenceBodies.length;
+        await sleep(80);
+        expect(presenceBodies.length).toBe(beatsAtRejection);
+      } finally {
+        globalThis.fetch = savedFetch;
+        globalThis.setInterval = savedSetInterval;
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+        else process.env.TPS_MAIL_DIR = savedMailDir;
+        for (const l of process.listeners("SIGTERM")) if (!savedSigterm.includes(l)) process.off("SIGTERM", l);
+        for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
+        rmSync(dir, { recursive: true, force: true });
+      }
     },
     10_000,
   );

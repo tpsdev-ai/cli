@@ -732,36 +732,43 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
-  const flairOnline = await runtimeBootPreflight(flair, agentId);
-  if (flairOnline) {
-    await snapshotSoulToDisk(flair, agentId);
-  } else {
-    const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
-    console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
-  }
-
   try {
-    const caught = catchUpTopics(agentId);
-    if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
-  } catch (err: any) {
-    console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
-  }
+    const flairOnline = await runtimeBootPreflight(flair, agentId);
+    if (flairOnline) {
+      await snapshotSoulToDisk(flair, agentId);
+    } else {
+      const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
+      console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
+    }
 
-  if (workspaceProvider) {
     try {
-      const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
-      if (lastCheckpoint) console.log(`[${agentId}] Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      const caught = catchUpTopics(agentId);
+      if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
     } catch (err: any) {
-      console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
     }
-    try {
-      const base = await workspaceProvider.baseline();
-      await workspaceProvider.reset(base);
-      console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
-    } catch (err: any) {
-      console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
-      throw err;
+
+    if (workspaceProvider) {
+      try {
+        const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
+        if (lastCheckpoint) console.log(`[${agentId}] Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      } catch (err: any) {
+        console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      }
+      try {
+        const base = await workspaceProvider.baseline();
+        await workspaceProvider.reset(base);
+        console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
+      } catch (err: any) {
+        console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
+        throw err;
+      }
     }
+  } catch (err) {
+    stopHeartbeat();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    throw err;
   }
 
 
