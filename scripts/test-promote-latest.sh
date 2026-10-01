@@ -29,9 +29,16 @@
 #     fixture S overrides tool stdin with /dev/null while keeping stdout on the
 #     pty. Fixture R pins both TTYs on each add, and S pins refusal when stdin
 #     is not a TTY
+#   * a successful promote dispatches the Docker image workflow once, for the
+#     promoted version, only after all six `dist-tag add`s (fixture T); a failed
+#     promote never dispatches (U); `--no-docker` promotes but never dispatches
+#     (V); a gh failure after a successful promote exits 6, names the failure and
+#     the hand-run command, and does NOT roll back (W); a missing gh does the same
+#     (X)
 #   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
-#     trap, the pre-add attempt flag, and the trap-clear branch, and restore the
-#     command substitution around `dist-tag add`; confirm a fixture catches each —
+#     trap, the pre-add attempt flag, and the trap-clear branch, restore the
+#     command substitution around `dist-tag add`, dispatch before the post-check,
+#     and roll back on a gh failure; confirm a fixture catches each —
 #     a test that passes on both the fixed and the broken script is not a test.
 #   * the fixtures run under bash 3.2 too (BASH_BIN; the macos-14 CI leg pins it),
 #     and the workflow still invokes this harness
@@ -250,6 +257,38 @@ if (cmd === 'view') {
 FAKE_NPM
 chmod +x "$fake_npm"
 
+# ── the fake `gh` ────────────────────────────────────────────────────────────
+# The promote script dispatches `gh workflow run docker.yml --repo tpsdev-ai/cli
+# -f version=<v>` after a successful promote. This stub records every invocation
+# (its argv, and how many `dist-tag add` calls the promote had made when it ran),
+# then succeeds — or fails when GH_STUB_FAIL=1, standing in for an
+# unauthenticated or otherwise failed dispatch. Bash 3.2-compatible.
+gh_stub="$work/fake-gh"
+cat >"$gh_stub" <<'FAKE_GH'
+#!/usr/bin/env bash
+set -uo pipefail
+if [ -z "${GH_LOG:-}" ]; then
+  printf 'fake-gh: GH_LOG is not set\n' >&2
+  exit 90
+fi
+adds=0
+if [ -n "${GH_NPM_LOG:-}" ] && [ -f "$GH_NPM_LOG" ]; then
+  adds="$(grep -c '^dist-tag add ' "$GH_NPM_LOG" 2>/dev/null)"
+  case "$adds" in '' | *[!0-9]*) adds=0 ;; esac
+fi
+{
+  printf 'argv:'
+  for a in "$@"; do printf ' %s' "$a"; done
+  printf '\nadds_before=%s\n' "$adds"
+} >>"$GH_LOG"
+if [ "${GH_STUB_FAIL:-0}" = "1" ]; then
+  printf 'gh: authentication required: please run gh auth login\n' >&2
+  exit 1
+fi
+exit 0
+FAKE_GH
+chmod +x "$gh_stub"
+
 # ── fixture helpers ──────────────────────────────────────────────────────────
 cat >"$work/mkstate.mjs" <<'MK'
 import fs from 'fs';
@@ -300,6 +339,14 @@ const targets = {
     '  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
     '  set +e\n  out="$("$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"\n  rc=$?\n  set -e\n  [ -z "$out" ] || printf \'%s\\n\' "$out"\n',
   ],
+  dispatch_early: [
+    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  dispatch_docker\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+  ],
+  dispatch_rollback: [
+    '  exit "$EXIT_DISPATCH_FAILED"\n',
+    '  rollback_moved\n  exit "$EXIT_DISPATCH_FAILED"\n',
+  ],
 };
 const t = targets[which];
 if (!t) { console.error('unknown mutation: ' + which); process.exit(2); }
@@ -342,7 +389,9 @@ invoke() { # [TOOL=...] <fixture-dir> [args...] — stdin and stdout on the pty;
   local raw
   LOG="$d/log.txt"
   : >"$LOG"
+  : >"$d/gh.log"
   raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+    GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
@@ -356,7 +405,9 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...] — the reply is t
   local raw
   LOG="$d/log.txt"
   : >"$LOG"
+  : >"$d/gh.log"
   raw="$(printf '%s\n' "$reply" | FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+    GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@")"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
@@ -369,8 +420,10 @@ invoke_stdin_not_tty() { # [TOOL=...] <fixture-dir> [args...] — stdout on the 
   local raw
   LOG="$d/log.txt"
   : >"$LOG"
+  : >"$d/gh.log"
   # shellcheck disable=SC2016  # "$@" is expanded by the inner bash, not here
   raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+    GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" -c 'exec "$@" </dev/null' stdin-null "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
@@ -459,6 +512,12 @@ adds_count() {
   printf '%s' "${n:-0}"
 }
 
+gh_calls() { # <fixture-dir> — how many times the stub gh was invoked
+  local n
+  n="$(grep -c '^argv:' "$1/gh.log" 2>/dev/null)"
+  printf '%s' "${n:-0}"
+}
+
 # ── A. refuse when the version is not published for all six ───────────────────
 d="$(new_fixture refuse-missing)"
 write_state "$d/state.json" "0.5.4" "0.5.4"
@@ -494,6 +553,7 @@ assert_eq "D move-plan: exit" 0 "$RC"
 assert_contains "D move-plan: dry-run banner" "$OUT" "DRY RUN"
 assert_eq "D move-plan: six 'move' rows" 6 "$(printf '%s\n' "$OUT" | grep -cE 'move$')"
 assert_eq "D move-plan: no dist-tag add attempted" 0 "$(adds_count)"
+assert_eq "D move-plan: no Docker dispatch" 0 "$(gh_calls "$d")"
 
 # ── E. --yes moves all six and verifies each against the registry ─────────────
 d="$(new_fixture move-all)"
@@ -644,6 +704,54 @@ assert_contains "S stdin-not-tty: npm refused with EOTP" "$ERR" "npm error code 
 assert_contains "S stdin-not-tty: reports the rollback failure" "$ERR" "ROLLBACK FAILED for @tpsdev-ai/cli-darwin-arm64"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "S stdin-not-tty: registry unchanged" "latest=0.5.3 for all six"; else bad "S stdin-not-tty: registry unchanged" "registry changed"; fi
 
+# ── T. a successful promote dispatches the Docker image once, after the moves ──
+d="$(new_fixture dispatch-success)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+invoke "$d" 0.5.4 --yes
+assert_eq "T dispatch: exit" 0 "$RC"
+assert_eq "T dispatch: gh called exactly once" 1 "$(gh_calls "$d")"
+assert_contains "T dispatch: the right command" "$(cat "$d/gh.log")" "workflow run docker.yml --repo tpsdev-ai/cli -f version=0.5.4"
+assert_eq "T dispatch: ran after all six dist-tag adds" 1 "$(grep -c '^adds_before=6$' "$d/gh.log" 2>/dev/null || true)"
+assert_eq "T dispatch: six dist-tag adds" 6 "$(adds_count)"
+if all_latest_eq "$d/state.json" "0.5.4"; then ok "T dispatch: registry moved" "latest=0.5.4 for all six"; else bad "T dispatch: registry moved" "not all 0.5.4"; fi
+
+# ── U. a failed promote never dispatches the Docker image ─────────────────────
+d="$(new_fixture dispatch-on-failure)"
+write_state "$d/state.json" "0.5.4" "0.5.3" "cli-linux-arm64"
+invoke "$d" 0.5.4 --yes
+assert_eq "U no-dispatch-on-failure: exit" 4 "$RC"
+assert_eq "U no-dispatch-on-failure: gh never called" 0 "$(gh_calls "$d")"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "U no-dispatch-on-failure: rolled back" "latest=0.5.3 for all six"; else bad "U no-dispatch-on-failure: rolled back" "a partial promote was left behind"; fi
+
+# ── V. --no-docker promotes but never dispatches ──────────────────────────────
+d="$(new_fixture no-docker)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "V no-docker: exit" 0 "$RC"
+assert_eq "V no-docker: gh never called" 0 "$(gh_calls "$d")"
+assert_eq "V no-docker: six dist-tag adds" 6 "$(adds_count)"
+if all_latest_eq "$d/state.json" "0.5.4"; then ok "V no-docker: registry moved" "latest=0.5.4 for all six"; else bad "V no-docker: registry moved" "not all 0.5.4"; fi
+
+# ── W. a gh failure after a successful promote: distinct exit, message, no rollback ─
+d="$(new_fixture dispatch-fail)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+GH_STUB_FAIL=1 invoke "$d" 0.5.4 --yes
+assert_eq "W dispatch-fail: exit" 6 "$RC"
+assert_contains "W dispatch-fail: says NOT dispatched" "$ERR" "the Docker image was NOT dispatched"
+assert_contains "W dispatch-fail: prints the command" "$ERR" "gh workflow run docker.yml --repo tpsdev-ai/cli -f version=0.5.4"
+if all_latest_eq "$d/state.json" "0.5.4"; then ok "W dispatch-fail: no rollback" "latest=0.5.4 for all six"; else bad "W dispatch-fail: no rollback" "the promote was rolled back"; fi
+GH_STUB_FAIL=""
+
+# ── X. gh missing: same distinct exit and message, no rollback ────────────────
+d="$(new_fixture gh-missing)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+GH_BIN_OVERRIDE="$work/no-such-gh" invoke "$d" 0.5.4 --yes
+assert_eq "X gh-missing: exit" 6 "$RC"
+assert_contains "X gh-missing: says NOT dispatched" "$ERR" "the Docker image was NOT dispatched"
+assert_contains "X gh-missing: names the missing binary" "$ERR" "gh not found"
+if all_latest_eq "$d/state.json" "0.5.4"; then ok "X gh-missing: no rollback" "latest=0.5.4 for all six"; else bad "X gh-missing: no rollback" "the promote was rolled back"; fi
+GH_BIN_OVERRIDE=""
+
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" existence; then
@@ -720,6 +828,40 @@ if node "$work/mutate.mjs" "$tool" "$mut" capture; then
   TOOL=""
 else
   bad "M6 mutation: captured add caught" "could not build the mutant"
+fi
+
+# ── M7. mutation: dispatch inside the move loop (before the post-check) ───────
+# The mutant dispatches right after each `dist-tag add`, before the registry is
+# re-read to confirm the move, as well as at the end. Fixture T (exactly one
+# dispatch) must catch it: the mutant dispatches once per move, not once per
+# promote. A test that passes on this mutant is blind to dispatching before the
+# post-check.
+mut="$work/tool-dispatch-early.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" dispatch_early; then
+  d="$(new_fixture mut-dispatch-early)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  TOOL="$mut" invoke "$d" 0.5.4 --yes
+  if [ "$(gh_calls "$d")" -eq 1 ]; then bad "M7 mutation: early dispatch caught" "mutant still dispatched once — fixture T is blind to it"; else ok "M7 mutation: early dispatch caught" "mutant dispatched $(gh_calls "$d") times (fixture T expects 1)"; fi
+  TOOL=""
+else
+  bad "M7 mutation: early dispatch caught" "could not build the mutant"
+fi
+
+# ── M8. mutation: roll back on a gh failure; fixture W must catch it ──────────
+# The mutant rolls the promote back when the dispatch fails. Fixture W (a gh
+# failure leaves `latest` at the target) must catch it: the mutant restores the
+# previous `latest`. A test that passes on this mutant is blind to a dispatch
+# failure undoing a promote that already succeeded.
+mut="$work/tool-dispatch-rollback.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" dispatch_rollback; then
+  d="$(new_fixture mut-dispatch-rollback)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  GH_STUB_FAIL=1 TOOL="$mut" invoke "$d" 0.5.4 --yes
+  if all_latest_eq "$d/state.json" "0.5.4"; then bad "M8 mutation: rollback on gh failure caught" "mutant kept the promote — fixture W is blind to it"; else ok "M8 mutation: rollback on gh failure caught" "mutant rolled the promote back (fixture W catches it)"; fi
+  GH_STUB_FAIL=""
+  TOOL=""
+else
+  bad "M8 mutation: rollback on gh failure caught" "could not build the mutant"
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
