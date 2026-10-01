@@ -5,32 +5,31 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import {
-  readFileSync, existsSync, writeFileSync, appendFileSync, createWriteStream,
-} from "node:fs";
-import { basename, join } from "node:path";
+import { appendFileSync, createWriteStream, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { FlairClient } from "./flair-client.js";
-import {
-  snapshotSoulToDisk,
-  bootContext,
-  searchPastExperience,
-  writeTaskMemory,
-  catchUpTopics,
-  onBoot,
-  onTaskStart,
-  onTaskComplete,
-  onTaskFailure,
-} from "./agent-lifecycle.js";
+import { basename, join } from "node:path";
 import {
   refreshOpenAIToken,
   type StoredCredentials,
 } from "../commands/auth.js";
-import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
+import { agentKeyCandidates, resolveAgentKeyPath } from "./agent-keys.js";
+import {
+  bootContext,
+  catchUpTopics,
+  onBoot,
+  onTaskComplete,
+  onTaskFailure,
+  onTaskStart,
+  searchPastExperience,
+  snapshotSoulToDisk,
+  writeTaskMemory,
+} from "./agent-lifecycle.js";
+import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
 import { handlePrOpened } from "./pr-review-trigger.js";
+import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
 import { formatTaskCompleteMailBody } from "./task-result-mail.js";
-import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
+import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 
 /** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
 const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
@@ -111,7 +110,7 @@ export interface CodexRuntimeConfig {
   watchdogTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
-  flairKeyPath: string;
+  flairKeyPath?: string;
   systemPrompt?: string;
   workspaceProvider?: WorkspaceProvider;
   /** If set, auto-commit workspace changes after each task completes */
@@ -148,7 +147,7 @@ async function buildSystemPrompt(
   config: CodexRuntimeConfig,
 ): Promise<string> {
   const { agentId, workspace, extraDirs, supervisorId, flairUrl, flairKeyPath } = config;
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: resolveRuntimeKeyPath(agentId, flairKeyPath) });
   const allowedTools = ["Bash", "Read", "Write", "Edit"];
   const { systemPrompt } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -195,7 +194,7 @@ async function runCodex(
     proc.stdin.write(prompt);
     proc.stdin.end();
 
-    let resultMessages: string[] = [];
+    const resultMessages: string[] = [];
     let turnCount = 0;
     let stderr = "";
     let buf = "";
@@ -609,6 +608,97 @@ async function _runAutoCommitLegacy(
 }
 
 
+/** How often the runtime publishes a Presence heartbeat. */
+export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/** Upper bound on the final shutdown beat before the process exits. */
+export const SHUTDOWN_BEAT_TIMEOUT_MS = 3000;
+
+/**
+ * The Flair key path the runtime authenticates with: the configured path, else
+ * the locally resolved agent key — the same candidate order the rest of the CLI uses
+ * (agent-keys.ts). Falls back to the first candidate so a missing key fails with
+ * the client's named path error.
+ */
+export function resolveRuntimeKeyPath(agentId: string, configured?: string): string {
+  if (configured) return configured;
+  return resolveAgentKeyPath(agentId) ?? (agentKeyCandidates(agentId)[0] as string);
+}
+
+/**
+ * Publish ONE presence heartbeat for the agent on Flair's Presence resource,
+ * signed with the agent's own Ed25519 credential. cli#444: liveness is recorded
+ * HERE, never by writing the agent's `Agent.status` — in Flair that field is the
+ * principal's lifecycle state (a value other than `active` deactivates it). A
+ * failure only LOGS (never throws) and never writes `/Agent`.
+ */
+export async function publishRuntimePresence(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  activity?: PresenceActivity,
+): Promise<void> {
+  try {
+    await client.presence(activity);
+  } catch (e: any) {
+    console.warn(`[${agentId}] presence heartbeat failed: ${e?.message ?? String(e)}`);
+  }
+}
+
+/**
+ * Start the runtime's Presence heartbeat: ONE beat at startup, then one every
+ * `intervalMs`, on the timer's own schedule. Returns a stop function that clears
+ * the timer.
+ */
+export function startPresenceHeartbeat(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  intervalMs: number = HEARTBEAT_INTERVAL_MS,
+): () => void {
+  void publishRuntimePresence(client, agentId);
+  const timer = setInterval(() => {
+    void publishRuntimePresence(client, agentId);
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
+ * The final Presence beat on shutdown: a bounded `"idle"` beat. Never throws;
+ * resolves when the beat settles or `timeoutMs` elapses, whichever comes first.
+ */
+export async function shutdownPresenceBeat(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([publishRuntimePresence(client, agentId, "idle"), bound]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * The SIGINT/SIGTERM handler: stop the heartbeat, await the bounded final beat,
+ * then exit. `exit` and `timeoutMs` are injectable so a test drives the real
+ * handler.
+ */
+export function shutdownHandler(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  stopHeartbeat: () => void,
+  exit: (code: number) => void = (code) => process.exit(code),
+  timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
+): () => void {
+  return () => {
+    stopHeartbeat();
+    void shutdownPresenceBeat(client, agentId, timeoutMs).finally(() => exit(0));
+  };
+}
+
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
@@ -616,8 +706,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   await ensureFreshOpenAIToken(agentId);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
-  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath };
+  // cli#444: a generated agent config omits flair.keyPath; resolve the agent's
+  // locally resolved agent key (the same candidates the rest of the CLI uses) so the
+  // Presence beats are signed.
+  const keyPath = resolveRuntimeKeyPath(agentId, flairKeyPath);
+  const taskConfig: CodexRuntimeConfig = keyPath === flairKeyPath ? config : { ...config, flairKeyPath: keyPath };
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath });
+  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath: keyPath };
 
   // All runtime outbound mail goes through the SIGNED path; a send failure must
   // not abort a task that otherwise completed (the completion boundary closes
@@ -627,43 +722,53 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     catch (e: any) { console.warn(`[${agentId}] outbound mail to ${to} failed: ${e.message}`); }
   };
 
-  // Mark offline on clean shutdown
-  const markOffline = () => {
-    try { (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "offline" }).catch(() => {}); } catch {}
-  };
-  process.once("SIGINT", () => { markOffline(); process.exit(0); });
-  process.once("SIGTERM", () => { markOffline(); process.exit(0); });
-
-  const flairOnline = await runtimeBootPreflight(flair, agentId);
-  if (flairOnline) {
-    await snapshotSoulToDisk(flair, agentId);
-  } else {
-    const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
-    console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
-  }
+  // cli#444: liveness goes to Flair's Presence resource, never to the agent's
+  // Agent row — `Agent.status` is the principal's lifecycle state (a value other
+  // than `active` deactivates it). The heartbeat runs on its own timer from
+  // startup, independent of the mail loop; the signal handlers await the bounded
+  // final beat before exiting.
+  const stopHeartbeat = startPresenceHeartbeat(flair, agentId);
+  const onSignal = shutdownHandler(flair, agentId, stopHeartbeat);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
 
   try {
-    const caught = catchUpTopics(agentId);
-    if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
-  } catch (err: any) {
-    console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
-  }
+    const flairOnline = await runtimeBootPreflight(flair, agentId);
+    if (flairOnline) {
+      await snapshotSoulToDisk(flair, agentId);
+    } else {
+      const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
+      console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
+    }
 
-  if (workspaceProvider) {
     try {
-      const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
-      if (lastCheckpoint) console.log(`[${agentId}] Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      const caught = catchUpTopics(agentId);
+      if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
     } catch (err: any) {
-      console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
     }
-    try {
-      const base = await workspaceProvider.baseline();
-      await workspaceProvider.reset(base);
-      console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
-    } catch (err: any) {
-      console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
-      throw err;
+
+    if (workspaceProvider) {
+      try {
+        const { lastCheckpoint } = await onBoot(workspaceProvider, flair, agentId);
+        if (lastCheckpoint) console.log(`[${agentId}] Resumed from: ${lastCheckpoint.label ?? lastCheckpoint.ref}`);
+      } catch (err: any) {
+        console.warn(`[${agentId}] Boot lifecycle failed (non-fatal): ${err.message}`);
+      }
+      try {
+        const base = await workspaceProvider.baseline();
+        await workspaceProvider.reset(base);
+        console.log(`[${agentId}] Workspace reset to baseline: ${base.label ?? base.ref.slice(0, 7)}`);
+      } catch (err: any) {
+        console.error(`[${agentId}] Workspace baseline reset failed: ${err.message}`);
+        throw err;
+      }
     }
+  } catch (err) {
+    stopHeartbeat();
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    throw err;
   }
 
 
@@ -682,7 +787,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       const flairPub1 = { publishEvent: async (ev: Record<string, unknown>) => {
         try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
       }};
-      const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+      const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
         flairPublisher: flairPub1,
         onStall: () => { notify(event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
       });
@@ -752,9 +857,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   let lastSnapshot = Date.now();
   let lastTokenRefresh = Date.now();
-  let lastHeartbeat = 0; // publish on first tick
   const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
-  const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // publish heartbeat every 5min
   while (true) {
     if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
       await ensureFreshOpenAIToken(agentId);
@@ -764,14 +867,6 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       await snapshotSoulToDisk(flair, agentId);
       lastSnapshot = Date.now();
     }
-    // Publish heartbeat to Flair (update agent status + OrgEvent)
-    if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      try {
-        await (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "online", lastSeen: new Date().toISOString() });
-      } catch { /* non-fatal */ }
-      lastHeartbeat = Date.now();
-    }
-
     for (const msg of await pollRuntimeMail(mailCfg)) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
       let preTaskState;
@@ -785,7 +880,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
         const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
-        const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+        const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
           flairPublisher: flairPub2,
           onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
         });

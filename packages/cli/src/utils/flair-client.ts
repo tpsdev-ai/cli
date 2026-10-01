@@ -4,7 +4,7 @@
  * Auth protocol: TPS-Ed25519 <agentId>:<timestamp>:<nonce>:<signatureBase64>
  * Signature payload: agentId:timestamp:nonce:METHOD:/path?query
  */
-import { sign as ed25519Sign, createPrivateKey, randomUUID } from "node:crypto";
+import { createPrivateKey, sign as ed25519Sign, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -127,6 +127,9 @@ export interface SkillScanResult {
   riskLevel: "low" | "medium" | "high" | "critical";
 }
 
+/** The activity vocabulary Flair's Presence contract accepts. */
+export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -197,6 +200,17 @@ export class FlairClient {
     }
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
+  }
+
+  /**
+   * POST /Presence — the agent's OWN presence heartbeat, signed with `this`
+   * agent's Ed25519 key (Flair keys the record by the signature's agentId).
+   * `activity` is optional. cli#444: the codex
+   * runtime records liveness HERE, never by writing `Agent.status` (that field is
+   * the principal's lifecycle state).
+   */
+  async presence(activity?: PresenceActivity): Promise<void> {
+    await this.request("POST", "/Presence", activity !== undefined ? { activity } : {});
   }
 
   /**
