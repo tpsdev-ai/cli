@@ -16,7 +16,7 @@ See **[DESIGN.md](DESIGN.md)** for the invariants behind that — why identity i
 
 ### What You Get
 
-- **Identity & Keys** — Ed25519 keypairs per agent.
+- **Identity & Keys** — `tps init` and `tps agent create` generate or reuse Ed25519 keys.
 - **Branch Offices** — Docker containers with four layers of isolation: Docker → Linux users → [nono](https://github.com/lukehinds/nono) Landlock → BoundaryManager
 - **The Mailroom** — Async, persistent, cross-boundary Maildir-based messaging with pub/sub topics
 - **Agent Runtime** — Native runtime with tool use, multi-provider LLM support, and session management
@@ -125,7 +125,7 @@ Publishing attempts delivery to other subscribers.
 
 ### Identity
 
-Every agent gets an Ed25519 keypair at creation.
+`tps init` and `tps agent create` generate or reuse an agent's Ed25519 keys.
 
 ```bash
 tps identity show              # Show host identity
