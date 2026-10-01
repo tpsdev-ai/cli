@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
@@ -80,8 +80,13 @@ export function assertValidBody(body: string): void {
   }
 }
 
+/** The mail directory path, without creating it. */
+function mailDirPath(): string {
+  return process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+}
+
 export function getMailDir(): string {
-  const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const dir = mailDirPath();
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -103,14 +108,19 @@ export function inboxExists(agent: string): boolean {
   return existsSync(join(getMailDir(), agent));
 }
 
-export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
+/** The mailbox root `getInbox` uses, resolved without creating anything. */
+function mailboxRoot(agent: string): string {
   assertValidAgentId(agent);
 
   // Branch-office compatibility: if this agent has a local branch-office mail root,
   // prefer that over ~/.tps/mail/<agent>. This keeps `tps mail check <agent>` aligned
   // with branch delivery paths used by relay/deliverToSandbox.
   const branchMailRoot = join(process.env.HOME || homedir(), ".tps", "branch-office", agent, "mail");
-  const root = existsSync(branchMailRoot) ? branchMailRoot : join(getMailDir(), agent);
+  return existsSync(branchMailRoot) ? branchMailRoot : join(mailDirPath(), agent);
+}
+
+export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
+  const root = mailboxRoot(agent);
   const tmp = join(root, "tmp");
   const fresh = join(root, "new");
   const cur = join(root, "cur");
@@ -535,23 +545,12 @@ function recordConsumedMessageId(root: string, messageId: string): void {
 }
 
 /**
- * Read the durable ledger, dropping entries older than the retention. Returns
- * the live id set. When pruning actually removed something the ledger is
- * rewritten in place (atomic replace) so the file stays bounded by age.
+ * Parse ledger text into the live id set (entries older than `cutoff` are
+ * dropped), the lines to keep, and how many lines were dropped. Both ledger
+ * readers use it, so they agree on which ids are live.
  */
-function readConsumedLedger(root: string): Set<string> {
-  const path = consumedLedgerPath(root);
+function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
-  if (!existsSync(path)) return ids;
-
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch {
-    return ids;
-  }
-
-  const cutoff = Date.now() - CONSUMED_LEDGER_RETENTION_MS;
   const kept: string[] = [];
   let pruned = 0;
   for (const line of raw.split("\n")) {
@@ -588,7 +587,30 @@ function readConsumedLedger(root: string): Set<string> {
     ids.add(id);
     kept.push(line);
   }
+  return { ids, kept, pruned };
+}
 
+/**
+ * Read the durable ledger, dropping entries older than the retention. Returns
+ * the live id set. When pruning actually removed something the ledger is
+ * rewritten in place (atomic replace) so the file stays bounded by age.
+ *
+ * The replace drops any line appended between the read and the rename, so call
+ * this only while holding the mailbox lock (as promote() does). A reader that
+ * does not hold the lock uses peekConsumedLedger.
+ */
+function readConsumedLedger(root: string): Set<string> {
+  const path = consumedLedgerPath(root);
+  if (!existsSync(path)) return new Set<string>();
+
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return new Set<string>();
+  }
+
+  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
   if (pruned > 0) {
     try {
       const tmp = `${path}.tmp`;
@@ -601,6 +623,46 @@ function readConsumedLedger(root: string): Set<string> {
   return ids;
 }
 
+/** A read error on consumed history, naming the path that could not be read. */
+function unreadableHistory(path: string, err: unknown): Error {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  const detail = code ?? (err instanceof Error ? err.message : String(err));
+  return new Error(`consumed history at ${path} is unreadable (${detail})`);
+}
+
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+/**
+ * Read the ledger without changing it: the live id set readConsumedLedger would
+ * return, or null when there is no ledger file. Throws when the ledger exists
+ * but cannot be read. It never writes, renames or prunes.
+ */
+function peekConsumedLedger(root: string): Set<string> | null {
+  const path = consumedLedgerPath(root);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    if (isMissing(err)) return null;
+    throw unreadableHistory(path, err);
+  }
+  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
+}
+
+/**
+ * Does this maildir record carry the envelope messageId? Counts both the
+ * persisted `envelopeId` and, for legacy records, a body that is itself a
+ * signed envelope.
+ */
+function recordCarriesMessageId(msg: MailMessage, messageId: string): boolean {
+  if (msg.envelopeId === messageId) return true;
+  const parsed = tryParseEnvelope(msg.body);
+  if (parsed === "json-parse-error" || parsed === "missing-fields") return false;
+  return (parsed as { messageId?: unknown }).messageId === messageId;
+}
+
 /**
  * Has this envelope messageId already been consumed?
  *
@@ -610,6 +672,9 @@ function readConsumedLedger(root: string): Set<string> {
  * upgrade does not open a window for records already on disk. Counts both the
  * persisted `envelopeId` and, for legacy records, a body that is itself a
  * signed envelope. This is the gate on replay of consumed history.
+ *
+ * It reads the ledger through readConsumedLedger, which may rewrite the ledger:
+ * call it only while holding the mailbox lock.
  */
 function isConsumedMessageId(root: string, messageId: string): boolean {
   if (readConsumedLedger(root).has(messageId)) return true;
@@ -627,11 +692,7 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
       if (!entry.name.endsWith(".json")) continue;
       try {
         const msg = JSON.parse(readFileSync(full, "utf-8")) as MailMessage;
-        if (msg.envelopeId === messageId) return true;
-        const parsed = tryParseEnvelope(msg.body);
-        if (parsed !== "json-parse-error" && parsed !== "missing-fields") {
-          if ((parsed as { messageId?: unknown }).messageId === messageId) return true;
-        }
+        if (recordCarriesMessageId(msg, messageId)) return true;
       } catch {
         // skip corrupt records
       }
@@ -641,15 +702,56 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
 }
 
 /**
- * Read-only replay lookup for one mailbox: true when this envelope messageId is
- * already consumed. It wraps the SAME check `promote()` uses — the durable
- * ledger plus the maildir migration fallback — and consumes nothing: it moves,
- * leases and delivers no record. A non-consuming reader (mail watch) uses it to
- * skip an envelope `promote()` would reject as a replay.
+ * The maildir fallback of isConsumedMessageId, failing closed: a directory or
+ * record that does not exist is skipped, a corrupt record is skipped (as
+ * isConsumedMessageId skips it), and any other read error throws.
+ */
+function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
+  const stack = [join(root, "cur"), join(root, "archive")];
+  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (isMissing(err)) continue;
+      throw unreadableHistory(dir, err);
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+        continue;
+      }
+      if (!entry.name.endsWith(".json")) continue;
+      let raw: string;
+      try {
+        raw = readFileSync(full, "utf-8");
+      } catch (err) {
+        if (isMissing(err)) continue; // removed after the listing
+        throw unreadableHistory(full, err);
+      }
+      try {
+        if (recordCarriesMessageId(JSON.parse(raw) as MailMessage, messageId)) return true;
+      } catch {
+        // corrupt record — skipped, as isConsumedMessageId skips it
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Replay lookup for a reader that does not hold the mailbox lock (mail watch):
+ * true when this envelope messageId is in the consumed ledger or, failing that,
+ * in the maildir fallback — the history isConsumedMessageId consults. It writes,
+ * renames, prunes and creates nothing. A missing ledger file counts as an empty
+ * ledger; a ledger or maildir that cannot be read THROWS, and the caller must
+ * withhold the record.
  */
 export function isConsumedForMailbox(agent: string, messageId: string): boolean {
-  assertValidAgentId(agent);
-  return isConsumedMessageId(getInbox(agent).root, messageId);
+  const root = mailboxRoot(agent);
+  if (peekConsumedLedger(root)?.has(messageId)) return true;
+  return maildirHistoryHasMessageId(root, messageId);
 }
 
 type EnvelopeBinding =

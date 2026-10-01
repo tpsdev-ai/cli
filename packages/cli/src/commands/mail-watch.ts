@@ -14,9 +14,8 @@
  * NON-CONSUMING (cli#375): the watcher verifies each record in `new/` IN PLACE
  * with the same verification `promote()` applies, and presents ONLY records
  * that verify. It calls no consumer path — no promote, no lease, no ack, no
- * `checkMessages` — so it never competes with the inbox's consumers and never
- * moves a record out of `new/`. A record that does not verify is skipped and
- * logged; it is never presented.
+ * `checkMessages` — and never moves a record out of `new/`. A record that does
+ * not verify is skipped and logged; it is never presented.
  *
  * Hook contract:
  * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
@@ -103,7 +102,7 @@ export function validateAgentId(agentId: string): void {
 //
 // `new/` is listed and each record is verified IN PLACE through
 // `verifyRecordForMailbox` — the same policy `promote()` applies — so an
-// unverified record is never handed on. Nothing here moves, leases or writes.
+// unverified record is never handed on.
 
 /**
  * Filenames (`*.json`) directly under `dir`; `[]` when `dir` is absent, and
@@ -209,7 +208,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
   // came from. Within ONE watcher instance an entry is dropped only when a scan
   // observes that file absent from `new/`; while the file stays, it is presented
-  // once. (A watcher restart presents a still-present file again.)
+  // once.
   const presented = new Map<string, string>();
   // Files already classified this residence (presented, or skipped as
   // unverifiable), keyed on the filename, so a later pass does not re-verify or
@@ -261,8 +260,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         return;
       }
       const present = new Set(files);
-      // Forget records whose file has left `new/`, so a re-delivered message is
-      // presented again.
+      // Forget records whose file has left `new/`.
       for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
       for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
 
@@ -296,9 +294,20 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           classified.set(file, "refused:no-envelope-id");
           continue;
         }
-        // A verified record whose id is already consumed is a replay — skip it,
-        // as promote() would (it dead-letters a replay).
-        if (isConsumedForMailbox(opts.agent, envId)) {
+        // Skip a verified record whose id the consumed history holds. When that
+        // history cannot be read, withhold the record WITHOUT classifying it, so
+        // a later scan retries it.
+        let consumed: boolean;
+        try {
+          consumed = isConsumedForMailbox(opts.agent, envId);
+        } catch (err) {
+          console.error(
+            `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
+              "it stays in new/ and is retried on the next scan. Remedy: make that path readable by this user.",
+          );
+          continue;
+        }
+        if (consumed) {
           classified.set(file, "already-consumed");
           console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
           continue;

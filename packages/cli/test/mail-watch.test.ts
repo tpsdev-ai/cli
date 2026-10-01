@@ -22,13 +22,14 @@
  * Flair and point FLAIR_URL/FLAIR_KEY_PATH at it.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
-import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
+import { buildPlist, type MailWatcher, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
 import { getInbox, promote, sendMessage, type MailMessage, verifyRecordForMailbox } from "../src/utils/mail.js";
 import {
   buildSignedEnvelope,
@@ -184,6 +185,13 @@ describe("watchMail (verified-only, non-consuming)", () => {
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
+    }
+    // A case that failed early can leave cur/ unreadable; restore it so the
+    // temp root can be removed.
+    try {
+      chmodSync(join(tempRoot, "mail", AGENT, "cur"), 0o755);
+    } catch {
+      /* absent */
     }
     rmSync(tempRoot, { recursive: true, force: true });
   });
@@ -602,6 +610,158 @@ describe("watchMail (verified-only, non-consuming)", () => {
     // Non-consuming: the replayed record stays in new/.
     expect(jsonFiles(inbox.fresh)).toHaveLength(1);
   });
+
+  /**
+   * Consume a signed message with promote(), then remove its record from cur/
+   * (as an ack or GC does), so the record is no longer in the maildir fallback.
+   * Returns the envelope, the new/ filename and the record's original bytes.
+   */
+  async function consumeAndDropRecord(body: string) {
+    const env = buildSignedEnvelope("flint", AGENT, body, SEEDS);
+    sendMessage(AGENT, JSON.stringify(env), "flint");
+    const inbox = getInbox(AGENT);
+    const [file] = jsonFiles(inbox.fresh);
+    const bytes = readFileSync(join(inbox.fresh, file!));
+    expect((await promote(AGENT, join(inbox.fresh, file!))).ok).toBe(true);
+    for (const f of jsonFiles(inbox.cur)) rmSync(join(inbox.cur, f));
+    expect(jsonFiles(inbox.cur)).toHaveLength(0);
+    return { env, file: file!, bytes };
+  }
+
+  /** Capture console.error lines (the watcher's log) until restored. */
+  function captureErrors() {
+    const lines: string[] = [];
+    const spy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    return { lines, restore: () => spy.mockRestore() };
+  }
+
+  it("the replay lookup leaves the ledger untouched: a consumer's append that lands mid-lookup survives", async () => {
+    const inbox = getInbox(AGENT);
+    const ledger = join(inbox.root, "consumed.jsonl");
+    // An entry past the 180-day retention, which a pruning read would drop by
+    // replacing the file.
+    const expired = `${JSON.stringify({ id: "expired-entry", at: new Date(Date.now() - 200 * 86_400_000).toISOString() })}\n`;
+    writeFileSync(ledger, expired);
+    const appended = `${JSON.stringify({ id: "consumed-mid-lookup", at: new Date().toISOString() })}\n`;
+
+    // A consumer's append lands right after the watcher's lookup has read the
+    // ledger, before the lookup returns.
+    const realRead = fs.readFileSync as (...a: unknown[]) => unknown;
+    let interleaved = 0;
+    const readSpy = spyOn(fs, "readFileSync").mockImplementation(((...a: unknown[]) => {
+      const out = realRead(...a);
+      if (a[0] === ledger && interleaved === 0) {
+        interleaved++;
+        fs.appendFileSync(ledger, appended, "utf-8");
+      }
+      return out;
+    }) as typeof fs.readFileSync);
+
+    const received: string[] = [];
+    let watcher: MailWatcher | undefined;
+    let envId = "";
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      envId = deliverSigned("lookup meets an append").messageId;
+      await waitFor(() => received.length > 0, 5000);
+    } finally {
+      watcher?.stop();
+      readSpy.mockRestore();
+    }
+
+    expect(received).toEqual([envId]);
+    expect(interleaved).toBe(1); // the append did land inside the lookup
+    // Nothing was rewritten: the ledger is the seeded line plus the append.
+    expect(readFileSync(ledger, "utf-8")).toBe(expired + appended);
+  }, 10_000);
+
+  it("an unreadable consumed ledger withholds a replay, logs it and retries it, after the consumed record has left the maildir", async () => {
+    const { env, file, bytes } = await consumeAndDropRecord("ledger unreadable");
+    const inbox = getInbox(AGENT);
+    const ledger = join(inbox.root, "consumed.jsonl");
+    const log = captureErrors();
+    const received: string[] = [];
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      chmodSync(ledger, 0o000);
+      writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
+
+      // Withheld and logged on more than one scan: never classified, so retried.
+      const withheld = () =>
+        log.lines.filter(
+          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${ledger} is unreadable`) && l.includes("Remedy:"),
+        ).length;
+      await waitFor(() => withheld() >= 2 || received.length > 0, 5000);
+      expect(received).toEqual([]);
+
+      // Readable again: the retry reaches the replay verdict, still not presented.
+      chmodSync(ledger, 0o644);
+      await waitFor(() => log.lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`)), 5000);
+      await sleep(100);
+      expect(received).toEqual([]);
+    } finally {
+      watcher?.stop();
+      log.restore();
+      chmodSync(ledger, 0o644);
+    }
+  }, 15_000);
+
+  it("with no ledger file, an unreadable maildir history withholds a replay, logs it and retries it", async () => {
+    const { env, file, bytes } = await consumeAndDropRecord("maildir unreadable");
+    const inbox = getInbox(AGENT);
+    const ledger = join(inbox.root, "consumed.jsonl");
+    const aside = join(tempRoot, "consumed.jsonl.aside");
+    const log = captureErrors();
+    const received: string[] = [];
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      // No ledger file, so the lookup falls back to the maildir — which cannot be listed.
+      renameSync(ledger, aside);
+      chmodSync(inbox.cur, 0o000);
+      writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
+
+      const withheld = () =>
+        log.lines.filter(
+          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${inbox.cur} is unreadable`) && l.includes("Remedy:"),
+        ).length;
+      await waitFor(() => withheld() >= 2 || received.length > 0, 5000);
+      expect(received).toEqual([]);
+
+      // History restored: the retry reaches the replay verdict, still not presented.
+      renameSync(aside, ledger);
+      chmodSync(inbox.cur, 0o755);
+      await waitFor(() => log.lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`)), 5000);
+      await sleep(100);
+      expect(received).toEqual([]);
+    } finally {
+      watcher?.stop();
+      log.restore();
+      chmodSync(inbox.cur, 0o755);
+      if (existsSync(aside)) renameSync(aside, ledger);
+    }
+  }, 15_000);
 
   it("a trigger during an active scan rescans once, so two files in one burst are both presented without the poll", async () => {
     const bodies: string[] = [];
