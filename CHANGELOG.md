@@ -12,6 +12,8 @@ All notable changes to the TPS CLI are recorded here.
 
 - **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
 
+- **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
+
 ### Security
 
 - **`tps mail watch --exec` presents only mail that verifies, without consuming it (Closes #375).** The watcher verifies each record in `new/` IN PLACE — the same signature and envelope-binding checks `promote()` applies (the wrapper sender against the signed sender, and the signed recipient against the mailbox), factored into a shared function that moves, leases and writes nothing — and passes only the records that verify to `onMessage` and the `--exec` hook. It calls no consumer path (`promote`, `checkMessages`, a lease or an ack), so it never competes with the inbox's consumers and never moves a record out of `new/`. A record that does not verify is skipped and logged, never presented. The verified body is written to the hook as UTF-8, and the four `TPS_MAIL_*` variables the watcher sets for the hook come from verified fields (the verified envelope id as `TPS_MAIL_ID`, plus `TPS_MAIL_FROM`/`TPS_MAIL_TO`/`TPS_MAIL_TIMESTAMP`).
