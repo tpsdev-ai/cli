@@ -35,6 +35,7 @@ When modifying the branch daemon or transport layers, keep the following securit
 ## Code Quality
 
 - We use Biome for linting. Run `bun run lint` before committing.
+- Run `bun run audit` for this repo's dependency audit: it invokes `bun audit`, the command CI's Dependency Audit runs. A bare `npm audit` is unsupported.
 - Ensure all tests pass (`bun run test`). We aim for high test coverage, especially in `packages/cli/src/utils/identity.ts`, `packages/cli/src/utils/relay.ts`, and the transport layers.
 - Write tests for new features.
 
