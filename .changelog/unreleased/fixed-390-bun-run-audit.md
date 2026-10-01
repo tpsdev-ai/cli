@@ -1,0 +1,1 @@
+- **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
