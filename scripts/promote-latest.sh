@@ -141,6 +141,9 @@ together; the script refuses if any is not published at VERSION.
                       downgrade) or a pre-release. `--yes` does NOT imply this.
   --help              Show this help.
 
+Each package's move runs `npm dist-tag add` with this terminal attached, so npm
+can open a browser 2FA prompt; approve each package as it appears.
+
 Environment: NPM_BIN (default `npm`); NPM_REGISTRY (default
 https://registry.npmjs.org) pins every npm call.
 EOF
@@ -359,11 +362,12 @@ rollback_moved() {
   # binaries — so there is no window with a new CLI beside previous platform tags.
   for ((i = NPKG - 1; i >= 0; i--)); do
     [ "${moved[i]}" = 1 ] || continue
+    # Run the rollback add with the terminal attached too: a captured or piped
+    # add has no terminal, and npm's browser 2FA exits EOTP at once.
     set +e
-    rb_out="$("$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY" 2>&1)"
+    "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
     set -e
-    [ -z "$rb_out" ] || printf '%s\n' "$rb_out" >&2
     set +e
     back="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     brc=$?
@@ -436,11 +440,14 @@ for ((i = 0; i < NPKG; i++)); do
   # package that the rollback skips.
   moved[i]=1
   printf '\n-> %s: npm dist-tag add %s@%s latest\n' "${names[i]}" "${names[i]}" "$version"
+  # Run the add with the terminal attached: no command substitution and no pipe,
+  # so stdin/stdout/stderr are inherited. With 2FA on writes, npm opens a browser
+  # link and waits on the terminal; with its output captured it has no terminal
+  # and exits EOTP without moving the tag.
   set +e
-  out="$("$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"
+  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?
   set -e
-  [ -z "$out" ] || printf '%s\n' "$out"
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
