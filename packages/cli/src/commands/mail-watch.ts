@@ -107,11 +107,10 @@ export function validateAgentId(agentId: string): void {
  * "every file left" (see processNew).
  */
 function listNewFiles(dir: string): string[] | null {
-  if (!existsSync(dir)) return [];
   try {
     return readdirSync(dir).filter((f) => f.endsWith(".json"));
-  } catch {
-    return null;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
   }
 }
 

@@ -23,8 +23,8 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
@@ -429,6 +429,34 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(received).toEqual([env.messageId]);
   }, 10_000);
 
+  it("an unreadable parent of new/ is a listing failure, not an empty inbox", async () => {
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+    await sleep(60);
+    const env = deliverSigned("parent-locked");
+    await sleep(200);
+    expect(received).toEqual([env.messageId]);
+
+    const parent = dirname(getInbox(AGENT).fresh);
+    const mode = statSync(parent).mode & 0o777;
+    chmodSync(parent, 0o000);
+    try {
+      await sleep(120);
+    } finally {
+      chmodSync(parent, mode);
+    }
+    await sleep(200);
+    watcher.stop();
+
+    expect(received).toEqual([env.messageId]);
+  }, 10_000);
+
   it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
     const out = join(tempRoot, "hook-out.txt");
     const envOut = join(tempRoot, "hook-env.json");
@@ -460,7 +488,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     watcher.stop();
 
     expect(existsSync(out), "the hook ran").toBe(true);
-    expect(readFileSync(out, "utf-8")).toBe(body); // verified body, byte-identical
+    expect(readFileSync(out, "utf-8")).toBe(body); // verified body
     const h = JSON.parse(readFileSync(envOut, "utf-8")) as {
       id: string;
       from: string;
