@@ -1322,11 +1322,11 @@ async function main() {
         return idx >= 0 ? process.argv[idx + 1] : undefined;
       };
 
-      const { runSkill } = await import("../src/commands/skill.js");
+      const { runSkill, skillNameFromCli } = await import("../src/commands/skill.js");
       await runSkill({
         action: action === "add-pack" ? "addPack" : action,
         agent: getFlag("agent") ?? cli.flags.agent,
-        name: getFlag("name") ?? cli.flags.name,
+        name: skillNameFromCli(action, rest, getFlag("name") ?? cli.flags.name),
         version: getFlag("version"),
         source: action === "register" ? rest[1] : (action === "add-pack" ? rest[1] : undefined),
         file: action === "scan" ? rest[1] : (action === "register" ? rest[1] : undefined),

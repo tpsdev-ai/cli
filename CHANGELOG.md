@@ -1,6 +1,12 @@
 # Changelog
 
 All notable changes to the TPS CLI are recorded here.
+All notable changes to the TPS CLI are recorded here.
+## [Unreleased]
+
+### Fixed
+
+- **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
 
 ## [0.8.0] — 2026-09-30
 
