@@ -702,8 +702,8 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
 }
 
 /**
- * The maildir fallback of isConsumedMessageId, failing closed: a directory or
- * record that does not exist is skipped, a corrupt record is skipped (as
+ * The maildir fallback of isConsumedMessageId: a directory or record that does
+ * not exist is skipped, a corrupt record is skipped (as
  * isConsumedMessageId skips it), and any other read error throws.
  */
 function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
@@ -981,10 +981,8 @@ export type VerifyRecordResult =
  * Verify ONE record IN PLACE: the checks `promote()` applies to a `new/`
  * record — the inner signed envelope, plus the shared `decideEnvelopeForMailbox`
  * bindings (the wrapper SENDER against the signed sender, and the signed
- * recipient against the mailbox; not every wrapper field is compared) — with NO
- * side effect. It moves, leases and writes NOTHING, so a non-consuming reader
- * (mail watch) can present only records that verify without competing with the
- * inbox's consumers.
+ * recipient against the mailbox; not every wrapper field is compared). It moves,
+ * leases and writes NOTHING.
  *
  * Returns the verified message, or the refusal class and reason. Throws on a
  * verification ERROR — Flair unreachable, or a malformed envelope structure —
@@ -1051,8 +1049,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
   // recipient binding, messageId/replyToId shapes, timestamp shape). The wrapper
   // was parsed above.
   // This is the SAME function the non-consuming `mail watch` reader calls, so
-  // the two cannot diverge. It has NO side effect; `promote` adds the move
-  // below.
+  // the two cannot diverge. `promote` adds the move below.
   let verified: VerifyRecordResult;
   try {
     verified = await verifyRecordForMailbox(agent, msg, verify);

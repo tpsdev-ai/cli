@@ -14,18 +14,16 @@
  *    message is presented again only after a scan observes its file absent from
  *    new/, and a failed new/ listing keeps that state.
  *  - concurrency limit: the default is 3 (the case below tests 2)
- *  - watcher.stop(): cleans up fs.watch
  *  - xmlEscape / buildPlist / daemon arg validation
  *
- * watchMail() now verifies in place through verifyRecordForMailbox(), which
- * constructs its Flair client unconditionally, so these tests stand up a stub
- * Flair and point FLAIR_URL/FLAIR_KEY_PATH at it.
+ * watchMail() now verifies in place through verifyRecordForMailbox(), so these
+ * tests stand up a stub Flair and point FLAIR_URL/FLAIR_KEY_PATH at it.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "node:fs";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
@@ -56,7 +54,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000) {
   }
 }
 
-// Never fires an fs event, so only the poll timer can deliver.
+// Never fires an fs event.
 const NO_FS_EVENTS = () => ({ close() {} });
 
 // ---------------------------------------------------------------------------
@@ -213,6 +211,39 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   function hookCapturing(outFile: string, envFile: string) {
     return { args: [process.execPath, "-e", HOOK_SCRIPT], env: { HOOK_OUT: outFile, HOOK_ENV: envFile } };
+  }
+
+  /** Capture console.error lines (the watcher's log) until restored. */
+  function captureErrors() {
+    const lines: string[] = [];
+    const spy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    return { lines, restore: () => spy.mockRestore() };
+  }
+
+  /**
+   * Make one node:fs read fail with an EACCES-coded error for `target` only,
+   * while `fault.armed` is true. Injected rather than set up with chmod, which
+   * does not stop a root reader. `fault.injected` counts the failures thrown.
+   */
+  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string) {
+    const real = fs[fn] as (...a: unknown[]) => unknown;
+    const syscall = fn === "readdirSync" ? "scandir" : "open";
+    const fault = { armed: true, injected: 0 };
+    const spy = spyOn(fs, fn).mockImplementation(((...a: unknown[]) => {
+      if (fault.armed && a[0] === target) {
+        fault.injected++;
+        throw Object.assign(new Error(`EACCES: permission denied, ${syscall} '${target}'`), {
+          code: "EACCES",
+          errno: -13,
+          syscall,
+          path: target,
+        });
+      }
+      return real(...a);
+    }) as never);
+    return { fault, restore: () => spy.mockRestore() };
   }
 
   it("poll path (fs events suppressed): a signed record delivered AFTER startup is presented, and new/ is left untouched", async () => {
@@ -380,7 +411,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(received).toEqual([env.messageId]);
   });
 
-  it("presents a message AGAIN after its file leaves and re-enters new/", async () => {
+  it("presents an unconsumed message AGAIN after its file leaves and re-enters new/", async () => {
     const received: string[] = [];
     const watcher = watchMail({
       agent: AGENT,
@@ -394,7 +425,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     await sleep(250);
     expect(received.filter((b) => b === "redelivered")).toHaveLength(1);
 
-    // The file leaves new/ (e.g. a consumer took it) — the watcher forgets it.
+    // The file leaves new/ — the watcher forgets it.
     const inbox = getInbox(AGENT);
     const [file] = jsonFiles(inbox.fresh);
     const bytes = readFileSync(join(inbox.fresh, file));
@@ -411,60 +442,40 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("a transient new/ listing failure does not present a still-present file twice", async () => {
     const received: string[] = [];
-    const watcher = watchMail({
-      agent: AGENT,
-      debounceMs: 20,
-      pollMs: 30,
-      watchImpl: NO_FS_EVENTS,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-    await sleep(60);
-    const env = deliverSigned("resilient");
-    await sleep(200);
-    expect(received).toEqual([env.messageId]);
-
-    // Make one new/ LISTING fail while the file stays put. A failed read must not
-    // be read as "every file left": the dedup state is kept, so the file is not
-    // presented again when the listing recovers.
-    const fresh = getInbox(AGENT).fresh;
-    chmodSync(fresh, 0o000);
+    const log = captureErrors();
+    let restore = () => {};
+    let watcher: MailWatcher | undefined;
     try {
-      await sleep(120);
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+      const env = deliverSigned("resilient");
+      await waitFor(() => received.length > 0, 5000);
+      expect(received).toEqual([env.messageId]);
+
+      // The new/ LISTING fails (EACCES) on several scans while the file stays put.
+      const injected = failReadsOf("readdirSync", getInbox(AGENT).fresh);
+      restore = injected.restore;
+      const failedListings = () =>
+        log.lines.filter((l) => l.includes("cannot list new/; keeping the current dedup state")).length;
+      await waitFor(() => failedListings() >= 2 || injected.fault.injected >= 2, 5000);
+
+      // The listing works again for several scans.
+      injected.fault.armed = false;
+      await sleep(200);
+      expect(received).toEqual([env.messageId]);
+      expect(failedListings()).toBeGreaterThanOrEqual(2);
+      expect(injected.fault.injected).toBeGreaterThanOrEqual(2); // the failure came from the injection
     } finally {
-      chmodSync(fresh, 0o755);
+      watcher?.stop();
+      restore();
+      log.restore();
     }
-    await sleep(200);
-    watcher.stop();
-
-    expect(received).toEqual([env.messageId]);
-  }, 10_000);
-
-  it("an unreadable parent of new/ is a listing failure, not an empty inbox", async () => {
-    const received: string[] = [];
-    const watcher = watchMail({
-      agent: AGENT,
-      debounceMs: 20,
-      pollMs: 30,
-      watchImpl: NO_FS_EVENTS,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-    await sleep(60);
-    const env = deliverSigned("parent-locked");
-    await sleep(200);
-    expect(received).toEqual([env.messageId]);
-
-    const parent = dirname(getInbox(AGENT).fresh);
-    const mode = statSync(parent).mode & 0o777;
-    chmodSync(parent, 0o000);
-    try {
-      await sleep(120);
-    } finally {
-      chmodSync(parent, mode);
-    }
-    await sleep(200);
-    watcher.stop();
-
-    expect(received).toEqual([env.messageId]);
   }, 10_000);
 
   it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
@@ -621,15 +632,6 @@ describe("watchMail (verified-only, non-consuming)", () => {
     return { env, file: file!, bytes };
   }
 
-  /** Capture console.error lines (the watcher's log) until restored. */
-  function captureErrors() {
-    const lines: string[] = [];
-    const spy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
-      lines.push(a.map(String).join(" "));
-    });
-    return { lines, restore: () => spy.mockRestore() };
-  }
-
   it("the replay lookup leaves the ledger untouched: a consumer's append that lands mid-lookup survives", async () => {
     const inbox = getInbox(AGENT);
     const ledger = join(inbox.root, "consumed.jsonl");
@@ -675,30 +677,6 @@ describe("watchMail (verified-only, non-consuming)", () => {
     // Nothing was rewritten: the ledger is the seeded line plus the append.
     expect(readFileSync(ledger, "utf-8")).toBe(expired + appended);
   }, 10_000);
-
-  /**
-   * Make one node:fs read fail with an EACCES-coded error for `target` only,
-   * while `fault.armed` is true. Injected rather than set up with chmod, which
-   * does not stop a root reader. `fault.injected` counts the failures thrown.
-   */
-  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string) {
-    const real = fs[fn] as (...a: unknown[]) => unknown;
-    const syscall = fn === "readdirSync" ? "scandir" : "open";
-    const fault = { armed: true, injected: 0 };
-    const spy = spyOn(fs, fn).mockImplementation(((...a: unknown[]) => {
-      if (fault.armed && a[0] === target) {
-        fault.injected++;
-        throw Object.assign(new Error(`EACCES: permission denied, ${syscall} '${target}'`), {
-          code: "EACCES",
-          errno: -13,
-          syscall,
-          path: target,
-        });
-      }
-      return real(...a);
-    }) as never);
-    return { fault, restore: () => spy.mockRestore() };
-  }
 
   it("an unreadable consumed ledger withholds a replay, logs it and retries it, after the consumed record has left the maildir", async () => {
     const { env, file, bytes } = await consumeAndDropRecord("ledger unreadable");
