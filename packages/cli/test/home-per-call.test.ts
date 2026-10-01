@@ -252,10 +252,12 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.HOME = homeB;
     mkdirSync(join(homeB, ".tps"), { recursive: true });
     writeFileSync(join(homeB, ".tps", "flair-sync.json"), JSON.stringify({ agentId: "beta-agent" }));
+    const keyPath = join(homeB, ".tps", "identity", "beta-agent.key");
+    expect(existsSync(keyPath)).toBe(false);
 
     // The first thing the sync does with the config is resolve that agent's key,
     // which is absent: the refusal names the agent from B's config.
-    await expect(mod.runFlairSync({ once: true })).rejects.toThrow(/--id beta-agent/);
+    await expect(mod.runFlairSync({ once: true, keyPath })).rejects.toThrow(/--id beta-agent/);
   });
 
   test("commands/flair.ts: the log path in `flair logs` follows the current HOME", async () => {
@@ -425,10 +427,9 @@ await Promise.race([daemon, new Promise((resolve) => setTimeout(resolve, 50))]);
 });
 
 /**
- * The modules this change touches resolve the home only through the helper
- * (`src/utils/home.ts`, and the agent package's `src/home.ts`): a direct
- * `homedir()` call or `process.env.HOME` read in one of them fails here, so the
- * two cannot be mixed again in the same module.
+ * For the listed modules, this source check catches literal `homedir()` calls
+ * and direct `process.env.HOME` or `process.env["HOME"]` reads. The helpers are
+ * `src/utils/home.ts` in the CLI and `src/home.ts` in the agent package.
  */
 const TOUCHED_MODULES = [
   "src/commands/bootstrap.ts",
@@ -445,7 +446,7 @@ const TOUCHED_MODULES = [
   "../agent/src/llm/provider.ts",
 ];
 
-test("cli#439: no touched module calls homedir() or reads process.env.HOME outside the helper", () => {
+test("cli#439: converted modules omit the listed direct home spellings", () => {
   const direct = /\bhomedir\s*\(|process\.env\.HOME\b|process\.env\[\s*["'`]HOME["'`]\s*\]/;
   const found: string[] = [];
   for (const rel of TOUCHED_MODULES) {
