@@ -60,10 +60,10 @@
 #      `--allow-downgrade` acknowledgement, which `--yes` does NOT imply.
 #   6. It prints a final table — package, previous latest, new latest, and whether
 #      the move was verified against the registry.
-#   7. On success it dispatches the Docker image workflow for the version that has
-#      just become `latest`. A dispatch that fails does NOT roll the promote back
-#      (the registry already moved): it exits 6 and prints the command to run by
-#      hand. `--no-docker` skips the dispatch.
+#   7. After a successful move it dispatches the Docker image workflow for the new
+#      `latest`. A dispatch that fails does NOT roll the promote back (the registry
+#      already moved): it exits 6 and prints the command to run by hand.
+#      `--no-docker` skips the dispatch.
 #
 # Every npm call is pinned with `--registry` (NPM_REGISTRY, default
 # https://registry.npmjs.org) so the one path that publishes cannot be redirected
@@ -158,8 +158,8 @@ together; the script refuses if any is not published at VERSION.
                       successful promote (build the image yourself).
   --help              Show this help.
 
-After every package's `latest` is re-read and confirmed at VERSION, the script
-dispatches the Docker image workflow:
+After a successful move, the script dispatches the Docker image workflow for
+VERSION:
 
     gh workflow run docker.yml --repo tpsdev-ai/cli -f version=VERSION
 
