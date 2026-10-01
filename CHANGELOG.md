@@ -4,15 +4,21 @@ All notable changes to the TPS CLI are recorded here.
 
 ## [Unreleased]
 
-### Removed
+Entries for the next release live as **fragment files** under [`.changelog/unreleased/`](.changelog/unreleased/) —
+one file per change, so pull requests with distinct fragment filenames do not share an edit to this section.
 
-- **The unused root CLI tree (root `src/`, `bin/tps.ts`, `scripts/stall-monitor.ts`) is deleted; the CLI lives in `packages/cli` (Closes #379).**
+Add `.changelog/unreleased/<category>-<slug>.md` containing your entry as it should read under
+its `### Category` heading, leading `- ` included. Categories: `added`, `changed`, `deprecated`,
+`removed`, `fixed`, `security`.
 
-### Fixed
+```bash
+node scripts/changelog-fragments.mjs render   # preview the assembled section
+node scripts/changelog-fragments.mjs check    # what CI checks
+```
 
-- **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
-
-- **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
+`node scripts/changelog-fragments.mjs promote <version>` writes them into a `## [<version>]` section
+below this one and deletes them as part of a version cut. **Do not add anything to this section by
+hand**: `check` and `promote` refuse while it holds anything but this note.
 
 ## [0.8.0] — 2026-09-30
 

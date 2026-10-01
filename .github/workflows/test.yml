@@ -50,6 +50,10 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint:ci
+      # The changelog fragment gate (cli#449): refuses a malformed fragment, and
+      # anything but the managed note under [Unreleased]. Read-only, no secret.
+      - name: Changelog fragments (cli#449)
+        run: node scripts/changelog-fragments.mjs check
 
   # cli#366 — the promote script must run under bash 3.2, which is the bash on the
   # machine that drives releases (macOS still ships 3.2.57). Fixtures that only ever
