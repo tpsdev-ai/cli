@@ -285,10 +285,10 @@ describe("office image ships an agent that answers `check` (cli#352 r4)", () => 
 /**
  * cli#420 slice 1 — the Docker Image workflow ran on the Release workflow's
  * completion, when the packages are staged and not yet public, so npm answered
- * ETARGET and every release ended in a failed Docker run. It is now dispatched
- * with a version, and it refuses a version npm has not published. These
- * assertions pin the refusal order and the tag rule: a `workflow_run` trigger
- * back, or a version check without its end anchor, fails here.
+ * ETARGET and the Docker run failed. It is now dispatched with a version, and
+ * it refuses a version npm has not published. These assertions pin the refusal
+ * order and the tag rule: a `workflow_run` trigger back, or a version check
+ * without its end anchor, fails here.
  */
 describe("docker image workflow — dispatched only for a version public on npm (cli#420 slice 1)", () => {
   interface DockerStep {
