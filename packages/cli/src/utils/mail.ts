@@ -640,6 +640,18 @@ function isConsumedMessageId(root: string, messageId: string): boolean {
   return false;
 }
 
+/**
+ * Read-only replay lookup for one mailbox: true when this envelope messageId is
+ * already consumed. It wraps the SAME check `promote()` uses — the durable
+ * ledger plus the maildir migration fallback — and consumes nothing: it moves,
+ * leases and delivers no record. A non-consuming reader (mail watch) uses it to
+ * skip an envelope `promote()` would reject as a replay.
+ */
+export function isConsumedForMailbox(agent: string, messageId: string): boolean {
+  assertValidAgentId(agent);
+  return isConsumedMessageId(getInbox(agent).root, messageId);
+}
+
 type EnvelopeBinding =
   | { kind: "bind"; recordField: keyof MailMessage }
   | { kind: "exclude"; reason: string };

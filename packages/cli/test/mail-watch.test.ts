@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
-import { sendMessage, getInbox, type MailMessage } from "../src/utils/mail.js";
+import { getInbox, promote, sendMessage, type MailMessage, verifyRecordForMailbox } from "../src/utils/mail.js";
 import {
   buildSignedEnvelope,
   startStubFlair,
@@ -44,6 +44,15 @@ const SEEDS = { flint: FLINT_SEED, kern: KERN_SEED };
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Bounded poll: resolve when `cond` is true, else throw at `timeoutMs`. */
+async function waitFor(cond: () => boolean, timeoutMs = 5000) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    await sleep(5);
+  }
 }
 
 // Never fires an fs event, so only the poll timer can deliver.
@@ -559,6 +568,79 @@ describe("watchMail (verified-only, non-consuming)", () => {
     watcher.stop();
     expect(received).toContain("still alive");
   });
+
+  it("does not present a re-planted envelope whose id is already consumed (replay skip)", async () => {
+    const received: string[] = [];
+    const out = join(tempRoot, "replay-hook.txt");
+    const envOut = join(tempRoot, "replay-env.json");
+
+    // CONSUME the message: promote() moves it to cur/ and records its id.
+    const env = buildSignedEnvelope("flint", AGENT, "replay me", SEEDS);
+    sendMessage(AGENT, JSON.stringify(env), "flint");
+    const inbox = getInbox(AGENT);
+    const [file] = jsonFiles(inbox.fresh);
+    const bytes = readFileSync(join(inbox.fresh, file!));
+    expect((await promote(AGENT, join(inbox.fresh, file!))).ok).toBe(true);
+    expect(jsonFiles(inbox.fresh)).toHaveLength(0);
+
+    // Copy the consumed record back into new/ — a replay.
+    writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
+
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      hook: hookCapturing(out, envOut),
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+    await sleep(400);
+    watcher.stop();
+
+    expect(received).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
+    // Non-consuming: the replayed record stays in new/.
+    expect(jsonFiles(inbox.fresh)).toHaveLength(1);
+  });
+
+  it("a trigger during an active scan rescans once, so two files in one burst are both presented without the poll", async () => {
+    const bodies: string[] = [];
+    let fsListener: (() => void) | null = null;
+    let verifyCalls = 0;
+    let openFirstScan: () => void = () => {};
+    const firstScanGate = new Promise<void>((r) => { openFirstScan = r; });
+    const slowVerify: typeof verifyRecordForMailbox = async (agent, record) => {
+      verifyCalls++;
+      if (verifyCalls === 1) await firstScanGate; // hold scan A open on file 1
+      return verifyRecordForMailbox(agent, record);
+    };
+
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 10,
+      pollMs: 60_000, // far above the test window: the poll cannot deliver
+      watchImpl: (_dir, listener) => { fsListener = listener; return { close() {} }; },
+      verifyImpl: slowVerify,
+      onMessage: (msg) => { bodies.push(msg.body); },
+    });
+
+    await sleep(30); // let the startup scan settle
+    sendMessage(AGENT, JSON.stringify(buildSignedEnvelope("flint", AGENT, "burst-1", SEEDS)), "flint");
+    (fsListener as unknown as () => void)();
+    // Scan A has listed new/ (file 1 only) and is now held in verification.
+    await waitFor(() => verifyCalls === 1);
+
+    // File 2 arrives mid-scan; its debounced trigger must coalesce into a rescan.
+    sendMessage(AGENT, JSON.stringify(buildSignedEnvelope("flint", AGENT, "burst-2", SEEDS)), "flint");
+    (fsListener as unknown as () => void)();
+    await sleep(40); // let the second trigger's debounce run processNew (checking → rescan)
+
+    openFirstScan(); // let scan A finish; the pending rescan then runs
+    await waitFor(() => bodies.length >= 2, 5000);
+    watcher.stop();
+
+    expect(bodies.sort()).toEqual(["burst-1", "burst-2"]);
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MailMessage } from "../utils/mail.js";
-import { getInbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
+import { getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,11 @@ export interface MailWatchOptions {
    * swallowed: a heartbeat failure must never crash the mail loop.
    */
   onPoll?: () => void | Promise<void>;
+  /**
+   * Test seam: the record verifier. Defaults to `verifyRecordForMailbox`. A test
+   * that must control verification timing injects one.
+   */
+  verifyImpl?: typeof verifyRecordForMailbox;
   /**
    * Test seam: the fs.watch implementation. Defaults to node's `fs.watch`. A
    * test that must prove the POLL path alone passes a no-op here, so no fs
@@ -199,6 +204,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   const inbox = getInbox(opts.agent);
+  const verifyRecord = opts.verifyImpl ?? verifyRecordForMailbox;
 
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
   // came from. Within ONE watcher instance an entry is dropped only when a scan
@@ -215,6 +221,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // as slots free.
   const pending: MailMessage[] = [];
   let checking = false;
+  // A trigger that arrives while a scan runs is coalesced into ONE pending
+  // rescan (a flag, not a queue), run when the current scan finishes.
+  let rescan = false;
 
   const drain = () => {
     while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
@@ -239,7 +248,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // verify. Nothing is moved, leased or acked. A record that does not verify is
   // logged and skipped, never presented.
   const processNew = async () => {
-    if (stopped || checking) return;
+    if (stopped) return;
+    if (checking) { rescan = true; return; }
     checking = true;
     try {
       const files = listNewFiles(inbox.fresh);
@@ -266,7 +276,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         let result: VerifyRecordResult;
         try {
-          result = await verifyRecordForMailbox(opts.agent, record);
+          result = await verifyRecord(opts.agent, record);
         } catch (err) {
           // A verification ERROR — Flair unreachable, or a malformed envelope
           // structure — is not a verdict. The record is withheld and logged, and
@@ -286,6 +296,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           classified.set(file, "refused:no-envelope-id");
           continue;
         }
+        // A verified record whose id is already consumed is a replay — skip it,
+        // as promote() would (it dead-letters a replay).
+        if (isConsumedForMailbox(opts.agent, envId)) {
+          classified.set(file, "already-consumed");
+          console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
+          continue;
+        }
         classified.set(file, "presented");
         // Dedup on the VERIFIED envelope id.
         if (presented.has(envId)) continue;
@@ -295,6 +312,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
     } finally {
       checking = false;
       drain();
+      if (rescan && !stopped) { rescan = false; void processNew(); }
     }
   };
 
