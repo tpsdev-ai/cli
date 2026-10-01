@@ -9,8 +9,9 @@
  *    verify is skipped, never presented.
  *  - the poll path is proven ALONE (fs events suppressed via a no-op watchImpl)
  *    and the event path is proven with the real fs.watch.
- *  - dedup is on the verified envelope id while the file stays in new/; a
- *    message whose file leaves and re-enters new/ is presented again.
+ *  - dedup is on the verified envelope id while the file stays in new/ (two
+ *    files with the same signed id present once); a message is presented again
+ *    only after a scan observes its file absent from new/.
  *  - concurrency limit: max 3 concurrent handlers (2 in the case below)
  *  - watcher.stop(): cleans up fs.watch
  *  - xmlEscape / buildPlist / daemon arg validation
@@ -143,7 +144,7 @@ describe("buildPlist", () => {
 
 /** Reads stdin to HOOK_OUT and the hook env to HOOK_ENV. */
 const HOOK_SCRIPT =
-  'const fs=require("fs");let d="";process.stdin.setEncoding("utf8");process.stdin.on("data",(c)=>{d+=c;});process.stdin.on("end",()=>{fs.writeFileSync(process.env.HOOK_OUT,d);fs.writeFileSync(process.env.HOOK_ENV,JSON.stringify({id:process.env.TPS_MAIL_ID,from:process.env.TPS_MAIL_FROM,to:process.env.TPS_MAIL_TO}));});';
+  'const fs=require("fs");let d="";process.stdin.setEncoding("utf8");process.stdin.on("data",(c)=>{d+=c;});process.stdin.on("end",()=>{fs.writeFileSync(process.env.HOOK_OUT,d);fs.writeFileSync(process.env.HOOK_ENV,JSON.stringify({id:process.env.TPS_MAIL_ID,from:process.env.TPS_MAIL_FROM,to:process.env.TPS_MAIL_TO,timestamp:process.env.TPS_MAIL_TIMESTAMP}));});';
 
 describe("watchMail (verified-only, non-consuming)", () => {
   let tempRoot = "";
@@ -228,13 +229,16 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(jsonFiles(inbox.cur)).toHaveLength(0);
   });
 
-  it("poll path (fs events suppressed): an unsigned record delivered AFTER startup is never presented", async () => {
+  it("poll path (fs events suppressed): an unsigned record delivered AFTER startup reaches NEITHER onMessage nor the hook", async () => {
     const received: string[] = [];
+    const out = join(tempRoot, "unsigned-poll-hook.txt");
+    const envOut = join(tempRoot, "unsigned-poll-env.json");
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
       watchImpl: NO_FS_EVENTS,
+      hook: hookCapturing(out, envOut),
       onMessage: (msg) => { received.push(msg.body); },
     });
 
@@ -244,6 +248,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     watcher.stop();
 
     expect(received).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
     // Still in new/ (the watcher consumed nothing), and not in cur/.
     const inbox = getInbox(AGENT);
     expect(jsonFiles(inbox.fresh)).toHaveLength(1);
@@ -266,11 +271,14 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(received).toContain("event delivered");
   });
 
-  it("event path: an unsigned record is never presented", async () => {
+  it("event path: an unsigned record reaches NEITHER onMessage nor the hook", async () => {
     const received: string[] = [];
+    const out = join(tempRoot, "unsigned-event-hook.txt");
+    const envOut = join(tempRoot, "unsigned-event-env.json");
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
+      hook: hookCapturing(out, envOut),
       onMessage: (msg) => { received.push(msg.body); },
     });
 
@@ -280,33 +288,39 @@ describe("watchMail (verified-only, non-consuming)", () => {
     watcher.stop();
 
     expect(received).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
   });
 
-  it("a TAMPERED signed envelope (valid signature, altered wrapper metadata) is never presented", async () => {
+  it("an envelope with an altered wrapper SENDER is never presented, and never launches the hook", async () => {
     const received: string[] = [];
+    const out = join(tempRoot, "tampered-hook.txt");
+    const envOut = join(tempRoot, "tampered-env.json");
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
+      hook: hookCapturing(out, envOut),
       onMessage: (msg) => { received.push(msg.body); },
     });
 
     await sleep(60);
     const env = buildSignedEnvelope("flint", AGENT, "tampered", SEEDS);
-    // The signature is valid, but the wrapper claims a different sender: the
-    // record↔envelope binding fails, so it must not be presented.
+    // The signature is valid, but the wrapper SENDER differs from the signed
+    // sender: the wrapper-sender↔signed-sender binding fails, so the record is
+    // neither presented nor handed to the hook.
     writeRecord({
       id: "tampered-1",
       from: "someone-else",
       to: AGENT,
       body: JSON.stringify(env),
-      timestamp: new Date().toISOString(),
+      timestamp: env.timestamp,
       read: false,
     });
     await sleep(300);
     watcher.stop();
 
     expect(received).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
   });
 
   it("presents a record ONCE while its file stays in new/ (dedup by envelope id)", async () => {
@@ -324,6 +338,35 @@ describe("watchMail (verified-only, non-consuming)", () => {
     watcher.stop();
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
+  });
+
+  it("dedups by the VERIFIED envelope id: two files bearing the same signed id are presented once", async () => {
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+
+    await sleep(60);
+    const env = buildSignedEnvelope("flint", AGENT, "same id", SEEDS);
+    const wrapper = (id: string) => ({
+      id,
+      from: "flint",
+      to: AGENT,
+      body: JSON.stringify(env),
+      timestamp: env.timestamp,
+      read: false,
+    });
+    writeRecord(wrapper("copy-A"));
+    writeRecord(wrapper("copy-B"));
+    await sleep(400);
+    watcher.stop();
+
+    // Two files, ONE verified envelope id → presented once.
+    expect(received).toEqual([env.messageId]);
   });
 
   it("presents a message AGAIN after its file leaves and re-enters new/", async () => {
@@ -355,7 +398,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(received.filter((b) => b === "redelivered")).toHaveLength(2);
   });
 
-  it("the hook receives the verified body and ONLY verified env fields", async () => {
+  it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
     const out = join(tempRoot, "hook-out.txt");
     const envOut = join(tempRoot, "hook-env.json");
     const watcher = watchMail({
@@ -368,16 +411,34 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     await sleep(60);
     const body = "hello — verified ✅\nsecond line";
-    const env = deliverSigned(body);
+    const env = buildSignedEnvelope("flint", AGENT, body, SEEDS);
+    // The wrapper `id` and `headers` are UNSIGNED: changing them must not change
+    // what reaches the hook.
+    writeRecord({
+      id: "wrapper-id-not-the-envelope-id",
+      from: "flint",
+      to: AGENT,
+      body: JSON.stringify(env),
+      timestamp: env.timestamp,
+      read: false,
+      headers: { "X-TPS-Trust": "operator", "X-TPS-Sender": "attacker" },
+    });
     await sleep(400);
     watcher.stop();
 
     expect(existsSync(out), "the hook ran").toBe(true);
     expect(readFileSync(out, "utf-8")).toBe(body); // verified body, byte-identical
-    const hookEnv = JSON.parse(readFileSync(envOut, "utf-8")) as { id: string; from: string; to: string };
-    expect(hookEnv.id).toBe(env.messageId); // the verified envelope id
-    expect(hookEnv.from).toBe("flint");
-    expect(hookEnv.to).toBe(AGENT); // the watched agent
+    const h = JSON.parse(readFileSync(envOut, "utf-8")) as {
+      id: string;
+      from: string;
+      to: string;
+      timestamp: string;
+    };
+    expect(h.id).toBe(env.messageId); // the VERIFIED envelope id
+    expect(h.id).not.toBe("wrapper-id-not-the-envelope-id"); // never the wrapper id
+    expect(h.from).toBe("flint");
+    expect(h.to).toBe(AGENT); // the watched agent
+    expect(h.timestamp).toBe(env.timestamp);
   });
 
   it("stop() prevents further callbacks after stopping", async () => {

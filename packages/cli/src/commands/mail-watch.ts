@@ -21,11 +21,11 @@
  * Hook contract:
  * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
  *   byte-identical);
- * - the hook's environment carries ONLY verified fields: TPS_MAIL_ID (the
- *   verified envelope id), TPS_MAIL_FROM, TPS_MAIL_TO (the watched agent) and
- *   TPS_MAIL_TIMESTAMP;
- * - a hook that consumes a message acks it with
- *   `tps mail ack --agent "$TPS_MAIL_TO" <id>`.
+ * - the four mail variables the watcher sets come from VERIFIED fields:
+ *   TPS_MAIL_ID (the verified envelope id), TPS_MAIL_FROM, TPS_MAIL_TO (the
+ *   watched agent) and TPS_MAIL_TIMESTAMP. The hook process also inherits the
+ *   watcher's environment (plus any `env` on the hook), so those four are the
+ *   only mail variables this module vouches for.
  */
 
 import { execSync, spawn } from "node:child_process";
@@ -145,7 +145,8 @@ function projectVerified(m: MailMessage): MailMessage {
 
 /**
  * Run a hook for a single VERIFIED message.
- * Passes the verified fields via env vars; body via stdin.
+ * Writes the verified body to stdin and sets the four TPS_MAIL_* variables from
+ * verified fields (the rest of the environment is inherited).
  * No shell interpolation — args passed directly to spawn().
  */
 function runHook(hook: WatchExecHook, msg: MailMessage): Promise<void> {
@@ -196,8 +197,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   const inbox = getInbox(opts.agent);
 
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
-  // came from. Dropped when that file leaves `new/`, so a message re-delivered
-  // into `new/` is presented again; while the file stays, it is presented once.
+  // came from. An entry is dropped only when a SCAN observes that file absent
+  // from `new/`; then a re-delivered message is presented again. While the file
+  // stays, it is presented once.
   const presented = new Map<string, string>();
   // Files already classified this residence (presented, or skipped as
   // unverifiable), keyed on the filename, so a later pass does not re-verify or
@@ -255,8 +257,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         try {
           result = await verifyRecordForMailbox(opts.agent, record);
         } catch (err) {
-          // Flair unreachable — a retryable outage, not a verdict. Log it and
-          // let the next pass try again (do NOT mark it classified).
+          // A verification ERROR — Flair unreachable, or a malformed envelope
+          // structure — is not a verdict. The record is withheld and logged, and
+          // the next pass tries again (do NOT mark it classified).
           console.error(
             `[mail-watch] ${record.id}: verification unavailable (${err instanceof Error ? err.message : String(err)})`,
           );

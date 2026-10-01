@@ -865,14 +865,16 @@ export type VerifyRecordResult =
 
 /**
  * Verify ONE record IN PLACE: the checks `promote()` applies to a `new/`
- * record — the inner signed envelope and the record↔envelope bindings (the
- * SAME `decideEnvelopeForMailbox` policy) — with NO side effect. It moves,
- * leases and writes NOTHING, so a non-consuming reader (mail watch) can present
- * only records that verify without competing with the inbox's consumers.
+ * record — the inner signed envelope, plus the shared `decideEnvelopeForMailbox`
+ * bindings (the wrapper SENDER against the signed sender, and the signed
+ * recipient against the mailbox; not every wrapper field is compared) — with NO
+ * side effect. It moves, leases and writes NOTHING, so a non-consuming reader
+ * (mail watch) can present only records that verify without competing with the
+ * inbox's consumers.
  *
- * Returns the verified message, or the refusal class and reason. Throws ONLY
- * when Flair is unreachable — a retryable outage, not a verdict (callers
- * classify that themselves).
+ * Returns the verified message, or the refusal class and reason. Throws on a
+ * verification ERROR — Flair unreachable, or a malformed envelope structure —
+ * which callers withhold and retry, not a verdict.
  */
 export async function verifyRecordForMailbox(
   agent: string,
@@ -930,9 +932,10 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     return { ok: false, class: "invalid", reason };
   }
 
-  // Step 1+2: the SHARED record verification (parse the wrapper, parse the
-  // envelope, and run the ONE mailbox policy: signature, wrapper→envelope from
-  // binding, recipient binding, messageId/replyToId shapes, timestamp shape).
+  // Step 1+2: the SHARED record verification (parse the envelope, and run the
+  // ONE mailbox policy: signature, wrapper-sender↔signed-sender binding,
+  // recipient binding, messageId/replyToId shapes, timestamp shape). The wrapper
+  // was parsed above.
   // This is the SAME function the non-consuming `mail watch` reader calls, so
   // the two cannot diverge. It has NO side effect; `promote` adds the move
   // below.
