@@ -10,7 +10,7 @@ All notable changes to the TPS CLI are recorded here.
 
 ### Fixed
 
-- **`bun run audit` runs this repo's dependency audit, the same command as CI; the root `ws` dependency now equals its override (Closes #390).**
+- **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
 
 ## [0.8.0] — 2026-09-30
 
