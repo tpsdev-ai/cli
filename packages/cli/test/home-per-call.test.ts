@@ -255,8 +255,8 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     const keyPath = join(homeB, ".tps", "identity", "beta-agent.key");
     expect(existsSync(keyPath)).toBe(false);
 
-    // The first thing the sync does with the config is resolve that agent's key,
-    // which is absent: the refusal names the agent from B's config.
+    // The sync checks the explicitly supplied key, which is absent; the refusal
+    // names the agent it read from B's config.
     await expect(mod.runFlairSync({ once: true, keyPath })).rejects.toThrow(/--id beta-agent/);
   });
 
@@ -363,7 +363,7 @@ function runAfterHomeSwitch(module: string, body: (homeB: string) => string) {
   return { startHome, homeB, status: r.status, pid: r.pid, stderr: r.stderr };
 }
 
-/** The child exited 0; otherwise fail with its stderr, which names the path it could not write. */
+/** The child exited 0; a nonzero exit fails the test and includes the child's stderr. */
 function expectCleanExit(r: { status: number | null; stderr: string }): void {
   if (r.status !== 0) throw new Error(`child exited ${r.status}:\n${r.stderr}`);
 }
