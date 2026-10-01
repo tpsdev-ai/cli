@@ -211,7 +211,7 @@ describe("docker-image-tags.sh — the npm checks and the tags (cli#420)", () =>
     }
   });
 
-  test("E404 for the version: refused with the staged-release remedy, and no outputs", () => {
+  test("E404 for the version: refused with conditional staged-release guidance, and no outputs", () => {
     // npm 11 prefixes its error lines "npm error"; older npm used "npm ERR!".
     const npmError = e404("0.7.0");
     const npmErr: Answer = { rc: 1, err: "npm ERR! code E404\nnpm ERR! 404 No match found for version 0.7.0\n" };
@@ -219,7 +219,7 @@ describe("docker-image-tags.sh — the npm checks and the tags (cli#420)", () =>
       const r = run("0.7.0", { version: answer, latest: latestIs("0.7.0") });
       expect(r.status, what("0.7.0", r)).toBe(1);
       expect(r.stdout).toContain(
-        `::error::${PKG}@0.7.0 is not public on npm (E404): approve the staged release, then re-run this workflow with version=0.7.0`,
+        `::error::npm could not find version 0.7.0 of ${PKG} (E404): if this version is staged, approve its staged release and re-run this workflow with version=0.7.0; otherwise publish this version or choose a public version`,
       );
       expect(r.stdout).not.toContain("could not verify");
       expect(r.outputs).toEqual({});
@@ -275,6 +275,21 @@ describe("docker-image-tags.sh — the npm checks and the tags (cli#420)", () =>
     expect(r.stdout).not.toContain("selected for push");
     expect(r.outputs).toEqual({});
     expect(r.npmCalls).toEqual([`view ${PKG}@0.7.0 version`, `view ${PKG} dist-tags.latest`]);
+  });
+
+  test("the latest lookup succeeds with empty or malformed output: refused without tags", () => {
+    for (const [label, output] of [
+      ["empty", ""],
+      ["malformed", "not-a-version\n"],
+      ["multiple lines", "0.7.0\n0.8.0\n"],
+    ]) {
+      const r = run("0.7.0", { version: published("0.7.0"), latest: { out: output } });
+      expect(r.status, `${label}: ${what("0.7.0", r)}`).toBe(1);
+      expect(r.stdout, label).toContain(`::error::could not verify npm's latest for ${PKG}:`);
+      expect(r.stdout, label).not.toContain("selected for push");
+      expect(r.outputs, label).toEqual({});
+      expect(r.npmCalls, label).toEqual([`view ${PKG}@0.7.0 version`, `view ${PKG} dist-tags.latest`]);
+    }
   });
 });
 

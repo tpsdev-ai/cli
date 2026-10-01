@@ -11,7 +11,7 @@
 #   tags            the image tags to push, one per line
 # Exit 1, with a ::error:: line, when the version does not have the required
 # shape, the version lookup does not confirm publication, or the latest lookup
-# exits nonzero.
+# fails or does not return a single version-shaped value.
 #
 # `npm` is taken from PATH. test/docker-image-tags.test.ts runs this script
 # with a stub npm first on PATH.
@@ -52,7 +52,8 @@ lookup_error() {
 #    image before that, and its `npm install` failed with ETARGET ("No matching
 #    version found for @tpsdev-ai/agent@0.7.0.").
 #    An E404 code and matching "No match found for version <version>" message,
-#    with no conflicting code, gets the staged-release remedy. Every other
+#    with no conflicting code, reports that npm could not find the version and
+#    recommends approval only if this version is staged. Every other
 #    unverifiable lookup is reported as "could not verify". Both exit 1.
 set +e
 published="$(npm view "${PKG}@${V}" version 2>"$errf")"
@@ -69,7 +70,7 @@ if [ "$rc" -ne 0 ] || [ "$published" != "$V" ]; then
     /^npm (error|ERR!) code / &&
       $0 != "npm error code E404" && $0 != "npm ERR! code E404" { exit 1 }
   ' "$errf"; then
-    echo "::error::${PKG}@${V} is not public on npm (E404): approve the staged release, then re-run this workflow with version=${V}"
+    echo "::error::npm could not find version ${V} of ${PKG} (E404): if this version is staged, approve its staged release and re-run this workflow with version=${V}; otherwise publish this version or choose a public version"
   else
     echo "::error::could not verify ${PKG}@${V} on npm: $(lookup_error "$rc" "$published"); re-run the workflow"
   fi
@@ -79,12 +80,13 @@ echo "${PKG}@${V} is public on npm"
 
 # 3. The tags: the version tag, and :latest when the version equals npm's
 #    dist-tags.latest for the package. The comparison is made when the tags
-#    are computed. If the lookup fails, exit 1: no tags are output.
+#    are computed. If the lookup fails or does not return a single
+#    version-shaped value, exit 1: no tags are output.
 set +e
 latest="$(npm view "$PKG" dist-tags.latest 2>"$errf")"
 rc=$?
 set -e
-if [ "$rc" -ne 0 ]; then
+if [ "$rc" -ne 0 ] || ! [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
   cat "$errf" >&2
   echo "::error::could not verify npm's latest for ${PKG}: $(lookup_error "$rc" "$latest"); re-run the workflow"
   exit 1
