@@ -6,6 +6,7 @@
     "packages/*"
   ],
   "scripts": {
+    "audit": "bun audit",
     "build": "(cd packages/cli && bun run build || true) && cd packages/agent && bun run build && cd ../cli && rm -rf dist && bun run build && cd ../pi-tps-mail && bun run build",
     "test": "cd packages/agent && node ../../scripts/test-suite.mjs agent && cd ../cli && node ../../scripts/test-suite.mjs cli && cd ../pi-tps-mail && node ../../scripts/test-suite.mjs pi-tps-mail && cd ../.. && node scripts/test-suite.mjs root-test ./test",
     "lint": "cd packages/cli && bun run lint",
@@ -29,7 +30,7 @@
     "sha512-universal": "^1.2.1",
     "siphash24": "^1.3.1",
     "sodium-javascript": "^0.8.0",
-    "ws": "^8.20.1",
+    "ws": "^8.21.0",
     "xsalsa20": "^1.2.0"
   },
   "overrides": {

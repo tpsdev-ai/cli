@@ -10,6 +10,8 @@ All notable changes to the TPS CLI are recorded here.
 
 ### Fixed
 
+- **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
+
 - **The codex runtime records liveness on Flair's Presence resource instead of writing `Agent.status` (Closes #444).** `Agent.status` is the principal's lifecycle state, so the shutdown write of `"offline"` deactivated the agent — its requests were refused with `401 principal_deactivated`, and the matching `"online"` write could never succeed. The runtime now POSTs `/Presence` with the agent's own credential on each heartbeat and on shutdown (a final `activity: "idle"` beat); Flair derives `offline` from heartbeat age. A Presence failure only logs and never falls back to the Agent row.
 ## [0.8.0] — 2026-09-30
 
