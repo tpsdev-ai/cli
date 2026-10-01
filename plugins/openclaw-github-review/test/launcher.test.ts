@@ -23,8 +23,10 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** Run the launcher with a fake bun that exits `exit` and writes the report
- *  only when `write` is set. */
+/** Run the launcher with a fake bun on PATH that exits `exit` and writes the
+ *  report only when `write` is set. The fake carries that behaviour in its own
+ *  bytes: the launcher gives its child only the allowlist, so a variable it read
+ *  for the same purpose would never arrive. */
 function launch(opts: { exit: number; write: boolean; args?: string[] }) {
   const bin = join(root, "bin");
   mkdirSync(bin, { recursive: true });
@@ -33,24 +35,31 @@ function launch(opts: { exit: number; write: boolean; args?: string[] }) {
     fake,
     [
       "#!/bin/sh",
-      'for a in "$@"; do',
-      '  case "$a" in --reporter-outfile=*) [ "$FAKE_BUN_WRITE" = 1 ] && printf "<testsuites></testsuites>" > "${a#--reporter-outfile=}";; esac',
-      "done",
-      'exit "${FAKE_BUN_EXIT:-0}"',
+      ...(opts.write
+        ? [
+            'for a in "$@"; do',
+            '  case "$a" in --reporter-outfile=*) printf "<testsuites></testsuites>" > "${a#--reporter-outfile=}";; esac',
+            "done",
+          ]
+        : []),
+      `exit ${opts.exit}`,
       "",
     ].join("\n"),
   );
   chmodSync(fake, 0o755);
   const reports = join(root, "reports");
+  // A HOME of its own, outside its temp dir: this launcher treats a temp dir
+  // inside the HOME it runs under as a destination it will not use.
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
   const res = spawnSync(process.env.TPS_LANE_NODE || "node", [join(pluginDir, "scripts", "run-tests.mjs"), ...(opts.args ?? [])], {
     cwd: pluginDir,
     env: {
       ...process.env,
+      HOME: home,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
       TMPDIR: root,
       TPS_TEST_REPORT_DIR: reports,
-      FAKE_BUN_EXIT: String(opts.exit),
-      FAKE_BUN_WRITE: opts.write ? "1" : "0",
     },
     encoding: "utf8",
     timeout: LAUNCHER_TEST_TIMEOUT_MS,

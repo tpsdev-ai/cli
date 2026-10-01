@@ -5,11 +5,11 @@
  *   - scripts/test-home-guard.mjs — the environment ALLOWLIST, the throwaway
  *     root, the temp/report destination checks, the suite-name check, the
  *     preloads' root check, and the `~/.tps` metadata snapshot (a diagnostic);
- *   - scripts/home-isolation-preload.ts and the plugin's test/preload-guard.ts —
+ *   - scripts/home-isolation-preload.ts and the two plugins' test/preload-guard.ts —
  *     the launch-time precondition, in every location a bare `bun test` can
  *     start from;
- *   - the two launchers (scripts/test-suite.mjs and
- *     plugins/openclaw-tps-mail/scripts/run-tests.mjs), end to end.
+ *   - the three launchers (scripts/test-suite.mjs and each plugin's
+ *     scripts/run-tests.mjs), end to end.
  *
  * Every end-to-end case runs against a SIMULATED operator home (a temp dir
  * passed as HOME), never the real one: a leak these cases provoke lands in a
@@ -59,6 +59,8 @@ const SUITE_LAUNCHER = join(REPO, "scripts/test-suite.mjs");
 const GUARD_MODULE = join(REPO, "scripts/test-home-guard.mjs");
 const PLUGIN_DIR = join(REPO, "plugins/openclaw-tps-mail");
 const PLUGIN_LAUNCHER = join(PLUGIN_DIR, "scripts/run-tests.mjs");
+const REVIEW_DIR = join(REPO, "plugins/openclaw-github-review");
+const REVIEW_LAUNCHER = join(REVIEW_DIR, "scripts/run-tests.mjs");
 
 /** The end-to-end cases spawn a launcher that spawns bun; allow for a slow runner. */
 const E2E_TIMEOUT = 60_000;
@@ -538,6 +540,7 @@ const BARE_RUN_LOCATIONS = [
   { name: "packages/cli", cwd: join(REPO, "packages/cli") },
   { name: "packages/pi-tps-mail", cwd: join(REPO, "packages/pi-tps-mail") },
   { name: "plugins/openclaw-tps-mail", cwd: PLUGIN_DIR },
+  { name: "plugins/openclaw-github-review", cwd: REVIEW_DIR },
 ];
 
 describe("end to end: a bare `bun test` aborts before any test module body runs", () => {
@@ -609,19 +612,36 @@ function ranFixture(marker: string): string {
   return join(dir, "ran.test.ts");
 }
 
-/** How each launcher is invoked on one fixture file, and the suite name its report carries. */
+/**
+ * How each launcher is invoked on one fixture file, and the suite name its
+ * report carries. `fake` is the launcher's path inside a COPY of the repo
+ * layout (the symlink case builds one), and `fakeCwd` the directory it runs
+ * from there — null for the monorepo launcher, which runs beside the fixture.
+ */
 const LAUNCHERS = [
   {
     name: "scripts/test-suite.mjs",
     suite: "guard-probe",
     argv: (fixture: string) => [SUITE_LAUNCHER, "guard-probe", fixture],
     cwd: (fixture: string) => dirname(fixture),
+    fake: "scripts/test-suite.mjs",
+    fakeCwd: null as string | null,
   },
   {
     name: "the openclaw-tps-mail launcher",
     suite: "plugin",
     argv: (fixture: string) => [PLUGIN_LAUNCHER, fixture],
     cwd: (_fixture: string) => PLUGIN_DIR,
+    fake: "plugins/openclaw-tps-mail/scripts/run-tests.mjs",
+    fakeCwd: "plugins/openclaw-tps-mail",
+  },
+  {
+    name: "the openclaw-github-review launcher",
+    suite: "github-review",
+    argv: (fixture: string) => [REVIEW_LAUNCHER, fixture],
+    cwd: (_fixture: string) => REVIEW_DIR,
+    fake: "plugins/openclaw-github-review/scripts/run-tests.mjs",
+    fakeCwd: "plugins/openclaw-github-review",
   },
 ];
 
@@ -681,6 +701,8 @@ const EXPECTED_NAMES = [
   "TPS_MAIL_DIR",
   "TPS_TEST_KEYS_DIR",
   "TPS_MAIL_REQUIRE_EXPLICIT_DIR",
+  // The github-review lane's gateway-boundary test runs OpenClaw under node.
+  "TPS_LANE_NODE",
   "NODE_ENV",
 ];
 
@@ -809,14 +831,14 @@ describe("end to end: the launchers give a test only the allowlisted environment
 });
 
 /**
- * A launcher run as its real lane: the monorepo launcher under suite `cli`, the
- * plugin launcher under its fixed suite `plugin`. The report, log and seal it
+ * A launcher run as its real lane: the monorepo launcher under suite `cli`, each
+ * plugin launcher under its own fixed suite name. The report, log and seal it
  * deletes and writes are `<suite>.xml`, `<suite>.log` and `<suite>.xml.sha256`.
  */
 function asLane(launcher: (typeof LAUNCHERS)[number], fixture: string): { suite: string; argv: string[] } {
-  return launcher.suite === "plugin"
-    ? { suite: "plugin", argv: launcher.argv(fixture) }
-    : { suite: "cli", argv: [SUITE_LAUNCHER, "cli", fixture] };
+  return launcher.suite === "guard-probe"
+    ? { suite: "cli", argv: [SUITE_LAUNCHER, "cli", fixture] }
+    : { suite: launcher.suite, argv: launcher.argv(fixture) };
 }
 
 /** Operator files at the names a lane's launcher deletes and writes in `dir`; returns each path with its bytes. */
@@ -986,18 +1008,22 @@ describe("end to end: the launchers refuse an operator-critical destination befo
         for (const f of ["test-suite.mjs", "test-home-guard.mjs", "home-isolation-preload.ts"]) {
           copyFileSync(join(REPO, "scripts", f), join(fake, "scripts", f));
         }
-        mkdirSync(join(fake, "plugins/openclaw-tps-mail/scripts"), { recursive: true });
-        copyFileSync(PLUGIN_LAUNCHER, join(fake, "plugins/openclaw-tps-mail/scripts/run-tests.mjs"));
+        // Every launcher, so the case runs each lane from the copied layout.
+        for (const [rel, source] of [
+          ["plugins/openclaw-tps-mail/scripts/run-tests.mjs", PLUGIN_LAUNCHER],
+          ["plugins/openclaw-github-review/scripts/run-tests.mjs", REVIEW_LAUNCHER],
+        ] as const) {
+          mkdirSync(join(fake, dirname(rel)), { recursive: true });
+          copyFileSync(source, join(fake, rel));
+        }
         symlinkSync(target, join(fake, "test-reports"));
-        const argv =
-          launcher.suite === "plugin"
-            ? [join(fake, "plugins/openclaw-tps-mail/scripts/run-tests.mjs")]
-            : [join(fake, "scripts/test-suite.mjs"), launcher.suite];
+        const fakeLauncher = join(fake, launcher.fake);
+        const argv = launcher.fakeCwd ? [fakeLauncher] : [fakeLauncher, launcher.suite];
         const marker = join(mktmp("tps-guard-marker-"), "ran");
         const fixture = ranFixture(marker);
         const { status, out } = runLauncher(
           [...argv, fixture],
-          launcher.suite === "plugin" ? join(fake, "plugins/openclaw-tps-mail") : dirname(fixture),
+          launcher.fakeCwd ? join(fake, launcher.fakeCwd) : dirname(fixture),
           envWith({ HOME: sim, TPS_TEST_REPORT_DIR: undefined }),
         );
         expect(existsSync(marker)).toBe(false);
