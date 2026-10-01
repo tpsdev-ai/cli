@@ -15,13 +15,18 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { homeDir } from "../utils/home.js";
 import { FlairClient, Memory, defaultFlairKeyPath } from "../utils/flair-client.js";
 
-const CONFIG_PATH = join(homedir(), ".tps", "flair-sync.json");
-const SECRETS_DIR = join(homedir(), ".tps", "secrets");
+function configPath(): string {
+  return join(homeDir(), ".tps", "flair-sync.json");
+}
+
+function secretsDir(): string {
+  return join(homeDir(), ".tps", "secrets");
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -39,19 +44,19 @@ function loadConfig(): FlairSyncConfig {
     agentId: "anvil",
     lastSyncTimestamp: new Date(0).toISOString(),
   };
-  if (!existsSync(CONFIG_PATH)) return defaults;
+  if (!existsSync(configPath())) return defaults;
   try {
-    return { ...defaults, ...JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) };
+    return { ...defaults, ...JSON.parse(readFileSync(configPath(), "utf-8")) };
   } catch {
     return defaults;
   }
 }
 
 function saveConfig(cfg: FlairSyncConfig): void {
-  mkdirSync(join(homedir(), ".tps"), { recursive: true });
-  const tmp = CONFIG_PATH + ".tmp";
+  mkdirSync(join(homeDir(), ".tps"), { recursive: true });
+  const tmp = configPath() + ".tmp";
   writeFileSync(tmp, JSON.stringify(cfg, null, 2) + "\n", "utf-8");
-  renameSync(tmp, CONFIG_PATH);
+  renameSync(tmp, configPath());
 }
 
 // ─── Content hash ─────────────────────────────────────────────────────────────

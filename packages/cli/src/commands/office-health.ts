@@ -1,16 +1,27 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { createFlairClient, defaultFlairKeyPath, type FlairAgent } from "../utils/flair-client.js";
+import { homeDir } from "../utils/home.js";
 
 const DEFAULT_INTERVAL_SECONDS = 60;
 const STALE_MS = 5 * 60 * 1000;
-const CURSOR_DIR = join(process.env.HOME || homedir(), ".tps", "cursors");
-const PULSE_STATE_PATH = join(process.env.HOME || homedir(), ".tps", "pulse", "state.json");
-const STATE_DIR = join(process.env.HOME || homedir(), ".tps", "office-health");
-const STATE_PATH = join(STATE_DIR, "state.json");
+function cursorDir(): string {
+  return join(homeDir(), ".tps", "cursors");
+}
+
+function pulseStatePath(): string {
+  return join(homeDir(), ".tps", "pulse", "state.json");
+}
+
+function stateDir(): string {
+  return join(homeDir(), ".tps", "office-health");
+}
+
+function statePath(): string {
+  return join(stateDir(), "state.json");
+}
 const LOCAL_AGENT_IDS = ["ember", "sherlock", "kern", "pixel"] as const;
 
 export interface OfficeHealthArgs {
@@ -88,9 +99,9 @@ function normalizeIntervalSeconds(interval?: number): number {
 }
 
 function readState(): HealthState {
-  if (!existsSync(STATE_PATH)) return { unhealthyAgents: {} };
+  if (!existsSync(statePath())) return { unhealthyAgents: {} };
   try {
-    const parsed = JSON.parse(readFileSync(STATE_PATH, "utf-8")) as HealthState;
+    const parsed = JSON.parse(readFileSync(statePath(), "utf-8")) as HealthState;
     return { unhealthyAgents: parsed.unhealthyAgents ?? {} };
   } catch {
     return { unhealthyAgents: {} };
@@ -98,8 +109,8 @@ function readState(): HealthState {
 }
 
 function writeState(state: HealthState): void {
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + "\n", "utf-8");
+  mkdirSync(stateDir(), { recursive: true });
+  writeFileSync(statePath(), JSON.stringify(state, null, 2) + "\n", "utf-8");
 }
 
 function ageMsFromIso(value: string | undefined, nowMs: number): number | null {
@@ -130,7 +141,7 @@ function formatAge(ageMs: number | null): string {
 }
 
 function cursorPath(agentId: string): string {
-  return join(CURSOR_DIR, `${agentId}-task-loop.json`);
+  return join(cursorDir(), `${agentId}-task-loop.json`);
 }
 
 function buildIssues(agent: FlairAgent, nowMs: number): Omit<AgentHealthRecord, "eventPublished"> {
@@ -186,9 +197,9 @@ export function checkLocalHealth(): LocalHealthResult {
   });
 
   let pulseLastPoll: string | null = null;
-  if (existsSync(PULSE_STATE_PATH)) {
+  if (existsSync(pulseStatePath())) {
     try {
-      const parsed = JSON.parse(readFileSync(PULSE_STATE_PATH, "utf-8")) as { lastPollAt?: string | null };
+      const parsed = JSON.parse(readFileSync(pulseStatePath(), "utf-8")) as { lastPollAt?: string | null };
       pulseLastPoll = parsed.lastPollAt ?? null;
     } catch {
       pulseLastPoll = null;

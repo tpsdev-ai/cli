@@ -1,4 +1,3 @@
-import { homedir } from "node:os";
 import {
   appendFileSync,
   existsSync,
@@ -16,10 +15,19 @@ import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { workspacePath as resolveWorkspacePath } from "../utils/workspace.js";
 import { createFlairClient, type OrgEvent } from "../utils/flair-client.js";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
+import { homeDir } from "../utils/home.js";
 
-const STATUS_DIR = join(process.env.HOME || homedir(), ".tps", "status");
-const NODES_DIR = join(STATUS_DIR, "nodes");
-const ARCHIVE_DIR = join(STATUS_DIR, "archive");
+function statusDir(): string {
+  return join(homeDir(), ".tps", "status");
+}
+
+function nodesDir(): string {
+  return join(statusDir(), "nodes");
+}
+
+function archiveDir(): string {
+  return join(statusDir(), "archive");
+}
 const DEFAULT_STALE_MS = 30 * 60 * 1000;
 const DEFAULT_OFFLINE_MS = 2 * 60 * 60 * 1000;
 const DEFAULT_PRUNE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -106,11 +114,11 @@ function safeAgentDir(agentId: string): string {
 
 function statusFilePath(agentId: string): string {
   const id = safeAgentDir(agentId);
-  return join(NODES_DIR, `${id}.json`);
+  return join(nodesDir(), `${id}.json`);
 }
 
 function usageFilePath(agentId: string): string {
-  return join(NODES_DIR, safeAgentDir(agentId), "usage.jsonl");
+  return join(nodesDir(), safeAgentDir(agentId), "usage.jsonl");
 }
 
 function hostFingerprint(): string {
@@ -195,8 +203,8 @@ function readStatus(agentId: string): NodeStatus | null {
 }
 
 function writeStatus(agentId: string, payload: NodeStatus): void {
-  ensureDir(NODES_DIR);
-  ensureDir(join(NODES_DIR, safeAgentDir(agentId)));
+  ensureDir(nodesDir());
+  ensureDir(join(nodesDir(), safeAgentDir(agentId)));
   writeFileSync(statusFilePath(agentId), JSON.stringify(payload, null, 2) + "\n", "utf-8");
 }
 
@@ -246,7 +254,7 @@ function rotateUsage(agentId: string): void {
   if (!existsSync(usagePath)) return;
   if (statSync(usagePath).size <= STATUS_FILE_SIZE_LIMIT) return;
 
-  const baseDir = join(NODES_DIR, safeAgentId(agentId));
+  const baseDir = join(nodesDir(), safeAgentId(agentId));
   ensureDir(baseDir);
 
   for (let slot = 3; slot >= 1; slot--) {
@@ -312,7 +320,7 @@ export function extractModelFromHeartbeatEvent(event: OrgEvent): string | null {
 
 async function resolveModelFromHeartbeat(agentId: string): Promise<string | null> {
   try {
-    const flair = createFlairClient(agentId, undefined, join(homedir(), ".tps", "identity", `${agentId}.key`));
+    const flair = createFlairClient(agentId, undefined, join(homeDir(), ".tps", "identity", `${agentId}.key`));
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const events = await flair.getEventsSince(agentId, since);
     const heartbeat = events
@@ -373,21 +381,21 @@ function computeState(raw: NodeStatus, now: number, staleMs: number, offlineMs: 
 }
 
 function maybePrune(statusFiles: string[], now: number): void {
-  ensureDir(ARCHIVE_DIR);
+  ensureDir(archiveDir());
   for (const file of statusFiles) {
     const id = basename(file, ".json");
     const content = readStatus(id);
     if (!content?.lastHeartbeat) continue;
     if (now - new Date(content.lastHeartbeat).getTime() > DEFAULT_PRUNE_MS) {
-      ensureDir(ARCHIVE_DIR);
-      renameSync(file, join(ARCHIVE_DIR, `${id}.json`));
+      ensureDir(archiveDir());
+      renameSync(file, join(archiveDir(), `${id}.json`));
     }
   }
 }
 
 function listAgents(): string[] {
-  if (!existsSync(NODES_DIR)) return [];
-  return readdirSync(NODES_DIR)
+  if (!existsSync(nodesDir())) return [];
+  return readdirSync(nodesDir())
     .filter((name) => name.endsWith(".json"))
     .map((name) => name.slice(0, -5));
 }
@@ -466,15 +474,15 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 }
 
 export async function runStatus(args: StatusArgs): Promise<void> {
-  ensureDir(NODES_DIR);
+  ensureDir(nodesDir());
 
   if (!args.agentId) {
     const now = Date.now();
     const staleMs = (args.staleMinutes || 30) * 60 * 1000;
     const offlineMs = (args.offlineHours || 2) * 60 * 60 * 1000;
 
-    const statusPaths = readdirSync(NODES_DIR)
-      .map((name) => join(NODES_DIR, name))
+    const statusPaths = readdirSync(nodesDir())
+      .map((name) => join(nodesDir(), name))
       .filter((name) => name.endsWith(".json") && existsSync(name));
 
     if (args.autoPrune) {
@@ -586,7 +594,7 @@ export async function runStatus(args: StatusArgs): Promise<void> {
 export function writeUsageEntry(agentId: string, entry: UsageEntry): void {
   const safeAgent = safeAgentId(agentId);
   const usagePath = usageFilePath(safeAgent);
-  const usageDir = join(NODES_DIR, safeAgent);
+  const usageDir = join(nodesDir(), safeAgent);
   ensureDir(usageDir);
   appendFileSync(usagePath, `${JSON.stringify(entry)}\n`, "utf-8");
   rotateUsage(safeAgent);

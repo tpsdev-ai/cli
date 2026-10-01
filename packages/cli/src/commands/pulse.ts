@@ -7,10 +7,10 @@
 
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createFlairClient } from "../utils/flair-client.js";
 import { gcMessages, sendMessage } from "../utils/mail.js";
+import { homeDir } from "../utils/home.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -94,18 +94,26 @@ const DEFAULT_CONFIG: PulseConfig = {
   pruneAfterDays: 7,
 };
 
-const PULSE_DIR = join(homedir(), ".tps", "pulse");
-const CONFIG_PATH = join(PULSE_DIR, "config.json");
-const STATE_PATH = join(PULSE_DIR, "state.json");
+function pulseDir(): string {
+  return join(homeDir(), ".tps", "pulse");
+}
+
+function configPath(): string {
+  return join(pulseDir(), "config.json");
+}
+
+function statePath(): string {
+  return join(pulseDir(), "state.json");
+}
 
 // ---------------------------------------------------------------------------
 // Config & State I/O
 // ---------------------------------------------------------------------------
 
 export function loadConfig(): PulseConfig {
-  if (existsSync(CONFIG_PATH)) {
+  if (existsSync(configPath())) {
     try {
-      const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+      const raw = JSON.parse(readFileSync(configPath(), "utf-8"));
       return { ...DEFAULT_CONFIG, ...raw };
     } catch (e: unknown) {
       console.warn(`[pulse] Failed to parse config: ${(e as Error).message}, using defaults`);
@@ -115,9 +123,9 @@ export function loadConfig(): PulseConfig {
 }
 
 export function loadState(): PulseState {
-  if (existsSync(STATE_PATH)) {
+  if (existsSync(statePath())) {
     try {
-      return JSON.parse(readFileSync(STATE_PATH, "utf-8")) as PulseState;
+      return JSON.parse(readFileSync(statePath(), "utf-8")) as PulseState;
     } catch (e: unknown) {
       console.warn(`[pulse] Failed to parse state: ${(e as Error).message}, starting fresh`);
     }
@@ -126,8 +134,8 @@ export function loadState(): PulseState {
 }
 
 export function saveState(state: PulseState): void {
-  mkdirSync(PULSE_DIR, { recursive: true });
-  writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), "utf-8");
+  mkdirSync(pulseDir(), { recursive: true });
+  writeFileSync(statePath(), JSON.stringify(state, null, 2), "utf-8");
 }
 
 /**

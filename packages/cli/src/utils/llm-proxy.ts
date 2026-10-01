@@ -20,9 +20,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import crypto from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import snooplogg from "snooplogg";
+import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:llm");
 
 
@@ -47,7 +47,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 
   if (Math.abs(now - ts) > WINDOW_MS) return null; // replay window
 
-  const pubPath = join(homedir(), ".tps", "identity", `${agentId}.pub`);
+  const pubPath = join(homeDir(), ".tps", "identity", `${agentId}.pub`);
   if (!existsSync(pubPath)) return null;
 
   try {
@@ -89,7 +89,7 @@ function verifyRequest(authHeader: string, method: string, path: string): string
 type Provider = "anthropic" | "openai" | "openai-oauth" | "claude-oauth";
 
 function readSecretFile(name: string): string | null {
-  const p = join(homedir(), ".tps", "secrets", name);
+  const p = join(homeDir(), ".tps", "secrets", name);
   return existsSync(p) ? readFileSync(p, "utf-8").trim() : null;
 }
 
@@ -104,15 +104,17 @@ interface ClaudeOAuthCredentials {
   rateLimitTier: string;
 }
 
-const CLAUDE_CREDENTIALS_PATH = join(homedir(), ".claude", ".credentials.json");
+function claudeCredentialsPath(): string {
+  return join(homeDir(), ".claude", ".credentials.json");
+}
 const OAUTH_REFRESH_URL = "https://console.anthropic.com/v1/oauth/token";
 // Refresh 5 minutes before actual expiry
 const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 
 function readClaudeOAuthCredentials(): ClaudeOAuthCredentials | null {
   try {
-    if (!existsSync(CLAUDE_CREDENTIALS_PATH)) return null;
-    const raw = readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8");
+    if (!existsSync(claudeCredentialsPath())) return null;
+    const raw = readFileSync(claudeCredentialsPath(), "utf-8");
     const data = JSON.parse(raw);
     return data?.claudeAiOauth ?? null;
   } catch {
@@ -122,13 +124,13 @@ function readClaudeOAuthCredentials(): ClaudeOAuthCredentials | null {
 
 function writeClaudeOAuthCredentials(creds: ClaudeOAuthCredentials): void {
   try {
-    const raw = readFileSync(CLAUDE_CREDENTIALS_PATH, "utf-8");
+    const raw = readFileSync(claudeCredentialsPath(), "utf-8");
     const data = JSON.parse(raw);
     data.claudeAiOauth = creds;
     // Atomic write: write to tmp then rename to avoid corruption on crash
-    const tmp = `${CLAUDE_CREDENTIALS_PATH}.tmp`;
+    const tmp = `${claudeCredentialsPath()}.tmp`;
     writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: "utf-8", mode: 0o600 });
-    renameSync(tmp, CLAUDE_CREDENTIALS_PATH);
+    renameSync(tmp, claudeCredentialsPath());
   } catch (err) {
     serror("[llm-proxy] Failed to write OAuth credentials:", err);
   }
@@ -209,7 +211,7 @@ interface OpenAIOAuthCredentials {
 }
 
 function readOpenAIOAuthCredentials(): OpenAIOAuthCredentials | null {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const authPath = join(home, ".tps", "auth", "openai.json");
   if (!existsSync(authPath)) return null;
   try {
@@ -227,7 +229,7 @@ function readOpenAIOAuthCredentials(): OpenAIOAuthCredentials | null {
 }
 
 function writeOpenAIOAuthCredentials(creds: OpenAIOAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const authPath = join(home, ".tps", "auth", "openai.json");
   try {
     // Read existing file to preserve all fields (StoredCredentials format)
@@ -288,7 +290,7 @@ async function refreshOpenAIOAuthToken(creds: OpenAIOAuthCredentials): Promise<O
 }
 
 function syncOpenAIToCodexCli(creds: OpenAIOAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const codexHome = process.env.CODEX_HOME || join(home, ".codex");
   const candidates = [
     join(codexHome, "auth.json"),
@@ -502,7 +504,9 @@ export function createLLMProxy(port = DEFAULT_PORT): { start: () => Promise<void
 
 // ─── PID-based lifecycle (for 'tps agent proxy start') ───────────────────────
 
-const PROXY_PID_PATH = join(homedir(), ".tps", "run", "llm-proxy.pid");
+function proxyPidPath(): string {
+  return join(homeDir(), ".tps", "run", "llm-proxy.pid");
+}
 
 export function startProxyDaemon(port = DEFAULT_PORT): void {
   const proxy = createLLMProxy(port);
@@ -512,25 +516,25 @@ export function startProxyDaemon(port = DEFAULT_PORT): void {
   });
 
   const { mkdirSync } = require("node:fs") as typeof import("node:fs");
-  mkdirSync(join(homedir(), ".tps", "run"), { recursive: true });
-  writeFileSync(PROXY_PID_PATH, `${process.pid}\n`, "utf-8");
+  mkdirSync(join(homeDir(), ".tps", "run"), { recursive: true });
+  writeFileSync(proxyPidPath(), `${process.pid}\n`, "utf-8");
 
   process.once("SIGTERM", () => {
     proxy.stop();
-    rmSync(PROXY_PID_PATH, { force: true });
+    rmSync(proxyPidPath(), { force: true });
     process.exit(0);
   });
   process.once("SIGINT", () => {
     proxy.stop();
-    rmSync(PROXY_PID_PATH, { force: true });
+    rmSync(proxyPidPath(), { force: true });
     process.exit(0);
   });
 }
 
 export function proxyStatus(): { running: boolean; pid?: number; port?: number } {
-  if (!existsSync(PROXY_PID_PATH)) return { running: false };
+  if (!existsSync(proxyPidPath())) return { running: false };
   try {
-    const pid = parseInt(readFileSync(PROXY_PID_PATH, "utf-8").trim(), 10);
+    const pid = parseInt(readFileSync(proxyPidPath(), "utf-8").trim(), 10);
     process.kill(pid, 0);
     return { running: true, pid, port: DEFAULT_PORT };
   } catch {

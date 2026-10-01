@@ -21,19 +21,26 @@ import {
   renameSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomBytes } from "node:crypto";
+import { homeDir } from "../utils/home.js";
 
 const PLIST_LABEL = "ai.tpsdev.flair";
 const HARPER_OPS_URL = "http://127.0.0.1:9925";  // local only, not a security risk
-const PLIST_PATH = join(
-  homedir(),
-  "Library/LaunchAgents",
-  `${PLIST_LABEL}.plist`,
-);
-const LOG_DIR = join(homedir(), ".tps/logs");
-const STDOUT_LOG = join(LOG_DIR, "flair.log");
-const STDERR_LOG = join(LOG_DIR, "flair.error.log");
+function plistPath(): string {
+  return join(homeDir(), "Library/LaunchAgents", `${PLIST_LABEL}.plist`);
+}
+
+function logDir(): string {
+  return join(homeDir(), ".tps/logs");
+}
+
+function stdoutLogPath(): string {
+  return join(logDir(), "flair.log");
+}
+
+function stderrLogPath(): string {
+  return join(logDir(), "flair.error.log");
+}
 
 interface HarperOpts {
   flairDir?: string;
@@ -55,7 +62,7 @@ export interface FlairConfigFile {
 const DEFAULT_LOCAL_PORT = 9926;
 
 function tpsRoot(): string {
-  return process.env.TPS_ROOT || join(process.env.HOME || homedir(), ".tps");
+  return process.env.TPS_ROOT || join(homeDir(), ".tps");
 }
 
 function flairConfigPath(): string {
@@ -112,7 +119,7 @@ function getFlairDir(opts: HarperOpts): string {
   const dir =
     opts.flairDir ??
     process.env.FLAIR_DIR ??
-    join(homedir(), "ops/flair");
+    join(homeDir(), "ops/flair");
   const resolved = resolve(dir);
   if (!existsSync(resolved)) {
     throw new Error(
@@ -123,16 +130,21 @@ function getFlairDir(opts: HarperOpts): string {
   return resolved;
 }
 
-const SECRETS_DIR = join(homedir(), ".tps/secrets/flair");
-const ADMIN_TOKEN_PATH = join(SECRETS_DIR, "harper-admin-token");
+function secretsDir(): string {
+  return join(homeDir(), ".tps/secrets/flair");
+}
+
+function adminTokenPath(): string {
+  return join(secretsDir(), "harper-admin-token");
+}
 
 function ensureAdminToken(): string {
-  mkdirSync(SECRETS_DIR, { recursive: true });
-  if (existsSync(ADMIN_TOKEN_PATH)) {
-    return readFileSync(ADMIN_TOKEN_PATH, "utf8").trim();
+  mkdirSync(secretsDir(), { recursive: true });
+  if (existsSync(adminTokenPath())) {
+    return readFileSync(adminTokenPath(), "utf8").trim();
   }
   const token = randomBytes(32).toString("base64url");
-  writeFileSync(ADMIN_TOKEN_PATH, token, { encoding: "utf8", mode: 0o600 });
+  writeFileSync(adminTokenPath(), token, { encoding: "utf8", mode: 0o600 });
   return token;
 }
 
@@ -191,17 +203,17 @@ function buildPlist(flairDir: string, _dev: boolean, harperDataDir: string): str
   <integer>10</integer>
 
   <key>StandardOutPath</key>
-  <string>${STDOUT_LOG}</string>
+  <string>${stdoutLogPath()}</string>
 
   <key>StandardErrorPath</key>
-  <string>${STDERR_LOG}</string>
+  <string>${stderrLogPath()}</string>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <key>HOME</key>
-    <string>${homedir()}</string>
+    <string>${homeDir()}</string>
     <key>HARPER_SET_CONFIG</key>
     <string>{"rootPath":"${harperDataDir}","http":{"port":9926,"cors":true,"corsAccessList":["http://127.0.0.1:9926","http://localhost:9926"]},"operationsApi":{"network":{"port":9925,"cors":true,"corsAccessList":["http://127.0.0.1:9925","http://localhost:9925"],"domainSocket":"${harperDataDir}/operations-server"}},"mqtt":{"network":{"port":null},"webSocket":false},"localStudio":{"enabled":false}}</string>
   </dict>
@@ -252,24 +264,24 @@ export async function flairCommand(
   switch (action) {
     case "install": {
       const flairDir = getFlairDir(opts);
-      mkdirSync(LOG_DIR, { recursive: true });
-      const harperDataDir = join(homedir(), ".harper/flair");
+      mkdirSync(logDir(), { recursive: true });
+      const harperDataDir = join(homeDir(), ".harper/flair");
       mkdirSync(harperDataDir, { recursive: true });
       const adminToken = ensureAdminToken();
       const plist = buildPlist(flairDir, opts.dev ?? false, harperDataDir);
-      writeFileSync(PLIST_PATH, plist, "utf8");
-      chmodSync(PLIST_PATH, 0o644);
+      writeFileSync(plistPath(), plist, "utf8");
+      chmodSync(plistPath(), 0o644);
       if (isLoaded()) {
-        execSync(`launchctl unload "${PLIST_PATH}" 2>/dev/null || true`, {
+        execSync(`launchctl unload "${plistPath()}" 2>/dev/null || true`, {
           stdio: "pipe",
         });
       }
-      execSync(`launchctl load "${PLIST_PATH}"`);
+      execSync(`launchctl load "${plistPath()}"`);
       console.log(`✅ Flair launchd agent installed and started`);
-      console.log(`   Plist: ${PLIST_PATH}`);
-      console.log(`   Logs:  ${STDOUT_LOG}`);
+      console.log(`   Plist: ${plistPath()}`);
+      console.log(`   Logs:  ${stdoutLogPath()}`);
       console.log(`   Flair: ${flairDir}`);
-      console.log(`   Token: ${ADMIN_TOKEN_PATH}`);
+      console.log(`   Token: ${adminTokenPath()}`);
       console.log(`   Mode:  dev`);
       // Update Harper's internal admin password (stored in DB, HARPER_SET_CONFIG only sets on first install).
       // Poll until Harper is up (up to 30s), then rotate.
@@ -299,12 +311,12 @@ export async function flairCommand(
     }
     case "uninstall": {
       if (isLoaded()) {
-        execSync(`launchctl unload "${PLIST_PATH}" 2>/dev/null || true`, {
+        execSync(`launchctl unload "${plistPath()}" 2>/dev/null || true`, {
           stdio: "pipe",
         });
       }
-      if (existsSync(PLIST_PATH)) {
-        execSync(`rm "${PLIST_PATH}"`);
+      if (existsSync(plistPath())) {
+        execSync(`rm "${plistPath()}"`);
         console.log(`✅ Harper launchd agent uninstalled`);
       } else {
         console.log(`Nothing to uninstall (plist not found)`);
@@ -312,14 +324,14 @@ export async function flairCommand(
       break;
     }
     case "start": {
-      if (!existsSync(PLIST_PATH)) {
+      if (!existsSync(plistPath())) {
         console.error(`❌ Not installed. Run: tps flair install --flair-dir <path>`);
         process.exit(1);
       }
       if (isLoaded()) {
         execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, { shell: "/bin/sh", stdio: "pipe" } as any);
       } else {
-        execSync(`launchctl load "${PLIST_PATH}"`);
+        execSync(`launchctl load "${plistPath()}"`);
       }
       console.log(`✅ Harper started`);
       break;
@@ -329,21 +341,21 @@ export async function flairCommand(
         console.log(`Harper is not running`);
         return;
       }
-      execSync(`launchctl unload "${PLIST_PATH}" 2>/dev/null || true`, {
+      execSync(`launchctl unload "${plistPath()}" 2>/dev/null || true`, {
         stdio: "pipe",
       });
       console.log(`✅ Harper stopped`);
       break;
     }
     case "restart": {
-      if (!existsSync(PLIST_PATH)) {
+      if (!existsSync(plistPath())) {
         console.error(`❌ Not installed. Run: tps flair install`);
         process.exit(1);
       }
       if (isLoaded()) {
         execSync(`launchctl kickstart -k "user/$(id -u)/${PLIST_LABEL}"`, { shell: "/bin/sh", stdio: "pipe" } as any);
       } else {
-        execSync(`launchctl load "${PLIST_PATH}"`);
+        execSync(`launchctl load "${plistPath()}"`);
       }
       console.log(`✅ Harper restarted`);
       break;
@@ -352,7 +364,7 @@ export async function flairCommand(
       const loaded = isLoaded();
       const pid = getPid();
       const responding = loaded ? isHarperResponding() : false;
-      if (!existsSync(PLIST_PATH)) {
+      if (!existsSync(plistPath())) {
         console.log(`Flair launchd agent: NOT INSTALLED`);
         console.log(`  Run: tps flair install --flair-dir ~/ops/flair`);
       } else if (!loaded) {
@@ -365,21 +377,21 @@ export async function flairCommand(
         if (pid) console.log(`  PID: ${pid}`);
         console.log(`  API:   http://127.0.0.1:9925`);
         console.log(`  Flair: http://127.0.0.1:9926`);
-        console.log(`  Logs:  ${STDOUT_LOG}`);
+        console.log(`  Logs:  ${stdoutLogPath()}`);
       }
-      if (existsSync(PLIST_PATH)) {
-        const plistContent = readFileSync(PLIST_PATH, "utf8");
+      if (existsSync(plistPath())) {
+        const plistContent = readFileSync(plistPath(), "utf8");
         const modeMatch = plistContent.match(/<string>(run|dev)<\/string>/);
         if (modeMatch) console.log(`  Mode:  ${modeMatch[1]}`);
       }
       break;
     }
     case "logs": {
-      if (!existsSync(STDOUT_LOG)) {
-        console.log(`No logs yet at ${STDOUT_LOG}`);
+      if (!existsSync(stdoutLogPath())) {
+        console.log(`No logs yet at ${stdoutLogPath()}`);
         return;
       }
-      execSync(`tail -50 "${STDOUT_LOG}"`, { stdio: "inherit" });
+      execSync(`tail -50 "${stdoutLogPath()}"`, { stdio: "inherit" });
       break;
     }
 

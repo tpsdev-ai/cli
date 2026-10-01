@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
   LLMConfig,
@@ -12,6 +11,7 @@ import type {
 } from "../runtime/types.js";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
+import { homeDir } from "../home.js";
 
 type ProviderKind = LLMConfig["provider"];
 
@@ -24,12 +24,14 @@ interface OAuthCredentials {
   scopes: string;
 }
 
-const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+function authDir(): string {
+  return join(homeDir(), ".tps", "auth");
+}
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 function oauthPath(provider: string): string {
-  return join(AUTH_DIR, `${provider}.json`);
+  return join(authDir(), `${provider}.json`);
 }
 
 function loadOAuth(provider: string): OAuthCredentials | null {
@@ -39,7 +41,7 @@ function loadOAuth(provider: string): OAuthCredentials | null {
 }
 
 function saveOAuth(provider: string, creds: OAuthCredentials): void {
-  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(authDir(), { recursive: true, mode: 0o700 });
   writeFileSync(oauthPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 
@@ -79,7 +81,7 @@ export async function refreshAnthropicOAuthToken(creds: OAuthCredentials): Promi
  * Keep Claude Code's credentials in sync after TPS refreshes the token.
  */
 function syncToClaudeCode(creds: OAuthCredentials): void {
-  const credPath = join(process.env.HOME || homedir(), ".claude", ".credentials.json");
+  const credPath = join(homeDir(), ".claude", ".credentials.json");
   if (!existsSync(credPath)) return;
   try {
     const data = JSON.parse(readFileSync(credPath, "utf-8"));
@@ -129,7 +131,7 @@ export async function refreshGoogleOAuthToken(creds: OAuthCredentials): Promise<
 }
 
 function syncToGeminiCli(creds: OAuthCredentials): void {
-  const home = process.env.HOME || homedir();
+  const home = homeDir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
   const candidates = [
     join(home, ".gemini", "oauth_creds.json"),
@@ -428,7 +430,7 @@ export class ProviderManager {
     const nonce = crypto.randomUUID();
     const signPayload = `${this.agentId}:${ts}:${nonce}:POST:${providerPath}`;
 
-    const keyPath = join(homedir(), ".tps", "identity", `${this.agentId}.key`);
+    const keyPath = join(homeDir(), ".tps", "identity", `${this.agentId}.key`);
     let authHeader = "";
     try {
       const rawBuf = readFileSync(keyPath);
