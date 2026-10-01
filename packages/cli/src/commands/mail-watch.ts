@@ -20,7 +20,7 @@
  *
  * Hook contract:
  * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
- *   byte-identical);
+ *   written to the hook as UTF-8);
  * - the four mail variables the watcher sets come from VERIFIED fields:
  *   TPS_MAIL_ID (the verified envelope id), TPS_MAIL_FROM, TPS_MAIL_TO (the
  *   watched agent) and TPS_MAIL_TIMESTAMP. The hook process also inherits the
@@ -100,13 +100,18 @@ export function validateAgentId(agentId: string): void {
 // `verifyRecordForMailbox` — the same policy `promote()` applies — so an
 // unverified record is never handed on. Nothing here moves, leases or writes.
 
-/** Filenames (`*.json`) directly under `dir`, or [] when it is missing. */
-function listNewFiles(dir: string): string[] {
+/**
+ * Filenames (`*.json`) directly under `dir`; `[]` when `dir` is absent, and
+ * `null` when the LISTING FAILS (a read error). The two are distinct: an absent
+ * or empty `new/` means no files, but a failed listing must not be read as
+ * "every file left" (see processNew).
+ */
+function listNewFiles(dir: string): string[] | null {
   if (!existsSync(dir)) return [];
   try {
     return readdirSync(dir).filter((f) => f.endsWith(".json"));
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -121,9 +126,9 @@ function readNewRecord(filePath: string): MailMessage | null {
 
 /**
  * Project a VERIFIED message to the fields a hook/onMessage may see: the
- * verified envelope fields only. `id` is the VERIFIED envelope id (never the
- * unsigned wrapper id), and the unsigned wrapper fields the source file carried
- * — `headers` above all — are dropped.
+ * verified envelope fields, plus the local `read` flag (always false here). `id`
+ * is the VERIFIED envelope id (never the unsigned wrapper id), and the unsigned
+ * wrapper fields the source file carried — `headers` above all — are dropped.
  */
 function projectVerified(m: MailMessage): MailMessage {
   const out: MailMessage = {
@@ -197,9 +202,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   const inbox = getInbox(opts.agent);
 
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
-  // came from. An entry is dropped only when a SCAN observes that file absent
-  // from `new/`; then a re-delivered message is presented again. While the file
-  // stays, it is presented once.
+  // came from. Within ONE watcher instance an entry is dropped only when a scan
+  // observes that file absent from `new/`; while the file stays, it is presented
+  // once. (A watcher restart presents a still-present file again.)
   const presented = new Map<string, string>();
   // Files already classified this residence (presented, or skipped as
   // unverifiable), keyed on the filename, so a later pass does not re-verify or
@@ -239,6 +244,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
     checking = true;
     try {
       const files = listNewFiles(inbox.fresh);
+      if (files === null) {
+        // The listing FAILED. A failed read is not "every file left": keep the
+        // dedup state so a still-present file is not presented twice when the
+        // listing recovers.
+        console.error("[mail-watch] cannot list new/; keeping the current dedup state");
+        return;
+      }
       const present = new Set(files);
       // Forget records whose file has left `new/`, so a re-delivered message is
       // presented again.
@@ -261,7 +273,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           // structure — is not a verdict. The record is withheld and logged, and
           // the next pass tries again (do NOT mark it classified).
           console.error(
-            `[mail-watch] ${record.id}: verification unavailable (${err instanceof Error ? err.message : String(err)})`,
+            `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
           );
           continue;
         }

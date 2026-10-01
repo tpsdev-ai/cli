@@ -10,9 +10,10 @@
  *  - the poll path is proven ALONE (fs events suppressed via a no-op watchImpl)
  *    and the event path is proven with the real fs.watch.
  *  - dedup is on the verified envelope id while the file stays in new/ (two
- *    files with the same signed id present once); a message is presented again
- *    only after a scan observes its file absent from new/.
- *  - concurrency limit: max 3 concurrent handlers (2 in the case below)
+ *    files with the same signed id present once); within one watcher instance a
+ *    message is presented again only after a scan observes its file absent from
+ *    new/, and a failed new/ listing keeps that state.
+ *  - concurrency limit: the default is 3 (the case below tests 2)
  *  - watcher.stop(): cleans up fs.watch
  *  - xmlEscape / buildPlist / daemon arg validation
  *
@@ -22,13 +23,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
-import { sendMessage, getInbox } from "../src/utils/mail.js";
+import { sendMessage, getInbox, type MailMessage } from "../src/utils/mail.js";
 import {
   buildSignedEnvelope,
   startStubFlair,
@@ -398,14 +399,46 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(received.filter((b) => b === "redelivered")).toHaveLength(2);
   });
 
-  it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
-    const out = join(tempRoot, "hook-out.txt");
-    const envOut = join(tempRoot, "hook-env.json");
+  it("a transient new/ listing failure does not present a still-present file twice", async () => {
+    const received: string[] = [];
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
       watchImpl: NO_FS_EVENTS,
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+    await sleep(60);
+    const env = deliverSigned("resilient");
+    await sleep(200);
+    expect(received).toEqual([env.messageId]);
+
+    // Make one new/ LISTING fail while the file stays put. A failed read must not
+    // be read as "every file left": the dedup state is kept, so the file is not
+    // presented again when the listing recovers.
+    const fresh = getInbox(AGENT).fresh;
+    chmodSync(fresh, 0o000);
+    try {
+      await sleep(120);
+    } finally {
+      chmodSync(fresh, 0o755);
+    }
+    await sleep(200);
+    watcher.stop();
+
+    expect(received).toEqual([env.messageId]);
+  }, 10_000);
+
+  it("the hook receives the verified body and the four TPS_MAIL_* variables from verified fields, even when the unsigned wrapper id/headers are changed", async () => {
+    const out = join(tempRoot, "hook-out.txt");
+    const envOut = join(tempRoot, "hook-env.json");
+    const cb: MailMessage[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      onMessage: (msg) => { cb.push(msg); },
       hook: hookCapturing(out, envOut),
     });
 
@@ -439,6 +472,17 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(h.from).toBe("flint");
     expect(h.to).toBe(AGENT); // the watched agent
     expect(h.timestamp).toBe(env.timestamp);
+
+    // The callback projection carries the verified fields; the unsigned wrapper
+    // `id`/`headers` above are absent.
+    expect(cb).toHaveLength(1);
+    expect(cb[0].id).toBe(env.messageId); // the VERIFIED envelope id
+    expect(cb[0].from).toBe("flint");
+    expect(cb[0].to).toBe(AGENT);
+    expect(cb[0].body).toBe(body);
+    expect(cb[0].timestamp).toBe(env.timestamp);
+    expect(cb[0].id).not.toBe("wrapper-id-not-the-envelope-id"); // never the wrapper id
+    expect("headers" in cb[0]).toBe(false); // the unsigned wrapper headers are dropped
   });
 
   it("stop() prevents further callbacks after stopping", async () => {
