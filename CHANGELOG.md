@@ -10,6 +10,8 @@ All notable changes to the TPS CLI are recorded here.
 
 ### Fixed
 
+- **Correction to the 0.7.0 notes: the `latest` promote is not all-six-or-none.** `scripts/promote-latest.sh` re-reads each move and attempts a rollback; a rollback that fails is reported and needs manual repair (Refs #441).
+
 - **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
 
 - **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
@@ -647,7 +649,7 @@ Because the changelog-fragment convention is in use for the whole of this range,
 - **The three agent runtimes adopt the shared `promote()` LIFECYCLE.** Inbound mail is verified before it reaches a tool-holding model; replies are signed envelopes, and a record is acked only after the completion boundary — the reply is persisted and, for codex, the auto-commit that reads the `cur/` body has finished. Detail below.
 - **Mail delivery fails closed.** Verification at the `new/` → `cur/` boundary is mandatory, `cur/` re-presentation is gated on proof-of-promotion and re-verification, and mailbox mutation is serialized by an inter-process lock that cannot be inherited in a broken state.
 - **The mail archive no longer makes its importers unloadable outside bun**, so the OpenClaw gateway starts with the `openclaw-tps-mail` plugin loaded instead of silently missing it.
-- **The `latest` promote after a release is a scripted, checked step** (`scripts/promote-latest.sh`), not a note in a run summary.
+- **The `latest` promote after a release is a scripted, checked, all-six-or-none step** (`scripts/promote-latest.sh`), not a note in a run summary.
 
 ### Detail
 
@@ -755,10 +757,10 @@ Because the changelog-fragment convention is in use for the whole of this range,
 
 - **`signOutboundBody` no longer aliases the caller's delegation chain (Refs #380).** `opts.priorChain` was used directly as the array to extend, so the outgoing hop was `push()`ed onto the CALLER's array. No current caller was affected, but it mutated caller state; the chain is now shallow-copied before the hop is appended.
 
-- **The `latest` promote is now a checked step (`scripts/promote-latest.sh`), not a note in a run summary (cli#366).** After a tag push, `release.yml` stage-publishes six packages under the `staged` dist-tag and a maintainer approves them in npm — but approval cannot move `latest` (`--tag` is immutable on a staged package and `npm stage approve` has no tag flag), so `npm install` keeps serving the previous version until someone runs `npm dist-tag add`, by hand, per package.
-  The new script performs that step. Each move is verified by RE-READING the registry rather than trusting `npm dist-tag add`'s exit code.
+- **The `latest` promote is now a recorded, checked, all-six-or-none step (`scripts/promote-latest.sh`), not a note in a run summary (cli#366).** After a tag push, `release.yml` stage-publishes six packages under the `staged` dist-tag and a maintainer approves them in npm — but approval cannot move `latest` (`--tag` is immutable on a staged package and `npm stage approve` has no tag flag), so `npm install` keeps serving the previous version until someone runs `npm dist-tag add`, by hand, per package. A forgotten promote is indistinguishable from a failed release.
+  The new script performs that step. It verifies BEFORE acting that all six packages exist at the target version, and refuses — naming each missing package — if any does not, because `packages/cli` pins the four platform packages at exact versions and a partial promote would publish a `latest` CLI whose pinned dependencies do not resolve. It shows the current `latest` for each package and what it will do, then requires an explicit `yes` (`--dry-run` stops before any change; `--yes` skips the prompt for a scripted run). It promotes all six or none: each move is verified by RE-READING the registry rather than trusting `npm dist-tag add`'s exit code, and if a move fails, does not land, or the process is INTERRUPTED (SIGINT/SIGTERM/SIGHUP) — during the move loop or during the rollback itself — the packages already moved are rolled back. The attempt is flagged before each `dist-tag add`, so a signal landing immediately after a tag change still rolls that package back, and further termination signals are IGNORED while the rollback runs, so a second signal cannot abandon the remaining restorations. A final table reports each package's previous and new `latest` and whether the move was verified.
   A target that is not a forward release — older than the current `latest` (a downgrade) or a pre-release — is allowed (a downgrade is a legitimate rollback) but never silently: it is called out loudly and needs a distinct `--allow-downgrade` acknowledgement that `--yes` does not imply. Build metadata (for example `1.2.3+build-abc`) is not a pre-release and does not require the acknowledgement. Every npm call is pinned with `--registry` so the publish path cannot be redirected by machine-local npm config.
-  The script checks that each package exists at the version, never that the four platform packages came from the same commit as `cli`. A canary-gated, sha-bound promote is the remaining half of cli#366.
+  The invariant delivered is *no partial promote*, not *the promoted set is trustworthy*: the script checks that each package exists at the version, never that the four platform packages came from the same commit as `cli`. A canary-gated, sha-bound promote is the remaining half of cli#366.
   `scripts/test-promote-latest.sh` pins the refusals, the registry re-read, the interrupt rollback, the direction guard, and the registry pin against a fake registry — no network, no real dist-tag is moved — and includes mutation checks that break the existence check, the post-move re-read, the TERM trap, and the pre-add attempt flag and confirm a fixture catches each. It runs in CI on both `ubuntu-latest` and `macos-14` (the script must run under bash 3.2, the bash on the machine that drives releases).
 
 **Full commit range:** https://github.com/tpsdev-ai/cli/compare/v0.6.0...v0.7.0

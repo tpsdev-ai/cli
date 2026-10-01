@@ -125,7 +125,7 @@ Publishing attempts delivery to other subscribers.
 
 ### Identity
 
-Every agent gets an Ed25519 keypair at creation. Keys never leave the host — agents prove identity through signatures, not shared secrets.
+Every agent gets an Ed25519 keypair at creation.
 
 ```bash
 tps identity show              # Show host identity
