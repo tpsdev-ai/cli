@@ -12,11 +12,11 @@ We will acknowledge receipt of your vulnerability report within 48 hours and str
 
 TPS is a security-focused project. The following components are in scope for our security program:
 
-- The Noise_IK transport layer (`src/utils/noise-ik-transport.ts`, `src/utils/ws-noise-transport.ts`)
-- The cryptographic identity primitives (`src/utils/identity.ts`)
+- The Noise_IK transport layer (`packages/cli/src/utils/noise-ik-transport.ts`, `packages/cli/src/utils/ws-noise-transport.ts`)
+- The cryptographic identity primitives (`packages/cli/src/utils/identity.ts`)
 - Mail signing and verification
 - The branch daemon connection state and mail handler isolation boundaries
-- Input sanitization (`src/utils/sanitizer.ts`) and path traversal protections
+- Input sanitization (`packages/cli/src/utils/sanitizer.ts`) and path traversal protections
 
 ## Out of Scope
 
