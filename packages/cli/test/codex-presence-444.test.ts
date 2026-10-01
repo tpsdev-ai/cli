@@ -5,8 +5,8 @@
 //
 // These tests drive the PRODUCTION wiring — key resolution for a generated
 // config, the heartbeat timer, and the signal handler — against a fake client
-// that records every call it receives, so re-adding a PATCH/PUT to
-// `/Agent/<id>` makes a test fail.
+// that records every call it receives, so an Agent write in the Presence helpers
+// or the signal handler makes a test fail.
 import { describe, expect, it } from "bun:test";
 import { generateKeyPairSync, verify as edVerify } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
