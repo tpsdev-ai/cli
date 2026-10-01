@@ -36,13 +36,13 @@ export interface PackContents {
   maintainer?: string;
 }
 
-/** The skill name: `--name` wins; `show` and `revoke` also take it as the first positional (cli#360). */
+/** The skill name: a given `--name` wins, even when empty; `show` and `revoke` also take it as the first positional (cli#360). */
 export function skillNameFromCli(
   action: string,
   positionals: readonly string[],
   flagName: string | undefined,
 ): string | undefined {
-  if (flagName) return flagName;
+  if (flagName !== undefined) return flagName;
   return action === "show" || action === "revoke" ? positionals[1] : undefined;
 }
 export async function runSkill(args: SkillArgs): Promise<void> {
