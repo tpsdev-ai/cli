@@ -2,6 +2,11 @@
 
 All notable changes to the TPS CLI are recorded here.
 
+## [Unreleased]
+
+### Removed
+
+- **The unused root CLI tree (root `src/`, `bin/tps.ts`, `scripts/stall-monitor.ts`) is deleted; the CLI lives in `packages/cli` (Closes #379).**
 ## [0.8.0] — 2026-09-30
 
 **Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.
