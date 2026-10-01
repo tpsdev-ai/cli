@@ -24,7 +24,7 @@
  *
  *   - `test.yml` — guarded (runs on `pull_request`).
  *   - `docker.yml` — NOT guarded: triggered by `workflow_dispatch` only, so it
- *     never checks out a pull request.
+ *     never runs on a pull request.
  *   - `release.yml` — NOT guarded: triggered by a `push` of `v*` tags, not by a
  *     pull request, and it already has its own guard
  *     (`release-workflow-permissions.test.ts`).
