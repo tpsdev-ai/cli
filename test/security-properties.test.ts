@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import yaml from "js-yaml";
 
 const ROOT = process.cwd();
 
@@ -278,5 +279,70 @@ describe("office image ships an agent that answers `check` (cli#352 r4)", () => 
     // ...and the workspace tarball is the verification-only override.
     expect(df).toContain('ARG TPS_AGENT_TARBALL=""');
     expect(df).toContain("/tmp/agent.tgz");
+  });
+});
+
+/**
+ * cli#420 slice 1 — the Docker Image workflow ran on the Release workflow's
+ * completion, when the packages are staged and not yet public, so npm answered
+ * ETARGET and every release ended in a failed Docker run. It is now dispatched
+ * with a version, and it refuses a version npm has not published. These
+ * assertions pin the refusal order and the tag rule: a `workflow_run` trigger
+ * back, or a version check without its end anchor, fails here.
+ */
+describe("docker image workflow — dispatched only for a version public on npm (cli#420 slice 1)", () => {
+  interface DockerStep {
+    name?: string;
+    id?: string;
+    uses?: string;
+    run?: string;
+    with?: Record<string, unknown>;
+  }
+  const yml = src(".github/workflows/docker.yml");
+  const job = (yaml.load(yml) as { jobs: Record<string, { steps: DockerStep[] }> }).jobs["build-and-push"];
+  const steps = job.steps;
+
+  test("docker.yml is dispatched, never chained to a completed Release", () => {
+    // `workflow_run` is what made the trigger fire before approval was possible.
+    expect(yml).not.toContain("workflow_run");
+    expect(yml).toContain("workflow_dispatch:");
+  });
+
+  test("the version input must match the semver shape end to end", () => {
+    const patterns = yml.match(/grep -qE '([^']+)'/g) ?? [];
+    expect(patterns.length, "one version check in the workflow").toBe(1);
+    const pattern = /grep -qE '([^']+)'/.exec(yml)![1];
+    expect(pattern.startsWith("^"), `anchored at the start: ${pattern}`).toBe(true);
+    expect(pattern.endsWith("$"), `anchored at the end: ${pattern}`).toBe(true);
+    const re = new RegExp(pattern);
+    for (const ok of ["0.7.0", "10.20.30", "0.7.0-rc.1", "0.7.0-beta"]) {
+      expect(re.test(ok), `${ok} is a version`).toBe(true);
+    }
+    for (const bad of ["0.7.0-garbage!", "0.7", "v0.7.0", "0.7.0.1", "0.7.0-", " 0.7.0"]) {
+      expect(re.test(bad), `${bad} is not a version`).toBe(false);
+    }
+  });
+
+  test("npm must answer for the version before the first build step", () => {
+    const npmIdx = steps.findIndex((s) => s.run?.includes('npm view "@tpsdev-ai/agent@'));
+    const buildIdx = steps.findIndex((s) => s.uses?.includes("build-push-action"));
+    expect(npmIdx, "the npm-public check is a step").toBeGreaterThan(-1);
+    expect(buildIdx, "a build step follows it").toBeGreaterThan(-1);
+    expect(npmIdx, "the check runs before any build").toBeLessThan(buildIdx);
+    expect(yml).toContain(
+      "@tpsdev-ai/agent@${TPS_VERSION} is not public on npm yet: approve the staged release, then re-run this workflow with version=${TPS_VERSION}",
+    );
+  });
+
+  test(":latest is not a literal tag in the push step — it comes from the computed output", () => {
+    const push = steps.find((s) => s.uses?.includes("build-push-action") && s.with?.push === true);
+    expect(push, "the pushing build step").toBeDefined();
+    expect(push!.with!.tags, "the push step takes the computed tags").toBe("${{ steps.tags.outputs.tags }}");
+    expect(JSON.stringify(push!.with!.tags)).not.toContain("latest");
+    const compute = steps.find((s) => s.id === "tags");
+    expect(compute?.run, "the tag is computed from npm's latest").toContain(
+      "ghcr.io/tpsdev-ai/tps-office:latest",
+    );
+    expect(compute?.run).toContain("dist-tags.latest");
   });
 });
