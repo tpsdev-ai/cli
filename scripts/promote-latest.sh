@@ -141,6 +141,11 @@ together; the script refuses if any is not published at VERSION.
                       downgrade) or a pre-release. `--yes` does NOT imply this.
   --help              Show this help.
 
+Each `npm dist-tag add` runs with the script's own stdin/stdout/stderr (not
+captured), so npm's browser 2FA can run when the script itself is run from a
+terminal. npm prompts for 2FA only when stdin and stdout are both a terminal:
+do not pipe or redirect either.
+
 Environment: NPM_BIN (default `npm`); NPM_REGISTRY (default
 https://registry.npmjs.org) pins every npm call.
 EOF
@@ -359,11 +364,13 @@ rollback_moved() {
   # binaries — so there is no window with a new CLI beside previous platform tags.
   for ((i = NPKG - 1; i >= 0; i--)); do
     [ "${moved[i]}" = 1 ] || continue
+    # When a changing tag's registry operation requires 2FA, the rollback add
+    # also needs the script's own stdin/stdout/stderr (not captured): captured
+    # output loses stdout's TTY, so npm cannot prompt for 2FA.
     set +e
-    rb_out="$("$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY" 2>&1)"
+    "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
     set -e
-    [ -z "$rb_out" ] || printf '%s\n' "$rb_out" >&2
     set +e
     back="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     brc=$?
@@ -434,13 +441,19 @@ for ((i = 0; i < NPKG; i++)); do
   # Mark the attempt BEFORE the mutation: a signal (or a crash) landing between
   # the tag change and any later flag would otherwise leave a moved-but-unflagged
   # package that the rollback skips.
+  # The EOTP case described below is a changing tag whose registry operation
+  # requires 2FA.
   moved[i]=1
   printf '\n-> %s: npm dist-tag add %s@%s latest\n' "${names[i]}" "${names[i]}" "$version"
+  # The add runs with the script's own stdin/stdout/stderr (not captured): no
+  # command substitution and no pipe, so npm's browser 2FA can run when the script
+  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout
+  # are both TTYs; captured output loses stdout's TTY, and npm then exits EOTP
+  # without moving the tag.
   set +e
-  out="$("$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"
+  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?
   set -e
-  [ -z "$out" ] || printf '%s\n' "$out"
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
