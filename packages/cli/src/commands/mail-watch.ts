@@ -1,40 +1,40 @@
 /**
- * mail-watch — watch an agent's inbox for new messages and run exec hooks.
+ * mail-watch — watch an agent's inbox and run exec hooks on new mail.
  *
- * OPS-121: mail watcher using fs.watch + debounce for low-latency delivery,
- * backed by a low-frequency poll fallback. fs.watch (FSEvents on macOS) goes
- * deaf after uptime, so it can't be the sole trigger — the poll guarantees
- * delivery and lets a (re)start recover any mail stranded in new/. Near-zero
- * idle CPU; reliability over strictly-zero-CPU.
+ * OPS-121: fs.watch + debounce for low-latency delivery, backed by a
+ * low-frequency poll fallback. fs.watch (FSEvents on macOS) goes deaf after
+ * uptime, so it can't be the sole trigger — the poll keeps delivery going.
+ * Near-zero idle CPU.
  *
  * Security mitigations (K&S):
  * - exec hooks use args[] array, no shell interpolation
  * - agent IDs validated: ^[a-zA-Z0-9._-]+$
  * - max 3 concurrent handlers
  *
- * Verification (cli#375): the hook and onMessage get ONLY verified mail. On
- * every fs event and poll, watchMail calls checkMessages(agent) — the
- * mailbox's ONE enforcement point — which promotes new/ → cur/ (verifying the
- * signed envelope), re-drives retryable dlq/ entries and lease-sweeps cur/,
- * and hands those verified records to onMessage and the --exec hook. An
- * unsigned or tampered record never reaches either: it dead-letters to dlq/.
+ * NON-CONSUMING (cli#375): the watcher verifies each record in `new/` IN PLACE
+ * with the same verification `promote()` applies, and presents ONLY records
+ * that verify. It calls no consumer path — no promote, no lease, no ack, no
+ * `checkMessages` — so it never competes with the inbox's consumers and never
+ * moves a record out of `new/`. A record that does not verify is skipped and
+ * logged; it is never presented.
  *
  * Hook contract:
  * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
  *   byte-identical);
- * - TPS_MAIL_ID (with TPS_MAIL_FROM / TPS_MAIL_TO / TPS_MAIL_TIMESTAMP) is set
- *   in the hook's environment; TPS_MAIL_ID is the ack key;
- * - the hook acks by running `tps mail ack $TPS_MAIL_ID`; an unacked record
- *   stays checked out in cur/ and the mailbox re-presents it after its lease.
+ * - the hook's environment carries ONLY verified fields: TPS_MAIL_ID (the
+ *   verified envelope id), TPS_MAIL_FROM, TPS_MAIL_TO (the watched agent) and
+ *   TPS_MAIL_TIMESTAMP;
+ * - a hook that consumes a message acks it with
+ *   `tps mail ack --agent "$TPS_MAIL_TO" <id>`.
  */
 
 import { execSync, spawn } from "node:child_process";
-import { existsSync, watch as fsWatch, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MailMessage } from "../utils/mail.js";
-import { checkMessages, getInbox } from "../utils/mail.js";
+import { getInbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,12 @@ export interface MailWatchOptions {
    * swallowed: a heartbeat failure must never crash the mail loop.
    */
   onPoll?: () => void | Promise<void>;
+  /**
+   * Test seam: the fs.watch implementation. Defaults to node's `fs.watch`. A
+   * test that must prove the POLL path alone passes a no-op here, so no fs
+   * event can deliver the mail it writes.
+   */
+  watchImpl?: (dir: string, listener: () => void) => { close(): void };
 }
 
 // ---------------------------------------------------------------------------
@@ -87,21 +93,59 @@ export function validateAgentId(agentId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Message reading — through the ONE enforcement point (cli#375)
+// Reading `new/` for verification (cli#375)
 // ---------------------------------------------------------------------------
 //
-// new/ is NEVER handed to a hook: watchMail reads mail only through
-// checkMessages(), which promotes (verifying the signed envelope) and returns
-// the verified records. There is no raw-file reader here on purpose — a
-// by-path reader is exactly how a hook could be driven by an unverified body.
+// `new/` is listed and each record is verified IN PLACE through
+// `verifyRecordForMailbox` — the same policy `promote()` applies — so an
+// unverified record is never handed on. Nothing here moves, leases or writes.
+
+/** Filenames (`*.json`) directly under `dir`, or [] when it is missing. */
+function listNewFiles(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  try {
+    return readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+}
+
+/** Parse one `new/` record, or null when it is unreadable/corrupt. */
+function readNewRecord(filePath: string): MailMessage | null {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8")) as MailMessage;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Project a VERIFIED message to the fields a hook/onMessage may see: the
+ * verified envelope fields only. `id` is the VERIFIED envelope id (never the
+ * unsigned wrapper id), and the unsigned wrapper fields the source file carried
+ * — `headers` above all — are dropped.
+ */
+function projectVerified(m: MailMessage): MailMessage {
+  const out: MailMessage = {
+    id: m.envelopeId as string,
+    from: m.from,
+    to: m.to,
+    body: m.body,
+    timestamp: m.timestamp,
+    read: false,
+  };
+  if (m.envelopeId !== undefined) out.envelopeId = m.envelopeId;
+  if (m.replyToId !== undefined) out.replyToId = m.replyToId;
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // Exec hook runner
 // ---------------------------------------------------------------------------
 
 /**
- * Run a hook for a single message.
- * Passes message metadata via env vars; body via stdin.
+ * Run a hook for a single VERIFIED message.
+ * Passes the verified fields via env vars; body via stdin.
  * No shell interpolation — args passed directly to spawn().
  */
 function runHook(hook: WatchExecHook, msg: MailMessage): Promise<void> {
@@ -148,14 +192,21 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   let stopped = false;
   let activeHandlers = 0;
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-  const seen = new Set<string>();
 
   const inbox = getInbox(opts.agent);
 
-  // Verified mail waiting for a free slot. checkMessages() can return several
-  // records at once; the cap must hold WITHOUT dropping the rest, so over-cap
-  // records wait here and are delivered as slots free (the alternative —
-  // leaving them in cur/ — would defer them to a lease re-present 30 min out).
+  // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
+  // came from. Dropped when that file leaves `new/`, so a message re-delivered
+  // into `new/` is presented again; while the file stays, it is presented once.
+  const presented = new Map<string, string>();
+  // Files already classified this residence (presented, or skipped as
+  // unverifiable), keyed on the filename, so a later pass does not re-verify or
+  // re-log a file still sitting in `new/`. Dropped when the file leaves `new/`.
+  const classified = new Map<string, string>();
+
+  // Verified records waiting for a free slot. The concurrency cap must hold
+  // WITHOUT dropping the rest, so over-cap records wait here and are delivered
+  // as slots free.
   const pending: MailMessage[] = [];
   let checking = false;
 
@@ -173,31 +224,60 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         } catch { /* hook errors don't crash the watcher */ }
       })().finally(() => {
         activeHandlers--;
-        // A slot just freed — deliver the next queued record (or re-check new/).
         if (!stopped) drain();
       });
     }
   };
 
-  // Promote through the ONE enforcement point and hand ONLY the verified
-  // records to the hook/callback. An unsigned or tampered record never appears
-  // in the returned list — checkMessages dead-letters it to dlq/. `seen` is
-  // keyed on the message id (never the new/ pathname), so a record promoted out
-  // of new/ is delivered once.
+  // Verify each record in `new/` IN PLACE and queue ONLY the records that
+  // verify. Nothing is moved, leased or acked. A record that does not verify is
+  // logged and skipped, never presented.
   const processNew = async () => {
     if (stopped || checking) return;
     checking = true;
     try {
-      const verified = await checkMessages(opts.agent);
-      for (const msg of verified) {
-        if (seen.has(msg.id)) continue;
-        seen.add(msg.id);
-        pending.push(msg);
+      const files = listNewFiles(inbox.fresh);
+      const present = new Set(files);
+      // Forget records whose file has left `new/`, so a re-delivered message is
+      // presented again.
+      for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
+      for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
+
+      for (const file of files) {
+        if (classified.has(file)) continue;
+        const record = readNewRecord(join(inbox.fresh, file));
+        if (record === null) {
+          classified.set(file, "unreadable");
+          console.error(`[mail-watch] ${file}: not presented (unreadable record)`);
+          continue;
+        }
+        let result: VerifyRecordResult;
+        try {
+          result = await verifyRecordForMailbox(opts.agent, record);
+        } catch (err) {
+          // Flair unreachable — a retryable outage, not a verdict. Log it and
+          // let the next pass try again (do NOT mark it classified).
+          console.error(
+            `[mail-watch] ${record.id}: verification unavailable (${err instanceof Error ? err.message : String(err)})`,
+          );
+          continue;
+        }
+        if (!result.ok) {
+          classified.set(file, `refused:${result.class}`);
+          console.error(`[mail-watch] ${record.id}: not presented (${result.class}: ${result.reason})`);
+          continue;
+        }
+        const envId = result.message.envelopeId;
+        if (envId === undefined) {
+          classified.set(file, "refused:no-envelope-id");
+          continue;
+        }
+        classified.set(file, "presented");
+        // Dedup on the VERIFIED envelope id.
+        if (presented.has(envId)) continue;
+        presented.set(envId, file);
+        pending.push(projectVerified(result.message));
       }
-    } catch {
-      // checkMessages() does not reject per message (those are dead-lettered); a
-      // rejection here is a fault in the mailbox itself. The next poll retries.
-      console.error("[mail-watch] check failed; will retry on the next poll");
     } finally {
       checking = false;
       drain();
@@ -212,11 +292,11 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   };
 
   // fs.watch on new/ fires on file create/rename — low-latency, but fs.watch
-  // (FSEvents on macOS) silently stops emitting after uptime, which strands
-  // mail. So treat fs.watch as a latency optimization, NOT the source of truth:
-  // a low-frequency poll guarantees delivery even if the watcher goes deaf.
-  // Reliability > idle CPU for the review/mail pipeline.
-  const watcher = fsWatch(inbox.fresh, onFsEvent);
+  // (FSEvents on macOS) silently stops emitting after uptime. So treat fs.watch
+  // as a latency optimization, NOT the source of truth: the low-frequency poll
+  // keeps delivery going even if the watcher goes deaf.
+  const watchImpl = opts.watchImpl ?? ((dir: string, listener: () => void) => fsWatch(dir, listener));
+  const watcher = watchImpl(inbox.fresh, onFsEvent);
   const pollMs = opts.pollMs ?? 15_000;
 
   // Liveness heartbeat — fire once per GUARANTEED poll cycle (not the fs-event

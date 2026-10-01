@@ -6,7 +6,7 @@ All notable changes to the TPS CLI are recorded here.
 
 ### Security
 
-- **`tps mail watch --exec` now hands its hook and callback only verified mail (Closes #375).** The watcher no longer reads `new/` directly: on every fs event and poll it goes through the mailbox's promotion path (`checkMessages`), which verifies the signed envelope — promoting `new/` → `cur/`, re-driving retryable `dlq/` entries and lease-sweeping `cur/` — and passes only the verified records to `onMessage` and the `--exec` hook. An unsigned or tampered record never reaches either; it dead-letters to `dlq/`. The hook contract is documented in the `tps mail watch` help: the verified body on stdin, `TPS_MAIL_ID` as the ack key (ack with `tps mail ack $TPS_MAIL_ID`), and re-presentation after its lease while unacked.
+- **`tps mail watch --exec` presents only mail that verifies, without consuming it (Closes #375).** The watcher verifies each record in `new/` IN PLACE — the same signature and envelope-binding checks `promote()` applies, factored into a shared function that moves, leases and writes nothing — and passes only the records that verify to `onMessage` and the `--exec` hook. It calls no consumer path (`promote`, `checkMessages`, a lease or an ack), so it never competes with the inbox's consumers and never moves a record out of `new/`. A record that does not verify is skipped and logged, never presented. The hook's environment carries only verified fields (the verified envelope id as `TPS_MAIL_ID`, plus `TPS_MAIL_FROM`/`TPS_MAIL_TO`/`TPS_MAIL_TIMESTAMP`), with the verified body on stdin; a consuming hook acks with `tps mail ack --agent "$TPS_MAIL_TO" <id>`.
 
 ## [0.8.0] — 2026-09-30
 

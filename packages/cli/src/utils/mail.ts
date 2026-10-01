@@ -1,17 +1,17 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
-import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
+import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
-import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
 // (which imports this module) applies the same rule the CLI does.
-export { isValidEnvelopeId, ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
+export { ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 
 export interface MailMessage {
   id: string;
@@ -859,6 +859,52 @@ async function decideEnvelopeForMailbox(
   return { ok: true, envelope };
 }
 
+export type VerifyRecordResult =
+  | { ok: true; message: MailMessage }
+  | { ok: false; class: PromoteRejectClass; reason: string };
+
+/**
+ * Verify ONE record IN PLACE: the checks `promote()` applies to a `new/`
+ * record — the inner signed envelope and the record↔envelope bindings (the
+ * SAME `decideEnvelopeForMailbox` policy) — with NO side effect. It moves,
+ * leases and writes NOTHING, so a non-consuming reader (mail watch) can present
+ * only records that verify without competing with the inbox's consumers.
+ *
+ * Returns the verified message, or the refusal class and reason. Throws ONLY
+ * when Flair is unreachable — a retryable outage, not a verdict (callers
+ * classify that themselves).
+ */
+export async function verifyRecordForMailbox(
+  agent: string,
+  record: MailMessage,
+  verify: MailVerifyConfig = {},
+): Promise<VerifyRecordResult> {
+  const parsed = tryParseEnvelope(record.body);
+  if (parsed === "json-parse-error") {
+    return { ok: false, class: "invalid", reason: "body is not JSON (signed envelope required)" };
+  }
+  if (parsed === "missing-fields") {
+    return { ok: false, class: "invalid", reason: "body is not a v1 signed envelope" };
+  }
+  const envelope = parsed as unknown as Envelope;
+  const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, verify);
+  if (!decision.ok) return { ok: false, class: decision.class, reason: decision.reason };
+  return {
+    ok: true,
+    message: {
+      ...record,
+      from: envelope.from,
+      to: envelope.to,
+      body: envelope.body,
+      timestamp: envelope.timestamp,
+      read: false,
+      envelopeId: envelope.messageId,
+      envelope,
+      replyToId: envelope.replyToId,
+    },
+  };
+}
+
 /**
  * THE enforcer. Move one record to cur/ ONLY if its envelope verifies AND is
  * addressed to this mailbox AND has not already been consumed. Otherwise
@@ -884,26 +930,15 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     return { ok: false, class: "invalid", reason };
   }
 
-  // Step 1: parse wrapper → parse envelope.
-  const parsed = tryParseEnvelope(msg.body);
-  if (parsed === "json-parse-error") {
-    const reason = "body is not JSON (signed envelope required)";
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-  if (parsed === "missing-fields") {
-    const reason = "body is not a v1 signed envelope";
-    rejectToDlq(dirs, filename, filePath, "invalid", reason);
-    return { ok: false, class: "invalid", reason };
-  }
-  const envelope = parsed as unknown as Envelope;
-
-  // Step 2: run the SHARED mailbox policy (signature, wrapper→envelope from
-  // binding, recipient binding, messageId shape). This is the SAME list
-  // recoverPromoted runs, so the two paths cannot diverge.
-  let decision: EnvelopePolicyResult;
+  // Step 1+2: the SHARED record verification (parse the wrapper, parse the
+  // envelope, and run the ONE mailbox policy: signature, wrapper→envelope from
+  // binding, recipient binding, messageId/replyToId shapes, timestamp shape).
+  // This is the SAME function the non-consuming `mail watch` reader calls, so
+  // the two cannot diverge. It has NO side effect; `promote` adds the move
+  // below.
+  let verified: VerifyRecordResult;
   try {
-    decision = await decideEnvelopeForMailbox(agent, envelope, msg.from, verify);
+    verified = await verifyRecordForMailbox(agent, msg, verify);
   } catch (err: any) {
     // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
     // later check re-drive it, so an outage self-heals when Flair returns.
@@ -911,10 +946,11 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     rejectToDlq(dirs, filename, filePath, "verify-unavailable", reason);
     return { ok: false, class: "verify-unavailable", reason };
   }
-  if (!decision.ok) {
-    rejectToDlq(dirs, filename, filePath, decision.class, decision.reason);
-    return { ok: false, class: decision.class, reason: decision.reason };
+  if (!verified.ok) {
+    rejectToDlq(dirs, filename, filePath, verified.class, verified.reason);
+    return { ok: false, class: verified.class, reason: verified.reason };
   }
+  const envelope = verified.message.envelope as Envelope;
 
   // Step 3: acquire the per-mailbox lock. It spans the replay check AND the
   // promotion commit/rollback (the ledger prune and append included): two
