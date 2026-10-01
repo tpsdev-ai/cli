@@ -127,8 +127,7 @@ export interface SkillScanResult {
   riskLevel: "low" | "medium" | "high" | "critical";
 }
 
-/** The activity vocabulary Flair's Presence contract accepts
- *  (flair `resources/Presence.ts:42`; `post()` validates it at `:544`). */
+/** The activity vocabulary Flair's Presence contract accepts. */
 export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
 
 export class FlairClient {
@@ -206,18 +205,12 @@ export class FlairClient {
   /**
    * POST /Presence — the agent's OWN presence heartbeat, signed with `this`
    * agent's Ed25519 key (Flair keys the record by the signature's agentId and
-   * rejects a cross-agent write). `activity` is optional: a beat with neither
-   * activity nor currentTask is a pure-liveness heartbeat that refreshes
-   * `lastHeartbeatAt` and leaves the prior activity alone (flair
-   * `resources/Presence.ts`, `buildPresenceRecord`). cli#444: runtimes record
-   * liveness HERE, never by writing `Agent.status` (that field is the
-   * principal's lifecycle state).
+   * rejects a cross-agent write). `activity` is optional. cli#444: the codex
+   * runtime records liveness HERE, never by writing `Agent.status` (that field is
+   * the principal's lifecycle state).
    */
-  async presence(activity?: PresenceActivity, currentTask?: string): Promise<void> {
-    await this.request("POST", "/Presence", {
-      ...(activity !== undefined ? { activity } : {}),
-      ...(currentTask !== undefined ? { currentTask } : {}),
-    });
+  async presence(activity?: PresenceActivity): Promise<void> {
+    await this.request("POST", "/Presence", activity !== undefined ? { activity } : {});
   }
 
   /**

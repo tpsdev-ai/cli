@@ -5,15 +5,14 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import {appendFileSync, createWriteStream,existsSync, 
-  readFileSync, writeFileSync, 
-} from "node:fs";
+import { appendFileSync, createWriteStream, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
   refreshOpenAIToken,
   type StoredCredentials,
 } from "../commands/auth.js";
+import { agentKeyCandidates, resolveAgentKeyPath } from "./agent-keys.js";
 import {
   bootContext,
   catchUpTopics,
@@ -111,7 +110,7 @@ export interface CodexRuntimeConfig {
   watchdogTimeoutMs?: number;
   sessionLogPath?: string;
   flairUrl?: string;
-  flairKeyPath: string;
+  flairKeyPath?: string;
   systemPrompt?: string;
   workspaceProvider?: WorkspaceProvider;
   /** If set, auto-commit workspace changes after each task completes */
@@ -148,7 +147,7 @@ async function buildSystemPrompt(
   config: CodexRuntimeConfig,
 ): Promise<string> {
   const { agentId, workspace, extraDirs, supervisorId, flairUrl, flairKeyPath } = config;
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: resolveRuntimeKeyPath(agentId, flairKeyPath) });
   const allowedTools = ["Bash", "Read", "Write", "Edit"];
   const { systemPrompt } = await bootContext(
     flair, agentId, message.body.slice(0, 100), workspace,
@@ -609,14 +608,28 @@ async function _runAutoCommitLegacy(
 }
 
 
+/** How often the runtime publishes a Presence heartbeat. */
+export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
+/** Upper bound on the final shutdown beat before the process exits. */
+export const SHUTDOWN_BEAT_TIMEOUT_MS = 3000;
+
+/**
+ * The Flair key path the runtime authenticates with: the configured path, else
+ * the agent's registered key — the same candidate order the rest of the CLI uses
+ * (agent-keys.ts). Falls back to the first candidate so a missing key fails with
+ * the client's named path error.
+ */
+export function resolveRuntimeKeyPath(agentId: string, configured?: string): string {
+  if (configured) return configured;
+  return resolveAgentKeyPath(agentId) ?? (agentKeyCandidates(agentId)[0] as string);
+}
+
 /**
  * Publish ONE presence heartbeat for the agent on Flair's Presence resource,
  * signed with the agent's own Ed25519 credential. cli#444: liveness is recorded
  * HERE, never by writing the agent's `Agent.status` — in Flair that field is the
- * principal's lifecycle state, so an `"offline"` write deactivates the agent and
- * the matching `"online"` write can never succeed. Flair derives `offline` from
- * heartbeat age; this beat refreshes it. A failure only LOGS (never throws) and
- * never falls back to touching `/Agent`.
+ * principal's lifecycle state (a value other than `active` deactivates it). A
+ * failure only LOGS (never throws) and never writes `/Agent`.
  */
 export async function publishRuntimePresence(
   client: Pick<FlairClient, "presence">,
@@ -630,14 +643,60 @@ export async function publishRuntimePresence(
   }
 }
 
-/** The runtime's shutdown presence beat: ONE final Presence beat, activity
- *  `"idle"` (flair derives `offline` from heartbeat age — never a status
- *  write). The signal handlers run this. */
-export function runtimeShutdownBeat(
+/**
+ * Start the runtime's Presence heartbeat: ONE beat at startup, then one every
+ * `intervalMs`, on the timer's own schedule — independent of the task/mail loop,
+ * so a long task cannot starve it. Returns a stop function that clears the timer.
+ */
+export function startPresenceHeartbeat(
   client: Pick<FlairClient, "presence">,
   agentId: string,
+  intervalMs: number = HEARTBEAT_INTERVAL_MS,
+): () => void {
+  void publishRuntimePresence(client, agentId);
+  const timer = setInterval(() => {
+    void publishRuntimePresence(client, agentId);
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  return () => clearInterval(timer);
+}
+
+/**
+ * The final Presence beat on shutdown: a bounded `"idle"` beat. Never throws;
+ * resolves when the beat settles or `timeoutMs` elapses, whichever comes first.
+ */
+export async function shutdownPresenceBeat(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
 ): Promise<void> {
-  return publishRuntimePresence(client, agentId, "idle");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const bound = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  try {
+    await Promise.race([publishRuntimePresence(client, agentId, "idle"), bound]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * The SIGINT/SIGTERM handler: stop the heartbeat, await the bounded final beat,
+ * then exit. `exit` and `timeoutMs` are injectable so a test drives the real
+ * handler.
+ */
+export function shutdownHandler(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  stopHeartbeat: () => void,
+  exit: (code: number) => void = (code) => process.exit(code),
+  timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
+): () => void {
+  return () => {
+    stopHeartbeat();
+    void shutdownPresenceBeat(client, agentId, timeoutMs).finally(() => exit(0));
+  };
 }
 
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
@@ -647,8 +706,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   await ensureFreshOpenAIToken(agentId);
 
-  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath: flairKeyPath });
-  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath };
+  // cli#444: a generated agent config omits flair.keyPath; resolve the agent's
+  // registered key (the same candidates the rest of the CLI uses) so the
+  // Presence beats are signed.
+  const keyPath = resolveRuntimeKeyPath(agentId, flairKeyPath);
+  const taskConfig: CodexRuntimeConfig = keyPath === flairKeyPath ? config : { ...config, flairKeyPath: keyPath };
+  const flair = new FlairClient({ baseUrl: flairUrl, agentId, keyPath });
+  const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath: keyPath };
 
   // All runtime outbound mail goes through the SIGNED path; a send failure must
   // not abort a task that otherwise completed (the completion boundary closes
@@ -659,14 +723,14 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   };
 
   // cli#444: liveness goes to Flair's Presence resource, never to the agent's
-  // Agent row — `Agent.status` is the principal's lifecycle state, so an
-  // "offline" write DEACTIVATES the agent and its requests are refused with
-  // `401 principal_deactivated`. Flair derives `offline` from heartbeat age.
-  const markOffline = () => {
-    void runtimeShutdownBeat(flair, agentId);
-  };
-  process.once("SIGINT", () => { markOffline(); process.exit(0); });
-  process.once("SIGTERM", () => { markOffline(); process.exit(0); });
+  // Agent row — `Agent.status` is the principal's lifecycle state (a value other
+  // than `active` deactivates it). The heartbeat runs on its own timer from
+  // startup, independent of the mail loop; the signal handlers await the bounded
+  // final beat before exiting.
+  const stopHeartbeat = startPresenceHeartbeat(flair, agentId);
+  const onSignal = shutdownHandler(flair, agentId, stopHeartbeat);
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
 
   const flairOnline = await runtimeBootPreflight(flair, agentId);
   if (flairOnline) {
@@ -716,7 +780,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       const flairPub1 = { publishEvent: async (ev: Record<string, unknown>) => {
         try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
       }};
-      const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+      const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
         flairPublisher: flairPub1,
         onStall: () => { notify(event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
       });
@@ -786,9 +850,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
   let lastSnapshot = Date.now();
   let lastTokenRefresh = Date.now();
-  let lastHeartbeat = 0; // publish on first tick
   const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
-  const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // publish heartbeat every 5min
   while (true) {
     if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
       await ensureFreshOpenAIToken(agentId);
@@ -798,13 +860,6 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       await snapshotSoulToDisk(flair, agentId);
       lastSnapshot = Date.now();
     }
-    // Publish a Presence heartbeat to Flair (cli#444): a pure-liveness beat on
-    // Flair's OWN liveness surface, on the first tick (start) and every 5min.
-    if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      await publishRuntimePresence(flair, agentId);
-      lastHeartbeat = Date.now();
-    }
-
     for (const msg of await pollRuntimeMail(mailCfg)) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
       let preTaskState;
@@ -818,7 +873,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
         const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
-        const result = await runCodex(msg, config, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+        const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
           flairPublisher: flairPub2,
           onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
         });
