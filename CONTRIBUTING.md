@@ -35,7 +35,7 @@ When modifying the branch daemon or transport layers, keep the following securit
 ## Code Quality
 
 - We use Biome for linting. Run `bun run lint` before committing.
-- Ensure all tests pass (`bun run test`). We aim for high test coverage, especially in `src/utils/identity.ts`, `src/utils/relay.ts`, and the transport layers.
+- Ensure all tests pass (`bun run test`). We aim for high test coverage, especially in `packages/cli/src/utils/identity.ts`, `packages/cli/src/utils/relay.ts`, and the transport layers.
 - Write tests for new features.
 
 ## Submitting a Pull Request

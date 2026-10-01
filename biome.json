@@ -35,6 +35,6 @@
     "enabled": false
   },
   "files": {
-    "includes": ["src/**", "bin/**"]
+    "includes": []
   }
 }

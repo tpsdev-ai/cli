@@ -4,6 +4,10 @@ All notable changes to the TPS CLI are recorded here.
 
 ## [Unreleased]
 
+### Removed
+
+- **The unused root CLI tree (root `src/`, `bin/tps.ts`, `scripts/stall-monitor.ts`) is deleted; the CLI lives in `packages/cli` (Closes #379).**
+
 ### Fixed
 
 - **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
