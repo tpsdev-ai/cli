@@ -13,6 +13,8 @@ All notable changes to the TPS CLI are recorded here.
 - **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
 
 - **The codex runtime records liveness on Flair's Presence resource instead of writing `Agent.status` (Closes #444).** In Flair `Agent.status` is the principal's lifecycle state (a value other than `active` deactivates it), so the shutdown write of `"offline"` deactivated the agent — its requests were then refused with `401 principal_deactivated`, and the agent could no longer self-update back to `active`. The runtime now POSTs `/Presence` with the agent's own credential: one beat at startup, then one every 5 minutes on its own timer, and one bounded final `activity: "idle"` beat on SIGINT/SIGTERM. A Presence failure only logs and never writes the Agent row.
+- **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
+
 ## [0.8.0] — 2026-09-30
 
 **Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.

@@ -4,9 +4,9 @@
  * Manages skill assignments as Soul records in Flair.
  * Skills are knowledge packages — not executable code.
  */
-import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
 
@@ -36,6 +36,15 @@ export interface PackContents {
   maintainer?: string;
 }
 
+/** The skill name: a given `--name` wins, even when empty; `show` and `revoke` also take it as the first positional (cli#360). */
+export function skillNameFromCli(
+  action: string,
+  positionals: readonly string[],
+  flagName: string | undefined,
+): string | undefined {
+  if (flagName !== undefined) return flagName;
+  return action === "show" || action === "revoke" ? positionals[1] : undefined;
+}
 export async function runSkill(args: SkillArgs): Promise<void> {
   switch (args.action) {
     case "list":
