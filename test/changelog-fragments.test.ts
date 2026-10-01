@@ -666,6 +666,45 @@ describe("changelog fragments — render + promote (cli#449)", () => {
     }
   });
 
+  // git checkout restores a tracked link, not the files it points at, so
+  // `.changelog` or `.changelog/unreleased` as a symbolic link is refused before
+  // any read or delete. The link points into a separate tracked work tree that
+  // holds a well-formed, staged fragment.
+  for (const linked of [".changelog", join(".changelog", "unreleased")]) {
+    it(`REFUSES ${linked} as a symbolic link, in check and in promote, and changes nothing`, () => {
+      const { dir, changelogPath } = project();
+      const external = mkdtempSync(join(tmpdir(), "cli-fragments-ext-"));
+      try {
+        const extDir = join(external, ".changelog", "unreleased");
+        mkdirSync(extDir, { recursive: true });
+        writeFileSync(join(extDir, "fixed-a.md"), "- **a fix.** \n");
+        for (const args of [
+          ["init", "-q"],
+          ["add", "-A"],
+        ]) {
+          const r = spawnSync("git", args, { cwd: external, encoding: "utf8", timeout: 10_000 });
+          expect(r.status, `git ${args.join(" ")}: ${r.stderr}`).toBe(0);
+        }
+        rmSync(join(root, linked), { recursive: true });
+        symlinkSync(join(external, linked), join(root, linked));
+        stageAll();
+        const changelogBefore = readFileSync(changelogPath);
+        const extNames = () => readdirSync(extDir).sort();
+        const namesBefore = extNames();
+        const bytesBefore = namesBefore.map((n) => readFileSync(join(extDir, n)));
+        const msg = `${linked} is a symbolic link; it must be a directory`;
+        expect(() => cf.check({ dir, changelogPath })).toThrow(msg);
+        expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(msg);
+        expect(readFileSync(changelogPath).equals(changelogBefore)).toBe(true);
+        expect(extNames()).toEqual(["fixed-a.md"]);
+        expect(namesBefore.map((n) => readFileSync(join(extDir, n)))).toEqual(bytesBefore);
+        expect(lstatSync(join(root, linked)).isSymbolicLink()).toBe(true);
+      } finally {
+        rmSync(external, { recursive: true, force: true });
+      }
+    });
+  }
+
   // A truncating write would change every hard link of CHANGELOG.md, and git
   // checkout restores only this path, so a second link is refused.
   it("REFUSES a CHANGELOG.md with another hard link, in check and in promote, and changes nothing", () => {
@@ -846,7 +885,7 @@ describe("changelog fragments — render + promote (cli#449)", () => {
       chmodSync(dir, 0o555);
       try {
         expect(() => cf.promote("1.2.3", { date: "2022-01-02", dir, changelogPath })).toThrow(
-          /is written to CHANGELOG\.md, but 1 fragment\(s\) could not be deleted: fixed-a\.md \(EACCES\)/,
+          "promote: '## [1.2.3] — 2022-01-02' is written to CHANGELOG.md, but 1 fragment(s) could not be deleted: fixed-a.md (EACCES)",
         );
       } finally {
         chmodSync(dir, 0o755);
@@ -870,8 +909,7 @@ describe("changelog fragments — the migration (cli#449)", () => {
 
   // The migration moved every entry VERBATIM: no entry was edited, so `render`
   // must carry main's text unchanged (whitespace at its end aside). A new
-  // difference fails. That detects an entry changed or dropped; it does not prove
-  // every fact is preserved (a rewrite that removes no word would pass).
+  // difference fails. That detects an entry changed or dropped.
   it("render carries every pre-migration list entry unchanged (trailing whitespace aside)", () => {
     const rendered = ENTRIES(cf.assemble(migrated));
     expect(rendered.length).toBe(before.length);
@@ -969,6 +1007,7 @@ describe("changelog fragments — the CLI (cli#449)", () => {
     stageAll();
     const ok = run("promote", "1.2.3", "--date=2026-01-01");
     expect(ok.code, ok.out).toBe(0);
+    expect(ok.out).toContain("✓ promoted 1 entr(ies) into '## [1.2.3] — 2026-01-01'; removed 1 fragment(s).");
     expect(readFileSync(changelogPath, "utf8")).toContain("## [1.2.3] — 2026-01-01");
   });
 

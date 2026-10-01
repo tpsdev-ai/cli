@@ -51,6 +51,7 @@ import {
   constants,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -362,6 +363,34 @@ export function writeChangelog(changelogPath, text, read, { fstat = fstatBigint 
   }
 }
 
+// `.changelog` and `.changelog/unreleased` are used only as directories, never
+// through a symbolic link, for the reason CHANGELOG.md is a regular file:
+// promote's recovery, `git checkout -- CHANGELOG.md .changelog/unreleased`,
+// restores a tracked link, not the files it points at. `check` and `promote`
+// judge each by lstat before they read or delete anything. A missing one is
+// left to readFragments, which names it.
+export function fragmentDirsOrThrow(dir = FRAGMENT_DIR) {
+  for (const [path, rel] of [
+    [dirname(dir), dirname(FRAGMENT_DIR_REL)],
+    [dir, FRAGMENT_DIR_REL],
+  ]) {
+    let st;
+    try {
+      st = lstatSync(path);
+    } catch (err) {
+      if (err?.code === "ENOENT") return;
+      throw err;
+    }
+    if (st.isSymbolicLink()) {
+      throw new FragmentError(
+        `${rel} is a symbolic link; it must be a directory, so that git checkout -- CHANGELOG.md ` +
+          `${FRAGMENT_DIR_REL} can undo what promote changes. Replace the link with the directory itself; ` +
+          "nothing was changed.",
+      );
+    }
+  }
+}
+
 // Read every fragment in `dir`. Dotfiles are ignored (.DS_Store, .gitkeep);
 // README.md documents the convention and is not a fragment. EVERYTHING else is
 // parsed, and a file that will not parse throws — a fragment directory that
@@ -554,6 +583,7 @@ export function unreleasedNoteMismatch(loc) {
  * a test can point it at a temp dir + temp CHANGELOG.
  */
 export function check({ changelogPath = CHANGELOG_PATH, dir = FRAGMENT_DIR } = {}) {
+  fragmentDirsOrThrow(dir);
   const fragments = readFragments(dir);
   const section = assemble(fragments);
   const entries = countEntries(section);
@@ -614,6 +644,7 @@ export function promote(
       `promote: invalid --date '${date}'. Expected a real date as YYYY-MM-DD, e.g. 2026-09-29; nothing was written.`,
     );
   }
+  fragmentDirsOrThrow(dir);
   const fragments = readFragments(dir);
   if (fragments.length === 0) {
     throw new FragmentError(
@@ -669,7 +700,8 @@ export function promote(
   gitRestorableOrThrow({ changelogPath, dir, names: fragments.map((f) => f.name) });
 
   const day = date ?? new Date().toISOString().slice(0, 10);
-  const replacement = ["", UNRELEASED_NOTE, "", `## [${version}] — ${day}`, "", section, ""];
+  const sectionHeading = `## [${version}] — ${day}`;
+  const replacement = ["", UNRELEASED_NOTE, "", sectionHeading, "", section, ""];
   const next = [...lines.slice(0, loc.start + 1), ...replacement, ...lines.slice(loc.end)];
   // A failure part-way must say what state it left and how to recover: the
   // section is written first, and the fragments are deleted only after that.
@@ -694,7 +726,7 @@ export function promote(
   }
   if (left.length > 0) {
     throw new FragmentError(
-      `promote: '## [${version}] - ${day}' is written to CHANGELOG.md, but ${left.length} fragment(s) could ` +
+      `promote: '${sectionHeading}' is written to CHANGELOG.md, but ${left.length} fragment(s) could ` +
         `not be deleted: ${left.join(", ")}. They are already in that section: delete them before the next ` +
         `check or promote, or restore both (git checkout -- CHANGELOG.md ${FRAGMENT_DIR_REL}) and run promote again.`,
     );
@@ -878,7 +910,7 @@ if (isEntryPoint()) {
       const date = dates.length === 1 ? dates[0].slice("--date=".length) : undefined;
       const res = promote(version, { date });
       process.stdout.write(
-        `✓ promoted ${res.entries} entr(ies) into '## [${res.version}] - ${res.date}'; removed ${res.removed.length} fragment(s).\n`,
+        `✓ promoted ${res.entries} entr(ies) into '## [${res.version}] — ${res.date}'; removed ${res.removed.length} fragment(s).\n`,
       );
     } else {
       usageError(`unknown command '${cmd}'`);
