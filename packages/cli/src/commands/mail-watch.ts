@@ -70,10 +70,11 @@ export interface MailWatchOptions {
    */
   onPoll?: () => void | Promise<void>;
   /**
-   * Test seam: the record verifier. Defaults to `verifyRecordForMailbox`. A test
-   * that must control verification timing injects one.
+   * Test seam: awaited before each record's `verifyRecordForMailbox` call. It can
+   * delay that call but not replace it: its return value is ignored, and a throw
+   * withholds the record as a verification error does.
    */
-  verifyImpl?: typeof verifyRecordForMailbox;
+  beforeVerify?: () => Promise<void>;
   /**
    * Test seam: the fs.watch implementation. Defaults to node's `fs.watch`. A
    * test that must prove the POLL path alone passes a no-op here, so no fs
@@ -203,7 +204,6 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
   const inbox = getInbox(opts.agent);
-  const verifyRecord = opts.verifyImpl ?? verifyRecordForMailbox;
 
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
   // came from. Within ONE watcher instance an entry is dropped only when a scan
@@ -220,21 +220,25 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // as slots free.
   const pending: MailMessage[] = [];
   let checking = false;
-  // A trigger that arrives while a scan runs is coalesced into ONE pending
-  // rescan (a flag, not a queue), run when the current scan finishes.
+  // A processNew call while a scan is active sets ONE pending rescan (a flag,
+  // not a queue), run when that scan finishes.
   let rescan = false;
 
   const drain = () => {
     while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
       const msg = pending.shift();
       if (msg === undefined) break;
+      // The callback and the hook each get their own copy, so the callback
+      // cannot change what the hook receives.
+      const forCallback = structuredClone(msg);
+      const forHook = structuredClone(msg);
       activeHandlers++;
       (async () => {
         try {
-          if (opts.onMessage) await opts.onMessage(msg);
+          if (opts.onMessage) await opts.onMessage(forCallback);
         } catch { /* callback errors don't crash the watcher */ }
         try {
-          if (opts.hook) await runHook(opts.hook, msg);
+          if (opts.hook) await runHook(opts.hook, forHook);
         } catch { /* hook errors don't crash the watcher */ }
       })().finally(() => {
         activeHandlers--;
@@ -274,7 +278,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         let result: VerifyRecordResult;
         try {
-          result = await verifyRecord(opts.agent, record);
+          if (opts.beforeVerify) await opts.beforeVerify();
+          result = await verifyRecordForMailbox(opts.agent, record);
         } catch (err) {
           // A verification ERROR — Flair unreachable, or a malformed envelope
           // structure — is not a verdict. The record is withheld and logged, and
@@ -295,15 +300,15 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         // Skip a verified record whose id the consumed history holds. When that
-        // history cannot be read, withhold the record WITHOUT classifying it, so
-        // a later scan retries it.
+        // history cannot be read, withhold the record WITHOUT classifying it.
         let consumed: boolean;
         try {
           consumed = isConsumedForMailbox(opts.agent, envId);
         } catch (err) {
           console.error(
             `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
-              "it stays in new/ and is retried on the next scan. Remedy: make that path readable by this user.",
+              "the file is left untouched and is retried on the next scan if it remains in new/. " +
+              "Remedy: make that path readable by this user.",
           );
           continue;
         }

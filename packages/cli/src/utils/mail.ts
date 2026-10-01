@@ -1000,6 +1000,9 @@ export async function verifyRecordForMailbox(
   if (parsed === "missing-fields") {
     return { ok: false, class: "invalid", reason: "body is not a v1 signed envelope" };
   }
+  if (typeof parsed.body !== "string") {
+    return { ok: false, class: "invalid", reason: "envelope body is not a string" };
+  }
   const envelope = parsed as unknown as Envelope;
   const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, verify);
   if (!decision.ok) return { ok: false, class: decision.class, reason: decision.reason };

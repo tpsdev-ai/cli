@@ -12,7 +12,7 @@
  *  - dedup is on the verified envelope id while the file stays in new/ (two
  *    files with the same signed id present once); within one watcher instance a
  *    message is presented again only after a scan observes its file absent from
- *    new/, and a failed new/ listing keeps that state.
+ *    new/, and a new/ listing error other than ENOENT keeps that state.
  *  - concurrency limit: the default is 3 (the case below tests 2)
  *  - xmlEscape / buildPlist / daemon arg validation
  *
@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
 import { buildPlist, type MailWatcher, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
-import { getInbox, promote, sendMessage, type MailMessage, verifyRecordForMailbox } from "../src/utils/mail.js";
+import { getInbox, promote, sendMessage, type MailMessage } from "../src/utils/mail.js";
 import {
   buildSignedEnvelope,
   startStubFlair,
@@ -762,16 +762,15 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 15_000);
 
-  it("a trigger during an active scan rescans once, so two files in one burst are both presented without the poll", async () => {
+  it("a scan request that runs during an active scan rescans once, so two files in one burst are both presented without the poll", async () => {
     const bodies: string[] = [];
     let fsListener: (() => void) | null = null;
     let verifyCalls = 0;
     let openFirstScan: () => void = () => {};
     const firstScanGate = new Promise<void>((r) => { openFirstScan = r; });
-    const slowVerify: typeof verifyRecordForMailbox = async (agent, record) => {
+    const holdFirstVerify = async () => {
       verifyCalls++;
       if (verifyCalls === 1) await firstScanGate; // hold scan A open on file 1
-      return verifyRecordForMailbox(agent, record);
     };
 
     const watcher = watchMail({
@@ -779,7 +778,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       debounceMs: 10,
       pollMs: 60_000, // far above the test window: the poll cannot deliver
       watchImpl: (_dir, listener) => { fsListener = listener; return { close() {} }; },
-      verifyImpl: slowVerify,
+      beforeVerify: holdFirstVerify,
       onMessage: (msg) => { bodies.push(msg.body); },
     });
 
@@ -800,6 +799,130 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     expect(bodies.sort()).toEqual(["burst-1", "burst-2"]);
   }, 15_000);
+
+  it("the beforeVerify seam cannot supply a verdict: an unsigned record is not presented when the seam returns success", async () => {
+    const received: string[] = [];
+    const record = {
+      id: "seam-unsigned",
+      from: "flint",
+      to: AGENT,
+      body: "not signed",
+      timestamp: new Date().toISOString(),
+      read: false,
+    };
+    let seamCalls = 0;
+    // Returns a value shaped like a successful verification result.
+    const seamReturningSuccess = async () => {
+      seamCalls++;
+      return { ok: true, message: { ...record, envelopeId: "seam-supplied-id" } };
+    };
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      beforeVerify: seamReturningSuccess as unknown as () => Promise<void>,
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+    try {
+      await sleep(60);
+      writeRecord(record);
+      await waitFor(() => seamCalls >= 1, 5000);
+      await sleep(200);
+    } finally {
+      watcher.stop();
+    }
+    expect(seamCalls).toBeGreaterThanOrEqual(1);
+    expect(received).toEqual([]);
+  }, 10_000);
+
+  it("a callback that changes its message does not change what the hook receives", async () => {
+    const out = join(tempRoot, "snapshot-hook.txt");
+    const envOut = join(tempRoot, "snapshot-env.json");
+    let callbacks = 0;
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: NO_FS_EVENTS,
+      hook: hookCapturing(out, envOut),
+      onMessage: (msg) => {
+        callbacks++;
+        msg.body = "changed by the callback";
+        msg.id = "changed-id";
+        msg.from = "changed-from";
+        msg.to = "changed-to";
+        msg.timestamp = "changed-timestamp";
+      },
+    });
+    let env: ReturnType<typeof buildSignedEnvelope>;
+    try {
+      await sleep(60);
+      env = deliverSigned("the hook sees the verified body");
+      await waitFor(() => {
+        try {
+          JSON.parse(readFileSync(envOut, "utf-8"));
+          return true;
+        } catch {
+          return false;
+        }
+      }, 5000);
+    } finally {
+      watcher.stop();
+    }
+    expect(callbacks).toBe(1);
+    expect(readFileSync(out, "utf-8")).toBe("the hook sees the verified body");
+    expect(JSON.parse(readFileSync(envOut, "utf-8"))).toEqual({
+      id: env.messageId,
+      from: "flint",
+      to: AGENT,
+      timestamp: env.timestamp,
+    });
+  }, 10_000);
+
+  it("a correctly signed envelope whose body is not a string is refused, and reaches neither onMessage nor the hook", async () => {
+    const received: unknown[] = [];
+    const out = join(tempRoot, "object-body-hook.txt");
+    // Records that it ran, without reading stdin.
+    const hook = {
+      args: [process.execPath, "-e", 'require("fs").writeFileSync(process.env.HOOK_OUT, "ran")'],
+      env: { HOOK_OUT: out },
+    };
+    const env = buildSignedEnvelope("flint", AGENT, { text: "an object body" } as unknown as string, SEEDS);
+    const refusal = "not presented (invalid: envelope body is not a string)";
+    const log = captureErrors();
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        watchImpl: NO_FS_EVENTS,
+        hook,
+        onMessage: (msg) => { received.push(msg.body); },
+      });
+      await sleep(60);
+      sendMessage(AGENT, JSON.stringify(env), "flint");
+      await waitFor(() => log.lines.some((l) => l.includes(refusal)) || received.length > 0, 5000);
+      await sleep(200);
+    } finally {
+      watcher?.stop();
+      log.restore();
+    }
+    expect(received).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
+    expect(log.lines.some((l) => l.includes(refusal))).toBe(true);
+
+    // promote() runs the same check.
+    const inbox = getInbox(AGENT);
+    const [file] = jsonFiles(inbox.fresh);
+    const promoted = await promote(AGENT, join(inbox.fresh, file!));
+    expect(promoted.ok).toBe(false);
+    if (!promoted.ok) {
+      expect(promoted.class).toBe("invalid");
+      expect(promoted.reason).toBe("envelope body is not a string");
+    }
+  }, 10_000);
 });
 
 // ---------------------------------------------------------------------------
