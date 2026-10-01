@@ -932,8 +932,8 @@ describe("changelog fragments — the migration (cli#449)", () => {
 });
 
 describe("changelog fragments — the live directory (release-safe)", () => {
-  // No count is asserted here: every change adds a fragment and every release
-  // empties the directory, and an empty directory passes both assertions.
+  // No count is asserted here: the number of fragments changes with every PR and
+  // release, and an empty directory passes both assertions.
   it("the live fragment directory passes `check`, and no entry renders twice", () => {
     const res = cf.check();
     expect(res.fragments).toBe(res.entries);
