@@ -645,8 +645,8 @@ export async function publishRuntimePresence(
 
 /**
  * Start the runtime's Presence heartbeat: ONE beat at startup, then one every
- * `intervalMs`, on the timer's own schedule — independent of the task/mail loop,
- * so a long task cannot starve it. Returns a stop function that clears the timer.
+ * `intervalMs`, on the timer's own schedule. Returns a stop function that clears
+ * the timer.
  */
 export function startPresenceHeartbeat(
   client: Pick<FlairClient, "presence">,

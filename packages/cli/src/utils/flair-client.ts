@@ -204,8 +204,8 @@ export class FlairClient {
 
   /**
    * POST /Presence — the agent's OWN presence heartbeat, signed with `this`
-   * agent's Ed25519 key (Flair keys the record by the signature's agentId and
-   * rejects a cross-agent write). `activity` is optional. cli#444: the codex
+   * agent's Ed25519 key (Flair keys the record by the signature's agentId).
+   * `activity` is optional. cli#444: the codex
    * runtime records liveness HERE, never by writing `Agent.status` (that field is
    * the principal's lifecycle state).
    */

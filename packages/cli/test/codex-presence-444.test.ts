@@ -3,7 +3,7 @@
 // principal's lifecycle state, so a value other than `active` deactivates the
 // agent.
 //
-// The first tests call the Presence helpers directly. The last two drive the
+// The last two tests drive the
 // REAL `runCodexRuntime` — startup, a mail tick, and a delivered SIGTERM/SIGINT
 // — with the Flair client's `fetch` recorded, so an Agent write at the runtime's
 // startup site or signal handler makes them fail.
