@@ -7,6 +7,10 @@ All notable changes to the TPS CLI are recorded here.
 ### Removed
 
 - **The unused root CLI tree (root `src/`, `bin/tps.ts`, `scripts/stall-monitor.ts`) is deleted; the CLI lives in `packages/cli` (Closes #379).**
+
+### Fixed
+
+- **The codex runtime records liveness on Flair's Presence resource instead of writing `Agent.status` (Closes #444).** `Agent.status` is the principal's lifecycle state, so the shutdown write of `"offline"` deactivated the agent — its requests were refused with `401 principal_deactivated`, and the matching `"online"` write could never succeed. The runtime now POSTs `/Presence` with the agent's own credential on each heartbeat and on shutdown (a final `activity: "idle"` beat); Flair derives `offline` from heartbeat age. A Presence failure only logs and never falls back to the Agent row.
 ## [0.8.0] — 2026-09-30
 
 **Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.

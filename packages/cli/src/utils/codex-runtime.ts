@@ -5,32 +5,32 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import {
-  readFileSync, existsSync, writeFileSync, appendFileSync, createWriteStream,
+import {appendFileSync, createWriteStream,existsSync, 
+  readFileSync, writeFileSync, 
 } from "node:fs";
-import { basename, join } from "node:path";
 import { homedir } from "node:os";
-import { FlairClient } from "./flair-client.js";
-import {
-  snapshotSoulToDisk,
-  bootContext,
-  searchPastExperience,
-  writeTaskMemory,
-  catchUpTopics,
-  onBoot,
-  onTaskStart,
-  onTaskComplete,
-  onTaskFailure,
-} from "./agent-lifecycle.js";
+import { basename, join } from "node:path";
 import {
   refreshOpenAIToken,
   type StoredCredentials,
 } from "../commands/auth.js";
-import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
+import {
+  bootContext,
+  catchUpTopics,
+  onBoot,
+  onTaskComplete,
+  onTaskFailure,
+  onTaskStart,
+  searchPastExperience,
+  snapshotSoulToDisk,
+  writeTaskMemory,
+} from "./agent-lifecycle.js";
+import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
 import { handlePrOpened } from "./pr-review-trigger.js";
+import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
 import { formatTaskCompleteMailBody } from "./task-result-mail.js";
-import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
+import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 
 /** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
 const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
@@ -195,7 +195,7 @@ async function runCodex(
     proc.stdin.write(prompt);
     proc.stdin.end();
 
-    let resultMessages: string[] = [];
+    const resultMessages: string[] = [];
     let turnCount = 0;
     let stderr = "";
     let buf = "";
@@ -609,6 +609,37 @@ async function _runAutoCommitLegacy(
 }
 
 
+/**
+ * Publish ONE presence heartbeat for the agent on Flair's Presence resource,
+ * signed with the agent's own Ed25519 credential. cli#444: liveness is recorded
+ * HERE, never by writing the agent's `Agent.status` — in Flair that field is the
+ * principal's lifecycle state, so an `"offline"` write deactivates the agent and
+ * the matching `"online"` write can never succeed. Flair derives `offline` from
+ * heartbeat age; this beat refreshes it. A failure only LOGS (never throws) and
+ * never falls back to touching `/Agent`.
+ */
+export async function publishRuntimePresence(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+  activity?: PresenceActivity,
+): Promise<void> {
+  try {
+    await client.presence(activity);
+  } catch (e: any) {
+    console.warn(`[${agentId}] presence heartbeat failed: ${e?.message ?? String(e)}`);
+  }
+}
+
+/** The runtime's shutdown presence beat: ONE final Presence beat, activity
+ *  `"idle"` (flair derives `offline` from heartbeat age — never a status
+ *  write). The signal handlers run this. */
+export function runtimeShutdownBeat(
+  client: Pick<FlairClient, "presence">,
+  agentId: string,
+): Promise<void> {
+  return publishRuntimePresence(client, agentId, "idle");
+}
+
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
@@ -627,9 +658,12 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     catch (e: any) { console.warn(`[${agentId}] outbound mail to ${to} failed: ${e.message}`); }
   };
 
-  // Mark offline on clean shutdown
+  // cli#444: liveness goes to Flair's Presence resource, never to the agent's
+  // Agent row — `Agent.status` is the principal's lifecycle state, so an
+  // "offline" write DEACTIVATES the agent and its requests are refused with
+  // `401 principal_deactivated`. Flair derives `offline` from heartbeat age.
   const markOffline = () => {
-    try { (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "offline" }).catch(() => {}); } catch {}
+    void runtimeShutdownBeat(flair, agentId);
   };
   process.once("SIGINT", () => { markOffline(); process.exit(0); });
   process.once("SIGTERM", () => { markOffline(); process.exit(0); });
@@ -764,11 +798,10 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       await snapshotSoulToDisk(flair, agentId);
       lastSnapshot = Date.now();
     }
-    // Publish heartbeat to Flair (update agent status + OrgEvent)
+    // Publish a Presence heartbeat to Flair (cli#444): a pure-liveness beat on
+    // Flair's OWN liveness surface, on the first tick (start) and every 5min.
     if (Date.now() - lastHeartbeat > HEARTBEAT_INTERVAL_MS) {
-      try {
-        await (flair as any).request("PATCH", `/Agent/${agentId}`, { status: "online", lastSeen: new Date().toISOString() });
-      } catch { /* non-fatal */ }
+      await publishRuntimePresence(flair, agentId);
       lastHeartbeat = Date.now();
     }
 

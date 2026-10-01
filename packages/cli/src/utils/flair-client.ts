@@ -4,7 +4,7 @@
  * Auth protocol: TPS-Ed25519 <agentId>:<timestamp>:<nonce>:<signatureBase64>
  * Signature payload: agentId:timestamp:nonce:METHOD:/path?query
  */
-import { sign as ed25519Sign, createPrivateKey, randomUUID } from "node:crypto";
+import { createPrivateKey, sign as ed25519Sign, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -127,6 +127,10 @@ export interface SkillScanResult {
   riskLevel: "low" | "medium" | "high" | "critical";
 }
 
+/** The activity vocabulary Flair's Presence contract accepts
+ *  (flair `resources/Presence.ts:42`; `post()` validates it at `:544`). */
+export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -197,6 +201,23 @@ export class FlairClient {
     }
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
+  }
+
+  /**
+   * POST /Presence — the agent's OWN presence heartbeat, signed with `this`
+   * agent's Ed25519 key (Flair keys the record by the signature's agentId and
+   * rejects a cross-agent write). `activity` is optional: a beat with neither
+   * activity nor currentTask is a pure-liveness heartbeat that refreshes
+   * `lastHeartbeatAt` and leaves the prior activity alone (flair
+   * `resources/Presence.ts`, `buildPresenceRecord`). cli#444: runtimes record
+   * liveness HERE, never by writing `Agent.status` (that field is the
+   * principal's lifecycle state).
+   */
+  async presence(activity?: PresenceActivity, currentTask?: string): Promise<void> {
+    await this.request("POST", "/Presence", {
+      ...(activity !== undefined ? { activity } : {}),
+      ...(currentTask !== undefined ? { currentTask } : {}),
+    });
   }
 
   /**
