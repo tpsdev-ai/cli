@@ -134,7 +134,7 @@ tps identity show --agent ember  # Show agent identity
 
 ### Flair (Memory & Soul)
 
-[Flair](https://github.com/tpsdev-ai/flair) is the persistence layer.
+[Flair](https://github.com/tpsdev-ai/flair) is optional.
 
 ```bash
 tps flair status               # Check Flair health

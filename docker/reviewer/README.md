@@ -10,9 +10,8 @@ linux/amd64 only (the reviewer VMs are x86_64).
 ## What `review-build-ok` means
 
 `review-build-ok` is **advisory evidence for the reviewer, not a merge gate**.
-How well a review build predicts CI is best effort: the launcher refuses workflow
-features it cannot reproduce faithfully, and the fidelity limits that remain are
-listed under [Known limits](#known-limits).
+How well a review build predicts CI is best effort; the fidelity limits are listed
+under [Known limits](#known-limits).
 
 ## Pieces
 
