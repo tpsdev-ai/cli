@@ -1,43 +1,45 @@
 /**
- * mail-watch tests — OPS-121
+ * mail-watch tests — OPS-121 + cli#375 (verified-only delivery)
  *
  * Tests cover:
  *  - validateAgentId: valid and invalid patterns
- *  - watchMail: event-driven (fs.watch), detects new messages, ENOENT safety, dedup
- *  - exec hook: args[] array, no shell interpolation, env injection
+ *  - watchMail: the hook/onMessage receive ONLY verified mail (a real signed
+ *    envelope through a stub Flair), on the fs-event path AND the poll path; an
+ *    unsigned record never arrives and dead-letters to dlq/
+ *  - exec hook: args[] array, no shell interpolation, env injection, verified
+ *    body on stdin
  *  - concurrency limit: max 3 concurrent handlers
  *  - watcher.stop(): cleans up fs.watch
+ *  - xmlEscape / buildPlist / daemon arg validation
+ *
+ * watchMail() now reads mail only through checkMessages(), which constructs its
+ * Flair client unconditionally. These tests stand up a stub Flair and point
+ * FLAIR_URL/FLAIR_KEY_PATH at it, so the real verification path runs.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync, renameSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
+import { buildPlist, validateAgentId, watchMail, xmlEscape } from "../src/commands/mail-watch.js";
+import { sendMessage, getInbox } from "../src/utils/mail.js";
+import {
+  buildSignedEnvelope,
+  startStubFlair,
+  writeKeyFile,
+  type StubFlair,
+} from "./helpers/stub-flair.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const AGENT = "kern";
+const FLINT_SEED = Buffer.alloc(32, 0x11);
+const KERN_SEED = Buffer.alloc(32, 0x22);
+const SEEDS = { flint: FLINT_SEED, kern: KERN_SEED };
 
-function makeInbox(base: string, agent: string) {
-  const root = join(base, ".tps", "mail", agent);
-  const fresh = join(root, "new");
-  const cur = join(root, "cur");
-  const tmp = join(root, "tmp");
-  const dlq = join(root, "dlq");
-  for (const d of [fresh, cur, tmp, dlq]) mkdirSync(d, { recursive: true });
-  return { root, fresh, cur };
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
-
-function writeMsg(dir: string, id: string, from: string, to: string, body: string) {
-  const msg = { id, from, to, body, timestamp: new Date().toISOString(), read: false };
-  writeFileSync(join(dir, `${id}.json`), JSON.stringify(msg));
-  return msg;
-}
-
-function sleep(ms: number) { return new Promise((r) => setTimeout(r, ms)); }
 
 // ---------------------------------------------------------------------------
 // validateAgentId
@@ -57,209 +59,6 @@ describe("validateAgentId", () => {
     expect(() => validateAgentId("agent name")).toThrow(/Invalid agent ID/);
     expect(() => validateAgentId("agent$PWD")).toThrow(/Invalid agent ID/);
     expect(() => validateAgentId("")).toThrow(/Invalid agent ID/);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// watchMail — fs.watch event-driven
-// ---------------------------------------------------------------------------
-
-describe("watchMail (fs.watch)", () => {
-  let tmp = "";
-  let origHome: string | undefined;
-
-  beforeEach(() => {
-    tmp = join(tmpdir(), `mail-watch-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    origHome = process.env.HOME;
-    process.env.HOME = tmp;
-  });
-
-  afterEach(() => {
-    process.env.HOME = origHome;
-    rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("fires onMessage when a new file is written", async () => {
-    const { fresh } = makeInbox(tmp, "test-agent");
-    const received: string[] = [];
-
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-
-    await sleep(30); // let watcher init and pre-populate seen
-    writeMsg(fresh, "msg-001", "sender", "test-agent", "hello world");
-    await sleep(150); // wait for fs event + debounce
-
-    watcher.stop();
-    expect(received).toContain("msg-001");
-  });
-
-  it("delivers pre-existing undelivered messages waiting in new/ at startup", async () => {
-    // new/ holds UNDELIVERED mail — the exec hook moves delivered mail to cur/
-    // on ack. So a (re)started watcher MUST deliver whatever is already waiting:
-    // this is the recovery path that lets a kickstart drain mail stranded by an
-    // fs.watch stall, instead of marking it seen and forcing a re-dispatch.
-    const { fresh } = makeInbox(tmp, "test-agent");
-    writeMsg(fresh, "waiting-msg", "sender", "test-agent", "stranded before watch start");
-
-    const received: string[] = [];
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-
-    await sleep(150);
-    watcher.stop();
-    expect(received).toContain("waiting-msg");
-  });
-
-  it("does not deliver the same message twice (dedup via seen set)", async () => {
-    const { fresh } = makeInbox(tmp, "test-agent");
-    const received: string[] = [];
-
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-
-    await sleep(30);
-    writeMsg(fresh, "dedup-msg", "sender", "test-agent", "once");
-    await sleep(200); // two debounce windows
-
-    watcher.stop();
-    expect(received.filter((id) => id === "dedup-msg")).toHaveLength(1);
-  });
-
-  it("fires onPoll once at startup and on each poll cycle (liveness heartbeat, ops-i3vw)", async () => {
-    makeInbox(tmp, "test-agent");
-    let beats = 0;
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      pollMs: 40, // fast poll for the test
-      onPoll: () => { beats++; },
-    });
-
-    await sleep(150); // startup beat + ~3 poll cycles at 40ms
-    watcher.stop();
-    // At least the startup beat plus a couple poll beats.
-    expect(beats).toBeGreaterThanOrEqual(2);
-  });
-
-  it("a throwing onPoll never crashes the watcher (heartbeat failure is swallowed)", async () => {
-    const { fresh } = makeInbox(tmp, "test-agent");
-    const received: string[] = [];
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      pollMs: 40,
-      onPoll: () => { throw new Error("simulated heartbeat failure"); },
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-
-    await sleep(60);
-    // Mail delivery must still work despite a throwing heartbeat.
-    writeMsg(fresh, "after-bad-beat", "sender", "test-agent", "still alive");
-    await sleep(150);
-    watcher.stop();
-    expect(received).toContain("after-bad-beat");
-  });
-
-  it("handles ENOENT gracefully when file is moved before read", async () => {
-    const { fresh, cur } = makeInbox(tmp, "test-agent");
-
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      onMessage: () => { /* ignore */ },
-    });
-
-    await sleep(30);
-    writeMsg(fresh, "race-msg", "sender", "test-agent", "body");
-    // Immediately move to cur/ before the debounce fires
-    try {
-      renameSync(join(fresh, "race-msg.json"), join(cur, "race-msg.json"));
-    } catch { /* already moved */ }
-    await sleep(150); // should not throw
-
-    watcher.stop();
-    expect(true).toBe(true); // no throw = pass
-  });
-
-  it("stop() prevents further callbacks after stopping", async () => {
-    const { fresh } = makeInbox(tmp, "test-agent");
-    const received: string[] = [];
-
-    const watcher = watchMail({
-      agent: "test-agent",
-      debounceMs: 20,
-      onMessage: (msg) => { received.push(msg.id); },
-    });
-
-    await sleep(30);
-    watcher.stop();
-    writeMsg(fresh, "post-stop", "sender", "test-agent", "should not arrive");
-    await sleep(150);
-
-    expect(received).not.toContain("post-stop");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Concurrency limit
-// ---------------------------------------------------------------------------
-
-describe("watchMail concurrency", () => {
-  let tmp = "";
-  let origHome: string | undefined;
-
-  beforeEach(() => {
-    tmp = join(tmpdir(), `mail-watch-conc-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    origHome = process.env.HOME;
-    process.env.HOME = tmp;
-  });
-
-  afterEach(() => {
-    process.env.HOME = origHome;
-    rmSync(tmp, { recursive: true, force: true });
-  });
-
-  it("respects maxConcurrent=2 and still delivers every message (over-cap mail is retried)", async () => {
-    const { fresh } = makeInbox(tmp, "conc-agent");
-    let active = 0;
-    let maxSeen = 0;
-    const received: string[] = [];
-
-    const watcher = watchMail({
-      agent: "conc-agent",
-      debounceMs: 20,
-      maxConcurrent: 2,
-      onMessage: async (msg) => {
-        active++;
-        maxSeen = Math.max(maxSeen, active);
-        await sleep(60);
-        received.push(msg.id);
-        active--;
-      },
-    });
-
-    await sleep(30);
-    // Write 5 messages — all arrive in a single debounce window, over the cap.
-    for (let i = 0; i < 5; i++) {
-      writeMsg(fresh, `m${i}`, "s", "conc-agent", `body${i}`);
-    }
-    await sleep(500);
-    watcher.stop();
-
-    expect(maxSeen).toBeLessThanOrEqual(2);
-    // All 5 must be delivered: mail over the cap is left UNSEEN and retried as
-    // slots free (the old code marked it seen then dropped it → lost forever).
-    expect(received.sort()).toEqual(["m0", "m1", "m2", "m3", "m4"]);
   });
 });
 
@@ -298,7 +97,6 @@ describe("buildPlist", () => {
   it("sets ProcessType=Background so macOS does not idle-reap the watcher", () => {
     const xml = buildPlist("test-agent", "/usr/local/bin/tps.js", []);
     expect(xml).toContain("<key>ProcessType</key>");
-    // The <string> follows the <key> on the next line — assert the pairing.
     expect(xml).toMatch(/<key>ProcessType<\/key>\s*<string>Background<\/string>/);
   });
 
@@ -324,12 +122,302 @@ describe("buildPlist", () => {
     const tmpFile = join(tmpdir(), `buildplist-lint-${Date.now()}.plist`);
     writeFileSync(tmpFile, xml);
     try {
-      // Throws (non-zero exit) if the plist is malformed.
       const out = execFileSync("plutil", ["-lint", tmpFile], { encoding: "utf-8" });
       expect(out).toContain("OK");
     } finally {
       rmSync(tmpFile, { force: true });
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// watchMail — only VERIFIED mail reaches the hook / onMessage (cli#375)
+// ---------------------------------------------------------------------------
+
+/** Reads stdin to the file named by HOOK_OUT; proves the hook's stdin payload. */
+const HOOK_SCRIPT =
+  'const fs=require("fs");let d="";process.stdin.setEncoding("utf8");process.stdin.on("data",(c)=>{d+=c;});process.stdin.on("end",()=>{fs.writeFileSync(process.env.HOOK_OUT,d);});';
+
+describe("watchMail (verified-only delivery)", () => {
+  let tempRoot = "";
+  let keysDir = "";
+  let stub: StubFlair;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-verified-"));
+    keysDir = join(tempRoot, "keys");
+    stub = startStubFlair(SEEDS);
+    writeKeyFile(keysDir, AGENT, KERN_SEED);
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+
+    savedEnv = {};
+    for (const k of ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_AGENT_ID"]) {
+      savedEnv[k] = process.env[k];
+    }
+    process.env.HOME = tempRoot;
+    process.env.TPS_MAIL_DIR = join(tempRoot, "mail");
+    process.env.FLAIR_URL = stub.url;
+    process.env.FLAIR_KEY_PATH = join(keysDir, `${AGENT}.key`);
+  });
+
+  afterEach(() => {
+    stub.stop();
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  /** Deliver a real SIGNED envelope into the agent's new/. */
+  function deliverSigned(body: string, from = "flint", to = AGENT): void {
+    const env = buildSignedEnvelope(from, to, body, SEEDS);
+    sendMessage(to, JSON.stringify(env), from);
+  }
+
+  /** Drop an UNSIGNED record straight into new/ (no envelope). */
+  function deliverUnsigned(body: string, id: string): void {
+    const inbox = getInbox(AGENT);
+    writeFileSync(
+      join(inbox.fresh, `${id}.json`),
+      JSON.stringify({ id, from: "flint", to: AGENT, body, timestamp: new Date().toISOString(), read: false }),
+    );
+  }
+
+  function hookCapturing(outFile: string) {
+    return {
+      args: [process.execPath, "-e", HOOK_SCRIPT],
+      env: { HOOK_OUT: outFile },
+    };
+  }
+
+  function dlqFiles(): string[] {
+    const dlq = getInbox(AGENT).dlq;
+    return existsSync(dlq) ? readdirSync(dlq).filter((f) => f.endsWith(".json")) : [];
+  }
+
+  it("event path: a signed record reaches the hook, its verified body byte-identical on stdin", async () => {
+    const out = join(tempRoot, "hook-out.txt");
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      hook: hookCapturing(out),
+    });
+
+    await sleep(50); // watcher up
+    const body = "hello — verified ✅\nsecond line";
+    deliverSigned(body);
+    await sleep(500);
+    watcher.stop();
+
+    expect(existsSync(out), "the hook ran").toBe(true);
+    expect(readFileSync(out, "utf-8")).toBe(body); // byte-identical, plaintext
+    expect(dlqFiles()).toEqual([]);
+  });
+
+  it("event path: an unsigned record never reaches the hook and dead-letters to dlq/", async () => {
+    const out = join(tempRoot, "hook-out.txt");
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      hook: hookCapturing(out),
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+
+    await sleep(50);
+    deliverUnsigned("unsigned body", "unsigned-event");
+    await sleep(500);
+    watcher.stop();
+
+    expect(received).toEqual([]); // never reached onMessage
+    expect(existsSync(out)).toBe(false); // the hook never ran
+    expect(dlqFiles()).toContain("unsigned-event.json"); // dead-lettered
+  });
+
+  it("poll path (startup recovery): a signed record already in new/ is delivered", async () => {
+    const received: string[] = [];
+    deliverSigned("already waiting");
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+
+    await sleep(400);
+    watcher.stop();
+    expect(received).toContain("already waiting");
+  });
+
+  it("poll path: an unsigned record already in new/ dead-letters and is never delivered", async () => {
+    const received: string[] = [];
+    deliverUnsigned("not signed", "unsigned-poll");
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+
+    await sleep(400);
+    watcher.stop();
+    expect(received).toEqual([]);
+    expect(dlqFiles()).toContain("unsigned-poll.json");
+  });
+
+  it("verifier unavailable: the hook does not run, then a later poll delivers once verification succeeds", async () => {
+    const out = join(tempRoot, "hook-out.txt");
+    const received: string[] = [];
+    process.env.FLAIR_URL = "http://127.0.0.1:1"; // nothing listening
+    deliverSigned("delivered after recovery");
+
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 40,
+      hook: hookCapturing(out),
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+
+    await sleep(250);
+    expect(received, "nothing delivered while verification was unavailable").toEqual([]);
+    expect(existsSync(out)).toBe(false);
+
+    // Verification comes back; the next poll re-drives the retryable quarantine.
+    process.env.FLAIR_URL = stub.url;
+    await sleep(600);
+    watcher.stop();
+    expect(received).toContain("delivered after recovery");
+    expect(readFileSync(out, "utf-8")).toBe("delivered after recovery");
+  });
+
+  it("delivers a promoted record once (seen keyed on message id), across fs events and polls", async () => {
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 40,
+      onMessage: (msg) => { received.push(msg.id); },
+    });
+
+    await sleep(50);
+    deliverSigned("once only");
+    await sleep(500); // several poll cycles + the fs event
+    watcher.stop();
+
+    expect(received).toHaveLength(1);
+  });
+
+  it("stop() prevents further callbacks after stopping", async () => {
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+
+    await sleep(50);
+    watcher.stop();
+    deliverSigned("after stop");
+    await sleep(300);
+
+    expect(received).toEqual([]);
+  });
+
+  it("fires onPoll once at startup and on each poll cycle (liveness heartbeat, ops-i3vw)", async () => {
+    let beats = 0;
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 40,
+      onPoll: () => { beats++; },
+    });
+
+    await sleep(150);
+    watcher.stop();
+    expect(beats).toBeGreaterThanOrEqual(2);
+  });
+
+  it("a throwing onPoll never crashes the watcher (heartbeat failure is swallowed)", async () => {
+    const received: string[] = [];
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: 40,
+      onPoll: () => { throw new Error("simulated heartbeat failure"); },
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+
+    await sleep(60);
+    deliverSigned("still alive");
+    await sleep(400);
+    watcher.stop();
+    expect(received).toContain("still alive");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Concurrency limit
+// ---------------------------------------------------------------------------
+
+describe("watchMail concurrency", () => {
+  let tempRoot = "";
+  let keysDir = "";
+  let stub: StubFlair;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(() => {
+    tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-conc-"));
+    keysDir = join(tempRoot, "keys");
+    stub = startStubFlair(SEEDS);
+    writeKeyFile(keysDir, AGENT, KERN_SEED);
+    writeKeyFile(keysDir, "flint", FLINT_SEED);
+    savedEnv = {};
+    for (const k of ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH"]) savedEnv[k] = process.env[k];
+    process.env.HOME = tempRoot;
+    process.env.TPS_MAIL_DIR = join(tempRoot, "mail");
+    process.env.FLAIR_URL = stub.url;
+    process.env.FLAIR_KEY_PATH = join(keysDir, `${AGENT}.key`);
+  });
+
+  afterEach(() => {
+    stub.stop();
+    for (const [k, v] of Object.entries(savedEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    rmSync(tempRoot, { recursive: true, force: true });
+  });
+
+  it("respects maxConcurrent=2 and still delivers every verified message (over-cap mail is queued)", async () => {
+    let active = 0;
+    let maxSeen = 0;
+    const received: string[] = [];
+
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      maxConcurrent: 2,
+      onMessage: async (msg) => {
+        active++;
+        maxSeen = Math.max(maxSeen, active);
+        await sleep(60);
+        received.push(msg.body);
+        active--;
+      },
+    });
+
+    await sleep(50);
+    // 5 signed messages arrive in one window — over the cap.
+    for (let i = 0; i < 5; i++) {
+      const env = buildSignedEnvelope("flint", AGENT, `body${i}`, SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), "flint");
+    }
+    await sleep(1000);
+    watcher.stop();
+
+    expect(maxSeen).toBeLessThanOrEqual(2);
+    expect(received.sort()).toEqual(["body0", "body1", "body2", "body3", "body4"]);
   });
 });
 

@@ -10,17 +10,31 @@
  * Security mitigations (K&S):
  * - exec hooks use args[] array, no shell interpolation
  * - agent IDs validated: ^[a-zA-Z0-9._-]+$
- * - ENOENT grace on metadata read (file may move to cur/ before read)
  * - max 3 concurrent handlers
+ *
+ * Verification (cli#375): the hook and onMessage get ONLY verified mail. On
+ * every fs event and poll, watchMail calls checkMessages(agent) — the
+ * mailbox's ONE enforcement point — which promotes new/ → cur/ (verifying the
+ * signed envelope), re-drives retryable dlq/ entries and lease-sweeps cur/,
+ * and hands those verified records to onMessage and the --exec hook. An
+ * unsigned or tampered record never reaches either: it dead-letters to dlq/.
+ *
+ * Hook contract:
+ * - the VERIFIED body arrives on the hook's stdin (the signed plaintext,
+ *   byte-identical);
+ * - TPS_MAIL_ID (with TPS_MAIL_FROM / TPS_MAIL_TO / TPS_MAIL_TIMESTAMP) is set
+ *   in the hook's environment; TPS_MAIL_ID is the ack key;
+ * - the hook acks by running `tps mail ack $TPS_MAIL_ID`; an unacked record
+ *   stays checked out in cur/ and the mailbox re-presents it after its lease.
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, watch as fsWatch, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { homedir, platform } from "node:os";
 import { execSync, spawn } from "node:child_process";
+import { existsSync, watch as fsWatch, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, platform } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getInbox } from "../utils/mail.js";
 import type { MailMessage } from "../utils/mail.js";
+import { checkMessages, getInbox } from "../utils/mail.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
@@ -73,35 +87,13 @@ export function validateAgentId(agentId: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Message reading (ENOENT-safe)
+// Message reading — through the ONE enforcement point (cli#375)
 // ---------------------------------------------------------------------------
-
-function readMessageSafe(filePath: string): MailMessage | null {
-  try {
-    const raw = readFileSync(filePath, "utf-8");
-    return JSON.parse(raw) as MailMessage;
-  } catch (err: unknown) {
-    // ENOENT: file moved to cur/ between readdir and read — expected race
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
-    // JSON parse error: corrupt file — log and skip instead of crashing
-    if (err instanceof SyntaxError) {
-      console.error(`[mail-watch] skipping corrupt message ${filePath}: ${err.message}`);
-      return null;
-    }
-    throw err;
-  }
-}
-
-function listNewFiles(freshDir: string): string[] {
-  if (!existsSync(freshDir)) return [];
-  try {
-    return readdirSync(freshDir)
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => join(freshDir, f));
-  } catch {
-    return [];
-  }
-}
+//
+// new/ is NEVER handed to a hook: watchMail reads mail only through
+// checkMessages(), which promotes (verifying the signed envelope) and returns
+// the verified records. There is no raw-file reader here on purpose — a
+// by-path reader is exactly how a hook could be driven by an unverified body.
 
 // ---------------------------------------------------------------------------
 // Exec hook runner
@@ -160,25 +152,18 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
   const inbox = getInbox(opts.agent);
 
-  // NOTE: we intentionally do NOT pre-populate `seen` with files already in
-  // new/. new/ holds UNDELIVERED mail — the exec hook moves delivered mail to
-  // cur/ on ack — so anything present at (re)start must be delivered. Marking
-  // it seen on boot is what made a mail-watch kickstart silently strand stuck
-  // dispatches (and forced re-dispatches, which double-posted K&S reviews).
-  const processNew = async () => {
-    if (stopped) return;
-    for (const filePath of listNewFiles(inbox.fresh)) {
-      if (seen.has(filePath)) continue;
-      // Check the concurrency cap BEFORE marking seen. If we're at the limit,
-      // leave the file UNSEEN so the next pass (poll or fs event) retries it.
-      // The old order marked it seen and THEN dropped it → never delivered.
-      if (activeHandlers >= maxConcurrent) continue;
-      seen.add(filePath);
+  // Verified mail waiting for a free slot. checkMessages() can return several
+  // records at once; the cap must hold WITHOUT dropping the rest, so over-cap
+  // records wait here and are delivered as slots free (the alternative —
+  // leaving them in cur/ — would defer them to a lease re-present 30 min out).
+  const pending: MailMessage[] = [];
+  let checking = false;
 
-      const msg = readMessageSafe(filePath);
-      if (!msg) continue; // moved to cur/ before we could read — skip
+  const drain = () => {
+    while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
+      const msg = pending.shift();
+      if (msg === undefined) break;
       activeHandlers++;
-
       (async () => {
         try {
           if (opts.onMessage) await opts.onMessage(msg);
@@ -188,11 +173,34 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         } catch { /* hook errors don't crash the watcher */ }
       })().finally(() => {
         activeHandlers--;
-        // A slot just freed — immediately re-check for mail that was over the
-        // concurrency cap on a prior pass, so a burst drains as slots cycle
-        // instead of waiting for the next fs event or poll.
-        if (!stopped) void processNew();
+        // A slot just freed — deliver the next queued record (or re-check new/).
+        if (!stopped) drain();
       });
+    }
+  };
+
+  // Promote through the ONE enforcement point and hand ONLY the verified
+  // records to the hook/callback. An unsigned or tampered record never appears
+  // in the returned list — checkMessages dead-letters it to dlq/. `seen` is
+  // keyed on the message id (never the new/ pathname), so a record promoted out
+  // of new/ is delivered once.
+  const processNew = async () => {
+    if (stopped || checking) return;
+    checking = true;
+    try {
+      const verified = await checkMessages(opts.agent);
+      for (const msg of verified) {
+        if (seen.has(msg.id)) continue;
+        seen.add(msg.id);
+        pending.push(msg);
+      }
+    } catch {
+      // checkMessages() does not reject per message (those are dead-lettered); a
+      // rejection here is a fault in the mailbox itself. The next poll retries.
+      console.error("[mail-watch] check failed; will retry on the next poll");
+    } finally {
+      checking = false;
+      drain();
     }
   };
 
