@@ -12,8 +12,8 @@
 import type { FlairClient } from "./flair-client.js";
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import snooplogg from "snooplogg";
+import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:flair");
 
 
@@ -34,10 +34,12 @@ export type TaskHandler = (event: OrgEvent) => Promise<void>;
 
 const DEFAULT_POLL_MS = 10_000;
 const MAX_BACKOFF_MS = 60_000;
-const CURSOR_DIR = join(homedir(), ".tps", "cursors");
+function cursorDir(): string {
+  return join(homeDir(), ".tps", "cursors");
+}
 
 function cursorPath(agentId: string): string {
-  return join(CURSOR_DIR, `${agentId}-task-loop.json`);
+  return join(cursorDir(), `${agentId}-task-loop.json`);
 }
 
 function loadCursor(agentId: string): string {
@@ -51,7 +53,7 @@ function loadCursor(agentId: string): string {
 
 function saveCursor(agentId: string, since: string): void {
   try {
-    mkdirSync(CURSOR_DIR, { recursive: true });
+    mkdirSync(cursorDir(), { recursive: true });
     writeFileSync(cursorPath(agentId), JSON.stringify({ since, updatedAt: new Date().toISOString() }));
   } catch (e) {
     const err = e as Error;

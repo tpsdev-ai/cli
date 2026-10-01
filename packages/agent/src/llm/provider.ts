@@ -12,6 +12,7 @@ import type {
 } from "../runtime/types.js";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
+import { homeDir } from "../home.js";
 
 type ProviderKind = LLMConfig["provider"];
 
@@ -24,12 +25,14 @@ interface OAuthCredentials {
   scopes: string;
 }
 
-const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+function authDir(): string {
+  return join(homeDir(), ".tps", "auth");
+}
 const ANTHROPIC_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 function oauthPath(provider: string): string {
-  return join(AUTH_DIR, `${provider}.json`);
+  return join(authDir(), `${provider}.json`);
 }
 
 function loadOAuth(provider: string): OAuthCredentials | null {
@@ -39,7 +42,7 @@ function loadOAuth(provider: string): OAuthCredentials | null {
 }
 
 function saveOAuth(provider: string, creds: OAuthCredentials): void {
-  mkdirSync(AUTH_DIR, { recursive: true, mode: 0o700 });
+  mkdirSync(authDir(), { recursive: true, mode: 0o700 });
   writeFileSync(oauthPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 

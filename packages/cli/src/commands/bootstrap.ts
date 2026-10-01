@@ -7,6 +7,7 @@ import { workspacePath as resolveWorkspacePath, resolveTeamId, branchRoot as wor
 import { runCommandUnderNono } from "../utils/nono.js";
 import { deliverToSandbox, resolveAgentMailRoot } from "../utils/relay.js";
 import { readOpenClawConfig, findOpenClawConfig, type OpenClawConfig } from "../utils/config.js";
+import { homeDir } from "../utils/home.js";
 
 export interface BootstrapArgs {
   agentId: string;
@@ -31,7 +32,9 @@ const REQUIRED_FILES: Record<string, string> = {
 
   "HEARTBEAT.md": "# HEARTBEAT\n\n# Keep this file empty (or with only comments) to skip heartbeat API calls.\n\n# Add tasks below when you want the agent to check something periodically.\n",
 };
-const BOOTSTRAP_STATE_DIR = join(process.env.HOME || homedir(), ".tps", "bootstrap-state");
+function bootstrapStateDir(): string {
+  return join(homeDir(), ".tps", "bootstrap-state");
+}
 const BOOTSTRAP_MARKER = ".bootstrap-complete";
 
 function assertAgent(agentId: string): string {
@@ -226,8 +229,8 @@ function sendIntroduction(teamId: string, _teamWorkspace: string, body: string):
 }
 
 function writeMarker(teamId: string, payload: string): void {
-  const path = join(BOOTSTRAP_STATE_DIR, teamId, BOOTSTRAP_MARKER);
-  mkdirSync(join(BOOTSTRAP_STATE_DIR, teamId), { recursive: true });
+  const path = join(bootstrapStateDir(), teamId, BOOTSTRAP_MARKER);
+  mkdirSync(join(bootstrapStateDir(), teamId), { recursive: true });
   writeFileSync(path, payload, "utf-8");
 }
 
@@ -308,5 +311,5 @@ export async function runBootstrap(args: BootstrapArgs): Promise<void> {
   console.log(`✓ Bootstrap complete for ${agentId}`);
   console.log(`Model: ${updatedConfig.agents?.list?.find((a) => a.id === agentId)?.model}`);
   console.log(`Workspace: ${workspace}`);
-  console.log(`Marker: ${join(BOOTSTRAP_STATE_DIR, teamId, BOOTSTRAP_MARKER)}`);
+  console.log(`Marker: ${join(bootstrapStateDir(), teamId, BOOTSTRAP_MARKER)}`);
 }

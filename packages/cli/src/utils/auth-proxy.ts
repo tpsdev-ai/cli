@@ -1,16 +1,18 @@
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { refreshAnthropicToken, type StoredCredentials } from "../commands/auth.js";
+import { homeDir } from "./home.js";
 
-const AUTH_DIR = join(process.env.HOME || homedir(), ".tps", "auth");
+function authDir(): string {
+  return join(homeDir(), ".tps", "auth");
+}
 
 interface AuthHeaders {
   [key: string]: string;
 }
 
 function credPath(provider: string): string {
-  return join(AUTH_DIR, `${provider}.json`);
+  return join(authDir(), `${provider}.json`);
 }
 
 function load(provider: string): StoredCredentials | null {
@@ -20,7 +22,7 @@ function load(provider: string): StoredCredentials | null {
 }
 
 function save(provider: string, creds: StoredCredentials): void {
-  mkdirSync(AUTH_DIR, { recursive: true });
+  mkdirSync(authDir(), { recursive: true });
   writeFileSync(credPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
 }
 

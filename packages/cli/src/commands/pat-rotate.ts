@@ -18,13 +18,15 @@
  */
 
 import { existsSync, readFileSync, writeFileSync, renameSync, chmodSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import * as readline from "node:readline";
+import { homeDir } from "../utils/home.js";
 
-const SECRETS_DIR = resolve(homedir(), ".tps", "secrets");
+function secretsDir(): string {
+  return resolve(homeDir(), ".tps", "secrets");
+}
 
 // Agents whose PAT lives in the macOS keychain via `gh auth login`
 // (not in a file). Currently only `flint` — the gh-as helper resolves
@@ -115,7 +117,7 @@ function patFilePath(agent: string): string {
   if (!/^[a-zA-Z0-9_-]+$/.test(agent)) {
     throw new Error(`invalid agent name: ${agent}`);
   }
-  return resolve(SECRETS_DIR, `${agent}-github-pat`);
+  return resolve(secretsDir(), `${agent}-github-pat`);
 }
 
 async function rotateFilePat(agent: string, token: string): Promise<void> {
@@ -221,19 +223,19 @@ export async function runRotateGithubPat(agent: string): Promise<void> {
 }
 
 export async function runListGithubPats(opts: { json?: boolean } = {}): Promise<void> {
-  if (!existsSync(SECRETS_DIR)) {
-    console.error(`Error: secrets dir missing: ${SECRETS_DIR}`);
+  if (!existsSync(secretsDir())) {
+    console.error(`Error: secrets dir missing: ${secretsDir()}`);
     process.exit(1);
   }
 
   const { readdirSync } = await import("node:fs");
-  const files = readdirSync(SECRETS_DIR).filter((f) => f.endsWith("-github-pat") || f.includes("-github-pat-"));
+  const files = readdirSync(secretsDir()).filter((f) => f.endsWith("-github-pat") || f.includes("-github-pat-"));
 
   type Result = { source: string; status: number; ok: boolean; login?: string; mtime?: string };
   const results: Result[] = [];
 
   for (const f of files) {
-    const path = resolve(SECRETS_DIR, f);
+    const path = resolve(secretsDir(), f);
     let token = "";
     try { token = readFileSync(path, "utf-8").replace(/\s+$/, ""); } catch { continue; }
     if (!token) {

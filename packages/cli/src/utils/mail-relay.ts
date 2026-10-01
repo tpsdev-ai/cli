@@ -20,10 +20,13 @@ import {
 import { join } from "node:path";
 import { homedir } from "node:os";
 import snooplogg from "snooplogg";
+import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
-const RELAY_PID_PATH = join(homedir(), ".tps", "relay.pid");
+function relayPidPath(): string {
+  return join(homeDir(), ".tps", "relay.pid");
+}
 const RELAY_POLL_MS = 500;
 
 /** agentId validation — same rule as everywhere else */
@@ -95,14 +98,14 @@ export function deliverPendingMail(mailDir: string): number {
 export async function runRelayDaemon(mailDir: string): Promise<void> {
   // Write PID file
   mkdirSync(join(homedir(), ".tps"), { recursive: true });
-  writeFileSync(RELAY_PID_PATH, `${process.pid}\n`, "utf-8");
+  writeFileSync(relayPidPath(), `${process.pid}\n`, "utf-8");
 
   process.on("SIGTERM", () => {
-    rmSync(RELAY_PID_PATH, { force: true });
+    rmSync(relayPidPath(), { force: true });
     process.exit(0);
   });
   process.on("SIGINT", () => {
-    rmSync(RELAY_PID_PATH, { force: true });
+    rmSync(relayPidPath(), { force: true });
     process.exit(0);
   });
 
@@ -123,14 +126,14 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
 
 /** Get relay PID if running, else null. */
 export function getRelayPid(): number | null {
-  if (!existsSync(RELAY_PID_PATH)) return null;
+  if (!existsSync(relayPidPath())) return null;
   try {
-    const pid = parseInt(readFileSync(RELAY_PID_PATH, "utf-8").trim(), 10);
+    const pid = parseInt(readFileSync(relayPidPath(), "utf-8").trim(), 10);
     // Verify process is alive
     process.kill(pid, 0);
     return pid;
   } catch {
-    rmSync(RELAY_PID_PATH, { force: true });
+    rmSync(relayPidPath(), { force: true });
     return null;
   }
 }
