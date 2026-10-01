@@ -615,7 +615,7 @@ export const SHUTDOWN_BEAT_TIMEOUT_MS = 3000;
 
 /**
  * The Flair key path the runtime authenticates with: the configured path, else
- * the agent's registered key — the same candidate order the rest of the CLI uses
+ * the locally resolved agent key — the same candidate order the rest of the CLI uses
  * (agent-keys.ts). Falls back to the first candidate so a missing key fails with
  * the client's named path error.
  */
@@ -707,7 +707,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   await ensureFreshOpenAIToken(agentId);
 
   // cli#444: a generated agent config omits flair.keyPath; resolve the agent's
-  // registered key (the same candidates the rest of the CLI uses) so the
+  // locally resolved agent key (the same candidates the rest of the CLI uses) so the
   // Presence beats are signed.
   const keyPath = resolveRuntimeKeyPath(agentId, flairKeyPath);
   const taskConfig: CodexRuntimeConfig = keyPath === flairKeyPath ? config : { ...config, flairKeyPath: keyPath };

@@ -136,7 +136,7 @@ function keySeed(): { seed: Buffer; publicKey: ReturnType<typeof generateKeyPair
 
 describe("codex runtime presence (cli#444)", () => {
   it(
-    "resolves the agent's registered key when the config omits flair.keyPath",
+    "resolves the locally resolved agent key when the config omits flair.keyPath",
     () => {
       const dir = mkdtempSync(join(tmpdir(), "cli444-keys-"));
       const saved = process.env.TPS_TEST_KEYS_DIR;
