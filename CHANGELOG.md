@@ -20,10 +20,6 @@ node scripts/changelog-fragments.mjs check    # what CI checks
 below this one and deletes them as part of a version cut. **Do not add anything to this section by
 hand**: `check` and `promote` refuse while it holds anything but this note.
 
-### Security
-
-- **`tps mail watch --exec` presents only mail that verifies, without consuming it (Closes #375).** The watcher verifies each record in `new/` IN PLACE — the same signature and envelope-binding checks `promote()` applies (the wrapper sender against the signed sender, and the signed recipient against the mailbox), factored into a shared function that moves, leases and writes nothing — and passes only the records that verify to `onMessage` and the `--exec` hook. It calls no consumer path (`promote`, `checkMessages`, a lease or an ack) and never moves a record out of `new/`. A record that does not verify is skipped and logged, never presented. The verified body is written to the hook as UTF-8, and the four `TPS_MAIL_*` variables the watcher sets for the hook come from verified fields (the verified envelope id as `TPS_MAIL_ID`, plus `TPS_MAIL_FROM`/`TPS_MAIL_TO`/`TPS_MAIL_TIMESTAMP`). A verified record whose envelope id is in the consumed ledger is skipped and logged; when the consumed history cannot be read, the record is withheld, logged and retried on the next scan.
-
 ## [0.8.0] — 2026-09-30
 
 **Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.
