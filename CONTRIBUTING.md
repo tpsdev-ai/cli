@@ -39,6 +39,22 @@ When modifying the branch daemon or transport layers, keep the following securit
 - Ensure all tests pass (`bun run test`). We aim for high test coverage, especially in `packages/cli/src/utils/identity.ts`, `packages/cli/src/utils/relay.ts`, and the transport layers.
 - Write tests for new features.
 
+## Changelog
+
+A user-visible change adds one fragment file under
+[`.changelog/unreleased/`](.changelog/unreleased/) — one file per change, so
+pull requests with distinct fragment filenames do not share an edit to
+`CHANGELOG.md`'s `[Unreleased]` section. Name it `<category>-<slug>.md`
+(category one of `added`, `changed`, `deprecated`, `removed`, `fixed`,
+`security`) and write the entry as it should read under its `### Category`
+heading, leading `- ` included. Do not edit `[Unreleased]` by hand; CI runs
+`node scripts/changelog-fragments.mjs check`.
+
+At a release cut, `node scripts/changelog-fragments.mjs promote <version>`
+writes the fragments into a new `## [<version>]` section of `CHANGELOG.md` and
+deletes them. See [`.changelog/unreleased/README.md`](.changelog/unreleased/README.md)
+for the naming, indentation and bold-lede rules.
+
 ## Submitting a Pull Request
 
 1. Fork the repository.
