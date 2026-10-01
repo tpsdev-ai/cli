@@ -141,8 +141,10 @@ together; the script refuses if any is not published at VERSION.
                       downgrade) or a pre-release. `--yes` does NOT imply this.
   --help              Show this help.
 
-Each move runs `npm dist-tag add` with this terminal attached, so npm may open a
-browser 2FA prompt; approve each prompt as it appears.
+Each `npm dist-tag add` runs with the script's own stdin/stdout/stderr (not
+captured), so npm's browser 2FA can run when the script itself is run from a
+terminal. npm prompts for 2FA only when stdin and stdout are both a terminal:
+do not pipe or redirect either.
 
 Environment: NPM_BIN (default `npm`); NPM_REGISTRY (default
 https://registry.npmjs.org) pins every npm call.
@@ -362,8 +364,9 @@ rollback_moved() {
   # binaries — so there is no window with a new CLI beside previous platform tags.
   for ((i = NPKG - 1; i >= 0; i--)); do
     [ "${moved[i]}" = 1 ] || continue
-    # Run the rollback add with the terminal attached too: a captured or piped
-    # add has no terminal, and npm's browser 2FA exits EOTP at once.
+    # The rollback add also runs with the script's own stdin/stdout/stderr (not
+    # captured): captured output loses stdout's TTY, and npm then cannot prompt
+    # for 2FA.
     set +e
     "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
@@ -440,10 +443,11 @@ for ((i = 0; i < NPKG; i++)); do
   # package that the rollback skips.
   moved[i]=1
   printf '\n-> %s: npm dist-tag add %s@%s latest\n' "${names[i]}" "${names[i]}" "$version"
-  # Run the add with the terminal attached: no command substitution and no pipe,
-  # so stdin/stdout/stderr are inherited. With 2FA on writes, npm opens a browser
-  # link and waits on the terminal; with its output captured it has no terminal
-  # and exits EOTP without moving the tag.
+  # The add runs with the script's own stdin/stdout/stderr (not captured): no
+  # command substitution and no pipe, so npm's browser 2FA can run when the script
+  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout
+  # are both TTYs; captured output loses stdout's TTY, and npm then exits EOTP
+  # without moving the tag.
   set +e
   "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?

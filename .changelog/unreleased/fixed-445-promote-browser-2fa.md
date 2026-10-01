@@ -1,3 +1,3 @@
-- **`scripts/promote-latest.sh` runs `npm dist-tag add` with the terminal attached, so a write behind browser 2FA can approve each move (Closes #445).**
+- **`scripts/promote-latest.sh` runs `npm dist-tag add` with the script's own stdin/stdout/stderr, so npm's browser 2FA can run when the script runs from a terminal (Closes #445).**
 
-  A captured or piped add has no terminal, so npm printed the auth URL and exited `EOTP` without moving the tag; the promote then rolled back. Both adds (promote and rollback) now inherit stdin/stdout/stderr, and the registry re-read stays the source of truth.
+  Both adds (promote and rollback) ran inside a command substitution, so npm's stdout was not a TTY and npm could not prompt for 2FA; the first add exited `EOTP` without moving the tag. Neither add is captured now. npm prompts for 2FA only when stdin and stdout are both a terminal, so run the script with neither piped nor redirected. A move still needs a zero exit from the add and a registry re-read that shows the target.

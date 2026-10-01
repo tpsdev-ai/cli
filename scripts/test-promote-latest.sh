@@ -24,10 +24,11 @@
 #   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
 #     which --yes does NOT satisfy
 #   * every npm call is pinned with --registry
-#   * the fake npm refuses a `dist-tag add` whose stdout is not a TTY with EOTP,
-#     the way npm refuses a write with browser 2FA when its output is captured:
-#     every fixture runs the tool under a pty, and fixture R pins that each add
-#     actually saw the terminal
+#   * the fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout
+#     are both TTYs (installed npm prompts for 2FA only then): every fixture runs
+#     the tool with stdin and stdout on a pty, fixture R pins that each add had
+#     both, and fixture S pins that an add with stdout on the pty but stdin not is
+#     refused
 #   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
 #     trap, the pre-add attempt flag, and the trap-clear branch, and restore the
 #     command substitution around `dist-tag add`; confirm a fixture catches each —
@@ -39,11 +40,11 @@
 # constructs that have already bitten. The real control for the bash-3.2 class is
 # the `macos-14` CI leg, which runs this whole harness under /bin/bash (3.2.57).
 #
-# Every invocation runs the tool with its stdout on a pseudo-terminal, because the
-# fake npm mirrors npm's browser-2FA behaviour: an add whose stdout is not a TTY is
-# refused with EOTP. The pty runner (python3) keeps the tool's stderr in a file,
-# leaves the tool signalable, and exits with its status; the tool's own pid is
-# recorded first, so a signal fixture signals the tool and not the runner.
+# Every invocation runs the tool with its stdin and stdout on a pseudo-terminal,
+# because the fake npm refuses a `dist-tag add` with EOTP unless both are TTYs. The
+# pty runner (python3) forwards its own stdin to the pty, keeps the tool's stderr
+# in a file, leaves the tool signalable, and exits with its status; the tool's own
+# pid is recorded first, so a signal fixture signals the tool and not the runner.
 #
 # The fixtures are generated at run time, not committed, so no fake registry state
 # or mutant script lives in the tree for scanners to read as real.
@@ -63,50 +64,81 @@ printf 'test-promote-latest: harness under bash %s; tool under %s\n' \
   "$BASH_VERSION" "$("$BASH_BIN" --version | head -n1)"
 
 # ── pseudo-terminal runner ───────────────────────────────────────────────────
-# npm's browser 2FA needs a terminal to wait on; the fake npm refuses a
-# `dist-tag add` whose stdout is not a TTY (EOTP), exactly as npm does when its
-# output is captured. Every invocation below runs the tool through this runner, so
-# the tool's stdout is a TTY and an inherited add inherits one.
+# The fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout are
+# both TTYs. Every invocation below runs the tool through this runner, so the
+# tool's stdin and stdout are the pty and an add that inherits them has both.
 command -v python3 >/dev/null 2>&1 || {
   printf 'test-promote-latest: python3 is required to run the tool under a pty\n' >&2
   exit 1
 }
 pty_runner="$work/pty-run.py"
 cat >"$pty_runner" <<'PTY_RUNNER'
-"""Run a command with its stdout on a pseudo-terminal.
+"""Run a command with its stdin and stdout on a pseudo-terminal.
 
 argv: <stderr-file> <command> [args...]
 
-The command's stdout is the pty slave (a TTY), its stderr is the given file and
-its stdin is inherited. The pty's bytes are forwarded to this process's stdout,
-and this process exits with the command's status. When PTY_PIDFILE is set, the
-command's pid is written there first, so a caller can signal the command itself
-rather than this wrapper.
+The command's stdin and stdout are the pty slave (a TTY); its stderr is the given
+file. This process copies its own stdin into the pty and, when its stdin ends,
+sends the pty's end-of-file character, so a `read` in the command gets the
+forwarded line and then end of file. Echo is off, so forwarded input is not copied
+back out. The pty's output is copied to this process's stdout, and this process
+exits with the command's status, or 124 after PTY_TIMEOUT seconds (default 60),
+having killed the command. When PTY_PIDFILE is set, the command's pid is written
+there first, so a caller can signal the command itself rather than this wrapper.
 """
 import os
+import select
 import subprocess
 import sys
+import termios
+import time
 
 err_path = sys.argv[1]
 argv = sys.argv[2:]
 master, slave = os.openpty()
+attrs = termios.tcgetattr(slave)
+attrs[3] &= ~termios.ECHO
+termios.tcsetattr(slave, termios.TCSANOW, attrs)
+veof = attrs[6][termios.VEOF]
+if isinstance(veof, int):
+    veof = bytes([veof])
 err_fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-proc = subprocess.Popen(argv, stdout=slave, stderr=err_fd)
+proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=err_fd)
 os.close(slave)
 os.close(err_fd)
 pidfile = os.environ.get('PTY_PIDFILE')
 if pidfile:
     with open(pidfile, 'w') as fh:
         fh.write(str(proc.pid))
+deadline = time.monotonic() + float(os.environ.get('PTY_TIMEOUT', '60'))
 out = sys.stdout.buffer
+inp = sys.stdin.fileno()
+inp_open = True
 while True:
-    try:
-        chunk = os.read(master, 65536)
-    except OSError:
-        break
-    if not chunk:
-        break
-    out.write(chunk)
+    left = deadline - time.monotonic()
+    if left <= 0:
+        proc.kill()
+        proc.wait()
+        out.flush()
+        sys.stderr.write('pty-run: timed out; killed the command\n')
+        sys.exit(124)
+    ready, _, _ = select.select([master] + ([inp] if inp_open else []), [], [], left)
+    if inp_open and inp in ready:
+        data = os.read(inp, 65536)
+        try:
+            os.write(master, data if data else veof)
+        except OSError:
+            pass
+        if not data:
+            inp_open = False
+    if master in ready:
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out.write(chunk)
 out.flush()
 sys.exit(proc.wait())
 PTY_RUNNER
@@ -134,6 +166,7 @@ cat >"$fake_npm" <<'FAKE_NPM'
 #!/usr/bin/env node
 'use strict';
 const fs = require('fs');
+const tty = require('tty');
 const statePath = process.env.FAKE_NPM_STATE;
 if (!statePath) { process.stderr.write('fake-npm: FAKE_NPM_STATE is not set\n'); process.exit(90); }
 const logPath = process.env.FAKE_NPM_LOG || '';
@@ -147,7 +180,9 @@ function splitSpec(spec) {
   return { pkg: spec.slice(0, at), ver: spec.slice(at + 1) };
 }
 const args = process.argv.slice(2);
-log(args.join(' ') + ' tty=' + (process.stdout.isTTY ? '1' : '0'));
+const stdinTTY = tty.isatty(0);
+const stdoutTTY = tty.isatty(1);
+log(args.join(' ') + ' stdin_tty=' + (stdinTTY ? '1' : '0') + ' stdout_tty=' + (stdoutTTY ? '1' : '0'));
 const cmd = args[0];
 const sub = args[1];
 const rest = args.slice(2);
@@ -173,12 +208,16 @@ if (cmd === 'view') {
   }
   fail('npm error unknown field: ' + field);
 } else if (cmd === 'dist-tag' && sub === 'add') {
-  // npm with browser 2FA needs a terminal: with its output captured it prints the
-  // auth URL and exits EOTP at once, without moving the tag. Mirror that here, so
-  // the tool must run the add with the terminal attached.
-  if (!process.stdout.isTTY) {
+  // Installed npm's otplease (lib/utils/auth.js) prompts for 2FA only when
+  // process.stdin.isTTY and process.stdout.isTTY are both true; otherwise the add
+  // fails (#445 saw EOTP) and the tag does not move. This stub refuses every add
+  // with EOTP unless both are TTYs. (npm skips 2FA for an add that sets a tag to
+  // its current value; this stub does not, so it also refuses the rollback of a
+  // tag that never moved.)
+  if (!(stdinTTY && stdoutTTY)) {
     fail(
-      'npm error code EOTP\nnpm error This command needs a terminal to approve the change in a browser (2FA), and stdout is not a TTY.',
+      'npm error code EOTP\nnpm error fake npm: 2FA needs stdin and stdout to be TTYs (stdin_tty=' +
+        (stdinTTY ? '1' : '0') + ' stdout_tty=' + (stdoutTTY ? '1' : '0') + ').',
     );
   }
   const spec = splitSpec(rest[0]);
@@ -252,8 +291,8 @@ const targets = {
     "trap - TERM INT HUP\nif [ \"$failure\" -ne 0 ]; then\n  rollback_moved\nfi\n",
   ],
   reorder: [
-    '  moved[i]=1\n  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # Run the add with the terminal attached: no command substitution and no pipe,\n  # so stdin/stdout/stderr are inherited. With 2FA on writes, npm opens a browser\n  # link and waits on the terminal; with its output captured it has no terminal\n  # and exits EOTP without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
-    '  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # Run the add with the terminal attached: no command substitution and no pipe,\n  # so stdin/stdout/stderr are inherited. With 2FA on writes, npm opens a browser\n  # link and waits on the terminal; with its output captured it has no terminal\n  # and exits EOTP without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  moved[i]=1\n  set -e\n',
+    '  moved[i]=1\n  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
+    '  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  moved[i]=1\n  set -e\n',
   ],
   capture: [
     '  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
@@ -294,7 +333,7 @@ OUT=""
 ERR=""
 LOG=""
 IRC=0
-invoke() { # [TOOL=...] <fixture-dir> [args...]
+invoke() { # [TOOL=...] <fixture-dir> [args...] — stdin and stdout on the pty; a read gets end of file
   local d="$1"
   shift
   local t="${TOOL:-$tool}"
@@ -302,12 +341,12 @@ invoke() { # [TOOL=...] <fixture-dir> [args...]
   LOG="$d/log.txt"
   : >"$LOG"
   raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
-    python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@")"
+    python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
   ERR="$(cat "$d/err.txt")"
 }
-invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...]
+invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...] — the reply is typed into the pty
   local d="$1"
   local reply="$2"
   shift 2
@@ -317,6 +356,20 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...]
   : >"$LOG"
   raw="$(printf '%s\n' "$reply" | FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@")"
+  RC=$?
+  OUT="$(printf '%s\n' "$raw" | strip_cr)"
+  ERR="$(cat "$d/err.txt")"
+}
+invoke_stdin_not_tty() { # [TOOL=...] <fixture-dir> [args...] — stdout on the pty, stdin /dev/null
+  local d="$1"
+  shift
+  local t="${TOOL:-$tool}"
+  local raw
+  LOG="$d/log.txt"
+  : >"$LOG"
+  # shellcheck disable=SC2016  # "$@" is expanded by the inner bash, not here
+  raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+    python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" -c 'exec "$@" </dev/null' stdin-null "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
   ERR="$(cat "$d/err.txt")"
@@ -352,7 +405,7 @@ start_held() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> [args...]
   FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
     FAKE_NPM_HOLD_PKG="@tpsdev-ai/$hold" FAKE_NPM_HOLD_VER="$hv" FAKE_NPM_MARKER="$HCOUNTER" \
     PTY_PIDFILE="$d/tool.pid" \
-    python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" >"$d/out.txt" &
+    python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" </dev/null >"$d/out.txt" &
   HPID=$!
 }
 finish_held() { # <dir>
@@ -454,6 +507,7 @@ d="$(new_fixture confirm-abort)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 invoke_stdin "$d" "no" 0.5.4
 assert_eq "F confirm-abort: exit" 3 "$RC"
+assert_contains "F confirm-abort: read the reply via the pty" "$ERR" 'got "no"'
 assert_eq "F confirm-abort: no dist-tag add attempted" 0 "$(adds_count)"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "F confirm-abort: registry untouched" "latest=0.5.3 for all six"; else bad "F confirm-abort: registry untouched" "registry changed"; fi
 
@@ -555,20 +609,36 @@ else
   bad "N registry pin: every npm call pinned" "$total_lines calls, $unpinned unpinned"
 fi
 
-# ── R. dist-tag add runs with the terminal attached (npm's browser 2FA) ────────
-# The fake npm refuses a `dist-tag add` whose stdout is not a TTY, exactly as npm
-# does for a write with browser 2FA when its output is captured. Every fixture runs
-# the tool under the pty runner, so this one pins that each add SAW the terminal:
-# a script that captures the add's output (the pre-fix shape) gets EOTP, never
-# moves the tag and rolls back — this fixture and M6 are that control.
+# ── R. each dist-tag add inherits the tool's stdin and stdout (npm's 2FA gate) ──
+# The fake npm refuses a `dist-tag add` with EOTP unless its stdin and stdout are
+# both TTYs. This fixture gives the tool both on the pty and pins that each add
+# had both. A script that captures the add's output (the pre-fix shape) gets EOTP
+# on the first add and the tag does not move; this fixture and M6 are that control.
 d="$(new_fixture tty-2fa)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 invoke "$d" 0.5.4 --yes
 assert_eq "R tty-2fa: exit" 0 "$RC"
 assert_eq "R tty-2fa: six dist-tag adds" 6 "$(adds_count)"
-assert_eq "R tty-2fa: every add saw a terminal" 6 "$(grep -c 'dist-tag add .* tty=1' "$LOG")"
-assert_eq "R tty-2fa: no add without a terminal" 0 "$(grep -c 'dist-tag add .* tty=0' "$LOG")"
+assert_eq "R tty-2fa: every add had stdin+stdout TTYs" 6 "$(grep -c '^dist-tag add .* stdin_tty=1 stdout_tty=1$' "$LOG")"
+assert_eq "R tty-2fa: no add without both TTYs" 0 "$(grep '^dist-tag add ' "$LOG" | grep -vc 'stdin_tty=1 stdout_tty=1$')"
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "R tty-2fa: registry moved" "latest=0.5.4 for all six"; else bad "R tty-2fa: registry moved" "not all 0.5.4"; fi
+
+# ── S. stdout on the pty but stdin not: the add is refused ───────────────────
+# npm prompts for 2FA only when stdin AND stdout are TTYs, so a run with stdin
+# redirected cannot pass 2FA even with stdout on a terminal. The first add exits
+# EOTP and its tag does not move. The stub refuses the rollback add of that
+# unmoved tag too (see its note), so here the tool reports ROLLBACK FAILED (exit 5)
+# with the registry unchanged. A stub that checks only stdout lets these adds
+# through, and this fixture fails.
+d="$(new_fixture stdin-not-tty)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+invoke_stdin_not_tty "$d" 0.5.4 --yes
+assert_eq "S stdin-not-tty: exit" 5 "$RC"
+assert_eq "S stdin-not-tty: two adds (promote, rollback)" 2 "$(adds_count)"
+assert_eq "S stdin-not-tty: adds had stdout TTY only" 2 "$(grep -c '^dist-tag add .* stdin_tty=0 stdout_tty=1$' "$LOG")"
+assert_contains "S stdin-not-tty: npm refused with EOTP" "$ERR" "npm error code EOTP"
+assert_contains "S stdin-not-tty: reports the rollback failure" "$ERR" "ROLLBACK FAILED for @tpsdev-ai/cli-darwin-arm64"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "S stdin-not-tty: registry unchanged" "latest=0.5.3 for all six"; else bad "S stdin-not-tty: registry unchanged" "registry changed"; fi
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
@@ -631,17 +701,18 @@ else
 fi
 
 # ── M6. mutation: capture the add again; fixture R must catch it ─────────────
-# A captured add has no terminal, so npm EOTPs it: the tag never moves and the
-# promote rolls back. A test that passes on this mutant is blind to the bug this
-# issue is about.
+# A captured add's stdout is not a TTY, so the fake npm EOTPs it and the tag does
+# not move. Only the promote add is captured here; the rollback add still inherits
+# the pty, so the mutant's rollback succeeds (exit 4). A test that passes on this
+# mutant is blind to the bug this issue is about.
 mut="$work/tool-capture.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" capture; then
   d="$(new_fixture mut-capture)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   TOOL="$mut" invoke "$d" 0.5.4 --yes
-  captured="$(grep -c 'dist-tag add .* tty=0' "$LOG")"
+  captured="$(grep -c '^dist-tag add .* stdout_tty=0$' "$LOG")"
   if [ "$RC" -eq 0 ]; then bad "M6 mutation: captured add caught" "mutant exited 0 — fixture R is blind to it"; else ok "M6 mutation: captured add caught" "mutant exited $RC (fixture R expects 0)"; fi
-  if [ "$captured" -ge 1 ]; then ok "M6 mutation: add had no terminal" "the log records a captured add"; else bad "M6 mutation: add had no terminal" "no tty=0 add in the log"; fi
+  if [ "$captured" -ge 1 ]; then ok "M6 mutation: add's stdout not a TTY" "the log records a captured add"; else bad "M6 mutation: add's stdout not a TTY" "no stdout_tty=0 add in the log"; fi
   TOOL=""
 else
   bad "M6 mutation: captured add caught" "could not build the mutant"
