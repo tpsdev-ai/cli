@@ -12,11 +12,11 @@ Most agent frameworks assume all agents run in the same memory space. TPS assume
 
 > "I have eight different bosses right now. So that means that when I make a mistake, I have eight different people coming by to tell me about it." — Make your agents communicate through a single, auditable mail interface instead.
 
-See **[DESIGN.md](DESIGN.md)** for the invariants behind that — why identity is signed, why failures self-heal instead of hiding, and why every task moves through review before it merges.
+See **[DESIGN.md](DESIGN.md)** for the design invariants.
 
 ### What You Get
 
-- **Identity & Keys** — Ed25519 keypairs per agent. Agents prove who they are cryptographically, not by env var.
+- **Identity & Keys** — `tps init` and `tps agent create` generate or reuse Ed25519 keys.
 - **Branch Offices** — Docker containers with four layers of isolation: Docker → Linux users → [nono](https://github.com/lukehinds/nono) Landlock → BoundaryManager
 - **The Mailroom** — Async, persistent, cross-boundary Maildir-based messaging with pub/sub topics
 - **Agent Runtime** — Native runtime with tool use, multi-provider LLM support, and session management
@@ -73,7 +73,7 @@ tps agent run --config my-agent/.tps/agent.yaml \
   --message "Implement the feature described in TASK.md"
 ```
 
-CLI runtimes stream output in real-time, auto-commit on turn limits, write task memories to Flair, and catch up on missed pub/sub messages at boot. Claude Code is shipped; Codex and Gemini CLI are planned.
+Claude Code is shipped; Codex and Gemini CLI are supported.
 
 ### Run agents in a Docker office
 
@@ -121,11 +121,11 @@ tps mail subscribe pr-reviews
 tps mail publish pr-reviews "PR #42 approved — ready to merge"
 ```
 
-Messages fan out to all subscribers. Agents catch up on missed messages at boot via cursor-based replay. Delivery is idempotent.
+Publishing attempts delivery to other subscribers.
 
 ### Identity
 
-Every agent gets an Ed25519 keypair at creation. Keys never leave the host — agents prove identity through signatures, not shared secrets.
+`tps init` and `tps agent create` generate or reuse an agent's Ed25519 keys.
 
 ```bash
 tps identity show              # Show host identity
@@ -134,7 +134,7 @@ tps identity show --agent ember  # Show agent identity
 
 ### Flair (Memory & Soul)
 
-[Flair](https://github.com/tpsdev-ai/flair) is the persistence layer. Agents load their soul (personality, role, mission) and memories from Flair at startup. Task completions and failures are written back automatically.
+[Flair](https://github.com/tpsdev-ai/flair) is optional.
 
 ```bash
 tps flair status               # Check Flair health
@@ -219,7 +219,7 @@ git clone https://github.com/tpsdev-ai/cli.git
 cd cli
 bun install
 bun run build
-bun run test    # every suite, through its HOME-isolating launcher; a bare `bun test` aborts
+bun run test    # through its HOME-isolating launcher; a bare `bun test` aborts
                 # (a launch-time check, not an OS boundary: see cli#434)
 ```
 

@@ -1,0 +1,1 @@
+- **Correction to the 0.7.0 notes: the `latest` promote is not all-six-or-none.** `scripts/promote-latest.sh` re-reads each move and attempts a rollback; a rollback that fails is reported and needs manual repair (Refs #441).
