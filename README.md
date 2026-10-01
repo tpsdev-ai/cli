@@ -16,7 +16,7 @@ See **[DESIGN.md](DESIGN.md)** for the invariants behind that — why identity i
 
 ### What You Get
 
-- **Identity & Keys** — Ed25519 keypairs per agent. Agents prove who they are cryptographically, not by env var.
+- **Identity & Keys** — Ed25519 keypairs per agent.
 - **Branch Offices** — Docker containers with four layers of isolation: Docker → Linux users → [nono](https://github.com/lukehinds/nono) Landlock → BoundaryManager
 - **The Mailroom** — Async, persistent, cross-boundary Maildir-based messaging with pub/sub topics
 - **Agent Runtime** — Native runtime with tool use, multi-provider LLM support, and session management
@@ -73,7 +73,7 @@ tps agent run --config my-agent/.tps/agent.yaml \
   --message "Implement the feature described in TASK.md"
 ```
 
-CLI runtimes stream output in real-time, auto-commit on turn limits, write task memories to Flair, and catch up on missed pub/sub messages at boot. Claude Code is shipped; Codex and Gemini CLI are planned.
+Claude Code is shipped; Codex and Gemini CLI are supported.
 
 ### Run agents in a Docker office
 
@@ -121,7 +121,7 @@ tps mail subscribe pr-reviews
 tps mail publish pr-reviews "PR #42 approved — ready to merge"
 ```
 
-Messages fan out to all subscribers. Agents catch up on missed messages at boot via cursor-based replay. Delivery is idempotent.
+Publishing attempts delivery to other subscribers.
 
 ### Identity
 
@@ -134,7 +134,7 @@ tps identity show --agent ember  # Show agent identity
 
 ### Flair (Memory & Soul)
 
-[Flair](https://github.com/tpsdev-ai/flair) is the persistence layer. Agents load their soul (personality, role, mission) and memories from Flair at startup. Task completions and failures are written back automatically.
+[Flair](https://github.com/tpsdev-ai/flair) is the persistence layer.
 
 ```bash
 tps flair status               # Check Flair health
@@ -219,7 +219,7 @@ git clone https://github.com/tpsdev-ai/cli.git
 cd cli
 bun install
 bun run build
-bun run test    # every suite, through its HOME-isolating launcher; a bare `bun test` aborts
+bun run test    # through its HOME-isolating launcher; a bare `bun test` aborts
                 # (a launch-time check, not an OS boundary: see cli#434)
 ```
 
