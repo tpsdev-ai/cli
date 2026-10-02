@@ -15,6 +15,8 @@ import {
   catchUpTopics, onBoot, onTaskStart, onTaskComplete, onTaskFailure,
 } from "./agent-lifecycle.js";
 import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
+import { externalDispatchRefusal } from "./mail-tier.js";
+import type { Envelope } from "@tpsdev-ai/agent";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
 
@@ -40,6 +42,15 @@ export interface GeminiConfig {
 }
 
 interface MailMessage { id: string; from: string; to: string; body: string; timestamp: string; }
+
+/**
+ * cli#433 (slice B2-1): the consumer-side tier gate for the Gemini runtime. A
+ * verified record whose SIGNED tier is external is not dispatched with the
+ * internal capability set; returns the named reason, or null to dispatch.
+ */
+export function geminiDispatchRefusal(envelope: Envelope | undefined, from: string): string | null {
+  return externalDispatchRefusal(envelope, from);
+}
 
 function getFallbackSoulPath(agentId: string): string {
   return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
@@ -157,6 +168,14 @@ export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
   while (true) {
     for (const msg of await pollRuntimeMail(mailCfg)) {
       slog(`Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+      // cli#433 (slice B2-1): honour the SIGNED tier. External-tier mail is not
+      // dispatched with the internal capability set; it stays in cur/ with a
+      // named reason (no reply, no ack) so nothing is silently dropped.
+      const refusal = geminiDispatchRefusal(msg.envelope, msg.from);
+      if (refusal) {
+        swarn(`${refusal}; not dispatched`);
+        continue;
+      }
       try {
         let preState: import("./workspace-provider.js").WorkspaceState | undefined;
         if (workspaceProvider) preState = await onTaskStart(workspaceProvider, flair, msg.id).catch(() => undefined);

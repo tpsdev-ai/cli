@@ -12,6 +12,20 @@ export interface LLMConfig {
 
 export type TrustLevel = "user" | "internal" | "external";
 
+/**
+ * The ONE mapping from a SIGNED trust claim to a capability tier, shared by the
+ * runtime event loop (#466) and the CLI mail consumers (cli#433).
+ *
+ * Only a signed `internal` is internal. A signed `external`, a signed `user`
+ * (agent mail is never an operator invocation) and any unrecognised value are
+ * external. Callers decide what an ABSENT claim means: the event loop defaults
+ * it to external (lowest capabilities); a consumer leaves its existing
+ * behaviour for a record that carries no claim.
+ */
+export function signedTrustTier(claim: unknown): TrustLevel {
+  return claim === "internal" ? "internal" : "external";
+}
+
 export interface AgentConfig {
   /** Agent identifier from tps.yaml */
   agentId: string;

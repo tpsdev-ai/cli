@@ -1,13 +1,14 @@
 import type { MailMessage, MailClient } from "../io/mail.js";
-import type {
-  AgentConfig,
-  CompletionRequest,
-  LLMMessage,
-  ToolCall,
-  ToolResult,
-  ToolSpec,
-  AgentState,
-  TrustLevel,
+import {
+  signedTrustTier,
+  type AgentConfig,
+  type CompletionRequest,
+  type LLMMessage,
+  type ToolCall,
+  type ToolResult,
+  type ToolSpec,
+  type AgentState,
+  type TrustLevel,
 } from "./types.js";
 import type { MemoryStore } from "../io/memory.js";
 import type { ContextManager } from "../io/context.js";
@@ -139,13 +140,11 @@ export class EventLoop {
     // Only a verified envelope can carry a trust decision. Older envelopes
     // have no trust field and receive the lowest capability set.
     const trust = message.verifiedEnvelope?.trust;
+    if (trust === undefined) return "external";
     // Agent mail is never an operator invocation. A sender can sign its own
-    // trust claim, so even a signed `user` value cannot grant full tools.
-    if (trust === "internal" || trust === "external") {
-      return trust;
-    }
-    // Default: external (zero trust)
-    return "external";
+    // trust claim, so even a signed `user` value cannot grant full tools. The
+    // claim -> tier rule is the shared mapping (signedTrustTier).
+    return signedTrustTier(trust);
   }
 
   private parseSender(message: MailMessage): string {

@@ -8,6 +8,7 @@ import { logEvent } from "./archive.js";
 import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
+import { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "../bridge/core.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
 // (which imports this module) applies the same rule the CLI does.
@@ -864,6 +865,61 @@ type EnvelopePolicyResult =
   | { ok: true; envelope: Envelope }
   | { ok: false; class: PromoteRejectClass; reason: string };
 
+/** The trust values a SIGNED envelope may carry. Anything else is refused. */
+const VALID_SIGNED_TRUST: ReadonlySet<string> = new Set(["user", "internal", "external"]);
+
+/**
+ * The bridge principal ids this receiver caps at `external` (cli#433 slice
+ * B2-1): the configured id when set (MailVerifyConfig.bridgeAgentId, else
+ * TPS_BRIDGE_AGENT_ID), resolved by the ONE bridge rule (resolveBridgeAgentId);
+ * otherwise the default identity of each bridge adapter the CLI ships.
+ */
+function bridgePrincipalIds(verify: MailVerifyConfig): Set<string> {
+  const configured = verify.bridgeAgentId ?? process.env.TPS_BRIDGE_AGENT_ID;
+  if (configured) return new Set([configured]);
+  return new Set(BRIDGE_ADAPTERS.map((name) => resolveBridgeAgentId(name)));
+}
+
+/**
+ * The trust ceiling (cli#433 slice B2-1): validate the SIGNED trust value and
+ * cap it by sender. It reads the VERIFIED envelope only — wrapper headers such
+ * as X-TPS-Trust sit outside the signature and never confer trust. An
+ * unrecognised value is REFUSED, never defaulted. A bridge principal may
+ * deliver only `external`, so a bridge-signed `internal` (or higher) is
+ * refused. Returns a rejection, or null when the envelope may be promoted.
+ */
+function trustCeilingReject(
+  envelope: Envelope,
+  verify: MailVerifyConfig,
+): { ok: false; class: PromoteRejectClass; reason: string } | null {
+  const trust = (envelope as { trust?: unknown }).trust;
+  if (trust !== undefined && !VALID_SIGNED_TRUST.has(trust as string)) {
+    const shown =
+      typeof trust === "string"
+        ? trust.length === 0
+          ? "an empty string"
+          : `a ${trust.length}-char string outside the rule`
+        : trust === null
+          ? "null"
+          : typeof trust;
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `invalid trust value (must be "user", "internal" or "external"; got ${shown})`,
+    };
+  }
+  if (bridgePrincipalIds(verify).has(envelope.from) && trust !== undefined && trust !== "external") {
+    return {
+      ok: false,
+      class: "invalid",
+      reason:
+        `trust ceiling: a bridge principal may deliver only external mail ` +
+        `(envelope.from=${envelope.from}, trust=${JSON.stringify(trust)})`,
+    };
+  }
+  return null;
+}
+
 /**
  * The ONE mailbox decision for an enveloped record — the shared policy that BOTH
  * first delivery (`promote`) and re-presentation (`recoverPromoted`) run, so the
@@ -914,6 +970,11 @@ async function decideEnvelopeForMailbox(
     }
     return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
   }
+
+  // 1b. Trust ceiling (cli#433 slice B2-1): the SIGNED trust value, validated
+  //     and capped by sender. A wrapper header never reaches here.
+  const ceiling = trustCeilingReject(envelope, verify);
+  if (ceiling) return ceiling;
 
   // 2. The wrapper `from` is what consumers route by, and it is unverified; a
   //    wrapper/envelope mismatch is itself a reject.

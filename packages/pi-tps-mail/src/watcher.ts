@@ -375,6 +375,20 @@ async function dispatchVerified(state: WatcherState, msg: MailMessage): Promise<
     console.error(`[${ts()}] a verified record lacks a usable id, sender or envelope id; not dispatched`);
     return;
   }
+  // cli#433 (slice B2-1): honour the SIGNED tier. External-tier mail is not
+  // dispatched with the internal capability set. The tier rule is the same one
+  // the CLI's consumers apply (only a SIGNED `internal` is internal); the CLI
+  // has already refused an unrecognised value at promotion, so a signed claim
+  // here is user/internal/external. The record is left in cur/ (no reply, no
+  // ack) so nothing is silently dropped.
+  const signedTrust = msg.envelope?.trust;
+  if (signedTrust !== undefined && signedTrust !== "internal") {
+    console.error(
+      `[${ts()}] not dispatching ${id}: signed ${JSON.stringify(signedTrust)} trust — ` +
+        `external-tier mail is not dispatched with the internal capability set`,
+    );
+    return;
+  }
   // A reply already produced for this inbound is finished from the journal
   // (re-send or re-ack) — never produced a second time.
   if (await hasJournal(paths, id)) return;

@@ -1,0 +1,1 @@
+- **promote() caps a bridge-signed envelope at `external`, and consumers no longer dispatch external-tier mail with the internal capability set.** An unrecognised signed trust value is refused (not defaulted); a bridge principal may deliver only `external`; wrapper headers such as `X-TPS-Trust` confer no trust.

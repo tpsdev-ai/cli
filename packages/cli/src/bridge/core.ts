@@ -27,6 +27,19 @@ export function validateAgentId(id: string): boolean {
   return AGENT_ID_RE.test(id);
 }
 
+/** The adapter names the CLI ships bridges for. */
+export const BRIDGE_ADAPTERS = ["openclaw", "discord", "stdio"] as const;
+
+/**
+ * The bridge's own identity: the configured id, else the adapter's default
+ * (`<adapter>-bridge`) — the ONE rule the bridge resolves its principal by and
+ * that a receiver reuses to cap a bridge-signed envelope at `external`
+ * (cli#433 slice B2-1).
+ */
+export function resolveBridgeAgentId(adapterName: string, configured?: string): string {
+  return configured ?? `${adapterName}-bridge`;
+}
+
 export interface BridgeCoreConfig {
   bridgeAgentId?: string;
   mailDir?: string;
@@ -50,7 +63,7 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    this.bridgeAgentId = config.bridgeAgentId ?? "bridge-" + adapter.name;
+    this.bridgeAgentId = resolveBridgeAgentId(adapter.name, config.bridgeAgentId);
     this.mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";

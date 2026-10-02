@@ -20,6 +20,12 @@ export interface MailMessage {
   envelopeId?: string;
   /** The signed `messageId` this message itself replies to, when it is a reply. */
   replyToId?: string;
+  /**
+   * The stored SIGNED envelope (cli#433): `tps mail check --json` prints it on a
+   * verified record. The watcher reads the SIGNED tier from here — never from an
+   * unsigned wrapper field.
+   */
+  envelope?: { trust?: unknown };
 }
 
 /** Watcher options */

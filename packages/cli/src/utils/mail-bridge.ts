@@ -11,7 +11,7 @@ export type { BridgeEnvelope } from "../bridge/adapter.js";
 export { OpenClawAdapter } from "../bridge/openclaw-adapter.js";
 export { StdioAdapter } from "../bridge/stdio-adapter.js";
 
-import { BridgeCore } from "../bridge/core.js";
+import { BridgeCore, resolveBridgeAgentId } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
@@ -55,7 +55,7 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
 
   const adapter = new OpenClawAdapter(adapterConfig);
   const core = new BridgeCore(adapter, {
-    bridgeAgentId: config.bridgeAgentId ?? "openclaw-bridge",
+    bridgeAgentId: resolveBridgeAgentId("openclaw", config.bridgeAgentId),
     mailDir: config.mailDir,
     defaultAgentId: config.defaultAgentId,
   });
