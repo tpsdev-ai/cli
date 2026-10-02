@@ -70,7 +70,8 @@ under [Known limits](#known-limits).
   `../../scripts/reviewer/per-job-isolation-checks.sh` — the container-level
   checks for this: two jobs linked by `needs`, the first changing a tracked
   file, `.git` state (a ref and the index) and leaving a detached (`setsid`)
-  process; the second must see none of it.
+  process; the second checks the original tracked file, absent ref and staged
+  entry, and no heartbeat growth over one second.
 - `../../scripts/reviewer/ci-job.mjs` — bounds the workflow (256 KiB, 50,000
   YAML nodes counting every alias use, 32 levels), parses it (YAML 1.2 core
   schema), requires printable-ASCII keys, and requires a `pull_request` trigger

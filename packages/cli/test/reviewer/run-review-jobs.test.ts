@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cloneArgs, containerArgs, gitRunner, runReviewJobs } from "../../../../scripts/reviewer/run-review-jobs.mjs";
+import { checkFreshClone } from "../../../../scripts/reviewer/reviewer-launch.mjs";
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
@@ -207,13 +208,26 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     }
   });
 
+  test("a launcher that exits 0 with ok:false, job-ok and the right job is not a pass", async () => {
+    publish();
+    const d = fakeDocker({ build: { ok: false, status: "job-ok", job: "build" } });
+    const r = await drive((args) => {
+      const result = d.run(args);
+      return args[0] === "exec" ? { ...result, status: 0 } : result;
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.kind).toBe("job-failed");
+    expect(d.seen.execs).toEqual(["build"]);
+    expect(d.seen.removed).toEqual(["cid1"]);
+  });
+
   test("a timed-out exec's captured stderr reaches the refusal's output", async () => {
     publish();
     const partial = "step 2: running the build\n";
     const docker = (args: string[]) => {
       if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
       if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
-      if (args[0] === "exec") return { status: null, stdout: "", stderr: partial };
+      if (args[0] === "exec") return { status: null, errorCode: "ETIMEDOUT", stdout: "", stderr: partial };
       return { status: 0, stdout: "", stderr: "" };
     };
     const r = await drive(docker);
@@ -233,10 +247,11 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     const probe = join(root, "docker-runner-probe.mjs");
     const driver = fileURLToPath(new URL("../../../../scripts/reviewer/run-review-jobs.mjs", import.meta.url));
     writeFileSync(probe, `import { dockerRunner } from ${JSON.stringify(driver)};\nconsole.log(JSON.stringify(dockerRunner(["exec", "cid", "launcher"], { timeoutMs: 1500 })));\n`);
-    const r = spawnSync(process.execPath, [probe], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, timeout: 30_000 });
+    const r = spawnSync("node", [probe], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, timeout: 30_000 });
     expect(r.status).toBe(0);
-    const out = JSON.parse(r.stdout.trim()) as { status: unknown; stderr: string };
+    const out = JSON.parse(r.stdout.trim()) as { status: unknown; errorCode?: string; stderr: string };
     expect(out.status).toBe(null);
+    expect(out.errorCode).toBe("ETIMEDOUT");
     expect(out.stderr).toContain("partial stderr from the sandbox");
     expect(out.stderr).toContain("ETIMEDOUT");
   });
@@ -246,8 +261,45 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     // kills it, so the capture and the timeout error both exist.
     const r = gitRunner(["-c", "alias.blk=!printf 'partial git stderr\\n' >&2; exec sleep 30", "blk"], { timeoutMs: 1500 });
     expect(r.status).toBe(null);
+    expect(r.errorCode).toBe("ETIMEDOUT");
     expect(r.stderr).toContain("partial git stderr");
     expect(r.stderr).toContain("ETIMEDOUT");
+  });
+
+  test("a docker buffer error retains its code and stderr and is not diagnosed as a timeout", async () => {
+    publish();
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "docker"), "#!/bin/sh\nprintf 'partial buffer stderr\\n' >&2\nexec /usr/bin/head -c 20000000 /dev/zero\n", { mode: 0o755 });
+    const probe = join(root, "docker-buffer-probe.mjs");
+    const driver = fileURLToPath(new URL("../../../../scripts/reviewer/run-review-jobs.mjs", import.meta.url));
+    writeFileSync(probe, `import { dockerRunner } from ${JSON.stringify(driver)};\nconst { status, errorCode, stderr } = dockerRunner(["exec", "cid", "launcher"], { timeoutMs: 3000 });\nconsole.log(JSON.stringify({ status, errorCode, stderr }));\n`);
+    const child = spawnSync("node", [probe], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, timeout: 10_000 });
+    expect(child.status).toBe(0);
+    const out = JSON.parse(child.stdout.trim());
+    expect(out.status).toBe(null);
+    expect(out.errorCode).toBe("ENOBUFS");
+    expect(out.stderr).toContain("partial buffer stderr");
+    expect(out.stderr).toContain("ENOBUFS");
+    const d = fakeDocker();
+    const r = await drive((args) => args[0] === "exec" ? { ...out, stdout: "" } : d.run(args));
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("container-exec");
+      expect(r.refusal.message).toContain("ENOBUFS");
+      expect(r.refusal.message).not.toContain("did not finish within");
+      expect(r.refusal.output).toBe(out.stderr);
+    }
+    expect(d.seen.removed).toEqual(["cid1"]);
+    expect(existsSync(join(scratch, "build"))).toBe(false);
+  });
+
+  test("a git buffer error retains its code and stderr", () => {
+    const r = gitRunner(["-c", "alias.flood=!printf 'partial git buffer stderr\\n' >&2; exec /usr/bin/head -c 20000000 /dev/zero", "flood"], { timeoutMs: 3000 });
+    expect(r.status).toBe(null);
+    expect(r.errorCode).toBe("ENOBUFS");
+    expect(r.stderr).toContain("partial git buffer stderr");
+    expect(r.stderr).toContain("ENOBUFS");
   });
 
   test("a job-ok verdict that names another job is not a pass", async () => {
@@ -310,6 +362,24 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     expect(cloneArgs({ source: "/s", dir: "/d", depth: 1 })).toContain("--depth");
     expect(cloneArgs({ source: "/s", dir: "/d", depth: 1 }).slice(0, 3)).toEqual(["clone", "--quiet", "--depth"]);
     expect(cloneArgs({ source: "/s", dir: "/d", depth: 0 })).toEqual(["clone", "--quiet", "file:///s", "/d"]);
+  });
+
+  test("depth 1 clones pass the clean-clone check when the source head is tagged", async () => {
+    publish();
+    expect(git(source, "tag", "head-tag", "HEAD").status).toBe(0);
+    expect(git(source, "rev-parse", "head-tag").stdout).toBe(git(source, "rev-parse", "HEAD").stdout);
+    const checked: string[] = [];
+    const d = fakeDocker({}, (job, dir) => {
+      expect(checkFreshClone({ workspace: dir, env: GIT_ENV(), fetchDepth: 1 })).toEqual({ ok: true });
+      expect(git(dir, "tag", "--list").stdout).toBe("");
+      checked.push(job);
+    });
+    expect((await drive(d.run)).ok).toBe(true);
+    expect(checked).toEqual(["build", "review"]);
+    const full = join(root, "full");
+    expect(gitRunner(cloneArgs({ source, dir: full, depth: 0 })).status).toBe(0);
+    expect(checkFreshClone({ workspace: full, env: GIT_ENV(), fetchDepth: 0 })).toEqual({ ok: true });
+    expect(git(full, "tag", "--list").stdout.trim()).toBe("head-tag");
   });
 
   test("a job whose need fails is skipped: the dependent never runs, and the build is not ok", async () => {

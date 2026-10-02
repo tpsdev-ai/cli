@@ -50,20 +50,20 @@ const refuse = (kind, message, output) => ({ ok: false, refusal: output ? { kind
 /** The default docker runner: one argv, a hard timeout, stdout and stderr captured (up to 16 MiB each). */
 export function dockerRunner(args, { timeoutMs = 120_000 } = {}) {
   const r = spawnSync("docker", args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
+  if (r.error) return { status: null, errorCode: r.error.code, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 /** The default git runner (read-only against the source). */
 export function gitRunner(args, { timeoutMs = 120_000 } = {}) {
   const r = spawnSync("/usr/bin/git", args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
+  if (r.error) return { status: null, errorCode: r.error.code, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 /** `git clone` args for a fresh depth-1 (or full) clone of the source. */
 export function cloneArgs({ source, dir, depth }) {
-  const shallow = depth === 0 ? [] : ["--depth", "1"];
+  const shallow = depth === 0 ? [] : ["--depth", "1", "--no-tags"];
   return ["clone", "--quiet", ...shallow, `file://${source}`, dir];
 }
 
@@ -147,7 +147,9 @@ function runOneJob({ job, source, scratch, image, workflow, base, docker, git })
       output = exec.stderr ?? "";
       execStatus = exec.status;
       if (exec.status === null) {
-        result = { ok: false, kind: "container-timeout", message: `job ${job.id}: the sandbox container did not finish within ${Math.round(timeoutMs / 1000)} s` };
+        result = exec.errorCode === "ETIMEDOUT"
+          ? { ok: false, kind: "container-timeout", message: `job ${job.id}: the sandbox container did not finish within ${Math.round(timeoutMs / 1000)} s` }
+          : { ok: false, kind: "container-exec", message: `job ${job.id}: the sandbox exec failed (${exec.errorCode ?? "unknown error"})` };
       } else {
         const verdict = lastJsonLine(exec.stdout);
         result =

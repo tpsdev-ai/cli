@@ -294,7 +294,8 @@ jobs:
       # cli#435 — each job of a `needs` closure gets a fresh isolated tree and
       # process space: one sandbox container per job, from a fresh clone of a
       # read-only source. Job 1 changes a tracked file, `.git` state and leaves
-      # a detached (setsid) process; job 2 must see none of it.
+      # a detached (setsid) process. Job 2 checks the original tracked file,
+      # absent ref and staged entry, and no heartbeat growth over one second.
       - name: Per-job isolation checks (cli#435)
         run: |
           set -euo pipefail

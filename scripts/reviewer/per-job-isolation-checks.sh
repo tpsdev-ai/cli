@@ -9,10 +9,11 @@
 #            heartbeat into a shared evidence directory;
 #   review — needs: build. It records what it sees of build's changes: git
 #            status, the tracked file, the new ref, the index, and whether the
-#            heartbeat is still growing (the process is still alive).
+#            heartbeat is still growing.
 # The host driver (run-review-jobs.mjs) runs one sandbox container per job, from
-# a fresh clone of a read-only bare source. review must see a pristine tree and
-# a dead heartbeat. The shared evidence directory is the fixture's own: the
+# a fresh clone of a read-only bare source. review checks the original tracked
+# file, absent ref and staged entry, and no heartbeat growth over one second.
+# The shared evidence directory is the fixture's own: the
 # production driver attaches no host mount beyond each job's clone, so the
 # fixture adds that one bind through the driver's injected docker runner (see
 # the harness below). The driver's workflow parser (js-yaml) is taken from the
@@ -179,7 +180,7 @@ if [ -f "$obs" ]; then
     fail "job 2 tracked file: $(grep '^tracked=' "$obs")"
   fi
   if grep -qx 'job1ref=absent' "$obs"; then
-    pass "job 2's .git has none of job 1's refs"
+    pass "job 2 has no refs/heads/job1-marker"
   else
     fail "job 2 ref: $(grep '^job1ref=' "$obs")"
   fi
@@ -191,7 +192,7 @@ if [ -f "$obs" ]; then
   before="$(sed -n 's/^alive_before=//p' "$obs")"
   after="$(sed -n 's/^alive_after=//p' "$obs")"
   if [ -n "$before" ] && [ "$before" != "0" ] && [ "$before" = "$after" ]; then
-    pass "job 1's detached (setsid) process wrote into the shared evidence directory and is not writing while job 2 observes it (heartbeat ${before} bytes, unchanged over 1 s)"
+    pass "job 1 wrote a heartbeat; its size is unchanged over job 2's 1 s observation (${before} bytes)"
   else
     fail "job 1's detached process: before=${before:-?} after=${after:-?} (0 means the probe never wrote; a change means it survived into job 2)"
   fi
