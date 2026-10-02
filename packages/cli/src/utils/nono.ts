@@ -21,8 +21,9 @@
  *   - A non-interactive invocation that launches an agent MUST carry
  *     `--sandbox-required`; a launcher that dropped it is refused rather than
  *     silently running unsandboxed. See `evaluateLaunchControl`.
- *   - `--sandbox-required` is itself REFUSED on `agent start --runtime
- *     claude-code|codex|gemini`: those runtimes are spawned directly and never
+ *   - an `agent start --runtime claude-code|codex|gemini` invocation carrying
+ *     `--sandbox-required` is refused, by this rule unless an earlier one
+ *     already refused it: those runtimes are spawned directly and never
  *     reach the attested launch, so the flag would assert an isolation that
  *     path cannot deliver (cli#363 slice A; routing them through the attested
  *     launch is slice B).

@@ -13,7 +13,9 @@
  * `runAgent`, and spawns the runtime directly — so it never arrives here and is
  * NOT confined by nono. `launchesAgent()` (`nono.ts`) still keys on the command
  * name, so that path still reads as an agent launch to the gate; the gate
- * therefore REFUSES `--sandbox-required` on it (cli#363 slice A), because the
+ * therefore refuses an invocation carrying `--sandbox-required` on it before
+ * dispatch, unless an earlier launch control has already refused it (cli#363
+ * slice A), because the
  * flag asserts an isolation the path cannot deliver. Do not read "every launch
  * through `tps agent start`" anywhere in this file or the release notes as
  * covering those three runtimes. Routing them through this attestation is
