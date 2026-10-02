@@ -1,37 +1,24 @@
 /**
- * approval-evidence.ts — the host-side record of a review's build/test run.
- *
- * `APPROVE` requires one, for the same repository, pull request, dispatch,
- * reviewer, session and full commit; `REQUEST_CHANGES` and `COMMENT` do not.
- * A record binds those fields, the commands of the review build with their exit
- * statuses and their roles, and the run's start and finish times, under a
- * SHA-256 over those fields AND an HMAC-SHA256 over the same bytes with a
- * HOST-HELD key the sandbox cannot read (see the plugin README for the key's
- * path and why it is unreachable from the sandbox).
- *
- * It is written HOST-SIDE, by the process that runs the review build (see
- * approval-driver.ts). `github_review` re-computes the digest and re-computes
- * the HMAC, so a record edited after it was written fails the digest, and one
- * rewritten with a matching digest still fails the HMAC unless the editor holds
- * the host key.
+ * approval-evidence.ts — the record `APPROVE` requires, for the same
+ * repository, pull request, dispatch, reviewer, session and full commit;
+ * `REQUEST_CHANGES` and `COMMENT` do not. scripts/reviewer/run-review-jobs.mjs
+ * writes it (scripts/reviewer/approval-evidence.mjs) under a SHA-256 and an
+ * HMAC-SHA256 over the same bytes with a host-held key.
  */
 
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { readJsonStore, writeJsonStore } from "./durable-file.js";
-import { withStoreLock } from "./store-lock.js";
+import { readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readJsonStore } from "./durable-file.js";
 import type { RefusalReason } from "./types.js";
 
-export const APPROVAL_EVIDENCE_VERSION = 1;
+export const APPROVAL_EVIDENCE_VERSION = 2;
 
-/** What a command contributed to the run. `build` and `test` are the stages
- *  `github_review` requires; every other planned step is `other`. */
-export type ApprovalCommandRole = "build" | "test" | "other";
-
-/** One executed command of the review build, its stage and its exit status. */
-export interface ApprovalCommand {
-  command: string;
-  role: ApprovalCommandRole;
+/** One job of the selected CI job's `needs` closure: its planned `run:`
+ *  scripts and its launcher's exit status. */
+export interface ApprovalJob {
+  job: string;
+  commands: string[];
   exitCode: number;
 }
 
@@ -44,9 +31,13 @@ export interface ApprovalEvidenceRecord {
   reviewer: string;
   sessionKey: string;
   commit: string;
+  /** The selected CI workflow and job. */
+  workflow: string;
+  job: string;
   startedAt: string;
   finishedAt: string;
-  commands: ApprovalCommand[];
+  /** The closure, dependencies first; the selected job is last. */
+  jobs: ApprovalJob[];
   digest: string;
   mac: string;
 }
@@ -63,12 +54,18 @@ export interface ApprovalEvidenceBinding {
   commit: string;
 }
 
+/** The CI job `APPROVE` requires the record to be for. */
+export interface ApprovalCiJob {
+  workflow: string;
+  job: string;
+}
+
 /** The exact bytes the digest and the HMAC cover: the bound fields, in a fixed
  *  order. */
 export function approvalEvidenceBytes(fields: ApprovalEvidenceFields): string {
-  const commands = Array.isArray(fields.commands)
-    ? fields.commands.map((c) => ({ command: c.command, role: c.role, exitCode: c.exitCode }))
-    : fields.commands;
+  const jobs = Array.isArray(fields.jobs)
+    ? fields.jobs.map((j) => ({ job: j?.job, commands: j?.commands, exitCode: j?.exitCode }))
+    : fields.jobs;
   return JSON.stringify({
     version: fields.version,
     repo: fields.repo,
@@ -77,9 +74,11 @@ export function approvalEvidenceBytes(fields: ApprovalEvidenceFields): string {
     reviewer: fields.reviewer,
     sessionKey: fields.sessionKey,
     commit: fields.commit,
+    workflow: fields.workflow,
+    job: fields.job,
     startedAt: fields.startedAt,
     finishedAt: fields.finishedAt,
-    commands,
+    jobs,
   });
 }
 
@@ -101,28 +100,51 @@ export function readHostKey(file: string): Buffer {
   return key;
 }
 
-/** Build a record from the host's observed fields, computing its digest and
- *  its keyed MAC. */
-export function buildApprovalEvidence(
-  input: {
-    repo: string;
-    pr: number;
-    dispatchId: string;
-    reviewer: string;
-    sessionKey: string;
-    commit: string;
-    startedAt: string;
-    finishedAt: string;
-    commands: ApprovalCommand[];
-  },
-  key: Buffer,
-): ApprovalEvidenceRecord {
-  const fields: ApprovalEvidenceFields = { version: APPROVAL_EVIDENCE_VERSION, ...input };
-  return { ...fields, digest: approvalEvidenceDigest(fields), mac: approvalEvidenceMac(fields, key) };
+/** The path with every symlink in its existing prefix resolved. */
+function resolveExisting(path: string): string {
+  let head = resolve(path);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      return join(realpathSync(head), ...tail.reverse());
+    } catch (err) {
+      if ((err as { code?: unknown }).code !== "ENOENT") throw err;
+    }
+    const parent = dirname(head);
+    if (parent === head) return resolve(path);
+    tail.push(basename(head));
+    head = parent;
+  }
+}
+
+const within = (root: string, path: string): boolean => {
+  const rel = relative(root, path);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+/** The first of `paths` that is at or under one of `roots` (each compared as
+ *  given and with symlinks resolved), or that has a second hard link; null
+ *  when none is. Throws when a path cannot be resolved. */
+export function reachablePath(paths: string[], roots: string[]): { path: string; root: string } | null {
+  const rootForms = roots.flatMap((r) => [resolve(r), resolveExisting(r)]);
+  for (const p of paths) {
+    for (const form of [resolve(p), resolveExisting(p)]) {
+      const root = rootForms.find((r) => within(r, form));
+      if (root !== undefined) return { path: p, root };
+    }
+    let nlink = 1;
+    try {
+      nlink = statSync(p).nlink;
+    } catch (err) {
+      if ((err as { code?: unknown }).code !== "ENOENT") throw err;
+    }
+    if (nlink !== 1) return { path: p, root: "(a second hard link)" };
+  }
+  return null;
 }
 
 /** Structural check for a stored entry. It is deliberately loose about the
- *  command list and the timestamps: a record the digest will reject must still
+ *  job list and the timestamps: a record the digest will reject must still
  *  LOAD, so the handler can report it as invalid rather than as an unreadable
  *  store. */
 function isRecord(v: unknown): v is ApprovalEvidenceRecord {
@@ -136,9 +158,11 @@ function isRecord(v: unknown): v is ApprovalEvidenceRecord {
     typeof o.reviewer === "string" &&
     typeof o.sessionKey === "string" &&
     typeof o.commit === "string" &&
+    typeof o.workflow === "string" &&
+    typeof o.job === "string" &&
     typeof o.startedAt === "string" &&
     typeof o.finishedAt === "string" &&
-    Array.isArray(o.commands) &&
+    Array.isArray(o.jobs) &&
     typeof o.digest === "string" &&
     typeof o.mac === "string"
   );
@@ -198,38 +222,36 @@ export class FileApprovalEvidenceStore implements ApprovalEvidenceStore {
   }
 }
 
-/** HOST: record one build's evidence. Upserts by the bound fields, durably,
- *  under the store lock; throws when it cannot write. */
-export function writeApprovalEvidence(file: string, record: ApprovalEvidenceRecord): void {
-  withStoreLock(file, "approval-evidence write", () => {
-    const kept = readApprovalEvidence(file).filter((a) => !sameBinding(a, record));
-    kept.push(record);
-    writeJsonStore(file, { approvals: kept });
-  });
-}
-
 export type ApprovalEvidenceVerdict =
   | { ok: true; digest: string }
   | { ok: false; reason: RefusalReason; state: string; remedy: string };
 
 const RERECORD = "run the review build on the host and record its evidence for this dispatch, then approve again";
 
-/** An ISO-8601 instant, or null. */
-function isoInstant(value: string): number | null {
+const ISO_INSTANT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+
+/** An ISO-8601 instant with a time and a zone whose fields name a real
+ *  calendar date and time, or null. */
+export function parseIsoInstant(value: string): number | null {
+  const m = ISO_INSTANT.exec(value);
+  if (!m) return null;
+  const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mo - 1];
+  if (days === undefined || d < 1 || d > days || h > 23 || mi > 59 || s > 59) return null;
+  if (m[7] !== undefined && (Number(m[7]) > 23 || Number(m[8]) > 59)) return null;
   const ms = Date.parse(value);
-  if (!Number.isFinite(ms)) return null;
-  // Date.parse accepts a date-only string; require a full instant with a time.
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) ? ms : null;
+  return Number.isFinite(ms) ? ms : null;
 }
 
-/** Check one record against the binding and the host key. In order: the record
- *  is intact (its digest matches), it is authenticated (its HMAC matches),
- *  its timestamps are a valid ordered pair of instants, it lists commands with
- *  exit statuses INCLUDING one build and one test, no command failed, and it is
- *  for this repository, PR, dispatch, reviewer, session and commit. */
+/** Check one record against the binding, the selected CI job and the host key.
+ *  In order: the digest, the HMAC, the timestamps, the job list, the exit
+ *  statuses, the CI job, and the repository, PR, dispatch, reviewer, session
+ *  and commit. */
 export function validateApprovalEvidence(
   record: ApprovalEvidenceRecord,
   binding: ApprovalEvidenceBinding,
+  ciJob: ApprovalCiJob,
   key: Buffer,
 ): ApprovalEvidenceVerdict {
   if (!isRecord(record)) {
@@ -262,11 +284,11 @@ export function validateApprovalEvidence(
       remedy: RERECORD,
     };
   }
-  const started = isoInstant(record.startedAt);
+  const started = parseIsoInstant(record.startedAt);
   if (started === null) {
     return { ok: false, reason: "approval_evidence_incomplete", state: "the approval-evidence record has no valid start time", remedy: RERECORD };
   }
-  const finished = isoInstant(record.finishedAt);
+  const finished = parseIsoInstant(record.finishedAt);
   if (finished === null) {
     return { ok: false, reason: "approval_evidence_incomplete", state: "the approval-evidence record has no valid finish time", remedy: RERECORD };
   }
@@ -278,37 +300,50 @@ export function validateApprovalEvidence(
       remedy: RERECORD,
     };
   }
-  if (record.commands.length === 0) {
-    return { ok: false, reason: "approval_evidence_incomplete", state: "the approval-evidence record lists no command", remedy: RERECORD };
+  if (record.jobs.length === 0) {
+    return { ok: false, reason: "approval_evidence_incomplete", state: "the approval-evidence record lists no job", remedy: RERECORD };
   }
-  for (const c of record.commands) {
-    if (typeof c?.command !== "string" || c.command === "" || typeof c.role !== "string" || !Number.isInteger(c.exitCode)) {
+  for (const j of record.jobs) {
+    if (
+      typeof j?.job !== "string" ||
+      j.job === "" ||
+      !Array.isArray(j.commands) ||
+      j.commands.length === 0 ||
+      !j.commands.every((c) => typeof c === "string" && c !== "") ||
+      !Number.isInteger(j.exitCode)
+    ) {
       return {
         ok: false,
         reason: "approval_evidence_incomplete",
-        state: "a command in the approval-evidence record has no exit status",
+        state: "a job in the approval-evidence record has no command or no exit status",
         remedy: RERECORD,
       };
     }
   }
-  const failed = record.commands.find((c) => c.exitCode !== 0);
+  const failed = record.jobs.find((j) => j.exitCode !== 0);
   if (failed) {
     return {
       ok: false,
       reason: "approval_evidence_failed",
-      state: `the review build's command "${failed.command}" exited ${failed.exitCode}`,
-      remedy: "a passing build and test run of this commit is required before an APPROVE",
+      state: `the review build's job "${failed.job}" exited ${failed.exitCode}`,
+      remedy: "a passing review build of this commit is required before an APPROVE",
     };
   }
-  for (const role of ["build", "test"] as const) {
-    if (!record.commands.some((c) => c.role === role)) {
-      return {
-        ok: false,
-        reason: "approval_evidence_incomplete",
-        state: `the approval-evidence record lists no ${role} command`,
-        remedy: RERECORD,
-      };
-    }
+  if (record.workflow !== ciJob.workflow || record.job !== ciJob.job) {
+    return {
+      ok: false,
+      reason: "approval_evidence_mismatch",
+      state: "the approval-evidence record is not for the configured CI workflow and job",
+      remedy: "record the configured CI job's review build for this dispatch, then approve again",
+    };
+  }
+  if (record.jobs[record.jobs.length - 1]!.job !== record.job) {
+    return {
+      ok: false,
+      reason: "approval_evidence_incomplete",
+      state: "the approval-evidence record does not end with the selected CI job",
+      remedy: RERECORD,
+    };
   }
   if (!sameBinding(record, binding)) {
     return {

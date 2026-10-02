@@ -27,7 +27,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readHostKey, validateApprovalEvidence, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
+import { reachablePath, readHostKey, validateApprovalEvidence, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
 import { buildOrgEvent } from "./audit.js";
 import type { CredentialCustody } from "./credential.js";
 import type { DispatchLedger } from "./dispatch-ledger.js";
@@ -267,29 +267,45 @@ function latchedRefusal(record: LatchRecord, actor: string): Outcome {
   );
 }
 
-/** `APPROVE`'s evidence gate: a host-recorded, authenticated, passing build/test
- *  run for this repository, PR, dispatch, reviewer, session and commit. Returns
- *  the record's digest, or the refusal. `REQUEST_CHANGES` and `COMMENT` never
- *  call it. */
+/** `APPROVE`'s evidence gate (approval-evidence.ts). Returns the record's
+ *  digest, or the refusal. `REQUEST_CHANGES` and `COMMENT` never call it. */
 function approvalEvidenceGate(
   deps: HandlerDeps,
   binding: { repo: string; pr: number; dispatchId: string; reviewer: string; sessionKey: string; commit: string },
 ): { ok: true; digest: string } | { ok: false; refusal: Outcome } {
   const actor = binding.reviewer;
-  if (!deps.config.approvalEvidenceFile || !deps.config.approvalEvidenceKeyFile) {
+  const { approvalEvidenceFile, approvalEvidenceKeyFile, approvalCiWorkflow, approvalCiJob, sandboxMountRoots } = deps.config;
+  if (!approvalEvidenceFile || !approvalEvidenceKeyFile || !approvalCiWorkflow || !approvalCiJob || sandboxMountRoots.length === 0) {
     return {
       ok: false,
       refusal: refuse(
         "approval_evidence_unconfigured",
         actor,
-        "no approval-evidence file or host key is configured",
-        "configure approvalEvidenceFile and approvalEvidenceKeyFile on the host and record the review build's evidence before approving",
+        "the approval-evidence file, host key, CI workflow and job, and sandbox mount roots are not all configured",
+        "configure approvalEvidenceFile, approvalEvidenceKeyFile, approvalCiWorkflow, approvalCiJob and sandboxMountRoots on the host before approving",
+      ),
+    };
+  }
+  let reachable: { path: string; root: string } | null;
+  try {
+    reachable = reachablePath([approvalEvidenceFile, approvalEvidenceKeyFile], sandboxMountRoots);
+  } catch {
+    reachable = { path: "", root: "" };
+  }
+  if (reachable) {
+    return {
+      ok: false,
+      refusal: refuse(
+        "approval_evidence_reachable",
+        actor,
+        "the approval-evidence file or host key is not shown to be outside every sandbox mount root",
+        "move approvalEvidenceFile and approvalEvidenceKeyFile outside every path in sandboxMountRoots, with one link each",
       ),
     };
   }
   let key: Buffer;
   try {
-    key = readHostKey(deps.config.approvalEvidenceKeyFile);
+    key = readHostKey(approvalEvidenceKeyFile);
   } catch {
     return {
       ok: false,
@@ -327,7 +343,7 @@ function approvalEvidenceGate(
       ),
     };
   }
-  const verdict = validateApprovalEvidence(lookup.record, binding, key);
+  const verdict = validateApprovalEvidence(lookup.record, binding, { workflow: approvalCiWorkflow, job: approvalCiJob }, key);
   if (!verdict.ok) return { ok: false, refusal: refuse(verdict.reason, actor, verdict.state, verdict.remedy) };
   return { ok: true, digest: verdict.digest };
 }
@@ -411,8 +427,7 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
     );
   }
 
-  // ── APPROVE requires a passing build/test record for this reviewer, session
-  //    and commit. REQUEST_CHANGES and COMMENT are unaffected. ──
+  // ── APPROVE requires the evidence record (approvalEvidenceGate). ──
   let approvalEvidenceSha256: string | null = null;
   if (event === "APPROVE") {
     const evidence = approvalEvidenceGate(deps, {

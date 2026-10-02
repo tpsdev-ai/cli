@@ -254,7 +254,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
   // Boot: catch up on any topic messages missed while offline
   try {
-    const caught = catchUpTopics(agentId);
+    const caught = await catchUpTopics(agentId, undefined, mailCfg);
     if (caught > 0) {
       slog(`[${agentId}] Caught up ${caught} missed topic message(s) on boot`);
     }

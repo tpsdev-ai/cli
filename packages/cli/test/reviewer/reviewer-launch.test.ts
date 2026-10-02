@@ -2,13 +2,13 @@
  * reviewer-launch.test.ts — the trusted launcher (cli#425 acceptance A2, A3,
  * A9): the host assignment and its override refusal, the allowlisted child
  * environment with a fixed PATH, runtime verification with fixed binaries, the
- * worktree checks (symlinked lockfiles and directories before and after every
+ * worktree checks (symlinked lockfiles and directories before and after the
  * job, bounded reads, the git configuration baseline and hooks, the fresh-clone
  * check checkout's skip relies on, resolved working directories), timeouts and
- * leftover processes, and the review build end to end — the needs closure,
- * real bash steps — on depth-1 clones of a temporary source repository, with
- * temporary trusted/scratch directories in place of /opt/reviewer and
- * /tmp/review.
+ * leftover processes, and the review build of the ONE job the host names, end
+ * to end — real bash steps — on depth-1 clones of a temporary source
+ * repository, with temporary trusted/scratch directories in place of
+ * /opt/reviewer and /tmp/review.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -40,11 +40,9 @@ import {
   hostAssignment,
   inspectGitConfig,
   PASSTHROUGH_KEYS,
-  pinDrift,
   probeActualVersions,
   readBoundedFile,
   readCreationEnv,
-  removeCreatedPaths,
   reviewBuild,
   runSteps,
   scanWorkspace,
@@ -62,6 +60,7 @@ const launcher = resolve(repo, "scripts", "reviewer", "reviewer-launch.mjs");
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
+const SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const SOCKET = "socketdev/action@ba6de6cc0565af1f42295590380973573297e31f";
 
 /** Parent-environment values that must never reach a step. */
@@ -397,9 +396,6 @@ const inspectNoSystem = (a: { workspace: string; env: Record<string, string> }) 
   inspectGitConfig({ ...a, env: { ...a.env, GIT_CONFIG_NOSYSTEM: "1" } });
 const freshNoSystem = (a: { workspace: string; env: Record<string, string>; fetchDepth: number }) =>
   checkFreshClone({ ...a, env: { ...a.env, GIT_CONFIG_NOSYSTEM: "1" } });
-/** A checkout step, for jobs added before `review`. */
-const CO = `      - uses: ${CHECKOUT}\n`;
-
 /** A pull_request workflow whose `review` job runs the given step lines; `jobs` adds jobs before it. Written to the source repo. */
 function writeWorkspace(nodeRange: string, steps: string, { jobExtra = "", jobs = "", env = "", checkoutWith = "" } = {}) {
   writeFileSync(join(src, "package.json"), JSON.stringify({ name: "fixture", private: true, packageManager: "bun@1.3.10", engines: { node: nodeRange } }));
@@ -475,7 +471,7 @@ describe("A2/A3 — the review build", () => {
     const r = await build();
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.status).toBe("review-build-ok");
+    expect(r.status).toBe("job-ok");
     expect(r.image).toBe("reviewer-node22-bun1310");
     expect(r.base).toBe("main");
     expect(r.jobs).toHaveLength(1);
@@ -522,6 +518,30 @@ describe("A2/A3 — the review build", () => {
       expect(r.refusal.message).toContain("resolves to reviewer-node24-bun1310");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a step planned on the default node before a setup-node pin refuses (node-mismatch) before anything runs", async () => {
+    writeWorkspace(
+      "22.x",
+      `      - run: echo ran > review-marker\n        name: early\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "22.22.1"\n      - run: echo ran > late-marker\n`,
+    );
+    let steps = 0;
+    const r = await build({ runStep: async () => ++steps });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("node-mismatch");
+      expect(r.refusal.message).toBe("job review step 3 (early) is planned on node default but the image's node is 22.22.1");
+    }
+    expect(steps).toBe(0);
+  });
+
+  test("a job whose steps all follow its setup-node pin of the image's node runs every step", async () => {
+    writeWorkspace("22.x", `      - uses: ${SETUP_NODE}\n        with:\n          node-version: "22.22.1"\n      - run: echo one > order\n      - run: echo two >> order\n`);
+    const r = await build();
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.jobs[0].steps.map((s: { code?: number }) => s.code)).toEqual([0, 0]);
+    expect(readFileSync(join(workspace, "order"), "utf8")).toBe("one\ntwo\n");
   });
 
   test("the actual runtime is measured with the CHILD env and must match; a mismatch runs nothing", async () => {
@@ -701,16 +721,6 @@ describe("A2/A3 — the review build", () => {
     if (!missing.ok) expect(missing.refusal.kind).toBe("git-config-unreadable");
   });
 
-  test("pinDrift names HEAD and each remote key whose values changed, and nothing else", () => {
-    const before = { head: "a", remotes: ["remote.origin.fetch +refs/heads/main:refs/remotes/origin/main", "remote.origin.url file:///src"] };
-    expect(pinDrift(before, { ...before })).toEqual([]);
-    expect(pinDrift(before, { ...before, head: "b" })).toEqual(["HEAD"]);
-    expect(pinDrift(before, { head: "a", remotes: [before.remotes[0], "remote.origin.url ssh://x"] })).toEqual(["remote.origin.url"]);
-    expect(pinDrift(before, { head: "a", remotes: [...before.remotes, "remote.origin.fetch +refs/*:refs/*"] })).toEqual(["remote.origin.fetch"]);
-    expect(pinDrift(before, { head: "a", remotes: [...before.remotes, "remote.evil.url file:///x"] })).toEqual(["remote.evil.url"]);
-    expect(pinDrift(before, { head: "a", remotes: [before.remotes[1]] })).toEqual(["remote.origin.fetch"]);
-  });
-
   test("checkFreshClone cannot verify a worktree whose git metadata is unreachable, and refuses", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
     const r = checkFreshClone({ workspace, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
@@ -730,45 +740,6 @@ describe("A2/A3 — the review build", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal.message).toContain("sets GH_TOKEN");
     expect(existsSync(join(workspace, "leaked"))).toBe(false);
-  });
-
-  test("a job whose needed guard fails does not run, and the build is not ok", async () => {
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-      jobExtra: "    needs: guard\n",
-      jobs: `  guard:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: exit 3\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.refusal.kind).toBe("stage-failed");
-      expect(r.refusal.message).toBe("job guard: step 2 (run 2) exited 3");
-      expect(r.jobs.at(-1)).toEqual({ job: "review", skipped: "needs guard, which did not succeed" });
-    }
-    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-  });
-
-  test("the closure runs dependencies first, each job from the worktree as the build found it", async () => {
-    writeFileSync(join(src, "kept"), "pre-existing\n");
-    writeWorkspace("22.x", "      - run: |\n          test ! -e left-behind\n          test ! -e made-dir\n          test -e kept\n          test ! -e \"$HOME/job-home\"\n          echo ran > review-marker\n", {
-      jobExtra: "    needs: build\n",
-      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: |\n          echo x > left-behind\n          mkdir -p made-dir/sub && echo y > made-dir/sub/f\n          echo job-home > "$HOME/job-home"\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.jobs.map((j: { job: string }) => j.job)).toEqual(["build", "review"]);
-    expect(existsSync(join(workspace, "review-marker"))).toBe(true);
-    expect(readFileSync(join(workspace, "kept"), "utf8")).toBe("pre-existing\n");
-  });
-
-  test("a job-level always() still runs after a failed need, and the build is still not ok", async () => {
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-      jobExtra: "    needs: guard\n    if: always()\n",
-      jobs: `  guard:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: exit 3\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.refusal.message).toContain("job guard: step 2");
-    expect(existsSync(join(workspace, "review-marker"))).toBe(true);
   });
 
   test("checkout is skipped only on a fresh clone: an untracked, ignored or modified path refuses before any step", async () => {
@@ -808,21 +779,6 @@ describe("A2/A3 — the review build", () => {
     if (!shallowForFull.ok) expect(shallowForFull.refusal.message).toContain("fetch-depth: 0");
   });
 
-  test("a needed job that modifies a tracked file leaves the next job no fresh clone: refused, the next job never runs", async () => {
-    writeFileSync(join(src, "tracked"), "v1\n");
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-      jobExtra: "    needs: build\n",
-      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: echo v2 > tracked\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.refusal.kind).toBe("not-fresh");
-      expect(r.refusal.message).toContain("tracked");
-    }
-    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-  });
-
   test("a tracked file carrying the assume-unchanged or skip-worktree bit refuses (either hides an edit from git status)", async () => {
     writeFileSync(join(src, "tracked"), "v1\n");
     writeWorkspace("22.x", "      - run: echo ran > review-marker\n");
@@ -839,53 +795,6 @@ describe("A2/A3 — the review build", () => {
         expect(r.refusal.kind).toBe("not-fresh");
         expect(r.refusal.message).toContain("carry the assume-unchanged or skip-worktree bit");
         expect(r.refusal.message).toContain("tracked");
-      }
-      expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-    }
-  });
-
-  test("a needed job that hides an edit behind assume-unchanged leaves the next job refused", async () => {
-    writeFileSync(join(src, "tracked"), "v1\n");
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-      jobExtra: "    needs: build\n",
-      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: git update-index --assume-unchanged tracked && echo v2 > tracked\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.refusal.message).toContain("assume-unchanged or skip-worktree bit");
-    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-  });
-
-  test("a needed job that moves HEAD (an amend keeps git status clean) leaves the next job refused", async () => {
-    writeFileSync(join(src, "tracked"), "v1\n");
-    writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-      jobExtra: "    needs: build\n",
-      jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: echo v2 > tracked && git -c user.name=a -c user.email=a@example.invalid commit -q --amend -a -m amended\n`,
-    });
-    const r = await build();
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.refusal.kind).toBe("not-fresh");
-      expect(r.refusal.message).toContain("the worktree's HEAD changed since the build started");
-    }
-    expect(existsSync(join(workspace, "review-marker"))).toBe(false);
-  });
-
-  test("a needed job that changes a remote URL or refspec leaves the next job refused, naming the key only", async () => {
-    for (const change of [
-      "git remote set-url origin ssh://example.invalid/fixture.git", // passes the baseline value rules; only the pin catches it
-      "git config --add remote.origin.fetch '+refs/*:refs/*'",
-    ]) {
-      writeWorkspace("22.x", "      - run: echo ran > review-marker\n", {
-        jobExtra: "    needs: build\n",
-        jobs: `  build:\n    runs-on: ubuntu-latest\n    steps:\n${CO}      - run: ${change}\n`,
-      });
-      const r = await build();
-      expect(r.ok).toBe(false);
-      if (!r.ok) {
-        expect(r.refusal.kind).toBe("not-fresh");
-        expect(r.refusal.message).toMatch(/the worktree's remote\.origin\.(url|fetch) changed since the build started/);
-        expect(r.refusal.message).not.toContain("example.invalid");
       }
       expect(existsSync(join(workspace, "review-marker"))).toBe(false);
     }
@@ -1050,19 +959,6 @@ describe("bounded reads of the worktree", () => {
     const s = scanWorkspace(workspace);
     expect(s.ok).toBe(false);
     if (!s.ok) expect(s.refusal.message).toContain("bun.lock is not a regular file");
-  });
-
-  test("removeCreatedPaths removes only what was not there before, top-most first", () => {
-    writeFileSync(join(workspace, "old"), "o");
-    const before = scanWorkspace(workspace);
-    mkdirSync(join(workspace, "new-dir", "deep"), { recursive: true });
-    writeFileSync(join(workspace, "new-dir", "deep", "f"), "n");
-    writeFileSync(join(workspace, "new-file"), "n");
-    const now = scanWorkspace(workspace);
-    if (!before.ok || !now.ok) throw new Error("scan failed");
-    expect(removeCreatedPaths(workspace, before.paths, now.paths).sort()).toEqual(["new-dir", "new-file"]);
-    expect(existsSync(join(workspace, "old"))).toBe(true);
-    expect(existsSync(join(workspace, "new-dir"))).toBe(false);
   });
 
   test("containedDirectory resolves symlinks and refuses an escape", () => {

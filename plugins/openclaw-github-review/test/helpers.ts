@@ -9,7 +9,7 @@ import { createHash, generateKeyPairSync, randomBytes, type KeyObject } from "no
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
-import { buildApprovalEvidence, writeApprovalEvidence } from "../src/approval-evidence.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../../../scripts/reviewer/approval-evidence.mjs";
 import { MemoryReconcileStore } from "../src/audit.js";
 import { CredentialCustody } from "../src/credential.js";
 import { resolveConfig, type GithubReviewConfig } from "../src/config.js";
@@ -145,6 +145,9 @@ export function pluginConfigOf(s: Scenario, flairUrl = "http://flair.test.invali
     pendingAuditFile: s.config.pendingAuditFile,
     approvalEvidenceFile: s.config.approvalEvidenceFile,
     approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
+    approvalCiWorkflow: s.config.approvalCiWorkflow,
+    approvalCiJob: s.config.approvalCiJob,
+    sandboxMountRoots: s.config.sandboxMountRoots,
     reconcileFile: s.config.reconcileFile,
     flairUrl,
   };
@@ -282,6 +285,9 @@ export function scenario(
       reconcileFile: join(root, "reconcile.json"),
       approvalEvidenceFile: join(root, "approval-evidence.json"),
       approvalEvidenceKeyFile,
+      approvalCiWorkflow: CI_WORKFLOW,
+      approvalCiJob: CI_JOB,
+      sandboxMountRoots: [join(root, "workspace")],
       sandboxImageDigest: "sha256:deadbeef",
       ...configOverrides,
     },
@@ -293,12 +299,17 @@ export function scenario(
     maxAgeDays: config.provisioningMaxAgeDays,
     clock: () => new Date(),
   });
-  // The host has recorded a passing review build for the standard dispatch,
-  // session and commit. A test overrides this file (or removes the config keys)
-  // to exercise the APPROVE evidence gate.
+  // A passing record for the standard dispatch, session and commit.
   recordEvidence({ config, approvalKey });
   return { config, custody, approvalKey };
 }
+
+export const CI_WORKFLOW = ".github/workflows/test.yml";
+export const CI_JOB = "test";
+export const PASSING_JOBS = [
+  { job: "build", commands: ["bun install --frozen-lockfile", "bun run build"], exitCode: 0 },
+  { job: CI_JOB, commands: ["bun install --frozen-lockfile", "bun run test"], exitCode: 0 },
+];
 
 /** Write a passing, host-signed evidence record for one dispatch (the standard
  *  dispatch by default). */
@@ -322,12 +333,11 @@ export function recordEvidence({
         reviewer: REVIEWER,
         sessionKey: "sess-1",
         commit: COMMIT,
+        workflow: CI_WORKFLOW,
+        job: CI_JOB,
         startedAt: new Date(Date.now() - 60_000).toISOString(),
         finishedAt: new Date().toISOString(),
-        commands: [
-          { command: "bun run build", role: "build", exitCode: 0 },
-          { command: "bun run test", role: "test", exitCode: 0 },
-        ],
+        jobs: PASSING_JOBS,
       },
       approvalKey,
     ),

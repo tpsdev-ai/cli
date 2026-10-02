@@ -343,18 +343,31 @@ async function routeViaDecision(to: string, bound: string[] = []): Promise<strin
 
 /** Route the OUTBOUND adapter path; report the route kind or the failure. */
 async function routeViaOutbound(to: string, bound: string[] = []): Promise<{ ok: boolean; route: string; error?: string }> {
-  const cfg = {
-    channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
-    bindings: bound.map((agentId) => ({ agentId, match: { channel: "tps-mail", accountId: "default" } })),
-  };
-  const res: any = await capturedPlugin.outbound.sendText({
-    cfg,
-    accountId: "default",
-    to,
-    text: "route probe",
-    identity: { agentId: "anvil" },
-  });
-  return res?.ok ? { ok: true, route: res.details.route } : { ok: false, route: "failure", error: String(res?.error ?? "") };
+  // cli#433 (slice B1): the outbound adapter signs through the ONE path, so its
+  // sender needs a key exactly as the dispatcher reply does — this probe routes
+  // and signs; the refusal with no key is covered by the outbound-signing suite.
+  const keysDir = join(root, "keys");
+  mkdirSync(keysDir, { recursive: true });
+  writeFileSync(join(keysDir, "anvil.key"), ANVIL_SEED);
+  const origKeys = process.env.TPS_TEST_KEYS_DIR;
+  process.env.TPS_TEST_KEYS_DIR = keysDir;
+  try {
+    const cfg = {
+      channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
+      bindings: bound.map((agentId) => ({ agentId, match: { channel: "tps-mail", accountId: "default" } })),
+    };
+    const res: any = await capturedPlugin.outbound.sendText({
+      cfg,
+      accountId: "default",
+      to,
+      text: "route probe",
+      identity: { agentId: "anvil" },
+    });
+    return res?.ok ? { ok: true, route: res.details.route } : { ok: false, route: "failure", error: String(res?.error ?? "") };
+  } finally {
+    if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+    else process.env.TPS_TEST_KEYS_DIR = origKeys;
+  }
 }
 
 interface DispatchOutcome {

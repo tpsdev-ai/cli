@@ -17,6 +17,7 @@ export type {
 
 // I/O
 export { MailClient } from "./io/mail.js";
+export { isTopicRecipient } from "./lib/topic-recipient.js";
 export type { MailMessage } from "./io/mail.js";
 export { MemoryStore } from "./io/memory.js";
 export type { MemoryEvent } from "./io/memory.js";
@@ -44,3 +45,8 @@ export type { FlairConfig } from "./runtime/types.js";
 // Signing
 export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
 export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";
+export {
+  KeyFormatError, AgentKeyError, AgentKeyConflictError,
+  agentKeyCandidates, existingAgentKeyPaths, resolveAgentKeyPath,
+  readAgentPrivateKey, readPrivateKeyAtPath, toEd25519Seed,
+} from "./lib/agent-keys.js";

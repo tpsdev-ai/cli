@@ -47,6 +47,7 @@ export type RefusalReason =
   | "pr_not_open"
   | "commit_mismatch"
   | "approval_evidence_unconfigured"
+  | "approval_evidence_reachable"
   | "approval_evidence_missing"
   | "approval_evidence_incomplete"
   | "approval_evidence_failed"

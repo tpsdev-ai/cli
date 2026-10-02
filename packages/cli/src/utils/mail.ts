@@ -774,6 +774,7 @@ export const ENVELOPE_BINDINGS = {
   to: { kind: "bind", recordField: "to" },
   subject: { kind: "exclude", reason: "not carried on the outer record" },
   body: { kind: "bind", recordField: "body" },
+  trust: { kind: "exclude", reason: "authority is signed inside the envelope, not copied to the record" },
   messageId: { kind: "bind", recordField: "envelopeId" },
   timestamp: { kind: "bind", recordField: "timestamp" },
   replyToId: { kind: "bind", recordField: "replyToId" },
@@ -872,7 +873,7 @@ type EnvelopePolicyResult =
  * The checks, in order:
  *   1. signature, through an ALWAYS-constructed Flair client;
  *   2. wrapper/envelope `from` binding;
- *   3. recipient binding (`envelope.to === agent`);
+ *   3. recipient binding;
  *   4. `messageId` shape, and `replyToId` shape when present — the ONE id
  *      rule in envelope-id.ts, shared with the sender (cli#429);
  *   5. `timestamp` shape.
@@ -924,8 +925,9 @@ async function decideEnvelopeForMailbox(
     };
   }
 
-  // 3. The verified recipient must be this mailbox's owner.
-  if (envelope.to !== agent) {
+  const topicRecipient = typeof envelope.to === "string" && envelope.to.startsWith("topic:")
+    && (await import("./mail-topics.js")).isTopicRecipient(envelope.to, agent, envelope.from);
+  if (envelope.to !== agent && !topicRecipient) {
     return {
       ok: false,
       class: "wrong-recipient",

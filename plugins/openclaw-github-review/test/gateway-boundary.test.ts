@@ -42,8 +42,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CI_PROBE_ENV, CI_PROBE_TOOL_NAME, HOST_MARKER_ENV, registerGithubReview, TOOL_NAME } from "../src/index.js";
-import { buildApprovalEvidence, writeApprovalEvidence } from "../src/approval-evidence.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../../../scripts/reviewer/approval-evidence.mjs";
 import {
+  CI_JOB,
+  CI_WORKFLOW,
   COMMIT,
   fakeCredentialFiles,
   FakeGitHub,
@@ -55,6 +57,7 @@ import {
   TOKEN,
   validAssignment,
   validInput,
+  PASSING_JOBS,
   writeEd25519Key,
   writeHostKey,
 } from "./helpers.js";
@@ -144,12 +147,11 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
         reviewer: REVIEWER,
         sessionKey: SESSION,
         commit: COMMIT,
+        workflow: CI_WORKFLOW,
+        job: CI_JOB,
         startedAt: new Date(Date.now() - 60_000).toISOString(),
         finishedAt: new Date().toISOString(),
-        commands: [
-          { command: "bun run build", role: "build", exitCode: 0 },
-          { command: "bun run test", role: "test", exitCode: 0 },
-        ],
+        jobs: PASSING_JOBS,
       },
       approvalKey,
     ),
@@ -167,6 +169,9 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
       reconcileFile,
       approvalEvidenceFile,
       approvalEvidenceKeyFile,
+      approvalCiWorkflow: CI_WORKFLOW,
+      approvalCiJob: CI_JOB,
+      sandboxMountRoots: [join(dir, "workspace")],
       flairUrl: FLAIR,
     },
     credentialFile,
@@ -414,6 +419,9 @@ describe("A11 — secret scans through registerGithubReview, every outcome path 
         reconcileFile: s.config.reconcileFile,
         approvalEvidenceFile: s.config.approvalEvidenceFile,
         approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
+        approvalCiWorkflow: s.config.approvalCiWorkflow,
+        approvalCiJob: s.config.approvalCiJob,
+        sandboxMountRoots: s.config.sandboxMountRoots,
       },
       tools,
       logs,

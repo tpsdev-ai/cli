@@ -291,6 +291,16 @@ jobs:
           set -euo pipefail
           id="$(node -e 'process.stdout.write(require("./docker/reviewer/runtime-matrix.json").images[0].id)')"
           bash scripts/reviewer/a9-red-proofs.sh "reviewer-image:${id}" "$id" docker/reviewer/runtime-matrix.json
+      # cli#435 — each job of a `needs` closure gets a fresh isolated tree and
+      # process space: one sandbox container per job, from a fresh clone of a
+      # read-only source. Job 1 changes a tracked file, `.git` state and leaves
+      # a detached (setsid) process. Job 2 checks the original tracked file,
+      # absent ref and staged entry, and no heartbeat growth over one second.
+      - name: Per-job isolation checks (cli#435)
+        run: |
+          set -euo pipefail
+          id="$(node -e 'process.stdout.write(require("./docker/reviewer/runtime-matrix.json").images[0].id)')"
+          bash scripts/reviewer/per-job-isolation-checks.sh "reviewer-image:${id}" "$id"
       - name: Record the local image ids of this build
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

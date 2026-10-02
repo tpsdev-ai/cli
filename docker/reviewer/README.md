@@ -13,12 +13,11 @@ linux/amd64 only (the reviewer VMs are x86_64).
 How well a review build predicts CI is best effort; the fidelity limits are listed
 under [Known limits](#known-limits).
 
-A reviewer's `APPROVE` requires a host-side, host-authenticated record of such
-a build for the same repository, PR, dispatch, reviewer, session and commit (the
-`openclaw-github-review` plugin); it records the commands the host ran for the
-job (including a build and a test stage) and their exit statuses, as the host
-observed them. It does not establish that those commands are adequate or that
-they match what CI ran.
+A reviewer's `APPROVE` requires the evidence record that
+`../../scripts/reviewer/run-review-jobs.mjs` writes for such a build when given
+the evidence arguments (see the `openclaw-github-review` plugin README). It
+holds each job's planned `run:` scripts and its launcher's exit status. It does
+not establish that those commands are adequate or that they match what CI ran.
 
 ## Pieces
 
@@ -51,8 +50,8 @@ they match what CI ran.
   job, plans the job and the jobs it needs, resolves the declarations and pins
   to ONE image and refuses unless it is THIS image; builds the child env from an
   allowlist with a fixed `PATH`; and runs the image's own node and bun at fixed
-  paths to verify their versions. Then, per job in dependency order, it removes
-  what earlier jobs of the build created, gives the job a fresh
+  paths to verify their versions. Then it runs the ONE job the host names, in
+  the container it runs in: it gives the job a fresh
   `HOME`/`TMPDIR`/cache root, refuses a worktree whose effective git
   configuration leaves the safe baseline (below) or whose repository holds
   hooks, and refuses unless the worktree passes the clean-clone check
@@ -61,10 +60,27 @@ they match what CI ran.
   environment and that its resolved working directory stays inside the
   worktree; it enforces `timeout-minutes` (the job's, default 360, and each
   planned `run:` step's; on a skipped `uses:` step it is refused) and kills
-  what a job left running when the job ends.
-  `review-build-ok` only if every job in the closure ran, every step exited 0,
-  and no lockfile in the worktree (outside `node_modules/` and `.git/`)
-  changed, appeared or disappeared.
+  tracked step process groups at job end; container removal stops detached
+  processes before another job runs.
+  `job-ok` only if every executed `run:` step exited 0, with allowed `uses:`
+  steps recorded as skipped, and no lockfile in the worktree
+  (outside `node_modules/` and `.git/`) changed, appeared or disappeared.
+- `../../scripts/reviewer/run-review-jobs.mjs` — the host-side driver. The host
+  runs one sandbox container per job: for each job of the named job's `needs`
+  closure, in dependency order, it makes a fresh clone of the assigned commit
+  from a read-only source the host provides, starts one container with that
+  job's clone bound writable at `/workspace` and no other host mount
+  (OpenClaw's run model), runs the launcher in it for that one job, then removes
+  the container — refusing the build if the removal fails — and discards the
+  job's directory. A job runs only if the jobs it needs succeeded (or its `if:` is
+  `always()`), and it reports `review-build-ok` only if every job ran to a
+  `job-ok` verdict that names it and every executed `run:` step exited 0,
+  with allowed `uses:` steps recorded as skipped.
+  `../../scripts/reviewer/per-job-isolation-checks.sh` — the container-level
+  checks for this: two jobs linked by `needs`, the first changing a tracked
+  file, `.git` state (a ref and the index) and leaving a detached (`setsid`)
+  process; the second checks the original tracked file, absent ref and staged
+  entry, and no heartbeat growth over one second.
 - `../../scripts/reviewer/ci-job.mjs` — bounds the workflow (256 KiB, 50,000
   YAML nodes counting every alias use, 32 levels), parses it (YAML 1.2 core
   schema), requires printable-ASCII keys, and requires a `pull_request` trigger
@@ -87,7 +103,9 @@ they match what CI ran.
   skipped `uses:` step, other `if:` conditions, `continue-on-error`,
   `strategy`, containers/services, non-bash shells, launcher-owned env keys,
   and credential-shaped or config-redirecting env such as `GH_TOKEN`,
-  `*_TOKEN`, `GIT_*`, `NPM_CONFIG_*`, `NODE_OPTIONS`, `BASH_ENV`, `LD_*`.
+  `*_TOKEN`, `GIT_*`, `NPM_CONFIG_*`, `NODE_OPTIONS`, `BASH_ENV`, `LD_*`. A
+  planned `run:` step carries `node`: `default`, or the version the most recent
+  preceding `setup-node` pins.
 - `../../scripts/reviewer/resolve-runtime.mjs` — resolves `packageManager`,
   `engines`, `.nvmrc`, `.node-version`, `.bun-version`, `.tool-versions` and the
   jobs' pins to ONE matrix image with npm-semver range semantics, or refuses by
@@ -121,18 +139,14 @@ repository `hooks/` directory may hold only git's `*.sample` files.
 
 The baseline is an allowlist of **keys**. It does not approve the **values**
 of `remote.<name>.url` and `remote.<name>.fetch`: those are whatever the host's
-clone wrote, and the launcher trusts them as the host's choice. It pins them
-before the first job and refuses any change before each later job (see below),
-so a transport or refspec change made by the build itself is refused.
+clone wrote, and the launcher trusts them as the host's choice.
 
 ### The clean-clone check
 
-`actions/checkout` is skipped only when, before each job, the worktree passes
+`actions/checkout` is skipped only when, before the job, the worktree passes
 these checks (and only these):
 
-- a commit is checked out; for every job after the first, HEAD and every
-  `remote.<name>.url` / `remote.<name>.fetch` value are what they were before
-  the first job;
+- a commit is checked out;
 - no tracked file carries the assume-unchanged or skip-worktree index bit
   (`git ls-files -v`: a lowercase tag or `S`), since either hides an edit from
   `git status`;
@@ -143,9 +157,9 @@ these checks (and only these):
 
 It is not a byte-for-byte comparison with a host-pinned commit: a change `git
 status` does not report (for example a line-ending-only change under a text
-attribute) and state inside `.git/` beyond HEAD, the index bits and the remote
-settings are not detected. Giving each job an independent tree at a
-host-pinned commit is tracked in tpsdev-ai/cli#435.
+attribute) is not detected here. It does not need to be: each job runs in its
+own container, from its own fresh clone of the assigned commit (see the host
+driver above), so nothing an earlier job did in its tree reaches it.
 
 ## Building and installing on a reviewer host
 
@@ -160,8 +174,8 @@ Dockerfile at install time and records the printed `local_image_id`
 reference the container engine itself resolves. The same config carries the
 assignment: `sandbox.docker.env` sets `REVIEWER_CI_WORKFLOW`, `REVIEWER_CI_JOB`
 and `REVIEWER_CI_BASE`, which the container runtime gives the sandbox's init
-process at creation. The host mounts the review worktree as a fresh clone of
-the assigned head with its git metadata inside it: depth 1 without tags for
+process at creation. The host driver makes a fresh clone of the assigned head
+for each job, with its git metadata inside it: depth 1 without tags for
 workflows using checkout's default fetch, a full clone for `fetch-depth: 0`.
 
 Builds on different hosts are **not** claimed to produce the same image id: the
@@ -183,15 +197,17 @@ Trust boundary (host integration, PR 3):
 
 CI fidelity (`review-build-ok` may disagree with CI):
 
-- Jobs of a `needs` closure run one after another in the one worktree. Before
-  each job the launcher removes what earlier jobs created and requires the
-  clean-clone check above; it keeps a `node_modules/` that existed before the
-  build whole (a fresh clone has none, so the first job's check refuses it).
-  What that check cannot see carries over (tpsdev-ai/cli#435).
+- Each job of a `needs` closure runs in its own container, from its own fresh
+  clone of the assigned commit, so the worktree state does not carry over
+  between jobs. A job that installs its dependencies does so into its own tree,
+  from its own cold caches.
 - On `pull_request`, CI checks out the merge of the head into the base; the
   review builds the assigned head.
 - CI's runner image carries its own Node (e.g. 22.23.2 today) where a workflow
-  does not pin one; the review uses the matrix image's (22.22.1).
+  does not pin one; the review uses the selected matrix image's Node (e.g.
+  22.22.1). After resolution selects the current image, a `default` step in a
+  plan with a Node pin is refused as `node-mismatch`. Conflicting in-matrix
+  pins are refused as `conflicting`; a different selected image as `wrong-image`.
 - Socket Firewall is not reproduced (`sfw` runs the command unwrapped); cache
   restores never happen (a cold build); a workflow's artifact uploads are not
   performed.

@@ -130,6 +130,13 @@ export interface SkillScanResult {
 /** The activity vocabulary Flair's Presence contract accepts. */
 export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
 
+export class FlairRequestError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = "FlairRequestError";
+  }
+}
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -196,7 +203,7 @@ export class FlairClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Flair ${method} ${path} → ${res.status}: ${text}`);
+      throw new FlairRequestError(`Flair ${method} ${path} → ${res.status}: ${text}`, res.status);
     }
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
@@ -251,6 +258,19 @@ export class FlairClient {
       return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`);
     } catch {
       return null;
+    }
+  }
+
+  async getAgentForVerification(id: string): Promise<FlairAgent | null> {
+    try {
+      const agent = await this.request<FlairAgent>("GET", `/Agent/${encodeURIComponent(id)}`);
+      if (!agent || typeof agent.publicKey !== "string") {
+        throw new Error(`Flair returned an invalid principal record for ${id}`);
+      }
+      return agent;
+    } catch (err) {
+      if (err instanceof FlairRequestError && err.status === 404) return null;
+      throw err;
     }
   }
 

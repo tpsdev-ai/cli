@@ -30,6 +30,11 @@ export interface GithubReviewConfig {
   approvalEvidenceFile: string | null;
   /** The host-held key that authenticates approval-evidence records. */
   approvalEvidenceKeyFile: string | null;
+  /** The CI workflow and job an APPROVE's evidence must be for. */
+  approvalCiWorkflow: string | null;
+  approvalCiJob: string | null;
+  /** Every host path a review sandbox mounts; empty = unusable. */
+  sandboxMountRoots: string[];
   /** Durable per-dispatch latch for outcomes whose external state is unknown. */
   reconcileFile: string | null;
   flairUrl: string;
@@ -44,12 +49,17 @@ function asString(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v : null;
 }
 
-/** A host path the sandbox can never reach: it must be absolute. A relative
- *  path could resolve inside the review worktree the sandbox mounts, so it is
- *  treated as unusable. */
+/** An absolute path, or null. */
 function asAbsolutePath(v: unknown): string | null {
   const s = asString(v);
   return s !== null && s.startsWith("/") ? s : null;
+}
+
+/** A non-empty list of absolute paths, or empty when any entry is not one. */
+function asAbsolutePaths(v: unknown): string[] {
+  if (!Array.isArray(v) || v.length === 0) return [];
+  const paths = v.map(asAbsolutePath);
+  return paths.every((p): p is string => p !== null) ? paths : [];
 }
 
 function asPositiveInt(v: unknown): number | null {
@@ -77,6 +87,9 @@ export function resolveConfig(raw: unknown, pluginVersion: string): GithubReview
     pendingAuditFile: asString(cfg.pendingAuditFile),
     approvalEvidenceFile: asAbsolutePath(cfg.approvalEvidenceFile),
     approvalEvidenceKeyFile: asAbsolutePath(cfg.approvalEvidenceKeyFile),
+    approvalCiWorkflow: asString(cfg.approvalCiWorkflow),
+    approvalCiJob: asString(cfg.approvalCiJob),
+    sandboxMountRoots: asAbsolutePaths(cfg.sandboxMountRoots),
     reconcileFile: asString(cfg.reconcileFile),
     flairUrl: asString(cfg.flairUrl) ?? "http://127.0.0.1:9926",
     sandboxImageDigest: asString(cfg.sandboxImageDigest),

@@ -193,6 +193,9 @@ describe("B3 — only a full registration does host-side work", () => {
       reconcileFile: s.config.reconcileFile,
       approvalEvidenceFile: s.config.approvalEvidenceFile,
       approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
+      approvalCiWorkflow: s.config.approvalCiWorkflow,
+      approvalCiJob: s.config.approvalCiJob,
+      sandboxMountRoots: s.config.sandboxMountRoots,
       flairUrl: "http://flair.test.invalid",
     };
     return { s, pluginConfig };

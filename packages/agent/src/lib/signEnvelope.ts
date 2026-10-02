@@ -32,6 +32,8 @@ export interface Envelope {
   to: string;
   subject?: string;
   body: string;
+  /** Signed authority level. Absent means external at the receiving runtime. */
+  trust?: "user" | "internal" | "external";
   messageId: string;
   timestamp: string;
   /**

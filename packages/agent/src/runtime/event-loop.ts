@@ -118,13 +118,12 @@ export class EventLoop {
   // --- Mail trust parsing ---
 
   private parseTrust(message: MailMessage): TrustLevel {
-    // Check X-TPS-Trust header if present
-    const body =
-      typeof message.body === "string" ? message.body : JSON.stringify(message.body);
-    // Headers may be embedded in the message metadata
-    const meta = (message as any).headers ?? {};
-    const trust = meta["X-TPS-Trust"] ?? meta["x-tps-trust"];
-    if (trust === "user" || trust === "internal" || trust === "external") {
+    // Only a verified envelope can carry a trust decision. Older envelopes
+    // have no trust field and receive the lowest capability set.
+    const trust = message.verifiedEnvelope?.trust;
+    // Agent mail is never an operator invocation. A sender can sign its own
+    // trust claim, so even a signed `user` value cannot grant full tools.
+    if (trust === "internal" || trust === "external") {
       return trust;
     }
     // Default: external (zero trust)
@@ -132,8 +131,7 @@ export class EventLoop {
   }
 
   private parseSender(message: MailMessage): string {
-    const meta = (message as any).headers ?? {};
-    return meta["X-TPS-Sender"] ?? meta["x-tps-sender"] ?? "unknown";
+    return message.verifiedEnvelope?.from ?? "unknown";
   }
 
   private formatMailPrompt(body: string, trust: TrustLevel, sender: string): string {

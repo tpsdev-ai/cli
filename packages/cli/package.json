@@ -15,6 +15,7 @@
     "./utils/mail": "./dist/src/utils/mail.js",
     "./utils/mail-verify": "./dist/src/utils/mail-verify.js",
     "./utils/mail-routing": "./dist/src/utils/mail-routing.js",
+    "./utils/mail-producer": "./dist/src/utils/mail-producer.js",
     "./utils/relay": "./dist/src/utils/relay.js"
   },
   "optionalDependencies": {

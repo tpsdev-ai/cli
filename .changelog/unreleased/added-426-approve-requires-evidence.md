@@ -1,8 +1,8 @@
-- **`github_review` refuses `APPROVE` without a host-recorded, host-authenticated passing build/test record for the same repository, PR, dispatch, reviewer, session and commit (Closes #426).**
+- **`github_review` refuses `APPROVE` without an authenticated, passing evidence record for the same repository, PR, dispatch, reviewer, session, commit and configured CI job (#426).**
 
-  The record is written host-side to `approvalEvidenceFile` from what the host
-  observed, and authenticated with a host-held key the sandbox cannot read;
-  `REQUEST_CHANGES` and `COMMENT` are unaffected. Its digest is recorded in the
-  audit draft and in an acknowledged signed audit record when that write
-  succeeds. The evidence records the commands the host ran for the job, and their
-  exit statuses, not that they are adequate.
+  `scripts/reviewer/run-review-jobs.mjs` writes the record when given the
+  evidence arguments: each job's planned `run:` scripts and its launcher's exit
+  status as `docker exec` returned it. `APPROVE` is also refused unless the store
+  and its key resolve outside every `sandboxMountRoots` path. `REQUEST_CHANGES`
+  and `COMMENT` are unaffected. Its digest is recorded in the audit draft and in
+  an acknowledged signed audit record when that write succeeds.
