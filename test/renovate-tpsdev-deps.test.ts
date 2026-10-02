@@ -14,6 +14,7 @@ function releasePackages(source = readFileSync(RELEASE_WORKFLOW, "utf8")): strin
   const workflow = Bun.YAML.parse(source) as {
     defaults?: unknown;
     jobs?: Record<string, {
+      "runs-on"?: unknown;
       if?: unknown;
       defaults?: unknown;
       steps?: Array<{ name?: string; if?: unknown; shell?: unknown; run?: unknown }>;
@@ -22,9 +23,10 @@ function releasePackages(source = readFileSync(RELEASE_WORKFLOW, "utf8")): strin
   const job = workflow.jobs?.["publish-packages"];
   const steps = job?.steps?.filter((step) => step.name === "Verify ALL workspace versions match the tag") ?? [];
   const step = steps[0];
-  if (workflow.defaults !== undefined || job?.defaults !== undefined || job?.if !== undefined ||
+  if (job?.["runs-on"] !== "ubuntu-latest" ||
+      workflow.defaults !== undefined || job.defaults !== undefined || job.if !== undefined ||
       steps.length !== 1 || step.if !== undefined || step.shell !== undefined || typeof step.run !== "string") {
-    throw new Error(`${RELEASE_WORKFLOW}: expected an unconditional version-verification step with the default shell`);
+    throw new Error(`${RELEASE_WORKFLOW}: expected an unconditional version-verification step on ubuntu-latest with the default shell`);
   }
   const lines = step.run.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
   const assignment = lines[2]?.match(/^PKGS=\(([a-z0-9-]+(?:[ \t]+[a-z0-9-]+)*)\)$/);
@@ -122,6 +124,12 @@ describe("Renovate @tpsdev-ai scope (cli#424)", () => {
       expect(() => releasePackages(changed)).toThrow();
     });
   }
+
+  it("rejects a Windows release runner", () => {
+    const workflow = Bun.YAML.parse(readFileSync(RELEASE_WORKFLOW, "utf8"));
+    workflow.jobs["publish-packages"]["runs-on"] = "windows-latest";
+    expect(() => releasePackages(Bun.YAML.stringify(workflow))).toThrow();
+  });
 
   it("checks regular, non-symlinked package.json files outside node_modules and .git for nonrelease @tpsdev-ai/* dependencies", () => {
     const allowed = new Set(releasePackages());
