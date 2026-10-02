@@ -121,7 +121,7 @@ beforeAll(() => {
 });
 
 describe("tps --help never executes the command (cli#342)", () => {
-	test("every top-level command prints usage and exits 0 with no side effects", () => {
+	test("top-level commands print usage and exit 0 with no side effects", () => {
 		const commands = topLevelCommands();
 		// The source parse must see the real dispatch table; a silent regex miss
 		// would turn this test into a no-op.

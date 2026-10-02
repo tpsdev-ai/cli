@@ -250,11 +250,11 @@ async function checkNono() {
 
 /**
  * cli#342: the usage text `--help`/`-h` prints for each top-level command,
- * mirrored from the inline usage strings in the switch below. It sits here,
- * beside the help intercept in main(), so the intercept can print a command's
- * usage before any launch control, nono check or dispatch — without changing
- * the case bodies (which keep their own copy for a missing or unknown action).
- * A command with no entry falls back to the general help.
+ * seeded from the inline usage strings in the switch below (and written out for
+ * the commands that have none). It sits here, beside the help intercept in
+ * main(), so the intercept can print a command's usage before any launch
+ * control, nono check or dispatch. An unknown command falls back to the general
+ * help.
  */
 const USAGE: Record<string, string> = {
   init: "Usage: tps init [--id <agent-id>] [--name <name>] [--model <provider/model>]",
