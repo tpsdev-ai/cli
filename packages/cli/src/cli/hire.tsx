@@ -33,7 +33,7 @@ interface Step {
 
 /**
  * Send the new agent's onboarding mail, signed as `from` (the CLI's own
- * identity) so the recipient's promote() accepts it. Exported so a test can
+ * identity) for the recipient to verify under its Flair and mailbox policy. Exported so a test can
  * exercise the producer without rendering the TUI. Throws when `from` has no
  * signing key.
  */
@@ -130,7 +130,7 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
         // Onboarding mail
         try {
           // Sign as the CLI's own identity (the same signing path `tps mail
-          // send` uses) so the new agent's promote() accepts it. With no key
+          // send` uses) for the new agent to verify under its Flair and mailbox policy. With no key
           // this refuses and the step is skipped, rather than writing a body
           // no promote() will accept.
           const senderId = await resolveCliSenderId();

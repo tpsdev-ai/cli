@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { assertValidBody } from "./mail.js";
+import { assertValidBody, sendMessage } from "./mail.js";
 import { sendSignedMail } from "./mail-producer.js";
+import { signOutboundBody } from "./mail-sign.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -141,7 +142,13 @@ function readLog(topic: string): TopicLogEntry[] {
 }
 
 function readLogSince(topic: string, cursor: string): TopicLogEntry[] {
-  return readLog(topic).filter((e) => e.timestamp > cursor);
+  const log = readLog(topic);
+  if (cursor.startsWith("@")) {
+    const index = log.findIndex((entry) => entry.id === cursor.slice(1));
+    // A missing cursor must replay; delivered tracking makes that safe.
+    return index < 0 ? log : log.slice(index + 1);
+  }
+  return log.filter((e) => e.timestamp > cursor);
 }
 
 // ── Public API ─────────────────────────────────────────────────────────────
@@ -223,6 +230,17 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
     throw new Error(`Agent '${from}' is not authorized to publish to topic '${topic}'`);
   }
 
+  // Prove the publisher can sign even when there are no subscribers. A missing
+  // or conflicting key refuses before the durable topic log is changed.
+  const recipients = meta.subscribers.filter((subscriberId) => subscriberId !== from);
+  const signed = recipients.map((subscriberId) => ({
+    subscriberId,
+    body: signOutboundBody(from, subscriberId, body, {
+      requireKey: true, rationale: `agent ${from} topic publish`,
+    }),
+  }));
+  if (signed.length === 0) signOutboundBody(from, from, body, { requireKey: true });
+
   // 1. Append to topic log
   const entry: TopicLogEntry = {
     id: randomUUID(),
@@ -234,11 +252,9 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
   appendFileSync(logPath(topic), JSON.stringify(entry) + "\n", "utf-8");
 
   // 2. Fan-out to all subscribers
-  for (const subscriberId of meta.subscribers) {
-    // Skip sending to the publisher themselves
-    if (subscriberId === from) continue;
+  for (const { subscriberId, body: signedBody } of signed) {
     try {
-      const msg = sendSignedMail(from, subscriberId, body, { rationale: `agent ${from} topic publish` });
+      const msg = sendMessage(subscriberId, signedBody, from);
       // Patch topic fields into the written file
       if (existsSync(msg.filePath)) {
         const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
@@ -267,7 +283,10 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
     const missed = readLogSince(topic, cursor);
 
     for (const entry of missed) {
-      if (entry.from === agentId) continue;
+      if (entry.from === agentId) {
+        updateCursor(agentId, topic, `@${entry.id}`);
+        continue;
+      }
       if (!alreadyDelivered(agentId, entry.id)) {
         try {
           const msg = sendSignedMail(entry.from, agentId, entry.body, { rationale: `agent ${entry.from} topic catch-up` });
@@ -281,13 +300,11 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
           delivered++;
         } catch (err: any) {
           serror(`Warning: catch-up delivery failed for ${topic}/${entry.id}: ${err.message}`);
+          break; // Leave the cursor before this undelivered entry.
         }
       }
-    }
-
-    // Advance cursor
-    if (missed.length > 0) {
-      updateCursor(agentId, topic, missed[missed.length - 1]!.timestamp);
+      // An already-delivered entry can be skipped without losing it.
+      updateCursor(agentId, topic, `@${entry.id}`);
     }
   }
 

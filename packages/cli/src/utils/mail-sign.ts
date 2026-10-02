@@ -18,7 +18,7 @@
 
 import { randomUUID } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
-import { readAgentPrivateKey, readPrivateKeyAtPath, agentKeyCandidates, AgentKeyError, AgentKeyConflictError } from "./agent-keys.js";
+import { readAgentPrivateKey, agentKeyCandidates, AgentKeyError, AgentKeyConflictError } from "./agent-keys.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
 
 /**
@@ -50,7 +50,7 @@ function unusableKeyError(from: string, err: AgentKeyError): Error {
 }
 
 export interface SignOutboundOptions {
-  /** Explicit Ed25519 key path. Falls back to the agent-keys search path for `from` (or TPS_TEST_KEYS_DIR). */
+  /** Explicit Ed25519 key path, checked against both default locations (or TPS_TEST_KEYS_DIR). */
   keyPath?: string;
   /** Prior delegation chain to extend. Null/undefined originates a fresh one. */
   priorChain?: ChainEntry[] | null;
@@ -87,7 +87,7 @@ export function signOutboundBody(
 
   let privkey: Buffer | null;
   try {
-    privkey = opts.keyPath ? readPrivateKeyAtPath(opts.keyPath) : readAgentPrivateKey(from);
+    privkey = readAgentPrivateKey(from, opts.keyPath);
   } catch (err) {
     if (err instanceof AgentKeyError) throw unusableKeyError(from, err);
     if (err instanceof AgentKeyConflictError) throw new Error(`cannot sign for agent "${from}": ${err.message}`);

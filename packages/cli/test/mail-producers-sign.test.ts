@@ -1,17 +1,7 @@
 /**
- * mail-producers-sign.test.ts — cli#433 slice A.
- *
- * Every CLI-internal mail producer listed in the issue now signs its body
- * through the shared helper (utils/mail-producer.ts) instead of writing an
- * unsigned record. This proves, per producer, that the recipient's promote()
- * ACCEPTS what the producer writes — running the real path (a stub Flair
- * HTTP server for public keys) with a real signing key in a scratch HOME.
- *
- * Covered: pulse (defaultMailSender), topic fan-out (publishToTopic), topic
- * catch-up (catchUpTopics), hire onboarding (sendOnboardingMail), roster invite
- * (runRoster), bootstrap intro (sendIntroduction), branch reply/forward
- * (routeHandlerAction). One missing-key case asserts the named refusal and that
- * nothing is written.
+ * CLI slice-A producer integration checks. The tests exercise real promotion
+ * for each delivered CLI producer, including both branch forward forms and
+ * MailClient. Health probe rejection is checked against the same policy.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -29,8 +19,9 @@ import { defaultMailSender } from "../src/commands/pulse.js";
 import { createTopic, subscribe, publishToTopic, catchUpTopics } from "../src/utils/mail-topics.js";
 import { sendOnboardingMail } from "../src/cli/hire.js";
 import { runRoster } from "../src/commands/roster.js";
-import { sendIntroduction } from "../src/commands/bootstrap.js";
+import { sendIntroduction, healthMail } from "../src/commands/bootstrap.js";
 import { routeHandlerAction } from "../src/commands/branch.js";
+import { MailClient } from "../../agent/src/io/mail.js";
 
 const FLINT = Buffer.alloc(32, 0x11);
 const ANVIL = Buffer.alloc(32, 0x22);
@@ -211,7 +202,7 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
     }
   });
 
-  test("branch forward signs only when the handler rewrote the body", async () => {
+  test("branch forward signs as the forwarding identity and promotes", async () => {
     // Rewritten body → signed.
     const rewritten: Array<{ to: string; body: string; from: string }> = [];
     const r1 = routeHandlerAction(
@@ -225,7 +216,7 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
     const promoted = await promoteNew("kern");
     expect(promoted.ok).toBe(true);
 
-    // Unchanged body → pure relay, queued byte-for-byte.
+    // Unchanged body is carried as data in a new forwarder-signed envelope.
     const relayed: Array<{ to: string; body: string; from: string }> = [];
     const r2 = routeHandlerAction(
       { type: "forward", body: "<signed original>", to: "kern" },
@@ -233,7 +224,35 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
       (to, body, from) => relayed.push({ to, body, from }),
     );
     expect(r2).toEqual({ kind: "forward", to: "kern" });
-    expect(relayed[0]!.body).toBe("<signed original>");
+    expect(relayed[0]!.from).toBe("anvil");
+    expect(JSON.parse(relayed[0]!.body).body).toBe("<signed original>");
+    sendMessage("kern", relayed[0]!.body, relayed[0]!.from);
+    const forwarded = await promoteNew("kern");
+    expect(forwarded.ok).toBe(true);
+    if (forwarded.ok) expect(forwarded.message.from).toBe("anvil");
+  });
+
+  test("MailClient sendMail resolves the Flair-only key and recipient promotes it", async () => {
+    delete process.env.TPS_TEST_KEYS_DIR;
+    const flairKeys = join(home, ".flair", "keys");
+    mkdirSync(flairKeys, { recursive: true });
+    writeFileSync(join(flairKeys, "flint.key"), FLINT);
+    const client = new MailClient(mailDir, undefined, "flint");
+    await client.sendMail("kern", "agent runtime mail");
+    const outbox = join(mailDir, "flint", "outbox");
+    const [file] = readdirSync(outbox).filter((f) => f.endsWith(".json"));
+    const record = JSON.parse(readFileSync(join(outbox, file!), "utf8"));
+    sendMessage("kern", record.body, record.from);
+    const result = await promoteNew("kern");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.message.body).toBe("agent runtime mail");
+  });
+
+  test("bootstrap health fails when the sender key disagrees with Flair", async () => {
+    writeFileSync(join(keysDir, "host.key"), Buffer.alloc(32, 0x55));
+    expect(await healthMail("kern", "host")).toBe(false);
+    const cur = join(home, ".tps", "branch-office", "kern", "mail", "cur");
+    expect(existsSync(cur) ? readdirSync(cur).filter((f) => f.endsWith(".json")) : []).toHaveLength(0);
   });
 
   test("a missing signing key refuses with the named error and writes nothing", async () => {

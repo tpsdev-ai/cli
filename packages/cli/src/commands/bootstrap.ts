@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier, sanitizeFreeText, sanitizeModelIdentifier } from "../schema/sanitizer.js";
@@ -6,6 +6,7 @@ import { workspacePath as resolveWorkspacePath, resolveTeamId, branchRoot as wor
 import { runCommandUnderNono } from "../utils/nono.js";
 import { deliverToSandbox, resolveAgentMailRoot } from "../utils/relay.js";
 import { signForDelivery } from "../utils/mail-producer.js";
+import { promote } from "../utils/mail.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
 import { readOpenClawConfig, findOpenClawConfig, type OpenClawConfig } from "../utils/config.js";
 import { homeDir } from "../utils/home.js";
@@ -172,12 +173,12 @@ function healthGateway(): boolean {
   return runCommandUnderNono("tps-bootstrap", {}, ["openclaw", "gateway", "status"]) === 0;
 }
 
-function healthMail(teamId: string, senderId: string): boolean {
+export async function healthMail(teamId: string, senderId: string): Promise<boolean> {
   // Use resolveAgentMailRoot() — same path derivation as deliverToSandbox()
   const mailRoot = resolveAgentMailRoot(teamId);
   const freshDir = join(mailRoot, "new");
   mkdirSync(freshDir, { recursive: true });
-  const before = readdirSync(freshDir).filter((f) => f.endsWith(".json")).length;
+  const before = new Set(readdirSync(freshDir).filter((f) => f.endsWith(".json")));
 
   // Sign the probe as the CLI's own identity (the same signing path
   // `tps mail send` uses). With no key this refuses and the check reports
@@ -192,30 +193,15 @@ function healthMail(teamId: string, senderId: string): boolean {
     return false;
   }
 
-  const after = readdirSync(freshDir).filter((f) => f.endsWith(".json")).length;
-
-  if (after <= before) {
-    return false;
-  }
-
-  // mark probe as received by moving one file to cur and parsing
+  // Use the recipient's actual verification and promotion policy. Only the
+  // newly written probe counts, and a wrong Flair key fails the health check.
   try {
-    const curDir = join(mailRoot, "cur");
-    mkdirSync(curDir, { recursive: true });
-    const files = readdirSync(freshDir)
-      .filter((f) => f.endsWith(".json"))
-      .sort()
-      .reverse();
-    const probe = join(freshDir, files[0]!);
-    const raw = readFileSync(probe, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (parsed.from !== senderId) return false;
-    renameSync(probe, join(curDir, files[0]!));
+    const files = readdirSync(freshDir).filter((f) => f.endsWith(".json") && !before.has(f));
+    if (files.length !== 1) return false;
+    return (await promote(teamId, join(freshDir, files[0]!))).ok;
   } catch {
     return false;
   }
-
-  return true;
 }
 
 export function sendIntroduction(teamId: string, body: string, senderId: string): void {
@@ -232,11 +218,11 @@ function writeMarker(teamId: string, payload: string): void {
   writeFileSync(path, payload, "utf-8");
 }
 
-function runHealthChecks(agentWorkspace: string, _teamWorkspace: string, teamId: string, senderId: string): HealthResult {
+async function runHealthChecks(agentWorkspace: string, _teamWorkspace: string, teamId: string, senderId: string): Promise<HealthResult> {
   return {
     workspaceWritable: healthReadWrite(agentWorkspace),
     gatewayReachable: healthGateway(),
-    mailOperational: healthMail(teamId, senderId),
+    mailOperational: await healthMail(teamId, senderId),
   };
 }
 
@@ -290,7 +276,7 @@ export async function runBootstrap(args: BootstrapArgs): Promise<void> {
     throw new Error("Failed to register agent in roster");
   }
 
-  const health = runHealthChecks(workspace, teamWorkspace, teamId, senderId);
+  const health = await runHealthChecks(workspace, teamWorkspace, teamId, senderId);
   if (!health.workspaceWritable) throw new Error("Workspace read/write check failed");
   if (!health.gatewayReachable) throw new Error("Gateway reachability check failed");
   if (!health.mailOperational) throw new Error("Mail send/receive check failed");

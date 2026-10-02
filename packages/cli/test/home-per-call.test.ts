@@ -8,7 +8,8 @@
  *
  * Both homes are temp dirs; nothing here reads or writes a real home.
  */
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import * as ed from "@noble/ed25519";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -277,6 +278,15 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
   });
 
   test("commands/bootstrap.ts: the completion marker is written under the current HOME", async () => {
+    // Keep this home-path test socket-free while running the real promote()
+    // policy against the registered public key.
+    mock.module("../src/utils/mail-verify.js", () => ({
+      createMailVerifyClient: async () => ({
+        getAgent: async (name: string) => name === "host"
+          ? { publicKey: Buffer.from(ed.getPublicKey(Buffer.alloc(32, 9))) }
+          : null,
+      }),
+    }));
     const mod = await importUnder<any>(homeA, "../src/commands/bootstrap.js?home-per-call");
     process.env.HOME = homeB;
     const agentId = "smoke";

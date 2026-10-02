@@ -184,7 +184,7 @@ export async function runRoster(args: RosterArgs): Promise<void> {
       const inviteMessage = buildInviteMessage(args.agent, invitedBy);
       const inviteTarget: string = args.agent;
       // Sign the invite as the inviter before it is written, so the recipient's
-      // promote() accepts it.
+      // promote() can verify it under the recipient's Flair and mailbox policy.
       signForDelivery(
         invitedBy,
         inviteTarget,

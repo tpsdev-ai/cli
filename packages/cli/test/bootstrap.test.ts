@@ -40,6 +40,7 @@ describe("bootstrap command", () => {
     writeFileSync(join(identityDir, "host.key"), Buffer.alloc(32, 9));
     process.env.TPS_TEST_KEYS_DIR = identityDir;
 
+
     // Fake helper binaries for bootstrap health checks.
     fakeBin = mkdtempSync(join(tempRoot, "tools-"));
     mkdirSync(fakeBin, { recursive: true });
@@ -85,7 +86,7 @@ exit 0
   });
 
   function run(args: string[], env: Record<string, string> = {}) {
-    return spawnSync("bun", [TPS_BIN, ...args], {
+    return spawnSync("bun", [`--preload=${join(import.meta.dir, "fakes", "bootstrap-verify-preload.ts")}`, TPS_BIN, ...args], {
       encoding: "utf-8",
       cwd: tempRoot,
       env: {
@@ -103,7 +104,7 @@ exit 0
     mkdirSync(workspace, { recursive: true });
 
     const r = run(["bootstrap", agentId]);
-    expect(r.status).toBe(0);
+    expect(r.status, r.stderr + r.stdout).toBe(0);
 
     expect(existsSync(join(workspace, "SOUL.md"))).toBe(true);
     expect(existsSync(join(workspace, "IDENTITY.md"))).toBe(true);

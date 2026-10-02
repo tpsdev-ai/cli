@@ -2,7 +2,7 @@
  * sender-id.ts — the CLI's own mail sender identity, resolved once.
  *
  * This is the id an outbound message is signed as when its producer has no
- * agent-specific sender: `tps mail send` (with no override), roster invites
+ * agent-specific sender: roster invites
  * (no `TPS_AGENT_ID`), and the system-origin producers (bootstrap, hire
  * onboarding). The rules, in order: an explicit override, `TPS_AGENT_ID`,
  * `~/.tps/identity/host.json`'s `hostId`, then the vault host identity. The

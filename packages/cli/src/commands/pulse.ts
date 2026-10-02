@@ -189,7 +189,7 @@ export function setSendTimeoutMs(ms: number): void {
 
 export function defaultMailSender(to: string, body: string, agentId: string): void {
   // Sign the body as `agentId` before it is written — the same signing path
-  // `tps mail send` uses — so a promote()-reading recipient accepts it. Call
+  // `tps mail send` uses — for a promote()-reading recipient to verify under its Flair and mailbox policy. Call
   // sendMessage in-process instead of shelling out to the 'tps' PATH shim:
   // the shim hangs on mail send (observed on @tpsdev-ai/cli 0.5.4) and has no
   // spawnSync timeout, so a single undeliverable message wedges the daemon.

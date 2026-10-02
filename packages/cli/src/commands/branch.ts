@@ -35,11 +35,10 @@ export type HandlerRoute =
 /**
  * Route a handler action for a received message.
  *
- * A handler-generated reply (or a forward whose body the handler REWROTE) is
- * signed as `incoming.to` before it is queued, so the recipient's promote()
- * accepts it; with no key the route is `refused` and nothing is queued. A
- * routing forward passes the original signed content through unchanged and is
- * a pure relay. `queueOutbox` defaults to the shared outbox (injectable for tests).
+ * Replies and forwards are signed by the local forwarding identity before
+ * queueing. An unchanged forward carries the original envelope as data inside
+ * the new signed envelope. Acceptance also requires the recipient's Flair and
+ * mailbox policy to accept that identity and envelope.
  */
 export function routeHandlerAction(
   action: HandlerAction,
@@ -58,17 +57,13 @@ export function routeHandlerAction(
     }
     case "forward": {
       if (!action.to) return { kind: "forward", to: "" };
-      const rewritten = action.body !== undefined && action.body !== incoming.body;
-      if (rewritten) {
-        try {
-          signForDelivery(incoming.to, action.to, action.body!, (signed) => queueOutbox(action.to!, signed, incoming.to));
-          return { kind: "forward", to: action.to };
-        } catch (e: any) {
-          return { kind: "refused", reason: e?.message || "signing failed" };
-        }
+      try {
+        signForDelivery(incoming.to, action.to, action.body ?? incoming.body,
+          (signed) => queueOutbox(action.to!, signed, incoming.to));
+        return { kind: "forward", to: action.to };
+      } catch (e: any) {
+        return { kind: "refused", reason: e?.message || "signing failed" };
       }
-      queueOutbox(action.to, action.body ?? incoming.body, incoming.to);
-      return { kind: "forward", to: action.to };
     }
     case "drop":
       return { kind: "drop" };

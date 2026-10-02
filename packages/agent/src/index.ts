@@ -44,3 +44,8 @@ export type { FlairConfig } from "./runtime/types.js";
 // Signing
 export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
 export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";
+export {
+  KeyFormatError, AgentKeyError, AgentKeyConflictError,
+  agentKeyCandidates, existingAgentKeyPaths, resolveAgentKeyPath,
+  readAgentPrivateKey, readPrivateKeyAtPath, toEd25519Seed,
+} from "./lib/agent-keys.js";
