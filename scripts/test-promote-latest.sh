@@ -47,7 +47,8 @@
 #
 # The bash-4 denylist below is a cheap companion, NOT coverage: it catches only the
 # constructs that have already bitten. The real control for the bash-3.2 class is
-# the macOS CI leg, which runs this whole harness under /bin/bash (3.2.57).
+# the macOS CI leg, which runs this whole harness under /bin/bash and fails unless
+# that bash reports version 3.2.
 #
 # The runner normally gives the tool a pseudo-terminal for stdin and stdout.
 # Fixture S overrides tool stdin with /dev/null while keeping stdout on the pty.
