@@ -465,7 +465,19 @@ async function main() {
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
           const runtimeArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : undefined;
-          if (runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini") {
+          const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
+          const sandboxed = process.argv.includes("--sandboxed");
+          const noSandbox = process.argv.includes("--no-sandbox");
+          // cli#363 slice B: the three runtime runners are reached only on the
+          // EXECUTION side — inside the launcher's nono session (`--sandboxed`),
+          // or under an interactive human `--no-sandbox` opt-out. Every other
+          // invocation routes through `runAgent({action:"start"})` carrying
+          // `--runtime`, so the runtime reaches the SAME attested launch as every
+          // other agent start and is confined like it. There is no unconfined
+          // runtime spawn path: `--sandboxed` is only honoured with the
+          // launcher's release (attested), and `--no-sandbox` is the documented
+          // interactive escape hatch the launch gate already governs.
+          if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
             const { join } = await import("node:path");
             const { homedir } = await import("node:os");
@@ -587,7 +599,17 @@ async function main() {
               if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
             }
           } else {
-            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: !process.argv.includes("--no-sandbox"), sandboxed: process.argv.includes("--sandboxed"), sandboxRequired: process.argv.includes("--sandbox-required") });
+            await runAgent({
+              action: "start",
+              config: configPath,
+              id: agentId,
+              sandbox: !noSandbox,
+              sandboxed,
+              sandboxRequired: process.argv.includes("--sandbox-required"),
+              // Carry the runtime into the re-exec so the sandboxed child runs the
+              // runtime runner (cli#363 slice B); undefined for the default path.
+              runtime: attestedRuntime ? runtimeArg : undefined,
+            });
           }
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });

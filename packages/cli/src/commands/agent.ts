@@ -61,6 +61,12 @@ export interface AgentArgs {
   sandboxed?: boolean;
   /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
   sandboxRequired?: boolean;
+  /**
+   * The selected agent runtime (`--runtime claude-code|codex|gemini`). Carried
+   * into the attested re-exec so the sandboxed child runs the runtime runner
+   * (cli#363 slice B); undefined for the default AgentRuntime path.
+   */
+  runtime?: string;
   lines?: number;
   follow?: boolean;
   ackScopeExpansion?: boolean;
@@ -814,6 +820,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         const sandbox = (args as any).sandbox ?? true; // default ON — nono is the required isolation layer
         const sandboxed = (args as any).sandboxed ?? false;
         const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
+        // cli#363 slice B: carry the selected runtime into the re-exec so the
+        // sandboxed child runs the runtime runner rather than the default
+        // AgentRuntime. Only the three attested runtimes ever reach here.
+        const selectedRuntime = args.runtime;
         // The pinned ABSOLUTE path (never PATH) — the same resolution the
         // launcher performs, so the decision to launch and the launch itself
         // cannot disagree about which nono is in play (cli#350 round 4e). Using
@@ -869,6 +879,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               "--sandboxed",
             ];
             if (sandboxRequired) relaunch.push("--sandbox-required");
+            // Carry the runtime through the attested launch (cli#363 slice B):
+            // the sandboxed child re-enters bin/tps.ts, which runs the runtime
+            // runner on the execution side.
+            if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
