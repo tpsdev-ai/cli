@@ -248,6 +248,133 @@ async function checkNono() {
   }
 }
 
+/**
+ * cli#342: the usage text `--help`/`-h` prints for each top-level command,
+ * mirrored from the inline usage strings in the switch below. It sits here,
+ * beside the help intercept in main(), so the intercept can print a command's
+ * usage before any launch control, nono check or dispatch — without changing
+ * the case bodies (which keep their own copy for a missing or unknown action).
+ * A command with no entry falls back to the general help.
+ */
+const USAGE: Record<string, string> = {
+  init: "Usage: tps init [--id <agent-id>] [--name <name>] [--model <provider/model>]",
+  hire: "I'm gonna need you to specify a TPS report file or persona.\n\n  tps hire <report.tps | persona> [--name Name]\n\nBuilt-in personas: developer, designer, support, ea, ops, strategy",
+  roster: "Usage:\n  tps roster\n  tps roster list\n  tps roster show <agent> [--json]\n  tps roster find --channel <channel> [--json]\n  tps roster dashboard [--json]",
+  review: "Review who? I'm gonna need a name.\n\n  tps review <agent-name>",
+  bootstrap: "Usage: tps bootstrap <agent-id>",
+  agent: "Usage:\n" +
+          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent list [--json]\n" +
+          "  tps agent status --id <agent-id> [--json]\n" +
+          "  tps agent decommission --id <agent-id> [--force]\n" +
+          "  tps agent run --id <agent-id> --message <text>\n" +
+          "  tps agent start --id <agent-id>\n" +
+          "  tps agent health --id <agent-id>\n" +
+          "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
+          "  tps agent healthcheck <agent-id>\n" +
+          "  tps agent decommission --id <agent-id> [--force]\n" +
+          "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>] [--ack-scope-expansion] [--scope-warn-threshold <factor>]",
+  auth: "Usage:\n  tps auth login <provider>\n  tps auth status\n  tps auth revoke <provider>\n  tps auth refresh <provider>",
+  office: "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill",
+  context: "Usage:\n  tps context read <workstream>\n  tps context update <workstream> --summary \"...\"\n  tps context list",
+  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
+  identity: "Usage:\n  tps identity init [--expires-in 90d]\n  tps identity show\n  tps identity register <branch> [--expires-in 90d] [--trust standard]\n  tps identity list\n  tps identity revoke <branch> --reason \"...\"\n  tps identity verify <branch>",
+  secrets: [
+          "Usage:",
+          "  tps secrets set <KEY>=<VALUE>",
+          "  tps secrets list [--owner <id>] [--scope <s>] [--type <t>] [--stale-only] [--expires-within <d>] [--json]",
+          "  tps secrets remove <KEY>",
+          "  tps secrets show <name> [--json]",
+          "  tps secrets emit <name>",
+          "  tps secrets register <name> --path <p> --type <t> --owner <o> [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
+          "  tps secrets unregister <name>",
+          "  tps secrets adopt [--dry-run] [--apply] [--non-interactive] [--secrets-dir <dir>] [--keys-dir <dir>]",
+          "  tps secrets adopt <path-or-name>  (single candidate)",
+          "  tps secrets verify [--scope <s>] [--type <t>] [--fix] [--fail-on-drift] [--json]",
+          "  tps secrets scan [--root <path>] [--json]",
+          "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
+          "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
+          "  tps secrets audit tail [-n <count>]       Show last N audit log entries",
+          "  tps secrets audit grep <pattern>           Filter audit log by op or name",
+          "  tps secrets audit stats [--window <d>] [--json]   Audit log statistics",
+        ].join("\n"),
+  backup: "Usage: tps backup [keys]",
+  restore: "Usage: tps restore <agent-id> <archive> [--from <archive>] [--clone] [--overwrite] [--force]",
+  heartbeat: "Usage: tps heartbeat <agent-id>",
+  stats: "Usage: tps stats [--today] [--agent <id>] [--costs]",
+  status: "Usage: tps status [agent-id] [--json] [--cost] [--shared] [--auto-prune] [--prune]",
+  facts: [
+          "Usage:",
+          "  tps facts list [--scope <s>] [--json]",
+          "  tps facts show <name> [--json]",
+          "  tps facts get <name> [--no-verify] [--verify-preview] [--json]",
+          "  tps facts verify [--scope <s>] [--fail-on-drift]",
+          "  tps facts register <name> --command <cmd> --args <json-array> --type <t> [--ttl <ttl>] [--scope <s>] --rationale <text>",
+          "  tps facts unregister <name>",
+          "  tps facts init [--strict] [--json]",
+          "  tps facts refresh [--strict] [--json]",
+          "  tps facts schemas [--json]",
+          "  tps facts which <name> [--json]",
+        ].join("\n"),
+  gal: "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations",
+  branch: "Usage:\n  tps branch init [--listen <port>] [--host <hostname>] [--transport ws|tcp] [--agent <id>]\n  tps branch start\n  tps branch stop\n  tps branch status\n  tps branch log [--lines N] [--follow]",
+  git: "Usage: tps git worktree <agent> <repo-path> [branch-name]",
+  service: "Usage:\n  tps service register <name> <url> [--port <local-port>] [--desc <text>]\n  tps service list [--json]\n  tps service remove <name>",
+  memory: "Usage:\n" +
+          "  tps memory reflect <agentId> [--scope recent|tagged|all] [--since ISO] [--focus lessons_learned|patterns|decisions|errors] [--limit N]\n" +
+          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]",
+  proxy: "Usage:\n  tps proxy start [--port 6459]\n  tps proxy stop\n  tps proxy status",
+  bridge: "Usage:\n" +
+          "  tps bridge start [--port 7891] [--openclaw-url <url>] [--bridge-agent-id openclaw-bridge] [--default-agent <id>]\n" +
+          "  tps bridge start --adapter discord [--discord-token <token>] [--discord-token-file <path>] [--discord-channel <id>] [--webhook-url <url>]\n" +
+          "  tps bridge stop\n" +
+          "  tps bridge status [--json]",
+  skill: "Usage:\n" +
+          "  tps skill list --agent <id>                                    List skills assigned to an agent\n" +
+          "  tps skill register <source> --name <n> --version <hash> --agent <id> [--priority standard]\n" +
+          "  tps skill scan <file>                                          Static analysis of skill content\n" +
+          "  tps skill revoke <name> --agent <id>                           Remove skill assignment\n" +
+          "  tps skill show <name> --agent <id>                             Show skill details\n" +
+          "  tps skill add-pack <npm-package> --agent <id>                  Bulk-import npm-shipped skill pack",
+  flair: "Usage:\n" +
+          "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
+          "  tps flair uninstall\n" +
+          "  tps flair start|stop|restart\n" +
+          "  tps flair status\n" +
+          "  tps flair logs\n" +
+          "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]\n" +
+          "  tps flair sync [--once] [--interval <seconds>] [--dry-run]\n" +
+          "  tps flair set-hub <url> [--auth-mode admin-pass-file --auth-path <path>] [--port <n>]\n" +
+          "  tps flair clear-hub\n" +
+          "  tps flair show [--json]\n" +
+          "  tps flair probe [--json]",
+  tui: "Usage: tps tui [--agent <id>] [--repo <owner/name>]",
+  ui: "Usage: tps tui [--agent <id>] [--repo <owner/name>]",
+  pulse: "Usage: tps pulse [start|status|list] [--json] [--dry-run] [--interval <seconds>] [--repo <owner/name>]",
+};
+
+/**
+ * cli#342: commands whose arguments are a wrapped command (`secrets-guard <cmd>
+ * [args...]`). A `--help` in their tail is that command's, not ours, so the
+ * global help intercept leaves them alone. `office exec <agent> -- <cmd...>`
+ * needs no entry here: the `--` rule in `helpRequested` covers it.
+ */
+const PASS_THROUGH_COMMANDS = new Set(["secrets-guard"]);
+
+/**
+ * cli#342: whether argv asks for the help of the command being run — a
+ * `--help`/`-h` before any `--` separator. A `--help` after `--` belongs to a
+ * wrapped command, so it is not a request for tps help.
+ */
+function helpRequested(argv: readonly string[]): boolean {
+  const separator = argv.indexOf("--");
+  const end = separator === -1 ? argv.length : separator;
+  for (let i = 2; i < end; i++) {
+    if (argv[i] === "--help" || argv[i] === "-h") return true;
+  }
+  return false;
+}
+
 async function main() {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
     // Version is injected at build time to avoid runtime package.json reads,
@@ -256,6 +383,15 @@ async function main() {
     // INJECTED_VERSION is replaced by the build script with the actual semver.
     const version = typeof INJECTED_VERSION !== "undefined" ? INJECTED_VERSION : "dev";
     console.log(version);
+    return;
+  }
+
+  // cli#342: `--help`/`-h` on a subcommand prints that command's usage and
+  // exits 0 without running it, before launch control, the nono check and
+  // dispatch — so `identity init --help` cannot rewrite nono profiles and
+  // `branch init --help` cannot mint an identity or open a listener.
+  if (helpRequested(process.argv) && !PASS_THROUGH_COMMANDS.has(command ?? "")) {
+    console.log(USAGE[command ?? ""] ?? cli.help);
     return;
   }
 
@@ -714,11 +850,11 @@ async function main() {
     case "mail": {
       const action = rest[0] as "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc" | undefined;
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
-      if (cli.flags.help || !action || !validMailActions.includes(action)) {
+      if (!action || !validMailActions.includes(action)) {
         console.log(
           "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
-        process.exit(cli.flags.help ? 0 : 1);
+        process.exit(1);
       }
 
       const getFlag = (name: string): string | undefined => {
@@ -1110,11 +1246,11 @@ async function main() {
     case "gal": {
       const action = rest[0] as "list" | "set" | "remove" | "sync" | undefined;
       const valid = ["list", "set", "remove", "sync"];
-      if (cli.flags.help || !action || !valid.includes(action)) {
+      if (!action || !valid.includes(action)) {
         console.log(
           "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations"
         );
-        process.exit(cli.flags.help ? 0 : 1);
+        process.exit(1);
       }
       const { runGal } = await import("../src/commands/gal.js");
       runGal({

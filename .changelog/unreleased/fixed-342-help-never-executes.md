@@ -1,0 +1,1 @@
+- **`--help` and `-h` on a subcommand print that command's usage and exit 0 instead of running it.** Before, `branch init --help` minted a branch identity and opened a listener, and `identity init --help` rewrote every nono profile.
