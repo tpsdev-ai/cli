@@ -9,7 +9,8 @@ import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createFlairClient } from "../utils/flair-client.js";
-import { gcMessages, sendMessage } from "../utils/mail.js";
+import { gcMessages } from "../utils/mail.js";
+import { sendSignedMail } from "../utils/mail-producer.js";
 import { homeDir } from "../utils/home.js";
 
 // ---------------------------------------------------------------------------
@@ -187,15 +188,16 @@ export function setSendTimeoutMs(ms: number): void {
 }
 
 export function defaultMailSender(to: string, body: string, agentId: string): void {
-  // Call sendMessage in-process instead of shelling out to the 'tps' PATH shim.
-  // The shim hangs on mail send (observed on @tpsdev-ai/cli 0.5.4) and has no
-  // spawnSync timeout — a single undeliverable message wedges the pulse daemon.
-  // In-process call eliminates both the shim dependency and the hang vector.
+  // Sign the body as `agentId` before it is written — the same signing path
+  // `tps mail send` uses — so a promote()-reading recipient accepts it. Call
+  // sendMessage in-process instead of shelling out to the 'tps' PATH shim:
+  // the shim hangs on mail send (observed on @tpsdev-ai/cli 0.5.4) and has no
+  // spawnSync timeout, so a single undeliverable message wedges the daemon.
   try {
-    sendMessage(to, body, agentId);
+    sendSignedMail(agentId, to, body, { rationale: `agent ${agentId} pulse notification` });
   } catch (e: unknown) {
     // Defense in depth: a single bad recipient must not stop the notification loop.
-    // Log loudly and continue. Examples: "Inbox full", disk full, invalid agent id.
+    // Log loudly and continue. Examples: "Inbox full", a missing signing key, invalid agent id.
     console.error(`[pulse/mail] FAILED to send to ${to}: ${(e as Error).message}`);
   }
 }

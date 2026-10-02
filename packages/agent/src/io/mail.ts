@@ -1,8 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
-import { verifyEnvelope, type FlairClient } from "../lib/signEnvelope.js";
+import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
+import { readSigningSeedFile } from "../lib/signing-key.js";
 
 export interface MailMessage {
   filename: string;
@@ -76,6 +79,8 @@ export class MailClient {
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
     private readonly flairClient?: FlairClient,
+    /** Ed25519 key path used to SIGN outbound mail. Defaults to the agent's identity key. */
+    private readonly signingKeyPath?: string,
   ) {
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
@@ -224,10 +229,14 @@ export class MailClient {
     const started = Date.now();
     try {
       const { writeFileSync } = await import("node:fs");
+      // Sign the body as this agent — the v1 envelope a promote() reader
+      // verifies. signMailBody THROWS when no key exists, so an unsigned body
+      // is never written.
+      const signed = this.signMailBody(to, body);
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
       writeFileSync(
         join(this.outboxNew, filename),
-        JSON.stringify({ to, body, sentAt: new Date().toISOString() }, null, 2),
+        JSON.stringify({ from: this.agentId, to, body: signed, sentAt: new Date().toISOString() }, null, 2),
         "utf-8"
       );
       this.events?.emit({
@@ -248,6 +257,32 @@ export class MailClient {
       });
       throw err;
     }
+  }
+
+  /**
+   * Sign `body` as this agent into a v1 signed envelope. Throws a named error
+   * when no signing key exists — the same refusal the shared mail path makes,
+   * so an unsigned body a promote() reader would dead-letter is never written.
+   */
+  private signMailBody(to: string, body: string): string {
+    const keyPath = this.signingKeyPath ?? join(homedir(), ".tps", "identity", `${this.agentId}.key`);
+    const seed = readSigningSeedFile(keyPath);
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "agent runtime sendMail", signature: null },
+      { agent: this.agentId, kind: "agent", timestamp: now, rationale: `agent ${this.agentId} sendMail`, signature: null },
+    ];
+    const envelope: Envelope = {
+      v: 1,
+      from: this.agentId,
+      to,
+      subject: `mail to ${to}`,
+      body,
+      messageId: randomUUID(),
+      timestamp: now,
+      delegationChain: chain,
+    };
+    return JSON.stringify(signEnvelope(envelope, { [this.agentId]: Buffer.from(seed) }));
   }
 
   /** Deliver all messages in outbox to recipient inboxes (local relay). */

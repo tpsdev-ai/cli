@@ -281,6 +281,16 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.HOME = homeB;
     const agentId = "smoke";
     mkdirSync(join(homeB, ".tps", "branch-office", agentId), { recursive: true });
+    // bootstrap signs its mail as the CLI's own identity (resolveCliSenderId:
+    // TPS_AGENT_ID here); provision the sender's key so the signed intro and
+    // health probe can be written.
+    const originalAgentId = process.env.TPS_AGENT_ID;
+    const originalKeysDir = process.env.TPS_TEST_KEYS_DIR;
+    process.env.TPS_AGENT_ID = "host";
+    const bootstrapKeysDir = join(homeB, "keys");
+    mkdirSync(bootstrapKeysDir, { recursive: true });
+    writeFileSync(join(bootstrapKeysDir, "host.key"), Buffer.alloc(32, 9));
+    process.env.TPS_TEST_KEYS_DIR = bootstrapKeysDir;
     // The health checks shell out: a fake `nono` (the lane's fake, as the other
     // bootstrap cases use) plus an `openclaw` that reports a healthy gateway.
     const fakeBin = mkdtempSync(join(tmpdir(), "tps-bootstrap-bin-"));
@@ -316,6 +326,10 @@ exit 0
     } finally {
       console.log = originalLog;
       process.env.PATH = originalPath;
+      if (originalAgentId === undefined) delete process.env.TPS_AGENT_ID;
+      else process.env.TPS_AGENT_ID = originalAgentId;
+      if (originalKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+      else process.env.TPS_TEST_KEYS_DIR = originalKeysDir;
       rmSync(fakeBin, { recursive: true, force: true });
     }
 

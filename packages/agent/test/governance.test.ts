@@ -46,7 +46,10 @@ describe("ReviewGate", () => {
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-gate-test-"));
-    mail = new MailClient(tmpDir, undefined, "testagent");
+    // sendMail signs as the agent; give it a raw 32-byte Ed25519 seed.
+    const keyPath = join(tmpDir, "testagent.key");
+    writeFileSync(keyPath, Buffer.alloc(32, 5));
+    mail = new MailClient(tmpDir, undefined, "testagent", undefined, keyPath);
   });
 
   afterEach(() => {

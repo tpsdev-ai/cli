@@ -8,13 +8,74 @@ import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js
 import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema } from "../utils/wire-mail.js";
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
 import { sendMessage, inboxExists } from "../utils/mail.js";
+import { signForDelivery } from "../utils/mail-producer.js";
 import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
-import { runHandlerPipeline } from "../utils/mail-handler.js";
+import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
 
 let activeHostChannel: TransportChannel | null = null;
+
+export interface HandlerIncoming {
+  id: string;
+  from: string;
+  to: string;
+  /** The original, already-signed message content. */
+  body: string;
+}
+
+export type HandlerRoute =
+  | { kind: "reply"; to: string }
+  | { kind: "forward"; to: string }
+  | { kind: "drop" }
+  | { kind: "inbox" }
+  | { kind: "refused"; reason: string };
+
+/**
+ * Route a handler action for a received message.
+ *
+ * A handler-generated reply (or a forward whose body the handler REWROTE) is
+ * signed as `incoming.to` before it is queued, so the recipient's promote()
+ * accepts it; with no key the route is `refused` and nothing is queued. A
+ * routing forward passes the original signed content through unchanged and is
+ * a pure relay. `queueOutbox` defaults to the shared outbox (injectable for tests).
+ */
+export function routeHandlerAction(
+  action: HandlerAction,
+  incoming: HandlerIncoming,
+  queueOutbox: (to: string, body: string, from: string) => void = queueOutboxMessage,
+): HandlerRoute {
+  switch (action.type) {
+    case "reply": {
+      const to = action.to ?? incoming.from;
+      try {
+        signForDelivery(incoming.to, to, action.body ?? "", (signed) => queueOutbox(to, signed, incoming.to));
+        return { kind: "reply", to };
+      } catch (e: any) {
+        return { kind: "refused", reason: e?.message || "signing failed" };
+      }
+    }
+    case "forward": {
+      if (!action.to) return { kind: "forward", to: "" };
+      const rewritten = action.body !== undefined && action.body !== incoming.body;
+      if (rewritten) {
+        try {
+          signForDelivery(incoming.to, action.to, action.body!, (signed) => queueOutbox(action.to!, signed, incoming.to));
+          return { kind: "forward", to: action.to };
+        } catch (e: any) {
+          return { kind: "refused", reason: e?.message || "signing failed" };
+        }
+      }
+      queueOutbox(action.to, action.body ?? incoming.body, incoming.to);
+      return { kind: "forward", to: action.to };
+    }
+    case "drop":
+      return { kind: "drop" };
+    default:
+      return { kind: "inbox" };
+  }
+}
 
 export interface BranchArgs {
   action: "init" | "start" | "stop" | "status" | "log";
@@ -327,16 +388,18 @@ async function runStart(): Promise<void> {
       getRegisteredAgents(),
     );
 
-    switch (action.type) {
+    const routed = routeHandlerAction(action, { id: body.id, from: body.from, to: body.to, body: body.content });
+
+    switch (routed.kind) {
       case "reply":
-        queueOutboxMessage(action.to ?? body.from, action.body ?? "", body.to);
-        logLine("HANDLER", `Reply queued to ${action.to ?? body.from}`);
+        logLine("HANDLER", `Reply queued to ${routed.to}`);
         break;
       case "forward":
-        if (action.to) {
-          queueOutboxMessage(action.to, action.body ?? body.content, body.to);
-          logLine("HANDLER", `Forwarded to ${action.to}`);
-        }
+        if (routed.to) logLine("HANDLER", `Forwarded to ${routed.to}`);
+        break;
+      case "refused":
+        logLine("WARN", `Handler action refused: ${routed.reason}`);
+        deliveryError = sanitizeDeliveryError(routed.reason);
         break;
       case "drop":
         logLine("HANDLER", `Message ${body.id} dropped`);

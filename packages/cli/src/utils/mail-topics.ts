@@ -3,7 +3,8 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { sendMessage, assertValidBody } from "./mail.js";
+import { assertValidBody } from "./mail.js";
+import { sendSignedMail } from "./mail-producer.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -237,7 +238,7 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
     // Skip sending to the publisher themselves
     if (subscriberId === from) continue;
     try {
-      const msg = sendMessage(subscriberId, body, from);
+      const msg = sendSignedMail(from, subscriberId, body, { rationale: `agent ${from} topic publish` });
       // Patch topic fields into the written file
       if (existsSync(msg.filePath)) {
         const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
@@ -269,7 +270,7 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
       if (entry.from === agentId) continue;
       if (!alreadyDelivered(agentId, entry.id)) {
         try {
-          const msg = sendMessage(agentId, entry.body, entry.from);
+          const msg = sendSignedMail(entry.from, agentId, entry.body, { rationale: `agent ${entry.from} topic catch-up` });
           if (existsSync(msg.filePath)) {
             const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
             existing.topic = topic;

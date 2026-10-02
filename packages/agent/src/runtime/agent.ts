@@ -40,7 +40,7 @@ export class AgentRuntime {
       };
     }
 
-    const mail = new MailClient(config.mailDir, events, config.agentId, flairClient);
+    const mail = new MailClient(config.mailDir, events, config.agentId, flairClient, config.flair?.keyPath);
     const memory = new MemoryStore(config.memoryPath);
     const context = new ContextManager(memory, config.contextWindowTokens ?? 8000);
     const provider = new ProviderManager(config.llm, events, config.agentId);

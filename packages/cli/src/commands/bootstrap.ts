@@ -5,6 +5,8 @@ import { sanitizeIdentifier, sanitizeFreeText, sanitizeModelIdentifier } from ".
 import { workspacePath as resolveWorkspacePath, resolveTeamId, branchRoot as workspaceRoot } from "../utils/workspace.js";
 import { runCommandUnderNono } from "../utils/nono.js";
 import { deliverToSandbox, resolveAgentMailRoot } from "../utils/relay.js";
+import { signForDelivery } from "../utils/mail-producer.js";
+import { resolveCliSenderId } from "../utils/sender-id.js";
 import { readOpenClawConfig, findOpenClawConfig, type OpenClawConfig } from "../utils/config.js";
 import { homeDir } from "../utils/home.js";
 
@@ -170,23 +172,22 @@ function healthGateway(): boolean {
   return runCommandUnderNono("tps-bootstrap", {}, ["openclaw", "gateway", "status"]) === 0;
 }
 
-function healthMail(_teamWorkspace: string, teamId: string): boolean {
+function healthMail(teamId: string, senderId: string): boolean {
   // Use resolveAgentMailRoot() — same path derivation as deliverToSandbox()
   const mailRoot = resolveAgentMailRoot(teamId);
   const freshDir = join(mailRoot, "new");
   mkdirSync(freshDir, { recursive: true });
   const before = readdirSync(freshDir).filter((f) => f.endsWith(".json")).length;
 
-  const msg = {
-    id: randomUUID(),
-    from: "system:bootstrap",
-    to: teamId,
-    body: "bootstrap health check probe",
-    timestamp: new Date().toISOString(),
-  };
-
+  // Sign the probe as the CLI's own identity (the same signing path
+  // `tps mail send` uses). With no key this refuses and the check reports
+  // mail not operational, rather than writing a body no promote() will accept.
   try {
-    deliverToSandbox(teamId, msg);
+    const id = randomUUID();
+    const timestamp = new Date().toISOString();
+    signForDelivery(senderId, teamId, "bootstrap health check probe", (signed) =>
+      deliverToSandbox(teamId, { id, from: senderId, to: teamId, body: signed, timestamp }),
+    );
   } catch {
     return false;
   }
@@ -208,7 +209,7 @@ function healthMail(_teamWorkspace: string, teamId: string): boolean {
     const probe = join(freshDir, files[0]!);
     const raw = readFileSync(probe, "utf-8");
     const parsed = JSON.parse(raw);
-    if (!parsed.from?.startsWith("system:")) return false;
+    if (parsed.from !== senderId) return false;
     renameSync(probe, join(curDir, files[0]!));
   } catch {
     return false;
@@ -217,14 +218,12 @@ function healthMail(_teamWorkspace: string, teamId: string): boolean {
   return true;
 }
 
-function sendIntroduction(teamId: string, _teamWorkspace: string, body: string): void {
-  deliverToSandbox(teamId, {
-    id: randomUUID(),
-    from: "system:bootstrap",
-    to: teamId,
-    body,
-    timestamp: new Date().toISOString(),
-  });
+export function sendIntroduction(teamId: string, body: string, senderId: string): void {
+  const id = randomUUID();
+  const timestamp = new Date().toISOString();
+  signForDelivery(senderId, teamId, body, (signed) =>
+    deliverToSandbox(teamId, { id, from: senderId, to: teamId, body: signed, timestamp }),
+  );
 }
 
 function writeMarker(teamId: string, payload: string): void {
@@ -233,11 +232,11 @@ function writeMarker(teamId: string, payload: string): void {
   writeFileSync(path, payload, "utf-8");
 }
 
-function runHealthChecks(agentWorkspace: string, teamWorkspace: string, teamId: string): HealthResult {
+function runHealthChecks(agentWorkspace: string, _teamWorkspace: string, teamId: string, senderId: string): HealthResult {
   return {
     workspaceWritable: healthReadWrite(agentWorkspace),
     gatewayReachable: healthGateway(),
-    mailOperational: healthMail(teamWorkspace, teamId),
+    mailOperational: healthMail(teamId, senderId),
   };
 }
 
@@ -266,6 +265,10 @@ export async function runBootstrap(args: BootstrapArgs): Promise<void> {
   const agentId = assertAgent(args.agentId);
   const teamId = resolveTeamId(agentId);
   const workspace = resolveWorkspacePath(agentId);
+  const senderId = await resolveCliSenderId();
+  if (sanitizeIdentifier(senderId) !== senderId) {
+    throw new Error(`Invalid sender id: ${senderId}`);
+  }
   if (!existsSync(workspace)) {
     throw new Error(`No workspace found for ${agentId}. Run tps office start ${agentId} first.`);
   }
@@ -287,7 +290,7 @@ export async function runBootstrap(args: BootstrapArgs): Promise<void> {
     throw new Error("Failed to register agent in roster");
   }
 
-  const health = runHealthChecks(workspace, teamWorkspace, teamId);
+  const health = runHealthChecks(workspace, teamWorkspace, teamId, senderId);
   if (!health.workspaceWritable) throw new Error("Workspace read/write check failed");
   if (!health.gatewayReachable) throw new Error("Gateway reachability check failed");
   if (!health.mailOperational) throw new Error("Mail send/receive check failed");
@@ -295,8 +298,8 @@ export async function runBootstrap(args: BootstrapArgs): Promise<void> {
   const { name, role } = readNameAndRole(workspace);
   sendIntroduction(
     teamId,
-    teamWorkspace,
-    `Welcome ${name} (${role})\nModel: ${updatedConfig.agents?.list?.find((a) => a.id === agentId)?.model}\nCapabilities summary: open mail, run workspace tools, execute tasks.`
+    `Welcome ${name} (${role})\nModel: ${updatedConfig.agents?.list?.find((a) => a.id === agentId)?.model}\nCapabilities summary: open mail, run workspace tools, execute tasks.`,
+    senderId,
   );
 
   writeMarker(teamId, JSON.stringify({

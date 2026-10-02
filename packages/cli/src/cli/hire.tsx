@@ -9,7 +9,9 @@ import { randomQuip, resolveReportPath } from "../utils/output.js";
 import { findNono, isNonoStrict, runCommandUnderNono } from "../utils/nono.js";
 import { injectAgent } from "../utils/config-inject.js";
 import { findOpenClawConfig } from "../utils/config.js";
-import { sendMessage } from "../utils/mail.js";
+import { sendSignedMail } from "../utils/mail-producer.js";
+import { resolveCliSenderId } from "../utils/sender-id.js";
+import { sanitizeIdentifier } from "../schema/sanitizer.js";
 
 interface HireProps {
   reportPath: string;
@@ -29,6 +31,29 @@ interface Step {
   done: boolean;
 }
 
+/**
+ * Send the new agent's onboarding mail, signed as `from` (the CLI's own
+ * identity) so the recipient's promote() accepts it. Exported so a test can
+ * exercise the producer without rendering the TUI. Throws when `from` has no
+ * signing key.
+ */
+export function sendOnboardingMail(from: string, agentId: string, agentName: string, role: string, workspacePath: string): void {
+  sendSignedMail(from, agentId, [
+    `Subject: Welcome to the team, ${agentName}!`,
+    "",
+    `You've been hired as a ${role}. Your workspace is set up at ${workspacePath}.`,
+    "",
+    "Your first steps:",
+    "1. Read your SOUL.md — it defines who you are",
+    "2. Read your AGENTS.md — it defines how you work",
+    `3. Check your mail regularly with: tps mail check ${agentId}`,
+    `4. Reply to confirm you're online: tps mail send ${from} "ready"`,
+    "",
+    "Welcome aboard.",
+    "— TPS",
+  ].join("\n"), { rationale: `agent ${from} hire onboarding` });
+}
+
 function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, inject, runtime = "openclaw", baseModel }: HireProps) {
   const [steps, setSteps] = useState<Step[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -43,6 +68,7 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
   const shouldInject = inject !== false && !dryRun && !branch && isOpenClaw;
 
   useEffect(() => {
+    void (async () => {
     try {
       const resolvedPath = resolveReportPath(reportPath);
       const generator = getGenerator(runtime);
@@ -103,20 +129,13 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
 
         // Onboarding mail
         try {
-          sendMessage(result.agentId, [
-            `Subject: Welcome to the team, ${result.agentName}!`,
-            "",
-            `You've been hired as a ${parsed.name}. Your workspace is set up at ${result.workspacePath}.`,
-            "",
-            "Your first steps:",
-            "1. Read your SOUL.md — it defines who you are",
-            "2. Read your AGENTS.md — it defines how you work",
-            `3. Check your mail regularly with: tps mail check ${result.agentId}`,
-            `4. Reply to confirm you're online: tps mail send tps-onboard "ready"`,
-            "",
-            "Welcome aboard.",
-            "— TPS",
-          ].join("\n"), "tps-onboard");
+          // Sign as the CLI's own identity (the same signing path `tps mail
+          // send` uses) so the new agent's promote() accepts it. With no key
+          // this refuses and the step is skipped, rather than writing a body
+          // no promote() will accept.
+          const senderId = await resolveCliSenderId();
+          if (sanitizeIdentifier(senderId) !== senderId) throw new Error(`Invalid sender id: ${senderId}`);
+          sendOnboardingMail(senderId, result.agentId, result.agentName, parsed.name, result.workspacePath);
           setOnboarded(true);
         } catch { /* best-effort */ }
         allSteps[5]!.done = true;
@@ -131,6 +150,7 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
     } catch (e: any) {
       setError(e.message);
     }
+    })();
   }, []);
 
   if (error) {

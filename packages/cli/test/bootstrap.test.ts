@@ -20,12 +20,25 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 describe("bootstrap command", () => {
   let tempRoot: string;
   let originalHome: string | undefined;
+  let originalAgentId: string | undefined;
+  let originalKeysDir: string | undefined;
   let fakeBin = "";
 
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-bootstrap-test-"));
     originalHome = process.env.HOME;
+    originalAgentId = process.env.TPS_AGENT_ID;
+    originalKeysDir = process.env.TPS_TEST_KEYS_DIR;
     process.env.HOME = tempRoot;
+
+    // bootstrap signs its mail as the CLI's own identity (resolveCliSenderId:
+    // TPS_AGENT_ID here), the same signing path `tps mail send` uses. Provision
+    // the sender's key so the signed intro and health probe can be written.
+    process.env.TPS_AGENT_ID = "host";
+    const identityDir = join(tempRoot, ".tps", "identity");
+    mkdirSync(identityDir, { recursive: true });
+    writeFileSync(join(identityDir, "host.key"), Buffer.alloc(32, 9));
+    process.env.TPS_TEST_KEYS_DIR = identityDir;
 
     // Fake helper binaries for bootstrap health checks.
     fakeBin = mkdtempSync(join(tempRoot, "tools-"));
@@ -63,6 +76,10 @@ exit 0
   afterEach(() => {
     if (originalHome) process.env.HOME = originalHome;
     else delete process.env.HOME;
+    if (originalAgentId === undefined) delete process.env.TPS_AGENT_ID;
+    else process.env.TPS_AGENT_ID = originalAgentId;
+    if (originalKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+    else process.env.TPS_TEST_KEYS_DIR = originalKeysDir;
     rmSync(tempRoot, { recursive: true, force: true });
     if (fakeBin) rmSync(fakeBin, { recursive: true, force: true });
   });
@@ -116,7 +133,7 @@ exit 0
     const intro = mailFiles
       .map((f) => JSON.parse(readFileSync(join(mailDir, f), "utf-8")))
       .find((m) => typeof m.body === "string" && m.body.includes("Welcome"));
-    expect(intro?.from).toBe("system:bootstrap");
+    expect(intro?.from).toBe("host");
     expect(intro?.body).toContain("Welcome");
   });
 

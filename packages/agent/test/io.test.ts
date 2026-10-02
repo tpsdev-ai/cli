@@ -8,11 +8,15 @@ import { ContextManager } from "../src/io/context.js";
 
 describe("MailClient", () => {
   let tmpDir: string;
+  let keyPath: string;
   let client: MailClient;
 
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), "tps-mail-test-"));
-    client = new MailClient(tmpDir, undefined, "testagent");
+    // sendMail signs as the agent; give it a raw 32-byte Ed25519 seed.
+    keyPath = join(tmpDir, "testagent.key");
+    writeFileSync(keyPath, Buffer.alloc(32, 3));
+    client = new MailClient(tmpDir, undefined, "testagent", undefined, keyPath);
   });
 
   afterEach(() => {
@@ -43,12 +47,27 @@ describe("MailClient", () => {
     expect(existsSync(join(tmpDir, "testagent", "cur", "test-1.json"))).toBe(false);
   });
 
-  test("sendMail writes a file to outbox/new", async () => {
+  test("sendMail writes a signed envelope to outbox/new", async () => {
     await client.sendMail("host@tps", "hello from agent");
 
-    const { readdirSync } = await import("node:fs");
+    const { readdirSync, readFileSync } = await import("node:fs");
     const files = readdirSync(join(tmpDir, "testagent", "outbox"));
     expect(files.length).toBe(1);
+    const record = JSON.parse(readFileSync(join(tmpDir, "testagent", "outbox", files[0]!), "utf-8"));
+    expect(record.from).toBe("testagent");
+    const envelope = JSON.parse(record.body);
+    expect(envelope.v).toBe(1);
+    expect(envelope.from).toBe("testagent");
+    expect(envelope.to).toBe("host@tps");
+    expect(envelope.body).toBe("hello from agent");
+    expect(envelope.signature).toMatch(/^ed25519:/);
+  });
+
+  test("sendMail refuses with a named error and writes nothing when no key exists", async () => {
+    const keyless = new MailClient(tmpDir, undefined, "nokeyagent");
+    await expect(keyless.sendMail("host@tps", "hi")).rejects.toThrow(/no Ed25519 private key/);
+    const { readdirSync } = await import("node:fs");
+    expect(readdirSync(join(tmpDir, "nokeyagent", "outbox")).filter((f) => f.endsWith(".json")).length).toBe(0);
   });
 });
 
