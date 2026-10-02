@@ -375,16 +375,11 @@ function main() {
   process.exitCode = exitCodeFor(result);
 }
 
-/**
- * Whether this module is the process entry point (cli#475). Compared by REAL
- * path: `import.meta.url` is resolved through symlinks while `process.argv[1]`
- * keeps the path it was invoked with, so comparing them as given made the guard
- * a silent no-op — exit 0, no report — through a symlinked path.
- */
+/** Compare canonical entry paths (cli#475); an unresolvable argv[1] throws. */
 function isEntryPoint() {
   const invoked = process.argv[1];
   if (invoked === undefined) return false;
-  return realpathSync(invoked) === fileURLToPath(import.meta.url);
+  return realpathSync(invoked) === realpathSync(fileURLToPath(import.meta.url));
 }
 
 if (isEntryPoint()) main();
