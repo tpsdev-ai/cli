@@ -1,1 +1,1 @@
-- **A unit test fails on an `@tpsdev-ai/*` dependency outside cli's six release packages, the invariant the scope's Renovate disable relies on (Closes #424).**
+- **Reject nonrelease `@tpsdev-ai/*` dependencies in regular, non-symlinked `package.json` files outside `node_modules` and `.git` (Closes #424).**

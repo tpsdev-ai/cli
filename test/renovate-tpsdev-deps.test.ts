@@ -1,15 +1,4 @@
-/**
- * cli#424 — pin Renovate's `@tpsdev-ai/**` exclusion to the invariant it needs.
- *
- * `.github/renovate.json` turns Renovate off for every `@tpsdev-ai/*`
- * dependency. That is safe only while each such dependency name in this repo is
- * one of cli's current six release packages. This test fails on any other name,
- * regardless of its specifier, naming the file and the dependency.
- *
- * The six names are read from `.github/workflows/release.yml`'s `PKGS` array,
- * not restated here. A workflow that cannot supply the list throws rather than
- * reading as an empty set.
- */
+/** Checks regular, non-symlinked package.json files outside node_modules and .git for nonrelease @tpsdev-ai/* dependencies. */
 import { describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,26 +10,28 @@ const RELEASE_WORKFLOW = join(ROOT, ".github", "workflows", "release.yml");
 /** The dependency maps a package.json may name dependencies in. */
 const DEP_KINDS = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"] as const;
 
-/** `@tpsdev-ai/<name>` for each package in the release workflow's `PKGS` array. */
-function releasePackages(): string[] {
-  const workflow = Bun.YAML.parse(readFileSync(RELEASE_WORKFLOW, "utf8")) as {
-    jobs?: Record<string, { steps?: Array<{ run?: unknown }> }>;
+function releasePackages(source = readFileSync(RELEASE_WORKFLOW, "utf8")): string[] {
+  const workflow = Bun.YAML.parse(source) as {
+    defaults?: unknown;
+    jobs?: Record<string, {
+      if?: unknown;
+      defaults?: unknown;
+      steps?: Array<{ name?: string; if?: unknown; shell?: unknown; run?: unknown }>;
+    }>;
   };
-  const runs = Object.values(workflow.jobs ?? {})
-    .flatMap((job) => job.steps ?? [])
-    .map((step) => step.run)
-    .filter((run): run is string => typeof run === "string");
-  const arrays = runs.flatMap((run) => [...run.matchAll(/\bPKGS=\(([^)]*)\)/g)].map((match) => match[1]));
-  if (arrays.length !== 1) {
-    throw new Error(`${RELEASE_WORKFLOW}: expected exactly one PKGS=(...) array, found ${arrays.length}`);
+  const job = workflow.jobs?.["publish-packages"];
+  const steps = job?.steps?.filter((step) => step.name === "Verify ALL workspace versions match the tag") ?? [];
+  const step = steps[0];
+  if (workflow.defaults !== undefined || job?.defaults !== undefined || job?.if !== undefined ||
+      steps.length !== 1 || step.if !== undefined || step.shell !== undefined || typeof step.run !== "string") {
+    throw new Error(`${RELEASE_WORKFLOW}: expected an unconditional version-verification step with the default shell`);
   }
-  const names = arrays[0]
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((name) => `@tpsdev-ai/${name}`);
-  if (names.length === 0) throw new Error(`${RELEASE_WORKFLOW}: PKGS=(...) is empty`);
-  return names;
+  const lines = step.run.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+  const assignment = lines[2]?.match(/^PKGS=\(([a-z0-9-]+(?:[ \t]+[a-z0-9-]+)*)\)$/);
+  if (lines[0] !== "set -euo pipefail" || lines[1] !== 'VERSION="${GITHUB_REF_NAME#v}"' || !assignment) {
+    throw new Error(`${RELEASE_WORKFLOW}: expected executable literal PKGS=(...) after set -euo pipefail and VERSION`);
+  }
+  return assignment[1].split(/[ \t]+/).map((name) => `@tpsdev-ai/${name}`);
 }
 
 /** Regular package.json files below root; node_modules, .git, and symlinks are skipped. */
@@ -90,7 +81,49 @@ function dependencyViolations(
 }
 
 describe("Renovate @tpsdev-ai scope (cli#424)", () => {
-  it("every @tpsdev-ai/* dependency names one of the six release packages", () => {
+  it("rejects a commented-out release PKGS assignment", () => {
+    const source = readFileSync(RELEASE_WORKFLOW, "utf8");
+    const commented = source.replace(/^(\s*)PKGS=/m, "$1# PKGS=");
+    expect(commented).not.toBe(source);
+    expect(() => releasePackages(commented)).toThrow();
+  });
+
+  for (const [label, replacement] of [
+    ["missing", ""],
+    ["echoed", "echo 'PKGS=(cli)'"],
+    ["quoted", "TEXT='\nPKGS=(cli)\n'"],
+    ["heredoc", "cat <<'EOF'\nPKGS=(cli)\nEOF"],
+    ["conditional", "if false; then\nPKGS=(cli)\nfi"],
+    ["short-circuited", "false && PKGS=(cli)"],
+    ["uncalled function", "unused() {\nPKGS=(cli)\n}"],
+    ["after exit", "exit 0\nPKGS=(cli)"],
+    ["empty", "PKGS=()"],
+  ]) {
+    it(`rejects ${label} release PKGS assignments`, () => {
+      const source = readFileSync(RELEASE_WORKFLOW, "utf8");
+      const changed = source.replace(/^([ \t]*)PKGS=.*$/m, (_, indent) =>
+        replacement.split("\n").map((line) => `${indent}${line}`).join("\n"));
+      expect(changed).not.toBe(source);
+      expect(() => releasePackages(changed)).toThrow();
+    });
+  }
+
+  for (const [label, before, after] of [
+    ["wrong job", "  publish-packages:", "  another-job:"],
+    ["wrong step", "name: Verify ALL workspace versions match the tag", "name: Another step"],
+    ["disabled job", "  publish-packages:", "  publish-packages:\n    if: false"],
+    ["disabled step", "name: Verify ALL workspace versions match the tag", "name: Verify ALL workspace versions match the tag\n        if: false"],
+    ["nondefault shell", "name: Verify ALL workspace versions match the tag", "name: Verify ALL workspace versions match the tag\n        shell: python"],
+  ]) {
+    it(`rejects PKGS in a ${label}`, () => {
+      const source = readFileSync(RELEASE_WORKFLOW, "utf8");
+      const changed = source.replace(before, after);
+      expect(changed).not.toBe(source);
+      expect(() => releasePackages(changed)).toThrow();
+    });
+  }
+
+  it("checks regular, non-symlinked package.json files outside node_modules and .git for nonrelease @tpsdev-ai/* dependencies", () => {
     const allowed = new Set(releasePackages());
     const files = packageJsonPaths();
     expect(files.length).toBeGreaterThan(0);
