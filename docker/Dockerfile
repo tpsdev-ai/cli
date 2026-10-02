@@ -22,10 +22,9 @@ RUN set -eux; \
 
 FROM node:24-bookworm-slim AS base
 ARG TPS_VERSION=0.5.4
-# The shipped path: the PUBLISHED agent at the tag version. docker.yml reads
-# TPS_VERSION from packages/cli/package.json, and the release train publishes
-# @tpsdev-ai/agent at that same tag version (release.yml), so the image installs
-# the agent that carries the supervisor's `check` pre-flight (cli#352 r4).
+# The shipped path installs the PUBLISHED @tpsdev-ai/agent version supplied by
+# docker.yml's workflow dispatch input as TPS_VERSION. The workflow checks that
+# npm has published that version before this build (cli#420).
 #
 # TPS_AGENT_TARBALL is VERIFICATION-ONLY — the release build never sets it. Its
 # value is the path (relative to the build context) of an `npm pack` of

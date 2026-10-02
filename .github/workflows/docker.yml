@@ -1,9 +1,6 @@
 name: Docker Image
 
 on:
-  workflow_run:
-    workflows: ["Release"]
-    types: [completed]
   workflow_dispatch:
     inputs:
       version:
@@ -18,28 +15,18 @@ jobs:
   build-and-push:
     name: Build & Push
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Determine version
-        id: version
+      # Before any build: the required version shape, whether npm has
+      # published @tpsdev-ai/agent at that version, and the tags to push
+      # (cli#420). The script and its tests: .github/scripts/docker-image-tags.sh,
+      # test/docker-image-tags.test.ts.
+      - name: Check the version and compute the tags
+        id: image
         env:
           INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$INPUT_VERSION" ]; then
-            # Validate: must be semver-like (digits and dots only)
-            if ! echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
-              echo "❌ Invalid version: $INPUT_VERSION" && exit 1
-            fi
-            echo "tps_version=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
-            echo "tag=$INPUT_VERSION" >> "$GITHUB_OUTPUT"
-          else
-            # Read version from package.json (workflow_run trigger)
-            V=$(node -p "require('./packages/cli/package.json').version")
-            echo "tps_version=$V" >> "$GITHUB_OUTPUT"
-            echo "tag=$V" >> "$GITHUB_OUTPUT"
-          fi
+        run: bash .github/scripts/docker-image-tags.sh
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
@@ -65,7 +52,7 @@ jobs:
           push: false
           load: true
           build-args: |
-            TPS_VERSION=${{ steps.version.outputs.tps_version }}
+            TPS_VERSION=${{ steps.image.outputs.tps_version }}
           tags: |
             tps-office-verify:latest
           cache-from: type=gha
@@ -167,9 +154,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            TPS_VERSION=${{ steps.version.outputs.tps_version }}
-          tags: |
-            ghcr.io/tpsdev-ai/tps-office:${{ steps.version.outputs.tag }}
-            ghcr.io/tpsdev-ai/tps-office:latest
+            TPS_VERSION=${{ steps.image.outputs.tps_version }}
+          tags: ${{ steps.image.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
