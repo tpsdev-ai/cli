@@ -187,8 +187,9 @@ CI fidelity (`review-build-ok` may disagree with CI):
   review builds the assigned head.
 - CI's runner image carries its own Node (e.g. 22.23.2 today) where a workflow
   does not pin one; the review uses the selected matrix image's Node (e.g.
-  22.22.1). If any planned `setup-node` pins node, a step planned on `default`
-  refuses the build (`node-mismatch`).
+  22.22.1). After resolution selects the current image, a `default` step in a
+  plan with a Node pin is refused as `node-mismatch`. Conflicting in-matrix
+  pins are refused as `conflicting`; a different selected image as `wrong-image`.
 - Socket Firewall is not reproduced (`sfw` runs the command unwrapped); cache
   restores never happen (a cold build); a workflow's artifact uploads are not
   performed.
