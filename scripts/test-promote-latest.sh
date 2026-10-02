@@ -42,12 +42,12 @@
 #     post-check, skip the final all-package read, and roll back on a gh failure;
 #     confirm a fixture catches each —
 #     a test that passes on both the fixed and the broken script is not a test.
-#   * the fixtures run under bash 3.2 too (BASH_BIN; the macos-14 CI leg pins it),
+#   * the fixtures run under bash 3.2 too (BASH_BIN; the macOS CI leg pins it),
 #     and the workflow still invokes this harness
 #
 # The bash-4 denylist below is a cheap companion, NOT coverage: it catches only the
 # constructs that have already bitten. The real control for the bash-3.2 class is
-# the `macos-14` CI leg, which runs this whole harness under /bin/bash (3.2.57).
+# the macOS CI leg, which runs this whole harness under /bin/bash (3.2.57).
 #
 # The runner normally gives the tool a pseudo-terminal for stdin and stdout.
 # Fixture S overrides tool stdin with /dev/null while keeping stdout on the pty.
@@ -962,7 +962,7 @@ else
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
-# Companion only, NOT coverage — see the header. The real control is the macos-14
+# Companion only, NOT coverage — see the header. The real control is the macOS
 # CI leg running this harness under bash 3.2.
 grep -vE '^[[:space:]]*#' "$tool" >"$work/tool-code.txt"
 if grep -nF -e 'declare -A' -e 'mapfile' -e 'readarray' -e ';;&' -e '&>>' -e '^^' "$work/tool-code.txt" >"$work/b4.txt"; then

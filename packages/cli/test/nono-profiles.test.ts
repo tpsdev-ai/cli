@@ -167,7 +167,7 @@ describe("the gate is a durable control", () => {
     // The gate cannot be silently orphaned by a later workflow edit.
     expect(yml).toContain("./scripts/check-nono-profiles.sh");
     expect(yml).toContain("NONO_BIN=");
-    expect(yml).toMatch(/macos-\d+/);
+    expect(yml).toMatch(/macos-(latest|\d+)/);
     expect(yml).toMatch(/nono-pin|\.nono-version|bc1406e9/);
   });
 });
