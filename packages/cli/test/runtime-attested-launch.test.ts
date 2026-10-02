@@ -71,7 +71,7 @@ function seedHome(home: string, ws: string): void {
 }
 
 function makeSandbox(): Sandbox {
-  const base = tmpdir();
+  const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
   const root = mkdtempSync(join(base, "tps-363-rt-"));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
