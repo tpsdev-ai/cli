@@ -70,10 +70,10 @@
  * wiring together, and the boundary there is review of the diff. What it holds
  * is that coverage cannot go quiet.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /** The repo root, from this file's own location: `<root>/scripts/check-test-reports.mjs`. */
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -375,4 +375,16 @@ function main() {
   process.exitCode = exitCodeFor(result);
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main();
+/**
+ * Whether this module is the process entry point (cli#475). Compared by REAL
+ * path: `import.meta.url` is resolved through symlinks while `process.argv[1]`
+ * keeps the path it was invoked with, so comparing them as given made the guard
+ * a silent no-op — exit 0, no report — through a symlinked path.
+ */
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  return realpathSync(invoked) === fileURLToPath(import.meta.url);
+}
+
+if (isEntryPoint()) main();

@@ -82,10 +82,10 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   IsolationRefusal,
   assertNoReporterOutfile,
@@ -329,6 +329,20 @@ async function main() {
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+/**
+ * Whether this module is the process entry point (cli#475). Compared by REAL
+ * path: `import.meta.url` is resolved through symlinks while `process.argv[1]`
+ * keeps the path it was invoked with, so comparing them as given made the
+ * launcher a silent no-op — exit 0, no suite run — through a symlinked path.
+ * An unresolvable argv[1] is not "not the entry point": it throws, rather than
+ * exit 0 having run nothing.
+ */
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  return realpathSync(invoked) === fileURLToPath(import.meta.url);
+}
+
+if (isEntryPoint()) {
   await main();
 }
