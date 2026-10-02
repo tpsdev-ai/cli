@@ -126,7 +126,7 @@ async function receiveSignedMail(options: {
 }
 
 describe("S43-A: internal mail drops exec", () => {
-  test("verified body with unsigned user-trust header gets external tools and signed sender", async () => {
+  test("verified body with an unsigned internal-trust wrapper header gets external tools and signed sender", async () => {
     const root = mkdtempSync(join(tmpdir(), "signed-mail-trust-"));
     try {
       const seed = Buffer.alloc(32, 0x31);

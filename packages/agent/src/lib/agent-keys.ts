@@ -110,10 +110,13 @@ export function existingAgentKeyPaths(agentName: string): string[] {
 }
 
 /**
- * The key file that signs for `agentName`: the first existing candidate, once
- * every existing candidate has been read and found to hold the SAME key. Null
- * when none exists. Throws AgentKeyError (a file cannot be read or parsed) or
- * AgentKeyConflictError (two files hold different keys) — never picks one.
+ * The key file that signs for `agentName`. With no explicit path: the first
+ * existing default candidate, once every existing candidate has been read and
+ * found to hold the SAME key; null when none exists. A configured explicit path
+ * must exist (a missing one returns null immediately without reading defaults)
+ * and must agree with any default keys. Throws AgentKeyError (a file cannot be
+ * read or parsed) or AgentKeyConflictError (two files hold different keys) —
+ * never picks one.
  */
 export function resolveAgentKeyPath(agentName: string, explicitPath?: string): string | null {
   return resolveAgentKey(agentName, explicitPath)?.path ?? null;
