@@ -358,6 +358,63 @@ describe("runtime tool allowlist", () => {
     expectRefusal(results[0], "exec", "denied", "external");
   });
 
+  test("disallowed call on the over-limit turn is neither dispatched nor refused", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tool-allowlist-limit-"));
+    const memory = makeMemory();
+    const tools = makeToolRegistry();
+    const exec = spyOn(tools.get("exec")!, "execute");
+    const dispatch = spyOn(tools, "execute");
+    const requests: CompletionRequest[] = [];
+    const provider = {
+      complete: mock(async (req: CompletionRequest): Promise<CompletionResponse> => {
+        requests.push(structuredClone(req));
+        return {
+          content: "",
+          toolCalls: requests.length === 1
+            ? [{ id: "allowed", name: "read", input: { path: "file.txt" } }]
+            : requests.length === 2
+              ? [{ id: "over-limit", name: "exec", input: { command: "echo test" } }]
+              : undefined,
+          inputTokens: 10,
+          outputTokens: 5,
+        };
+      }),
+    } as unknown as ProviderManager;
+    const loop = new EventLoop({
+      config: makeConfig({ workspace: root, maxToolTurns: 1 }),
+      memory, context: makeContext(), provider, tools,
+    });
+    try {
+      const received = await receiveSignedMail({
+        root, from: "sender", body: "read the file", trust: "external",
+        messageId: "tool-allowlist-limit", seed: Buffer.alloc(32, 0x34),
+      });
+      let delivered = false;
+      await loop.run(async () => {
+        if (!delivered) { delivered = true; return [received]; }
+        await loop.stop();
+        return [];
+      });
+      expect(requests).toHaveLength(2);
+      expect(requests[1]!.tools.map((tool) => tool.name)).not.toContain("exec");
+      expect(exec).not.toHaveBeenCalled();
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith("read", { path: "file.txt" });
+      expect(requests[1]!.messages.filter((message) => message.role === "tool")).toEqual([
+        { role: "tool", name: "read", tool_call_id: "allowed", content: JSON.stringify({ content: "file contents" }) },
+      ]);
+      const entries = (memory.append as ReturnType<typeof mock>).mock.calls.map(([entry]) => entry);
+      expect(entries.filter((entry) => entry.type === "error")).toEqual([
+        { type: "error", ts: expect.any(String), data: { message: "tool loop max depth reached (1)" } },
+      ]);
+      expect(entries.filter((entry) => entry.type === "tool_result")).toEqual([
+        { type: "tool_result", ts: expect.any(String), data: { tool: "read", result: { content: "file contents" } } },
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test.each(["external", "internal", "user"] as const)("%s trust refuses unknown tools before dispatch or review", async (trust) => {
     const { dispatch, sendMail, results } = await runCalls([
       { id: "unknown", name: "missing_tool", input: {} },

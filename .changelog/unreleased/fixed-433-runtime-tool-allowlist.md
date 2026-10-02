@@ -1,1 +1,1 @@
-- **Agent runtime enforces its trust-specific tool list at dispatch.** Calls outside that list return a refusal naming the tool and trust tier.
+- **Within the turn budget, the agent runtime refuses calls outside its advertised trust-specific tool list.** On the over-limit turn, the loop stops without executing or refusing those calls.
