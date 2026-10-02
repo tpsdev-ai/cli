@@ -117,6 +117,26 @@ input, none of it trusted on its own — and:
 session is not refused by the plugin: whether the session is offered the tool at
 all is decided by the reviewer's sandbox tool policy (see Install).
 
+## Approval evidence
+
+`APPROVE` requires a host-side record of the review's build/test run for the
+same reviewer, session and full commit, and every command in it must have
+exited 0. `REQUEST_CHANGES` and `COMMENT` are unaffected.
+
+The record is written by the host process that runs the review build, to
+`approvalEvidenceFile`. Nothing inside the sandbox can write or read-modify that
+file: the sandbox mounts only the review worktree and has no other host
+filesystem access. The record binds the reviewer, the session key, the commit,
+the commands with their exit statuses and a finish time, under a SHA-256 over
+those fields; `github_review` re-computes the digest, so a record edited after
+it was written no longer matches. The digest is recorded in the signed audit
+record as `approval_evidence_sha256`. APPROVE is refused when the evidence is
+missing or unconfigured, incomplete, failed, bound to a different reviewer,
+session or commit, or does not match its digest.
+
+The limit, stated: the evidence proves the repository's own build and tests ran
+and passed on that commit, not that they are adequate.
+
 ## Configuration
 
 All values come from the gateway's plugin config. None come from tool input, and
@@ -133,6 +153,7 @@ All values come from the gateway's plugin config. None come from tool input, and
 | `reviewerIdentity` | The reviewer the signing key belongs to. |
 | `pendingAuditFile` | **Required.** Where a failed-after-post audit record is retained for retry. |
 | `reconcileFile` | **Required.** The durable per-dispatch latch store (see Dispatch latches). |
+| `approvalEvidenceFile` | **Required for `APPROVE`.** Host-only store of the review-build evidence (see Approval evidence). |
 | `flairUrl` | The Flair base URL. |
 | `sandboxImageDigest` | Recorded in every audit record once section A supplies it. |
 | `provisioningMaxAgeDays` | Evidence older than this is stale. Default 90. |
@@ -308,6 +329,6 @@ read the marker (the container half, see Scope).
 ## Scope
 
 This plugin implements the host-side, credential-custody and audit parts of the
-reviewer design. The reviewer sandbox **image matrix** and the real container
-half of the boundary lane (the sandbox must NOT read the marker) are follow-ups;
-build/test evidence binding for `APPROVE` is a separate slice.
+reviewer design, and the `APPROVE` build/test evidence binding. The reviewer
+sandbox **image matrix** and the real container half of the boundary lane (the
+sandbox must NOT read the marker) are follow-ups.

@@ -27,6 +27,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { validateApprovalEvidence, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
 import { buildOrgEvent } from "./audit.js";
 import type { CredentialCustody } from "./credential.js";
 import type { DispatchLedger } from "./dispatch-ledger.js";
@@ -59,6 +60,8 @@ export interface HandlerDeps {
   pendingAudits: PendingAuditStore;
   /** The per-dispatch latch and in-flight guard over the durable latch store. */
   ledger: DispatchLedger;
+  /** The host-only store of the review-build evidence `APPROVE` requires. */
+  approvalEvidence: ApprovalEvidenceStore;
   runtime: RuntimeEvidence;
   clock: () => Date;
   newId: () => string;
@@ -264,6 +267,61 @@ function latchedRefusal(record: LatchRecord, actor: string): Outcome {
   );
 }
 
+/** `APPROVE`'s evidence gate: a host-recorded, passing build/test run for this
+ *  reviewer, session and commit. Returns the record's digest, or the refusal.
+ *  `REQUEST_CHANGES` and `COMMENT` never call it. */
+function approvalEvidenceGate(
+  deps: HandlerDeps,
+  binding: { reviewer: string; sessionKey: string; commit: string },
+): { ok: true; digest: string } | { ok: false; refusal: Outcome } {
+  const actor = binding.reviewer;
+  if (!deps.config.approvalEvidenceFile) {
+    return {
+      ok: false,
+      refusal: refuse(
+        "approval_evidence_unconfigured",
+        actor,
+        "no approval-evidence file is configured",
+        "configure approvalEvidenceFile on the host and record the review build's evidence before approving",
+      ),
+    };
+  }
+  let lookup: ApprovalEvidenceLookup;
+  try {
+    lookup = deps.approvalEvidence.find(binding);
+  } catch {
+    return {
+      ok: false,
+      refusal: refuse("approval_evidence_invalid", actor, "the approval-evidence store could not be read", "repair the approval-evidence file on the host"),
+    };
+  }
+  if (lookup.status === "missing") {
+    return {
+      ok: false,
+      refusal: refuse(
+        "approval_evidence_missing",
+        actor,
+        "no approval evidence is recorded for this reviewer, session and commit",
+        "run the review build on the host and record its evidence before approving",
+      ),
+    };
+  }
+  if (lookup.status !== "found" && lookup.status !== "mismatch") {
+    return {
+      ok: false,
+      refusal: refuse(
+        "approval_evidence_invalid",
+        actor,
+        "the approval-evidence store does not resolve to exactly one record",
+        "repair the approval-evidence file on the host",
+      ),
+    };
+  }
+  const verdict = validateApprovalEvidence(lookup.record, binding);
+  if (!verdict.ok) return { ok: false, refusal: refuse(verdict.reason, actor, verdict.state, verdict.remedy) };
+  return { ok: true, digest: verdict.digest };
+}
+
 async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Promise<Outcome> {
   const { config, custody, github, pendingAudits, ledger, runtime, clock, newId } = deps;
   const { repo, pr, event, body, assignment } = req;
@@ -343,6 +401,15 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
     );
   }
 
+  // ── APPROVE requires a passing build/test record for this reviewer, session
+  //    and commit. REQUEST_CHANGES and COMMENT are unaffected. ──
+  let approvalEvidenceSha256: string | null = null;
+  if (event === "APPROVE") {
+    const evidence = approvalEvidenceGate(deps, { reviewer: actor, sessionKey: assignment.sessionKey, commit: head });
+    if (!evidence.ok) return evidence.refusal;
+    approvalEvidenceSha256 = evidence.digest;
+  }
+
   // ── everything fallible is prepared BEFORE the claim and the POST ──
   const bodySha256 = sha256Hex(Buffer.from(body, "utf8"));
   const auditEventId = newId();
@@ -420,6 +487,7 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
       commitId: head,
       event,
       bodySha256,
+      approvalEvidenceSha256,
       receipt,
       sessionCorrelationId: dispatchId,
       runtime,

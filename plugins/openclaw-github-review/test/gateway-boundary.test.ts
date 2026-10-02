@@ -42,6 +42,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CI_PROBE_ENV, CI_PROBE_TOOL_NAME, HOST_MARKER_ENV, registerGithubReview, TOOL_NAME } from "../src/index.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../src/approval-evidence.js";
 import {
   COMMIT,
   fakeCredentialFiles,
@@ -129,6 +130,17 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
   writeFileSync(markerPath, MARKER, { mode: 0o600 });
   const reconcileFile = join(dir, "reconcile.json");
   const pendingAuditFile = join(dir, "pending.json");
+  const approvalEvidenceFile = join(dir, "approval-evidence.json");
+  writeApprovalEvidence(
+    approvalEvidenceFile,
+    buildApprovalEvidence({
+      reviewer: REVIEWER,
+      sessionKey: SESSION,
+      commit: COMMIT,
+      recordedAt: new Date().toISOString(),
+      commands: [{ command: "bun run build", exitCode: 0 }],
+    }),
+  );
   return {
     pluginConfig: {
       allowedRepositories: [REPO],
@@ -140,6 +152,7 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
       reviewerIdentity: REVIEWER,
       pendingAuditFile,
       reconcileFile,
+      approvalEvidenceFile,
       flairUrl: FLAIR,
     },
     credentialFile,
@@ -385,6 +398,7 @@ describe("A11 — secret scans through registerGithubReview, every outcome path 
         reviewerIdentity: REVIEWER,
         pendingAuditFile: s.config.pendingAuditFile,
         reconcileFile: s.config.reconcileFile,
+        approvalEvidenceFile: s.config.approvalEvidenceFile,
       },
       tools,
       logs,

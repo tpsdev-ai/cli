@@ -30,6 +30,11 @@
       "help": "Absolute path to the reviewer's Flair signing key. Custody is separate from the GitHub credential; only the host-side audit path uses it.",
       "sensitive": true,
       "advanced": true
+    },
+    "approvalEvidenceFile": {
+      "label": "Approval evidence file",
+      "help": "Absolute path to the host-only store of review-build evidence that APPROVE requires. Written by the host process that runs the review build; the sandbox cannot write or read-modify it.",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -62,6 +67,10 @@
         "description": "The durable per-dispatch latch store (one host, local filesystem; every read-modify-write under its O_EXCL lock file). Before a review is posted the dispatch is claimed here: `reserved` plus the call's claim, held across the POST. It becomes `posted` (final) or `reconcile_required` (uncertain outcome). Only a GitHub response proving the POST created no review releases it; the host's `latch-admin reconcile` never releases — it latches `posted` when the recorded receipt id is listed, and otherwise a further review is a fresh dispatch. Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
+      "approvalEvidenceFile": {
+        "type": "string",
+        "description": "Host-only store of the review-build evidence APPROVE requires: the reviewer, session, full commit, commands and their exit statuses, written by the host process that runs the review build. The sandbox mounts only the review worktree, so nothing inside it can write or read-modify this file. APPROVE is refused when no passing record for this reviewer, session and commit is present."
+      },
       "sandboxImageDigest": {
         "type": "string",
         "description": "The deployed reviewer sandbox image digest, recorded in every audit record once the reviewer image (section A) supplies it."

@@ -174,6 +174,7 @@ describe("B3 — only a full registration does host-side work", () => {
         commitId: receipt.commitId,
         event: "APPROVE",
         bodySha256: "0".repeat(64),
+        approvalEvidenceSha256: null,
         receipt,
         sessionCorrelationId: "dispatch-0",
         runtime: { bunVersion: null, nodeVersion: null, sandboxImageDigest: null, pluginVersion: "0.1.0-test" },
@@ -190,6 +191,7 @@ describe("B3 — only a full registration does host-side work", () => {
       reviewerIdentity: "anvil",
       pendingAuditFile: s.config.pendingAuditFile,
       reconcileFile: s.config.reconcileFile,
+      approvalEvidenceFile: s.config.approvalEvidenceFile,
       flairUrl: "http://flair.test.invalid",
     };
     return { s, pluginConfig };

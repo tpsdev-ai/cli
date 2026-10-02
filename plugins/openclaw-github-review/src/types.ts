@@ -46,6 +46,12 @@ export type RefusalReason =
   | "pr_unavailable"
   | "pr_not_open"
   | "commit_mismatch"
+  | "approval_evidence_unconfigured"
+  | "approval_evidence_missing"
+  | "approval_evidence_incomplete"
+  | "approval_evidence_failed"
+  | "approval_evidence_mismatch"
+  | "approval_evidence_invalid"
   | "receipt_invalid"
   | "github_rejected"
   | "github_ambiguous";

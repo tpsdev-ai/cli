@@ -9,6 +9,7 @@ import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../src/approval-evidence.js";
 import { MemoryReconcileStore } from "../src/audit.js";
 import { CredentialCustody } from "../src/credential.js";
 import { resolveConfig, type GithubReviewConfig } from "../src/config.js";
@@ -142,6 +143,7 @@ export function pluginConfigOf(s: Scenario, flairUrl = "http://flair.test.invali
     signingKeyFile: s.config.signingKeyFile,
     reviewerIdentity: s.config.reviewerIdentity,
     pendingAuditFile: s.config.pendingAuditFile,
+    approvalEvidenceFile: s.config.approvalEvidenceFile,
     reconcileFile: s.config.reconcileFile,
     flairUrl,
   };
@@ -266,6 +268,7 @@ export function scenario(
       reviewerIdentity: REVIEWER,
       pendingAuditFile: join(root, "pending.json"),
       reconcileFile: join(root, "reconcile.json"),
+      approvalEvidenceFile: join(root, "approval-evidence.json"),
       sandboxImageDigest: "sha256:deadbeef",
       ...configOverrides,
     },
@@ -277,6 +280,24 @@ export function scenario(
     maxAgeDays: config.provisioningMaxAgeDays,
     clock: () => new Date(),
   });
+  // The host has recorded a passing review build for the standard session and
+  // commit. A test overrides this file (or removes the config key) to exercise
+  // the APPROVE evidence gate.
+  if (config.approvalEvidenceFile) {
+    writeApprovalEvidence(
+      config.approvalEvidenceFile,
+      buildApprovalEvidence({
+        reviewer: REVIEWER,
+        sessionKey: "sess-1",
+        commit: COMMIT,
+        recordedAt: new Date().toISOString(),
+        commands: [
+          { command: "bun run build", exitCode: 0 },
+          { command: "bun run test", exitCode: 0 },
+        ],
+      }),
+    );
+  }
   return { config, custody };
 }
 
