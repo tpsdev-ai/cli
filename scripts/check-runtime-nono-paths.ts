@@ -43,7 +43,7 @@ try {
     ], caseEnv);
     const result = spawnSync(bin, argv, { env: caseEnv, cwd: ws, encoding: "utf8", timeout: 30_000 });
     if (result.status !== 0) throw new Error(`${runtime}: credential/state and denial probe failed: ${result.stderr}`);
-    console.log(`${runtime}: credential/state reads and writes allowed; unrelated credentials denied`);
+    console.log(`${runtime}: credential/state reads and writes allowed; tested unrelated credential paths denied`);
   }
 } finally {
   rmSync(root, { recursive: true, force: true });

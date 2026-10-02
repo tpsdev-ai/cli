@@ -839,20 +839,16 @@ export async function runAgent(args: AgentArgs): Promise<void> {
           // to runtime. Whether that claim is TRUE was settled by the gate: this
           // process only reaches here holding the launcher's release
           // (cli#350 round 4e).
-        } else if (sandbox || isNonoStrict()) {
+        } else if (sandbox || selectedRuntime || isNonoStrict()) {
           if (!nonoAvailable) {
-            // Fail closed, in every context the launch control governs. A
-            // non-interactive launch MUST NOT fall back to running the agent
-            // unsandboxed: that is the silent no-op the unit cannot see (under
-            // TPS_SUPERVISED the refusal exits 0 and KeepAlive never
-            // relaunches). An interactive human keeps the old warning — they
-            // can see it and decide.
-            if (isNonoStrict() || sandboxRequired || !isInteractiveTty()) {
-              const why = isNonoStrict()
-                ? "TPS_NONO_STRICT=1"
-                : "this launch is not interactive";
+            if (selectedRuntime || isNonoStrict() || sandboxRequired || !isInteractiveTty()) {
+              const why = selectedRuntime
+                ? `runtime '${selectedRuntime}' requires isolation; use --no-sandbox in an interactive TTY to opt out`
+                : isNonoStrict()
+                  ? "TPS_NONO_STRICT=1"
+                  : "this launch is not interactive";
               console.error(
-                `❌ refusing to launch the agent: no nono at the pinned absolute path ` +
+                `❌ refusing to launch ${selectedRuntime ? `runtime '${selectedRuntime}'` : "the agent"}: no nono at the pinned absolute path ` +
                   `(${resolveNonoBinary().reason ?? "unknown"}) — ${why}, so the agent cannot ` +
                   `run without isolation. Install nono >= 0.70 or set NONO_BIN.`
               );

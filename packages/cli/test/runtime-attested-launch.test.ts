@@ -344,3 +344,121 @@ describe("selected runner startup with interactive opt-out", () => {
     });
   }
 });
+
+function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false) {
+  const defaultMarker = join(sb.root, "default-started");
+  const selectedMarker = join(sb.root, "selected-started");
+  const preload = join(sb.root, "interactive.mjs");
+  const agentModule = resolve(import.meta.dir, "../../agent/dist/index.js");
+  writeFileSync(preload, `
+import { AgentRuntime } from ${JSON.stringify(agentModule)};
+import { writeFileSync } from "node:fs";
+Object.defineProperty(process.stdin, "isTTY", {value: true});
+Object.defineProperty(process.stdout, "isTTY", {value: true});
+AgentRuntime.prototype.start = async function () {
+  writeFileSync(${JSON.stringify(defaultMarker)}, "started");
+  process.exit(0);
+};
+for (const stream of [process.stdout, process.stderr]) {
+  const write = stream.write.bind(stream);
+  stream.write = function (chunk, ...args) {
+    if (String(chunk).includes(${JSON.stringify(startup[rt as keyof typeof startup] ?? "unsupported runtime started.")})) {
+      writeFileSync(${JSON.stringify(selectedMarker)}, "started");
+      write(chunk, ...args);
+      process.exit(0);
+    }
+    return write(chunk, ...args);
+  };
+}
+`);
+  const result = spawnSync(NODE, ["--import", preload, TPS_BIN, "agent", "start", "--id", "probe", ...(rt ? equals ? [`--runtime=${rt}`] : ["--runtime", rt] : []), ...(noSandbox ? ["--no-sandbox"] : [])], {
+    cwd: sb.ws,
+    env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined }),
+    encoding: "utf8", timeout: 5000, killSignal: "SIGKILL",
+  });
+  return { status: result.status, text: `${result.stdout ?? ""}${result.stderr ?? ""}`, defaultMarker, selectedMarker };
+}
+
+describe("interactive selected runtime with no nono", () => {
+  for (const rt of RUNTIMES) {
+    test(`${rt}: refuses before either runtime starts`, () => {
+      const sb = makeSandbox();
+      try {
+        const result = interactiveRuntimeProbe(sb, rt);
+        expect(result.text).toContain(`refusing to launch runtime '${rt}'`);
+        expect(result.text).toContain("no nono at the pinned absolute path");
+        expect(result.text).toContain("--no-sandbox");
+        expect(result.status).toBe(78);
+        expect(existsSync(result.defaultMarker)).toBe(false);
+        expect(existsSync(result.selectedMarker)).toBe(false);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+
+    test(`${rt}: refused launch can retry with explicit --no-sandbox`, () => {
+      const sb = makeSandbox();
+      try {
+        const refused = interactiveRuntimeProbe(sb, rt);
+        expect(refused.status).toBe(78);
+        expect(existsSync(refused.defaultMarker)).toBe(false);
+        expect(existsSync(refused.selectedMarker)).toBe(false);
+        const optedOut = interactiveRuntimeProbe(sb, rt, true);
+        expect(optedOut.status).toBe(0);
+        expect(optedOut.text).toContain(startup[rt]);
+        expect(existsSync(optedOut.selectedMarker)).toBe(true);
+        expect(existsSync(optedOut.defaultMarker)).toBe(false);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+  }
+});
+
+
+test("interactive default runtime with no nono still warns and starts", () => {
+  const sb = makeSandbox();
+  try {
+    const result = interactiveRuntimeProbe(sb, undefined);
+    expect(result.status).toBe(0);
+    expect(result.text).toContain("nono not found — starting WITHOUT sandbox isolation");
+    expect(existsSync(result.defaultMarker)).toBe(true);
+    expect(existsSync(result.selectedMarker)).toBe(false);
+  } finally {
+    rmSync(sb.root, {recursive: true, force: true});
+  }
+});
+
+for (const noSandbox of [false, true]) {
+  test(`unsupported runtime never falls back to the default (opt-out=${noSandbox})`, () => {
+    const sb = makeSandbox();
+    try {
+      const result = interactiveRuntimeProbe(sb, "unsupported", noSandbox);
+      expect(result.status).toBe(78);
+      expect(result.text).toContain("refusing to launch runtime 'unsupported': unsupported runtime");
+      expect(existsSync(result.defaultMarker)).toBe(false);
+      expect(existsSync(result.selectedMarker)).toBe(false);
+    } finally {
+      rmSync(sb.root, {recursive: true, force: true});
+    }
+  });
+}
+
+for (const rt of RUNTIMES) {
+  test(`${rt}: --runtime=value also requires an explicit opt-out`, () => {
+    const sb = makeSandbox();
+    try {
+      const refused = interactiveRuntimeProbe(sb, rt, false, true);
+      expect(refused.status).toBe(78);
+      expect(existsSync(refused.defaultMarker)).toBe(false);
+      expect(existsSync(refused.selectedMarker)).toBe(false);
+      const optedOut = interactiveRuntimeProbe(sb, rt, true, true);
+      expect(optedOut.status).toBe(0);
+      expect(existsSync(optedOut.selectedMarker)).toBe(true);
+      expect(existsSync(optedOut.defaultMarker)).toBe(false);
+    } finally {
+      rmSync(sb.root, {recursive: true, force: true});
+    }
+  });
+}

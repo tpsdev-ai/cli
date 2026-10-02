@@ -464,8 +464,12 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          const runtimeArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : undefined;
+          const runtimeArg = process.argv.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
           const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
+          if (runtimeArg !== undefined && !attestedRuntime) {
+            console.error(`❌ refusing to launch runtime '${runtimeArg}': unsupported runtime`);
+            process.exit(78);
+          }
           const sandboxed = process.argv.includes("--sandboxed");
           const noSandbox = process.argv.includes("--no-sandbox");
           // Selected runners execute after launcher release or an interactive
