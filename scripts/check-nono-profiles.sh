@@ -16,7 +16,7 @@
 #   NONO_BIN=/path/to/nono scripts/check-nono-profiles.sh
 #
 # CI: set NONO_BIN (pinned) — see .github/workflows/test.yml "nono-profile-gate"
-# (ubuntu-latest + macos-14).
+# (ubuntu-latest + macos-latest).
 
 set -euo pipefail
 
