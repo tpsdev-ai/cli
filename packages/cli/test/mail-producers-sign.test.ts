@@ -134,11 +134,11 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
     }
   });
 
-  test("topic catch-up (catchUpTopics) signs as the original publisher", async () => {
+  test("topic catch-up (catchUpTopics) preserves the publisher's envelope", async () => {
     createTopic("eng2", "engineering");
     publishToTopic("eng2", "flint", "missed while away");
     subscribe("eng2", "kern", true); // subscribe from the beginning → the entry is missed
-    const delivered = catchUpTopics("kern");
+    const delivered = await catchUpTopics("kern");
     expect(delivered).toBeGreaterThanOrEqual(1);
     const result = await promoteNew("kern");
     expect(result.ok).toBe(true);

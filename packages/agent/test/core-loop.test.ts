@@ -1,5 +1,6 @@
 import { describe, test, expect, mock } from "bun:test";
 import { EventLoop } from "../src/runtime/event-loop.js";
+import { ToolRegistry } from "../src/tools/registry.js";
 import type {
   AgentConfig,
   CompletionRequest,
@@ -139,11 +140,12 @@ describe("ops-32: auto-compaction trigger", () => {
       { content: "Done.", toolCalls: undefined, inputTokens: 10, outputTokens: 5 },
     ];
     const { loop, calls, memory } = makeLoop(completions, { contextWindowTokens: 200 });
-    (loop as any).deps.tools = {
-      list: () => [],
-      execute: mock(async () => ({ content: bigContent })),
-    };
+    const tools = new ToolRegistry();
+    const execute = mock(async () => ({ content: bigContent }));
+    tools.register({ name: "read", description: "Read a file", input_schema: {}, execute });
+    (loop as any).deps.tools = tools;
     await (loop as any).processMessage("hello", "user");
+    expect(execute).toHaveBeenCalledTimes(1);
     expect(calls.length).toBeGreaterThanOrEqual(2);
     const memCalls: any[] = (memory.append as ReturnType<typeof mock>).mock.calls;
     const compactionEntry = memCalls.find((c: any) => c[0]?.type === "compaction");

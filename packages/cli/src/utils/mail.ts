@@ -569,7 +569,7 @@ type EnvelopePolicyResult =
 
 /**
  * The ONE mailbox decision (@tpsdev-ai/agent decideEnvelopeForMailbox), through
- * an ALWAYS-constructed Flair client. Throws only when Flair is unreachable.
+ * an ALWAYS-constructed Flair client.
  */
 async function decideEnvelopeForMailbox(
   agent: string,

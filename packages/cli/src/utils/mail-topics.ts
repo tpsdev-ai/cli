@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { decideEnvelopeForMailbox, parseSignedEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { assertValidBody, sendMessage } from "./mail.js";
-import { sendSignedMail } from "./mail-producer.js";
 import { signOutboundBody } from "./mail-sign.js";
+import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
+export { isTopicRecipient } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -26,6 +27,7 @@ export interface TopicLogEntry {
   from: string;
   body: string;
   timestamp: string;
+  envelope?: string;
 }
 
 // ── Paths ──────────────────────────────────────────────────────────────────
@@ -230,31 +232,27 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
     throw new Error(`Agent '${from}' is not authorized to publish to topic '${topic}'`);
   }
 
-  // Prove the publisher can sign even when there are no subscribers. A missing
-  // or conflicting key refuses before the durable topic log is changed.
   const recipients = meta.subscribers.filter((subscriberId) => subscriberId !== from);
-  const signed = recipients.map((subscriberId) => ({
-    subscriberId,
-    body: signOutboundBody(from, subscriberId, body, {
-      requireKey: true, rationale: `agent ${from} topic publish`,
-    }),
-  }));
-  if (signed.length === 0) signOutboundBody(from, from, body, { requireKey: true });
+  const signed = signOutboundBody(from, `topic:${topic}`, body, {
+    requireKey: true, rationale: `agent ${from} topic publish`,
+  });
+  const envelope = JSON.parse(signed) as Envelope;
 
   // 1. Append to topic log
   const entry: TopicLogEntry = {
-    id: randomUUID(),
+    id: envelope.messageId,
     topic,
     from,
     body,
-    timestamp: new Date().toISOString(),
+    timestamp: envelope.timestamp,
+    envelope: signed,
   };
   appendFileSync(logPath(topic), JSON.stringify(entry) + "\n", "utf-8");
 
   // 2. Fan-out to all subscribers
-  for (const { subscriberId, body: signedBody } of signed) {
+  for (const subscriberId of recipients) {
     try {
-      const msg = sendMessage(subscriberId, signedBody, from);
+      const msg = sendMessage(subscriberId, signed, from);
       // Patch topic fields into the written file
       if (existsSync(msg.filePath)) {
         const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
@@ -272,7 +270,7 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
   return entry;
 }
 
-export function catchUpTopics(agentId: string, topics?: string[]): number {
+export async function catchUpTopics(agentId: string, topics?: string[], config: MailVerifyConfig = {}): Promise<number> {
   assertValidAgentId(agentId);
   const cursors = readCursors(agentId);
   const subscriptions = topics ?? getSubscriptions(agentId);
@@ -283,13 +281,49 @@ export function catchUpTopics(agentId: string, topics?: string[]): number {
     const missed = readLogSince(topic, cursor);
 
     for (const entry of missed) {
-      if (entry.from === agentId) {
+      if (typeof entry.envelope !== "string") {
+        swarn(`topic-catch-up-unsigned-entry: skipping ${topic}/${entry.id}`);
+        updateCursor(agentId, topic, `@${entry.id}`);
+        continue;
+      }
+      let envelope: Envelope;
+      try {
+        const parsed = parseSignedEnvelope(entry.envelope);
+        if (!parsed.ok) throw new Error(parsed.reason);
+        envelope = parsed.envelope;
+        if (!envelope || envelope.from !== entry.from || envelope.body !== entry.body
+          || envelope.to !== `topic:${topic}` || entry.topic !== topic
+          || envelope.messageId !== entry.id || envelope.timestamp !== entry.timestamp) {
+          throw new Error("topic log/envelope mismatch");
+        }
+      } catch {
+        swarn(`topic-catch-up-invalid-envelope: skipping ${topic}/${entry.id}`);
+        updateCursor(agentId, topic, `@${entry.id}`);
+        continue;
+      }
+      try {
+        const verified = await decideEnvelopeForMailbox(agentId, envelope, entry.from, await createMailVerifyClient(agentId, config));
+        if (!verified.ok) {
+          if (verified.class === "wrong-recipient") {
+            swarn(`topic-catch-up-recipient-policy-unavailable: retry ${topic}/${entry.id}`);
+            return delivered;
+          }
+          const reason = verified.class === "unresolvable-principal" ? "unresolvable-principal" : "invalid-envelope";
+          swarn(`topic-catch-up-${reason}: skipping ${topic}/${entry.id}`);
+          updateCursor(agentId, topic, `@${entry.id}`);
+          continue;
+        }
+      } catch {
+        swarn(`topic-catch-up-verification-unavailable: retry ${topic}/${entry.id}`);
+        return delivered;
+      }
+      if (envelope.from === agentId) {
         updateCursor(agentId, topic, `@${entry.id}`);
         continue;
       }
       if (!alreadyDelivered(agentId, entry.id)) {
         try {
-          const msg = sendSignedMail(entry.from, agentId, entry.body, { rationale: `agent ${entry.from} topic catch-up` });
+          const msg = sendMessage(agentId, entry.envelope, envelope.from);
           if (existsSync(msg.filePath)) {
             const existing = JSON.parse(readFileSync(msg.filePath, "utf-8"));
             existing.topic = topic;

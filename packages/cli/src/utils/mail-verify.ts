@@ -13,12 +13,6 @@
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
  * `FlairAgent.publicKey` as a base64 string, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).
- *
- * Reachability matters: `verifyEnvelope` treats a null agent as a verification
- * FAILURE, but a Flair OUTAGE must be classified `verify-unavailable` (retryable)
- * rather than `invalid` (terminal). The CLI's getAgent() swallows network errors
- * into null, so on a null we probe /Health: unreachable → THROW (so promote()
- * can quarantine as verify-unavailable); reachable → genuinely-absent agent.
  */
 
 import { createFlairClient } from "./flair-client.js";
@@ -68,15 +62,13 @@ export async function createMailVerifyClient(
 
   return {
     async getAgent(name: string) {
-      const info = await cliClient.getAgent(name);
-      if (info) return { publicKey: Buffer.from(info.publicKey, "base64") };
-      // getAgent() swallows network errors into null. Distinguish "Flair is
-      // down" (retryable) from "no such agent" (a real verification failure).
-      const reachable = await cliClient.ping();
-      if (!reachable) {
-        throw new Error(`Flair unreachable at ${baseUrl} while resolving ${name}`);
+      const info = await cliClient.getAgentForVerification(name);
+      if (!info) return null;
+      const publicKey = Buffer.from(info.publicKey, "base64");
+      if (publicKey.length !== 32 || publicKey.toString("base64") !== info.publicKey) {
+        throw new Error(`Flair returned an invalid public key for ${name}`);
       }
-      return null;
+      return { publicKey };
     },
   };
 }

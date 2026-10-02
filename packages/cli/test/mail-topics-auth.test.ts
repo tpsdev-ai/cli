@@ -1,9 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { catchUpTopics, createTopic, publishToTopic, subscribe } from "../src/utils/mail-topics.js";
-import { readAgentPrivateKey } from "../src/utils/agent-keys.js";
+import { createTopic, publishToTopic } from "../src/utils/mail-topics.js";
 
 let home: string;
 let oldHome: string | undefined;
@@ -34,19 +33,4 @@ test("topic publish without a key refuses before appending, even with no subscri
   const log = join(home, ".tps", "topics", "alerts", "log.jsonl");
   expect(() => publishToTopic("alerts", "flint", "hi")).toThrow(/no Ed25519 private key/);
   expect(readFileSync(log, "utf8")).toBe("");
-});
-
-test("catch-up keeps its cursor before a failed signing attempt and retries it", () => {
-  createTopic("alerts");
-  writeFileSync(join(keys, "flint.key"), Buffer.alloc(32, 0x11));
-  publishToTopic("alerts", "flint", "missed");
-  subscribe("alerts", "kern", true);
-  rmSync(join(keys, "flint.key"));
-  expect(catchUpTopics("kern", ["alerts"])).toBe(0);
-  const cursor = join(home, ".tps", "agents", "kern", "topic-cursors.json");
-  expect(existsSync(cursor) ? JSON.parse(readFileSync(cursor, "utf8")).alerts : undefined).toBeUndefined();
-  writeFileSync(join(keys, "flint.key"), Buffer.alloc(32, 0x11));
-  expect(readAgentPrivateKey("flint")).not.toBeNull();
-  expect(catchUpTopics("kern", ["alerts"])).toBe(1);
-  expect(JSON.parse(readFileSync(cursor, "utf8")).alerts).toMatch(/^@/);
 });

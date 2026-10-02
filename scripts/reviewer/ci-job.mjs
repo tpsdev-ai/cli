@@ -3,8 +3,10 @@
  * workflow, with the jobs it `needs`, into the review build's plan, or refuse by
  * name.
  *
- * The plan feeds review-build-ok, which is advisory evidence for the reviewer,
- * not a merge gate (CI stays the gate). Where a workflow feature cannot be
+ * The plan feeds the review build, run one sandbox container per job by
+ * scripts/reviewer/run-review-jobs.mjs; its verdict (review-build-ok) is
+ * advisory evidence for the reviewer, not a merge gate (CI stays the gate).
+ * Where a workflow feature cannot be
  * reproduced faithfully and cheaply, it is refused rather than approximated;
  * the fidelity limits that remain are named in docker/reviewer/README.md.
  *

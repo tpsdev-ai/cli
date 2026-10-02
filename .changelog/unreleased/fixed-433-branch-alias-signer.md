@@ -1,0 +1,1 @@
+- **Branch handler responses resolve logical aliases to the local identity.** Replies and forwards use the inbox routing fallback when the wire recipient has no local inbox.

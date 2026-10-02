@@ -5,7 +5,7 @@
   ],
   "packageRules": [
     {
-      "description": "Every @tpsdev-ai/* dependency in this repo belongs to cli's six release packages (cli, agent and the four cli-<platform> binaries); the release workflow checks all six versions against the tag and attempts to stage all six for npm approval, so Renovate does not bump them.",
+      "description": "test/renovate-tpsdev-deps.test.ts rejects nonrelease @tpsdev-ai/* dependencies in regular, non-symlinked package.json files outside node_modules and .git.",
       "matchPackageNames": [
         "@tpsdev-ai/**"
       ],

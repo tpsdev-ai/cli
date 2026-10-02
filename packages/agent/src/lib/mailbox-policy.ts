@@ -4,6 +4,7 @@
  * `cur/` use it: the CLI's `promote()` and this package's `MailClient`.
  */
 import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.js";
 
@@ -81,7 +82,30 @@ export function parseSignedEnvelope(body: string): { ok: true; envelope: Envelop
   if (typeof parsed.body !== "string") {
     return { ok: false, class: "invalid", reason: "envelope body is not a string" };
   }
+  if (typeof parsed.from !== "string" || !(parsed.delegationChain as unknown[]).every((hop) => {
+    if (!hop || typeof hop !== "object") return false;
+    const entry = hop as Record<string, unknown>;
+    return typeof entry.agent === "string" && (entry.kind === "agent" || entry.kind === "human")
+      && (entry.signature === null || typeof entry.signature === "string");
+  })) {
+    return { ok: false, class: "invalid", reason: "invalid envelope sender or delegation chain" };
+  }
   return { ok: true, envelope: parsed as unknown as Envelope };
+}
+
+export function isTopicRecipient(address: unknown, agentId: string, from: string): boolean {
+  if (typeof address !== "string" || !address.startsWith("topic:")) return false;
+  const topic = address.slice("topic:".length);
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(topic) || topic.length > 64) return false;
+  try {
+    const root = process.env.TPS_HOME || join(process.env.HOME || homedir(), ".tps");
+    const meta = JSON.parse(readFileSync(join(root, "topics", topic, "meta.json"), "utf8"));
+    return Array.isArray(meta.subscribers) && meta.subscribers.includes(agentId)
+      && (meta.allowedPublishers === undefined || (Array.isArray(meta.allowedPublishers)
+        && (meta.allowedPublishers.length === 0 || meta.allowedPublishers.includes(from))));
+  } catch {
+    return false;
+  }
 }
 
 // ─── The mailbox decision ────────────────────────────────────────────────────
@@ -107,13 +131,11 @@ const UNRESOLVABLE_PRINCIPAL_REASON_RE = /^agent (.+) not found in Flair$/;
  * The checks, in order:
  *   1. signature, through the caller's Flair client;
  *   2. wrapper/envelope `from` binding;
- *   3. recipient binding (`envelope.to === agent`);
+ *   3. recipient binding;
  *   4. `messageId` shape, and `replyToId` shape when present;
  *   5. `timestamp` shape.
  *
  * The replay gate (first delivery only) is the ReplayStore below.
- *
- * Throws only when Flair is unreachable — a retryable outage, not a verdict.
  */
 export async function decideEnvelopeForMailbox(
   agent: string,
@@ -148,7 +170,7 @@ export async function decideEnvelopeForMailbox(
 
   // 2. The wrapper `from` is what consumers route by, and it is unverified; a
   //    wrapper/envelope mismatch is itself a reject.
-  if (wrapperFrom !== envelope.from) {
+  if (typeof wrapperFrom !== "string" || wrapperFrom !== envelope.from) {
     return {
       ok: false,
       class: "invalid",
@@ -156,8 +178,7 @@ export async function decideEnvelopeForMailbox(
     };
   }
 
-  // 3. The verified recipient must be this mailbox's owner.
-  if (envelope.to !== agent) {
+  if (envelope.to !== agent && !isTopicRecipient(envelope.to, agent, envelope.from)) {
     return {
       ok: false,
       class: "wrong-recipient",
