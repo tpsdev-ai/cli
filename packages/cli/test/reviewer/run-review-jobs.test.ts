@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { cloneArgs, containerArgs, runReviewJobs } from "../../../../scripts/reviewer/run-review-jobs.mjs";
+import { cloneArgs, containerArgs, gitRunner, runReviewJobs } from "../../../../scripts/reviewer/run-review-jobs.mjs";
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
@@ -178,16 +178,76 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     const docker = (args: string[]) => {
       if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
       if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
-      if (args[0] === "exec") return { status: 1, stdout: '{"ok":true}\n', stderr: "boom\n" };
+      if (args[0] === "exec")
+        return { status: 1, stdout: `${JSON.stringify({ ok: true, status: "job-ok", job: "build", jobs: [{ job: "build", steps: [] }] })}\n`, stderr: "boom\n" };
       return { status: 0, stdout: "", stderr: "" };
     };
     const r = await drive(docker);
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.refusal.kind).toBe("job-failed");
-      expect(r.refusal.message).toContain("did not report job-ok (exit 1)");
+      expect(r.refusal.message).toContain("job build: the launcher did not report job-ok (exit 1)");
       expect((r.refusal as { output?: string }).output).toBe("boom\n");
     }
+  });
+
+  test("a launcher that exits 0 with a verdict that is not job-ok is not a pass", async () => {
+    publish();
+    const docker = (args: string[]) => {
+      if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
+      if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "exec") return { status: 0, stdout: `${JSON.stringify({ ok: true, status: "self-check-ok", job: "build" })}\n`, stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("job-failed");
+      expect(r.refusal.message).toContain("job build: the launcher did not report job-ok (exit 0)");
+    }
+  });
+
+  test("a timed-out exec's captured stderr reaches the refusal's output", async () => {
+    publish();
+    const partial = "step 2: running the build\n";
+    const docker = (args: string[]) => {
+      if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
+      if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "exec") return { status: null, stdout: "", stderr: partial };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("container-timeout");
+      expect((r.refusal as { output?: string }).output).toBe(partial);
+    }
+  });
+
+  test("a timed-out docker runner keeps the stderr it captured and appends the error", () => {
+    // A child process with a shim `docker` first on its PATH: the runner's hard
+    // timeout kills the shim, which has already written to stderr.
+    const bin = join(root, "bin");
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(join(bin, "docker"), "#!/bin/sh\nprintf 'partial stderr from the sandbox\\n' >&2\nexec sleep 30\n", { mode: 0o755 });
+    const probe = join(root, "docker-runner-probe.mjs");
+    const driver = fileURLToPath(new URL("../../../../scripts/reviewer/run-review-jobs.mjs", import.meta.url));
+    writeFileSync(probe, `import { dockerRunner } from ${JSON.stringify(driver)};\nconsole.log(JSON.stringify(dockerRunner(["exec", "cid", "launcher"], { timeoutMs: 1500 })));\n`);
+    const r = spawnSync(process.execPath, [probe], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, timeout: 30_000 });
+    expect(r.status).toBe(0);
+    const out = JSON.parse(r.stdout.trim()) as { status: unknown; stderr: string };
+    expect(out.status).toBe(null);
+    expect(out.stderr).toContain("partial stderr from the sandbox");
+    expect(out.stderr).toContain("ETIMEDOUT");
+  });
+
+  test("a timed-out git runner keeps the stderr it captured and appends the error", () => {
+    // A git alias that writes to stderr and then blocks: the runner's timeout
+    // kills it, so the capture and the timeout error both exist.
+    const r = gitRunner(["-c", "alias.blk=!printf 'partial git stderr\\n' >&2; exec sleep 30", "blk"], { timeoutMs: 1500 });
+    expect(r.status).toBe(null);
+    expect(r.stderr).toContain("partial git stderr");
+    expect(r.stderr).toContain("ETIMEDOUT");
   });
 
   test("a job-ok verdict that names another job is not a pass", async () => {

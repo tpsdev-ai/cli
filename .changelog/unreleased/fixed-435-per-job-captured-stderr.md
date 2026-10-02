@@ -1,0 +1,1 @@
+- **A timed-out sandbox keeps the output it captured (Refs #435).** The driver's docker and git runners append the spawn error to the stderr they captured, so a job that times out still reaches the refusal's output with its own messages.

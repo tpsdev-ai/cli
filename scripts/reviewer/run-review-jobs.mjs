@@ -50,14 +50,14 @@ const refuse = (kind, message, output) => ({ ok: false, refusal: output ? { kind
 /** The default docker runner: one argv, a hard timeout, stdout and stderr captured (up to 16 MiB each). */
 export function dockerRunner(args, { timeoutMs = 120_000 } = {}) {
   const r = spawnSync("docker", args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.error.code ?? "error"}: ${r.error.message}` };
+  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 /** The default git runner (read-only against the source). */
 export function gitRunner(args, { timeoutMs = 120_000 } = {}) {
   const r = spawnSync("/usr/bin/git", args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.error.code ?? "error"}: ${r.error.message}` };
+  if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.stderr ?? ""}${r.error.code ?? "error"}: ${r.error.message}` };
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
