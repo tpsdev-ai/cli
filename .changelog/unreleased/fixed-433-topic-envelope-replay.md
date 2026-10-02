@@ -1,0 +1,1 @@
+- **Topic catch-up verifies stored publisher envelopes.** Publication stores a signed topic envelope; catch-up delivers it unchanged. Unsigned legacy entries and signature failures are skipped with named warnings. Promotion requires a local subscription and an allowed publisher.

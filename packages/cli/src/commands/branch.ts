@@ -34,22 +34,19 @@ export type HandlerRoute =
 
 /**
  * Route a handler action for a received message.
- *
- * Replies and forwards are signed by the local forwarding identity before
- * queueing. An unchanged forward carries the incoming content as data inside
- * the forwarder's new signed envelope. Acceptance also requires the recipient's
- * Flair and mailbox policy to accept that identity and envelope.
  */
 export function routeHandlerAction(
   action: HandlerAction,
   incoming: HandlerIncoming,
   queueOutbox: (to: string, body: string, from: string) => void = queueOutboxMessage,
+  localAgentId = process.env.TPS_AGENT_ID || hostname().split(".")[0],
 ): HandlerRoute {
+  const from = inboxExists(incoming.to) ? incoming.to : localAgentId;
   switch (action.type) {
     case "reply": {
       const to = action.to ?? incoming.from;
       try {
-        signForDelivery(incoming.to, to, action.body ?? "", (signed) => queueOutbox(to, signed, incoming.to));
+        signForDelivery(from, to, action.body ?? "", (signed) => queueOutbox(to, signed, from));
         return { kind: "reply", to };
       } catch (e: any) {
         return { kind: "refused", reason: e?.message || "signing failed" };
@@ -58,8 +55,8 @@ export function routeHandlerAction(
     case "forward": {
       if (!action.to) return { kind: "forward", to: "" };
       try {
-        signForDelivery(incoming.to, action.to, action.body ?? incoming.body,
-          (signed) => queueOutbox(action.to!, signed, incoming.to));
+        signForDelivery(from, action.to, action.body ?? incoming.body,
+          (signed) => queueOutbox(action.to!, signed, from));
         return { kind: "forward", to: action.to };
       } catch (e: any) {
         return { kind: "refused", reason: e?.message || "signing failed" };
@@ -383,7 +380,7 @@ async function runStart(): Promise<void> {
       getRegisteredAgents(),
     );
 
-    const routed = routeHandlerAction(action, { id: body.id, from: body.from, to: body.to, body: body.content });
+    const routed = routeHandlerAction(action, { id: body.id, from: body.from, to: body.to, body: body.content }, undefined, localAgentId);
 
     switch (routed.kind) {
       case "reply":

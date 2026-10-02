@@ -74,6 +74,7 @@ test("unchanged branch forward is re-signed by the forwarder and really promotes
     { type: "forward", to: "kern", body: original },
     { id: "m1", from: "flint", to: "anvil", body: original },
     (to, body, from) => queued.push({ to, body, from }),
+    "anvil",
   );
   expect(result.kind).toBe("forward");
   expect(queued).toHaveLength(1);
