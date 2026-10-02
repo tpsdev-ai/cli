@@ -26,6 +26,8 @@ import {
   isSupervised,
   harnessReadPaths,
   harnessReadFiles,
+  runtimeNonoOptions,
+  runtimeNonoProfile,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -822,7 +824,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
         // cli#363 slice B: carry the selected runtime into the re-exec so the
         // sandboxed child runs the runtime runner rather than the default
-        // AgentRuntime. Only the three attested runtimes ever reach here.
+        // AgentRuntime. Its CLI caller selects only those three runtimes.
         const selectedRuntime = args.runtime;
         // The pinned ABSOLUTE path (never PATH) — the same resolution the
         // launcher performs, so the decision to launch and the launch itself
@@ -888,8 +890,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // and releases the child over its own socket only after `nono ps`
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
+            const runtimeGrants = runtimeNonoOptions(selectedRuntime);
             const exitCode = await launchAttested(
-              "tps-agent-run",
+              runtimeNonoProfile(selectedRuntime),
               {
                 workdir: config.workspace,
                 // CHANGE (cli#341 S1b): this used to grant a read of the
@@ -901,12 +904,13 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 // Exactly this agent's own identity files, not the shared
                 // identity directory (cli#351 r4).
                 readFiles: harnessReadFiles(launchId),
+                allowFiles: runtimeGrants.allowFiles,
                 // Bun's own temp dir is /tmp regardless of TMPDIR, and an
                 // unreadable temp dir is fatal to it — grant BOTH /tmp and the
                 // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
                 // to /var/folders/…, so /tmp would otherwise not be granted at
                 // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir])],
+                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
               },
               relaunch,
             );

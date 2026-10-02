@@ -62,7 +62,7 @@ beforeAll(() => {
 
 describe("T2 — env bypass gone / --no-sandbox is TTY-only", () => {
   test("TPS_FORCE_NO_NONO=1 cannot rescue a non-TTY --no-sandbox (refused, exit 78)", () => {
-    const r = runLauncher(["agent", "start", "--id", "ghost", NO_SANDBOX, SANDBOX_REQUIRED], {
+    const r = runLauncher(["agent", "start", "--id", "ghost", NO_SANDBOX], {
       TPS_FORCE_NO_NONO: "1",
     });
     const out = output(r).toLowerCase();

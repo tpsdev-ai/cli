@@ -1,26 +1,10 @@
 /**
- * cli#363 slice B — `agent start --runtime claude-code|codex|gemini` runs
- * through the attested launch, so it is confined like every other agent launch.
- *
- * Slice A refused `--sandbox-required` on these runtimes because `bin/tps.ts`
- * branched on `--runtime` BEFORE `runAgent({action:"start"})` and spawned the
- * runtime directly, so it never reached `launchAttested()` and was not confined
- * by nono. Slice B routes them through the same attested launch (the runtime is
- * carried into the nono re-exec), so the flag is honoured rather than refused.
- *
- * These tests are black box and FAIL on `main`: they spawn the built CLI with
- * piped stdio (non-TTY, the shape a generated unit or a wrapper uses) against a
- * fake nono at an absolute path, and assert the REAL launch decision — that the
- * launcher spawned nono for a re-exec that carries `--runtime <rt>` and released
- * the child — never an exported helper. The fake nono "confines" the way the
- * profile does (it denies the child the launcher's OUTSIDE canary), so the child
- * attests and the launcher releases it; on `main` the slice-A refusal fires
- * instead and nono is never spawned.
+ * Selected runtime re-exec and startup with simulated canary denial.
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -31,6 +15,12 @@ const SANDBOX_REQUIRED = "--sandbox-required";
 const NONO_BIN_ENV = "NONO_BIN";
 const TIMEOUT_ENV = "TPS_LAUNCH_TIMEOUT_MS";
 const RUNTIMES = ["claude-code", "codex", "gemini"] as const;
+
+const startup = {
+  "claude-code": "Claude Code runtime started.",
+  codex: "Codex runtime started.",
+  gemini: "Gemini runtime started.",
+};
 
 // Real launches wait on a release window; raise the file default above it.
 setDefaultTimeout(60_000);
@@ -80,10 +70,8 @@ function seedHome(home: string, ws: string): void {
   writeFileSync(join(home, ".tps", "identity", "probe.pub"), "fixture-pub\n");
 }
 
-/** OUTSIDE /tmp: the launch grants /tmp, so a HOME under /tmp would put the
- * private dir inside that grant and the overlap assert would refuse (correctly). */
 function makeSandbox(): Sandbox {
-  const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+  const base = tmpdir();
   const root = mkdtempSync(join(base, "tps-363-rt-"));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
@@ -94,14 +82,8 @@ function makeSandbox(): Sandbox {
   return { root, home, tmp, ws, nonoDir, nonoLog: join(root, "nono.log") };
 }
 
-/**
- * A fake nono that "confines": for `run` it denies the child the launcher's
- * OUTSIDE canary (chmod 000 — the launcher read it BEFORE the spawn), starts the
- * wrapped command as its own child, and publishes a `ps` store bound to the real
- * pids it spawned, so the launcher's canary + binding checks pass and it
- * RELEASES the child. Anything else (`--version`, `profile validate`) exits 0.
- */
-const CONFINING_FAKE_NONO = `#!/usr/bin/env bash
+/** Simulates canary denial and a session record; provides no sandbox. */
+const CANARY_FAKE_NONO = `#!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
@@ -138,7 +120,8 @@ function writeFakeNono(sb: Sandbox, script: string): string {
 function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Record<string, string> {
   const base: Record<string, string> = {
     ...(process.env as Record<string, string>),
-    HOME: sb.home,
+    HOME: "../home",
+    SNOOPLOGG: "tps:agent*",
     TMPDIR: sb.tmp,
     FAKE_NONO_LOG: sb.nonoLog,
     [TIMEOUT_ENV]: "8000",
@@ -204,20 +187,19 @@ const real = process.getuid?.() !== 0 ? describe : describe.skip;
 
 real("cli#363 slice B — the three runtimes reach the attested launch", () => {
   for (const rt of RUNTIMES) {
-    test(`agent start --runtime ${rt} --sandbox-required is routed through the launcher and released`, async () => {
+    test(`agent start --runtime ${rt} --sandbox-required is released and starts its runner`, async () => {
       const sb = makeSandbox();
       try {
-        const bin = writeFakeNono(sb, CONFINING_FAKE_NONO);
+        const bin = writeFakeNono(sb, CANARY_FAKE_NONO);
         const { text, stopped } = await runUntil(
           sb,
           ["agent", "start", "--id", "probe", "--runtime", rt, SANDBOX_REQUIRED],
           { [NONO_BIN_ENV]: bin, FAKE_NONO_PS_JSON: join(sb.root, "ps.json") },
-          (t) => t.includes("released under nono session"),
+          (t) => t.includes(startup[rt]),
           30_000
         );
+        expect(text).toContain(startup[rt]);
         expect(stopped).toBe(true);
-        // The launcher's release is proof of confinement (canaries + session
-        // binding); its absence would mean the control refused.
         expect(text).toContain("released under nono session");
         // The runtime is not refused by the retired slice-A rule.
         expect(text).not.toContain("not launched through the attested sandbox");
@@ -315,5 +297,50 @@ describe("cli#363 slice B — confinement unavailable is refused before any spaw
         rmSync(sb.root, { recursive: true, force: true });
       }
     }, 25_000);
+  }
+});
+
+describe("conflicting sandbox flags", () => {
+  for (const rt of RUNTIMES) {
+    for (const tty of [true, false]) {
+      test(`${rt}: conflicting flags are refused before dispatch (TTY=${tty})`, () => {
+        const sb = makeSandbox();
+        try {
+          const preload = join(sb.root, "tty.cjs");
+          writeFileSync(preload, `Object.defineProperty(process.stdin, "isTTY", {value: ${tty}});\nObject.defineProperty(process.stdout, "isTTY", {value: ${tty}});\n`);
+          const r = spawnSync(NODE, ["--require", preload, TPS_BIN, "agent", "start", "--id", "probe", "--runtime", rt, "--sandbox-required", "--no-sandbox"], {
+            cwd: sb.ws, env: cliEnv(sb), encoding: "utf-8", timeout: 3000, killSignal: "SIGKILL",
+          });
+          const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+          expect(text).toContain("--sandbox-required conflicts with --no-sandbox");
+          expect(r.status).toBe(78);
+          expect(text).not.toContain(startup[rt]);
+          expect(fakeNonoRuns(sb)).toEqual([]);
+        } finally {
+          rmSync(sb.root, {recursive: true, force: true});
+        }
+      });
+    }
+  }
+});
+
+describe("selected runner startup with interactive opt-out", () => {
+  for (const rt of RUNTIMES) {
+    test(`${rt}: starts its selected runner`, async () => {
+      const sb = makeSandbox();
+      try {
+        const preload = join(sb.root, "tty.cjs");
+        writeFileSync(preload, 'Object.defineProperty(process.stdin, "isTTY", {value: true});\nObject.defineProperty(process.stdout, "isTTY", {value: true});\n');
+        const { text, stopped } = await runUntil(sb,
+          ["agent", "start", "--id", "probe", "--runtime", rt, "--no-sandbox"],
+          { NODE_OPTIONS: `--require=${preload}` },
+          (t) => t.includes(startup[rt]), 5000);
+        expect(text).toContain(startup[rt]);
+        expect(stopped).toBe(true);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
   }
 });

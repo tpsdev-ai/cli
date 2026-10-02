@@ -7,12 +7,8 @@
  * AND to the pid the child reports, with enforcement verified BEHAVIOURALLY from
  * outside the sandbox — or the child is never released.
  *
- * `tps agent start --runtime claude-code|codex|gemini` reaches this launch too
- * (cli#363 slice B): `bin/tps.ts` carries the runtime into the re-exec, so the
- * runtime runner runs inside the nono session this module starts — the same
- * confinement as every other agent launch. A `--sandbox-required` launch on
- * those runtimes is confined, or refused before anything is spawned when
- * confinement is unavailable.
+ * CLI selected runtime runners require launcher release or an interactive TTY
+ * `--no-sandbox` opt-out. Conflicting `--sandbox-required` is refused by the gate.
  *
  * Why behavioural, not a nono audit record (round 4e): nono 0.74.0 writes its
  * per-session `sandbox_runtime` audit record ONLY when tool-sandbox is active
@@ -275,7 +271,7 @@ export function grantsOfOptions(
     workdir: options.workdir,
     cwd,
     read: [...(options.read ?? [])],
-    readFiles: [...(options.readFiles ?? [])],
+    readFiles: [...(options.readFiles ?? []), ...(options.allowFiles ?? [])],
     allow: [...(options.allow ?? []), ...extraAllow],
   };
 }

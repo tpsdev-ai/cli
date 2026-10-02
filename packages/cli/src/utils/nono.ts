@@ -21,12 +21,8 @@
  *   - A non-interactive invocation that launches an agent MUST carry
  *     `--sandbox-required`; a launcher that dropped it is refused rather than
  *     silently running unsandboxed. See `evaluateLaunchControl`.
- *   - `agent start --runtime claude-code|codex|gemini` reaches the SAME attested
- *     launch as the default path (cli#363 slice B): the runtime is carried into
- *     the re-exec and runs inside the launcher's nono session, so a
- *     `--sandbox-required` launch is confined, or refused before anything is
- *     spawned when confinement is unavailable. There is no unconfined runtime
- *     path left.
+ *   - CLI selected runtime runners require launcher release or an interactive
+ *     TTY `--no-sandbox` opt-out. `--sandbox-required` conflicts with that opt-out.
  *   - Under `--sandboxed` the child must hold the launcher's release for a live
  *     nono session bound to its own pid (cli#350 round 4e): see
  *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
@@ -63,7 +59,10 @@ export type NonoProfile =
   | "tps-backup"
   | "tps-restore"
   | "tps-status"
-  | "tps-agent-run";
+  | "tps-agent-run"
+  | "tps-agent-run-claude-code"
+  | "tps-agent-run-codex"
+  | "tps-agent-run-gemini";
 
 export interface NonoOptions {
   /** Override workdir for the nono sandbox (--workdir flag) */
@@ -79,6 +78,7 @@ export interface NonoOptions {
   readFiles?: string[];
   /** Extra read-write paths to allow */
   allow?: string[];
+  allowFiles?: string[];
 }
 
 /**
@@ -285,6 +285,33 @@ export function harnessReadFiles(agentId?: string): string[] {
   return files;
 }
 
+export function runtimeNonoProfile(runtime?: string): NonoProfile {
+  return runtime === "claude-code" || runtime === "codex" || runtime === "gemini"
+    ? `tps-agent-run-${runtime}`
+    : "tps-agent-run";
+}
+
+export function runtimeNonoOptions(
+  runtime?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonoOptions {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  let allow: string[] = [];
+  let allowFiles: string[] = [];
+  if (runtime === "claude-code") {
+    allow = [env.CLAUDE_CONFIG_DIR || join(home, ".claude"), join(home, ".claude")];
+    allowFiles = [join(home, ".claude.json"), join(home, ".claude.lock")];
+  } else if (runtime === "codex") {
+    allow = [env.CODEX_HOME || join(home, ".codex"), join(home, ".config", "codex")];
+    allowFiles = [join(home, ".tps", "auth", "openai.json")];
+  } else if (runtime === "gemini") {
+    allow = [join(home, ".gemini"), join(xdg, "gemini")];
+  }
+  for (const path of allow) mkdirSync(path, { recursive: true, mode: 0o700 });
+  return { allow: [...new Set(allow)], allowFiles };
+}
+
 /**
  * Build the nono command args for a given profile and subcommand.
  *
@@ -314,6 +341,10 @@ export function buildNonoArgs(
 
   for (const p of options.readFiles ?? []) {
     args.push("--read-file", p);
+  }
+
+  for (const p of options.allowFiles ?? []) {
+    args.push("--allow-file", p);
   }
 
   for (const p of options.allow ?? []) {
@@ -705,6 +736,10 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const supervised = input.supervised ?? isSupervised();
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
+
+  if (argv.includes(SANDBOX_REQUIRED_FLAG) && argv.includes(NO_SANDBOX_FLAG)) {
+    return deny(`${SANDBOX_REQUIRED_FLAG} conflicts with ${NO_SANDBOX_FLAG}; remove ${NO_SANDBOX_FLAG} to require isolation.`);
+  }
 
   // (1) --no-sandbox is honoured only from an interactive TTY.
   if (argv.includes(NO_SANDBOX_FLAG) && !tty) {

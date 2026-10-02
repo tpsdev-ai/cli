@@ -104,7 +104,7 @@ describe("this repository's test job", () => {
     expect(t.steps[3].script).toBe(
       [
         `iso_home="$(mktemp -d)"`,
-        `HOME="$iso_home" bun run test`,
+        `HOME="$iso_home" TMPDIR="\${RUNNER_TEMP:-/var/tmp}" bun run test`,
         `if [ -e "$iso_home/.tps" ]; then`,
         `  echo "::error::the suite wrote $iso_home/.tps — HOME is not isolated"`,
         "  exit 1",

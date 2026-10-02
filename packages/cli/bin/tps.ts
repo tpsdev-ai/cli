@@ -468,15 +468,8 @@ async function main() {
           const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
           const sandboxed = process.argv.includes("--sandboxed");
           const noSandbox = process.argv.includes("--no-sandbox");
-          // cli#363 slice B: the three runtime runners are reached only on the
-          // EXECUTION side — inside the launcher's nono session (`--sandboxed`),
-          // or under an interactive human `--no-sandbox` opt-out. Every other
-          // invocation routes through `runAgent({action:"start"})` carrying
-          // `--runtime`, so the runtime reaches the SAME attested launch as every
-          // other agent start and is confined like it. There is no unconfined
-          // runtime spawn path: `--sandboxed` is only honoured with the
-          // launcher's release (attested), and `--no-sandbox` is the documented
-          // interactive escape hatch the launch gate already governs.
+          // Selected runners execute after launcher release or an interactive
+          // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
             const { join } = await import("node:path");
