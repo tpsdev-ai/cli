@@ -33,7 +33,7 @@ export interface BridgeCoreConfig {
   defaultChannelId?: string;
   /** Prompt injected when routing Discord messages. Empty string disables header. */
   discordContextPrompt?: string;
-  /** How often retryable dlq/ entries are re-driven, in ms (default 30000). */
+  /** Mailbox retry interval in ms (default 30000). */
   redriveMs?: number;
 }
 
@@ -132,7 +132,17 @@ Message: ${envelope.content}`;
     const { fresh, dlq } = this.mailboxDir(this.bridgeAgentId);
     mkdirSync(fresh, { recursive: true });
 
-    const processFile = async (file: string) => {
+    let stopped = false;
+    let work = Promise.resolve();
+    const pending = new Set<string>();
+    const enqueue = (task: () => Promise<void>) => {
+      work = work.then(async () => {
+        if (!stopped) await task();
+      }).catch((e) => this.log(`[bridge:outbound] mailbox processing failed: ${e}`));
+      return work;
+    };
+
+    const promoteFile = async (file: string) => {
       if (!file.endsWith(".json")) return;
       const fullPath = join(fresh, file);
       if (!existsSync(fullPath)) return;
@@ -152,17 +162,30 @@ Message: ${envelope.content}`;
       forward(promoted.message.body);
     };
 
+    const processFile = (file: string) => {
+      if (!file.endsWith(".json") || pending.has(file) || stopped) return;
+      pending.add(file);
+      void enqueue(async () => {
+        try {
+          await promoteFile(file);
+        } finally {
+          pending.delete(file);
+        }
+      });
+    };
+
     let redriving = false;
-    const redrive = async () => {
-      if (redriving) return;
+    const redrive = () => {
+      if (redriving || stopped) return;
       redriving = true;
-      try {
-        for (const promoted of await redriveRetryable(this.bridgeAgentId, dlq)) forward(promoted.message.body);
-      } catch (e) {
-        this.log(`[bridge:outbound] dlq re-drive failed: ${e}`);
-      } finally {
-        redriving = false;
-      }
+      void enqueue(async () => {
+        try {
+          for (const file of readdirSync(fresh)) await promoteFile(file);
+          for (const promoted of await redriveRetryable(this.bridgeAgentId, dlq)) forward(promoted.message.body);
+        } finally {
+          redriving = false;
+        }
+      });
     };
 
     // The promoted body is the verified payload (the envelope's body).
@@ -205,6 +228,7 @@ Message: ${envelope.content}`;
     const redriveTimer = setInterval(() => void redrive(), this.redriveMs);
 
     return () => {
+      stopped = true;
       clearInterval(redriveTimer);
       try { watcher.close(); } catch {}
     };

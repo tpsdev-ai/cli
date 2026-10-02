@@ -3,10 +3,16 @@ import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { acquireMailLock, mailboxReplayStore, type MailLock } from "@tpsdev-ai/agent";
+import type { MailLock } from "@tpsdev-ai/agent";
 import { FlairClient } from "../src/utils/flair-client.js";
-import { getInbox, promote, redriveRetryable, sendMessage } from "../src/utils/mail.js";
-import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+const lockModuleUrl = new URL("../../agent/dist/lib/mail-lock.js", import.meta.url);
+for (const path of [new URL("../../agent/dist/index.js", import.meta.url), lockModuleUrl]) {
+  if (!fs.existsSync(path)) throw new Error("packages/agent/dist missing — run bun run build");
+}
+const { acquireMailLock, mailboxReplayStore } = await import("@tpsdev-ai/agent");
+const { getInbox, promote, redriveRetryable, sendMessage } = await import("../src/utils/mail.js");
+const { buildSignedEnvelope, pubkeyFromSeed } = await import("./helpers/stub-flair.js");
 
 const SEED = Buffer.alloc(32, 1);
 let root: string;
@@ -95,9 +101,8 @@ for (const directory of ["new", "dlq"] as const) {
 }
 
 test("a live holder's unreadable owner file cannot be reclaimed", async () => {
-  const moduleUrl = new URL("../../agent/dist/lib/mail-lock.js", import.meta.url).href;
   const child = spawn("node", ["--input-type=module", "--eval", `
-    import { acquireMailLock } from ${JSON.stringify(moduleUrl)};
+    import { acquireMailLock } from ${JSON.stringify(lockModuleUrl.href)};
     const lock = await acquireMailLock(${JSON.stringify(root)});
     if (!lock) process.exit(2);
     process.stdin.once("data", () => { lock.release(); process.exit(0); });
