@@ -245,6 +245,16 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       abortSignal: abortController.signal,
     };
 
+    if (opts.noInbound) {
+      for (const file of readdirSafe(resolve(tempMailDir, agentId, "cur"))) {
+        const path = resolve(tempMailDir, agentId, "cur", file);
+        const record = JSON.parse(readFileSync(path, "utf8"));
+        if (record.envelope) continue;
+        const envelope = JSON.parse(record.body);
+        writeFileSync(path, JSON.stringify({ ...record, body: envelope.body, timestamp: envelope.timestamp,
+          envelopeId: envelope.messageId, envelope, replyToId: envelope.replyToId }));
+      }
+    }
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
     await pollUntil(() => dispatchedArgs !== null || curFiles(agentId).length > 0 || existsSync(resolve(tempMailDir, agentId, "dlq")), 4000);
 
@@ -1119,4 +1129,31 @@ describe("cli#389 round 11 — an owed nack is never swept", () => {
     }
   }, 20000);
 });
+  for (const state of ["failed", "posted"] as const) {
+    it(`external inbound gates ${state} obligation recovery, replies and ack`, async () => {
+      const agentId = "anvil";
+      const inboundId = `external-${state}`;
+      const signed = JSON.parse(buildSignedBody("flint", agentId, "external", FLINT_SEED));
+      delete signed.signature;
+      signed.trust = "external";
+      const envelope = signEnvelope(signed, { flint: FLINT_SEED });
+      const cur = resolve(tempMailDir, agentId, "cur");
+      const obligations = resolve(tempMailDir, agentId, ".obligations");
+      mkdirSync(cur, { recursive: true }); mkdirSync(obligations, { recursive: true });
+      writeFileSync(resolve(cur, `${inboundId}.json`), JSON.stringify({ id: inboundId, from: "flint", to: agentId,
+        body: envelope.body, timestamp: envelope.timestamp, envelopeId: envelope.messageId, envelope, read: false }));
+      writeFileSync(resolve(obligations, `${inboundId}.json`), JSON.stringify({ obligationId: `ob-${inboundId}`,
+        inboundId, inboundEnvelopeId: envelope.messageId, inboundTimestamp: envelope.timestamp, from: "flint", to: agentId,
+        accountId: "default", state, deadlineAt: new Date(Date.now() + 50).toISOString(), attempts: 1,
+        nackPending: state === "failed", failure: "external-old-debt" }));
+      const h = await start(agentId, "flint", { localSender: true, noInbound: true });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(h.dispatchCount).toBe(0);
+      expect(readdirSafe(resolve(tempMailDir, "flint", "new"))).toEqual([]);
+      expect(curRecordById(agentId, inboundId)?.ackedAt).toBeUndefined();
+      expect(obligationFile(agentId, inboundId)?.state).toBe(state);
+      await h.stop();
+    });
+  }
+
 });

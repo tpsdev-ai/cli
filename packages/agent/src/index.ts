@@ -52,3 +52,5 @@ export {
   agentKeyCandidates, existingAgentKeyPaths, resolveAgentKeyPath,
   readAgentPrivateKey, readPrivateKeyAtPath, toEd25519Seed,
 } from "./lib/agent-keys.js";
+
+export { BRIDGE_ADAPTERS, resolveBridgeAgentId, configureBridgeIdentity, bridgePrincipalIds, verifiedMailTier } from "./lib/bridge-identity.js";

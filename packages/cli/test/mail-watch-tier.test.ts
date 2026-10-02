@@ -1,3 +1,4 @@
+import { startFetchFlair } from "./helpers/fetch-flair.js";
 /**
  * mail-watch-tier.test.ts — `mail watch` hooks honour the SIGNED tier
  * (cli#433 slice B2-1).
@@ -14,12 +15,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { watchMail } from "../src/commands/mail-watch.js";
 import { getInbox } from "../src/utils/mail.js";
-import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
+import { buildSignedEnvelope, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
 const AGENT = "kern";
 const FLINT_SEED = Buffer.alloc(32, 0x51);
 const KERN_SEED = Buffer.alloc(32, 0x52);
-const SEEDS = { flint: FLINT_SEED, kern: KERN_SEED };
+const SEEDS = { flint: FLINT_SEED, kern: KERN_SEED, "openclaw-bridge": Buffer.alloc(32, 0x53) };
 
 const NO_FS_EVENTS = () => ({ close() {} });
 const HOOK_SCRIPT =
@@ -38,7 +39,7 @@ describe("mail watch honours the signed tier (cli#433 slice B2-1)", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-tier-"));
     keysDir = join(tempRoot, "keys");
-    stub = startStubFlair(SEEDS);
+    stub = startFetchFlair(SEEDS);
     writeKeyFile(keysDir, AGENT, KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
 
@@ -116,4 +117,19 @@ describe("mail watch honours the signed tier (cli#433 slice B2-1)", () => {
     expect(seen).toEqual(["watch body"]);
     expect(existsSync(out), "the hook ran").toBe(true);
   });
+  it("a bridge no-claim record cannot run the actual hook", async () => {
+    const out = join(tempRoot, "bridge-hook.txt");
+    const seen: string[] = [];
+    const watcher = watchMail({ agent: AGENT, debounceMs: 10, pollMs: 20, watchImpl: NO_FS_EVENTS,
+      hook: hookCapturing(out), onMessage: (msg) => { seen.push(msg.body); } });
+    try {
+      const envelope = buildSignedEnvelope("openclaw-bridge", AGENT, "bridge body", SEEDS);
+      writeFileSync(join(getInbox(AGENT).fresh, "bridge.json"), JSON.stringify({ id: "bridge", from: "openclaw-bridge",
+        to: AGENT, body: JSON.stringify(envelope), timestamp: envelope.timestamp, read: false }));
+      await sleep(300);
+      expect(seen).toEqual([]);
+      expect(existsSync(out)).toBe(false);
+    } finally { watcher.stop(); }
+  });
+
 });

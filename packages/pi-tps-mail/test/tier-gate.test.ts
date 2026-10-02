@@ -1,24 +1,15 @@
-/**
- * tier-gate.test.ts — the pi-tps-mail watcher honours the SIGNED tier
- * (cli#433 slice B2-1).
- *
- * The watcher dispatches ONLY what `tps mail check --json` verifies. This suite
- * pins that an external-tier record is NOT dispatched (the launcher never runs,
- * no reply is sent), while a record with no signed claim is unchanged. Fails
- * against origin/main, where the watcher never read the signed tier.
- */
-
+import { startFetchFlair } from "../../cli/test/helpers/fetch-flair.js";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { buildSignedEnvelope, startStubFlair, type StubFlair } from "../../cli/test/helpers/stub-flair.js";
+import { buildSignedEnvelope, type StubFlair } from "../../cli/test/helpers/stub-flair.js";
 import { watchMail } from "../src/index.js";
 
-const TPS_TS = resolve(import.meta.dir, "../../cli/bin/tps.ts");
+const TPS_TS = resolve(import.meta.dir, "../../cli/test/helpers/cli-fetch-driver.ts");
 const FLINT_SEED = Buffer.alloc(32, 0x61); // the sender
 const EMBER_SEED = Buffer.alloc(32, 0x62); // the watched agent
-const ENV_KEYS = ["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR", "TPS_BIN", "TPS_VAULT_KEY", "TPS_AGENT_ID", "FLAIR_URL", "FLAIR_KEY_PATH"] as const;
+const ENV_KEYS = ["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR", "TPS_BIN", "TPS_VAULT_KEY", "TPS_AGENT_ID", "FLAIR_URL", "FLAIR_KEY_PATH", "TEST_FLAIR_SEEDS"] as const;
 
 let root: string;
 let stub: StubFlair;
@@ -52,7 +43,7 @@ beforeEach(() => {
   mkdirSync(p.keys(), { recursive: true });
   mkdirSync(join(root, "agents", "ember", "bin"), { recursive: true });
   writeFileSync(join(root, "flair-auth.key"), Buffer.alloc(32, 0x6c));
-  stub = startStubFlair({ flint: FLINT_SEED, ember: EMBER_SEED });
+  stub = startFetchFlair({ flint: FLINT_SEED, ember: EMBER_SEED, "openclaw-bridge": FLINT_SEED });
 
   // The launcher records each call and answers with a fixed reply.
   writeFileSync(p.launcher(), `#!/bin/sh\nprintf 'call %s\\n' "$1" >> "${p.launcherLog()}"\nprintf 'reply from ember'\n`);
@@ -65,6 +56,8 @@ beforeEach(() => {
 
   saved = {};
   for (const k of ENV_KEYS) saved[k] = process.env[k];
+  process.env.TEST_FLAIR_SEEDS = join(root, "seeds.json");
+  writeFileSync(process.env.TEST_FLAIR_SEEDS, JSON.stringify({ flint: FLINT_SEED.toString("hex"), ember: EMBER_SEED.toString("hex"), "openclaw-bridge": FLINT_SEED.toString("hex") }));
   process.env.HOME = root;
   process.env.TPS_MAIL_DIR = p.mail();
   process.env.TPS_TEST_KEYS_DIR = p.keys();
@@ -87,13 +80,13 @@ afterEach(async () => {
 });
 
 /** Plant a genuine inbound in ember's new/, optionally with a signed trust claim. */
-function plantInbound(trust: string | undefined): void {
+function plantInbound(trust: string | undefined, from = "flint"): void {
   const envelopeBody = JSON.stringify(
-    buildSignedEnvelope("flint", "ember", "please answer", { flint: FLINT_SEED }, trust === undefined ? {} : { trust }),
+    buildSignedEnvelope(from, "ember", "please answer", { [from]: FLINT_SEED }, { messageId: "in-envelope", ...(trust === undefined ? {} : { trust }) }),
   );
   writeFileSync(
     join(p.emberNew(), "2026-09-28T00-00-00-in-1.json"),
-    JSON.stringify({ id: "in-1", from: "flint", to: "ember", body: envelopeBody, timestamp: new Date().toISOString(), read: false }),
+    JSON.stringify({ id: "in-1", from, to: "ember", body: envelopeBody, timestamp: new Date().toISOString(), read: false }),
   );
 }
 
@@ -130,4 +123,32 @@ describe("pi-tps-mail watcher honours the signed tier (cli#433 slice B2-1)", () 
     const dispatched = await until(() => lines(p.launcherLog()).length > 0, 8000);
     expect(dispatched).toBe(true);
   });
+});
+
+for (const state of ["prepared", "sent"] as const) {
+  it(`does not recover an external-tier ${state} reply journal: no send or ack`, async () => {
+    plantInbound("external");
+    const dir = join(p.mail(), "ember", ".pi-tps-mail", "replies");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "in-1.json"), JSON.stringify({
+      v: 1, inboundId: "in-1", to: "flint", threadId: "in-envelope", reply: "old reply",
+      replyMessageId: "old-reply", state, attempts: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    }));
+    start();
+    await until(() => lines(p.argvLog()).some((line) => line.startsWith("mail send") || line.startsWith("mail ack")), 1000);
+    expect(lines(p.argvLog()).filter((line) => line.startsWith("mail send") || line.startsWith("mail ack"))).toEqual([]);
+    expect(lines(p.launcherLog())).toEqual([]);
+    expect(existsSync(join(dir, "in-1.json"))).toBe(true);
+  });
+}
+
+it("pi real dispatch refuses a bridge no-claim record after verified promotion", async () => {
+  plantInbound(undefined, "openclaw-bridge");
+  start();
+  const cur = join(p.mail(), "ember", "cur", "2026-09-28T00-00-00-in-1.json");
+  expect(await until(() => existsSync(cur), 3000)).toBe(true);
+  await until(() => lines(p.launcherLog()).length > 0, 300);
+  expect(JSON.parse(readFileSync(cur, "utf8")).trustTier).toBe("external");
+  expect(lines(p.launcherLog())).toEqual([]);
+  expect(lines(p.argvLog()).filter((line) => line.startsWith("mail send") || line.startsWith("mail ack"))).toEqual([]);
 });

@@ -1,15 +1,4 @@
-/**
- * mail-trust-ceiling.test.ts — the trust ceiling at promotion and the consumer
- * tier gate (cli#433 slice B2-1).
- *
- * Everything runs the REAL path: promote()/checkMessages() construct their
- * Flair client unconditionally, so the tests stand up the stub Flair HTTP
- * server and point FLAIR_URL/FLAIR_KEY_PATH at it. No internal mocking.
- *
- * Each acceptance case FAILS against origin/main, where promote() never read
- * the SIGNED trust value and consumers never gated on it.
- */
-
+import { startFetchFlair } from "./helpers/fetch-flair.js";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -20,7 +9,7 @@ import { claudeCodeDispatchRefusal } from "../src/utils/claude-code-runtime.js";
 import { codexDispatchRefusal } from "../src/utils/codex-runtime.js";
 import { geminiDispatchRefusal } from "../src/utils/gemini-runtime.js";
 import { signedTrustTier } from "@tpsdev-ai/agent";
-import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
+import { writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const KERN_SEED = Buffer.alloc(32, 0x41);
 const FLINT_SEED = Buffer.alloc(32, 0x42);
@@ -37,7 +26,7 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-trust-ceiling-"));
     keysDir = join(tempRoot, "keys");
-    stub = startStubFlair(SEEDS);
+    stub = startFetchFlair(SEEDS);
     writeKeyFile(keysDir, "kern", KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
 
@@ -71,7 +60,7 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     }
   }
 
-  test("a bridge-principal envelope signed internal is refused at promotion", async () => {
+  test("a bridge-principal envelope signed internal receives the external tier", async () => {
     const env = buildSignedEnvelope("openclaw-bridge", "kern", "from the channel", SEEDS, { trust: "internal" });
     sendMessage("kern", JSON.stringify(env), "openclaw-bridge");
 
@@ -79,13 +68,9 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     const [file] = jsonFiles(inbox.fresh);
     const msgs = await checkMessages("kern");
 
-    expect(msgs.length).toBe(0);
-    expect(jsonFiles(inbox.cur).length).toBe(0);
-    expect(jsonFiles(inbox.dlq).length).toBe(1);
-    const reason = reasonFor("kern", file!);
-    expect(reason).toContain("class: invalid");
-    expect(reason).toContain("trust ceiling");
-    expect(reason).toContain("external");
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.trustTier).toBe("external");
+    expect(msgs[0]!.envelope?.trust).toBe("internal");
   });
 
   test("a bridge-principal envelope signed external is promoted (the allowed tier)", async () => {
@@ -118,8 +103,8 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     sendMessage("kern", JSON.stringify(env), "custom-bridge");
 
     const msgs = await checkMessages("kern");
-    expect(msgs.length).toBe(0);
-    expect(jsonFiles(getInbox("kern").dlq).length).toBe(1);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.trustTier).toBe("external");
   });
 
   test("a wrapper X-TPS-Trust: internal on external mail confers nothing", async () => {
@@ -149,7 +134,7 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     expect(externalDispatchRefusal(msgs[0]!.envelope, msgs[0]!.from)).not.toBeNull();
   });
 
-  test("a wrapper X-TPS-Trust: external cannot rescue a bridge-signed internal claim", async () => {
+  test("a wrapper cannot alter a bridge principal tier", async () => {
     const env = buildSignedEnvelope("openclaw-bridge", "kern", "escalated", SEEDS, { trust: "internal" });
     sendMessage("kern", JSON.stringify(env), "openclaw-bridge");
     const inbox = getInbox("kern");
@@ -161,8 +146,8 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     writeFileSync(join(inbox.fresh, file!), JSON.stringify(record));
 
     const msgs = await checkMessages("kern");
-    expect(msgs.length).toBe(0);
-    expect(jsonFiles(inbox.dlq).length).toBe(1);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.trustTier).toBe("external");
   });
 });
 

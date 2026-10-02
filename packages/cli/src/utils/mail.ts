@@ -2,13 +2,12 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
+import { type Envelope, verifyEnvelope, verifiedMailTier, bridgePrincipalIds } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
 import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
 import { acquireMailLock, type MailLock } from "./mail-lock.js";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
-import { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "../bridge/core.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
 // (which imports this module) applies the same rule the CLI does.
@@ -42,6 +41,7 @@ export interface MailMessage {
    * the two either breaks this envelope's signature or fails the field match.
    */
   envelope?: Envelope;
+  trustTier?: "user" | "internal" | "external";
   /**
    * cli#429: the signed `messageId` this message replies to, stamped from the
    * VERIFIED envelope at promotion (it is also bound to the envelope by
@@ -868,31 +868,12 @@ type EnvelopePolicyResult =
 /** The trust values a SIGNED envelope may carry. Anything else is refused. */
 const VALID_SIGNED_TRUST: ReadonlySet<string> = new Set(["user", "internal", "external"]);
 
-/**
- * The bridge principal ids this receiver caps at `external` (cli#433 slice
- * B2-1): the configured id when set (MailVerifyConfig.bridgeAgentId, else
- * TPS_BRIDGE_AGENT_ID), resolved by the ONE bridge rule (resolveBridgeAgentId);
- * otherwise the default identity of each bridge adapter the CLI ships.
- */
-function bridgePrincipalIds(verify: MailVerifyConfig): Set<string> {
-  const configured = verify.bridgeAgentId ?? process.env.TPS_BRIDGE_AGENT_ID;
-  if (configured) return new Set([configured]);
-  return new Set(BRIDGE_ADAPTERS.map((name) => resolveBridgeAgentId(name)));
-}
-
-/**
- * The trust ceiling (cli#433 slice B2-1): validate the SIGNED trust value and
- * cap it by sender. It reads the VERIFIED envelope only — wrapper headers such
- * as X-TPS-Trust sit outside the signature and never confer trust. An
- * unrecognised value is REFUSED, never defaulted. A bridge principal may
- * deliver only `external`, so a bridge-signed `internal` (or higher) is
- * refused. Returns a rejection, or null when the envelope may be promoted.
- */
 function trustCeilingReject(
   envelope: Envelope,
   verify: MailVerifyConfig,
 ): { ok: false; class: PromoteRejectClass; reason: string } | null {
   const trust = (envelope as { trust?: unknown }).trust;
+  if (bridgePrincipalIds(verify.mailRoot ?? mailDirPath(), verify.bridgeAgentId).has(envelope.from)) return null;
   if (trust !== undefined && !VALID_SIGNED_TRUST.has(trust as string)) {
     const shown =
       typeof trust === "string"
@@ -906,15 +887,6 @@ function trustCeilingReject(
       ok: false,
       class: "invalid",
       reason: `invalid trust value (must be "user", "internal" or "external"; got ${shown})`,
-    };
-  }
-  if (bridgePrincipalIds(verify).has(envelope.from) && trust !== undefined && trust !== "external") {
-    return {
-      ok: false,
-      class: "invalid",
-      reason:
-        `trust ceiling: a bridge principal may deliver only external mail ` +
-        `(envelope.from=${envelope.from}, trust=${JSON.stringify(trust)})`,
     };
   }
   return null;
@@ -1080,6 +1052,7 @@ export async function verifyRecordForMailbox(
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      trustTier: verifiedMailTier(envelope, verify.mailRoot ?? mailDirPath(), verify.bridgeAgentId),
       replyToId: envelope.replyToId,
     },
   };
@@ -1098,6 +1071,7 @@ export async function verifyRecordForMailbox(
 export async function promote(agent: string, filePath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(filePath);
+  verify = { ...verify, mailRoot: dirname(dirs.root) };
   const filename = filePath.split("/").pop()!;
 
   // Step 0: read the wrapper.
@@ -1190,6 +1164,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      trustTier: verifiedMailTier(envelope, verify.mailRoot ?? mailDirPath(), verify.bridgeAgentId),
       // Stamp the verified reply-to (or clear it): the binding table checks
       // record.replyToId against envelope.replyToId, so presentation cannot
       // show a reply-to that is not the one that was signed.
@@ -1335,7 +1310,10 @@ async function checkPromotedRecord(agent: string, record: MailMessage, verify: M
  */
 export async function isPresentableCurRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<boolean> {
   try {
-    return (await checkPromotedRecord(agent, record, verify)).ok;
+    const decision = await checkPromotedRecord(agent, record, verify);
+    if (!decision.ok) return false;
+    record.trustTier = verifiedMailTier(decision.envelope, verify.mailRoot ?? mailDirPath(), verify.bridgeAgentId);
+    return true;
   } catch {
     return false;
   }
@@ -1360,6 +1338,7 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage,
 export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
+  verify = { ...verify, mailRoot: dirname(dirs.root) };
   const filename = curPath.split("/").pop()!;
 
   let msg: MailMessage;
@@ -1392,6 +1371,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     body: env.body,
     timestamp: env.timestamp,
     envelopeId: env.messageId,
+    trustTier: verifiedMailTier(env, verify.mailRoot ?? mailDirPath(), verify.bridgeAgentId),
     replyToId: env.replyToId,
   };
   return { ok: true, message: presented, path: curPath };
@@ -1497,6 +1477,18 @@ export async function listMessages(agent: string): Promise<MailMessage[]> {
     cur.push((await isPresentableCurRecord(agent, m)) ? m : withholdUnverified(m));
   }
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+}
+
+export async function verifyMailAction(agent: string, id: string): Promise<MailMessage | null> {
+  const path = messagePathById(agent, id);
+  if (!path) return null;
+  const record = readMessageFile(path);
+  const result = dirname(path).endsWith("/cur")
+    ? await recoverPromoted(agent, path)
+    : await verifyRecordForMailbox(agent, record);
+  if (!result.ok) throw new Error(`mail action refused: ${result.reason}`);
+  if (result.message.trustTier === "external") throw new Error("external-tier mail cannot be acknowledged or nacked by an internal consumer");
+  return result.message;
 }
 
 export function ackMessage(agent: string, id: string): MailMessage | null {

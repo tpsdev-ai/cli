@@ -40,16 +40,11 @@ export function defaultVerifyKeyPath(agentId: string): string {
  * caller.
  */
 export interface MailVerifyConfig {
+  mailRoot?: string;
   /** Flair base URL. Falls back to FLAIR_URL, then the local default. */
   flairUrl?: string;
   /** Key path authenticating the verification reads. Falls back to FLAIR_KEY_PATH, then the per-agent default. */
   flairKeyPath?: string;
-  /**
-   * The channel bridge's principal id, if this receiver is configured to cap
-   * one (cli#433). Falls back to TPS_BRIDGE_AGENT_ID, then the default identity
-   * of each bridge adapter. This is configuration, not a verification bypass:
-   * it only names the sender whose signed trust the ceiling caps at `external`.
-   */
   bridgeAgentId?: string;
 }
 

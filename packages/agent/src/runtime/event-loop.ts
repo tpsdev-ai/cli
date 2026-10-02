@@ -139,6 +139,7 @@ export class EventLoop {
   private parseTrust(message: MailMessage): TrustLevel {
     // Only a verified envelope can carry a trust decision. Older envelopes
     // have no trust field and receive the lowest capability set.
+    if (message.trustTier !== undefined) return message.trustTier;
     const trust = message.verifiedEnvelope?.trust;
     if (trust === undefined) return "external";
     // Agent mail is never an operator invocation. A sender can sign its own

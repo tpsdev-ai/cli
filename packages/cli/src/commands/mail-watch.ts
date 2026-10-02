@@ -337,7 +337,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         // cli#433 (slice B2-1): honour the SIGNED tier. An arbitrary hook command
         // has no external capability set, so external-tier mail is not presented
         // (the hook does not run), with a named reason.
-        const refusal = externalDispatchRefusal(result.message.envelope, result.message.from);
+        const refusal = externalDispatchRefusal(result.message.envelope, result.message.from, result.message.trustTier);
         if (refusal) {
           classified.set(file, "refused:external-tier");
           console.error(`[mail-watch] ${envId}: not presented (${refusal})`);

@@ -95,8 +95,8 @@ interface MailMessage {
  * A verified record whose SIGNED tier is external is not dispatched with the
  * internal capability set; returns the named reason, or null to dispatch.
  */
-export function claudeCodeDispatchRefusal(envelope: Envelope | undefined, from: string): string | null {
-  return externalDispatchRefusal(envelope, from);
+export function claudeCodeDispatchRefusal(envelope: Envelope | undefined, from: string, tier?: string): string | null {
+  return externalDispatchRefusal(envelope, from, tier);
 }
 
 // ─── System prompt (delegates to agent-lifecycle) ────────────────────────────
@@ -313,10 +313,7 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
     for (const msg of messages) {
       slog(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
 
-      // cli#433 (slice B2-1): honour the SIGNED tier. External-tier mail is not
-      // dispatched with the internal capability set; it stays in cur/ with a
-      // named reason (no reply, no ack) so nothing is silently dropped.
-      const refusal = claudeCodeDispatchRefusal(msg.envelope, msg.from);
+      const refusal = claudeCodeDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
       if (refusal) {
         swarn(`[${agentId}] ${refusal}; not dispatched`);
         continue;

@@ -56,10 +56,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFile
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
-import { signEnvelope, verifyEnvelope } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -129,6 +129,8 @@ interface TpsMailBody {
   /** Set by promote() on an INBOUND: its verified envelope's messageId — the
    *  thread id a reply to it signs (cli#429). */
   envelopeId?: string;
+  envelope?: Envelope;
+  trustTier?: "user" | "internal" | "external";
   ackedAt?: string;
   nackedAt?: string;
   nackReason?: string;
@@ -832,6 +834,19 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
  * Returns the state it applied, or "none" when the record was gone, already
  * terminal, or could not be settled (the store itself rejected the write).
  */
+async function internalInbound(ctx: YieldContext): Promise<boolean> {
+  try {
+    const record = readMailFile(ctx.curPath);
+    if (!record) return false;
+    const recovered = record.envelope
+      ? await recoverPromoted(ctx.agent, ctx.curPath)
+      : await verifyRecordForMailbox(ctx.agent, record as any, { mailRoot: ctx.mailDir });
+    if (!recovered.ok || recovered.message.trustTier === "external") return false;
+    return recovered.message.from === ctx.sender && recovered.message.id === ctx.inboundId
+      && (ctx.inboundEnvelopeId === undefined || recovered.message.envelopeId === ctx.inboundEnvelopeId);
+  } catch { return false; }
+}
+
 async function settleObligation(
   ctx: YieldContext,
   obligationId: string,
@@ -850,6 +865,7 @@ async function settleObligation(
     alreadyStamped?: boolean;
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
+  if (!(await internalInbound(ctx))) return "none";
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec) return "none";
   if (TERMINAL_STATES.has(rec.state)) {
@@ -1188,7 +1204,7 @@ function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
     try {
       client ??= createMailVerifyClient(ctx.agent);
       const verdict = await verifyEnvelope(envelope, await client);
-      return verdict.ok;
+      return verdict.ok && verifiedMailTier(envelope, ctx.mailDir) !== "external";
     } catch (err: any) {
       ctx.log?.warn?.(
         `tps-mail: receipt-verify-unavailable: the reply carried by a receipt for ${ctx.inboundId} could not be verified ` +
@@ -1240,6 +1256,7 @@ async function reconcileObligation(
   ctx: YieldContext,
   rec: { obligationId: string; deadlineAt: string | null; inboundId: string; inboundEnvelopeId?: string; replyId?: string },
 ): Promise<void> {
+  if (!(await internalInbound(ctx))) return;
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
@@ -1280,6 +1297,7 @@ async function reconcileObligation(
  * error, so an operator can tell a dead branch from a refused one.
  */
 async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
+  if (!(await internalInbound(ctx))) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -1625,6 +1643,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
      * for the re-check instead.
      */
     async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
+      if (msg.trustTier === "external") {
+        log?.warn?.(`tps-mail: external-tier mail ${msg.id} not dispatched`);
+        return;
+      }
       if (seenFiles.has(curPath)) return;
       seenFiles.add(curPath);
 
@@ -1856,7 +1878,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                     : `tps-mail: no delivery route for reply recipient ${msg.from} ` +
                         `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
                 );
-              } else if (markDelivering(account.mailDir, recipient, msg.id, log)) {
+              } else if (await internalInbound(yieldCtx) && markDelivering(account.mailDir, recipient, msg.id, log)) {
                 // WRITE-AHEAD (item 1): `delivering` is persisted BEFORE the call.
                 if (route.kind === "local") {
                   writeMailFile(account.mailDir, msg.from, reply);

@@ -48,8 +48,8 @@ interface MailMessage { id: string; from: string; to: string; body: string; time
  * verified record whose SIGNED tier is external is not dispatched with the
  * internal capability set; returns the named reason, or null to dispatch.
  */
-export function geminiDispatchRefusal(envelope: Envelope | undefined, from: string): string | null {
-  return externalDispatchRefusal(envelope, from);
+export function geminiDispatchRefusal(envelope: Envelope | undefined, from: string, tier?: string): string | null {
+  return externalDispatchRefusal(envelope, from, tier);
 }
 
 function getFallbackSoulPath(agentId: string): string {
@@ -168,10 +168,7 @@ export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
   while (true) {
     for (const msg of await pollRuntimeMail(mailCfg)) {
       slog(`Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
-      // cli#433 (slice B2-1): honour the SIGNED tier. External-tier mail is not
-      // dispatched with the internal capability set; it stays in cur/ with a
-      // named reason (no reply, no ack) so nothing is silently dropped.
-      const refusal = geminiDispatchRefusal(msg.envelope, msg.from);
+      const refusal = geminiDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
       if (refusal) {
         swarn(`${refusal}; not dispatched`);
         continue;

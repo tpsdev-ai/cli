@@ -8,7 +8,7 @@
  */
 
 import { bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
-import { BridgeCore, resolveBridgeAgentId } from "../bridge/core.js";
+import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { rmSync } from "node:fs";
@@ -63,7 +63,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         requireMention: args.requireMention,
         });
         const core = new BridgeCore(discordAdapter, {
-          bridgeAgentId: resolveBridgeAgentId("discord", args.bridgeAgentId),
+          bridgeAgentId: args.bridgeAgentId,
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId ?? "ember",
           defaultChannelId: channelId,
@@ -80,7 +80,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
       if (adapter === "stdio") {
         const stdioAdapter = new StdioAdapter();
         const core = new BridgeCore(stdioAdapter, {
-          bridgeAgentId: resolveBridgeAgentId("stdio", args.bridgeAgentId),
+          bridgeAgentId: args.bridgeAgentId,
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId,
         });

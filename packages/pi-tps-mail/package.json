@@ -38,6 +38,7 @@
   ],
   "license": "Apache-2.0",
   "dependencies": {
+    "@tpsdev-ai/agent": "workspace:*",
     "minimist": "^1.2.8"
   },
   "devDependencies": {

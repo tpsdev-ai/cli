@@ -26,6 +26,7 @@ export interface MailMessage {
    * unsigned wrapper field.
    */
   envelope?: { trust?: unknown };
+  trustTier?: "user" | "internal" | "external";
 }
 
 /** Watcher options */

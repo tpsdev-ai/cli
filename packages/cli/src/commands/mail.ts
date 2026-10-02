@@ -1,4 +1,4 @@
-import { ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
+import { verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -669,6 +669,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         console.error("Usage: tps mail ack <id> [agent]");
         process.exit(1);
       }
+      await verifyMailAction(agent, id);
       const msg = ackMessage(agent, id);
       if (!msg) {
         console.warn(`Message already gone or not found: ${id}`);
@@ -685,6 +686,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         console.error("Usage: tps mail nack <id> --reason <text> [--type transient|agent|permanent] [--retry-after <duration>]");
         process.exit(1);
       }
+      await verifyMailAction(agent, id);
       const msg = nackMessage(agent, id, args.reason, args.type ?? "transient", args.retryAfter);
       if (!msg) {
         console.warn(`Message already gone or not found: ${id}`);
