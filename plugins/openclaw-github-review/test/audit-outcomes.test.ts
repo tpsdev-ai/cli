@@ -34,6 +34,7 @@ import {
   pluginConfigOf,
   PR,
   REPO,
+  recordEvidence,
   resolver,
   scenario,
   session,
@@ -193,6 +194,7 @@ describe("A13 — partial outcomes and recovery", () => {
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "reconcile_required");
     expect(restarted.github.reviewCalls.length).toBe(0);
     // A fresh dispatch (a new dispatchId from the host) reviews again.
+    recordEvidence({ config: s.config, approvalKey: s.approvalKey, dispatchId: "dispatch-2" });
     const fresh = makeDeps(s, { assignments: resolver([validAssignment({ dispatchId: "dispatch-2" })]) });
     const posted = await runGithubReview(validInput(), HOST, fresh.deps);
     expect(posted.ok && posted.status === "posted").toBe(true);
@@ -710,6 +712,7 @@ describe("R5 — the durable reservation BEFORE the POST", () => {
     expect(new FileReconcileStore(s.config.reconcileFile!).get("dispatch-1")).toBe("reserved");
     refusedWith(await runGithubReview(validInput(), HOST, restarted.deps), "dispatch_in_flight");
     expect(posts() + restarted.github.reviewCalls.length).toBe(0);
+    recordEvidence({ config: s.config, approvalKey: s.approvalKey, dispatchId: "dispatch-2" });
     const fresh = makeDeps(s, { assignments: resolver([validAssignment({ dispatchId: "dispatch-2" })]) });
     const posted = await runGithubReview(validInput(), HOST, fresh.deps);
     expect(posted.ok && posted.status === "posted").toBe(true);

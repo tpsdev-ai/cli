@@ -30,6 +30,17 @@
       "help": "Absolute path to the reviewer's Flair signing key. Custody is separate from the GitHub credential; only the host-side audit path uses it.",
       "sensitive": true,
       "advanced": true
+    },
+    "approvalEvidenceFile": {
+      "label": "Approval evidence file",
+      "help": "Absolute path to the approval-evidence store that scripts/reviewer/run-review-jobs.mjs writes. A relative path is rejected.",
+      "advanced": true
+    },
+    "approvalEvidenceKeyFile": {
+      "label": "Approval evidence key file",
+      "help": "Absolute path to the HMAC-SHA256 key that authenticates approval-evidence records.",
+      "sensitive": true,
+      "advanced": true
     }
   },
   "configSchema": {
@@ -62,6 +73,27 @@
         "description": "The durable per-dispatch latch store (one host, local filesystem; every read-modify-write under its O_EXCL lock file). Before a review is posted the dispatch is claimed here: `reserved` plus the call's claim, held across the POST. It becomes `posted` (final) or `reconcile_required` (uncertain outcome). Only a GitHub response proving the POST created no review releases it; the host's `latch-admin reconcile` never releases — it latches `posted` when the recorded receipt id is listed, and otherwise a further review is a fresh dispatch. Required: posting is refused before any request when unset."
       },
       "flairUrl": { "type": "string" },
+      "approvalEvidenceFile": {
+        "type": "string",
+        "description": "Absolute path to the approval-evidence store that scripts/reviewer/run-review-jobs.mjs writes. APPROVE is refused unless it holds one authenticated, passing record for this dispatch and the configured CI job, and unless it and the key are outside every sandboxMountRoots path."
+      },
+      "approvalEvidenceKeyFile": {
+        "type": "string",
+        "description": "Absolute path to the HMAC-SHA256 key that authenticates approval-evidence records."
+      },
+      "approvalCiWorkflow": {
+        "type": "string",
+        "description": "The workflow file an approval-evidence record must name."
+      },
+      "approvalCiJob": {
+        "type": "string",
+        "description": "The CI job an approval-evidence record must name."
+      },
+      "sandboxMountRoots": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Every host path a review sandbox mounts, each absolute. Required for APPROVE."
+      },
       "sandboxImageDigest": {
         "type": "string",
         "description": "The deployed reviewer sandbox image digest, recorded in every audit record once the reviewer image (section A) supplies it."

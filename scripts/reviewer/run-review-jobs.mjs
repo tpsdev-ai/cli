@@ -25,11 +25,20 @@
  *
  * The assignment the launcher reads from its container init's environment is set
  * here, in the container's create-time env file, never in the launcher's caller.
+ *
+ * With `evidence`, on review-build-ok it writes the APPROVE evidence record
+ * (approval-evidence.mjs) from what the host itself holds: the commit it read
+ * from the source and from each job's clone before that job's container
+ * existed, the selected job and its closure's planned `run:` scripts from its
+ * own planner, each job's launcher exit status as `docker exec` returned it,
+ * and its own clock. It refuses before any job runs unless the store and its
+ * key resolve outside the scratch and source directories.
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildApprovalEvidence, prepareApprovalEvidence, writeApprovalEvidence } from "./approval-evidence.mjs";
 import { planJob } from "./ci-job.mjs";
 import { RESERVED_ENV_KEYS } from "./reviewer-launch.mjs";
 
@@ -107,7 +116,7 @@ const lastJsonLine = (text) => {
  * Run one job in its own container, from a fresh clone of the source.
  * @returns {{ok:true, job, steps} | {ok:false, refusal, stop?}}
  */
-function runOneJob({ job, source, scratch, image, workflow, base, docker, git }) {
+function runOneJob({ job, source, commit, scratch, image, workflow, base, docker, git }) {
   const dir = join(scratch, job.id);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -115,6 +124,12 @@ function runOneJob({ job, source, scratch, image, workflow, base, docker, git })
   if (clone.status !== 0) {
     rmSync(dir, { recursive: true, force: true });
     return refuse("clone-failed", `job ${job.id}: cloning the assigned commit from the source failed: ${(clone.stderr ?? "").split("\n")[0]}`);
+  }
+  const head = git(["-C", dir, "rev-parse", "--verify", "HEAD^{commit}"]);
+  const cloned = (head.stdout ?? "").trim();
+  if (head.status !== 0 || cloned !== commit) {
+    rmSync(dir, { recursive: true, force: true });
+    return refuse("commit-mismatch", `job ${job.id}: the clone is at ${cloned || "no commit"}, not the source's ${commit}`);
   }
   // Best effort: the sandbox runs as this user, so it can write the bind;
   // widen the permissions anyway.
@@ -172,7 +187,7 @@ function runOneJob({ job, source, scratch, image, workflow, base, docker, git })
   // that exited 0: a crash after printing `ok:true`, another job's verdict, or a
   // non-zero exit carrying `ok:true` is not a pass.
   if (execStatus === 0 && result.ok === true && result.status === "job-ok" && result.job === job.id) {
-    return ok({ job: job.id, steps: result.jobs?.[0]?.steps ?? [] });
+    return ok({ job: job.id, steps: result.jobs?.[0]?.steps ?? [], exitCode: execStatus });
   }
   return refuse(result.kind ?? "job-failed", result.message ?? `job ${job.id}: the launcher did not report job-ok (exit ${execStatus})`, output);
 }
@@ -192,6 +207,7 @@ export function runReviewJobs({
   docker = dockerRunner,
   git = gitRunner,
   now = () => Date.now(),
+  evidence,
 } = {}) {
   for (const [name, value] of Object.entries({ image, source, scratch, workflow, job, base })) {
     if (typeof value !== "string" || value === "") return refuse("bad-input", `${name} is required`);
@@ -199,6 +215,16 @@ export function runReviewJobs({
   const sourceReal = resolve(source);
   if (!existsSync(sourceReal)) return refuse("bad-input", `the source ${sourceReal} does not exist`);
   mkdirSync(scratch, { recursive: true });
+  let evidenceKey = null;
+  if (evidence !== undefined) {
+    const prepared = prepareApprovalEvidence(evidence, [scratch, sourceReal]);
+    if (!prepared.ok) return prepared;
+    evidenceKey = prepared.key;
+  }
+  const sourceHead = git(["-C", sourceReal, "rev-parse", "--verify", "HEAD^{commit}"]);
+  const commit = (sourceHead.stdout ?? "").trim();
+  if (sourceHead.status !== 0 || commit === "") return refuse("bad-input", `the source has no commit checked out (${(sourceHead.stderr ?? "").split("\n")[0]})`);
+  if (evidenceKey && commit !== evidence.commit) return refuse("commit-mismatch", `the source is at ${commit}, not the evidence commit ${evidence.commit}`);
 
   const read = git(["-C", sourceReal, "show", `HEAD:${workflow}`]);
   if (read.status !== 0) return refuse("no-ci-job", `the source has no ${workflow} (${(read.stderr ?? "").split("\n")[0]})`);
@@ -206,6 +232,7 @@ export function runReviewJobs({
   if (!plan.ok) return plan;
 
   const status = new Map();
+  const exitCodes = new Map();
   const jobs = [];
   const startedAt = now();
   let failure = null;
@@ -216,7 +243,7 @@ export function runReviewJobs({
       jobs.push({ job: current.id, skipped: `needs ${blocked.join(", ")}, which did not succeed` });
       continue;
     }
-    const r = runOneJob({ job: current, source: sourceReal, scratch, image, workflow, base, docker, git });
+    const r = runOneJob({ job: current, source: sourceReal, commit, scratch, image, workflow, base, docker, git });
     if (!r.ok) {
       status.set(current.id, "failed");
       jobs.push({ job: current.id, failed: r.refusal });
@@ -227,6 +254,7 @@ export function runReviewJobs({
     }
     jobs.push({ job: current.id, steps: r.steps });
     status.set(current.id, "ok");
+    exitCodes.set(current.id, r.exitCode);
   }
   if (failure) return { ok: false, refusal: failure, jobs };
   const notOk = plan.jobs.find((j) => status.get(j.id) !== "ok");
@@ -234,24 +262,61 @@ export function runReviewJobs({
     const entry = jobs.find((j) => j.job === notOk.id);
     return { ok: false, refusal: { kind: "stage-failed", message: `job ${notOk.id}: ${entry?.skipped ?? "it did not run"}` }, jobs };
   }
-  return ok({ status: "review-build-ok", image, jobs, wall_ms: now() - startedAt });
+  const finishedAt = now();
+  const built = ok({ status: "review-build-ok", image, jobs, wall_ms: finishedAt - startedAt });
+  if (!evidenceKey) return built;
+  const { repo, pr, dispatchId, reviewer, sessionKey } = evidence;
+  const record = buildApprovalEvidence(
+    {
+      repo,
+      pr,
+      dispatchId,
+      reviewer,
+      sessionKey,
+      commit,
+      workflow,
+      job,
+      startedAt: new Date(startedAt).toISOString(),
+      finishedAt: new Date(finishedAt).toISOString(),
+      jobs: plan.jobs.map((j) => ({ job: j.id, commands: j.steps.map((s) => s.script), exitCode: exitCodes.get(j.id) })),
+    },
+    evidenceKey,
+  );
+  try {
+    writeApprovalEvidence(evidence.file, record);
+  } catch (err) {
+    return { ok: false, refusal: { kind: "evidence-unwritable", message: `the approval evidence could not be written: ${err?.message ?? err}` }, jobs };
+  }
+  return { ...built, evidence: { digest: record.digest } };
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 const USAGE = `usage: run-review-jobs.mjs --image <ref> --source <git-dir> --scratch <dir>
-         --workflow <.github/workflows/x.yml> --job <name> --base <branch>`;
+         --workflow <.github/workflows/x.yml> --job <name> --base <branch>
+         [--evidence-file <abs> --evidence-key <abs> --repo <owner/name> --pr <n>
+          --dispatch <id> --reviewer <id> --session <key> --commit <sha>]`;
+const EVIDENCE_ARGS = { "evidence-file": "file", "evidence-key": "keyFile", repo: "repo", pr: "pr", dispatch: "dispatchId", reviewer: "reviewer", session: "sessionKey", commit: "commit" };
 
 function parseArgs(argv) {
   const out = {};
   const names = { image: "image", source: "source", scratch: "scratch", workflow: "workflow", job: "job", base: "base" };
+  const evidence = {};
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    const key = a.startsWith("--") ? names[a.slice(2)] : undefined;
-    if (!key) return { error: `unknown argument ${a}` };
+    const name = a.startsWith("--") ? a.slice(2) : "";
+    const key = Object.hasOwn(names, name) ? names[name] : undefined;
+    const evidenceKey = Object.hasOwn(EVIDENCE_ARGS, name) ? EVIDENCE_ARGS[name] : undefined;
+    if (!key && !evidenceKey) return { error: `unknown argument ${a}` };
     const v = argv[++i];
     if (v === undefined) return { error: `${a} needs a value` };
-    out[key] = v;
+    if (key) out[key] = v;
+    else evidence[evidenceKey] = evidenceKey === "pr" ? (/^[1-9][0-9]*$/.test(v) ? Number(v) : NaN) : v;
+  }
+  if (Object.keys(evidence).length > 0) {
+    const missing = Object.keys(EVIDENCE_ARGS).filter((k) => evidence[EVIDENCE_ARGS[k]] === undefined);
+    if (missing.length > 0) return { error: `evidence needs every one of --${missing.join(", --")}` };
+    out.evidence = evidence;
   }
   return out;
 }
@@ -269,7 +334,7 @@ function main(argv) {
   }
   const result = runReviewJobs(args);
   if (result.ok) {
-    process.stdout.write(`${JSON.stringify({ status: result.status, image: result.image, jobs: result.jobs })}\n`);
+    process.stdout.write(`${JSON.stringify({ status: result.status, image: result.image, jobs: result.jobs, evidence: result.evidence })}\n`);
     return 0;
   }
   process.stderr.write(`refused: ${result.refusal.kind}: ${result.refusal.message}\n`);

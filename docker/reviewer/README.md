@@ -13,6 +13,12 @@ linux/amd64 only (the reviewer VMs are x86_64).
 How well a review build predicts CI is best effort; the fidelity limits are listed
 under [Known limits](#known-limits).
 
+A reviewer's `APPROVE` requires the evidence record that
+`../../scripts/reviewer/run-review-jobs.mjs` writes for such a build when given
+the evidence arguments (see the `openclaw-github-review` plugin README). It
+holds each job's planned `run:` scripts and its launcher's exit status. It does
+not establish that those commands are adequate or that they match what CI ran.
+
 ## Pieces
 
 - `Dockerfile` — `FROM` debian:bookworm-slim pinned by digest, with OpenClaw's

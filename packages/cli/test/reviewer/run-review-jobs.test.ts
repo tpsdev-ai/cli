@@ -11,12 +11,13 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { cloneArgs, containerArgs, gitRunner, runReviewJobs } from "../../../../scripts/reviewer/run-review-jobs.mjs";
 import { checkFreshClone } from "../../../../scripts/reviewer/reviewer-launch.mjs";
+import { validateApprovalEvidence } from "../../../../plugins/openclaw-github-review/src/approval-evidence.js";
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
@@ -437,6 +438,17 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     expect(existsSync(join(scratch, "build"))).toBe(false);
   });
 
+  test("the clone's commit is read on the host and must be the source's", async () => {
+    publish();
+    const d = fakeDocker();
+    const git = (args: string[], o?: unknown) =>
+      args[0] === "-C" && args[1]!.startsWith(scratch) ? { status: 0, stdout: `${"c".repeat(40)}\n`, stderr: "" } : gitRunner(args, o as never);
+    const r = await drive(d.run, { git });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.kind).toBe("commit-mismatch");
+    expect(d.seen.creates.length).toBe(0);
+  });
+
   test("a missing source, workflow or job is a named refusal before anything runs", async () => {
     publish();
     const d = fakeDocker();
@@ -446,5 +458,109 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     const noJob = await drive(d.run, { job: "missing" });
     expect(noJob.ok).toBe(false);
     expect(d.seen.creates.length).toBe(0);
+  });
+});
+
+describe("#426 — the host writes the APPROVE evidence from what it observed", () => {
+  const BIND = { repo: "tpsdev-ai/cli", pr: 7, dispatchId: "d-1", reviewer: "anvil", sessionKey: "s-1" };
+  let host: string;
+  let key: Buffer;
+  const evidence = (over: Record<string, unknown> = {}) => ({
+    file: join(host, "approval-evidence.json"),
+    keyFile: join(host, "approval-evidence.key"),
+    ...BIND,
+    commit: git(source, "rev-parse", "HEAD").stdout.trim(),
+    ...over,
+  });
+  const stored = () => JSON.parse(readFileSync(join(host, "approval-evidence.json"), "utf8")).approvals;
+  beforeEach(() => {
+    host = join(root, "host");
+    mkdirSync(host);
+    key = Buffer.alloc(32, 7);
+    writeFileSync(join(host, "approval-evidence.key"), key.toString("base64"), { mode: 0o600 });
+  });
+
+  test("review-build-ok writes one record: the planned run: scripts, each job's exec status, the host-read commit", async () => {
+    publish();
+    // The sandbox's own report names other commands; the record does not use it.
+    const d = fakeDocker({
+      build: { ok: true, status: "job-ok", job: "build", jobs: [{ job: "build", steps: [{ script: "echo build" }] }] },
+      review: { ok: true, status: "job-ok", job: "review", jobs: [{ job: "review", steps: [{ script: "echo test" }] }] },
+    });
+    const r = await drive(d.run, { evidence: evidence() });
+    expect(r.ok).toBe(true);
+    const [rec] = stored();
+    expect(rec.commit).toBe(git(source, "rev-parse", "HEAD").stdout.trim());
+    expect([rec.workflow, rec.job]).toEqual([".github/workflows/ci.yml", "review"]);
+    expect(rec.jobs).toEqual([
+      { job: "build", commands: ["echo b"], exitCode: 0 },
+      { job: "review", commands: ["echo r"], exitCode: 0 },
+    ]);
+    const binding = { ...BIND, commit: rec.commit };
+    expect(validateApprovalEvidence(rec, binding, { workflow: ".github/workflows/ci.yml", job: "review" }, key)).toEqual({ ok: true, digest: rec.digest });
+  });
+
+  test("no record is written when a job fails", async () => {
+    publish();
+    const d = fakeDocker({ review: { ok: false, kind: "stage-failed", message: "job review: step 3 (run 3) exited 1" } });
+    const r = await drive(d.run, { evidence: evidence() });
+    expect(r.ok).toBe(false);
+    expect(existsSync(join(host, "approval-evidence.json"))).toBe(false);
+  });
+
+  test("a store or key under the scratch or source directory, through a symlink, or hard-linked, is refused before any job runs", async () => {
+    publish();
+    mkdirSync(join(scratch, "keys"));
+    writeFileSync(join(scratch, "keys", "k"), key.toString("base64"));
+    symlinkSync(join(scratch, "keys"), join(root, "alias"));
+    const cases = [
+      { keyFile: join(scratch, "keys", "k") },
+      { file: join(scratch, "approval-evidence.json") },
+      { file: join(source, "approval-evidence.json") },
+      { keyFile: join(root, "alias", "k") },
+      "hard-link",
+    ];
+    for (const over of cases) {
+      if (over === "hard-link") linkSync(join(host, "approval-evidence.key"), join(root, "second-link.key"));
+      const d = fakeDocker();
+      const r = await drive(d.run, { evidence: evidence(over === "hard-link" ? {} : over) });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.refusal.kind).toBe("evidence-reachable");
+      expect(d.seen.creates.length).toBe(0);
+    }
+  });
+
+  test("an omitted or relative store or key path, or an unreadable key, is refused before any job runs", async () => {
+    publish();
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ file: undefined }, "bad-input"],
+      [{ keyFile: undefined }, "bad-input"],
+      [{ file: "approval-evidence.json" }, "bad-input"],
+      [{ keyFile: "approval-evidence.key" }, "bad-input"],
+      [{ keyFile: join(host, "absent.key") }, "key-unreadable"],
+    ];
+    for (const [over, kind] of cases) {
+      const d = fakeDocker();
+      const r = await drive(d.run, { evidence: evidence(over) });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.refusal.kind).toBe(kind);
+      expect(d.seen.creates.length).toBe(0);
+    }
+  });
+
+  test("a source at another commit than the evidence commit is refused before any job runs", async () => {
+    publish();
+    const d = fakeDocker();
+    const r = await drive(d.run, { evidence: evidence({ commit: "c".repeat(40) }) });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.kind).toBe("commit-mismatch");
+    expect(d.seen.creates.length).toBe(0);
+  });
+
+  test("the CLI requires every evidence argument once one is given", () => {
+    const driver = fileURLToPath(new URL("../../../../scripts/reviewer/run-review-jobs.mjs", import.meta.url));
+    const r = spawnSync(process.execPath, [driver, "--image", "i", "--source", "/s", "--scratch", "/x", "--workflow", "w", "--job", "j", "--base", "b", "--evidence-file", "/e"], { encoding: "utf8" });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("evidence needs every one of --evidence-key");
   });
 });

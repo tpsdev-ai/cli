@@ -20,6 +20,7 @@
 import { randomUUID } from "node:crypto";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { resolveConfig, type GithubReviewConfig } from "./config.js";
+import { FileApprovalEvidenceStore, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
 import { FileAssignmentResolver } from "./assignment.js";
 import { CredentialCustody } from "./credential.js";
 import { HttpGitHubApi } from "./github.js";
@@ -102,6 +103,8 @@ export interface HandlerServices {
   log?: (line: string) => void;
   /** The one-verdict ledger (registerGithubReview shares one per latch store). */
   ledger?: DispatchLedger;
+  /** The host-only store of the review-build evidence `APPROVE` requires. */
+  approvalEvidence?: ApprovalEvidenceStore;
 }
 
 /** The audit sink used when no signing key was loaded. The handler refuses
@@ -135,6 +138,11 @@ export function buildDeps(
     audit: services.audit ?? UNAVAILABLE_AUDIT,
     pendingAudits,
     ledger: services.ledger ?? new DispatchLedger(reconcile),
+    approvalEvidence:
+      services.approvalEvidence ??
+      (config.approvalEvidenceFile
+        ? new FileApprovalEvidenceStore(config.approvalEvidenceFile)
+        : { find: (): ApprovalEvidenceLookup => ({ status: "missing" }) }),
     // The review environment's versions and image digest come from the reviewer
     // image (section A); until then they are null, NOT the gateway's own values.
     runtime: {

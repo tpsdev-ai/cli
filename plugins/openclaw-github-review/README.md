@@ -117,6 +117,40 @@ input, none of it trusted on its own — and:
 session is not refused by the plugin: whether the session is offered the tool at
 all is decided by the reviewer's sandbox tool policy (see Install).
 
+## Approval evidence
+
+`APPROVE` requires one record for the same repository, PR, dispatch, reviewer,
+session and full commit, naming the configured CI workflow and job
+(`approvalCiWorkflow`, `approvalCiJob`) with that job last, and with every job's
+exit status 0. `REQUEST_CHANGES` and `COMMENT` are unaffected.
+
+`scripts/reviewer/run-review-jobs.mjs` writes the record to `approvalEvidenceFile`,
+on `review-build-ok` only, when it is given `--evidence-file`, `--evidence-key`,
+`--repo`, `--pr`, `--dispatch`, `--reviewer`, `--session` and `--commit`. For each
+job of the selected job's `needs` closure it records the job's planned `run:`
+scripts (from its planner) and the launcher's exit status as `docker exec`
+returned it. The commit is the one it read from the source and from each job's
+clone before that job's container was created. When evidence is requested, it
+refuses before any job runs when the store or the key resolves (symlinks followed)
+at or under its scratch or source directory, or has a second hard link.
+
+The record carries a SHA-256 and an HMAC-SHA256 over the same bytes under the key
+in `approvalEvidenceKeyFile`; `github_review` re-computes both. Before it reads
+the record, it refuses (`approval_evidence_reachable`) if the store or key is
+at or under a listed `sandboxMountRoots` path (symlinks followed), or an existing
+store or key has multiple hard links. A missing store yields `approval_evidence_missing`
+after these checks and a successful key read.
+`sandboxMountRoots` is the host's list; the plugin does not discover the
+sandbox's mounts. The digest is recorded in the audit draft as
+`approval_evidence_sha256`, and in an acknowledged signed audit record when that
+write succeeds; when the audit is only retained (`posted_audit_pending`) or its
+retention was not durably confirmed (`posted_audit_unretained`), the review
+result says so and the audit record is not acknowledged.
+
+The limit, stated: the record holds each job's launcher exit status, not each
+step's; the planned scripts are those of the reviewed commit's own workflow; it
+does not prove those commands are adequate.
+
 ## Configuration
 
 All values come from the gateway's plugin config. None come from tool input, and
@@ -133,6 +167,10 @@ All values come from the gateway's plugin config. None come from tool input, and
 | `reviewerIdentity` | The reviewer the signing key belongs to. |
 | `pendingAuditFile` | **Required.** Where a failed-after-post audit record is retained for retry. |
 | `reconcileFile` | **Required.** The durable per-dispatch latch store (see Dispatch latches). |
+| `approvalEvidenceFile` | **Required for `APPROVE`.** The approval-evidence store (see Approval evidence). Must be absolute. |
+| `approvalEvidenceKeyFile` | **Required for `APPROVE`.** The HMAC-SHA256 key of approval-evidence records. Must be absolute. |
+| `approvalCiWorkflow`, `approvalCiJob` | **Required for `APPROVE`.** The CI workflow and job the record must name. |
+| `sandboxMountRoots` | **Required for `APPROVE`.** Every host path a review sandbox mounts, each absolute. |
 | `flairUrl` | The Flair base URL. |
 | `sandboxImageDigest` | Recorded in every audit record once section A supplies it. |
 | `provisioningMaxAgeDays` | Evidence older than this is stale. Default 90. |
@@ -308,6 +346,5 @@ read the marker (the container half, see Scope).
 ## Scope
 
 This plugin implements the host-side, credential-custody and audit parts of the
-reviewer design. The reviewer sandbox **image matrix** and the real container
-half of the boundary lane (the sandbox must NOT read the marker) are follow-ups;
-build/test evidence binding for `APPROVE` is a separate slice.
+reviewer design, and the `APPROVE` evidence check. The real container half of
+the boundary lane (the sandbox must NOT read the marker) is a follow-up.
