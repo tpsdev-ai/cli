@@ -23,7 +23,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@tpsdev-ai/agent";
 import { buildSignedEnvelope, pubkeyFromSeed, startStubFlair, type StubFlair } from "../../cli/test/helpers/stub-flair.js";
 import { watchMail } from "../src/index.js";
 
@@ -206,6 +206,19 @@ function flintReplies(): Envelope[] {
   return jsonFiles(p.flintNew()).map((f) => JSON.parse(JSON.parse(readFileSync(join(p.flintNew(), f), "utf-8")).body) as Envelope);
 }
 
+/** A GENUINE flint→ember envelope that also claims a thread INSIDE the signature. */
+function signedWithThread(from: string, to: string, body: string, replyToId: string): Envelope {
+  const now = new Date().toISOString();
+  const chain: ChainEntry[] = [
+    { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+    { agent: from, kind: "agent", timestamp: now, rationale: `agent ${from} dispatches`, signature: null },
+  ];
+  return signEnvelope(
+    { v: 1, from, to, body, messageId: THREAD, timestamp: now, delegationChain: chain, replyToId },
+    { [from]: FLINT_SEED },
+  );
+}
+
 async function expectVerifiedReply(env: Envelope): Promise<void> {
   expect(env.from).toBe("ember");
   expect(env.to).toBe("flint");
@@ -255,6 +268,10 @@ describe("watcher: the inbound is VERIFIED before any field is used (cli#429)", 
     [
       "FORGED (claims flint, signed with a key Flair does not hold for flint)",
       () => JSON.stringify(buildSignedEnvelope("flint", "ember", "please answer", { flint: OTHER_SEED }, { messageId: THREAD })),
+    ],
+    [
+      "ALTERED (a genuine envelope whose thread was changed after it was signed)",
+      () => JSON.stringify({ ...signedWithThread("flint", "ember", "please answer", THREAD), replyToId: `${THREAD}-changed` }),
     ],
   ];
   for (const [label, body] of forgeries) {
