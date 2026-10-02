@@ -1,8 +1,9 @@
 /**
  * approval-evidence.test.ts — tpsdev-ai/cli#426: APPROVE requires an
  * authenticated, passing evidence record for the same repository, PR,
- * dispatch, reviewer, session, commit and configured CI job. Each refusal case
- * asserts that NO review is posted.
+ * dispatch, reviewer, session, commit and configured CI job. Each handler
+ * refusal case asserts that NO review is posted; direct validator cases assert
+ * the returned reason.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
