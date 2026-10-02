@@ -120,3 +120,45 @@ describe("tps launcher exit status", () => {
     expect(existsSync(harness.fallbackMarker)).toBe(false);
   });
 });
+
+function runWithSpawnError(error: { status: number; signal: string } | null) {
+  const launcher = makeIsolatedLauncher();
+  const dir = join(launcher, "..");
+  const marker = join(dir, "spawned");
+  const preload = join(dir, "preload.cjs");
+  writeFileSync(preload, `
+    const fs = require('node:fs');
+    require('node:child_process').execFileSync = () => {
+      fs.appendFileSync(${JSON.stringify(marker)}, 'x');
+      throw ${JSON.stringify(error ?? { status: 1, signal: null })};
+    };
+    ${error === null ? "" : `
+      const Module = require('node:module');
+      const resolve = Module._resolveFilename;
+      Module._resolveFilename = function(id, ...args) {
+        if (id === ${JSON.stringify(PLATFORM_PKG + "/package.json")}) return ${JSON.stringify(join(dir, "package.json"))};
+        return resolve.call(this, id, ...args);
+      };
+    `}
+  `);
+  const result = spawnSync(NODE, ["--require", preload, launcher], { encoding: "utf8" });
+  return {
+    status: result.status,
+    spawned: existsSync(marker) ? readFileSync(marker, "utf8").length : 0,
+    stderr: result.stderr,
+  };
+}
+
+test("a signal takes precedence over numeric status zero", () => {
+  const result = runWithSpawnError({ status: 0, signal: "SIGTERM" });
+  expect(result.status).toBe(143);
+  expect(result.spawned).toBe(1);
+  expect(result.stderr).toBe("");
+});
+
+test("missing platform package and JS entry print guidance without spawning node", () => {
+  const result = runWithSpawnError(null);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("Try reinstalling main package:");
+  expect(result.spawned).toBe(0);
+});
