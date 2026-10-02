@@ -54,8 +54,10 @@ under [Known limits](#known-limits).
   environment and that its resolved working directory stays inside the
   worktree; it enforces `timeout-minutes` (the job's, default 360, and each
   planned `run:` step's; on a skipped `uses:` step it is refused) and kills
-  what the job left running when the job ends.
-  `job-ok` only if every step exited 0 and no lockfile in the worktree
+  tracked step process groups at job end; container removal stops detached
+  processes before another job runs.
+  `job-ok` only if every executed `run:` step exited 0, with allowed `uses:`
+  steps recorded as skipped, and no lockfile in the worktree
   (outside `node_modules/` and `.git/`) changed, appeared or disappeared.
 - `../../scripts/reviewer/run-review-jobs.mjs` — the host-side driver. The host
   runs one sandbox container per job: for each job of the named job's `needs`
@@ -66,7 +68,8 @@ under [Known limits](#known-limits).
   the container — refusing the build if the removal fails — and discards the
   job's directory. A job runs only if the jobs it needs succeeded (or its `if:` is
   `always()`), and it reports `review-build-ok` only if every job ran to a
-  `job-ok` verdict that names it and every step exited 0.
+  `job-ok` verdict that names it and every executed `run:` step exited 0,
+  with allowed `uses:` steps recorded as skipped.
   `../../scripts/reviewer/per-job-isolation-checks.sh` — the container-level
   checks for this: two jobs linked by `needs`, the first changing a tracked
   file, `.git` state (a ref and the index) and leaving a detached (`setsid`)

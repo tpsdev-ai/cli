@@ -49,9 +49,11 @@
  * pipefail`, in its own process group, after re-checking the step's effective
  * environment and the RESOLVED working directory (it must stay inside the
  * worktree); it kills a `run:` step at its timeout-minutes, and the job's steps
- * at the job's (default 360), and kills what the job left running when it ends.
+ * at the job's (default 360), and kills tracked step process groups at job end;
+ * container removal stops detached processes before another job runs.
  * After the job it refuses symlinked lockfiles and symlinked directories and
- * any lockfile change. It reports job-ok only when every step exited 0.
+ * any lockfile change. It reports job-ok only when every executed `run:` step
+ * exited 0, with allowed `uses:` steps recorded as skipped.
  *
  * stdout carries exactly one JSON line (the verdict); step output and refusals
  * go to stderr. Exit 0 = job-ok, 1 = refused or failed, 2 = usage.
@@ -850,7 +852,8 @@ export async function reviewBuild({
       },
     );
   } finally {
-    // What the job's steps left running ends with the job, as on the runner.
+    // Kill tracked step process groups; container removal stops detached
+    // processes before another job runs.
     for (const pid of groups) killGroup(pid);
   }
   result.steps = outcome.results;

@@ -20,7 +20,8 @@
  *      DISCARDS the job's directory.
  * A job runs only if the jobs it needs succeeded (or its `if:` is always()), and
  * it reports review-build-ok only when every job ran to a job-ok verdict that
- * names that job and its launcher exited 0, and every step exited 0.
+ * names that job and its launcher exited 0, and every executed `run:` step exited 0,
+ * with allowed `uses:` steps recorded as skipped.
  *
  * The assignment the launcher reads from its container init's environment is set
  * here, in the container's create-time env file, never in the launcher's caller.
