@@ -1,11 +1,7 @@
 /**
  * deploy-bot-promote.test.ts — cli#380: the deploy bot's inbound path promotes.
  *
- * `scripts/deploy-bot.ts` (and its copy under `packages/cli/scripts/`) used to
- * parse-check a `new/` record and `renameSync` it into `cur/`. `cur/` is a live
- * delivery source (cli#377), so an unverified record there reaches a
- * tool-holding model; the deploy bot was a second verification boundary that
- * checked nothing. It now runs every record through the shared `promote()`.
+ * The old deploy bot accepted forged commands after a parse check.
  *
  * RED without the fix: the forged record below lands in `cur/` (the bypass) and
  * `pollNewMail()` returns it as a command.

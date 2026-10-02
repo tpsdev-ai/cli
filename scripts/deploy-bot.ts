@@ -53,9 +53,8 @@ function log(msg: string) {
  * never rename into `cur/` itself (cli#380).
  */
 export async function pollNewMail(): Promise<MailRow[]> {
-  if (!existsSync(MAIL_NEW_DIR)) return [];
   const out: MailRow[] = [];
-  for (const file of readdirSync(MAIL_NEW_DIR).sort()) {
+  for (const file of existsSync(MAIL_NEW_DIR) ? readdirSync(MAIL_NEW_DIR).sort() : []) {
     const src = join(MAIL_NEW_DIR, file);
     try {
       const result = await promote(AGENT_ID, src);

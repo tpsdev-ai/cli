@@ -106,7 +106,7 @@ export class MailClient {
    * replay store has not seen its messageId:
    *   - the verifier THROWS (Flair unreachable) → refuse; the record stays in
    *     new/ for a later check (a throw must never mean "pass");
-   *   - the policy or the replay gate REJECTS → dead-letter to dlq/ with a
+   *   - the policy or the replay gate REJECTS → attempt dead-lettering and a
    *     `.reason` sidecar.
    */
   async checkNewMail(): Promise<MailMessage[]> {
@@ -195,8 +195,7 @@ export class MailClient {
   /**
    * Under the mailbox lock: refuse a consumed messageId, else rename into cur/
    * and record the id. Returns the replay rejection, or null once committed.
-   * Throws when the lock is busy, the source changed, or the commit failed (the
-   * record is left in new/).
+   * On append failure, attempt to move the record back to new/; throw on failure.
    */
   private async commitToCur(
     file: string,
@@ -217,7 +216,12 @@ export class MailClient {
       try {
         replay.recordConsumed(envelope.messageId);
       } catch (err) {
-        renameSync(dstPath, srcPath);
+        try {
+          renameSync(dstPath, srcPath);
+        } catch (rollbackErr) {
+          throw new AggregateError([err, rollbackErr],
+            `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
+        }
         throw err;
       }
       return null;
@@ -226,7 +230,7 @@ export class MailClient {
     }
   }
 
-  /** Move a rejected record to dlq/ with its `.reason` sidecar and emit the rejection. */
+  /** Attempt the dlq/ move and sidecar write, then emit the rejection. */
   private deadLetter(
     file: string,
     srcPath: string,

@@ -1,7 +1,6 @@
 /**
- * mailbox-policy.ts — the ONE mailbox policy for a signed envelope, and the
- * durable consumed-id replay store (cli#380). Both writers of a mailbox's
- * `cur/` use it: the CLI's `promote()` and this package's `MailClient`.
+ * Shared mailbox policy and consumed-id replay store for both first-delivery
+ * paths: the CLI's `promote()` and this package's `MailClient`.
  */
 import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -10,16 +9,8 @@ import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.
 
 // ─── Envelope id shape (cli#429) ─────────────────────────────────────────────
 //
-// A v1 envelope's `messageId` is the durable id of a message (it survives every
-// hop; the local record `id` does not), and `replyToId` threads a reply to the
-// `messageId` it answers. Both are held to the same rule, on BOTH sides: every
-// signer that sets one refuses an id outside it, and the mailbox policy below
-// dead-letters an envelope whose `messageId`, or `replyToId` when present, is
-// outside it.
-//
-// The rule: 1-128 characters from letters, digits, dot, underscore and hyphen.
-// It admits the UUIDs every signer in this repo generates (randomUUID) and the
-// dotted/hyphenated ids the fleet also uses.
+// signOutboundBody validates replyToId before signing. The mailbox policy
+// validates messageId and any replyToId on receipt; signEnvelope itself does not.
 
 /** 1-128 chars of `[A-Za-z0-9._-]`. Anchored; no flags. */
 export const ENVELOPE_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
@@ -227,25 +218,8 @@ export async function decideEnvelopeForMailbox(
 
 // ─── Durable consumed-id ledger (replay gate that survives maildir GC) ───────
 //
-// The replay gate must NOT be the maildir. cur/ is mutable — ackMessage unlinks
-// the record, gcMessages purges it, and archiveOldCur rotates cur/ into
-// archive/ — so a gate built on those reopens the moment a record ages out. A
-// defence that expires is not a defence (CWE-294, replay).
-//
-// Consumed ids are therefore recorded in an append-only ledger at the mailbox
-// root — OUTSIDE every directory the maildir maintenance touches — and consulted
-// BEFORE promotion. The ledger is bounded by AGE, not by the maildir's
-// contents, so it outlives the record it stands in for rather than ageing out
-// with it.
-//
-// Retention (CONSUMED_LEDGER_RETENTION_MS): 180 days. This is deliberately many
-// multiples of the longest maildir lifetime — cur/ holds ~30 days before
-// archiveOldCur rotates it, and gcMessages purges acked records after 24h and
-// everything after 48h — so a replay must now wait out the LEDGER's window, not
-// the maildir's. The fix converts the pre-fix window (which reopened as soon as
-// the record was acked or GC'd — hours) into one bounded by this retention. The
-// residual exposure past the retention is acknowledged; it is strictly larger
-// than the window it replaced, and it is a knob, not an accident.
+// The ledger is appended on consumption and pruned by age, independently of
+// maildir cleanup.
 const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
@@ -276,17 +250,9 @@ function consumedLedgerPath(root: string): string {
 }
 
 /**
- * Append a consumed envelope messageId to the durable ledger.
- *
- * Called ONLY after the record is safely in cur/ — never before — so a failed
- * promotion cannot mark an id consumed and then reject the legitimate retry as
- * a replay.
+ * Append after writing cur/. A successful append commits the promotion.
  */
 function recordConsumedMessageId(root: string, messageId: string): void {
-  // THROWS on failure. The ledger write is part of the promotion COMMIT: if it
-  // fails, the id is not recorded and is silently replayable, so the caller
-  // rolls the move back rather than claiming success. (Log-and-continue here
-  // was fail-open — delivery succeeding silently was the bug.)
   mkdirSync(root, { recursive: true });
   appendFileSync(
     consumedLedgerPath(root),
@@ -352,13 +318,13 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
  */
 function readConsumedLedger(root: string): Set<string> {
   const path = consumedLedgerPath(root);
-  if (!existsSync(path)) return new Set<string>();
 
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");
-  } catch {
-    return new Set<string>();
+  } catch (err) {
+    if (isMissing(err)) return new Set<string>();
+    throw unreadableHistory(path, err);
   }
 
   const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);

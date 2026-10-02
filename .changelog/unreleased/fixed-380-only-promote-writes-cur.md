@@ -10,5 +10,4 @@
   and runs the same mailbox policy and consumed-id replay store as `promote()`,
   which now live in `@tpsdev-ai/agent`.
 
-  A test scans the source tree for writes into a `cur` directory (its header
-  states what the scan sees) and fails on any that is not on an explicit list.
+  A source scan checks detected writes into `cur` against an explicit list.

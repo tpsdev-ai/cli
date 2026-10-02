@@ -16,7 +16,8 @@
  * `.reason` sidecar. Both defects are RED at 545e23cd and GREEN after.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -350,6 +351,56 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect((await client.checkNewMail()).length).toBe(0);
     expect(files("cur").length).toBe(0);
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
+  });
+
+  for (const code of ["EACCES", "EISDIR"]) {
+    test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
+      const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      plant(wrapper("flint", env), "first.json");
+      expect(await client.checkNewMail()).toHaveLength(1);
+      rmSync(join(inbox("cur"), "first.json"));
+      plant(wrapper("flint", env), "again.json");
+      const ledger = join(tmpDir, AGENT, "consumed.jsonl");
+      const read = fs.readFileSync;
+      const fault = spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
+        if (args[0] === ledger) throw Object.assign(new Error(code), { code });
+        return read(...args);
+      });
+      try {
+        expect(await client.checkNewMail()).toEqual([]);
+        expect(files("cur")).toEqual([]);
+        expect(files("new")).toContain("again.json");
+      } finally {
+        fault.mockRestore();
+      }
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(readFileSync(join(inbox("dlq"), "again.json.reason"), "utf-8")).toContain("class: replay");
+    });
+  }
+
+  test("a failed ledger append and rollback are both reported without delivery", async () => {
+    const env = signedEnvelope("flint", AGENT, "uncommitted", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    plant(wrapper("flint", env));
+    const append = fs.appendFileSync;
+    const rename = fs.renameSync;
+    const appendFault = spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof append>) => {
+      if (args[0] === join(tmpDir, AGENT, "consumed.jsonl")) throw new Error("append fault");
+      return append(...args);
+    });
+    const rollbackFault = spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof rename>) => {
+      if (args[0] === join(inbox("cur"), "m1.json")) throw new Error("rollback fault");
+      return rename(...args);
+    });
+    try {
+      await expect(client["commitToCur"]("m1.json", join(inbox("new"), "m1.json"),
+        readFileSync(join(inbox("new"), "m1.json"), "utf-8"), env)).rejects.toThrow(/append fault.*rollback fault/);
+      expect(existsSync(join(tmpDir, AGENT, "consumed.jsonl"))).toBe(false);
+    } finally {
+      appendFault.mockRestore();
+      rollbackFault.mockRestore();
+    }
   });
 
   test("an envelope with a malformed timestamp is rejected (invalid)", async () => {
