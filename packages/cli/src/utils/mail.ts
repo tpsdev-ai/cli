@@ -774,6 +774,7 @@ export const ENVELOPE_BINDINGS = {
   to: { kind: "bind", recordField: "to" },
   subject: { kind: "exclude", reason: "not carried on the outer record" },
   body: { kind: "bind", recordField: "body" },
+  trust: { kind: "exclude", reason: "authority is signed inside the envelope, not copied to the record" },
   messageId: { kind: "bind", recordField: "envelopeId" },
   timestamp: { kind: "bind", recordField: "timestamp" },
   replyToId: { kind: "bind", recordField: "replyToId" },

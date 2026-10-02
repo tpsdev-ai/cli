@@ -1,17 +1,21 @@
 import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
-import { verifyEnvelope, type FlairClient } from "../lib/signEnvelope.js";
+import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
+import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 
 export interface MailMessage {
   filename: string;
   body: string;
   receivedAt: Date;
-  /** Trust/routing headers from bridge envelope */
+  /** Untrusted transport metadata. Never grants authority. */
   headers: Record<string, string>;
-  /** Sender agent ID */
+  /** Sender from the verified envelope when received through MailClient. */
   from: string;
+  /** Present only after signature and mailbox policy both passed. */
+  verifiedEnvelope?: Envelope;
 }
 
 /**
@@ -25,7 +29,7 @@ export interface MailMessage {
 type MailboxRejectClass = "invalid" | "unresolvable-principal" | "wrong-recipient";
 
 type VerifyOutcome =
-  | { pass: true }
+  | { pass: true; envelope: Envelope }
   | { pass: false; class: MailboxRejectClass; reason: string; from?: string };
 
 /**
@@ -76,6 +80,8 @@ export class MailClient {
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
     private readonly flairClient?: FlairClient,
+    /** Configured Flair signing key, checked against both standard locations. */
+    private readonly signingKeyPath?: string,
   ) {
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
@@ -189,14 +195,11 @@ export class MailClient {
       try {
         const dstPath = join(this.inboxCur, file);
         renameSync(srcPath, dstPath);
-        let headers: Record<string, string> = {};
-        let from = "unknown";
-        try {
-          const parsed = JSON.parse(body);
-          headers = parsed.headers ?? {};
-          from = parsed.from ?? "unknown";
-        } catch {}
-        messages.push({ filename: file, body, receivedAt: new Date(), headers, from });
+        const from = verifyResult.envelope.from;
+        messages.push({
+          filename: file, body, receivedAt: new Date(), headers: {}, from,
+          verifiedEnvelope: verifyResult.envelope,
+        });
         this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
@@ -224,10 +227,14 @@ export class MailClient {
     const started = Date.now();
     try {
       const { writeFileSync } = await import("node:fs");
+      // Sign the body as this agent — the v1 envelope a promote() reader
+      // verifies. signMailBody THROWS when no key exists, so an unsigned body
+      // is never written.
+      const signed = this.signMailBody(to, body);
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
       writeFileSync(
         join(this.outboxNew, filename),
-        JSON.stringify({ to, body, sentAt: new Date().toISOString() }, null, 2),
+        JSON.stringify({ from: this.agentId, to, body: signed, sentAt: new Date().toISOString() }, null, 2),
         "utf-8"
       );
       this.events?.emit({
@@ -248,6 +255,35 @@ export class MailClient {
       });
       throw err;
     }
+  }
+
+  /**
+   * Sign `body` as this agent into a v1 signed envelope. Throws a named error
+   * when no signing key exists — the same refusal condition as the CLI path,
+   * so an unsigned body a promote() reader would dead-letter is never written.
+   */
+  private signMailBody(to: string, body: string): string {
+    const seed = readAgentPrivateKey(this.agentId, this.signingKeyPath);
+    if (!seed) {
+      const paths = this.signingKeyPath ? [this.signingKeyPath] : agentKeyCandidates(this.agentId);
+      throw new Error(`no Ed25519 private key for agent "${this.agentId}" — refusing to send unsigned mail. Looked at ${paths.join(", then ")}. Provision the agent's key.`);
+    }
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "agent runtime sendMail", signature: null },
+      { agent: this.agentId, kind: "agent", timestamp: now, rationale: `agent ${this.agentId} sendMail`, signature: null },
+    ];
+    const envelope: Envelope = {
+      v: 1,
+      from: this.agentId,
+      to,
+      subject: `mail to ${to}`,
+      body,
+      messageId: randomUUID(),
+      timestamp: now,
+      delegationChain: chain,
+    };
+    return JSON.stringify(signEnvelope(envelope, { [this.agentId]: Buffer.from(seed) }));
   }
 
   /** Deliver all messages in outbox to recipient inboxes (local relay). */
@@ -375,6 +411,6 @@ export class MailClient {
       };
     }
 
-    return { pass: true };
+    return { pass: true, envelope: env as unknown as Envelope };
   }
 }
