@@ -142,7 +142,7 @@ describe("this repository's test job", () => {
       "socketdev/action@v1.3.2",
     ]);
     if (!p.ok) return;
-    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["1.3.10", "24.21.0", "1.3.10"]);
+    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["24.21.0", "1.3.10", "24.21.0", "1.3.10"]);
     expect(p.shims).toEqual(["sfw"]);
   });
 
