@@ -27,9 +27,9 @@ describe("hire onboarding mail UI", () => {
     process.env.TPS_AGENT_ID = "host";
     process.env.TPS_TEST_KEYS_DIR = emptyKeys;
     process.env.TPS_MAIL_DIR = join(root, ".tps", "mail");
-    // findOpenClawConfig walks up from the cwd to $HOME; run from inside the
-    // throwaway HOME so that walk ends here and never reaches the invoking
-    // host's ~/.openclaw/openclaw.json (cli#478).
+    // findOpenClawConfig walks up from the cwd; start it inside the throwaway
+    // HOME so the fixture config is found immediately, never a host config on
+    // the repo cwd's ancestor path (cli#478).
     savedCwd = process.cwd();
     process.chdir(root);
   });
