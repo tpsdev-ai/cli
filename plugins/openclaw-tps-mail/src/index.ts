@@ -58,6 +58,7 @@ import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
+import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
 import { isValidEnvelopeId, promote, recoverPromoted, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
@@ -1429,6 +1430,35 @@ const config: ChannelConfigAdapter<TpsMailAccount> = {
   unconfiguredReason: (account) => `TPS mail directory does not exist: ${account.mailDir}`,
 };
 
+/**
+ * cli#433 (slice B1): sign a channel send through the ONE outbound signing
+ * path — the `signForDelivery` helper the CLI's producers use, over the same
+ * builder `tps mail send` calls — with the same key resolution and the same
+ * named refusal when no key exists. A caller must never fall back to an
+ * unsigned body: `promote()` dead-letters it terminal. The reply thread is
+ * passed as `replyToId`, which the path validates and puts INSIDE the signed
+ * envelope — the record gets no unsigned wrapper field.
+ */
+function signedOutboundEnvelope(from: string, to: string, body: string, replyToId?: string): string {
+  let signed: string | null = null;
+  signForDelivery(
+    from,
+    to,
+    body,
+    (envelope) => {
+      signed = envelope;
+    },
+    {
+      rationale: `agent ${from} openclaw-tps-mail sendText`,
+      ...(replyToId !== undefined ? { replyToId } : {}),
+    },
+  );
+  if (signed === null) {
+    throw new Error(`cannot sign for agent "${from}": the signing path produced no envelope`);
+  }
+  return signed;
+}
+
 const outbound: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   sendText: async (ctx: ChannelOutboundContext) => {
@@ -1442,13 +1472,22 @@ const outbound: ChannelOutboundAdapter = {
 
     const account = config.resolveAccount(ctx.cfg as any, ctx.accountId ?? "default");
     const now = new Date().toISOString();
+    // cli#433 (slice B1): sign BEFORE anything is written, through the same path
+    // `tps mail send` uses — an unsigned body is a dead letterbox. The thread
+    // rides inside the signed envelope, so the record carries no wrapper
+    // `replyToId` a reader could present as a thread that was never signed.
+    let signedBody: string;
+    try {
+      signedBody = signedOutboundEnvelope(sender, ctx.to, ctx.text, ctx.replyToId ?? undefined);
+    } catch (err: any) {
+      return { ok: false, error: `tps-mail: ${err?.message ?? err}` } as any;
+    }
     const message: TpsMailBody = {
       id: randomUUID(),
       from: sender,
       to: ctx.to,
-      body: ctx.text,
+      body: signedBody,
       timestamp: now,
-      replyToId: ctx.replyToId ?? undefined,
       headers: {
         "X-TPS-Trust": "agent",
         "X-TPS-Surface": CHANNEL_ID,
