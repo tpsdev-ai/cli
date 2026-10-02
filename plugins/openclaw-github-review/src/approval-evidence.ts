@@ -124,7 +124,7 @@ const within = (root: string, path: string): boolean => {
 
 /** The first of `paths` that is at or under one of `roots` (each compared as
  *  given and with symlinks resolved), or that has a second hard link; null
- *  when none is. Throws when a path cannot be resolved. */
+ *  when none is. Tolerates missing paths (ENOENT); other filesystem errors throw. */
 export function reachablePath(paths: string[], roots: string[]): { path: string; root: string } | null {
   const rootForms = roots.flatMap((r) => [resolve(r), resolveExisting(r)]);
   for (const p of paths) {
@@ -270,7 +270,7 @@ export function validateApprovalEvidence(
     return {
       ok: false,
       reason: "approval_evidence_invalid",
-      state: "the approval-evidence record's digest does not match its contents (it was edited after it was written)",
+      state: "digest does not match record contents",
       remedy: RERECORD,
     };
   }
@@ -315,7 +315,7 @@ export function validateApprovalEvidence(
       return {
         ok: false,
         reason: "approval_evidence_incomplete",
-        state: "a job in the approval-evidence record has no command or no exit status",
+        state: "job entry lacks a valid name, command, or integer exit status",
         remedy: RERECORD,
       };
     }

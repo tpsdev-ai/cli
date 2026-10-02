@@ -329,7 +329,7 @@ describe("#426 — the store and key must be outside every sandbox mount root", 
 });
 
 describe("#426 — the record the host driver writes is the one APPROVE accepts", () => {
-  test("run-review-jobs.mjs records the planned commands it ran, and the gate accepts the record", async () => {
+  test("run-review-jobs.mjs records the planned commands, and the gate accepts the record", async () => {
     const GIT_ENV = { PATH: "/usr/bin:/bin", GIT_CONFIG_NOSYSTEM: "1" };
     const git = (cwd: string, ...args: string[]) => spawnSync("/usr/bin/git", args, { cwd, encoding: "utf8", env: GIT_ENV });
     const src = join(root, "src");

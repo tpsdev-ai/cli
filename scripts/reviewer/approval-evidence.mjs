@@ -66,7 +66,7 @@ const within = (root, path) => {
 
 /** The first of `paths` that is at or under one of `roots` (each compared as
  *  given and with symlinks resolved), or that has a second hard link; null
- *  when none is. Throws when a path cannot be resolved. */
+ *  when none is. Tolerates missing paths (ENOENT); other filesystem errors throw. */
 export function reachablePath(paths, roots) {
   const rootForms = roots.flatMap((r) => [resolve(r), resolveExisting(r)]);
   for (const p of paths) {

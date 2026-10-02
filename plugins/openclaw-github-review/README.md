@@ -130,14 +130,16 @@ on `review-build-ok` only, when it is given `--evidence-file`, `--evidence-key`,
 job of the selected job's `needs` closure it records the job's planned `run:`
 scripts (from its planner) and the launcher's exit status as `docker exec`
 returned it. The commit is the one it read from the source and from each job's
-clone before that job's container was created. It refuses before any job runs
-when the store or the key resolves (symlinks followed) at or under its scratch
-or source directory, or has a second hard link.
+clone before that job's container was created. When evidence is requested, it
+refuses before any job runs when the store or the key resolves (symlinks followed)
+at or under its scratch or source directory, or has a second hard link.
 
 The record carries a SHA-256 and an HMAC-SHA256 over the same bytes under the key
 in `approvalEvidenceKeyFile`; `github_review` re-computes both. Before it reads
-the record, it refuses (`approval_evidence_reachable`) unless the store and the
-key resolve outside every `sandboxMountRoots` path, each with one link.
+the record, it refuses (`approval_evidence_reachable`) if the store or key is
+at or under a listed `sandboxMountRoots` path (symlinks followed), or an existing
+store or key has multiple hard links. A missing store yields `approval_evidence_missing`
+after these checks and a successful key read.
 `sandboxMountRoots` is the host's list; the plugin does not discover the
 sandbox's mounts. The digest is recorded in the audit draft as
 `approval_evidence_sha256`, and in an acknowledged signed audit record when that
