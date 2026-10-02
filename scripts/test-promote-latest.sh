@@ -30,15 +30,17 @@
 #     pty. Fixture R pins both TTYs on each add, and S pins refusal when stdin
 #     is not a TTY
 #   * a successful promote dispatches the Docker image workflow once, for the
-#     promoted version, only after all six `dist-tag add`s (fixture T); a failed
-#     promote never dispatches (U); `--no-docker` promotes but never dispatches
-#     (V); a gh failure after a successful promote exits 6, names the failure and
-#     the hand-run command, and does NOT roll back (W); a missing gh does the same
-#     (X)
+#     promoted version, after all moves and registry checks (T); failures during
+#     or after the last add never dispatch (U, Y); an initially current tag
+#     that drifts or becomes unreadable during a move also prevents dispatch
+#     (Z, AA); `--no-docker` skips dispatch (V); a gh failure after a successful
+#     promote exits 6 and does NOT
+#     roll back (W); a missing gh does the same (X)
 #   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
 #     trap, the pre-add attempt flag, and the trap-clear branch, restore the
-#     command substitution around `dist-tag add`, dispatch before the post-check,
-#     and roll back on a gh failure; confirm a fixture catches each —
+#     command substitution around `dist-tag add`, dispatch before the last
+#     post-check, skip the final all-package read, and roll back on a gh failure;
+#     confirm a fixture catches each —
 #     a test that passes on both the fixed and the broken script is not a test.
 #   * the fixtures run under bash 3.2 too (BASH_BIN; the macos-14 CI leg pins it),
 #     and the workflow still invokes this harness
@@ -206,6 +208,7 @@ if (cmd === 'view') {
     fail("npm error code E404\nnpm error 404  '" + spec.pkg + '@' + spec.ver + "' is not in this registry.");
   }
   if (field === 'dist-tags.latest') {
+    if ((s.failViewLatest || []).includes(spec.pkg)) fail('npm error code E503\nnpm error fake registry read failed');
     const l = s.latest[spec.pkg];
     if (l === undefined) fail('npm error code E404\nnpm error 404 Not Found');
     process.stdout.write(l + '\n');
@@ -235,7 +238,13 @@ if (cmd === 'view') {
   const s = read();
   if ((s.failAdd || []).includes(spec.pkg)) fail('npm error code E401\nnpm error Unable to authenticate');
   // `noopAdd`: a command that exits 0 but never moves the tag.
-  if (!((s.noopAdd || []).includes(spec.pkg))) { s.latest[spec.pkg] = spec.ver; persist(s); }
+  if (!((s.noopAdd || []).includes(spec.pkg))) s.latest[spec.pkg] = spec.ver;
+  if (s.afterAdd && spec.pkg === s.afterAdd.trigger) {
+    if (s.afterAdd.latest) s.latest[s.afterAdd.pkg] = s.afterAdd.latest;
+    if (s.afterAdd.failView) s.failViewLatest = [s.afterAdd.pkg];
+    delete s.afterAdd;
+  }
+  persist(s);
   // Hold matching adds in flight (after the tag moved) so a signal from the
   // harness lands inside the in-flight window. The counter file records how many
   // holds have happened, so the harness can time a second signal.
@@ -265,7 +274,7 @@ chmod +x "$fake_npm"
 # unauthenticated or otherwise failed dispatch. Bash 3.2-compatible.
 gh_stub="$work/fake-gh"
 cat >"$gh_stub" <<'FAKE_GH'
-#!/usr/bin/env bash
+#!/bin/bash
 set -uo pipefail
 if [ -z "${GH_LOG:-}" ]; then
   printf 'fake-gh: GH_LOG is not set\n' >&2
@@ -320,6 +329,12 @@ cat >"$work/mutate.mjs" <<'MUT'
 import fs from 'fs';
 const [src, dst, which] = process.argv.slice(2);
 const s = fs.readFileSync(src, 'utf8');
+function withoutFinalRead(source) {
+  const start = source.indexOf('# Re-read every package, including ones that were already at the target before');
+  const end = source.indexOf('# ── 6. all-six-or-none:', start);
+  if (start < 0 || end < 0) { console.error('final-read mutation target not found'); process.exit(3); }
+  return source.slice(0, start) + source.slice(end);
+}
 const targets = {
   existence: ['  exit "$EXIT_REFUSED"\n', '  : # MUTATED: existence check disabled\n'],
   verify: [
@@ -341,17 +356,28 @@ const targets = {
   ],
   dispatch_early: [
     '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
-    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  dispatch_docker\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  if [ "$i" -eq $((NPKG - 1)) ]; then dispatch_docker; fi\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
   ],
   dispatch_rollback: [
     '  exit "$EXIT_DISPATCH_FAILED"\n',
     '  rollback_moved\n  exit "$EXIT_DISPATCH_FAILED"\n',
   ],
 };
+if (which === 'final_read') {
+  fs.writeFileSync(dst, withoutFinalRead(s));
+  process.exit(0);
+}
 const t = targets[which];
 if (!t) { console.error('unknown mutation: ' + which); process.exit(2); }
 if (!s.includes(t[0])) { console.error('mutation target not found: ' + which); process.exit(3); }
-fs.writeFileSync(dst, s.replace(t[0], t[1]));
+let out = s.replace(t[0], t[1]);
+if (which === 'verify') out = withoutFinalRead(out);
+if (which === 'dispatch_early') {
+  const finalDispatch = '  dispatch_docker\n  exit 0\n';
+  if (!out.includes(finalDispatch)) { console.error('final dispatch mutation target not found'); process.exit(3); }
+  out = out.replace(finalDispatch, '  exit 0\n');
+}
+fs.writeFileSync(dst, out);
 MUT
 
 new_fixture() { # <name> -> prints the fixture dir
@@ -723,6 +749,48 @@ assert_eq "U no-dispatch-on-failure: exit" 4 "$RC"
 assert_eq "U no-dispatch-on-failure: gh never called" 0 "$(gh_calls "$d")"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "U no-dispatch-on-failure: rolled back" "latest=0.5.3 for all six"; else bad "U no-dispatch-on-failure: rolled back" "a partial promote was left behind"; fi
 
+# ── Y. the last add exits 0 without landing: no early dispatch ────────────────
+d="$(new_fixture last-add-noop)"
+write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
+invoke "$d" 0.5.4 --yes
+assert_eq "Y last-add-noop: exit" 4 "$RC"
+assert_eq "Y last-add-noop: gh never called" 0 "$(gh_calls "$d")"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "Y last-add-noop: rolled back" "latest=0.5.3 for all six"; else bad "Y last-add-noop: rolled back" "a partial promote was left behind"; fi
+
+# ── Z. a tag initially at target drifts during the last add ───────────────────
+d="$(new_fixture initially-current-drifts)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node - "$d/state.json" <<'DRIFT'
+const fs = require('fs');
+const path = process.argv[2];
+const s = JSON.parse(fs.readFileSync(path, 'utf8'));
+s.latest['@tpsdev-ai/cli-darwin-arm64'] = '0.5.4';
+s.afterAdd = { trigger: '@tpsdev-ai/cli', pkg: '@tpsdev-ai/cli-darwin-arm64', latest: '0.5.3' };
+fs.writeFileSync(path, JSON.stringify(s));
+DRIFT
+invoke "$d" 0.5.4 --yes
+assert_eq "Z initially-current-drift: exit" 4 "$RC"
+assert_eq "Z initially-current-drift: gh never called" 0 "$(gh_calls "$d")"
+assert_contains "Z initially-current-drift: named" "$ERR" "final registry check failed for @tpsdev-ai/cli-darwin-arm64"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "Z initially-current-drift: moved tags rolled back" "latest=0.5.3 for all six"; else bad "Z initially-current-drift: moved tags rolled back" "a partial promote was left behind"; fi
+
+# ── AA. the final read of an initially current tag fails ──────────────────────
+d="$(new_fixture initially-current-unreadable)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node - "$d/state.json" <<'UNREADABLE'
+const fs = require('fs');
+const path = process.argv[2];
+const s = JSON.parse(fs.readFileSync(path, 'utf8'));
+s.latest['@tpsdev-ai/cli-darwin-arm64'] = '0.5.4';
+s.afterAdd = { trigger: '@tpsdev-ai/cli', pkg: '@tpsdev-ai/cli-darwin-arm64', failView: true };
+fs.writeFileSync(path, JSON.stringify(s));
+UNREADABLE
+invoke "$d" 0.5.4 --yes
+assert_eq "AA final-read-unreadable: exit" 4 "$RC"
+assert_eq "AA final-read-unreadable: gh never called" 0 "$(gh_calls "$d")"
+assert_contains "AA final-read-unreadable: named" "$ERR" "final registry check failed for @tpsdev-ai/cli-darwin-arm64"
+assert_eq "AA final-read-unreadable: moved tags rolled back" "0.5.3" "$(state_latest "$d/state.json" "@tpsdev-ai/cli")"
+
 # ── V. --no-docker promotes but never dispatches ──────────────────────────────
 d="$(new_fixture no-docker)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
@@ -737,7 +805,7 @@ d="$(new_fixture dispatch-fail)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 GH_STUB_FAIL=1 invoke "$d" 0.5.4 --yes
 assert_eq "W dispatch-fail: exit" 6 "$RC"
-assert_contains "W dispatch-fail: says NOT dispatched" "$ERR" "the Docker image was NOT dispatched"
+assert_contains "W dispatch-fail: status unconfirmed" "$ERR" "Docker image dispatch could not be confirmed"
 assert_contains "W dispatch-fail: prints the command" "$ERR" "gh workflow run docker.yml --repo tpsdev-ai/cli -f version=0.5.4"
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "W dispatch-fail: no rollback" "latest=0.5.4 for all six"; else bad "W dispatch-fail: no rollback" "the promote was rolled back"; fi
 GH_STUB_FAIL=""
@@ -747,7 +815,7 @@ d="$(new_fixture gh-missing)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 GH_BIN_OVERRIDE="$work/no-such-gh" invoke "$d" 0.5.4 --yes
 assert_eq "X gh-missing: exit" 6 "$RC"
-assert_contains "X gh-missing: says NOT dispatched" "$ERR" "the Docker image was NOT dispatched"
+assert_contains "X gh-missing: status unconfirmed" "$ERR" "Docker image dispatch could not be confirmed"
 assert_contains "X gh-missing: names the missing binary" "$ERR" "gh not found"
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "X gh-missing: no rollback" "latest=0.5.4 for all six"; else bad "X gh-missing: no rollback" "the promote was rolled back"; fi
 GH_BIN_OVERRIDE=""
@@ -764,16 +832,16 @@ else
   bad "M1 mutation: existence break caught" "could not build the mutant"
 fi
 
-# ── M2. mutation: break the post-move re-read; fixture G must catch it ────────
+# ── M2. mutation: ignore the per-add result and remove the final read ────────
 mut="$work/tool-no-verify.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" verify; then
   d="$(new_fixture mut-verify)"
   write_state "$d/state.json" "0.5.4" "0.5.3" "cli-linux-arm64"
   TOOL="$mut" invoke "$d" 0.5.4 --yes
-  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M2 mutation: re-read break caught" "mutant restored the registry — fixture G is blind to it"; else ok "M2 mutation: re-read break caught" "mutant left a partial promote (fixture G catches it)"; fi
+  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M2 mutation: both checks broken caught" "mutant restored the registry — fixture G is blind to it"; else ok "M2 mutation: both checks broken caught" "mutant left a partial promote (fixture G catches it)"; fi
   TOOL=""
 else
-  bad "M2 mutation: re-read break caught" "could not build the mutant"
+  bad "M2 mutation: both checks broken caught" "could not build the mutant"
 fi
 
 # ── M3. mutation: remove the TERM trap; fixture K must catch it ───────────────
@@ -830,21 +898,50 @@ else
   bad "M6 mutation: captured add caught" "could not build the mutant"
 fi
 
-# ── M7. mutation: dispatch inside the move loop (before the post-check) ───────
-# The mutant dispatches right after each `dist-tag add`, before the registry is
-# re-read to confirm the move, as well as at the end. Fixture T (exactly one
-# dispatch) must catch it: the mutant dispatches once per move, not once per
-# promote. A test that passes on this mutant is blind to dispatching before the
-# post-check.
+# ── M7. mutation: exactly one dispatch before the last add's post-check ───────
+# Fixture T's call count and add-count checks still pass on this mutant. Fixture
+# Y must catch its premature dispatch when the last add did not land.
 mut="$work/tool-dispatch-early.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" dispatch_early; then
   d="$(new_fixture mut-dispatch-early)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   TOOL="$mut" invoke "$d" 0.5.4 --yes
-  if [ "$(gh_calls "$d")" -eq 1 ]; then bad "M7 mutation: early dispatch caught" "mutant still dispatched once — fixture T is blind to it"; else ok "M7 mutation: early dispatch caught" "mutant dispatched $(gh_calls "$d") times (fixture T expects 1)"; fi
+  if [ "$RC" -eq 0 ] && [ "$(gh_calls "$d")" -eq 1 ] && [ "$(grep -c '^adds_before=6$' "$d/gh.log" 2>/dev/null || true)" -eq 1 ]; then
+    ok "M7 mutation: T remains green" "one dispatch after six adds"
+  else
+    bad "M7 mutation: T remains green" "mutant did not model T's blind spot"
+  fi
+  d="$(new_fixture mut-last-add-noop)"
+  write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
+  TOOL="$mut" invoke "$d" 0.5.4 --yes
+  if [ "$(gh_calls "$d")" -eq 0 ]; then bad "M7 mutation: early dispatch caught" "mutant made no gh call — fixture Y is blind"; else ok "M7 mutation: early dispatch caught" "fixture Y expects zero; mutant called gh $(gh_calls "$d") time(s)"; fi
   TOOL=""
 else
   bad "M7 mutation: early dispatch caught" "could not build the mutant"
+fi
+
+# ── M9. mutation: remove the final all-package registry read ─────────────────
+mut="$work/tool-no-final-read.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" final_read; then
+  d="$(new_fixture mut-initially-current-drifts)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node - "$d/state.json" <<'MUT_DRIFT'
+const fs = require('fs');
+const path = process.argv[2];
+const s = JSON.parse(fs.readFileSync(path, 'utf8'));
+s.latest['@tpsdev-ai/cli-darwin-arm64'] = '0.5.4';
+s.afterAdd = { trigger: '@tpsdev-ai/cli', pkg: '@tpsdev-ai/cli-darwin-arm64', latest: '0.5.3' };
+fs.writeFileSync(path, JSON.stringify(s));
+MUT_DRIFT
+  TOOL="$mut" invoke "$d" 0.5.4 --yes
+  if [ "$RC" -eq 0 ] && [ "$(gh_calls "$d")" -eq 1 ]; then
+    ok "M9 mutation: skipped final read caught" "mutant dispatched despite an off-target package"
+  else
+    bad "M9 mutation: skipped final read caught" "mutant did not expose fixture Z's missing check"
+  fi
+  TOOL=""
+else
+  bad "M9 mutation: skipped final read caught" "could not build the mutant"
 fi
 
 # ── M8. mutation: roll back on a gh failure; fixture W must catch it ──────────

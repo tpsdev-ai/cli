@@ -1,4 +1,4 @@
-- **`scripts/promote-latest.sh` dispatches the Docker image build after `latest` has moved (Closes #420).**
+- **`scripts/promote-latest.sh` dispatches the Docker image build after `latest` has moved (Refs #420).**
 
   After a successful move, the script runs `gh workflow run docker.yml --repo
   tpsdev-ai/cli -f version=<version>`. A dispatch that fails leaves the promote

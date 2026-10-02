@@ -461,7 +461,7 @@ dispatch_docker() {
   fi
   # Collapse a multi-line gh error into the single warning line below.
   dispatch_err="$(printf '%s' "$dispatch_err" | tr '\n' ' ')"
-  printf 'promote-latest: the Docker image was NOT dispatched (%s); the promote stands — dispatch it by hand: gh workflow run docker.yml --repo tpsdev-ai/cli -f version=%s\n' \
+  printf 'promote-latest: Docker image dispatch could not be confirmed (%s); the promote stands — check workflow runs before retrying: gh workflow run docker.yml --repo tpsdev-ai/cli -f version=%s\n' \
     "${dispatch_err:-gh exited $dispatch_rc}" "$version" >&2
   exit "$EXIT_DISPATCH_FAILED"
 }
@@ -534,6 +534,24 @@ for ((i = 0; i < NPKG; i++)); do
   fi
 done
 
+# Re-read every package, including ones that were already at the target before
+# the move. Keep rollback handling active until this final registry check ends.
+if [ "$failure" -eq 0 ]; then
+  for ((i = 0; i < NPKG; i++)); do
+    set +e
+    post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    prc=$?
+    set -e
+    post="$(trim "$post")"
+    new_latest[i]="$post"
+    if [ "$prc" -ne 0 ] || [ "$post" != "$version" ]; then
+      failure=1
+      printf 'promote-latest: final registry check failed for %s — expected %s, got %s.\n' \
+        "${names[i]}" "$version" "${post:-<unreadable>}" >&2
+    fi
+  done
+fi
+
 # ── 6. all-six-or-none: select the branch, THEN stop handling termination ─────
 # The handlers are still active here. Clearing them BEFORE this branch is what
 # left a window in which a signal killed the script mid-rollback. Select the
@@ -565,5 +583,5 @@ if [ "$rollback_failed" -ne 0 ]; then
   exit "$EXIT_ROLLBACK_FAILED"
 fi
 
-printf '\npromote-latest: FAILED — the promote did not complete for all six packages; the registry was restored to the previous "latest".\n' >&2
+printf '\npromote-latest: FAILED — the promote did not complete for all six packages; packages moved by this run were rolled back. Check the registry before retrying.\n' >&2
 exit "$EXIT_INCOMPLETE"
