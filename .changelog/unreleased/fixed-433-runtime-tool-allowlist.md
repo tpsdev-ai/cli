@@ -1,0 +1,1 @@
+- **Agent runtime enforces its trust-specific tool list at dispatch.** Calls outside that list return a refusal naming the tool and trust tier.

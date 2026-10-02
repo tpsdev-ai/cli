@@ -2,13 +2,14 @@
  * Security regression tests for mail trust and capability scoping.
  * Each test maps to a finding in SECURITY.md.
  */
-import { describe, test, expect, mock, beforeEach } from "bun:test";
+import { describe, test, expect, mock, beforeEach, spyOn } from "bun:test";
 import { EventLoop } from "../../src/runtime/event-loop.js";
-import type { AgentConfig, LLMMessage, ToolSpec, CompletionResponse } from "../../src/runtime/types.js";
+import type { AgentConfig, LLMMessage, ToolSpec, CompletionRequest, CompletionResponse, ToolCall, TrustLevel } from "../../src/runtime/types.js";
 import type { MemoryStore } from "../../src/io/memory.js";
 import type { ContextManager } from "../../src/io/context.js";
 import type { ProviderManager } from "../../src/llm/provider.js";
 import { ToolRegistry } from "../../src/tools/registry.js";
+import { ReviewGate } from "../../src/governance/review-gate.js";
 import { MailClient, type MailMessage } from "../../src/io/mail.js";
 import { signEnvelope, type Envelope } from "../../src/lib/signEnvelope.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -271,6 +272,102 @@ describe("S43-A: internal mail drops exec", () => {
     expect(captured.length).toBeGreaterThan(0);
     const toolNames = captured[0].map((t) => t.name);
     expect(toolNames).not.toContain("exec");
+  });
+});
+
+describe("runtime tool allowlist", () => {
+  async function runCalls(calls: ToolCall[], trust: TrustLevel = "external") {
+    const root = mkdtempSync(join(tmpdir(), "tool-allowlist-"));
+    const tools = makeToolRegistry();
+    const exec = spyOn(tools.get("exec")!, "execute");
+    const read = spyOn(tools.get("read")!, "execute");
+    const dispatch = spyOn(tools, "execute");
+    const sendMail = mock(async () => {});
+    const requests: CompletionRequest[] = [];
+    const provider = {
+      complete: mock(async (req: CompletionRequest): Promise<CompletionResponse> => {
+        requests.push(structuredClone(req));
+        return {
+          content: "Done.",
+          toolCalls: requests.length === 1 ? calls : undefined,
+          inputTokens: 10,
+          outputTokens: 5,
+        };
+      }),
+    } as unknown as ProviderManager;
+    const loop = new EventLoop({
+      config: makeConfig({ workspace: root }), memory: makeMemory(), context: makeContext(),
+      provider, tools, reviewGate: new ReviewGate({ sendMail } as unknown as MailClient, "reviewer"),
+    });
+    try {
+      if (trust === "user") {
+        await loop.runOnce("read the file");
+      } else {
+        const received = await receiveSignedMail({
+          root, from: "sender", body: "read the file", trust,
+          messageId: "tool-allowlist", seed: Buffer.alloc(32, 0x34),
+        });
+        expect(received.verifiedEnvelope?.trust).toBe(trust);
+        let delivered = false;
+        await loop.run(async () => {
+          if (!delivered) { delivered = true; return [received]; }
+          await loop.stop();
+          return [];
+        });
+      }
+      expect(requests).toHaveLength(2);
+      const results = requests[1]!.messages.filter((message) => message.role === "tool");
+      return { exec, read, dispatch, sendMail, results, advertised: requests[0]!.tools };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  function expectRefusal(message: LLMMessage | undefined, name: string, id: string, trust: TrustLevel) {
+    expect(message).toMatchObject({ role: "tool", name, tool_call_id: id });
+    expect(JSON.parse(message!.content!)).toEqual({
+      content: `Permission denied: tool "${name}" is not allowed for ${trust} trust.`,
+      isError: true,
+    });
+  }
+
+  test.each(["external", "internal"] as const)("verified %s mail receives an exec refusal without dispatch", async (trust) => {
+    const { exec, dispatch, results, advertised } = await runCalls([
+      { id: "denied", name: "exec", input: { command: "echo test" } },
+    ], trust);
+    expect(advertised.map((tool) => tool.name)).not.toContain("exec");
+    expect(exec).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(results).toHaveLength(1);
+    expectRefusal(results[0], "exec", "denied", trust);
+  });
+
+  test("verified external mail runs an allowed tool after a refused call", async () => {
+    const { exec, read, dispatch, results, advertised } = await runCalls([
+      { id: "denied", name: "exec", input: { command: "echo test" } },
+      { id: "allowed", name: "read", input: { path: "file.txt" } },
+    ]);
+    expect(advertised.map((tool) => tool.name)).toContain("read");
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(read).toHaveBeenCalledWith({ path: "file.txt" });
+    expect(results).toHaveLength(2);
+    expect(results[1]).toMatchObject({ name: "read", tool_call_id: "allowed" });
+    expect(JSON.parse(results[1]!.content!)).toEqual({ content: "file contents" });
+    expect(exec).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expectRefusal(results[0], "exec", "denied", "external");
+  });
+
+  test.each(["external", "internal", "user"] as const)("%s trust refuses unknown tools before dispatch or review", async (trust) => {
+    const { dispatch, sendMail, results } = await runCalls([
+      { id: "unknown", name: "missing_tool", input: {} },
+      { id: "review", name: "git_push", input: {} },
+    ], trust);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(sendMail).not.toHaveBeenCalled();
+    expect(results).toHaveLength(2);
+    expectRefusal(results[0], "missing_tool", "unknown", trust);
+    expectRefusal(results[1], "git_push", "review", trust);
   });
 });
 

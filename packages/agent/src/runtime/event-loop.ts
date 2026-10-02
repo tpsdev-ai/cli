@@ -4,6 +4,7 @@ import type {
   CompletionRequest,
   LLMMessage,
   ToolCall,
+  ToolResult,
   ToolSpec,
   AgentState,
   TrustLevel,
@@ -196,6 +197,45 @@ export class EventLoop {
 
   // --- Core processing ---
 
+  private async executeToolCall(
+    call: ToolCall,
+    trust: TrustLevel,
+    allowedTools: ReadonlySet<string>,
+  ): Promise<ToolResult | undefined> {
+    if (!allowedTools.has(call.name)) {
+      return {
+        content: `Permission denied: tool "${call.name}" is not allowed for ${trust} trust.`,
+        isError: true,
+      };
+    }
+
+    // External trust: enforce write/edit restriction to scratch/ (S43-D)
+    if (trust === "external" && (call.name === "write" || call.name === "edit")) {
+      const rawPath = String(call.input?.path ?? call.input?.file_path ?? "");
+      const resolvedPath = resolve(this.deps.config.workspace, rawPath);
+      const scratchDir = resolve(this.deps.config.workspace, "scratch") + sep;
+      if (!resolvedPath.startsWith(scratchDir)) {
+        return {
+          content: `Permission denied: external mail cannot write outside scratch/ directory`,
+          isError: true,
+        };
+      }
+    }
+
+    const reviewBlocked = this.deps.reviewGate?.isHighRisk(call.name) ?? false;
+    if (reviewBlocked) {
+      await this.deps.reviewGate!.requestApproval(call.name, call.input);
+      await this.deps.memory.append({
+        type: "approval_request",
+        ts: new Date().toISOString(),
+        data: { tool: call.name, args: call.input },
+      });
+      return;
+    }
+
+    return this.deps.tools.execute(call.name, call.input);
+  }
+
   private async processMail(message: MailMessage): Promise<void> {
     const body =
       typeof message.body === "string" ? message.body : JSON.stringify(message.body);
@@ -209,6 +249,7 @@ export class EventLoop {
   private async processMessage(promptRaw: string, trust: TrustLevel, sender?: string): Promise<void> {
     const prompt = String(promptRaw).trim();
     const tools = this.buildToolSpecs(trust);
+    const allowedTools = new Set(tools.map((tool) => tool.name));
     const systemPrompt = await this.buildSystemPrompt(trust, prompt.slice(0, 200));
     const maxTurns = Math.min(
       this.deps.config.maxToolTurns ?? 50,
@@ -314,51 +355,16 @@ export class EventLoop {
           data: { tool: call.name, args: call.input },
         });
 
-        // External trust: enforce write/edit restriction to scratch/ (S43-D)
-        if (trust === "external" && (call.name === "write" || call.name === "edit")) {
-          const rawPath = String(call.input?.path ?? call.input?.file_path ?? "");
-          const resolvedPath = resolve(this.deps.config.workspace, rawPath);
-          const scratchDir = resolve(this.deps.config.workspace, "scratch") + sep;
-          if (!resolvedPath.startsWith(scratchDir)) {
-            const result = {
-              content: `Permission denied: external mail cannot write outside scratch/ directory`,
-              isError: true,
-            };
-            await this.deps.memory.append({
-              type: "tool_result",
-              ts: new Date().toISOString(),
-              data: { tool: call.name, result },
-            });
-            messages.push({
-              role: "tool",
-              tool_call_id: String(call.id ?? `${Date.now()}-${Math.random()}`),
-              name: call.name,
-              content: JSON.stringify(result),
-            });
-            continue;
-          }
-        }
-
-        const reviewBlocked = this.deps.reviewGate?.isHighRisk(call.name) ?? false;
-        if (reviewBlocked) {
-          await this.deps.reviewGate!.requestApproval(call.name, call.input);
-          await this.deps.memory.append({
-            type: "approval_request",
-            ts: new Date().toISOString(),
-            data: { tool: call.name, args: call.input },
-          });
-          continue;
-        }
-
         let result;
         const toolStart = Date.now();
         try {
-          result = await this.deps.tools.execute(call.name, call.input);
+          result = await this.executeToolCall(call, trust, allowedTools);
+          if (!result) continue;
           this.deps.events?.emit({
             type: "tool.call",
             tool: call.name,
             durationMs: Date.now() - toolStart,
-            status: "ok",
+            status: result.isError ? "error" : "ok",
           });
         } catch (err: any) {
           result = {
