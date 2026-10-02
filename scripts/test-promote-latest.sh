@@ -30,12 +30,12 @@
 #     pty. Fixture R pins both TTYs on each add, and S pins refusal when stdin
 #     is not a TTY
 #   * a successful promote dispatches the Docker image workflow once, for the
-#     promoted version, after all moves and registry checks (T); failures during
-#     or after the last add never dispatch (U, Y); an initially current tag
-#     that drifts or becomes unreadable during a move also prevents dispatch
-#     (Z, AA); `--no-docker` skips dispatch (V); a gh failure after a successful
-#     promote exits 6 and does NOT
-#     roll back (W); a missing gh does the same (X)
+#     promoted version, after all adds (T); failed adds and failed post-add
+#     verification prevent dispatch (U, Y). The final registry read also covers
+#     initially current tags that drift or become unreadable (Z, AA); M7 and M9
+#     expose dispatch before verification finishes or without that final read.
+#     `--no-docker` skips dispatch (V); a gh failure after a successful promote
+#     exits 6 without rollback (W); a missing gh does the same (X)
 #   * MUTATION CHECKS: break the existence check, the post-move re-read, the TERM
 #     trap, the pre-add attempt flag, and the trap-clear branch, restore the
 #     command substitution around `dist-tag add`, dispatch before the last
