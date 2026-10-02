@@ -5,6 +5,7 @@ import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
 import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
+import { isTopicRecipient } from "../lib/topic-recipient.js";
 
 export interface MailMessage {
   filename: string;
@@ -311,7 +312,7 @@ export class MailClient {
   /**
    * Verify a mail body against the v1 signed envelope spec AND this mailbox's
    * policy: signature, wrapper→envelope `from` binding, recipient binding
-   * (`envelope.to` must be this mailbox's agent), and `messageId`/`timestamp`
+   * and `messageId`/`timestamp`
    * shape. These are the checks the shared `promote()` applies, so this path
    * cannot present mail the shared path would reject.
    *
@@ -369,7 +370,7 @@ export class MailClient {
 
     // 4. The wrapper `from` is what consumers route by, and it is unverified; a
     //    wrapper/envelope mismatch is itself a reject.
-    if (mailMsg.from !== env.from) {
+    if (typeof mailMsg.from !== "string" || mailMsg.from !== env.from) {
       return {
         pass: false,
         class: "invalid",
@@ -378,10 +379,7 @@ export class MailClient {
       };
     }
 
-    // 5. Recipient binding. A signature is NOT recipient-bound, so a correctly
-    //    signed envelope addressed to another principal must not be presented
-    //    here (deliverOutbox writes into any recipient's new/).
-    if (env.to !== this.agentId) {
+    if (env.to !== this.agentId && !isTopicRecipient(env.to, this.agentId, mailMsg.from)) {
       return {
         pass: false,
         class: "wrong-recipient",

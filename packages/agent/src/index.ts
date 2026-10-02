@@ -17,6 +17,7 @@ export type {
 
 // I/O
 export { MailClient } from "./io/mail.js";
+export { isTopicRecipient } from "./lib/topic-recipient.js";
 export type { MailMessage } from "./io/mail.js";
 export { MemoryStore } from "./io/memory.js";
 export type { MemoryEvent } from "./io/memory.js";
