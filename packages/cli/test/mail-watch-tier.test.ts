@@ -5,8 +5,8 @@ import { startFetchFlair } from "./helpers/fetch-flair.js";
  *
  * The watcher verifies each `new/` record in place; this suite pins that an
  * external-tier record is NOT presented (the hook does not run), while a record
- * with no signed claim is unchanged. Fails against origin/main, where the
- * watcher never read the signed tier.
+ * with no signed claim is unchanged. Removing the watcher's externalDispatchRefusal
+ * gate makes the external-tier assertions fail.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";

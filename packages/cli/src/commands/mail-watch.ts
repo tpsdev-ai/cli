@@ -33,7 +33,7 @@ import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MailMessage } from "../utils/mail.js";
-import { getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
+import { mailRootForRecordPath, getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
 import { externalDispatchRefusal } from "../utils/mail-tier.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
@@ -314,7 +314,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         let result: VerifyRecordResult;
         try {
           if (opts.beforeVerify) await opts.beforeVerify();
-          result = await verifyRecordForMailbox(opts.agent, record);
+          result = await verifyRecordForMailbox(opts.agent, record, mailRootForRecordPath(path));
         } catch (err) {
           // A verification ERROR — Flair unreachable, or a malformed envelope
           // structure — is not a verdict. The record is withheld and logged, and

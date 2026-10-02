@@ -1,4 +1,4 @@
-import { verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
+import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -503,13 +503,14 @@ export async function runMail(args: MailArgs): Promise<void> {
       const dirs: Array<[string, "new" | "cur"]> = [[inbox.fresh, "new"], [inbox.cur, "cur"]];
       let found: MailMessage | null = null;
       let foundLoc: "new" | "cur" = "cur";
+      let foundPath = "";
       for (const [dir, loc] of dirs) {
         if (!existsSync(dir)) continue;
         const files = readdirSync(dir).filter(f => f.endsWith(".json"));
         for (const f of files) {
           try {
             const msg = JSON.parse(readFileSync(join(dir, f), "utf-8")) as MailMessage;
-            if (msg.id === id || msg.id.startsWith(id)) { found = msg; foundLoc = loc; break; }
+            if (msg.id === id || msg.id.startsWith(id)) { found = msg; foundLoc = loc; foundPath = join(dir, f); break; }
           } catch { /* skip corrupt files */ }
         }
         if (found) break;
@@ -520,7 +521,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
       // A `cur/` record is only presentable with verified provenance; one that
       // cannot prove (and re-verify) its promotion is withheld, exactly like new/.
-      const unverified = foundLoc === "new" || !(await isPresentableCurRecord(agent, found));
+      const unverified = foundLoc === "new" || !(await isPresentableCurRecord(agent, found, mailRootForRecordPath(foundPath)));
       if (args.json) {
         // Unverified: body, thread fields and headers withheld (withholdUnverified, cli#429).
         const out = unverified ? withholdUnverified(found) : found;

@@ -40,7 +40,6 @@ export function defaultVerifyKeyPath(agentId: string): string {
  * caller.
  */
 export interface MailVerifyConfig {
-  mailRoot?: string;
   /** Flair base URL. Falls back to FLAIR_URL, then the local default. */
   flairUrl?: string;
   /** Key path authenticating the verification reads. Falls back to FLAIR_KEY_PATH, then the per-agent default. */

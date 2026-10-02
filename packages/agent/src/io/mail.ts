@@ -316,8 +316,7 @@ export class MailClient {
    * Verify a mail body against the v1 signed envelope spec AND this mailbox's
    * policy: signature, wrapper→envelope `from` binding, recipient binding
    * and `messageId`/`timestamp`
-   * shape. These are the checks the shared `promote()` applies, so this path
-   * cannot present mail the shared path would reject.
+   * shape.
    *
    * Returns a terminal `{ pass: false, class, reason }` on a deterministic
    * rejection. Called ONLY when a verifier is configured; a THROW (Flair

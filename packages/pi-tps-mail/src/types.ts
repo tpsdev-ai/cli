@@ -22,8 +22,7 @@ export interface MailMessage {
   replyToId?: string;
   /**
    * The stored SIGNED envelope (cli#433): `tps mail check --json` prints it on a
-   * verified record. The watcher reads the SIGNED tier from here — never from an
-   * unsigned wrapper field.
+   * verified record. The watcher uses CLI-derived trustTier before envelope.trust.
    */
   envelope?: { trust?: unknown };
   trustTier?: "user" | "internal" | "external";
