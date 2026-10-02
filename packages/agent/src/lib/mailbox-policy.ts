@@ -32,10 +32,10 @@ function describeIdValue(value: unknown): string {
 // ─── Envelope parsing ────────────────────────────────────────────────────────
 
 /**
- * Try to parse a message body as a TPS v1 signed envelope.
+ * Try to parse a message body as an envelope-shaped record.
  *
  * Returns the envelope object, or the string "json-parse-error" (not JSON) or
- * "missing-fields" (JSON but not a v1 envelope).
+ * "missing-fields" (JSON but not envelope-shaped).
  */
 export function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-error" | "missing-fields" {
   let parsed: unknown;
@@ -61,14 +61,14 @@ export function tryParseEnvelope(body: string): Record<string, unknown> | "json-
   return obj;
 }
 
-/** Parse a record body as a v1 signed envelope with a string body, or say why it is not one. */
+/** Parse an envelope-shaped record with a string body. */
 export function parseSignedEnvelope(body: string): { ok: true; envelope: Envelope } | { ok: false; class: "invalid"; reason: string } {
   const parsed = tryParseEnvelope(body);
   if (parsed === "json-parse-error") {
     return { ok: false, class: "invalid", reason: "body is not JSON (signed envelope required)" };
   }
   if (parsed === "missing-fields") {
-    return { ok: false, class: "invalid", reason: "body is not a v1 signed envelope" };
+    return { ok: false, class: "invalid", reason: "body is not envelope-shaped" };
   }
   if (typeof parsed.body !== "string") {
     return { ok: false, class: "invalid", reason: "envelope body is not a string" };
@@ -142,18 +142,16 @@ export async function decideEnvelopeForMailbox(
     //     presence failure (Flair is UP — an outage throws above and becomes the
     //     retryable `verify-unavailable`), which on a spoke is the normal shape
     //     of any cross-office envelope. Classify it as its own TERMINAL class so
-    //     `invalid` once again means a resolvable principal whose signature is
-    //     bad — a trustworthy forgery signal — instead of firing on every
-    //     legitimate hub-origin message.
+    //     `invalid` covers invalid verification or policy input.
     const missing = UNRESOLVABLE_PRINCIPAL_REASON_RE.exec(verified.reason);
     if (missing) {
       const entry = missing[1]!;
       const reason =
         `unresolvable-principal: ${entry} is not registered in the local Flair ` +
         `(agent-kind delegation-chain entry or sender this mailbox cannot resolve). ` +
-        `Spoke-topology condition: a spoke holds only its own principal and hub ` +
+        `Possible spoke-topology cause: a spoke holds only its own principal and hub ` +
         `principals are not distributed downward (see cli#383). Not a signature or ` +
-        `forgery verdict. Terminal — message DEAD-LETTERED, NOT delivered.`;
+        `forgery verdict. Terminal — delivery refused.`;
       return { ok: false, class: "unresolvable-principal", reason };
     }
     return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
@@ -209,7 +207,7 @@ export async function decideEnvelopeForMailbox(
     return {
       ok: false,
       class: "invalid",
-      reason: `invalid timestamp (must be an ISO-8601 string, got ${shown})`,
+      reason: `invalid timestamp (must be a parseable timestamp, got ${shown})`,
     };
   }
 
@@ -254,11 +252,15 @@ function consumedLedgerPath(root: string): string {
  */
 function recordConsumedMessageId(root: string, messageId: string): void {
   mkdirSync(root, { recursive: true });
-  appendFileSync(
-    consumedLedgerPath(root),
-    `${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`,
-    "utf-8",
-  );
+  const path = consumedLedgerPath(root);
+  const raw = readLedgerText(root);
+  if (raw === null) writeFileSync(path, "", { flag: "wx" });
+  try {
+    writeFileSync(join(root, ".consumed-initialized"), "", { flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  appendFileSync(path, `${raw !== null && raw !== "" && !raw.endsWith("\n") ? "\n" : ""}${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`, "utf-8");
 }
 
 /**
@@ -276,19 +278,21 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
     try {
       entry = JSON.parse(line);
     } catch {
-      // Torn/partial line from an interrupted append. Do NOT drop it — salvage
-      // the id and keep the line. Dropping was fail-open: a consumed id became
-      // forgotten. We cannot date it, so it is never pruned.
-      const m = line.match(/"id"\s*:\s*"([^"]+)"/);
-      if (m) ids.add(m[1]!);
+      // Retain intact IDs; a line without one blocks delivery.
+      const matches = [...line.matchAll(/"id"\s*:\s*("(?:[^"\\]|\\.)*")/g)];
+      if (matches.length === 0 || matches.length !== [...line.matchAll(/"id"\s*:/g)].length) {
+        throw new Error("consumed history has an unrecoverable ID");
+      }
+      for (const match of matches) {
+        const id = JSON.parse(match[1]!);
+        if (!isValidEnvelopeId(id)) throw new Error("consumed history has an invalid ID");
+        ids.add(id);
+      }
       kept.push(line);
       continue;
     }
-    const id = entry.id;
-    if (typeof id !== "string" || id === "") {
-      kept.push(line); // unknown shape — keep, never prune what we cannot read
-      continue;
-    }
+    const id = entry?.id;
+    if (!isValidEnvelopeId(id)) throw new Error("consumed history has an invalid ID");
     const at = typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
     if (Number.isNaN(at)) {
       // Corrupt/absent timestamp (torn append, clock skew). Keep the id — a
@@ -319,13 +323,8 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
 function readConsumedLedger(root: string): Set<string> {
   const path = consumedLedgerPath(root);
 
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (err) {
-    if (isMissing(err)) return new Set<string>();
-    throw unreadableHistory(path, err);
-  }
+  const raw = readLedgerText(root);
+  if (raw === null) return new Set<string>();
 
   const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
   if (pruned > 0) {
@@ -353,18 +352,12 @@ function isMissing(err: unknown): boolean {
 
 /**
  * Read the ledger without changing it: the live id set readConsumedLedger would
- * return, or null when there is no ledger file. Throws when the ledger exists
- * but cannot be read. It never writes, renames or prunes.
+ * return, or null for an uninitialized missing ledger. It never writes,
+ * renames or prunes.
  */
 function peekConsumedLedger(root: string): Set<string> | null {
-  const path = consumedLedgerPath(root);
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (err) {
-    if (isMissing(err)) return null;
-    throw unreadableHistory(path, err);
-  }
+  const raw = readLedgerText(root);
+  if (raw === null) return null;
   return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
 }
 
@@ -374,11 +367,16 @@ function peekConsumedLedger(root: string): Set<string> | null {
  * signed envelope.
  */
 function recordCarriesMessageId(msg: { envelopeId?: unknown; body?: unknown }, messageId: string): boolean {
-  if (msg.envelopeId === messageId) return true;
-  if (typeof msg.body !== "string") return false;
+  if (msg.envelopeId !== undefined) {
+    if (!isValidEnvelopeId(msg.envelopeId)) throw new Error("consumed record has an invalid envelope ID");
+    return msg.envelopeId === messageId;
+  }
+  if (typeof msg.body !== "string") throw new Error("consumed record has no envelope ID");
   const parsed = tryParseEnvelope(msg.body);
-  if (parsed === "json-parse-error" || parsed === "missing-fields") return false;
-  return (parsed as { messageId?: unknown }).messageId === messageId;
+  if (parsed === "json-parse-error" || parsed === "missing-fields" || !isValidEnvelopeId(parsed.messageId)) {
+    throw new Error("consumed record has no recoverable envelope ID");
+  }
+  return parsed.messageId === messageId;
 }
 
 /**
@@ -397,32 +395,9 @@ function recordCarriesMessageId(msg: { envelopeId?: unknown; body?: unknown }, m
 function isConsumedMessageId(root: string, messageId: string): boolean {
   if (readConsumedLedger(root).has(messageId)) return true;
 
-  const stack = [join(root, "cur"), join(root, "archive")];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    if (!existsSync(dir)) continue;
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!entry.name.endsWith(".json")) continue;
-      try {
-        if (recordCarriesMessageId(JSON.parse(readFileSync(full, "utf-8")), messageId)) return true;
-      } catch {
-        // skip corrupt records
-      }
-    }
-  }
-  return false;
+  return maildirHistoryHasMessageId(root, messageId);
 }
 
-/**
- * The maildir fallback of isConsumedMessageId: a directory or record that does
- * not exist is skipped, a corrupt record is skipped (as
- * isConsumedMessageId skips it), and any other read error throws.
- */
 function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
   const stack = [join(root, "cur"), join(root, "archive")];
   for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
@@ -447,11 +422,10 @@ function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
         if (isMissing(err)) continue; // removed after the listing
         throw unreadableHistory(full, err);
       }
-      try {
-        if (recordCarriesMessageId(JSON.parse(raw), messageId)) return true;
-      } catch {
-        // corrupt record — skipped, as isConsumedMessageId skips it
-      }
+      let record;
+      try { record = JSON.parse(raw); } catch { throw new Error(`consumed history at ${full} is corrupt`); }
+      if (record == null || typeof record !== "object") throw new Error(`consumed history at ${full} is corrupt`);
+      if (recordCarriesMessageId(record, messageId)) return true;
     }
   }
   return false;
@@ -461,11 +435,28 @@ function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
  * Replay lookup for a reader that does not hold the mailbox lock: true when
  * this envelope messageId is in the consumed ledger or, failing that, in the
  * maildir fallback — the history isConsumedMessageId consults. It writes,
- * renames, prunes and creates nothing. A missing ledger file counts as an empty
- * ledger; a ledger or maildir that cannot be read THROWS, and the caller must
- * withhold the record.
+ * renames, prunes and creates nothing. Unavailable history throws; the caller
+ * must withhold the record.
  */
 export function peekConsumedForMailboxRoot(root: string, messageId: string): boolean {
   if (peekConsumedLedger(root)?.has(messageId)) return true;
   return maildirHistoryHasMessageId(root, messageId);
+}
+
+function readLedgerText(root: string): string | null {
+  const path = consumedLedgerPath(root);
+  try { return readFileSync(path, "utf-8"); } catch (err) {
+    if (!isMissing(err)) throw unreadableHistory(path, err);
+    try { readFileSync(join(root, ".consumed-initialized")); } catch (markerErr) {
+      if (isMissing(markerErr)) return null;
+      throw unreadableHistory(path, markerErr);
+    }
+    throw new Error(`consumed history at ${path} is missing after initialization`);
+  }
+}
+
+export function hasCommittedMessageId(root: string, messageId: string): boolean {
+  const ids = peekConsumedLedger(root);
+  if (ids === null) return false;
+  return ids.has(messageId);
 }

@@ -10,6 +10,7 @@ import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
+import { decodeRegistryPublicKey } from "../lib/registry-key.js";
 import type { FlairClient } from "../lib/signEnvelope.js";
 
 export class AgentRuntime {
@@ -25,20 +26,13 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Build the FlairClient adapter for envelope verification. It is ALWAYS
-    // constructed (cli#380): verification is not optional, so no path promotes
-    // without it. With no `flair` config it resolves the same env/default
-    // endpoint every other Flair read uses; an unreachable Flair is a retryable
-    // refusal at promotion, never a pass. The provider's getAgent()
-    // disambiguates a Flair outage (throws → retryable) from an absent
-    // principal (null → terminal), so a signature verifier built on it does not
-    // dead-letter every message while Flair is down.
+    // Verification uses config.url, FLAIR_URL, then http://127.0.0.1:9926.
     const verifyProvider = new FlairContextProvider(config.agentId, config.flair ?? {});
     const flairClient: FlairClient = {
       getAgent: async (name: string) => {
         const a = await verifyProvider.getAgent(name);
         if (!a) return null;
-        return { publicKey: Buffer.from(a.publicKey, "hex") };
+        return { publicKey: decodeRegistryPublicKey(a.publicKey) };
       },
     };
 

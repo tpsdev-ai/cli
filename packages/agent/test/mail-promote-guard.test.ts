@@ -21,7 +21,7 @@ import * as fs from "node:fs";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "../src/lib/signEnvelope.js";
 import { FlairContextProvider } from "../src/io/flair.js";
@@ -221,12 +221,9 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     const env = signedEnvelope("flint", AGENT, "during outage", { flint: FLINT });
     plant(wrapper("flint", env));
 
-    // Real provider against a dead endpoint. getAgent() swallows the connection
-    // error to null; the verifier must probe /Health to tell "absent" from "down".
-    const provider = new FlairContextProvider(AGENT, {
-      url: "http://127.0.0.1:1",
-      keyPath: join(tmpDir, "no-key"),
-    });
+    const keyPath = join(tmpDir, "reader.key");
+    writeFileSync(keyPath, generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }));
+    const provider = new FlairContextProvider(AGENT, { url: "http://127.0.0.1:1", keyPath });
     const client = new MailClient(tmpDir, undefined, AGENT, providerVerifier(provider));
     const msgs = await client.checkNewMail();
 
@@ -236,7 +233,6 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   });
 
   test("a REACHABLE Flair that does not know the principal IS terminal (unresolvable-principal)", async () => {
-    // Control for the disambiguation: the SAME null from getAgent, but /Health is up.
     const server = Bun.serve({
       port: 0,
       fetch(req) {
@@ -248,10 +244,9 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     try {
       const env = signedEnvelope("flint", AGENT, "absent", { flint: FLINT });
       plant(wrapper("flint", env));
-      const provider = new FlairContextProvider(AGENT, {
-        url: server.url.href,
-        keyPath: join(tmpDir, "no-key"),
-      });
+      const keyPath = join(tmpDir, "reader.key");
+      writeFileSync(keyPath, generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }));
+      const provider = new FlairContextProvider(AGENT, { url: server.url.href, keyPath });
       const client = new MailClient(tmpDir, undefined, AGENT, providerVerifier(provider));
       const msgs = await client.checkNewMail();
 
@@ -396,7 +391,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     try {
       await expect(client["commitToCur"]("m1.json", join(inbox("new"), "m1.json"),
         readFileSync(join(inbox("new"), "m1.json"), "utf-8"), env)).rejects.toThrow(/append fault.*rollback fault/);
-      expect(existsSync(join(tmpDir, AGENT, "consumed.jsonl"))).toBe(false);
+      expect(readFileSync(join(tmpDir, AGENT, "consumed.jsonl"), "utf-8")).toBe("");
     } finally {
       appendFault.mockRestore();
       rollbackFault.mockRestore();

@@ -14,8 +14,9 @@
  *  - normal acquisition publishes a populated lock directory by rename;
  *  - ownership uses pid and process start time when readable; a live pid with
  *    an unverifiable token is retained;
- *  - only ownership proven stale permits reclamation;
- *  - release checks pid alone;
+ *  - acquisition and stale reclamation share an atomic claim;
+ *  - a stranded claim requires operator recovery;
+ *  - release checks the acquisition nonce;
  *  - nested (re)acquisition in one process fails loudly rather than deadlocking;
  *  - failure to acquire returns null — callers MUST treat that as "do not
  *    proceed" (fail-closed), never as "proceed without the lock".
@@ -101,6 +102,7 @@ function isPidAlive(pid: number): boolean {
 interface LockOwner {
   pid?: unknown;
   startToken?: unknown;
+  nonce?: unknown;
 }
 
 type OwnerState = "alive" | "dead" | "unverifiable";
@@ -189,16 +191,8 @@ export async function acquireMailLock(
   reapStrandedLockTemps(root);
   const deadline = Date.now() + timeoutMs;
   const myToken = processStartToken(process.pid);
-
-  // Resolve an owner's birth token ONCE per pid per attempt — processStartToken
-  // may fork `ps`, and polling every 25 ms must not fork it repeatedly. A pid's
-  // birth time is constant for its lifetime, so caching within an attempt is
-  // sound.
-  const tokenCache = new Map<number, string | null>();
-  const resolveToken = (pid: number): string | null => {
-    if (!tokenCache.has(pid)) tokenCache.set(pid, processStartToken(pid));
-    return tokenCache.get(pid)!;
-  };
+  const nonce = randomBytes(16).toString("hex");
+  const claimDir = join(root, `${MAIL_LOCK_DIR}.claim`);
 
   const makeLock = (): MailLock => {
     let released = false;
@@ -206,66 +200,58 @@ export async function acquireMailLock(
       release: () => {
         if (released) return;
         released = true;
-        releaseMailLock(lockDir);
+        releaseMailLock(lockDir, nonce);
       },
     };
   };
 
   for (;;) {
-    let lockExists = true;
+    let claimed = false;
     try {
-      lstatSync(lockDir);
-    } catch (err: any) {
-      if (err?.code !== "ENOENT") throw err;
-      lockExists = false;
-    }
-
-    if (!lockExists) {
-      const tmpDir = join(root, `${TEMP_PREFIX}${process.pid}.${randomBytes(6).toString("hex")}`);
       try {
-        mkdirSync(tmpDir);
-        writeFileSync(
-          join(tmpDir, OWNER_FILE),
-          JSON.stringify({ pid: process.pid, startToken: myToken }),
-          "utf-8",
-        );
-      } catch (err) {
-        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        throw err;
-      }
-
-      try {
-        renameSync(tmpDir, lockDir);
-        heldByThisProcess.add(lockDir);
-        return makeLock();
+        mkdirSync(claimDir);
+        claimed = true;
       } catch (err: any) {
-        try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-        const code = err?.code;
-        if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EISDIR" && code !== "ENOTDIR") {
-          throw err;
+        if (err?.code !== "EEXIST") throw err;
+      }
+      if (claimed) {
+        if (heldByThisProcess.has(lockDir)) throw new Error(`mail lock already held by this process for ${root}`);
+        let lockExists = true;
+        try {
+          lstatSync(lockDir);
+        } catch (err: any) {
+          if (err?.code !== "ENOENT") throw err;
+          lockExists = false;
+        }
+        if (lockExists && ownerState(readOwner(lockDir)) === "dead") {
+          rmSync(lockDir, { recursive: true });
+          lockExists = false;
+        }
+        if (!lockExists) {
+          const tmpDir = join(root, `${TEMP_PREFIX}${process.pid}.${nonce}`);
+          try {
+            mkdirSync(tmpDir);
+            writeFileSync(join(tmpDir, OWNER_FILE), JSON.stringify({ pid: process.pid, startToken: myToken, nonce }), "utf-8");
+            renameSync(tmpDir, lockDir);
+            heldByThisProcess.add(lockDir);
+            return makeLock();
+          } finally {
+            rmSync(tmpDir, { recursive: true, force: true });
+          }
         }
       }
+    } finally {
+      if (claimed) rmSync(claimDir, { recursive: true });
     }
-
-    const state = ownerState(readOwner(lockDir), resolveToken);
-    if (state === "dead") {
-      try {
-        rmSync(lockDir, { recursive: true, force: true });
-      } catch {
-        /* someone else may have broken it first */
-      }
-      continue;
-    }
-
     if (Date.now() >= deadline) return null;
     await sleep(pollMs);
   }
 }
 
-function releaseMailLock(lockDir: string): void {
+function releaseMailLock(lockDir: string, nonce: string): void {
   heldByThisProcess.delete(lockDir);
   const owner = readOwner(lockDir);
-  if (owner && owner.pid === process.pid) {
+  if (owner && owner.pid === process.pid && owner.nonce === nonce) {
     try {
       rmSync(lockDir, { recursive: true, force: true });
     } catch {

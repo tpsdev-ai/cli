@@ -3,9 +3,6 @@
  *
  * The old deploy bot accepted forged commands after a parse check.
  *
- * RED without the fix: the forged record below lands in `cur/` (the bypass) and
- * `pollNewMail()` returns it as a command.
- *
  * The script resolves its mailbox at module load, so HOME and the env are set
  * before the dynamic import.
  */
@@ -69,7 +66,7 @@ function plant(name: string, envelopeFrom: string, signWith: Buffer, body: strin
   const envelope = buildSignedEnvelope(envelopeFrom, BOT, body, { [envelopeFrom]: signWith });
   writeFileSync(
     join(inbox("new"), name),
-    JSON.stringify({ from: envelopeFrom, to: BOT, body: JSON.stringify(envelope) }),
+    JSON.stringify({ id: envelope.messageId, from: envelopeFrom, to: BOT, body: JSON.stringify(envelope) }),
     "utf-8",
   );
 }
@@ -92,8 +89,7 @@ describe("the deploy bot promotes inbound mail through promote() (cli#380)", () 
 
     const rows = await bot.pollNewMail();
 
-    expect(rows).toEqual([]);
-    expect(files("cur")).not.toContain("forged.json");
+    expect({ rows, inCur: files("cur").includes("forged.json") }).toEqual({ rows: [], inCur: false });
     expect(files("dlq")).toContain("forged.json");
   });
 
@@ -110,6 +106,7 @@ describe("the deploy bot promotes inbound mail through promote() (cli#380)", () 
       process.env.FLAIR_URL = goodUrl;
     }
 
+    rmSync(inbox("new"), { recursive: true });
     const recovered = await bot.pollNewMail();
     expect(recovered.map((r) => r.body)).toEqual(["status"]);
     expect(files("cur")).toContain("outage.json");

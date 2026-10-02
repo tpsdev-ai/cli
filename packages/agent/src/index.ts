@@ -48,7 +48,7 @@ export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "
 // Mailbox policy (cli#380)
 export {
   ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId, tryParseEnvelope, parseSignedEnvelope,
-  decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot,
+  decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
 } from "./lib/mailbox-policy.js";
 export type { MailboxPolicyRejectClass, MailboxPolicyResult, ReplayStore } from "./lib/mailbox-policy.js";
 export { acquireMailLock, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
@@ -58,3 +58,5 @@ export {
   agentKeyCandidates, existingAgentKeyPaths, resolveAgentKeyPath,
   readAgentPrivateKey, readPrivateKeyAtPath, toEd25519Seed,
 } from "./lib/agent-keys.js";
+
+export { decodeRegistryPublicKey } from "./lib/registry-key.js";

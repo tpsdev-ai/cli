@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import {
   decideEnvelopeForMailbox as decideEnvelope,
   type Envelope,
-  mailboxReplayStore,
+  mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
 } from "@tpsdev-ai/agent";
@@ -863,10 +863,8 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
  * the binding table, and the envelope must verify through the shared policy
  * (signature, wrapper->envelope from, recipient, messageId, timestamp).
  *
- * No side effects. Throws only when Flair is unreachable; callers decide (an
- * outage withholds presentation and leaves recovery to retry).
  */
-async function checkPromotedRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<EnvelopePolicyResult> {
+async function checkPromotedRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}, root = mailboxRoot(agent)): Promise<EnvelopePolicyResult> {
   // Provenance: only promote() stamps envelopeId + the signed envelope.
   if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
     return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
@@ -879,7 +877,12 @@ async function checkPromotedRecord(agent: string, record: MailMessage, verify: M
   if (!binding.ok) {
     return { ok: false, class: "unverified", reason: `record does not match its verified envelope: ${binding.reason}` };
   }
-  return decideEnvelopeForMailbox(agent, env, record.from, verify);
+  const decision = await decideEnvelopeForMailbox(agent, env, record.from, verify);
+  if (!decision.ok) return decision;
+  if (!hasCommittedMessageId(root, env.messageId)) {
+    throw new Error("promotion has no consumed ledger commit; not presented");
+  }
+  return decision;
 }
 
 /**
@@ -908,8 +911,6 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage,
  * stays for history (cur/ and archive are never swept as mail); LIVE
  * re-delivery is held to the same bar as first delivery.
  *
- * Throws only when Flair is unreachable — the caller should leave the record in
- * `cur/` and retry later (a transient outage is not a verdict about the mail).
  */
 export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
@@ -930,7 +931,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // includes the recipient binding, so a record carrying another mailbox's
   // genuine envelope cannot be presented here. (The first-delivery-only replay
   // gate is unnecessary: this id is already consumed.)
-  const decision = await checkPromotedRecord(agent, msg, verify);
+  const decision = await checkPromotedRecord(agent, msg, verify, dirs.root);
   if (!decision.ok) {
     rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
     return { ok: false, class: decision.class, reason: decision.reason };

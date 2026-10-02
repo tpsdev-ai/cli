@@ -14,22 +14,22 @@ import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
-/** Which argument is the DESTINATION: "first", "last", or a 0-based index. */
-type Dest = "first" | "last" | number;
+/** Which argument is the DESTINATION: "first" or a 0-based index. */
+type Dest = "first" | number;
 
 /** Write calls and which argument is the DESTINATION. */
 const WRITE_CALLS: Record<string, Dest> = {
   appendFile: "first",
   appendFileSync: "first",
   "Bun.write": "first",
-  copyFile: "last",
-  copyFileSync: "last",
-  cpSync: "last",
+  copyFile: 1,
+  copyFileSync: 1,
+  cpSync: 1,
   createWriteStream: "first",
-  link: "last",
-  linkSync: "last",
-  rename: "last",
-  renameSync: "last",
+  link: 1,
+  linkSync: 1,
+  rename: 1,
+  renameSync: 1,
   writeFile: "first",
   writeFileSync: "first",
 };
@@ -186,7 +186,6 @@ function callsOf(text: string, fn: string): Array<{ at: number; args: string[] }
 
 function destOf(args: string[], spec: Dest): string | undefined {
   if (spec === "first") return args[0];
-  if (spec === "last") return args[args.length - 1];
   return args[spec];
 }
 
@@ -317,3 +316,13 @@ describe("cli#380: no unlisted writer of a cur/ directory", () => {
     ]);
   });
 });
+
+for (const [fn, tail] of [["copyFile", ", 0, done"], ["copyFileSync", ", 0"], ["cpSync", ", { recursive: true }"], ["link", ", done"], ["rename", ", done"]]) {
+  test(`${fn} sees the destination before options or callbacks, including local wrappers`, () => {
+    const text = `function put(src, dest) { ${fn}(src, dest${tail}); }\n${fn}(src, join(root, "cur", f)${tail});\nput(src, join(root, "cur", f));`;
+    expect(curWritersInText(text).sort()).toEqual([
+      `${fn}(src, join(root, "cur", f)${tail})`,
+      'put(src, join(root, "cur", f))',
+    ].sort());
+  });
+}
