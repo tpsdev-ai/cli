@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { cloneArgs, containerArgs, runReviewJobs } from "../../../../scripts/reviewer/run-review-jobs.mjs";
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
@@ -62,7 +63,7 @@ function fakeDocker(verdicts: Record<string, unknown> = {}, onExec?: (job: strin
       if (!c) return { status: 1, stdout: "", stderr: "no such container" };
       seen.execs.push(c.job);
       onExec?.(c.job, c.dir);
-      const v = verdicts[c.job] ?? { ok: true, status: "job-ok", jobs: [{ job: c.job, steps: [] }] };
+      const v = verdicts[c.job] ?? { ok: true, status: "job-ok", job: c.job, jobs: [{ job: c.job, steps: [] }] };
       return { status: (v as { ok?: boolean }).ok === false ? 1 : 0, stdout: `${JSON.stringify(v)}\n`, stderr: "" };
     }
     if (args[0] === "rm") {
@@ -153,6 +154,16 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     expect(args.slice(-2)).toEqual(["sleep", "infinity"]);
     // a read-only clone source is the host's; the container gets only the job's tree.
     expect(args.filter((a) => a.includes(":/workspace")).length).toBe(1);
+    // Exactly one host mount: the job's own clone. No other host path is shared.
+    expect(args.filter((a) => a === "-v").length).toBe(1);
+    expect(args[args.indexOf("-v") + 1]).toBe("/jobs/review:/workspace");
+  });
+
+  test("the CLI refuses any extra host bind", () => {
+    const driver = fileURLToPath(new URL("../../../../scripts/reviewer/run-review-jobs.mjs", import.meta.url));
+    const r = spawnSync(process.execPath, [driver, "--image", "i", "--source", "/s", "--scratch", "/x", "--workflow", "w", "--job", "j", "--base", "b", "--bind", "/host:/evidence"], { encoding: "utf8" });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("unknown argument --bind");
   });
 
   test("a job's sandbox runs as the user that owns its clone", () => {
@@ -160,6 +171,59 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     expect(args[args.indexOf("--user") + 1]).toBe("1000:1000");
     // Without a user the sandbox keeps the image's own user.
     expect(containerArgs({ image: "img", dir: "/d", envFile: "/e", jobId: "review" })).not.toContain("--user");
+  });
+
+  test("a launcher that exits non-zero carrying ok:true is not a pass", async () => {
+    publish();
+    const docker = (args: string[]) => {
+      if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
+      if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "exec") return { status: 1, stdout: '{"ok":true}\n', stderr: "boom\n" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("job-failed");
+      expect(r.refusal.message).toContain("did not report job-ok (exit 1)");
+      expect((r.refusal as { output?: string }).output).toBe("boom\n");
+    }
+  });
+
+  test("a job-ok verdict that names another job is not a pass", async () => {
+    publish();
+    let creates = 0;
+    const docker = (args: string[]) => {
+      if (args[0] === "create") {
+        creates++;
+        return { status: 0, stdout: `cid${creates}\n`, stderr: "" };
+      }
+      if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "exec") return { status: 0, stdout: `${JSON.stringify({ ok: true, status: "job-ok", job: "someone-else", jobs: [] })}\n`, stderr: "" };
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.refusal.message).toContain("did not report job-ok");
+    expect(creates).toBe(1);
+  });
+
+  test("a container that cannot be removed fails the run before the next job starts", async () => {
+    publish();
+    const d = fakeDocker();
+    const docker = (args: string[]) => {
+      if (args[0] === "rm") return { status: 1, stdout: "", stderr: "Error: cannot remove container\n" };
+      return d.run(args);
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("container-remove");
+      expect(r.refusal.message).toContain("could not be removed");
+    }
+    // The failed removal stops the build: the dependent job never runs.
+    expect(d.seen.execs).toEqual(["build"]);
+    expect(d.seen.creates.length).toBe(1);
   });
 
   test("a failed job carries the launcher's output (the step that failed) in its refusal", async () => {

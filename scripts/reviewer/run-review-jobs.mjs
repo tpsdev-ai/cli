@@ -4,20 +4,23 @@
  *
  * review-build-ok is ADVISORY EVIDENCE for the reviewer, not a merge gate: CI
  * stays the gate. What this driver holds is the isolation boundary the
- * in-container launcher cannot: one sandbox container per job, so that state
- * inside .git/, a process that starts its own session (setsid), and any other
- * host-level carry-over cannot reach the next job.
+ * in-container launcher cannot: one sandbox container per job, each from its
+ * own fresh clone, so state inside .git/, a process that starts its own session
+ * (setsid), and anything else a job leaves in its tree cannot reach the next
+ * job. The driver attaches no host mount beyond that job's own clone.
  *
  * Per job of the named job's `needs` closure, in dependency order, it:
  *   1. makes a FRESH clone of the assigned commit from the read-only source the
  *      host provides (a bare clone, or a checkout; never written to);
- *   2. starts ONE sandbox container with the job's clone bound (writable) at
+ *   2. starts ONE sandbox container with that job's clone bound (writable) at
  *      /workspace, in OpenClaw's run model (read-only root, tmpfs on /tmp,
  *      /var/tmp and /run, no network, all caps dropped, no-new-privileges), and
  *      runs /opt/reviewer/bin/reviewer-launch in it — which runs that one job;
- *   3. removes the container and DISCARDS the job's directory.
+ *   3. removes the container, refusing the build if that removal fails, and
+ *      DISCARDS the job's directory.
  * A job runs only if the jobs it needs succeeded (or its `if:` is always()), and
- * it reports review-build-ok only when every job ran and every step exited 0.
+ * it reports review-build-ok only when every job ran to a job-ok verdict that
+ * names that job and its launcher exited 0, and every step exited 0.
  *
  * The assignment the launcher reads from its container init's environment is set
  * here, in the container's create-time env file, never in the launcher's caller.
@@ -44,7 +47,7 @@ const ok = (value) => ({ ok: true, ...value });
 const tailOutput = (text, maxChars = 8192) => { const s = String(text ?? ""); return s.length <= maxChars ? s : s.slice(s.length - maxChars); };
 const refuse = (kind, message, output) => ({ ok: false, refusal: output ? { kind, message, output: tailOutput(output) } : { kind, message } });
 
-/** The default docker runner: one argv, a hard timeout, everything captured. */
+/** The default docker runner: one argv, a hard timeout, stdout and stderr captured (up to 16 MiB each). */
 export function dockerRunner(args, { timeoutMs = 120_000 } = {}) {
   const r = spawnSync("docker", args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
   if (r.error) return { status: null, stdout: r.stdout ?? "", stderr: `${r.error.code ?? "error"}: ${r.error.message}` };
@@ -64,8 +67,9 @@ export function cloneArgs({ source, dir, depth }) {
   return ["clone", "--quiet", ...shallow, `file://${source}`, dir];
 }
 
-/** `docker create` args for one job's sandbox, in OpenClaw's run model. */
-export function containerArgs({ image, dir, envFile, jobId, binds = [], user }) {
+/** `docker create` args for one job's sandbox, in OpenClaw's run model: the
+ * job's own clone at /workspace and NO other host mount. */
+export function containerArgs({ image, dir, envFile, jobId, user }) {
   return [
     "create",
     "--init",
@@ -79,7 +83,6 @@ export function containerArgs({ image, dir, envFile, jobId, binds = [], user }) 
     ...(user ? ["--user", user] : []),
     "--workdir", "/workspace",
     "-v", `${dir}:/workspace`,
-    ...binds.flatMap((b) => ["-v", b]),
     "--env-file", envFile,
     "--label", `${LABEL}=${jobId}`,
     image,
@@ -101,9 +104,9 @@ const lastJsonLine = (text) => {
 
 /**
  * Run one job in its own container, from a fresh clone of the source.
- * @returns {{ok:true, job, steps} | {ok:false, refusal}}
+ * @returns {{ok:true, job, steps} | {ok:false, refusal, stop?}}
  */
-function runOneJob({ job, source, scratch, image, workflow, base, binds, docker, git }) {
+function runOneJob({ job, source, scratch, image, workflow, base, docker, git }) {
   const dir = join(scratch, job.id);
   rmSync(dir, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });
@@ -124,35 +127,51 @@ function runOneJob({ job, source, scratch, image, workflow, base, binds, docker,
   const envFile = join(scratch, `${job.id}.env`);
   writeFileSync(envFile, `${ENV_KEYS.workflow}=${workflow}\n${ENV_KEYS.job}=${job.id}\n${ENV_KEYS.base}=${base}\n`, { mode: 0o600 });
 
-  const created = docker(containerArgs({ image, dir, envFile, jobId: job.id, binds, user: currentUser() }));
+  const created = docker(containerArgs({ image, dir, envFile, jobId: job.id, user: currentUser() }));
   const cid = (created.stdout ?? "").trim();
   if (created.status !== 0 || cid === "") {
     rmSync(dir, { recursive: true, force: true });
     return refuse("container-create", `job ${job.id}: the sandbox container could not be created: ${(created.stderr ?? "").split("\n")[0]}`);
   }
   const timeoutMs = job.timeoutMinutes * 60_000 + CONTAINER_GRACE_MS;
-  let result;
+  let execStatus = null;
+  let result = null;
   let output = "";
+  let removeFailure = null;
   try {
     const started = docker(["start", cid]);
-    if (started.status !== 0) return refuse("container-start", `job ${job.id}: the sandbox container could not be started: ${(started.stderr ?? "").split("\n")[0]}`);
-    const exec = docker(["exec", cid, LAUNCHER], { timeoutMs });
-    output = exec.stderr ?? "";
-    if (exec.status === null) return refuse("container-timeout", `job ${job.id}: the sandbox container did not finish within ${Math.round(timeoutMs / 1000)} s`);
-    const verdict = lastJsonLine(exec.stdout);
-    if (!verdict || typeof verdict !== "object") {
-      return refuse("launcher-unreadable", `job ${job.id}: the launcher in the sandbox wrote no verdict (exit ${exec.status})`, output);
+    if (started.status !== 0) {
+      result = { ok: false, kind: "container-start", message: `job ${job.id}: the sandbox container could not be started: ${(started.stderr ?? "").split("\n")[0]}` };
+    } else {
+      const exec = docker(["exec", cid, LAUNCHER], { timeoutMs });
+      output = exec.stderr ?? "";
+      execStatus = exec.status;
+      if (exec.status === null) {
+        result = { ok: false, kind: "container-timeout", message: `job ${job.id}: the sandbox container did not finish within ${Math.round(timeoutMs / 1000)} s` };
+      } else {
+        const verdict = lastJsonLine(exec.stdout);
+        result =
+          verdict && typeof verdict === "object"
+            ? verdict
+            : { ok: false, kind: "launcher-unreadable", message: `job ${job.id}: the launcher in the sandbox wrote no verdict (exit ${exec.status})` };
+      }
     }
-    result = verdict;
   } finally {
-    docker(["rm", "-f", cid]);
+    const removed = docker(["rm", "-f", cid]);
     rmSync(dir, { recursive: true, force: true });
     rmSync(envFile, { force: true });
+    if (removed.status !== 0) removeFailure = `job ${job.id}: the sandbox container could not be removed: ${(removed.stderr ?? "").split("\n")[0]}`;
   }
-  if (result.ok !== true) {
-    return refuse(result.kind ?? "job-failed", result.message ?? `job ${job.id} did not pass`, output);
+  // A container that could not be removed leaves the host dirty: stop the build
+  // before the next job starts, whatever the job's own verdict was.
+  if (removeFailure) return { ok: false, stop: true, refusal: { kind: "container-remove", message: removeFailure } };
+  // A job passes only on a job-ok verdict that names THIS job and a launcher
+  // that exited 0: a crash after printing `ok:true`, another job's verdict, or a
+  // non-zero exit carrying `ok:true` is not a pass.
+  if (execStatus === 0 && result.ok === true && result.status === "job-ok" && result.job === job.id) {
+    return ok({ job: job.id, steps: result.jobs?.[0]?.steps ?? [] });
   }
-  return ok({ job: job.id, steps: result.jobs?.[0]?.steps ?? [] });
+  return refuse(result.kind ?? "job-failed", result.message ?? `job ${job.id}: the launcher did not report job-ok (exit ${execStatus})`, output);
 }
 
 /**
@@ -167,7 +186,6 @@ export function runReviewJobs({
   workflow,
   job,
   base,
-  binds = [],
   docker = dockerRunner,
   git = gitRunner,
   now = () => Date.now(),
@@ -195,11 +213,13 @@ export function runReviewJobs({
       jobs.push({ job: current.id, skipped: `needs ${blocked.join(", ")}, which did not succeed` });
       continue;
     }
-    const r = runOneJob({ job: current, source: sourceReal, scratch, image, workflow, base, binds, docker, git });
+    const r = runOneJob({ job: current, source: sourceReal, scratch, image, workflow, base, docker, git });
     if (!r.ok) {
       status.set(current.id, "failed");
       jobs.push({ job: current.id, failed: r.refusal });
       failure ??= r.refusal;
+      // A container that could not be removed stops the build here.
+      if (r.stop) break;
       continue;
     }
     jobs.push({ job: current.id, steps: r.steps });
@@ -217,20 +237,13 @@ export function runReviewJobs({
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 const USAGE = `usage: run-review-jobs.mjs --image <ref> --source <git-dir> --scratch <dir>
-         --workflow <.github/workflows/x.yml> --job <name> --base <branch>
-         [--bind <host>:<container>[:ro]]...`;
+         --workflow <.github/workflows/x.yml> --job <name> --base <branch>`;
 
 function parseArgs(argv) {
-  const out = { binds: [] };
+  const out = {};
   const names = { image: "image", source: "source", scratch: "scratch", workflow: "workflow", job: "job", base: "base" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--bind") {
-      const v = argv[++i];
-      if (!v) return { error: "--bind needs <host>:<container>" };
-      out.binds.push(v);
-      continue;
-    }
     const key = a.startsWith("--") ? names[a.slice(2)] : undefined;
     if (!key) return { error: `unknown argument ${a}` };
     const v = argv[++i];

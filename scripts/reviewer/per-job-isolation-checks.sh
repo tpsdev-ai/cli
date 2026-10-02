@@ -12,7 +12,10 @@
 #            heartbeat is still growing (the process is still alive).
 # The host driver (run-review-jobs.mjs) runs one sandbox container per job, from
 # a fresh clone of a read-only bare source. review must see a pristine tree and
-# a dead heartbeat. The driver's workflow parser (js-yaml) is taken from the
+# a dead heartbeat. The shared evidence directory is the fixture's own: the
+# production driver attaches no host mount beyond each job's clone, so the
+# fixture adds that one bind through the driver's injected docker runner (see
+# the harness below). The driver's workflow parser (js-yaml) is taken from the
 # image, not the checkout, so this check needs no node_modules in the repository.
 #
 # Usage: per-job-isolation-checks.sh <image-tag> <image-id>
@@ -91,7 +94,7 @@ jobs:
       - name: observe what build left behind
         run: |
           {
-            echo "status=$(git status --porcelain=v1 | tr '\n' '|')"
+            echo "status=$(git status --porcelain=v1 --ignored | tr '\n' '|')"
             echo "tracked=$(cat tracked.txt 2>/dev/null)"
             echo "job1ref=$(git rev-parse --verify --quiet refs/heads/job1-marker >/dev/null 2>&1 && echo present || echo absent)"
             echo "staged=$(git diff --cached --name-only | tr '\n' '|')"
@@ -121,14 +124,35 @@ mkdir -p "$HOSTMOD/scripts/reviewer" "$HOSTMOD/node_modules"
 cp "$REPO"/scripts/reviewer/*.mjs "$HOSTMOD/scripts/reviewer/"
 docker run --rm "$IMG" tar -cf - -C /opt/reviewer/lib node_modules/js-yaml | tar -xf - -C "$HOSTMOD"
 
-node "$HOSTMOD/scripts/reviewer/run-review-jobs.mjs" \
-  --image "$IMG" \
-  --source "$SCRATCH/source.git" \
-  --scratch "$SCRATCH/jobs" \
-  --workflow .github/workflows/review.yml \
-  --job review \
-  --base main \
-  --bind "$SCRATCH/evidence:/evidence" >"$SCRATCH/run.out" 2>"$SCRATCH/run.err"
+# test-only evidence channel: the two jobs must share ONE host directory (job 1
+# writes a heartbeat into it, job 2 reads what it sees), which the production
+# driver never attaches. The fixture adds that one bind at create time through
+# the driver's injected docker runner, so the driver it exercises is the
+# production one, unchanged.
+cat >"$HOSTMOD/scripts/reviewer/evidence-harness.mjs" <<'JS'
+import { dockerRunner, runReviewJobs } from "./run-review-jobs.mjs";
+const image = process.env.FIXTURE_IMAGE;
+const evidence = process.env.FIXTURE_EVIDENCE;
+const docker = (args, opts) => {
+  if (args[0] !== "create") return dockerRunner(args, opts);
+  const at = args.indexOf(image);
+  return dockerRunner([...args.slice(0, at), "-v", `${evidence}:/evidence`, ...args.slice(at)], opts);
+};
+const r = runReviewJobs({
+  image,
+  source: process.env.FIXTURE_SOURCE,
+  scratch: process.env.FIXTURE_SCRATCH,
+  workflow: ".github/workflows/review.yml",
+  job: "review",
+  base: "main",
+  docker,
+});
+process.stdout.write(`${JSON.stringify(r.ok ? { status: r.status, image: r.image, jobs: r.jobs } : { status: "refused", ...r.refusal, jobs: r.jobs })}\n`);
+process.exitCode = r.ok ? 0 : 1;
+JS
+
+FIXTURE_IMAGE="$IMG" FIXTURE_SOURCE="$SCRATCH/source.git" FIXTURE_SCRATCH="$SCRATCH/jobs" FIXTURE_EVIDENCE="$SCRATCH/evidence" \
+  node "$HOSTMOD/scripts/reviewer/evidence-harness.mjs" >"$SCRATCH/run.out" 2>"$SCRATCH/run.err"
 RUN_RC=$?
 
 if [ "$RUN_RC" -eq 0 ] && grep -q '"status":"review-build-ok"' "$SCRATCH/run.out"; then
@@ -167,7 +191,7 @@ if [ -f "$obs" ]; then
   before="$(sed -n 's/^alive_before=//p' "$obs")"
   after="$(sed -n 's/^alive_after=//p' "$obs")"
   if [ -n "$before" ] && [ "$before" != "0" ] && [ "$before" = "$after" ]; then
-    pass "job 1's detached (setsid) process wrote until job 1 ended, then stopped: not alive in job 2 (heartbeat ${before} bytes, unchanged)"
+    pass "job 1's detached (setsid) process wrote into the shared evidence directory and is not writing while job 2 observes it (heartbeat ${before} bytes, unchanged over 1 s)"
   else
     fail "job 1's detached process: before=${before:-?} after=${after:-?} (0 means the probe never wrote; a change means it survived into job 2)"
   fi
@@ -175,7 +199,9 @@ else
   fail "job 2 wrote no observations ($obs missing)"
 fi
 
-if [ -z "$(docker ps -aq --filter 'label=tps.reviewer.job' 2>/dev/null)" ]; then
+if ! leftover="$(docker ps -aq --filter 'label=tps.reviewer.job')"; then
+  fail "docker ps failed, so the fixture cannot tell whether a sandbox container is left behind"
+elif [ -z "$leftover" ]; then
   pass "no sandbox container is left behind"
 else
   fail "leftover sandbox containers: $(docker ps -a --filter 'label=tps.reviewer.job' --format '{{.Names}}' | tr '\n' ' ')"

@@ -61,11 +61,12 @@ under [Known limits](#known-limits).
   runs one sandbox container per job: for each job of the named job's `needs`
   closure, in dependency order, it makes a fresh clone of the assigned commit
   from a read-only source the host provides, starts one container with that
-  job's clone bound writable at `/workspace` (OpenClaw's run model), runs the
-  launcher in it for that one job, then removes the container and discards the
+  job's clone bound writable at `/workspace` and no other host mount
+  (OpenClaw's run model), runs the launcher in it for that one job, then removes
+  the container — refusing the build if the removal fails — and discards the
   job's directory. A job runs only if the jobs it needs succeeded (or its `if:` is
-  `always()`), and it reports `review-build-ok` only if every job ran and every
-  step exited 0.
+  `always()`), and it reports `review-build-ok` only if every job ran to a
+  `job-ok` verdict that names it and every step exited 0.
   `../../scripts/reviewer/per-job-isolation-checks.sh` — the container-level
   checks for this: two jobs linked by `needs`, the first changing a tracked
   file, `.git` state (a ref and the index) and leaving a detached (`setsid`)
@@ -146,7 +147,7 @@ It is not a byte-for-byte comparison with a host-pinned commit: a change `git
 status` does not report (for example a line-ending-only change under a text
 attribute) is not detected here. It does not need to be: each job runs in its
 own container, from its own fresh clone of the assigned commit (see the host
-driver above), so nothing an earlier job did reaches it.
+driver above), so nothing an earlier job did in its tree reaches it.
 
 ## Building and installing on a reviewer host
 
@@ -185,9 +186,9 @@ Trust boundary (host integration, PR 3):
 CI fidelity (`review-build-ok` may disagree with CI):
 
 - Each job of a `needs` closure runs in its own container, from its own fresh
-  clone of the assigned commit, so no state carries over between jobs. A job
-  that installs its dependencies does so into its own tree, from its own cold
-  caches.
+  clone of the assigned commit, so the worktree state does not carry over
+  between jobs. A job that installs its dependencies does so into its own tree,
+  from its own cold caches.
 - On `pull_request`, CI checks out the merge of the head into the base; the
   review builds the assigned head.
 - CI's runner image carries its own Node (e.g. 22.23.2 today) where a workflow
