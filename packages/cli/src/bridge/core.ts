@@ -17,7 +17,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { promote } from "../utils/mail.js";
+import { promote, redriveRetryable } from "../utils/mail.js";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -33,6 +33,8 @@ export interface BridgeCoreConfig {
   defaultChannelId?: string;
   /** Prompt injected when routing Discord messages. Empty string disables header. */
   discordContextPrompt?: string;
+  /** How often retryable dlq/ entries are re-driven, in ms (default 30000). */
+  redriveMs?: number;
 }
 
 export class BridgeCore {
@@ -42,6 +44,7 @@ export class BridgeCore {
   private readonly defaultChannelId: string;
   private readonly discordContextPrompt: string;
   private readonly log: (msg: string) => void;
+  private readonly redriveMs: number;
   private stopOutbound: (() => void) | null = null;
 
   constructor(
@@ -54,7 +57,8 @@ export class BridgeCore {
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
-    this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
+    this.redriveMs = config.redriveMs ?? 30_000;
+    this.log = log ??((msg) => console.log(`${new Date().toISOString()} ${msg}`));
   }
 
   async start(): Promise<void> {
@@ -125,7 +129,7 @@ Message: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {
-    const { fresh } = this.mailboxDir(this.bridgeAgentId);
+    const { fresh, dlq } = this.mailboxDir(this.bridgeAgentId);
     mkdirSync(fresh, { recursive: true });
 
     const processFile = async (file: string) => {
@@ -133,11 +137,7 @@ Message: ${envelope.content}`;
       const fullPath = join(fresh, file);
       if (!existsSync(fullPath)) return;
 
-      // The ONE transition into cur/: promote() verifies the signed envelope,
-      // dead-letters what fails and leaves a retryable record for a later check.
-      // A record this consumer never verified is never forwarded to the channel
-      // (cli#380) — the bridge must not be a second, weaker verification
-      // boundary.
+      // Only a record promote() verified is forwarded (cli#380).
       let promoted: Awaited<ReturnType<typeof promote>>;
       try {
         promoted = await promote(this.bridgeAgentId, fullPath);
@@ -149,10 +149,26 @@ Message: ${envelope.content}`;
         this.log(`[bridge:outbound] ${file} not promoted (${promoted.class}); not forwarded`);
         return;
       }
+      forward(promoted.message.body);
+    };
 
-      // The promoted body is the verified payload (the envelope's body).
+    // Re-drive retryable dlq/ entries (a verifier outage) on every interval.
+    let redriving = false;
+    const redrive = async () => {
+      if (redriving) return;
+      redriving = true;
+      try {
+        for (const promoted of await redriveRetryable(this.bridgeAgentId, dlq)) forward(promoted.message.body);
+      } catch (e) {
+        this.log(`[bridge:outbound] dlq re-drive failed: ${e}`);
+      } finally {
+        redriving = false;
+      }
+    };
+
+    // The promoted body is the verified payload (the envelope's body).
+    const forward = (verifiedBody: string) => {
       let envelope: BridgeEnvelope;
-      const verifiedBody = promoted.message.body;
       let parsedBody: unknown = null;
       try {
         parsedBody = JSON.parse(verifiedBody);
@@ -187,12 +203,16 @@ Message: ${envelope.content}`;
     const watcher = watch(fresh, (_event, filename) => {
       if (filename) void processFile(filename.toString());
     });
+    const redriveTimer = setInterval(() => void redrive(), this.redriveMs);
 
-    return () => { try { watcher.close(); } catch {} };
+    return () => {
+      clearInterval(redriveTimer);
+      try { watcher.close(); } catch {}
+    };
   }
 
   private mailboxDir(agentId: string) {
     const base = join(this.mailDir, agentId);
-    return { fresh: join(base, "new"), cur: join(base, "cur") };
+    return { fresh: join(base, "new"), cur: join(base, "cur"), dlq: join(base, "dlq") };
   }
 }

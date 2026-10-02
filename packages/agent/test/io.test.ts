@@ -36,9 +36,7 @@ describe("MailClient", () => {
     expect(msgs).toEqual([]);
   });
 
-  test("constructing a MailClient without a verifier is refused (cli#380)", () => {
-    // Verification is not optional: the optional client is deleted, so a
-    // MailClient that could promote unverified mail cannot be constructed.
+  test("constructing a MailClient without a verifier throws (cli#380)", () => {
     expect(() => new MailClient(tmpDir, undefined, "testagent")).toThrow(/requires a Flair verifier/);
   });
 

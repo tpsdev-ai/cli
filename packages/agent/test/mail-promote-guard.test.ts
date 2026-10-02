@@ -114,9 +114,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   };
 
   // ── F1 defect 1: verification was optional (no client ⇒ unverified promote) ─
-  test("NO verifier: the client cannot be constructed — the hatch is gone", () => {
-    // cli#380: the optional client is deleted. There is no MailClient without a
-    // verifier, so no state exists that could promote unverified mail.
+  test("NO verifier: construction throws", () => {
     expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);
   });
 
@@ -303,6 +301,55 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(msgs.length).toBe(0);
     expect(files("dlq")).toContain("m1.json");
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
+  });
+
+  test("a messageId outside the shared id rule is rejected (invalid)", async () => {
+    const env = signedEnvelope("flint", AGENT, "bad id", { flint: FLINT }, { messageId: "has a space\n" });
+    plant(wrapper("flint", env));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(0);
+    expect(files("cur").length).toBe(0);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("invalid messageId");
+  });
+
+  test("a replyToId outside the shared id rule is rejected (invalid)", async () => {
+    const env = signedEnvelope("flint", AGENT, "bad reply", { flint: FLINT }, { replyToId: "../../etc" });
+    plant(wrapper("flint", env));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(0);
+    expect(files("cur").length).toBe(0);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("invalid replyToId");
+  });
+
+  test("a signed replay is refused after the first copy has left cur/ (replay)", async () => {
+    const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+
+    plant(wrapper("flint", env), "first.json");
+    expect((await client.checkNewMail()).length).toBe(1);
+    rmSync(join(inbox("cur"), "first.json")); // acked and GC'd
+
+    plant(wrapper("flint", env), "again.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+    expect(files("cur")).not.toContain("again.json");
+    expect(readFileSync(join(inbox("dlq"), "again.json.reason"), "utf-8")).toContain("class: replay");
+  });
+
+  test("a messageId in the mailbox's consumed ledger is refused (replay)", async () => {
+    const env = signedEnvelope("flint", AGENT, "consumed elsewhere", { flint: FLINT });
+    mkdirSync(join(tmpDir, AGENT), { recursive: true });
+    writeFileSync(
+      join(tmpDir, AGENT, "consumed.jsonl"),
+      `${JSON.stringify({ id: env.messageId, at: new Date().toISOString() })}\n`,
+    );
+    plant(wrapper("flint", env));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(0);
+    expect(files("cur").length).toBe(0);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
   });
 
   test("an envelope with a malformed timestamp is rejected (invalid)", async () => {

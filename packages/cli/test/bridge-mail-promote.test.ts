@@ -4,8 +4,7 @@
  *
  * `BridgeCore.watchOutbox()` renamed `new/` → `cur/` itself, so a record the
  * bridge had not verified was forwarded to the channel and left where the
- * runtime reads mail. It now runs each record through the shared `promote()`,
- * which is the ONE transition into `cur/` (verification included).
+ * runtime reads mail. It now runs each record through the shared `promote()`.
  *
  * RED without the fix: the forged record below is forwarded and lands in `cur/`.
  */
@@ -63,7 +62,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   throw new Error("timed out waiting for the bridge to process the mailbox");
 }
 
-function startBridge(): { sent: BridgeEnvelope[]; core: BridgeCore } {
+function startBridge(redriveMs?: number): { sent: BridgeEnvelope[]; core: BridgeCore } {
   const sent: BridgeEnvelope[] = [];
   const adapter: BridgeAdapter = {
     name: "test",
@@ -77,6 +76,7 @@ function startBridge(): { sent: BridgeEnvelope[]; core: BridgeCore } {
     bridgeAgentId: BRIDGE,
     mailDir: root,
     defaultChannelId: "chan-1",
+    redriveMs,
   }, () => {});
   stops.push((core as unknown as { watchOutbox: () => () => void }).watchOutbox());
   return { sent, core };
@@ -121,5 +121,24 @@ describe("the channel bridge promotes before forwarding (cli#380)", () => {
     expect(sent).toEqual([]);
     expect(files("cur")).not.toContain("forged.json");
     expect(files("dlq")).toContain("forged.json");
+  });
+
+  test("a record quarantined by a verifier outage is re-driven and forwarded after recovery", async () => {
+    const goodUrl = process.env.FLAIR_URL;
+    process.env.FLAIR_URL = "http://127.0.0.1:1"; // no listener: a retryable outage
+    let sent: BridgeEnvelope[];
+    try {
+      ({ sent } = startBridge(50));
+      plant("outage.json", SENDER, SENDER_SEED, "after the outage");
+      await waitFor(() => files("dlq").includes("outage.json"));
+      expect(sent).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = goodUrl;
+    }
+
+    await waitFor(() => sent.length === 1);
+    expect(sent[0]!.content).toBe("after the outage");
+    expect(files("cur")).toContain("outage.json");
+    expect(files("dlq")).not.toContain("outage.json");
   });
 });

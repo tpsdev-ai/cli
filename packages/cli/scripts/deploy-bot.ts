@@ -3,7 +3,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { promote } from "../src/utils/mail.js";
+import { promote, redriveRetryable } from "../src/utils/mail.js";
 
 const HOME = homedir();
 
@@ -35,6 +35,7 @@ const ALLOWED_SENDERS = (process.env.DEPLOY_BOT_ALLOWED_SENDERS ?? HOST_AGENT)
 
 const MAIL_NEW_DIR = join(HOME, ".tps", "mail", AGENT_ID, "new");
 const MAIL_CUR_DIR = join(HOME, ".tps", "mail", AGENT_ID, "cur");
+const MAIL_DLQ_DIR = join(HOME, ".tps", "mail", AGENT_ID, "dlq");
 
 type MailRow = { id: string; from: string; body: string };
 
@@ -48,12 +49,9 @@ function log(msg: string) {
 }
 
 /**
- * Promote every `new/` record through the shared promote() boundary and return
- * the commands it verified. promote() is the ONE transition into `cur/`: it
- * verifies the signed envelope and dead-letters what fails, so a retryable
- * outage is re-driven by a later check. This script must never rename into
- * `cur/` itself (cli#380): a direct rename skips verification, and `cur/` is a
- * live delivery source.
+ * Promote every `new/` record, then re-drive every retryable `dlq/` entry,
+ * through promote(), and return the commands it verified. This script must
+ * never rename into `cur/` itself (cli#380).
  */
 export async function pollNewMail(): Promise<MailRow[]> {
   if (!existsSync(MAIL_NEW_DIR)) return [];
@@ -70,6 +68,13 @@ export async function pollNewMail(): Promise<MailRow[]> {
     } catch (e: any) {
       log(`WARN promote failed for ${file}: ${e.message}`);
     }
+  }
+  try {
+    for (const result of await redriveRetryable(AGENT_ID, MAIL_DLQ_DIR)) {
+      out.push({ id: result.message.id, from: result.message.from, body: result.message.body });
+    }
+  } catch (e: any) {
+    log(`WARN dlq re-drive failed: ${e.message}`);
   }
   return out;
 }

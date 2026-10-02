@@ -101,19 +101,22 @@ describe("the deploy bot promotes inbound mail through promote() (cli#380)", () 
     expect(files("dlq")).toContain("forged.json");
   });
 
-  test("a record the verifier cannot run on is not promoted (no cur/ write)", async () => {
+  test("a record the verifier cannot run on is not promoted, and the next poll after recovery delivers it", async () => {
     const goodUrl = process.env.FLAIR_URL;
     process.env.FLAIR_URL = "http://127.0.0.1:1"; // no listener: a retryable outage
     try {
       plant("outage.json", SENDER, SENDER_SEED, "status");
       const rows = await bot.pollNewMail();
       expect(rows).toEqual([]);
-      // Refused and re-driveable (dlq), never a delivery: a verifier outage must
-      // not put a record where the runtime can read it.
       expect(files("cur")).not.toContain("outage.json");
       expect(files("dlq")).toContain("outage.json");
     } finally {
       process.env.FLAIR_URL = goodUrl;
     }
+
+    const recovered = await bot.pollNewMail();
+    expect(recovered.map((r) => r.body)).toEqual(["status"]);
+    expect(files("cur")).toContain("outage.json");
+    expect(files("dlq")).not.toContain("outage.json");
   });
 });

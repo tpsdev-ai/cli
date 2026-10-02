@@ -4,11 +4,11 @@
   `packages/cli/scripts/`) and the channel bridge's outbound consumer
   (`BridgeCore.watchOutbox`) moved `new/` records into `cur/` themselves. They
   now run every record through `promote()`, so a record that fails verification
-  is dead-lettered instead of delivered, and a verifier outage leaves it
-  re-driveable. `@tpsdev-ai/agent`'s `MailClient` no longer accepts an optional
-  verifier: a client cannot be constructed without one, so there is no path that
-  promotes unverified mail.
+  is dead-lettered instead of delivered. Each also re-drives retryable `dlq/`
+  entries: the deploy bot on every poll, the bridge every 30 seconds.
+  `@tpsdev-ai/agent`'s `MailClient` throws when constructed without a verifier,
+  and runs the same mailbox policy and consumed-id replay store as `promote()`,
+  which now live in `@tpsdev-ai/agent`.
 
-  A test reads the source tree for writes whose destination is a `cur`
-  directory and fails on any that is not on an explicit list, so a new bypass is
-  red rather than conventional.
+  A test scans the source tree for writes into a `cur` directory (its header
+  states what the scan sees) and fails on any that is not on an explicit list.

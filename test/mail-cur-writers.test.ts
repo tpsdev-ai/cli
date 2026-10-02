@@ -1,38 +1,27 @@
 /**
- * mail-cur-writers.test.ts — cli#380: the enforceable half of the invariant
- * "only promote() writes a mailbox's cur/" — every write into a `cur` directory
- * is an allowed, listed site.
+ * mail-cur-writers.test.ts — cli#380: a source scan for writes into a `cur`
+ * directory that are not on the list below.
  *
- * `cur/` is a LIVE DELIVERY SOURCE (cli#377): a record that lands there is
- * re-verified and re-presented to a tool-holding model. Verification therefore
- * runs on the `new/` → `cur/` transition, and that transition has exactly one
- * implementation: `promote()` in `packages/cli/src/utils/mail.ts`. A second
- * writer is a second verification boundary — which is how the shipped verifier
- * stayed dead for weeks (cli#380).
- *
- * A convention nobody checks is how that happened, so this test READS THE
- * SOURCE TREE (scripts/ and every package's src/ and scripts/) and fails on any
- * write whose DESTINATION is a `cur` directory that is not one of the sites
- * below. Re-add a bypass and it goes red.
- *
- * SCOPE, STATED. The invariant is about a MAILBOX's `cur/` — the inbox store
- * `promote()` governs. Two other stores write a directory named `cur`, and
- * neither is an inbox with a promotion step: the container `outbox/cur` archive
- * (relay.ts) and the office internal-mail store (internal-mail.ts). They are
- * listed below, each with its reason, so they are visible decisions rather than
- * silent holes. The agent MailClient is listed for the same reason: it is a
- * live consumer in another package and cannot call `promote()` (the dependency
- * runs cli → agent), and its verification is mandatory — its verifier is a
- * required constructor argument, not an optional one.
+ * SCOPE, STATED. It reads scripts/ and every package's src/ and scripts/. It
+ * reports a call to one of WRITE_CALLS, or to a function declared in the same
+ * file that passes one of its parameters to a write call as the destination,
+ * when the destination argument holds a `cur` string literal, a name with the
+ * word "cur", or a name assigned from either. A destination reached any other
+ * way (a path returned by a helper, a name from another file) is not seen. Each
+ * listed site must match exactly one call.
  */
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
-/** Write calls and which argument is the DESTINATION ("last" when trailing). */
-const WRITE_CALLS: Record<string, "first" | "last"> = {
+/** Which argument is the DESTINATION: "first", "last", or a 0-based index. */
+type Dest = "first" | "last" | number;
+
+/** Write calls and which argument is the DESTINATION. */
+const WRITE_CALLS: Record<string, Dest> = {
   appendFile: "first",
   appendFileSync: "first",
+  "Bun.write": "first",
   copyFile: "last",
   copyFileSync: "last",
   cpSync: "last",
@@ -47,19 +36,24 @@ const WRITE_CALLS: Record<string, "first" | "last"> = {
 
 /**
  * Every write into a `cur` directory the scan may find. Each entry names the
- * file and the call, so a stale entry (a site that moved or vanished) fails the
- * test too.
+ * file and the call, and must match exactly one call: a stale entry, or a
+ * second call matching an entry, fails the test.
  */
 const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
   {
     file: "packages/cli/src/utils/mail.ts",
     contains: "renameSync(scratchPath, curPath)",
-    why: "promote() — the ONE transition into a mailbox's cur/, the verification boundary itself",
+    why: "promote() — first delivery into a mailbox's cur/",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(full, present)",
+    why: "checkMessages' lease sweep — re-stamps a record already in cur/ after recoverPromoted re-verified it",
   },
   {
     file: "packages/agent/src/io/mail.ts",
     contains: "renameSync(srcPath, dstPath)",
-    why: "MailClient — verified promotion; @tpsdev-ai/agent cannot import packages/cli (cli → agent), so it cannot call promote(); its verifier is a required constructor argument",
+    why: "MailClient.commitToCur — runs the shared mailbox policy and replay store (@tpsdev-ai/agent mailbox-policy.ts) that promote() runs; @tpsdev-ai/agent cannot import packages/cli, so it cannot call promote()",
   },
   {
     file: "packages/cli/src/utils/relay.ts",
@@ -69,13 +63,13 @@ const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
   {
     file: "packages/cli/src/utils/internal-mail.ts",
     contains: "renameSync(fromPath, toPath)",
-    why: "the office internal-mail store — a separate mailroom with no envelope promotion",
+    why: "the office internal-mail store — a separate inbox outside the signed-envelope promotion path",
   },
 ];
 
 const SKIP_DIRS = new Set(["node_modules", "dist", "test", "tests", "__tests__", "fixtures", "test-reports"]);
 
-/** Every `.ts`/`.js` source file the invariant covers. */
+/** Every `.ts`/`.js` source file the scan covers. */
 function sourceFiles(): string[] {
   const roots = ["scripts"];
   for (const pkg of readdirSync("packages")) {
@@ -126,7 +120,7 @@ function hasCurWord(name: string): boolean {
   return name.split(/[^A-Za-z0-9]+|(?=[A-Z])/).some((w) => w.toLowerCase() === "cur");
 }
 
-/** Locals and `this.X` fields bound to a cur path (one level of propagation). */
+/** Locals and `this.X` fields bound to a cur path. */
 function curNames(text: string): Set<string> {
   const names = new Set<string>();
   const add = (name: string, rhs: string) => {
@@ -144,7 +138,7 @@ function isCurDestination(dest: string, names: Set<string>): boolean {
   return identifiers(dest).some((n) => hasCurWord(n) || names.has(n));
 }
 
-/** The call's arguments, from the `(` at `open` to its matching `)`. */
+/** The text from the bracket at `open` to its match, split at depth-1 commas. */
 function callArgs(text: string, open: number): string[] {
   const args: string[] = [];
   let depth = 0;
@@ -168,45 +162,158 @@ function callArgs(text: string, open: number): string[] {
   return args;
 }
 
-/** Every write call in the file whose destination is a cur directory. */
-function curWriters(file: string): string[] {
-  const text = readFileSync(file, "utf-8");
+/** The index just past the bracket group that opens at `open`. */
+function groupEnd(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "(" || ch === "[" || ch === "{") depth++;
+    else if ((ch === ")" || ch === "]" || ch === "}") && --depth === 0) return i + 1;
+  }
+  return text.length;
+}
+
+const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Each call to `fn` in `text`: its offset and its argument texts. */
+function callsOf(text: string, fn: string): Array<{ at: number; args: string[] }> {
+  const out: Array<{ at: number; args: string[] }> = [];
+  for (const m of text.matchAll(new RegExp(`(?<![\\w$])${escape(fn)}\\s*\\(`, "g"))) {
+    out.push({ at: m.index!, args: callArgs(text, m.index! + m[0].length - 1) });
+  }
+  return out;
+}
+
+function destOf(args: string[], spec: Dest): string | undefined {
+  if (spec === "first") return args[0];
+  if (spec === "last") return args[args.length - 1];
+  return args[spec];
+}
+
+/**
+ * The write calls of WRITE_CALLS plus every function declared in `text`
+ * (`function f(...) {` or `const f = (...) => {`) that passes one of its own
+ * parameters into the destination of a known write call.
+ */
+function writeCallsFor(text: string): Record<string, Dest> {
+  const calls: Record<string, Dest> = { ...WRITE_CALLS };
+  const decls: Array<{ name: string; params: string[]; body: string }> = [];
+  const heads = [
+    ...text.matchAll(/function\s+([A-Za-z_$][\w$]*)\s*\(/g),
+    ...text.matchAll(/(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(/g),
+  ];
+  for (const d of heads) {
+    const open = d.index! + d[0].length - 1;
+    const close = groupEnd(text, open);
+    const arrow = d[0].startsWith("function") ? /^\s*(?::[^{=;]+)?\{/ : /^\s*(?::[^{=;]+)?=>\s*\{/;
+    const head = arrow.exec(text.slice(close));
+    if (!head) continue;
+    const bodyStart = close + head[0].length - 1;
+    decls.push({
+      name: d[1]!,
+      params: callArgs(text, open).map((p) => p.trim().split(/[\s:=?]/)[0]!),
+      body: text.slice(bodyStart, groupEnd(text, bodyStart)),
+    });
+  }
+  for (let changed = true; changed; ) {
+    changed = false;
+    for (const { name, params, body } of decls) {
+      if (name in calls) continue;
+      for (const [fn, spec] of Object.entries(calls)) {
+        if (fn === name) continue;
+        for (const c of callsOf(body, fn)) {
+          const dest = destOf(c.args, spec);
+          if (dest === undefined) continue;
+          const ids = identifiers(dest);
+          const idx = params.findIndex((p) => p !== "" && ids.includes(p));
+          if (idx !== -1) {
+            calls[name] = idx;
+            changed = true;
+            break;
+          }
+        }
+        if (name in calls) break;
+      }
+    }
+  }
+  return calls;
+}
+
+/** Every write call in `text` whose destination is a cur directory. */
+function curWritersInText(text: string): string[] {
   const names = curNames(text);
   const found: string[] = [];
-  for (const fn of Object.keys(WRITE_CALLS)) {
-    for (const m of text.matchAll(new RegExp(`\\b${fn}\\s*\\(`, "g"))) {
-      const args = callArgs(text, m.index! + m[0].length - 1);
-      if (args.length === 0) continue;
-      const dest = WRITE_CALLS[fn] === "last" ? args[args.length - 1]! : args[0]!;
-      if (!isCurDestination(dest, names)) continue;
-      found.push(`${fn}(${args.map((a) => a.replace(/\s+/g, " ").trim()).join(", ")})`);
+  for (const [fn, spec] of Object.entries(writeCallsFor(text))) {
+    for (const c of callsOf(text, fn)) {
+      if (c.args.length === 0) continue;
+      const dest = destOf(c.args, spec);
+      if (dest === undefined || !isCurDestination(dest, names)) continue;
+      found.push(`${fn}(${c.args.map((a) => a.replace(/\s+/g, " ").trim()).join(", ")})`);
     }
   }
   return found;
 }
 
+/** Match found calls against ALLOWED: each entry admits exactly one call. */
+function classify(found: Array<{ file: string; call: string }>): { offenders: string[]; stale: string[] } {
+  const offenders: string[] = [];
+  const used = new Set<number>();
+  for (const { file, call } of found) {
+    const idx = ALLOWED.findIndex((entry, i) => !used.has(i) && entry.file === file && call.includes(entry.contains));
+    if (idx === -1) offenders.push(`${file}: ${call}`);
+    else used.add(idx);
+  }
+  const stale = ALLOWED.filter((_, i) => !used.has(i)).map((e) => `${e.file}: ${e.contains}`);
+  return { offenders, stale };
+}
+
+function scanTree(override?: { file: string; text: string }): Array<{ file: string; call: string }> {
+  const found: Array<{ file: string; call: string }> = [];
+  for (const path of sourceFiles()) {
+    const file = relative(process.cwd(), path);
+    const text = override && override.file === file ? override.text : readFileSync(path, "utf-8");
+    for (const call of curWritersInText(text)) found.push({ file, call });
+  }
+  return found;
+}
+
 describe("cli#380: no unlisted writer of a cur/ directory", () => {
-  test("every write into a cur/ directory in the source tree is an allowed, listed site", () => {
+  test("every write into a cur/ directory the scan finds is a listed site", () => {
     const files = sourceFiles();
-    // A scan that saw nothing is a probe smell, not a pass: the tree has the
-    // promote() write, so the list below is never empty.
+    // A scan that saw nothing is a probe smell, not a pass.
     expect(files.length).toBeGreaterThan(100);
 
-    const offenders: string[] = [];
-    const used = new Set<number>();
-    for (const file of files) {
-      const rel = relative(process.cwd(), file);
-      for (const call of curWriters(file)) {
-        const idx = ALLOWED.findIndex((entry) => entry.file === rel && call.includes(entry.contains));
-        if (idx === -1) offenders.push(`${rel}: ${call}`);
-        else used.add(idx);
-      }
-    }
-
+    const { offenders, stale } = classify(scanTree());
     expect(offenders).toEqual([]);
-    // No stale entries: an allowlisted site that no longer exists must fail too,
-    // or the list silently widens with rot.
-    const stale = ALLOWED.filter((_, i) => !used.has(i)).map((e) => `${e.file}: ${e.contains}`);
     expect(stale).toEqual([]);
+  });
+
+  test("a second copy of an allowed call is reported", () => {
+    const file = "packages/agent/src/io/mail.ts";
+    const text = readFileSync(file, "utf-8");
+    const dup = text.replace(
+      "renameSync(srcPath, dstPath);",
+      "renameSync(srcPath, dstPath);\n      renameSync(srcPath, dstPath);",
+    );
+    expect(dup).not.toBe(text);
+    expect(classify(scanTree({ file, text: dup })).offenders).toEqual([
+      `${file}: renameSync(srcPath, dstPath)`,
+    ]);
+  });
+
+  test("a write through a local wrapper, and Bun.write, are reported", () => {
+    const text = [
+      "function put(target: string, data: string) { writeFileSync(target, data); }",
+      "const move = (from: string, to: string) => { renameSync(from, to); };",
+      "const inboxCur = join(root, \"cur\");",
+      "put(join(inboxCur, f), body);",
+      "move(src, join(root, \"cur\", f));",
+      "Bun.write(join(root, \"cur\", f), body);",
+    ].join("\n");
+    expect(curWritersInText(text).sort()).toEqual([
+      "Bun.write(join(root, \"cur\", f), body)",
+      "move(src, join(root, \"cur\", f))",
+      "put(join(inboxCur, f), body)",
+    ]);
   });
 });
