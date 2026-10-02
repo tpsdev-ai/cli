@@ -1,0 +1,1 @@
+- **CI sets up Node immediately after checkout** in the test and GitHub review gateway jobs.
