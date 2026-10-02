@@ -8,8 +8,9 @@ const SOURCE_LAUNCHER = resolve(import.meta.dir, "../bin/tps.cjs");
 const TMP_PREFIX = "tps-launcher-test-";
 const PLATFORM_PKG = `@tpsdev-ai/cli-${process.platform}-${process.arch}`;
 // The launcher is documented to run under node (`#!/usr/bin/env node`). Run it
-// with node here too: bun's require.resolve ignores `paths` and falls back to
-// its global install cache, so a fake package in a temp dir would not be seen.
+// with node here too: when a package is not found under `paths`, bun's
+// require.resolve falls back to its global install cache, so a fake package in
+// a temp dir would not be seen.
 const NODE = "node";
 
 const tempDirs: string[] = [];
