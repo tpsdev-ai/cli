@@ -155,6 +155,33 @@ describe("#435 — one sandbox container per job, from a fresh clone", () => {
     expect(args.filter((a) => a.includes(":/workspace")).length).toBe(1);
   });
 
+  test("a job's sandbox runs as the user that owns its clone", () => {
+    const args = containerArgs({ image: "img", dir: "/jobs/review", envFile: "/jobs/review.env", jobId: "review", user: "1000:1000" });
+    expect(args[args.indexOf("--user") + 1]).toBe("1000:1000");
+    // Without a user the sandbox keeps the image's own user.
+    expect(containerArgs({ image: "img", dir: "/d", envFile: "/e", jobId: "review" })).not.toContain("--user");
+  });
+
+  test("a failed job carries the launcher's output (the step that failed) in its refusal", async () => {
+    publish();
+    const out = "step 3 FAILED: write tracked.txt\n";
+    const docker = (args: string[]) => {
+      if (args[0] === "create") return { status: 0, stdout: "cid\n", stderr: "" };
+      if (args[0] === "start") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "exec") {
+        const verdict = { ok: false, kind: "stage-failed", message: "job build: step 3 (change the tree) exited 1" };
+        return { status: 1, stdout: `${JSON.stringify(verdict)}\n`, stderr: out };
+      }
+      return { status: 0, stdout: "", stderr: "" };
+    };
+    const r = await drive(docker);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("stage-failed");
+      expect((r.refusal as { output?: string }).output).toBe(out);
+    }
+  });
+
   test("depth 1 clones shallow and a full clone is not shallow", () => {
     expect(cloneArgs({ source: "/s", dir: "/d", depth: 1 })).toContain("--depth");
     expect(cloneArgs({ source: "/s", dir: "/d", depth: 1 }).slice(0, 3)).toEqual(["clone", "--quiet", "--depth"]);

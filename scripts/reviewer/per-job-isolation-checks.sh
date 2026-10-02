@@ -70,10 +70,11 @@ jobs:
           bun-version: "@BUN_V@"
       - name: change the tree, .git and leave a detached process
         run: |
-          echo changed > tracked.txt
-          git update-ref refs/heads/job1-marker HEAD
-          echo staged > staged.txt
-          git add staged.txt
+          fail() { echo "step 3 FAILED: $1" >&2; exit 1; }
+          echo changed > tracked.txt || fail "write tracked.txt"
+          git update-ref refs/heads/job1-marker HEAD || fail "git update-ref refs/heads/job1-marker"
+          echo staged > staged.txt || fail "write staged.txt"
+          git add staged.txt || fail "git add staged.txt"
           setsid sh -c 'i=0; while [ $i -lt 100000 ]; do echo tick >> /evidence/job1-alive; i=$((i+1)); sleep 0.2; done' >/dev/null 2>&1 &
           sleep 1
           echo "build-done; heartbeat=$(wc -c < /evidence/job1-alive 2>/dev/null || echo 0) bytes"

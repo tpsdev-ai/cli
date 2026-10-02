@@ -36,9 +36,13 @@ export const ENV_KEYS = Object.freeze({ workflow: "REVIEWER_CI_WORKFLOW", job: "
 /** How long past a job's timeout-minutes the driver waits for its container. */
 export const CONTAINER_GRACE_MS = 60_000;
 export const LABEL = "tps.reviewer.job";
+/** The job's clone belongs to whoever runs this driver; run the sandbox as that user. */
+const currentUser = () => (typeof process.getuid === "function" ? `${process.getuid()}:${process.getgid()}` : undefined);
 
 const ok = (value) => ({ ok: true, ...value });
-const refuse = (kind, message) => ({ ok: false, refusal: { kind, message } });
+/** A job's captured launcher output, bounded to its tail before it is reported. */
+const tailOutput = (text, maxChars = 8192) => { const s = String(text ?? ""); return s.length <= maxChars ? s : s.slice(s.length - maxChars); };
+const refuse = (kind, message, output) => ({ ok: false, refusal: output ? { kind, message, output: tailOutput(output) } : { kind, message } });
 
 /** The default docker runner: one argv, a hard timeout, everything captured. */
 export function dockerRunner(args, { timeoutMs = 120_000 } = {}) {
@@ -61,7 +65,7 @@ export function cloneArgs({ source, dir, depth }) {
 }
 
 /** `docker create` args for one job's sandbox, in OpenClaw's run model. */
-export function containerArgs({ image, dir, envFile, jobId, binds = [] }) {
+export function containerArgs({ image, dir, envFile, jobId, binds = [], user }) {
   return [
     "create",
     "--init",
@@ -72,6 +76,7 @@ export function containerArgs({ image, dir, envFile, jobId, binds = [] }) {
     "--network", "none",
     "--cap-drop", "ALL",
     "--security-opt", "no-new-privileges",
+    ...(user ? ["--user", user] : []),
     "--workdir", "/workspace",
     "-v", `${dir}:/workspace`,
     ...binds.flatMap((b) => ["-v", b]),
@@ -107,7 +112,8 @@ function runOneJob({ job, source, scratch, image, workflow, base, binds, docker,
     rmSync(dir, { recursive: true, force: true });
     return refuse("clone-failed", `job ${job.id}: cloning the assigned commit from the source failed: ${(clone.stderr ?? "").split("\n")[0]}`);
   }
-  // The container's user (uid 1000) must be able to write the bind.
+  // Best effort: the sandbox runs as this user, so it can write the bind;
+  // widen the permissions anyway.
   try {
     execFileSync("chmod", ["-R", "a+rX", dir], { stdio: "ignore" });
     execFileSync("chmod", ["0777", dir], { stdio: "ignore" });
@@ -118,7 +124,7 @@ function runOneJob({ job, source, scratch, image, workflow, base, binds, docker,
   const envFile = join(scratch, `${job.id}.env`);
   writeFileSync(envFile, `${ENV_KEYS.workflow}=${workflow}\n${ENV_KEYS.job}=${job.id}\n${ENV_KEYS.base}=${base}\n`, { mode: 0o600 });
 
-  const created = docker(containerArgs({ image, dir, envFile, jobId: job.id, binds }));
+  const created = docker(containerArgs({ image, dir, envFile, jobId: job.id, binds, user: currentUser() }));
   const cid = (created.stdout ?? "").trim();
   if (created.status !== 0 || cid === "") {
     rmSync(dir, { recursive: true, force: true });
@@ -126,14 +132,16 @@ function runOneJob({ job, source, scratch, image, workflow, base, binds, docker,
   }
   const timeoutMs = job.timeoutMinutes * 60_000 + CONTAINER_GRACE_MS;
   let result;
+  let output = "";
   try {
     const started = docker(["start", cid]);
     if (started.status !== 0) return refuse("container-start", `job ${job.id}: the sandbox container could not be started: ${(started.stderr ?? "").split("\n")[0]}`);
     const exec = docker(["exec", cid, LAUNCHER], { timeoutMs });
+    output = exec.stderr ?? "";
     if (exec.status === null) return refuse("container-timeout", `job ${job.id}: the sandbox container did not finish within ${Math.round(timeoutMs / 1000)} s`);
     const verdict = lastJsonLine(exec.stdout);
     if (!verdict || typeof verdict !== "object") {
-      return refuse("launcher-unreadable", `job ${job.id}: the launcher in the sandbox wrote no verdict (exit ${exec.status})`);
+      return refuse("launcher-unreadable", `job ${job.id}: the launcher in the sandbox wrote no verdict (exit ${exec.status})`, output);
     }
     result = verdict;
   } finally {
@@ -142,7 +150,7 @@ function runOneJob({ job, source, scratch, image, workflow, base, binds, docker,
     rmSync(envFile, { force: true });
   }
   if (result.ok !== true) {
-    return refuse(result.kind ?? "job-failed", result.message ?? `job ${job.id} did not pass`);
+    return refuse(result.kind ?? "job-failed", result.message ?? `job ${job.id} did not pass`, output);
   }
   return ok({ job: job.id, steps: result.jobs?.[0]?.steps ?? [] });
 }
@@ -249,6 +257,7 @@ function main(argv) {
     return 0;
   }
   process.stderr.write(`refused: ${result.refusal.kind}: ${result.refusal.message}\n`);
+  if (result.refusal.output) process.stderr.write(`${result.refusal.output}\n`);
   process.stdout.write(`${JSON.stringify({ status: "refused", ...result.refusal, jobs: result.jobs })}\n`);
   return 1;
 }
