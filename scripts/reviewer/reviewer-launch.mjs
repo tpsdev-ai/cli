@@ -864,6 +864,17 @@ export async function reviewBuild({
       `the reviewed commit resolves to ${resolved.image.id} (node ${resolved.node}, bun ${resolved.bun}) but this sandbox is ${identity.imageId}; run the review in ${resolved.image.id}`,
     );
   }
+  // One image runs every step: a `default` step passes only when no setup-node pins node.
+  const nodePinned = plan.pins.some((p) => p.tool === "node");
+  for (const job of plan.jobs) {
+    const step = job.steps.find((s) => (s.node === "default" ? nodePinned : s.node !== resolved.node));
+    if (step) {
+      return refuse(
+        "node-mismatch",
+        `job ${job.id} step ${step.index} (${step.name}) is planned on node ${step.node} but the image's node is ${resolved.node}`,
+      );
+    }
+  }
 
   prepareHermeticRoot(hermeticRoot);
   const env = hermeticEnv(parentEnv, hermeticRoot);

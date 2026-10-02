@@ -35,7 +35,8 @@
  * `defaults.run` (shell/working-directory); `if:` when it is absent, `true`,
  * `success()` or `always()`; `needs`; `timeout-minutes` on the job (default
  * 360) and on planned `run:` steps, which the launcher enforces (on a skipped
- * `uses:` step it is refused).
+ * `uses:` step it is refused). Each planned `run:` step carries `node`:
+ * `default`, or the version the most recent preceding setup-node pins.
  *
  * WHAT IS SKIPPED (named in the plan, with the reason): the actions in
  * SKIPPED_ACTIONS, each only at a reviewed immutable ref (a full commit SHA whose
@@ -607,6 +608,7 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
   const pins = [];
   const shims = new Set();
   let fetchDepth = null;
+  let stepNode = "default";
   for (const [i, step] of job.steps.entries()) {
     const index = i + 1;
     const label = typeof step?.name === "string" ? step.name : null;
@@ -643,6 +645,8 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
       const u = usesStep(step, at, ctx);
       if (!u.ok) return u;
       if (u.name === "actions/checkout") fetchDepth = u.fetchDepth;
+      const nodePin = u.pins.find((p) => p.tool === "node");
+      if (nodePin) stepNode = nodePin.range;
       skipped.push({ index, ...u.skipped });
       pins.push(...u.pins);
       if (u.shim) shims.add(u.shim);
@@ -671,6 +675,7 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
       env: { ...wfEnv, ...jobEnv.env, ...stepEnv.env },
       always: stepWhen === "always",
       timeoutMinutes: stepTimeout.minutes,
+      node: stepNode,
     });
   }
   if (steps.length === 0) return refuse("no-ci-plan", `${where} has no run: steps; nothing would be built or tested`);
@@ -687,7 +692,7 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
  * @param {{workflowText:string, workflowFile:string, jobId:string, baseBranch:string, reservedEnvKeys?:string[]}} input
  * @returns {{ok:true, workflow:string, job:string,
  *            jobs:{id:string, needs:string[], when:string,
- *                  steps:{index:number, name:string, script:string, workingDirectory:string, env:object, always:boolean}[],
+ *                  steps:{index:number, name:string, script:string, workingDirectory:string, env:object, always:boolean, node:string}[],
  *                  skipped:{index:number, uses:string, tag:string, reason:string}[]}[],
  *            pins:{tool:string, range:string, source:string}[], shims:string[]}
  *          | {ok:false, refusal:{kind:string, message:string}}}

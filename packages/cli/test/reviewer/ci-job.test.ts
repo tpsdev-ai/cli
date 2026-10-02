@@ -146,6 +146,19 @@ describe("this repository's test job", () => {
     expect(p.shims).toEqual(["sfw"]);
   });
 
+  test("the plan annotates the steps of test with node: default up to its setup-node, 24.21.0 after it", () => {
+    const t = jobOf(p, "test");
+    expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
+      [4, "default"],
+      [5, "default"],
+      [6, "default"],
+      [7, "default"],
+      [8, "default"],
+      [10, "24.21.0"],
+      [11, "24.21.0"],
+    ]);
+  });
+
   test("every ref this repository's workflows use for a skipped action is in the reviewed allowlist", () => {
     const dir = resolve(repo, ".github", "workflows");
     for (const file of readdirSync(dir)) {
@@ -458,6 +471,38 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          registry-url: https://r\n      - run: a\n`)).kind).toBe("ci-unhonourable");
     expect(refused(job(`      - uses: ${SETUP_NODE}\n        with:\n          node-version: \${{ matrix.node }}\n      - run: a\n`)).message).toContain("uses a ${{ }} expression");
     expect(refused(job(`      - uses: ${SETUP_NODE}\n      - run: a\n`)).message).toContain("no node-version");
+  });
+
+  test("a mid-job setup-node: the plan annotates a step before it default, a step after it the pinned version", () => {
+    const t = jobOf(
+      plan(
+        job(`      - run: before\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "24.21.0"\n      - run: after\n`),
+      ),
+    );
+    expect(t.steps.map((s: { script: string; node: string }) => [s.script, s.node])).toEqual([
+      ["before", "default"],
+      ["after", "24.21.0"],
+    ]);
+  });
+
+  test("a second setup-node: the plan annotates the steps after it with its version", () => {
+    const t = jobOf(
+      plan(
+        job(
+          `      - run: first\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "24.21.0"\n      - run: second\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "22.22.1"\n      - run: third\n`,
+        ),
+      ),
+    );
+    expect(t.steps.map((s: { script: string; node: string }) => [s.script, s.node])).toEqual([
+      ["first", "default"],
+      ["second", "24.21.0"],
+      ["third", "22.22.1"],
+    ]);
+  });
+
+  test("a job with no setup-node: the plan annotates every step default", () => {
+    const t = jobOf(plan(job("      - run: a\n      - run: b\n")));
+    expect(t.steps.map((s: { node: string }) => s.node)).toEqual(["default", "default"]);
   });
 
   test("socketdev is skipped only in firewall-free mode, which it must name", () => {
