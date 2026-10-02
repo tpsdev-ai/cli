@@ -56,7 +56,7 @@
  * exited 0, with allowed `uses:` steps recorded as skipped.
  *
  * stdout carries exactly one JSON line (the verdict); step output and refusals
- * go to stderr. Exit 0 = job-ok, 1 = refused or failed, 2 = usage.
+ * go to stderr. Exit 0 = job-ok in build mode or self-check-ok with --self-check, 1 = refused or failed, 2 = usage.
  */
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
