@@ -11,6 +11,7 @@ describe("hire onboarding mail UI", () => {
   let root: string;
   let emptyKeys: string;
   let savedEnv: Record<string, string | undefined>;
+  let savedCwd: string;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-hire-mail-ui-"));
@@ -26,9 +27,15 @@ describe("hire onboarding mail UI", () => {
     process.env.TPS_AGENT_ID = "host";
     process.env.TPS_TEST_KEYS_DIR = emptyKeys;
     process.env.TPS_MAIL_DIR = join(root, ".tps", "mail");
+    // findOpenClawConfig walks up from the cwd to $HOME; run from inside the
+    // throwaway HOME so that walk ends here and never reaches the invoking
+    // host's ~/.openclaw/openclaw.json (cli#478).
+    savedCwd = process.cwd();
+    process.chdir(root);
   });
 
   afterEach(() => {
+    process.chdir(savedCwd);
     for (const [name, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;

@@ -1,0 +1,1 @@
+- **The `hire onboarding mail UI` test runs from inside its throwaway HOME.** It rendered the hire UI from the repo cwd with an overridden HOME, so `findOpenClawConfig` walked up past that HOME to the invoking host's `~/.openclaw/openclaw.json` and a host whose config already held the fixture agent failed the test while CI stayed green.
