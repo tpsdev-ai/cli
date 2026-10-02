@@ -60,6 +60,10 @@
 #      `--allow-downgrade` acknowledgement, which `--yes` does NOT imply.
 #   6. It prints a final table — package, previous latest, new latest, and whether
 #      the move was verified against the registry.
+#   7. After a successful move it dispatches the Docker image workflow for the new
+#      `latest`. A dispatch that fails does NOT roll the promote back (the registry
+#      already moved): it exits 6 and prints the command to run by hand.
+#      `--no-docker` skips the dispatch.
 #
 # Every npm call is pinned with `--registry` (NPM_REGISTRY, default
 # https://registry.npmjs.org) so the one path that publishes cannot be redirected
@@ -68,6 +72,7 @@
 # USAGE
 #
 #     scripts/promote-latest.sh [VERSION] [--dry-run] [--yes] [--allow-downgrade]
+#                             [--no-docker]
 #
 #     VERSION             Version to promote. Defaults to the `version` in
 #                         packages/cli/package.json.
@@ -76,6 +81,8 @@
 #     --allow-downgrade   Acknowledge a non-forward promote: the target is older
 #                         than the current `latest` (a downgrade), or is a
 #                         pre-release. `--yes` does NOT imply this.
+#     --no-docker         Do not dispatch the Docker image workflow after a
+#                         successful promote (build the image yourself).
 #     --help              Show usage.
 #
 # ENVIRONMENT
@@ -86,6 +93,9 @@
 #                    https://registry.npmjs.org).
 #     PROMOTE_ROOT   Repo root to read package.json files from (default: the
 #                    script's own parent directory). Set only by the test harness.
+#     GH_BIN         GitHub CLI used to dispatch the Docker image workflow
+#                    (default: `gh`). Overridable so the test harness can inject
+#                    a stub.
 #
 # EXIT CODES
 #
@@ -98,6 +108,8 @@
 #     4  the promote did not complete for all six — failed, not landed, or
 #        interrupted (rolled back where possible)
 #     5  the promote failed AND a rollback did not restore the registry
+#     6  the promote succeeded, but the Docker image dispatch failed; the move
+#        stands and is NOT rolled back — run the printed command by hand
 set -euo pipefail
 
 # ── bash version guard ───────────────────────────────────────────────────────
@@ -112,6 +124,7 @@ fi
 
 NPM_BIN="${NPM_BIN:-npm}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+GH_BIN="${GH_BIN:-gh}"
 root="${PROMOTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # The six published packages, in dependency order: the four platform binaries
@@ -124,12 +137,14 @@ EXIT_REFUSED=2
 EXIT_ABORTED=3
 EXIT_INCOMPLETE=4
 EXIT_ROLLBACK_FAILED=5
+EXIT_DISPATCH_FAILED=6
 
 die() { printf 'promote-latest: %s\n' "$1" >&2; exit "${2:-$EXIT_USAGE}"; }
 
 usage() {
   cat <<'EOF'
 Usage: scripts/promote-latest.sh [VERSION] [--dry-run] [--yes] [--allow-downgrade]
+                                [--no-docker]
 
 Move the `latest` dist-tag of every @tpsdev-ai package to VERSION. All six move
 together; the script refuses if any is not published at VERSION.
@@ -139,7 +154,17 @@ together; the script refuses if any is not published at VERSION.
   --yes               Skip the confirmation prompt (for a scripted run).
   --allow-downgrade   Acknowledge a non-forward promote: an older target (a
                       downgrade) or a pre-release. `--yes` does NOT imply this.
+  --no-docker         Do not dispatch the Docker image workflow after a
+                      successful promote (build the image yourself).
   --help              Show this help.
+
+After a successful move, the script dispatches the Docker image workflow for
+VERSION:
+
+    gh workflow run docker.yml --repo tpsdev-ai/cli -f version=VERSION
+
+A failed dispatch does not roll the promote back: it exits 6 and prints the
+command to run by hand. `--no-docker` skips the dispatch.
 
 Each `npm dist-tag add` runs with the script's own stdin/stdout/stderr (not
 captured), so npm's browser 2FA can run when the script itself is run from a
@@ -147,7 +172,13 @@ terminal. npm prompts for 2FA only when stdin and stdout are both a terminal:
 do not pipe or redirect either.
 
 Environment: NPM_BIN (default `npm`); NPM_REGISTRY (default
-https://registry.npmjs.org) pins every npm call.
+https://registry.npmjs.org) pins every npm call; GH_BIN (default `gh`) is the
+GitHub CLI used for the dispatch.
+
+Exit codes: 0 promoted; 1 usage error or unsupported bash; 2 refused before
+acting; 3 not confirmed (or a non-forward promote not acknowledged); 4 promote
+did not complete (rolled back where possible); 5 rollback did not restore the
+registry; 6 promoted, but the Docker image dispatch failed.
 EOF
 }
 
@@ -172,11 +203,13 @@ version=""
 dry_run=0
 assume_yes=0
 allow_downgrade=0
+no_docker=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --yes | -y) assume_yes=1 ;;
     --allow-downgrade) allow_downgrade=1 ;;
+    --no-docker) no_docker=1 ;;
     --help | -h)
       usage
       exit 0
@@ -403,6 +436,36 @@ print_final_table() {
   done
 }
 
+# Dispatch the Docker image workflow for the version that has just become
+# `latest`. Called only from the success branch, where every package's `latest`
+# was re-read and confirmed at $version. The promote has already succeeded and
+# must NOT be rolled back if the dispatch fails, so a failure exits with the
+# distinct EXIT_DISPATCH_FAILED and prints the command to run by hand.
+dispatch_docker() {
+  if [ "$no_docker" -eq 1 ]; then
+    printf 'promote-latest: --no-docker set — skipping the Docker image dispatch.\n'
+    return 0
+  fi
+  if command -v "$GH_BIN" >/dev/null 2>&1; then
+    set +e
+    dispatch_err="$("$GH_BIN" workflow run docker.yml --repo tpsdev-ai/cli -f "version=$version" 2>&1)"
+    dispatch_rc=$?
+    set -e
+  else
+    dispatch_rc=127
+    dispatch_err="gh not found ($GH_BIN)"
+  fi
+  if [ "$dispatch_rc" -eq 0 ]; then
+    printf 'promote-latest: dispatched the Docker image build for %s.\n' "$version"
+    return 0
+  fi
+  # Collapse a multi-line gh error into the single warning line below.
+  dispatch_err="$(printf '%s' "$dispatch_err" | tr '\n' ' ')"
+  printf 'promote-latest: Docker image dispatch could not be confirmed (%s); the promote stands — check workflow runs before retrying: gh workflow run docker.yml --repo tpsdev-ai/cli -f version=%s\n' \
+    "${dispatch_err:-gh exited $dispatch_rc}" "$version" >&2
+  exit "$EXIT_DISPATCH_FAILED"
+}
+
 # ── 4. interrupt handling ────────────────────────────────────────────────────
 # Installed only now: before this point nothing has moved, so the default signal
 # action is harmless. A signal during the move loop must roll back, not leave a
@@ -471,6 +534,24 @@ for ((i = 0; i < NPKG; i++)); do
   fi
 done
 
+# Re-read every package, including ones that were already at the target before
+# the move. Keep rollback handling active until this final registry check ends.
+if [ "$failure" -eq 0 ]; then
+  for ((i = 0; i < NPKG; i++)); do
+    set +e
+    post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    prc=$?
+    set -e
+    post="$(trim "$post")"
+    new_latest[i]="$post"
+    if [ "$prc" -ne 0 ] || [ "$post" != "$version" ]; then
+      failure=1
+      printf 'promote-latest: final registry check failed for %s — expected %s, got %s.\n' \
+        "${names[i]}" "$version" "${post:-<unreadable>}" >&2
+    fi
+  done
+fi
+
 # ── 6. all-six-or-none: select the branch, THEN stop handling termination ─────
 # The handlers are still active here. Clearing them BEFORE this branch is what
 # left a window in which a signal killed the script mid-rollback. Select the
@@ -493,6 +574,7 @@ done
 
 if [ "$failure" -eq 0 ] && [ "$all_ok" -eq 1 ]; then
   printf '\npromote-latest: OK — "latest" is now %s for all six packages (verified against the registry).\n' "$version"
+  dispatch_docker
   exit 0
 fi
 
@@ -501,5 +583,5 @@ if [ "$rollback_failed" -ne 0 ]; then
   exit "$EXIT_ROLLBACK_FAILED"
 fi
 
-printf '\npromote-latest: FAILED — the promote did not complete for all six packages; the registry was restored to the previous "latest".\n' >&2
+printf '\npromote-latest: FAILED — the promote did not complete for all six packages; packages moved by this run were rolled back. Check the registry before retrying.\n' >&2
 exit "$EXIT_INCOMPLETE"
