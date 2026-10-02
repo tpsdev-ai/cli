@@ -134,7 +134,10 @@ describe("Renovate @tpsdev-ai scope (cli#424)", () => {
   it("checks regular, non-symlinked package.json files outside node_modules and .git for nonrelease @tpsdev-ai/* dependencies", () => {
     const allowed = new Set(releasePackages());
     const files = packageJsonPaths();
-    expect(files.length).toBeGreaterThan(0);
+    // The walk must reach the packages that carry @tpsdev-ai/* dependencies, not just any file.
+    for (const known of ["packages/cli", "packages/agent", "packages/cli-linux-x64", "plugins/openclaw-tps-mail"]) {
+      expect(files).toContain(join(ROOT, known, "package.json"));
+    }
 
     const violations: string[] = [];
     for (const file of files) {
