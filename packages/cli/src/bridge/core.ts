@@ -152,7 +152,6 @@ Message: ${envelope.content}`;
       forward(promoted.message.body);
     };
 
-    // Re-drive retryable dlq/ entries (a verifier outage) on every interval.
     let redriving = false;
     const redrive = async () => {
       if (redriving) return;

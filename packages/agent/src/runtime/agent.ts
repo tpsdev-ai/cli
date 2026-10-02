@@ -26,7 +26,7 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Verification uses config.url, FLAIR_URL, then http://127.0.0.1:9926.
+    // Verification uses config.flair?.url, FLAIR_URL, then http://127.0.0.1:9926.
     const verifyProvider = new FlairContextProvider(config.agentId, config.flair ?? {});
     const flairClient: FlairClient = {
       getAgent: async (name: string) => {

@@ -325,7 +325,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
 
     plant(wrapper("flint", env), "first.json");
     expect((await client.checkNewMail()).length).toBe(1);
-    rmSync(join(inbox("cur"), "first.json")); // acked and GC'd
+    rmSync(join(inbox("cur"), "first.json"));
 
     plant(wrapper("flint", env), "again.json");
     expect((await client.checkNewMail()).length).toBe(0);

@@ -1,15 +1,6 @@
 /**
  * mail-verify.ts — the verify-ready Flair client for mail promotion.
  *
- * `promote()` in utils/mail.ts constructs a verifier UNCONDITIONALLY through
- * this module. There is deliberately no client parameter on promote()/
- * checkMessages(): optional verification is exactly how this rotted, and a
- * default is the same hatch wearing a friendlier face.
- *
- * Why this is its own module: it is the one seam the tests replace (bun's
- * `mock.module`) to keep verification hermetic. The live path always calls it —
- * nothing can skip it.
- *
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
  * `FlairAgent.publicKey` as hex or canonical base64, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).

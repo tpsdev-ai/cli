@@ -99,8 +99,6 @@ export class MailClient {
   }
 
   /**
-   * Return all messages in inbox/new and move them to inbox/cur/.
-   *
    * A record is promoted ONLY after the shared mailbox policy
    * (decideEnvelopeForMailbox) passes and, under the mailbox lock, the shared
    * replay store has not seen its messageId:

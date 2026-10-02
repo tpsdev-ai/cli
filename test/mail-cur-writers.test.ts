@@ -2,13 +2,12 @@
  * mail-cur-writers.test.ts — cli#380: a source scan for writes into a `cur`
  * directory that are not on the list below.
  *
- * SCOPE, STATED. It reads scripts/ and every package's src/ and scripts/. It
- * reports a call to one of WRITE_CALLS, or to a function declared in the same
- * file that passes one of its parameters to a write call as the destination,
- * when the destination argument holds a `cur` string literal, a name with the
- * word "cur", or a name assigned from either. A destination reached any other
- * way (a path returned by a helper, a name from another file) is not seen. Each
- * listed site must match exactly one call.
+ * It scans .ts/.tsx/.mts/.cts/.js/.mjs files under scripts/ and package src/
+ * and scripts/, excluding .d.ts and SKIP_DIRS. WRITE_CALLS and same-file
+ * function declarations or parenthesized const/let arrow wrappers are matched
+ * by text patterns. Destination heuristics use CUR_LITERAL, cur-word names
+ * and curNames(); other destinations may be missed. Each listed site must
+ * match exactly one detected call.
  */
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -35,8 +34,7 @@ const WRITE_CALLS: Record<string, Dest> = {
 };
 
 /**
- * Every write into a `cur` directory the scan may find. Each entry names the
- * file and the call, and must match exactly one call: a stale entry, or a
+ * Each entry must match exactly one call: a stale entry, or a
  * second call matching an entry, fails the test.
  */
 const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
@@ -53,7 +51,7 @@ const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
   {
     file: "packages/agent/src/io/mail.ts",
     contains: "renameSync(srcPath, dstPath)",
-    why: "MailClient.commitToCur — runs the shared mailbox policy and replay store (@tpsdev-ai/agent mailbox-policy.ts) that promote() runs; @tpsdev-ai/agent cannot import packages/cli, so it cannot call promote()",
+    why: "MailClient — shared mailbox policy and replay store",
   },
   {
     file: "packages/cli/src/utils/relay.ts",
@@ -115,12 +113,10 @@ function identifiers(expr: string): string[] {
   return [...codeOnly(expr).matchAll(IDENT)].map((m) => m[0]!.split(".").pop()!);
 }
 
-/** A name holds a `cur` path when one of its camelCase/snake_case words is "cur". */
 function hasCurWord(name: string): boolean {
   return name.split(/[^A-Za-z0-9]+|(?=[A-Z])/).some((w) => w.toLowerCase() === "cur");
 }
 
-/** Locals and `this.X` fields bound to a cur path. */
 function curNames(text: string): Set<string> {
   const names = new Set<string>();
   const add = (name: string, rhs: string) => {
@@ -138,7 +134,6 @@ function isCurDestination(dest: string, names: Set<string>): boolean {
   return identifiers(dest).some((n) => hasCurWord(n) || names.has(n));
 }
 
-/** The text from the bracket at `open` to its match, split at depth-1 commas. */
 function callArgs(text: string, open: number): string[] {
   const args: string[] = [];
   let depth = 0;
@@ -162,7 +157,6 @@ function callArgs(text: string, open: number): string[] {
   return args;
 }
 
-/** The index just past the bracket group that opens at `open`. */
 function groupEnd(text: string, open: number): number {
   let depth = 0;
   for (let i = open; i < text.length; i++) {
@@ -175,7 +169,6 @@ function groupEnd(text: string, open: number): number {
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** Each call to `fn` in `text`: its offset and its argument texts. */
 function callsOf(text: string, fn: string): Array<{ at: number; args: string[] }> {
   const out: Array<{ at: number; args: string[] }> = [];
   for (const m of text.matchAll(new RegExp(`(?<![\\w$])${escape(fn)}\\s*\\(`, "g"))) {
@@ -189,11 +182,6 @@ function destOf(args: string[], spec: Dest): string | undefined {
   return args[spec];
 }
 
-/**
- * The write calls of WRITE_CALLS plus every function declared in `text`
- * (`function f(...) {` or `const f = (...) => {`) that passes one of its own
- * parameters into the destination of a known write call.
- */
 function writeCallsFor(text: string): Record<string, Dest> {
   const calls: Record<string, Dest> = { ...WRITE_CALLS };
   const decls: Array<{ name: string; params: string[]; body: string }> = [];
@@ -238,7 +226,6 @@ function writeCallsFor(text: string): Record<string, Dest> {
   return calls;
 }
 
-/** Every write call in `text` whose destination is a cur directory. */
 function curWritersInText(text: string): string[] {
   const names = curNames(text);
   const found: string[] = [];
@@ -276,7 +263,7 @@ function scanTree(override?: { file: string; text: string }): Array<{ file: stri
   return found;
 }
 
-describe("cli#380: no unlisted writer of a cur/ directory", () => {
+describe("cli#380: no unlisted detected writer of a cur/ directory", () => {
   test("every write into a cur/ directory the scan finds is a listed site", () => {
     const files = sourceFiles();
     // A scan that saw nothing is a probe smell, not a pass.

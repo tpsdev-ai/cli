@@ -114,7 +114,7 @@ test("promotion delivers with the public key registered by agent create", async 
   }
 });
 
-test("append after a torn final line preserves the next consumed ID after cur GC", () => {
+test("append after a torn final line preserves the next consumed ID", () => {
   const store = mailboxReplayStore(root);
   const ledger = join(root, "consumed.jsonl");
   fs.writeFileSync(ledger, JSON.stringify({ id: "expired", at: "1970-01-01T00:00:00Z" }) + "\n");

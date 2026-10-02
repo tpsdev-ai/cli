@@ -49,9 +49,7 @@ function log(msg: string) {
 }
 
 /**
- * Promote every `new/` record, then re-drive every retryable `dlq/` entry,
- * through promote(), and return the commands it verified. This script must
- * never rename into `cur/` itself (cli#380).
+ * This script must never rename into `cur/` itself (cli#380).
  */
 export async function pollNewMail(): Promise<MailRow[]> {
   const out: MailRow[] = [];

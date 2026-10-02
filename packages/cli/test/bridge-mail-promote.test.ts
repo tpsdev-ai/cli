@@ -4,7 +4,7 @@
  *
  * `BridgeCore.watchOutbox()` renamed `new/` → `cur/` itself, so a record the
  * bridge had not verified was forwarded to the channel and left where the
- * runtime reads mail. It now runs each record through the shared `promote()`.
+ * runtime reads mail.
  *
  * RED without the fix: the forged record below is forwarded and lands in `cur/`.
  */
@@ -53,7 +53,6 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** Bounded wait (hard 3s cap): never an unbounded poll. */
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let i = 0; i < 150; i++) {
     if (predicate()) return;

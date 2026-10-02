@@ -137,12 +137,9 @@ export async function decideEnvelopeForMailbox(
   // 1. Signature.
   const verified = await verifyEnvelope(envelope, client);
   if (!verified.ok) {
-    // 1a. Topology, not forgery. `verifyEnvelope` resolves every agent-kind
-    //     chain entry PLUS `envelope.from`; an unresolvable principal is a
-    //     presence failure (Flair is UP — an outage throws above and becomes the
-    //     retryable `verify-unavailable`), which on a spoke is the normal shape
-    //     of any cross-office envelope. Classify it as its own TERMINAL class so
-    //     `invalid` covers invalid verification or policy input.
+    // Unresolved-principal presence failure.
+    // CLI promotion attempts verify-unavailable dead-lettering on verifier throws;
+    // MailClient leaves the record in new/ for retry.
     const missing = UNRESOLVABLE_PRINCIPAL_REASON_RE.exec(verified.reason);
     if (missing) {
       const entry = missing[1]!;
@@ -264,9 +261,8 @@ function recordConsumedMessageId(root: string, messageId: string): void {
 }
 
 /**
- * Parse ledger text into the live id set (entries older than `cutoff` are
- * dropped), the lines to keep, and how many lines were dropped. Both ledger
- * readers use it, so they agree on which ids are live.
+ * Parse ledger text, pruning entries with parseable stored timestamps before `cutoff`.
+ * Both ledger readers use it, so they agree on which ids are live.
  */
 function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
@@ -295,14 +291,12 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
     if (!isValidEnvelopeId(id)) throw new Error("consumed history has an invalid ID");
     const at = typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
     if (Number.isNaN(at)) {
-      // Corrupt/absent timestamp (torn append, clock skew). Keep the id — a
-      // consumed id must never be forgotten because we could not date it.
       ids.add(id);
       kept.push(line);
       continue;
     }
     if (at < cutoff) {
-      pruned++; // genuinely older than the retention — the intended age bound
+      pruned++;
       continue;
     }
     ids.add(id);
@@ -312,10 +306,6 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
 }
 
 /**
- * Read the durable ledger, dropping entries older than the retention. Returns
- * the live id set. When pruning actually removed something the ledger is
- * rewritten in place (atomic replace) so the file stays bounded by age.
- *
  * The replace drops any line appended between the read and the rename, so call
  * this only while holding the mailbox lock. A reader that does not hold the
  * lock uses peekConsumedLedger.
