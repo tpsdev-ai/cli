@@ -80,10 +80,9 @@ under [Known limits](#known-limits).
   skipped `uses:` step, other `if:` conditions, `continue-on-error`,
   `strategy`, containers/services, non-bash shells, launcher-owned env keys,
   and credential-shaped or config-redirecting env such as `GH_TOKEN`,
-  `*_TOKEN`, `GIT_*`, `NPM_CONFIG_*`, `NODE_OPTIONS`, `BASH_ENV`, `LD_*`. The
-  node version is modelled per step: a planned `run:` step records the node it
-  runs under — `default`, or the version the most recent preceding `setup-node`
-  pins (a later `setup-node` re-pins from that step).
+  `*_TOKEN`, `GIT_*`, `NPM_CONFIG_*`, `NODE_OPTIONS`, `BASH_ENV`, `LD_*`. A
+  planned `run:` step carries `node`: `default`, or the version the most recent
+  preceding `setup-node` pins.
 - `../../scripts/reviewer/resolve-runtime.mjs` — resolves `packageManager`,
   `engines`, `.nvmrc`, `.node-version`, `.bun-version`, `.tool-versions` and the
   jobs' pins to ONE matrix image with npm-semver range semantics, or refuses by
@@ -187,10 +186,9 @@ CI fidelity (`review-build-ok` may disagree with CI):
 - On `pull_request`, CI checks out the merge of the head into the base; the
   review builds the assigned head.
 - CI's runner image carries its own Node (e.g. 22.23.2 today) where a workflow
-  does not pin one; the review uses the matrix image's (22.22.1). The plan
-  records the node each `run:` step runs under — `default`, or the version a
-  preceding `setup-node` pins — so a step before a mid-job `setup-node` is not
-  read as pinned.
+  does not pin one; the review uses the selected matrix image's Node (e.g.
+  22.22.1). If any planned `setup-node` pins node, a step planned on `default`
+  refuses the build (`node-mismatch`).
 - Socket Firewall is not reproduced (`sfw` runs the command unwrapped); cache
   restores never happen (a cold build); a workflow's artifact uploads are not
   performed.

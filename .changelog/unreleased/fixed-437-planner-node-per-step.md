@@ -1,5 +1,5 @@
-- **The reviewer build planner records the node each step runs under: the default node before the job's first `setup-node`, its pinned version after (Closes #437).**
+- **The reviewer launcher refuses a build with a step planned on the default node when any planned `setup-node` pins node (Closes #437).**
 
-  A planned `run:` step carries `node` — the version the most recent preceding
-  `setup-node` pins, or `default` for the node the job's environment provides. A
-  later `setup-node` re-pins from that step.
+  A planned `run:` step carries `node`: `default`, or the version the most
+  recent preceding `setup-node` pins. The refusal (`node-mismatch`) names the
+  job, the step, its planned node and the image's node.

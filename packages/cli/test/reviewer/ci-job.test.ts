@@ -146,7 +146,7 @@ describe("this repository's test job", () => {
     expect(p.shims).toEqual(["sfw"]);
   });
 
-  test("the node of test is per step: the default node up to its setup-node, 24.21.0 after it", () => {
+  test("the plan annotates the steps of test with node: default up to its setup-node, 24.21.0 after it", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
       [4, "default"],
@@ -473,7 +473,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     expect(refused(job(`      - uses: ${SETUP_NODE}\n      - run: a\n`)).message).toContain("no node-version");
   });
 
-  test("a mid-job setup-node is modelled per step: a step before it uses the default node, a step after it the pinned version", () => {
+  test("a mid-job setup-node: the plan annotates a step before it default, a step after it the pinned version", () => {
     const t = jobOf(
       plan(
         job(`      - run: before\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "24.21.0"\n      - run: after\n`),
@@ -485,7 +485,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     ]);
   });
 
-  test("a second setup-node re-pins from its own step", () => {
+  test("a second setup-node: the plan annotates the steps after it with its version", () => {
     const t = jobOf(
       plan(
         job(
@@ -500,7 +500,7 @@ describe("uses: — skipped at a reviewed ref, or refused", () => {
     ]);
   });
 
-  test("a job with no setup-node runs every step on the default node", () => {
+  test("a job with no setup-node: the plan annotates every step default", () => {
     const t = jobOf(plan(job("      - run: a\n      - run: b\n")));
     expect(t.steps.map((s: { node: string }) => s.node)).toEqual(["default", "default"]);
   });

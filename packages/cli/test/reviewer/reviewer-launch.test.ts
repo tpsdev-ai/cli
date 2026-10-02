@@ -62,6 +62,7 @@ const launcher = resolve(repo, "scripts", "reviewer", "reviewer-launch.mjs");
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
 const SETUP_BUN = "oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76";
+const SETUP_NODE = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const SOCKET = "socketdev/action@ba6de6cc0565af1f42295590380973573297e31f";
 
 /** Parent-environment values that must never reach a step. */
@@ -522,6 +523,30 @@ describe("A2/A3 — the review build", () => {
       expect(r.refusal.message).toContain("resolves to reviewer-node24-bun1310");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
+  });
+
+  test("a step planned on the default node before a setup-node pin refuses (node-mismatch) before anything runs", async () => {
+    writeWorkspace(
+      "22.x",
+      `      - run: echo ran > review-marker\n        name: early\n      - uses: ${SETUP_NODE}\n        with:\n          node-version: "22.22.1"\n      - run: echo ran > late-marker\n`,
+    );
+    let steps = 0;
+    const r = await build({ runStep: async () => ++steps });
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.refusal.kind).toBe("node-mismatch");
+      expect(r.refusal.message).toBe("job review step 3 (early) is planned on node default but the image's node is 22.22.1");
+    }
+    expect(steps).toBe(0);
+  });
+
+  test("a job whose steps all follow its setup-node pin of the image's node runs every step", async () => {
+    writeWorkspace("22.x", `      - uses: ${SETUP_NODE}\n        with:\n          node-version: "22.22.1"\n      - run: echo one > order\n      - run: echo two >> order\n`);
+    const r = await build();
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.jobs[0].steps.map((s: { code?: number }) => s.code)).toEqual([0, 0]);
+    expect(readFileSync(join(workspace, "order"), "utf8")).toBe("one\ntwo\n");
   });
 
   test("the actual runtime is measured with the CHILD env and must match; a mismatch runs nothing", async () => {

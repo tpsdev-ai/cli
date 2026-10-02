@@ -35,10 +35,8 @@
  * `defaults.run` (shell/working-directory); `if:` when it is absent, `true`,
  * `success()` or `always()`; `needs`; `timeout-minutes` on the job (default
  * 360) and on planned `run:` steps, which the launcher enforces (on a skipped
- * `uses:` step it is refused). The node version is modelled PER STEP, not per
- * job: each planned `run:` step carries `node` — `default` for the node the
- * job's environment provides, or the version the most recent preceding
- * setup-node pins (a later setup-node re-pins from that step).
+ * `uses:` step it is refused). Each planned `run:` step carries `node`:
+ * `default`, or the version the most recent preceding setup-node pins.
  *
  * WHAT IS SKIPPED (named in the plan, with the reason): the actions in
  * SKIPPED_ACTIONS, each only at a reviewed immutable ref (a full commit SHA whose
@@ -610,8 +608,6 @@ function planOneJob(doc, jobId, workflowFile, reserved, wfEnv, wfDefaults, ctx) 
   const pins = [];
   const shims = new Set();
   let fetchDepth = null;
-  // The node a `run:` step runs under: the version the most recent preceding
-  // setup-node pins, or the job environment's default until one appears.
   let stepNode = "default";
   for (const [i, step] of job.steps.entries()) {
     const index = i + 1;
