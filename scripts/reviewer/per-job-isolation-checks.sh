@@ -12,7 +12,8 @@
 #            heartbeat is still growing (the process is still alive).
 # The host driver (run-review-jobs.mjs) runs one sandbox container per job, from
 # a fresh clone of a read-only bare source. review must see a pristine tree and
-# a dead heartbeat.
+# a dead heartbeat. The driver's workflow parser (js-yaml) is taken from the
+# image, not the checkout, so this check needs no node_modules in the repository.
 #
 # Usage: per-job-isolation-checks.sh <image-tag> <image-id>
 set -uo pipefail
@@ -110,7 +111,16 @@ chmod 0777 "$SCRATCH/evidence"
 
 # ── run: one sandbox container per job ───────────────────────────────────────
 
-node "$REPO/scripts/reviewer/run-review-jobs.mjs" \
+# The driver imports js-yaml, the workflow parser. A checkout need not have its
+# dependencies installed (the reviewer-image CI job installs none), so run the
+# driver from a copy of the reviewer modules with the image's pinned js-yaml
+# alongside it; the check then needs no dependencies from the checkout.
+HOSTMOD="$SCRATCH/host"
+mkdir -p "$HOSTMOD/scripts/reviewer" "$HOSTMOD/node_modules"
+cp "$REPO"/scripts/reviewer/*.mjs "$HOSTMOD/scripts/reviewer/"
+docker run --rm "$IMG" tar -cf - -C /opt/reviewer/lib node_modules/js-yaml | tar -xf - -C "$HOSTMOD"
+
+node "$HOSTMOD/scripts/reviewer/run-review-jobs.mjs" \
   --image "$IMG" \
   --source "$SCRATCH/source.git" \
   --scratch "$SCRATCH/jobs" \
@@ -123,7 +133,12 @@ RUN_RC=$?
 if [ "$RUN_RC" -eq 0 ] && grep -q '"status":"review-build-ok"' "$SCRATCH/run.out"; then
   pass "the driver runs the needs closure one container per job to review-build-ok"
 else
-  fail "driver run: rc=${RUN_RC} out=$(cat "$SCRATCH/run.out" 2>/dev/null) err=$(tail -n 3 "$SCRATCH/run.err" 2>/dev/null)"
+  fail "driver run: rc=${RUN_RC}"
+  echo "---- driver stdout ----"
+  sed 's/^/  /' "$SCRATCH/run.out" 2>/dev/null
+  echo "---- driver stderr ----"
+  sed 's/^/  /' "$SCRATCH/run.err" 2>/dev/null
+  echo "---- end driver output ----"
 fi
 
 obs="$SCRATCH/evidence/job2.txt"
