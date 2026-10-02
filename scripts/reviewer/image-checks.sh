@@ -283,9 +283,9 @@ if want A2 || want A3; then
 fi
 
 if want A2; then
-  if [ "$OK_RC" -eq 0 ] && grep -q '"status":"review-build-ok"' "$SCRATCH/ok.out" && [ -e "$SCRATCH/ok/review-marker" ] \
+  if [ "$OK_RC" -eq 0 ] && grep -q '"status":"job-ok"' "$SCRATCH/ok.out" && [ -e "$SCRATCH/ok/review-marker" ] \
     && grep -qF "\"uses\":\"${CHECKOUT_REF}\"" "$SCRATCH/ok.out" && grep -qF "\"uses\":\"${SETUP_BUN_REF}\"" "$SCRATCH/ok.out"; then
-    pass "A2 build path: an in-matrix pin runs the host-named job to review-build-ok and writes the marker; skipped actions are named"
+    pass "A2 build path: an in-matrix pin runs the host-named job to job-ok and writes the marker; skipped actions are named"
   else
     fail "A2 build path in-matrix: rc=${OK_RC} out=$(cat "$SCRATCH/ok.out" 2>/dev/null) err=$(cat "$SCRATCH/ok.err" "$SCRATCH/ok.create.err" 2>/dev/null | tail -n 5)"
   fi
