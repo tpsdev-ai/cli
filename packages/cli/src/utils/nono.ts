@@ -775,8 +775,9 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   // `--sandbox-required`, because it never reaches the attested launch. The
   // command-name check above is satisfied by `agent start`, so before this rule
   // the flag passed the gate and the process then ran unconfined: a guarantee
-  // the path cannot deliver, read as delivered. Refused in every context, TTY
-  // included, until those runtimes are routed through `launchAttested()`.
+  // the path cannot deliver, read as delivered. Refused, TTY included, unless an
+  // earlier rule has already refused, until those runtimes are routed through
+  // `launchAttested()`.
   const exemptRuntime = attestationExemptRuntime(argv);
   if (
     exemptRuntime !== undefined &&

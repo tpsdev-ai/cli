@@ -8,7 +8,8 @@
  * (`nono.ts`) keys on the command name, so the launch gate used to accept
  * `--sandbox-required` on that path and the process then ran unconfined: the
  * flag asserted an isolation the path cannot deliver. The gate now refuses the
- * flag there, before dispatch, in every context.
+ * flag there, before dispatch, TTY included, unless an earlier launch control
+ * has already refused (those paths fail closed too).
  *
  * Black-box: spawns the built CLI with piped stdio (non-TTY), the same shape a
  * wrapper or a unit passes `--runtime` through. Flag literals are duplicated
