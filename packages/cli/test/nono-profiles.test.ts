@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { join } from "node:path";
 import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
+import yaml from "js-yaml";
 import {
   checkProfileLoadable,
   resolveProfilePath,
@@ -167,7 +168,13 @@ describe("the gate is a durable control", () => {
     // The gate cannot be silently orphaned by a later workflow edit.
     expect(yml).toContain("./scripts/check-nono-profiles.sh");
     expect(yml).toContain("NONO_BIN=");
-    expect(yml).toMatch(/macos-(latest|\d+)/);
+    const workflow = yaml.load(yml) as {
+      jobs: Record<string, { strategy: { matrix: { os: string[] } } }>;
+    };
+    const os = workflow.jobs["nono-profile-gate"].strategy.matrix.os;
+    expect(Array.isArray(os)).toBe(true);
+    expect(os.some((label) => /^macos-(latest|\d+)$/.test(label))).toBe(true);
+    expect(os.some((label) => /^ubuntu-(latest|\d+(?:\.\d+)?)$/.test(label))).toBe(true);
     expect(yml).toMatch(/nono-pin|\.nono-version|bc1406e9/);
   });
 });
