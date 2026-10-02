@@ -426,7 +426,7 @@ async function handleVerify(args: CmdArgs): Promise<void> {
 
 async function handleRegister(args: CmdArgs): Promise<void> {
   if (!args.name) {
-    console.error("Usage: tps facts register <name> --command <cmd> --args <json-array> --type <t> [--ttl <ttl>] [--scope <s>] --rationale <text>");
+    console.error("Usage: tps facts register <name> --command <cmd> --args <json-array> --cred-type <t> [--schedule <ttl>] [--scope <s>] --reason <text>");
     process.exit(1);
   }
 

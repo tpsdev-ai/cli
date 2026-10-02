@@ -1,1 +1,1 @@
-- **`--help` and `-h` on a tps subcommand print its usage and exit 0 instead of running it (wrapped-command passthroughs excepted).** Before, `branch init --help` minted a branch identity and opened a listener, and `identity init --help` rewrote the nono profiles.
+- **TPS help flags print usage and exit before dispatch.** Option values, `office exec`, `mail watch --exec`, `secrets-guard` tails and arguments after `--` are excluded. Before, `branch init --help` minted a branch identity and opened a listener, and `identity init --help` rewrote the nono profiles.

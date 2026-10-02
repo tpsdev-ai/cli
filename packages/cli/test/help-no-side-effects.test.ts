@@ -1,14 +1,7 @@
 /**
- * cli#342 — `--help`/`-h` on a subcommand must print that command's usage and
- * exit 0, never run the command. Before the fix, `branch init --help` minted a
- * branch identity and opened a listener, `branch start --help` started a
- * daemon, and `identity init --help` rewrote every nono profile.
- *
- * Black-box: spawn the built CLI under node, non-TTY, with a throwaway HOME and
- * a fake `nono` first on PATH, and assert exit 0, usage on stdout, no file
- * created under HOME, and no `nono run` logged. The command list is read from
- * bin/tps.ts so a new top-level command cannot be added without this test
- * covering its `--help`.
+ * cli#342: help flags print usage without running the command.
+ * Black-box probes use a throwaway HOME and fake nono.
+ * Top-level discovery uses a regex over the USAGE map; secrets-guard is excluded.
  */
 import { describe, test, expect, beforeAll } from "bun:test";
 import { resolve, join } from "node:path";
@@ -19,18 +12,15 @@ import { spawnSync } from "node:child_process";
 const BIN_SOURCE = resolve(import.meta.dir, "../bin/tps.ts");
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 
-/** The top-level commands of bin/tps.ts's dispatch switch, read from the source. */
+/** Discover top-level commands with a regex over the USAGE map. */
 function topLevelCommands(): string[] {
 	const source = readFileSync(BIN_SOURCE, "utf-8");
-	const names = [...source.matchAll(/^ {4}case "([a-z0-9-]+)":/gm)].map((m) => m[1]!);
+	const usage = source.slice(source.indexOf("const USAGE:"), source.indexOf("/** `--` ends TPS"));
+	const names = [...usage.matchAll(/^ {2}([a-z0-9-]+):/gm)].map((m) => m[1]!);
 	return [...new Set(names)].sort();
 }
 
-/**
- * `secrets-guard` wraps a command — its tail is that command's argv — so a
- * `--help` in it is not tps's (cli#342). `tps secrets-guard --help` is
- * therefore out of scope for the help assertions below.
- */
+/** secrets-guard is excluded from the top-level help assertions. */
 const PASS_THROUGH = new Set(["secrets-guard"]);
 
 /** A fresh empty HOME plus a fake `nono` on PATH that logs every invocation. */
@@ -74,11 +64,33 @@ interface Result {
 	nonoRuns: string;
 }
 
-/** Run `<argv> --help` (argv includes the trailing help flag) against a fresh HOME. */
-function runHelp(argv: string[]): Result & { cleanup: () => void } {
+/** Run argv against a fresh HOME. */
+function runHelp(argv: string[], controlled = false): Result & { cleanup: () => void } {
 	const f = fixture();
 	const before = tree(f.home);
-	const r = spawnSync("node", [TPS_BIN, ...argv], {
+	const register = join(f.home, "register.mjs");
+	const loader = join(f.home, "loader.mjs");
+	const handler = join(f.home, "handler.mjs");
+	if (controlled) {
+		writeFileSync(register, 'import { register } from "node:module"; register(new URL("./loader.mjs", import.meta.url));');
+		writeFileSync(loader, `export async function resolve(specifier, context, next) {
+  if (context.parentURL?.endsWith("/dist/bin/tps.js") && ["../src/commands/agent.js", "../src/commands/office.js", "../src/commands/mail.js", "../src/commands/init.js"].includes(specifier)) {
+    return { url: new URL("./handler.mjs", import.meta.url).href, shortCircuit: true };
+  }
+  return next(specifier, context);
+}`);
+		writeFileSync(handler, `import { spawnSync } from "node:child_process";
+export async function runAgent(args) { console.log(JSON.stringify({ message: args.message })); }
+export async function runInit(args) { console.log(JSON.stringify({ model: args.model })); }
+function child(argv) {
+  const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
+  process.exit(r.status ?? 1);
+}
+export async function runOffice(args) { child(args.command); }
+export async function runMail(args) { child(args.hook); }
+`);
+	}
+	const r = spawnSync("node", [...(controlled ? ["--import", register] : []), TPS_BIN, ...argv], {
 		encoding: "utf-8",
 		timeout: 15_000,
 		killSignal: "SIGKILL",
@@ -123,8 +135,7 @@ beforeAll(() => {
 describe("tps --help never executes the command (cli#342)", () => {
 	test("top-level commands print usage and exit 0 with no side effects", () => {
 		const commands = topLevelCommands();
-		// The source parse must see the real dispatch table; a silent regex miss
-		// would turn this test into a no-op.
+		// Guard against an empty regex result.
 		expect(commands.length).toBeGreaterThan(20);
 		expect(commands).toContain("branch");
 		expect(commands).toContain("identity");
@@ -181,17 +192,65 @@ describe("tps --help never executes the command (cli#342)", () => {
 		}
 	}, 30_000);
 
-	test("--help after a `--` separator belongs to the wrapped command, not tps", () => {
-		// `tps office exec <agent> -- <cmd...>` passes its tail through; a `--help`
-		// there must reach the wrapped command. Here the wrapped command is `true`,
-		// so the run must not be turned into tps help.
-		const r = runHelp(["office", "exec", "nobody", "--", "true"]);
-		try {
-			// Not a help request: tps dispatches `office exec`, which fails (there is
-			// no such agent) — the point is that no usage was printed for it.
-			expect(r.out).not.toContain("tps office join <name> <join-token>");
-		} finally {
-			r.cleanup();
+	for (const flag of ["-h", "--help"]) {
+		test(`agent run receives ${flag} as message data`, () => {
+			const r = runHelp(["agent", "run", "--id", "demo", "--message", flag], true);
+			try {
+				expect(r.status).toBe(0);
+				expect(r.out).toContain(JSON.stringify({ message: flag }));
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		test(`a declared string option receives ${flag} as its value`, () => {
+			const r = runHelp(["context", "update", "probe", "--summary", flag, "--json"]);
+			try {
+				expect(r.status).toBe(0);
+				expect(r.out).not.toContain("Usage");
+				expect(JSON.parse(r.out).summary).toBe(flag);
+			} finally { r.cleanup(); }
+		});
+
+		test(`an undeclared value option receives ${flag} as its value`, () => {
+			const r = runHelp(["init", "--model", flag], true);
+			try {
+				expect(r.status).toBe(0);
+				expect(r.out).toContain(JSON.stringify({ model: flag }));
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		for (const separator of [false, true]) {
+			test(`office exec child receives ${flag} ${separator ? "after --" : "without a separator"}`, () => {
+				expectChildData(["office", "exec", "demo", ...(separator ? ["--"] : [])], flag);
+			});
 		}
-	}, 30_000);
+		for (const options of [["--json", "false"], ["--unknown-option", "data"]]) {
+			test(`office exec child receives ${flag} with ${options[0]} before the command`, () => {
+				expectChildData([...options, "office", "exec", "demo"], flag);
+			});
+		}
+		test(`mail watch hook receives ${flag}`, () => {
+			expectChildData(["mail", "watch", "demo", "--sandbox-required", "--exec"], flag);
+		});
+		test(`secrets-guard child receives ${flag}`, () => {
+			expectChildData(["secrets-guard"], flag);
+		});
+	}
 });
+
+function expectChildData(prefix: string[], flag: string): void {
+	const root = mkdtempSync(join(tmpdir(), "tps-help-child-"));
+	const child = join(root, "child.mjs");
+	writeFileSync(child, 'console.log("CHILD_ARGV=" + JSON.stringify(process.argv.slice(2)));');
+	const r = runHelp([...prefix, process.execPath, child, flag], true);
+	try {
+		expect(r.signal).toBeNull();
+		expect(r.status).toBe(0);
+		expect(r.out).toContain(`CHILD_ARGV=${JSON.stringify([flag])}`);
+		expect(r.out).not.toContain("Usage");
+	} finally {
+		r.cleanup();
+		rmSync(root, { recursive: true, force: true });
+	}
+}
