@@ -480,10 +480,12 @@ async function runLauncher(
  */
 async function pollOnce(state: WatcherState): Promise<void> {
   const rescanDue = Date.now() - state.lastCheckAt >= (state.options.rescanIntervalMs ?? RESCAN_INTERVAL_MS);
-  if (!rescanDue && !(await newHasMail(state.paths))) return;
   if (state.stopped) return;
-  state.lastCheckAt = Date.now();
-  const verified = await checkVerified(state);
+  let verified: MailMessage[] = [];
+  if (rescanDue || await newHasMail(state.paths)) {
+    state.lastCheckAt = Date.now();
+    verified = await checkVerified(state);
+  }
   await recoverJournal(state, verified);
   for (const msg of verified) {
     if (state.stopped) return;

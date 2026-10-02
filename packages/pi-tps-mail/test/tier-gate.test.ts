@@ -152,3 +152,29 @@ it("pi real dispatch refuses a bridge no-claim record after verified promotion",
   expect(lines(p.launcherLog())).toEqual([]);
   expect(lines(p.argvLog()).filter((line) => line.startsWith("mail send") || line.startsWith("mail ack"))).toEqual([]);
 });
+
+for (const state of ["prepared", "sent"] as const) {
+  it(`does not recover a bridge-signed internal claim as internal from a ${state} journal`, async () => {
+    plantInbound("internal", "openclaw-bridge");
+    const proc = Bun.spawn([process.execPath, TPS_TS, "mail", "check", "ember", "--json"], {
+      env: { ...process.env, TPS_AGENT_ID: "ember" }, stdout: "pipe", stderr: "pipe",
+    });
+    const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect(code, stderr).toBe(0);
+    expect(JSON.parse(stdout)[0].trustTier).toBe("external");
+    const dir = join(p.mail(), "ember", ".pi-tps-mail", "replies");
+    mkdirSync(dir, { recursive: true });
+    const entry = {
+      v: 1, inboundId: "in-1", to: "openclaw-bridge", threadId: "in-envelope", reply: "old reply",
+      replyMessageId: "old-reply", state, attempts: 0, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(dir, "in-1.json"), JSON.stringify(entry));
+    start();
+    expect(await until(() => lines(p.argvLog()).filter((line) => line.startsWith("mail read")).length >= 2, 3000)).toBe(true);
+    await stop?.();
+    expect(lines(p.argvLog()).filter((line) => line.startsWith("mail send") || line.startsWith("mail ack"))).toEqual([]);
+    expect(lines(p.launcherLog())).toEqual([]);
+    expect(JSON.parse(readFileSync(join(dir, "in-1.json"), "utf8"))).toEqual(entry);
+    expect(existsSync(join(p.mail(), "ember", "cur", "2026-09-28T00-00-00-in-1.json"))).toBe(true);
+  });
+}
