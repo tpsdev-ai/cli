@@ -13,7 +13,7 @@ import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 
-interface HireProps {
+export interface HireProps {
   reportPath: string;
   name?: string;
   workspace?: string;
@@ -28,7 +28,8 @@ interface HireProps {
 
 interface Step {
   label: string;
-  done: boolean;
+  status: "pending" | "done" | "failed";
+  error?: string;
 }
 
 /**
@@ -54,7 +55,7 @@ export function sendOnboardingMail(from: string, agentId: string, agentName: str
   ].join("\n"), { rationale: `agent ${from} hire onboarding` });
 }
 
-function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, inject, runtime = "openclaw", baseModel }: HireProps) {
+export function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, inject, runtime = "openclaw", baseModel }: HireProps) {
   const [steps, setSteps] = useState<Step[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState<Record<string, unknown> | null>(null);
@@ -74,28 +75,28 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
       const generator = getGenerator(runtime);
 
       const allSteps: Step[] = [
-        { label: "Parsing TPS report", done: false },
-        { label: "Validating schema", done: false },
-        { label: `Generating ${runtime} workspace`, done: false },
-        { label: dryRun ? "Dry run — skipping write" : "Writing workspace", done: false },
+        { label: "Parsing TPS report", status: "pending" },
+        { label: "Validating schema", status: "pending" },
+        { label: `Generating ${runtime} workspace`, status: "pending" },
+        { label: dryRun ? "Dry run — skipping write" : "Writing workspace", status: "pending" },
       ];
       if (shouldInject) {
-        allSteps.push({ label: "Injecting into openclaw.json", done: false });
-        allSteps.push({ label: "Sending onboarding mail", done: false });
+        allSteps.push({ label: "Injecting into openclaw.json", status: "pending" });
+        allSteps.push({ label: "Sending onboarding mail", status: "pending" });
       }
       setSteps([...allSteps]);
 
       const parsed = parseTPSReport(resolvedPath);
-      allSteps[0]!.done = true;
+      allSteps[0]!.status = "done";
       setSteps([...allSteps]);
       setReport(parsed);
 
-      allSteps[1]!.done = true;
+      allSteps[1]!.status = "done";
       setSteps([...allSteps]);
 
       // Generate via registry
       const result = generator.generate(parsed, { name, workspace, branch, baseModel });
-      allSteps[2]!.done = true;
+      allSteps[2]!.status = "done";
       setSteps([...allSteps]);
 
       // Write
@@ -111,7 +112,7 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
           writeFileSync(join(dotOpenClaw, "openclaw.json"), JSON.stringify(sandboxConfig, null, 2), "utf-8");
         }
       }
-      allSteps[3]!.done = true;
+      allSteps[3]!.status = "done";
       setSteps([...allSteps]);
 
       // Config injection + onboarding (OpenClaw only)
@@ -124,21 +125,27 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
 
         setInjected(true);
         setBackupPath(injectResult.backupPath);
-        allSteps[4]!.done = true;
+        allSteps[4]!.status = "done";
         setSteps([...allSteps]);
 
         // Onboarding mail
         try {
           // Sign as the CLI's own identity (the same signing path `tps mail
           // send` uses) for the new agent to verify under its Flair and mailbox policy. With no key
-          // this refuses and the step is skipped, rather than writing a body
+          // this refuses and the mail step is marked failed, rather than writing a body
           // no promote() will accept.
           const senderId = await resolveCliSenderId();
           if (sanitizeIdentifier(senderId) !== senderId) throw new Error(`Invalid sender id: ${senderId}`);
           sendOnboardingMail(senderId, result.agentId, result.agentName, parsed.name, result.workspacePath);
           setOnboarded(true);
-        } catch { /* best-effort */ }
-        allSteps[5]!.done = true;
+          allSteps[5]!.status = "done";
+        } catch (e) {
+          // Hiring is best-effort after the workspace and config are written,
+          // but a signing refusal is still a failed mail step. Keep the named
+          // refusal visible instead of turning it into a green check.
+          allSteps[5]!.status = "failed";
+          allSteps[5]!.error = e instanceof Error ? e.message : String(e);
+        }
         setSteps([...allSteps]);
       }
 
@@ -183,8 +190,15 @@ function HireCommand({ reportPath, name, workspace, dryRun, jsonOutput, branch, 
 
       {steps.map((step, i) => (
         <Text key={i}>
-          {step.done ? <Text color="green">✅</Text> : <Text color="gray">⏳</Text>}
+          {step.status === "done" ? (
+            <Text color="green">✅</Text>
+          ) : step.status === "failed" ? (
+            <Text color="red">❌</Text>
+          ) : (
+            <Text color="gray">⏳</Text>
+          )}
           {" "}{step.label}
+          {step.status === "failed" && <Text color="red"> — FAILED: {step.error}</Text>}
         </Text>
       ))}
 

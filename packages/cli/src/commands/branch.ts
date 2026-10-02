@@ -21,7 +21,7 @@ export interface HandlerIncoming {
   id: string;
   from: string;
   to: string;
-  /** The original, already-signed message content. */
+  /** Incoming content after transport schema validation. */
   body: string;
 }
 
@@ -36,9 +36,9 @@ export type HandlerRoute =
  * Route a handler action for a received message.
  *
  * Replies and forwards are signed by the local forwarding identity before
- * queueing. An unchanged forward carries the original envelope as data inside
- * the new signed envelope. Acceptance also requires the recipient's Flair and
- * mailbox policy to accept that identity and envelope.
+ * queueing. An unchanged forward carries the incoming content as data inside
+ * the forwarder's new signed envelope. Acceptance also requires the recipient's
+ * Flair and mailbox policy to accept that identity and envelope.
  */
 export function routeHandlerAction(
   action: HandlerAction,

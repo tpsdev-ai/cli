@@ -11,9 +11,10 @@
  *                                   `tps agent create` generate (and register
  *                                   with Flair).
  *
- * EVERY location that holds a file is read. A configured explicit path, when
- * supplied, must exist and is checked for conflicts alongside both locations.
- * One key is used when every file
+ * When no explicit path is configured, every default location that holds a
+ * file is read. A configured explicit path must exist or resolution refuses
+ * immediately; when it exists, it is checked for conflicts alongside both
+ * default locations. One key is used when every file
  * found holds the SAME key; two files holding DIFFERENT keys are REFUSED
  * (AgentKeyConflictError, naming both paths and the remedy) rather than one
  * silently chosen: a signer that picked the wrong one would sign with a key its
@@ -120,10 +121,11 @@ export function resolveAgentKeyPath(agentName: string, explicitPath?: string): s
 
 /**
  * Read an agent's Ed25519 private key and return the 32-byte signing seed.
- * An explicit configured path must exist and agree with any default keys.
- * Returns null when NO candidate file exists; throws AgentKeyError when a file
- * that exists cannot be read or is not a valid key, and AgentKeyConflictError
- * when two files hold different keys.
+ * An explicit configured path must exist and agree with any default keys; a
+ * missing configured path returns null immediately without reading defaults.
+ * With no explicit path, returns null when no default candidate file exists.
+ * Throws AgentKeyError when a file that exists cannot be read or is not a valid
+ * key, and AgentKeyConflictError when two files hold different keys.
  */
 export function readAgentPrivateKey(agentName: string, explicitPath?: string): Buffer | null {
   return resolveAgentKey(agentName, explicitPath)?.seed ?? null;

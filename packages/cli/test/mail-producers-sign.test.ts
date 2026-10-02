@@ -216,16 +216,16 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
     const promoted = await promoteNew("kern");
     expect(promoted.ok).toBe(true);
 
-    // Unchanged body is carried as data in a new forwarder-signed envelope.
+    // Unchanged incoming content is carried as data in a new forwarder-signed envelope.
     const relayed: Array<{ to: string; body: string; from: string }> = [];
     const r2 = routeHandlerAction(
-      { type: "forward", body: "<signed original>", to: "kern" },
-      { id: "m3", from: "flint", to: "anvil", body: "<signed original>" },
+      { type: "forward", body: "<incoming content>", to: "kern" },
+      { id: "m3", from: "flint", to: "anvil", body: "<incoming content>" },
       (to, body, from) => relayed.push({ to, body, from }),
     );
     expect(r2).toEqual({ kind: "forward", to: "kern" });
     expect(relayed[0]!.from).toBe("anvil");
-    expect(JSON.parse(relayed[0]!.body).body).toBe("<signed original>");
+    expect(JSON.parse(relayed[0]!.body).body).toBe("<incoming content>");
     sendMessage("kern", relayed[0]!.body, relayed[0]!.from);
     const forwarded = await promoteNew("kern");
     expect(forwarded.ok).toBe(true);

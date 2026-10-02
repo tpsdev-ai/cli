@@ -47,10 +47,10 @@ export function signForDelivery(
 
 /**
  * Sign `body` for agent `from` and deliver it into `to`'s mailbox — the local
- * route of `tps mail send`. The record's `from` and `body` are the signed
- * envelope, which `promote()` can accept if the recipient resolves the sender's
- * Flair principal and mailbox policy passes. Returns the written
- * record, as `sendMessage` does.
+ * route of `tps mail send`. The record's `from` must match the signed envelope's
+ * sender, and its `body` contains that envelope. `promote()` can accept the
+ * record if the recipient resolves the sender's Flair principal and mailbox
+ * policy passes. Returns the written record, as `sendMessage` does.
  */
 export function sendSignedMail(
   from: string,
