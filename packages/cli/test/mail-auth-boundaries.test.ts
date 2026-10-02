@@ -1,5 +1,5 @@
 /** Real promote() policy with an in-process public-key provider; no socket bind. */
-import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -11,14 +11,8 @@ hashes.sha512 = (data) => new Uint8Array(createHash("sha512").update(data).diges
 const seeds: Record<string, Buffer> = {
   anvil: Buffer.alloc(32, 0x22),
   host: Buffer.alloc(32, 0x33),
+  kern: Buffer.alloc(32, 0x44),
 };
-mock.module("../src/utils/mail-verify.js", () => ({
-  createMailVerifyClient: async () => ({
-    getAgent: async (name: string) => seeds[name]
-      ? { publicKey: Buffer.from(ed.getPublicKey(seeds[name]!)) }
-      : null,
-  }),
-}));
 const { promote, sendMessage } = await import("../src/utils/mail.js");
 const { routeHandlerAction } = await import("../src/commands/branch.js");
 const { healthMail } = await import("../src/commands/bootstrap.js");
@@ -26,18 +20,40 @@ const { MailClient } = await import("../../agent/src/io/mail.js");
 
 let root: string;
 let saved: Record<string, string | undefined>;
+let originalFetch: typeof globalThis.fetch;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "auth-boundary-"));
   const keys = join(root, "keys");
   mkdirSync(keys);
   for (const [name, seed] of Object.entries(seeds)) writeFileSync(join(keys, `${name}.key`), seed);
   saved = {};
-  for (const name of ["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR"]) saved[name] = process.env[name];
+  for (const name of ["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR", "FLAIR_KEY_PATH"]) saved[name] = process.env[name];
   process.env.HOME = root;
   process.env.TPS_MAIL_DIR = join(root, "mail");
   process.env.TPS_TEST_KEYS_DIR = keys;
+  process.env.FLAIR_KEY_PATH = join(keys, "kern.key");
+  originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL) => {
+    const path = new URL(String(input)).pathname;
+    const match = /^\/Agent\/(.+)$/.exec(path);
+    if (match) {
+      const name = decodeURIComponent(match[1]!);
+      const seed = seeds[name];
+      if (seed) {
+        return Response.json({
+          id: name,
+          name,
+          publicKey: Buffer.from(ed.getPublicKey(seed)).toString("base64"),
+        });
+      }
+      return new Response("not found", { status: 404 });
+    }
+    if (path === "/Health") return new Response("ok");
+    return new Response("not found", { status: 404 });
+  }) as typeof globalThis.fetch;
 });
 afterEach(() => {
+  globalThis.fetch = originalFetch;
   for (const [name, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }

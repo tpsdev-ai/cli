@@ -8,7 +8,7 @@
  *
  * Both homes are temp dirs; nothing here reads or writes a real home.
  */
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import * as ed from "@noble/ed25519";
 import { spawnSync } from "node:child_process";
 import {
@@ -278,15 +278,6 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
   });
 
   test("commands/bootstrap.ts: the completion marker is written under the current HOME", async () => {
-    // Keep this home-path test socket-free while running the real promote()
-    // policy against the registered public key.
-    mock.module("../src/utils/mail-verify.js", () => ({
-      createMailVerifyClient: async () => ({
-        getAgent: async (name: string) => name === "host"
-          ? { publicKey: Buffer.from(ed.getPublicKey(Buffer.alloc(32, 9))) }
-          : null,
-      }),
-    }));
     const mod = await importUnder<any>(homeA, "../src/commands/bootstrap.js?home-per-call");
     process.env.HOME = homeB;
     const agentId = "smoke";
@@ -299,8 +290,27 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.TPS_AGENT_ID = "host";
     const bootstrapKeysDir = join(homeB, "keys");
     mkdirSync(bootstrapKeysDir, { recursive: true });
-    writeFileSync(join(bootstrapKeysDir, "host.key"), Buffer.alloc(32, 9));
+    const hostKey = join(bootstrapKeysDir, "host.key");
+    writeFileSync(hostKey, Buffer.alloc(32, 9));
+    const smokeKey = join(bootstrapKeysDir, "smoke.key");
+    writeFileSync(smokeKey, Buffer.alloc(32, 10));
     process.env.TPS_TEST_KEYS_DIR = bootstrapKeysDir;
+    // Keep this home-path test socket-free while exercising the real
+    // createMailVerifyClient() path. A process-wide mock.module() here would
+    // replace the verifier for every later Bun test file, making their real
+    // stub Flair registrations invisible.
+    const originalFlairKeyPath = process.env.FLAIR_KEY_PATH;
+    process.env.FLAIR_KEY_PATH = smokeKey;
+    const originalFetch = globalThis.fetch;
+    const hostPublicKey = Buffer.from(ed.getPublicKey(Buffer.alloc(32, 9))).toString("base64");
+    globalThis.fetch = (async (input: string | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/Agent/host") {
+        return Response.json({ id: "host", name: "host", publicKey: hostPublicKey });
+      }
+      if (path === "/Health") return new Response("ok");
+      return new Response("not found", { status: 404 });
+    }) as typeof globalThis.fetch;
     // The health checks shell out: a fake `nono` (the lane's fake, as the other
     // bootstrap cases use) plus an `openclaw` that reports a healthy gateway.
     const fakeBin = mkdtempSync(join(tmpdir(), "tps-bootstrap-bin-"));
@@ -335,7 +345,10 @@ exit 0
       await mod.runBootstrap({ agentId });
     } finally {
       console.log = originalLog;
+      globalThis.fetch = originalFetch;
       process.env.PATH = originalPath;
+      if (originalFlairKeyPath === undefined) delete process.env.FLAIR_KEY_PATH;
+      else process.env.FLAIR_KEY_PATH = originalFlairKeyPath;
       if (originalAgentId === undefined) delete process.env.TPS_AGENT_ID;
       else process.env.TPS_AGENT_ID = originalAgentId;
       if (originalKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
