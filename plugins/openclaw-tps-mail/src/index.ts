@@ -59,7 +59,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, mailRootForRecordPath, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -840,7 +840,7 @@ async function internalInbound(ctx: YieldContext): Promise<boolean> {
     if (!record) return false;
     const recovered = record.envelope
       ? await recoverPromoted(ctx.agent, ctx.curPath)
-      : await verifyRecordForMailbox(ctx.agent, record as any, { mailRoot: ctx.mailDir });
+      : await verifyRecordForMailbox(ctx.agent, record as any, mailRootForRecordPath(ctx.curPath));
     if (!recovered.ok || recovered.message.trustTier === "external") return false;
     return recovered.message.from === ctx.sender && recovered.message.id === ctx.inboundId
       && (ctx.inboundEnvelopeId === undefined || recovered.message.envelopeId === ctx.inboundEnvelopeId);
