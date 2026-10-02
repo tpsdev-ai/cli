@@ -87,7 +87,7 @@ test("unchanged branch forward is re-signed by the forwarder and really promotes
 });
 
 test("MailClient output passes the same promote policy", async () => {
-  const client = new MailClient(join(root, "mail"), undefined, "anvil");
+  const client = new MailClient(join(root, "mail"), undefined, "anvil", { getAgent: async () => null });
   await client.sendMail("kern", "runtime mail");
   const outbox = join(root, "mail", "anvil", "outbox");
   const file = readdirSync(outbox).find((f) => f.endsWith(".json"))!;

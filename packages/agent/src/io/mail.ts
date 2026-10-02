@@ -72,17 +72,28 @@ export class MailClient {
   private inboxCur: string;
   private inboxDlq: string;
   private outboxNew: string;
-  /** One-shot guard so a misconfigured (verifier-less) mailbox warns once, not per poll. */
-  private warnedNoVerifier = false;
+  private readonly flairClient: FlairClient;
 
   constructor(
     public readonly mailDir: string,
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
-    private readonly flairClient?: FlairClient,
+    flairClient?: FlairClient,
     /** Configured Flair signing key, checked against both standard locations. */
     private readonly signingKeyPath?: string,
   ) {
+    // cli#380: verification is NOT optional. A MailClient without a verifier is
+    // not a state that exists — refusing here deletes the hatch an unverified
+    // promotion went through (the shared checkMessages deleted its optional
+    // client the same way). There is deliberately no default: a default client
+    // would be the same hatch with a friendlier face.
+    if (!flairClient) {
+      throw new Error(
+        `MailClient requires a Flair verifier for "${agentId}": refusing to construct a mailbox that ` +
+          `could promote unverified mail (cli#380).`,
+      );
+    }
+    this.flairClient = flairClient;
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
     this.inboxDlq = join(mailDir, agentId, "dlq");
@@ -96,9 +107,9 @@ export class MailClient {
    * Return all messages in inbox/new and move them to inbox/cur/.
    *
    * Verification is MANDATORY — a record is promoted ONLY after its signed
-   * envelope verifies against the local Flair. There is no unverified path:
-   *   - NO verifier configured → refuse; the record stays in new/ (an absent
-   *     client must never mean "promote without verifying");
+   * envelope verifies against the local Flair. The verifier is a required
+   * constructor argument (a MailClient without one cannot be constructed), so
+   * there is no unverified path:
    *   - the verifier THROWS (Flair unreachable) → refuse; the record stays in
    *     new/ for a later check (a throw must never mean "pass");
    *   - the verifier REJECTS → dead-letter to dlq/ with a `.reason` sidecar.
@@ -109,30 +120,6 @@ export class MailClient {
 
     const files = readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
     const messages: MailMessage[] = [];
-
-    // No verifier → NOTHING is promotable. Refuse (never rename into cur/) and
-    // leave the records in new/ so a later check with a verifier — or the
-    // shared promote() path — can process them.
-    if (!this.flairClient) {
-      if (files.length === 0) return [];
-      this.events?.emit({
-        type: "mail.receive",
-        agent: this.agentId,
-        status: "rejected",
-        from: "unknown",
-        durationMs: 0,
-        error: "no verifier configured — refusing to promote unverified mail",
-      });
-      if (!this.warnedNoVerifier) {
-        this.warnedNoVerifier = true;
-        console.error(
-          `[MailClient] no Flair verifier configured for "${this.agentId}": refusing to promote ` +
-            `${files.length} unverified message(s) from new/. Unverified input must never reach the ` +
-            `model — configure flair (url + key) or promote through the shared promote() lifecycle.`,
-        );
-      }
-      return [];
-    }
 
     for (const file of files) {
       const started = Date.now();
@@ -320,7 +307,7 @@ export class MailClient {
    * unreachable) is a refusal the caller acts on, never a pass.
    */
   private async verifyMailBody(body: string): Promise<VerifyOutcome> {
-    const client = this.flairClient!;
+    const client = this.flairClient;
 
     // 1. Parse the mail file as JSON
     let mailMsg: { from?: string; body: string };

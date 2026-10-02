@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promote } from "../src/utils/mail.js";
 
 const HOME = homedir();
 
@@ -46,18 +47,28 @@ function log(msg: string) {
   console.log(`[deploy-bot ${new Date().toISOString()}] ${msg}`);
 }
 
-function pollNewMail(): MailRow[] {
+/**
+ * Promote every `new/` record through the shared promote() boundary and return
+ * the commands it verified. promote() is the ONE transition into `cur/`: it
+ * verifies the signed envelope and dead-letters what fails, so a retryable
+ * outage is re-driven by a later check. This script must never rename into
+ * `cur/` itself (cli#380): a direct rename skips verification, and `cur/` is a
+ * live delivery source.
+ */
+export async function pollNewMail(): Promise<MailRow[]> {
   if (!existsSync(MAIL_NEW_DIR)) return [];
   const out: MailRow[] = [];
-  for (const file of readdirSync(MAIL_NEW_DIR)) {
+  for (const file of readdirSync(MAIL_NEW_DIR).sort()) {
     const src = join(MAIL_NEW_DIR, file);
     try {
-      const row = JSON.parse(readFileSync(src, "utf-8")) as MailRow;
-      if (!row?.id || typeof row.body !== "string") continue;
-      out.push(row);
-      renameSync(src, join(MAIL_CUR_DIR, file));
+      const result = await promote(AGENT_ID, src);
+      if (!result.ok) {
+        log(`WARN promote refused ${file}: ${result.class}`);
+        continue;
+      }
+      out.push({ id: result.message.id, from: result.message.from, body: result.message.body });
     } catch (e: any) {
-      log(`WARN parse failed for ${file}: ${e.message}`);
+      log(`WARN promote failed for ${file}: ${e.message}`);
     }
   }
   return out;
@@ -164,15 +175,23 @@ export function dispatch(body: string): string {
   return `❓ unknown command: ${trimmed}\nKnown commands: deploy, status, run <cmd>`;
 }
 
-function tick() {
-  for (const msg of pollNewMail()) {
-    log(`← command from ${msg.from}: ${msg.body.slice(0, 80)}`);
-    if (!ALLOWED_SENDERS.includes(msg.from)) {
-      log(`WARN: rejected command from unauthorized sender: ${msg.from}`);
-      continue;
+let ticking = false;
+
+async function tick() {
+  if (ticking) return; // a slow promotion must not overlap the next poll
+  ticking = true;
+  try {
+    for (const msg of await pollNewMail()) {
+      log(`← command from ${msg.from}: ${msg.body.slice(0, 80)}`);
+      if (!ALLOWED_SENDERS.includes(msg.from)) {
+        log(`WARN: rejected command from unauthorized sender: ${msg.from}`);
+        continue;
+      }
+      const out = dispatch(msg.body);
+      reply(msg.from || HOST_AGENT, out);
     }
-    const out = dispatch(msg.body);
-    reply(msg.from || HOST_AGENT, out);
+  } finally {
+    ticking = false;
   }
 }
 
@@ -181,7 +200,7 @@ if (import.meta.main) {
   log(`Run allowlist: ${RUN_ALLOWLIST.join(", ")}`);
   log(`Allowed senders: ${ALLOWED_SENDERS.join(", ")}`);
   ensureDirs();
-  tick();
+  await tick();
   setInterval(tick, POLL_MS);
 
   process.on("SIGTERM", () => {

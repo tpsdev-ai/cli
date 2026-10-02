@@ -114,16 +114,10 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   };
 
   // ── F1 defect 1: verification was optional (no client ⇒ unverified promote) ─
-  test("NO verifier: refuses to promote — the record stays in new/", async () => {
-    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
-    plant(wrapper("flint", env));
-
-    const client = new MailClient(tmpDir, undefined, AGENT); // no flairClient
-    const msgs = await client.checkNewMail();
-
-    expect(msgs.length).toBe(0);
-    expect(files("new")).toContain("m1.json"); // untouched
-    expect(files("cur").length).toBe(0); // never promoted
+  test("NO verifier: the client cannot be constructed — the hatch is gone", () => {
+    // cli#380: the optional client is deleted. There is no MailClient without a
+    // verifier, so no state exists that could promote unverified mail.
+    expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);
   });
 
   // ── F1 defect 2: the verifier throw was swallowed and treated as a pass ────
@@ -208,12 +202,12 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   });
 
   // ── The refusal is non-destructive: a later verifier promotes the same file ─
-  test("a record refused without a verifier is promoted once a verifier is present", async () => {
+  test("a record a verifier could not run on is promoted once verification can run", async () => {
     const env = signedEnvelope("flint", AGENT, "heal me", { flint: FLINT });
     plant(wrapper("flint", env));
 
-    const noVerifier = new MailClient(tmpDir, undefined, AGENT);
-    expect((await noVerifier.checkNewMail()).length).toBe(0);
+    const unreachable = new MailClient(tmpDir, undefined, AGENT, throwingFlair);
+    expect((await unreachable.checkNewMail()).length).toBe(0);
     expect(files("new")).toContain("m1.json");
 
     const withVerifier = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));

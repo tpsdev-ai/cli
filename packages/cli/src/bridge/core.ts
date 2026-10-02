@@ -10,8 +10,6 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
-  renameSync,
   watch,
   writeFileSync,
   rmSync,
@@ -19,6 +17,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { promote } from "../utils/mail.js";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -126,45 +125,53 @@ Message: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {
-    const { fresh, cur } = this.mailboxDir(this.bridgeAgentId);
+    const { fresh } = this.mailboxDir(this.bridgeAgentId);
     mkdirSync(fresh, { recursive: true });
-    mkdirSync(cur, { recursive: true });
 
-    const processFile = (file: string) => {
+    const processFile = async (file: string) => {
       if (!file.endsWith(".json")) return;
       const fullPath = join(fresh, file);
       if (!existsSync(fullPath)) return;
 
-      let envelope: BridgeEnvelope;
+      // The ONE transition into cur/: promote() verifies the signed envelope,
+      // dead-letters what fails and leaves a retryable record for a later check.
+      // A record this consumer never verified is never forwarded to the channel
+      // (cli#380) — the bridge must not be a second, weaker verification
+      // boundary.
+      let promoted: Awaited<ReturnType<typeof promote>>;
       try {
-        const raw = readFileSync(fullPath, "utf-8");
-        const msg = JSON.parse(raw);
-        // If body is a JSON-serialized BridgeEnvelope, use it directly.
-        // Otherwise treat as plain text and route to the default channel.
-        let parsedBody: unknown = null;
-        if (typeof msg.body === "string") {
-          try { parsedBody = JSON.parse(msg.body); } catch { /* plain text */ }
-        }
-        if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
-          envelope = parsedBody as BridgeEnvelope;
-        } else {
-          // Plain text reply — route back to the channel this agent is bridging
-          envelope = {
-            channel: this.adapter.name,
-            channelId: this.defaultChannelId ?? "",
-            content: typeof msg.body === "string" ? msg.body : String(msg.body ?? ""),
-            senderId: "agent",
-            senderName: "agent",
-            timestamp: new Date().toISOString(),
-          };
-        }
+        promoted = await promote(this.bridgeAgentId, fullPath);
       } catch (e) {
-        this.log(`[bridge:outbound] Failed to parse ${file}: ${e}`);
-        renameSync(fullPath, join(cur, file));
+        this.log(`[bridge:outbound] promotion failed for ${file}: ${e}`);
+        return;
+      }
+      if (!promoted.ok) {
+        this.log(`[bridge:outbound] ${file} not promoted (${promoted.class}); not forwarded`);
         return;
       }
 
-      renameSync(fullPath, join(cur, file));
+      // The promoted body is the verified payload (the envelope's body).
+      let envelope: BridgeEnvelope;
+      const verifiedBody = promoted.message.body;
+      let parsedBody: unknown = null;
+      try {
+        parsedBody = JSON.parse(verifiedBody);
+      } catch {
+        /* plain text */
+      }
+      if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
+        envelope = parsedBody as BridgeEnvelope;
+      } else {
+        // Plain text reply — route back to the channel this agent is bridging
+        envelope = {
+          channel: this.adapter.name,
+          channelId: this.defaultChannelId ?? "",
+          content: verifiedBody,
+          senderId: "agent",
+          senderName: "agent",
+          timestamp: new Date().toISOString(),
+        };
+      }
 
       this.adapter.send(envelope).then(() => {
         this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
@@ -174,11 +181,11 @@ Message: ${envelope.content}`;
     };
 
     try {
-      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach(processFile);
+      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach((f) => void processFile(f));
     } catch {}
 
     const watcher = watch(fresh, (_event, filename) => {
-      if (filename) processFile(filename.toString());
+      if (filename) void processFile(filename.toString());
     });
 
     return () => { try { watcher.close(); } catch {} };

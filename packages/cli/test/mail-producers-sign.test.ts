@@ -237,7 +237,7 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
     const flairKeys = join(home, ".flair", "keys");
     mkdirSync(flairKeys, { recursive: true });
     writeFileSync(join(flairKeys, "flint.key"), FLINT);
-    const client = new MailClient(mailDir, undefined, "flint");
+    const client = new MailClient(mailDir, undefined, "flint", { getAgent: async () => null });
     await client.sendMail("kern", "agent runtime mail");
     const outbox = join(mailDir, "flint", "outbox");
     const [file] = readdirSync(outbox).filter((f) => f.endsWith(".json"));

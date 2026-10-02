@@ -25,20 +25,22 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Build FlairClient adapter for envelope verification. The provider's
-    // getAgent() disambiguates a Flair outage (throws → retryable) from an
-    // absent principal (null → terminal), so a signature verifier built on it
-    // does not dead-letter every message while Flair is down.
-    let flairClient: FlairClient | undefined;
-    if (this.flair) {
-      flairClient = {
-        getAgent: async (name: string) => {
-          const a = await this.flair!.getAgent(name);
-          if (!a) return null;
-          return { publicKey: Buffer.from(a.publicKey, "hex") };
-        },
-      };
-    }
+    // Build the FlairClient adapter for envelope verification. It is ALWAYS
+    // constructed (cli#380): verification is not optional, so no path promotes
+    // without it. With no `flair` config it resolves the same env/default
+    // endpoint every other Flair read uses; an unreachable Flair is a retryable
+    // refusal at promotion, never a pass. The provider's getAgent()
+    // disambiguates a Flair outage (throws → retryable) from an absent
+    // principal (null → terminal), so a signature verifier built on it does not
+    // dead-letter every message while Flair is down.
+    const verifyProvider = new FlairContextProvider(config.agentId, config.flair ?? {});
+    const flairClient: FlairClient = {
+      getAgent: async (name: string) => {
+        const a = await verifyProvider.getAgent(name);
+        if (!a) return null;
+        return { publicKey: Buffer.from(a.publicKey, "hex") };
+      },
+    };
 
     const mail = new MailClient(config.mailDir, events, config.agentId, flairClient, config.flair?.keyPath);
     const memory = new MemoryStore(config.memoryPath);
