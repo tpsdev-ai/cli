@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
+import { isTopicRecipient, verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { assertValidBody, sendMessage } from "./mail.js";
 import { signOutboundBody } from "./mail-sign.js";
-import { createMailVerifyClient } from "./mail-verify.js";
+import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
+export { isTopicRecipient } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -86,19 +87,6 @@ export function readMeta(topic: string): TopicMeta {
     throw new Error(`Topic not found: ${topic}`);
   }
   return JSON.parse(readFileSync(p, "utf-8")) as TopicMeta;
-}
-
-export function isTopicRecipient(address: string, agentId: string, from: string): boolean {
-  if (typeof address !== "string" || !address.startsWith("topic:")) return false;
-  const topic = address.slice("topic:".length);
-  try {
-    assertValidTopicName(topic);
-    const meta = readMeta(topic);
-    return meta.subscribers.includes(agentId)
-      && (!meta.allowedPublishers?.length || meta.allowedPublishers.includes(from));
-  } catch {
-    return false;
-  }
 }
 
 // Atomic write: write to .tmp then renameSync — safe for concurrent readers/writers on same filesystem.
@@ -282,7 +270,7 @@ export function publishToTopic(topic: string, from: string, body: string): Topic
   return entry;
 }
 
-export async function catchUpTopics(agentId: string, topics?: string[]): Promise<number> {
+export async function catchUpTopics(agentId: string, topics?: string[], config: MailVerifyConfig = {}): Promise<number> {
   assertValidAgentId(agentId);
   const cursors = readCursors(agentId);
   const subscriptions = topics ?? getSubscriptions(agentId);
@@ -317,17 +305,23 @@ export async function catchUpTopics(agentId: string, topics?: string[]): Promise
         continue;
       }
       try {
-        const verified = await verifyEnvelope(envelope, await createMailVerifyClient(agentId));
+        const verified = await verifyEnvelope(envelope, await createMailVerifyClient(agentId, config));
         if (!verified.ok) {
-          swarn(`topic-catch-up-invalid-envelope: skipping ${topic}/${entry.id}`);
+          const reason = /^agent (.+) not found in Flair$/.test(verified.reason)
+            ? "unresolvable-principal" : "invalid-envelope";
+          swarn(`topic-catch-up-${reason}: skipping ${topic}/${entry.id}`);
           updateCursor(agentId, topic, `@${entry.id}`);
           continue;
         }
       } catch {
         swarn(`topic-catch-up-verification-unavailable: retry ${topic}/${entry.id}`);
-        break;
+        return delivered;
       }
-      if (envelope.from === agentId || !isTopicRecipient(envelope.to, agentId, envelope.from)) {
+      if (!isTopicRecipient(envelope.to, agentId, envelope.from)) {
+        swarn(`topic-catch-up-recipient-policy-unavailable: retry ${topic}/${entry.id}`);
+        return delivered;
+      }
+      if (envelope.from === agentId) {
         updateCursor(agentId, topic, `@${entry.id}`);
         continue;
       }

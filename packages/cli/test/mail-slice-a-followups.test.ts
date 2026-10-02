@@ -8,7 +8,8 @@ import { SnoopLogg } from "snooplogg";
 import { routeHandlerAction } from "../src/commands/branch.js";
 import { getInbox, MAX_INBOX_MESSAGES, promote, recoverPromoted, sendMessage } from "../src/utils/mail.js";
 import { signOutboundBody } from "../src/utils/mail-sign.js";
-import { catchUpTopics, createTopic, publishToTopic, subscribe } from "../src/utils/mail-topics.js";
+import { catchUpTopics, createTopic, publishToTopic, subscribe, updateCursor } from "../src/utils/mail-topics.js";
+import { MailClient } from "../../agent/src/io/mail.js";
 
 const seed = Buffer.alloc(32, 0x11);
 let home: string;
@@ -64,6 +65,150 @@ afterEach(() => {
 function logPath() { return join(home, ".tps", "topics", "alerts", "log.jsonl"); }
 function stored() { return JSON.parse(readFileSync(logPath(), "utf8").trim()); }
 function replaceEntry(entry: unknown) { writeFileSync(logPath(), JSON.stringify(entry) + "\n"); }
+
+function cursorBytes() {
+  return readFileSync(join(home, ".tps", "agents", "kern", "topic-cursors.json"), "utf8");
+}
+
+test("native MailClient delivers publisher-signed topic fan-out", async () => {
+  createTopic("alerts", "", ["flint"]);
+  subscribe("alerts", "kern", true);
+  const entry = publishToTopic("alerts", "flint", "original");
+  const client = new MailClient(join(home, "mail"), undefined, "kern", {
+    async getAgent(name) { return name === "flint" ? { publicKey: Buffer.from(ed.getPublicKey(seed)) } : null; },
+  });
+  const messages = await client.checkNewMail();
+  expect(messages).toHaveLength(1);
+  expect(messages[0]!.from).toBe("flint");
+  expect(messages[0]!.verifiedEnvelope).toEqual(JSON.parse(entry.envelope!));
+  expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
+  expect(readdirSync(getInbox("kern").cur)).toHaveLength(1);
+});
+
+for (const policy of ["unsubscribed", "disallowed-publisher", "ordinary-recipient", "invalid-topic", "unreadable-meta"] as const) {
+  test(`native MailClient rejects topic policy violation: ${policy}`, async () => {
+    createTopic("alerts", "", policy === "disallowed-publisher" ? ["local-agent"] : ["flint"]);
+    if (policy !== "unsubscribed") subscribe("alerts", "kern", true);
+    if (policy === "unreadable-meta") writeFileSync(join(home, ".tps", "topics", "alerts", "meta.json"), "{");
+    const to = policy === "ordinary-recipient" ? "local-agent" : policy === "invalid-topic" ? "topic:../alerts" : "topic:alerts";
+    const sent = sendMessage("kern", signOutboundBody("flint", to, "original", { requireKey: true }), "flint");
+    const client = new MailClient(join(home, "mail"), undefined, "kern", {
+      async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+    });
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readdirSync(getInbox("kern").cur)).toEqual([]);
+    const file = sent.filePath.split("/").pop()!;
+    expect(readFileSync(join(home, "mail", "kern", "dlq", `${file}.reason`), "utf8")).toContain("class: wrong-recipient");
+  });
+}
+
+for (const status of [401, 403, 500]) {
+  test(`catch-up preserves its cursor when healthy Flair rejects lookup with ${status}`, async () => {
+    createTopic("alerts");
+    publishToTopic("alerts", "flint", "first");
+    publishToTopic("alerts", "flint", "second");
+    subscribe("alerts", "kern", true);
+    updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
+    const before = cursorBytes();
+    const healthy = fetchSpy.getMockImplementation()!;
+    fetchSpy.mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname === "/Health") return new Response("ok");
+      expect(new Headers(init?.headers).get("Authorization")).toMatch(/^TPS-Ed25519 kern:/);
+      return new Response("lookup refused", { status });
+    });
+    expect(await fetch("http://flair.test/Health").then((r) => r.ok)).toBe(true);
+    expect(await catchUpTopics("kern")).toBe(0);
+    expect(cursorBytes()).toBe(before);
+    expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
+    expect(warnings).toContain("topic-catch-up-verification-unavailable");
+    expect(warnings).not.toContain("skipping");
+    fetchSpy.mockImplementation(healthy);
+    expect(await catchUpTopics("kern")).toBe(2);
+  });
+}
+
+test("catch-up skips a verifiably absent principal with its named warning", async () => {
+  createTopic("alerts");
+  const entry = publishToTopic("alerts", "flint", "original");
+  subscribe("alerts", "kern", true);
+  updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
+  fetchSpy.mockImplementation(async (input) => new URL(String(input)).pathname === "/Health"
+    ? new Response("ok") : new Response("not found", { status: 404 }));
+  expect(await catchUpTopics("kern")).toBe(0);
+  expect(JSON.parse(cursorBytes()).alerts).toBe(`@${entry.id}`);
+  expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
+  expect(warnings).toContain("topic-catch-up-unresolvable-principal");
+  expect(warnings).not.toContain("topic-catch-up-invalid-envelope");
+});
+
+test("catch-up authenticates with the runtime's configured endpoint and key", async () => {
+  createTopic("alerts");
+  publishToTopic("alerts", "flint", "original");
+  subscribe("alerts", "kern", true);
+  const runtimeSeed = Buffer.alloc(32, 0x22);
+  const flairKeyPath = join(keys, "runtime.key");
+  writeFileSync(flairKeyPath, runtimeSeed);
+  const requests: string[] = [];
+  fetchSpy.mockImplementation(async (input, init) => {
+    const url = new URL(String(input));
+    requests.push(url.origin);
+    const auth = new Headers(init?.headers).get("Authorization")!;
+    const [agent, timestamp, nonce, signature] = auth.slice("TPS-Ed25519 ".length).split(":");
+    const payload = Buffer.from(`${agent}:${timestamp}:${nonce}:GET:${url.pathname}`);
+    if (url.origin !== "http://runtime-flair.test" || agent !== "kern"
+      || !ed.verify(Buffer.from(signature!, "base64"), payload, ed.getPublicKey(runtimeSeed))) {
+      return new Response("invalid credential", { status: 401 });
+    }
+    return Response.json({ id: "flint", publicKey: Buffer.from(ed.getPublicKey(seed)).toString("base64") });
+  });
+  expect(await catchUpTopics("kern", undefined, { flairUrl: "http://runtime-flair.test", flairKeyPath })).toBe(1);
+  expect(requests.length).toBeGreaterThan(0);
+  expect(requests.every((url) => url === "http://runtime-flair.test")).toBe(true);
+});
+
+for (const record of [null, {}, { publicKey: "bad-key" }]) {
+  test(`catch-up keeps its cursor for an indeterminate principal record: ${JSON.stringify(record)}`, async () => {
+    createTopic("alerts");
+    publishToTopic("alerts", "flint", "original");
+    subscribe("alerts", "kern", true);
+    updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
+    const before = cursorBytes();
+    fetchSpy.mockImplementation(async () => Response.json(record));
+    expect(await catchUpTopics("kern")).toBe(0);
+    expect(cursorBytes()).toBe(before);
+    expect(warnings).toContain("topic-catch-up-verification-unavailable");
+    expect(warnings).not.toContain("skipping");
+  });
+}
+
+test("indeterminate verification stops catch-up before any later topic", async () => {
+  for (const topic of ["alerts", "later"]) {
+    createTopic(topic);
+    publishToTopic(topic, "flint", "original");
+    subscribe(topic, "kern", true);
+    updateCursor("kern", topic, "1970-01-01T00:00:00Z");
+  }
+  const before = cursorBytes();
+  const healthy = fetchSpy.getMockImplementation()!;
+  fetchSpy.mockImplementationOnce(async () => new Response("unauthorized", { status: 401 }));
+  expect(await catchUpTopics("kern", ["alerts", "later"])).toBe(0);
+  expect(cursorBytes()).toBe(before);
+  expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
+  fetchSpy.mockImplementation(healthy);
+  expect(await catchUpTopics("kern", ["alerts", "later"])).toBe(2);
+});
+
+test("catch-up keeps its cursor when local topic policy cannot be read", async () => {
+  createTopic("alerts");
+  publishToTopic("alerts", "flint", "original");
+  subscribe("alerts", "kern", true);
+  updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
+  const before = cursorBytes();
+  writeFileSync(join(home, ".tps", "topics", "alerts", "meta.json"), "{");
+  expect(await catchUpTopics("kern", ["alerts"])).toBe(0);
+  expect(cursorBytes()).toBe(before);
+  expect(warnings).toContain("topic-catch-up-recipient-policy-unavailable");
+});
 
 async function promotedBodies() {
   const inbox = getInbox("kern");

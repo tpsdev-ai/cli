@@ -742,7 +742,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
 
     try {
-      const caught = await catchUpTopics(agentId);
+      const caught = await catchUpTopics(agentId, undefined, mailCfg);
       if (caught > 0) console.log(`[${agentId}] Caught up ${caught} missed topic message(s)`);
     } catch (err: any) {
       console.warn(`[${agentId}] Topic catch-up failed: ${err.message}`);
