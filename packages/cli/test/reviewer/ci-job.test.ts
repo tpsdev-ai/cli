@@ -146,7 +146,7 @@ describe("this repository's test job", () => {
     expect(p.shims).toEqual(["sfw"]);
   });
 
-  test("every test job step is planned on node 24.21.0", () => {
+  test("every run: step of the test job is planned on Node 24.21.0", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
       [5, "24.21.0"],
