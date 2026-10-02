@@ -28,6 +28,8 @@ export interface GithubReviewConfig {
   pendingAuditFile: string | null;
   /** Host-only store of the review-build evidence APPROVE requires. */
   approvalEvidenceFile: string | null;
+  /** The host-held key that authenticates approval-evidence records. */
+  approvalEvidenceKeyFile: string | null;
   /** Durable per-dispatch latch for outcomes whose external state is unknown. */
   reconcileFile: string | null;
   flairUrl: string;
@@ -40,6 +42,14 @@ export const DEFAULT_PROVISIONING_MAX_AGE_DAYS = 90;
 
 function asString(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v : null;
+}
+
+/** A host path the sandbox can never reach: it must be absolute. A relative
+ *  path could resolve inside the review worktree the sandbox mounts, so it is
+ *  treated as unusable. */
+function asAbsolutePath(v: unknown): string | null {
+  const s = asString(v);
+  return s !== null && s.startsWith("/") ? s : null;
 }
 
 function asPositiveInt(v: unknown): number | null {
@@ -65,7 +75,8 @@ export function resolveConfig(raw: unknown, pluginVersion: string): GithubReview
     signingKeyFile: asString(cfg.signingKeyFile),
     reviewerIdentity: asString(cfg.reviewerIdentity),
     pendingAuditFile: asString(cfg.pendingAuditFile),
-    approvalEvidenceFile: asString(cfg.approvalEvidenceFile),
+    approvalEvidenceFile: asAbsolutePath(cfg.approvalEvidenceFile),
+    approvalEvidenceKeyFile: asAbsolutePath(cfg.approvalEvidenceKeyFile),
     reconcileFile: asString(cfg.reconcileFile),
     flairUrl: asString(cfg.flairUrl) ?? "http://127.0.0.1:9926",
     sandboxImageDigest: asString(cfg.sandboxImageDigest),

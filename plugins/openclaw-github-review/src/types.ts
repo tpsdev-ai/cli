@@ -52,6 +52,7 @@ export type RefusalReason =
   | "approval_evidence_failed"
   | "approval_evidence_mismatch"
   | "approval_evidence_invalid"
+  | "approval_evidence_unauthenticated"
   | "receipt_invalid"
   | "github_rejected"
   | "github_ambiguous";

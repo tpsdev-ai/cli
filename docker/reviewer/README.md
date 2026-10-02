@@ -13,10 +13,12 @@ linux/amd64 only (the reviewer VMs are x86_64).
 How well a review build predicts CI is best effort; the fidelity limits are listed
 under [Known limits](#known-limits).
 
-A reviewer's `APPROVE` requires a host-side record of such a build for the same
-reviewer, session and commit (the `openclaw-github-review` plugin); it proves the
-repository's own build and tests ran and passed on that commit, not that they are
-adequate.
+A reviewer's `APPROVE` requires a host-side, host-authenticated record of such
+a build for the same repository, PR, dispatch, reviewer, session and commit (the
+`openclaw-github-review` plugin); it records the commands the host ran for the
+job (including a build and a test stage) and their exit statuses, as the host
+observed them. It does not establish that those commands are adequate or that
+they match what CI ran.
 
 ## Pieces
 

@@ -120,22 +120,44 @@ all is decided by the reviewer's sandbox tool policy (see Install).
 ## Approval evidence
 
 `APPROVE` requires a host-side record of the review's build/test run for the
-same reviewer, session and full commit, and every command in it must have
-exited 0. `REQUEST_CHANGES` and `COMMENT` are unaffected.
+same repository, PR, dispatch, reviewer, session and full commit, and it must
+list a build command and a test command, both exited 0. `REQUEST_CHANGES` and
+`COMMENT` are unaffected.
 
-The record is written by the host process that runs the review build, to
-`approvalEvidenceFile`. Nothing inside the sandbox can write or read-modify that
-file: the sandbox mounts only the review worktree and has no other host
-filesystem access. The record binds the reviewer, the session key, the commit,
-the commands with their exit statuses and a finish time, under a SHA-256 over
-those fields; `github_review` re-computes the digest, so a record edited after
-it was written no longer matches. The digest is recorded in the signed audit
-record as `approval_evidence_sha256`. APPROVE is refused when the evidence is
-missing or unconfigured, incomplete, failed, bound to a different reviewer,
-session or commit, or does not match its digest.
+The record is written by the trusted host process that runs the review build
+(`src/approval-driver.ts`), from what that process observed — the commands it
+ran, their exit statuses, the commit it cloned and the run's start and finish
+instants — to `approvalEvidenceFile`. The sandbox mounts only the review
+worktree, so nothing inside it can write or read-modify that file; the
+configuration rejects a relative path and the driver rejects a store inside the
+worktree. The record binds the repository, PR, dispatch, reviewer, session,
+commit, the commands with their stages and exit statuses, and the start/finish
+times, under a SHA-256 over those fields. It is also authenticated with an
+HMAC-SHA256 over the same bytes under a HOST-HELD key (`approvalEvidenceKeyFile`,
+which the sandbox cannot read): `github_review` re-computes both, so a record
+edited after it was written fails the digest, and a record rewritten with a
+matching digest still fails the HMAC unless its writer holds the host key. The
+digest is recorded in the audit draft as `approval_evidence_sha256`, and in an
+acknowledged signed audit record when that write succeeds; when the audit is
+only retained (`posted_audit_pending`) or its retention was not durably
+confirmed (`posted_audit_unretained`), the review result says so and the audit
+record is not acknowledged. APPROVE is refused when the evidence is missing or
+unconfigured, incomplete, a stage is absent, a command failed, unauthenticated,
+bound to a different repository, PR, dispatch, reviewer, session or commit, or
+does not match its digest.
 
-The limit, stated: the evidence proves the repository's own build and tests ran
-and passed on that commit, not that they are adequate.
+WHERE IT HOOKS. The host process that launches the review build calls
+`recordApprovalEvidence` (src/approval-driver.ts) with its own job runner: the
+function that runs the sandboxed job and returns the host's observations of it.
+In the tpsdev-ai/cli repository that process is the review-job driver
+(`scripts/reviewer/run-review-jobs.mjs`, tpsdev-ai/cli#435), one sandbox
+container per job. Until that driver is wired to this writer on a host, no
+record is written and `APPROVE` is refused (`approval_evidence_missing`).
+
+The limit, stated: the evidence proves the commands the host ran for this job
+(including its build and test stages) exited 0 on that commit, as observed by
+the host; it does not prove those commands establish the change is correct or
+adequate.
 
 ## Configuration
 
@@ -153,7 +175,8 @@ All values come from the gateway's plugin config. None come from tool input, and
 | `reviewerIdentity` | The reviewer the signing key belongs to. |
 | `pendingAuditFile` | **Required.** Where a failed-after-post audit record is retained for retry. |
 | `reconcileFile` | **Required.** The durable per-dispatch latch store (see Dispatch latches). |
-| `approvalEvidenceFile` | **Required for `APPROVE`.** Host-only store of the review-build evidence (see Approval evidence). |
+| `approvalEvidenceFile` | **Required for `APPROVE`.** Host-only store of the review-build evidence (see Approval evidence). Must be absolute. |
+| `approvalEvidenceKeyFile` | **Required for `APPROVE`.** Host-held HMAC-SHA256 key that authenticates approval-evidence records. Must be absolute and outside every sandbox mount. |
 | `flairUrl` | The Flair base URL. |
 | `sandboxImageDigest` | Recorded in every audit record once section A supplies it. |
 | `provisioningMaxAgeDays` | Evidence older than this is stale. Default 90. |

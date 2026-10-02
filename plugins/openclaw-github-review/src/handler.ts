@@ -27,7 +27,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { validateApprovalEvidence, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
+import { readHostKey, validateApprovalEvidence, type ApprovalEvidenceLookup, type ApprovalEvidenceStore } from "./approval-evidence.js";
 import { buildOrgEvent } from "./audit.js";
 import type { CredentialCustody } from "./credential.js";
 import type { DispatchLedger } from "./dispatch-ledger.js";
@@ -267,23 +267,33 @@ function latchedRefusal(record: LatchRecord, actor: string): Outcome {
   );
 }
 
-/** `APPROVE`'s evidence gate: a host-recorded, passing build/test run for this
- *  reviewer, session and commit. Returns the record's digest, or the refusal.
- *  `REQUEST_CHANGES` and `COMMENT` never call it. */
+/** `APPROVE`'s evidence gate: a host-recorded, authenticated, passing build/test
+ *  run for this repository, PR, dispatch, reviewer, session and commit. Returns
+ *  the record's digest, or the refusal. `REQUEST_CHANGES` and `COMMENT` never
+ *  call it. */
 function approvalEvidenceGate(
   deps: HandlerDeps,
-  binding: { reviewer: string; sessionKey: string; commit: string },
+  binding: { repo: string; pr: number; dispatchId: string; reviewer: string; sessionKey: string; commit: string },
 ): { ok: true; digest: string } | { ok: false; refusal: Outcome } {
   const actor = binding.reviewer;
-  if (!deps.config.approvalEvidenceFile) {
+  if (!deps.config.approvalEvidenceFile || !deps.config.approvalEvidenceKeyFile) {
     return {
       ok: false,
       refusal: refuse(
         "approval_evidence_unconfigured",
         actor,
-        "no approval-evidence file is configured",
-        "configure approvalEvidenceFile on the host and record the review build's evidence before approving",
+        "no approval-evidence file or host key is configured",
+        "configure approvalEvidenceFile and approvalEvidenceKeyFile on the host and record the review build's evidence before approving",
       ),
+    };
+  }
+  let key: Buffer;
+  try {
+    key = readHostKey(deps.config.approvalEvidenceKeyFile);
+  } catch {
+    return {
+      ok: false,
+      refusal: refuse("approval_evidence_invalid", actor, "the approval-evidence host key could not be read", "repair the approval-evidence key file on the host"),
     };
   }
   let lookup: ApprovalEvidenceLookup;
@@ -301,7 +311,7 @@ function approvalEvidenceGate(
       refusal: refuse(
         "approval_evidence_missing",
         actor,
-        "no approval evidence is recorded for this reviewer, session and commit",
+        "no approval evidence is recorded for this repository, PR, dispatch, reviewer, session and commit",
         "run the review build on the host and record its evidence before approving",
       ),
     };
@@ -317,7 +327,7 @@ function approvalEvidenceGate(
       ),
     };
   }
-  const verdict = validateApprovalEvidence(lookup.record, binding);
+  const verdict = validateApprovalEvidence(lookup.record, binding, key);
   if (!verdict.ok) return { ok: false, refusal: refuse(verdict.reason, actor, verdict.state, verdict.remedy) };
   return { ok: true, digest: verdict.digest };
 }
@@ -405,7 +415,14 @@ async function reviewClaimedDispatch(deps: HandlerDeps, req: ClaimedRequest): Pr
   //    and commit. REQUEST_CHANGES and COMMENT are unaffected. ──
   let approvalEvidenceSha256: string | null = null;
   if (event === "APPROVE") {
-    const evidence = approvalEvidenceGate(deps, { reviewer: actor, sessionKey: assignment.sessionKey, commit: head });
+    const evidence = approvalEvidenceGate(deps, {
+      repo,
+      pr,
+      dispatchId: assignment.dispatchId,
+      reviewer: actor,
+      sessionKey: assignment.sessionKey,
+      commit: head,
+    });
     if (!evidence.ok) return evidence.refusal;
     approvalEvidenceSha256 = evidence.digest;
   }

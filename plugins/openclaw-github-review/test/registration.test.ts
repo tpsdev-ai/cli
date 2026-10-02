@@ -192,6 +192,7 @@ describe("B3 — only a full registration does host-side work", () => {
       pendingAuditFile: s.config.pendingAuditFile,
       reconcileFile: s.config.reconcileFile,
       approvalEvidenceFile: s.config.approvalEvidenceFile,
+      approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
       flairUrl: "http://flair.test.invalid",
     };
     return { s, pluginConfig };

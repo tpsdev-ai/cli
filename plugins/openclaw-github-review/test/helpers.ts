@@ -5,7 +5,7 @@
  * outside the test's own temp root.
  */
 
-import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
@@ -144,6 +144,7 @@ export function pluginConfigOf(s: Scenario, flairUrl = "http://flair.test.invali
     reviewerIdentity: s.config.reviewerIdentity,
     pendingAuditFile: s.config.pendingAuditFile,
     approvalEvidenceFile: s.config.approvalEvidenceFile,
+    approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
     reconcileFile: s.config.reconcileFile,
     flairUrl,
   };
@@ -246,6 +247,15 @@ export function fakeCredentialFiles(
 export interface Scenario {
   config: GithubReviewConfig;
   custody: CredentialCustody;
+  /** The host key that authenticates the approval-evidence records. */
+  approvalKey: Buffer;
+}
+
+/** Write a fresh 32-byte host key as base64, returning its bytes. */
+export function writeHostKey(path: string): Buffer {
+  const key = randomBytes(32);
+  writeFileSync(path, key.toString("base64"), { mode: 0o600 });
+  return key;
 }
 
 /** The standard, fully-valid host configuration for a test. */
@@ -258,6 +268,8 @@ export function scenario(
   const files = fakeCredentialFiles(root, credOpts);
   const signingKeyFile = join(root, "anvil.key");
   writeEd25519Key(signingKeyFile);
+  const approvalEvidenceKeyFile = join(root, "approval-evidence.key");
+  const approvalKey = writeHostKey(approvalEvidenceKeyFile);
   const config = resolveConfig(
     {
       allowedRepositories: [REPO],
@@ -269,6 +281,7 @@ export function scenario(
       pendingAuditFile: join(root, "pending.json"),
       reconcileFile: join(root, "reconcile.json"),
       approvalEvidenceFile: join(root, "approval-evidence.json"),
+      approvalEvidenceKeyFile,
       sandboxImageDigest: "sha256:deadbeef",
       ...configOverrides,
     },
@@ -280,25 +293,45 @@ export function scenario(
     maxAgeDays: config.provisioningMaxAgeDays,
     clock: () => new Date(),
   });
-  // The host has recorded a passing review build for the standard session and
-  // commit. A test overrides this file (or removes the config key) to exercise
-  // the APPROVE evidence gate.
-  if (config.approvalEvidenceFile) {
-    writeApprovalEvidence(
-      config.approvalEvidenceFile,
-      buildApprovalEvidence({
+  // The host has recorded a passing review build for the standard dispatch,
+  // session and commit. A test overrides this file (or removes the config keys)
+  // to exercise the APPROVE evidence gate.
+  recordEvidence({ config, approvalKey });
+  return { config, custody, approvalKey };
+}
+
+/** Write a passing, host-signed evidence record for one dispatch (the standard
+ *  dispatch by default). */
+export function recordEvidence({
+  config,
+  approvalKey,
+  dispatchId = "dispatch-1",
+}: {
+  config: GithubReviewConfig;
+  approvalKey: Buffer;
+  dispatchId?: string;
+}): void {
+  if (!config.approvalEvidenceFile || !config.approvalEvidenceKeyFile) return;
+  writeApprovalEvidence(
+    config.approvalEvidenceFile,
+    buildApprovalEvidence(
+      {
+        repo: REPO,
+        pr: PR,
+        dispatchId,
         reviewer: REVIEWER,
         sessionKey: "sess-1",
         commit: COMMIT,
-        recordedAt: new Date().toISOString(),
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        finishedAt: new Date().toISOString(),
         commands: [
-          { command: "bun run build", exitCode: 0 },
-          { command: "bun run test", exitCode: 0 },
+          { command: "bun run build", role: "build", exitCode: 0 },
+          { command: "bun run test", role: "test", exitCode: 0 },
         ],
-      }),
-    );
-  }
-  return { config, custody };
+      },
+      approvalKey,
+    ),
+  );
 }
 
 export function resolver(assignments: DispatchAssignment[]): AssignmentResolver {

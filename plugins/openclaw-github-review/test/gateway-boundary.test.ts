@@ -56,6 +56,7 @@ import {
   validAssignment,
   validInput,
   writeEd25519Key,
+  writeHostKey,
 } from "./helpers.js";
 import {
   createProbeOverlay,
@@ -131,15 +132,27 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
   const reconcileFile = join(dir, "reconcile.json");
   const pendingAuditFile = join(dir, "pending.json");
   const approvalEvidenceFile = join(dir, "approval-evidence.json");
+  const approvalEvidenceKeyFile = join(dir, "approval-evidence.key");
+  const approvalKey = writeHostKey(approvalEvidenceKeyFile);
   writeApprovalEvidence(
     approvalEvidenceFile,
-    buildApprovalEvidence({
-      reviewer: REVIEWER,
-      sessionKey: SESSION,
-      commit: COMMIT,
-      recordedAt: new Date().toISOString(),
-      commands: [{ command: "bun run build", exitCode: 0 }],
-    }),
+    buildApprovalEvidence(
+      {
+        repo: REPO,
+        pr: PR,
+        dispatchId,
+        reviewer: REVIEWER,
+        sessionKey: SESSION,
+        commit: COMMIT,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        finishedAt: new Date().toISOString(),
+        commands: [
+          { command: "bun run build", role: "build", exitCode: 0 },
+          { command: "bun run test", role: "test", exitCode: 0 },
+        ],
+      },
+      approvalKey,
+    ),
   );
   return {
     pluginConfig: {
@@ -153,6 +166,7 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
       pendingAuditFile,
       reconcileFile,
       approvalEvidenceFile,
+      approvalEvidenceKeyFile,
       flairUrl: FLAIR,
     },
     credentialFile,
@@ -399,6 +413,7 @@ describe("A11 — secret scans through registerGithubReview, every outcome path 
         pendingAuditFile: s.config.pendingAuditFile,
         reconcileFile: s.config.reconcileFile,
         approvalEvidenceFile: s.config.approvalEvidenceFile,
+        approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
       },
       tools,
       logs,

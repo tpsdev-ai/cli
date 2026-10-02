@@ -33,7 +33,13 @@
     },
     "approvalEvidenceFile": {
       "label": "Approval evidence file",
-      "help": "Absolute path to the host-only store of review-build evidence that APPROVE requires. Written by the host process that runs the review build; the sandbox cannot write or read-modify it.",
+      "help": "Absolute path to the host-only store of review-build evidence that APPROVE requires. Written by the host process that runs the review build; the sandbox cannot write or read-modify it. A relative path is rejected.",
+      "advanced": true
+    },
+    "approvalEvidenceKeyFile": {
+      "label": "Approval evidence key file",
+      "help": "Absolute path to the host-held key that authenticates approval-evidence records (HMAC-SHA256). Keep it outside every path the review sandbox mounts; the sandbox cannot read it.",
+      "sensitive": true,
       "advanced": true
     }
   },
@@ -69,7 +75,11 @@
       "flairUrl": { "type": "string" },
       "approvalEvidenceFile": {
         "type": "string",
-        "description": "Host-only store of the review-build evidence APPROVE requires: the reviewer, session, full commit, commands and their exit statuses, written by the host process that runs the review build. The sandbox mounts only the review worktree, so nothing inside it can write or read-modify this file. APPROVE is refused when no passing record for this reviewer, session and commit is present."
+        "description": "Host-only store of the review-build evidence APPROVE requires: the repository, PR, dispatch, reviewer, session, full commit, commands and their exit statuses and start/finish times, written by the host process that runs the review build. Must be an absolute path outside the review worktree the sandbox mounts; a relative path is rejected. APPROVE is refused when no passing, host-authenticated record for this dispatch is present."
+      },
+      "approvalEvidenceKeyFile": {
+        "type": "string",
+        "description": "Absolute path to the host-held HMAC-SHA256 key that authenticates approval-evidence records. The sandbox cannot read it (it is outside every path the sandbox mounts). An APPROVE whose record does not authenticate with this key is refused."
       },
       "sandboxImageDigest": {
         "type": "string",
