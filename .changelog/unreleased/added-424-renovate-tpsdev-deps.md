@@ -1,0 +1,1 @@
+- **A unit test fails on an `@tpsdev-ai/*` dependency outside cli's six release packages, the invariant the scope's Renovate disable relies on (Closes #424).**
