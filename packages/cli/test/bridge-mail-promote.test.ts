@@ -73,6 +73,7 @@ function startBridge(redriveMs?: number): { sent: BridgeEnvelope[]; core: Bridge
   };
   const core = new BridgeCore(adapter, {
     bridgeAgentId: BRIDGE,
+    defaultAgentId: "agent-a",
     mailDir: root,
     defaultChannelId: "chan-1",
     redriveMs,
