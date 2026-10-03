@@ -2,6 +2,8 @@
 
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
+const { existsSync } = require('node:fs');
+const { constants: { signals } } = require('node:os');
 
 const platform = process.platform;
 const arch = process.arch;
@@ -27,31 +29,65 @@ if (process.argv.includes('--version') || process.argv.includes('-v')) {
 // npm nests optionalDependencies inside the parent's node_modules.
 const searchPaths = [path.join(__dirname, '..'), path.join(__dirname, '..', '..')];
 
-function runBinary() {
-  try {
-    const pkgJson = require.resolve(`${pkg}/package.json`, { paths: searchPaths });
-    const binPath = path.join(path.dirname(pkgJson), 'tps');
-    execFileSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
-    return;
-  } catch (_err) {
-    // Fall through to error message
-  }
+// The exit status a child's thrown error stands for, or null when the process
+// could not be started. execFileSync distinguishes the two: a process that ran
+// and exited non-zero carries a numeric `status`, one killed by a signal
+// carries `signal`, and a spawn failure (ENOENT, EACCES, …) carries neither.
+function exitStatusFor(thrown) {
+  if (thrown.signal) return 128 + (signals[thrown.signal] || 0);
+  if (typeof thrown.status === 'number') return thrown.status;
+  return null;
+}
 
-  // Fallback for source/dev installs where dist JS exists.
-  try {
-    const jsCli = path.join(__dirname, '..', 'dist', 'bin', 'tps.js');
-    execFileSync(process.execPath, [jsCli, ...process.argv.slice(2)], { stdio: 'inherit' });
-    return;
-  } catch (_) {
-    // continue to error output
-  }
-
-  console.error(`Failed to load native binding`);
-  console.error(`TPS: no binary package available for ${platform}-${arch}.`);
+function reportLoadFailure(message) {
+  console.error(message);
   const version = getCliVersion();
   console.error(`Try reinstalling main package: npm install -g @tpsdev-ai/cli@${version}`);
   console.error(`Or install platform binary directly: npm install -g ${pkg}@${version}`);
-  process.exitCode = 1;
+}
+
+// Fallback for source/dev installs where dist JS exists. Returns the exit
+// status to use.
+function runJsFallback(failureMessage) {
+  const jsCli = path.join(__dirname, '..', 'dist', 'bin', 'tps.js');
+  if (!existsSync(jsCli)) {
+    reportLoadFailure(failureMessage);
+    return 1;
+  }
+  try {
+    execFileSync(process.execPath, [jsCli, ...process.argv.slice(2)], { stdio: 'inherit' });
+    return 0;
+  } catch (err) {
+    const status = exitStatusFor(err);
+    if (status !== null) return status;
+    reportLoadFailure(`TPS: JS entry could not be started.`);
+    return 1;
+  }
+}
+
+function runBinary() {
+  let binPath;
+  try {
+    const pkgJson = require.resolve(`${pkg}/package.json`, { paths: searchPaths });
+    binPath = path.join(path.dirname(pkgJson), 'tps');
+  } catch (_err) {
+    // The platform package could not be resolved — fall back to the JS entry.
+    process.exitCode = runJsFallback(`Failed to load native binding\nTPS: no binary package available for ${platform}-${arch}.`);
+    return;
+  }
+
+  try {
+    execFileSync(binPath, process.argv.slice(2), { stdio: 'inherit' });
+  } catch (err) {
+    const status = exitStatusFor(err);
+    if (status !== null) {
+      // The binary ran and did not exit cleanly — propagate its status and
+      // never run the fallback.
+      process.exit(status);
+    }
+    // The binary could not be started — fall back to the JS entry.
+    process.exitCode = runJsFallback(`TPS: platform binary could not be started.`);
+  }
 }
 
 runBinary();
