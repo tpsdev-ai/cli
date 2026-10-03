@@ -1,1 +1,1 @@
-- **TPS help flags print usage and exit before dispatch.** Option values, `office exec`, `mail watch --exec`, `secrets-guard` tails and arguments after `--` are excluded. Before, `branch init --help` minted a branch identity and opened a listener, and `identity init --help` rewrote the nono profiles.
+- **TPS help requests print usage before dispatch.** Option values and wrapped-command arguments remain data.

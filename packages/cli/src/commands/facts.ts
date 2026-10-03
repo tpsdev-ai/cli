@@ -442,12 +442,12 @@ async function handleRegister(args: CmdArgs): Promise<void> {
   }
 
   if (!args.type) {
-    console.error("--type is required");
+    console.error("--cred-type is required");
     process.exit(1);
   }
 
   if (!args.rationale) {
-    console.error("--rationale is required");
+    console.error("--reason is required");
     process.exit(1);
   }
 

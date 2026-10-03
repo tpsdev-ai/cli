@@ -266,14 +266,6 @@ async function checkNono() {
   }
 }
 
-/**
- * cli#342: the usage text `--help`/`-h` prints for each top-level command,
- * seeded from the inline usage strings in the switch below (and written out for
- * the commands that have none). It sits here, beside the help intercept in
- * main(), so the intercept can print a command's usage before any launch
- * control, nono check or dispatch. An unknown command falls back to the general
- * help.
- */
 const USAGE: Record<string, string> = {
   init: "Usage: tps init [--id <agent-id>] [--name <name>] [--model <provider/model>]",
   hire: "I'm gonna need you to specify a TPS report file or persona.\n\n  tps hire <report.tps | persona> [--name Name]\n\nBuilt-in personas: developer, designer, support, ea, ops, strategy, security",
@@ -315,6 +307,7 @@ const USAGE: Record<string, string> = {
           "  tps secrets audit grep <pattern>           Filter audit log by op or name",
           "  tps secrets audit stats [--window <d>] [--json]   Audit log statistics",
         ].join("\n"),
+  "secrets-guard": "Usage:\n  tps secrets-guard [--no-guard] <cmd> [args...]\n  tps secrets-guard --check",
   backup: "Usage: tps backup <agent-id>\n  tps backup keys",
   restore: "Usage: tps restore <agent-id> <archive> [--from <archive>] [--clone] [--overwrite] [--force]",
   heartbeat: "Usage: tps heartbeat <agent-id>",
@@ -388,7 +381,7 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
       parsed.push(...argv.slice(i));
       break;
     }
-    if ((cmd === "secrets-guard" && arg !== "--check" && arg !== "--no-guard") || (cmd === "office" && action === "exec" && positionals.length === 3)) {
+    if ((cmd === "secrets-guard" && !arg.startsWith("-")) || (cmd === "office" && action === "exec" && positionals.length === 3)) {
       parsed.push("--", ...argv.slice(i));
       break;
     }
@@ -439,10 +432,6 @@ async function main() {
     return;
   }
 
-  // cli#342: `--help`/`-h` on a subcommand prints that command's usage and
-  // exits 0 without running it, before launch control, the nono check and
-  // dispatch — so `identity init --help` cannot rewrite nono profiles and
-  // `branch init --help` cannot mint an identity or open a listener.
   if (helpArgs.requested) {
     console.log(USAGE[command ?? ""] ?? cli.help);
     return;
