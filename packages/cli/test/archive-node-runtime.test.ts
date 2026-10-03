@@ -39,6 +39,13 @@ function runNode(script: string, nodeArgs: string[] = []) {
   });
 }
 
+// `--no-experimental-sqlite` removes node:sqlite on a node that has it. A node older than 22.5
+// rejects the flag (exit 9) and has no node:sqlite anyway, so it needs no flag to reproduce the
+// no-backend condition (the Docker lane runs such a node).
+function noSqliteNodeArgs(): string[] {
+  return runNode("", ["--no-experimental-sqlite"]).status === 0 ? ["--no-experimental-sqlite"] : [];
+}
+
 describe("archive under node (cli#394)", () => {
   test(
     "utils/mail.js imports under node without calling anything",
@@ -66,7 +73,7 @@ describe("archive under node (cli#394)", () => {
       `;
       // `--no-experimental-sqlite` makes `node:sqlite` unresolvable, reproducing
       // a node older than 22.13 on this modern runner.
-      const res = runNode(script, ["--no-experimental-sqlite"]);
+      const res = runNode(script, noSqliteNodeArgs());
       expect(res.signal).toBeNull();
       expect(res.status).toBe(0);
       expect(res.stdout).toContain("THREW=false");
