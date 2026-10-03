@@ -139,7 +139,7 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
     sendMessage("kern", JSON.stringify(env), "openclaw-bridge");
     const inbox = getInbox("kern");
     const [file] = jsonFiles(inbox.fresh);
-    // The bridge ceiling refuses the internal tier and assigns external.
+    // The bridge ceiling caps the claimed internal tier at external.
     const record = JSON.parse(readFileSync(join(inbox.fresh, file!), "utf-8"));
     record.headers = { "X-TPS-Trust": "external" };
     writeFileSync(join(inbox.fresh, file!), JSON.stringify(record));
