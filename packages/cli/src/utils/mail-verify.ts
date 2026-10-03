@@ -1,22 +1,13 @@
 /**
  * mail-verify.ts — the verify-ready Flair client for mail promotion.
  *
- * `promote()` in utils/mail.ts constructs a verifier UNCONDITIONALLY through
- * this module. There is deliberately no client parameter on promote()/
- * checkMessages(): optional verification is exactly how this rotted, and a
- * default is the same hatch wearing a friendlier face.
- *
- * Why this is its own module: it is the one seam the tests replace (bun's
- * `mock.module`) to keep verification hermetic. The live path always calls it —
- * nothing can skip it.
- *
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
- * `FlairAgent.publicKey` as a base64 string, while signEnvelope's verifyEnvelope
+ * `FlairAgent.publicKey` as hex or canonical base64, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).
  */
 
 import { createFlairClient } from "./flair-client.js";
-import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
+import { decodeRegistryPublicKey, type FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -65,10 +56,7 @@ export async function createMailVerifyClient(
     async getAgent(name: string) {
       const info = await cliClient.getAgentForVerification(name);
       if (!info) return null;
-      const publicKey = Buffer.from(info.publicKey, "base64");
-      if (publicKey.length !== 32 || publicKey.toString("base64") !== info.publicKey) {
-        throw new Error(`Flair returned an invalid public key for ${name}`);
-      }
+      const publicKey = decodeRegistryPublicKey(info.publicKey);
       return { publicKey };
     },
   };

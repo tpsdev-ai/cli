@@ -4,6 +4,7 @@ import { getAgentInfo } from "../utils/agent-info.js";
 import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
 import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 
 interface RosterArgs {
   action: "list" | "show" | "find" | "invite";
@@ -231,7 +232,7 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
   const { readFileSync, existsSync } = await import("node:fs");
   const { createPrivateKey, sign } = await import("node:crypto");
 
-  const viewerId = opts.agentId ?? process.env.TPS_AGENT_ID ?? "anvil";
+  const viewerId = requireLocalAgentId("roster viewer id", opts.agentId);
   const keyPath = opts.keyPath ?? join(homedir(), ".tps", "identity", `${viewerId}.key`);
 
   function makeAuth(method: string, urlPath: string): string | undefined {

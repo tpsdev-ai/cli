@@ -183,6 +183,23 @@ export function readObligation(mailDir: string, agent: string, inboundId: string
   }
 }
 
+export function readObligationResult(mailDir: string, agent: string, inboundId: string):
+  | { status: "found"; record: ObligationRecord }
+  | { status: "missing" }
+  | { status: "unverified"; path: string; code: string } {
+  const path = obligationPath(mailDir, agent, inboundId);
+  try {
+    const record = JSON.parse(readFileSync(path, "utf-8")) as ObligationRecord;
+    if (!record || typeof record.state !== "string") {
+      return { status: "unverified", path, code: "INVALID_RECORD" };
+    }
+    return { status: "found", record };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "INVALID_JSON";
+    return code === "ENOENT" ? { status: "missing" } : { status: "unverified", path, code };
+  }
+}
+
 export function listObligations(mailDir: string, agent: string): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
   let names: string[];

@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
-import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type Envelope, verifyEnvelope, verifiedMailTier, bridgePrincipalIds } from "@tpsdev-ai/agent";
+import {
+  decideEnvelopeForMailbox as decideEnvelope,
+  type Envelope, verifiedMailTier, bridgePrincipalIds,
+  mailboxReplayStore, hasCommittedMessageId,
+  parseSignedEnvelope,
+  peekConsumedForMailboxRoot,
+} from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
-import { acquireMailLock, type MailLock } from "./mail-lock.js";
+import { acquireMailLock, acquireMailLockSync, type MailLock } from "./mail-lock.js";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
@@ -21,6 +26,7 @@ export interface MailMessage {
   timestamp: string;
   read: boolean;
   ackedAt?: string;
+  bridgeSentAt?: string;
   nackedAt?: string;
   nackReason?: string;
   nackType?: "transient" | "agent" | "permanent";
@@ -172,12 +178,50 @@ function readMessageFile(path: string): MailMessage {
   try {
     return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
   } catch (err: any) {
-    throw new Error(`corrupt message file ${path}: ${err.message}`);
+    throw Object.assign(new Error(`corrupt message file ${path}: ${err.message}`), { code: err?.code });
   }
 }
 
-function writeMessageFile(path: string, msg: MailMessage): void {
-  writeFileSync(path, JSON.stringify(msg, null, 2), "utf-8");
+export type UpdateExistingResult<T> = { status: "updated"; record: T } | { status: "gone" | "changed" | "busy" };
+
+export function updateExistingRecord<T extends object>(
+  path: string,
+  mutate: (record: T) => T | null,
+  options: { snapshot?: T; afterWrite?: (record: T) => void; nonBlocking?: boolean } = {},
+): UpdateExistingResult<T> {
+  const lock = acquireMailLockSync(dirname(dirname(path)), options.nonBlocking ? { timeoutMs: 0 } : {});
+  if (!lock) {
+    if (options.nonBlocking) return { status: "busy" };
+    throw new Error(`mail lock contention timeout for ${path}`);
+  }
+  const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+  let fd: number | undefined;
+  let replaced = false;
+  try {
+    statSync(path);
+    const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
+    if (options.snapshot && JSON.stringify(fresh) !== JSON.stringify(options.snapshot)) return { status: "changed" };
+    const updated = mutate(fresh);
+    if (updated === null) return { status: "changed" };
+    statSync(path);
+    fd = openSync(scratchPath, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    statSync(path);
+    renameSync(scratchPath, path);
+    replaced = true;
+    options.afterWrite?.(updated);
+    return { status: "updated", record: updated };
+  } catch (err: any) {
+    if (!replaced && err?.code === "ENOENT") return { status: "gone" };
+    throw err;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch {} }
+    try { rmSync(scratchPath, { force: true }); } catch {}
+    lock.release();
+  }
 }
 
 function isLeaseExpired(msg: MailMessage, now = Date.now()): boolean {
@@ -194,17 +238,21 @@ function parseDurationMs(raw?: string, fallbackMs = 24 * 60 * 60 * 1000): number
   return n * (unit === "ms" ? 1 : unit === "s" ? 1000 : unit === "m" ? 60_000 : unit === "h" ? 3_600_000 : 86_400_000);
 }
 
-function messagePathById(agent: string, id: string): string | null {
+function messagePathById(agent: string, id: string, mailRoot?: string): string | null {
   validateMessageId(id);
-  const inbox = getInbox(agent);
-  for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
+  const resolvedInbox = mailRoot === undefined ? getInbox(agent) : {
+    fresh: join(mailRoot, agent, "new"), cur: join(mailRoot, agent, "cur"), dlq: join(mailRoot, agent, "dlq"),
+  };
+  let prefixMatch: string | null = null;
+  for (const dir of [resolvedInbox.fresh, resolvedInbox.cur, resolvedInbox.dlq]) {
     for (const file of listMessageFiles(dir)) {
       const full = join(dir, file);
       const msg = readMessageFile(full);
-      if (msg.id === id || msg.id.startsWith(id)) return full;
+      if (msg.id === id) return full;
+      if (prefixMatch === null && msg.id.startsWith(id)) prefixMatch = full;
     }
   }
-  return null;
+  return prefixMatch;
 }
 
 /**
@@ -260,27 +308,31 @@ export function inboxFullMessage(recipient: string, count: number): string {
 export function archiveOldCur(agent: string, maxAgeDays = 30): number {
   const inbox = getInbox(agent);
   if (!existsSync(inbox.cur)) return 0;
-  const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  const archiveRoot = join(inbox.root, "archive");
-  let moved = 0;
-  for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
-    const src = join(inbox.cur, file);
-    try {
-      const st = statSync(src);
-      // Use mtime as the archive boundary — covers both naturally-old files
-      // and ones manually touched. Most cur/ entries are written-once when
-      // ack'd, so mtime ≈ when the agent processed them.
-      if (st.mtimeMs > cutoffMs) continue;
-      const ts = new Date(st.mtimeMs);
-      const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
-      mkdirSync(monthDir, { recursive: true });
-      renameSync(src, join(monthDir, file));
-      moved++;
-    } catch {
-      // Skip on stat/rename failure — non-fatal; next call retries.
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  if (!lock) return 0;
+  try {
+    const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const archiveRoot = join(inbox.root, "archive");
+    let moved = 0;
+    for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
+      const src = join(inbox.cur, file);
+      try {
+        const st = statSync(src);
+        // Use mtime as the archive boundary — covers both naturally-old files
+        // and ones manually touched. Most cur/ entries are written-once when
+        // ack'd, so mtime ≈ when the agent processed them.
+        if (st.mtimeMs > cutoffMs) continue;
+        const ts = new Date(st.mtimeMs);
+        const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
+        mkdirSync(monthDir, { recursive: true });
+        renameSync(src, join(monthDir, file));
+        moved++;
+      } catch {
+        // Skip on stat/rename failure — non-fatal; next call retries.
+      }
     }
-  }
-  return moved;
+    return moved;
+  } finally { lock.release(); }
 }
 
 export function sendMessage(to: string, body: string, from?: string): MailMessage & { filePath: string } {
@@ -382,18 +434,6 @@ export const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set
   "busy",
   "inbox-full",
 ]);
-
-/**
- * The stable reason string `verifyEnvelope` returns when an agent-kind chain
- * entry or `envelope.from` cannot be resolved from the LOCAL Flair. It is a
- * presence failure, not a signature failure: the principal is simply not
- * registered here. Pinned to `signEnvelope.ts` (`agent ${agent} not found in
- * Flair`), unchanged since #336, and captured here so the class boundary is a
- * named, testable predicate rather than a substring check scattered at call
- * sites. (A structured reason enum belongs to the Option 1 follow-up, not this
- * gate — no library change here.)
- */
-const UNRESOLVABLE_PRINCIPAL_REASON_RE = /^agent (.+) not found in Flair$/;
 
 export interface PromoteOk {
   ok: true;
@@ -498,293 +538,9 @@ function dirsForRecordPath(filePath: string): { root: string; fresh: string; tmp
   };
 }
 
-/**
- * Try to parse a message body as a TPS v1 signed envelope.
- *
- * Returns the envelope object, or the string "json-parse-error" (not JSON) or
- * "missing-fields" (JSON but not a v1 envelope).
- */
-function tryParseEnvelope(body: string): Record<string, unknown> | "json-parse-error" | "missing-fields" {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(body);
-  } catch {
-    return "json-parse-error";
-  }
-
-  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return "missing-fields";
-  }
-
-  const obj = parsed as Record<string, unknown>;
-  if (
-    typeof obj.v !== "number" ||
-    !Array.isArray(obj.delegationChain) ||
-    typeof obj.signature !== "string"
-  ) {
-    return "missing-fields";
-  }
-
-  return obj;
-}
-
-// ─── Durable consumed-id ledger (replay gate that survives maildir GC) ───────
-//
-// The replay gate must NOT be the maildir. cur/ is mutable — ackMessage unlinks
-// the record, gcMessages purges it, and archiveOldCur rotates cur/ into
-// archive/ — so a gate built on those reopens the moment a record ages out. A
-// defence that expires is not a defence (CWE-294, replay).
-//
-// Consumed ids are therefore recorded in an append-only ledger at the mailbox
-// root — OUTSIDE every directory the maildir maintenance touches — and consulted
-// BEFORE promotion. The ledger is bounded by AGE, not by the maildir's
-// contents, so it outlives the record it stands in for rather than ageing out
-// with it.
-//
-// Retention (CONSUMED_LEDGER_RETENTION_MS): 180 days. This is deliberately many
-// multiples of the longest maildir lifetime — cur/ holds ~30 days before
-// archiveOldCur rotates it, and gcMessages purges acked records after 24h and
-// everything after 48h — so a replay must now wait out the LEDGER's window, not
-// the maildir's. The fix converts the pre-fix window (which reopened as soon as
-// the record was acked or GC'd — hours) into one bounded by this retention. The
-// residual exposure past the retention is acknowledged; it is strictly larger
-// than the window it replaced, and it is a knob, not an accident.
-const CONSUMED_LEDGER_FILE = "consumed.jsonl";
-const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
-
-function consumedLedgerPath(root: string): string {
-  return join(root, CONSUMED_LEDGER_FILE);
-}
-
-/**
- * Append a consumed envelope messageId to the durable ledger.
- *
- * Called ONLY after the record is safely in cur/ — never before — so a failed
- * promotion cannot mark an id consumed and then reject the legitimate retry as
- * a replay.
- */
-function recordConsumedMessageId(root: string, messageId: string): void {
-  // THROWS on failure. The ledger write is part of the promotion COMMIT: if it
-  // fails, the id is not recorded and is silently replayable, so promote()
-  // rolls the move back and dead-letters as retryable rather than claiming
-  // success. (Log-and-continue here was fail-open — delivery succeeding
-  // silently was the bug.)
-  mkdirSync(root, { recursive: true });
-  appendFileSync(
-    consumedLedgerPath(root),
-    `${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`,
-    "utf-8",
-  );
-}
-
-/**
- * Parse ledger text into the live id set (entries older than `cutoff` are
- * dropped), the lines to keep, and how many lines were dropped. Both ledger
- * readers use it, so they agree on which ids are live.
- */
-function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
-  const ids = new Set<string>();
-  const kept: string[] = [];
-  let pruned = 0;
-  for (const line of raw.split("\n")) {
-    if (!line) continue;
-    let entry: { id?: unknown; at?: unknown };
-    try {
-      entry = JSON.parse(line);
-    } catch {
-      // Torn/partial line from an interrupted append. Do NOT drop it — salvage
-      // the id and keep the line. Dropping was fail-open: a consumed id became
-      // forgotten. We cannot date it, so it is never pruned.
-      const m = line.match(/"id"\s*:\s*"([^"]+)"/);
-      if (m) ids.add(m[1]!);
-      kept.push(line);
-      continue;
-    }
-    const id = entry.id;
-    if (typeof id !== "string" || id === "") {
-      kept.push(line); // unknown shape — keep, never prune what we cannot read
-      continue;
-    }
-    const at = typeof entry.at === "string" ? Date.parse(entry.at) : Number.NaN;
-    if (Number.isNaN(at)) {
-      // Corrupt/absent timestamp (torn append, clock skew). Keep the id — a
-      // consumed id must never be forgotten because we could not date it.
-      ids.add(id);
-      kept.push(line);
-      continue;
-    }
-    if (at < cutoff) {
-      pruned++; // genuinely older than the retention — the intended age bound
-      continue;
-    }
-    ids.add(id);
-    kept.push(line);
-  }
-  return { ids, kept, pruned };
-}
-
-/**
- * Read the durable ledger, dropping entries older than the retention. Returns
- * the live id set. When pruning actually removed something the ledger is
- * rewritten in place (atomic replace) so the file stays bounded by age.
- *
- * The replace drops any line appended between the read and the rename, so call
- * this only while holding the mailbox lock (as promote() does). A reader that
- * does not hold the lock uses peekConsumedLedger.
- */
-function readConsumedLedger(root: string): Set<string> {
-  const path = consumedLedgerPath(root);
-  if (!existsSync(path)) return new Set<string>();
-
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch {
-    return new Set<string>();
-  }
-
-  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
-  if (pruned > 0) {
-    try {
-      const tmp = `${path}.tmp`;
-      writeFileSync(tmp, kept.length > 0 ? `${kept.join("\n")}\n` : "", "utf-8");
-      renameSync(tmp, path);
-    } catch {
-      // Pruning is housekeeping — non-fatal, retried on the next read.
-    }
-  }
-  return ids;
-}
-
-/** A read error on consumed history, naming the path that could not be read. */
-function unreadableHistory(path: string, err: unknown): Error {
-  const code = (err as NodeJS.ErrnoException | undefined)?.code;
-  const detail = code ?? (err instanceof Error ? err.message : String(err));
-  return new Error(`consumed history at ${path} is unreadable (${detail})`);
-}
-
-function isMissing(err: unknown): boolean {
-  return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
-}
-
-/**
- * Read the ledger without changing it: the live id set readConsumedLedger would
- * return, or null when there is no ledger file. Throws when the ledger exists
- * but cannot be read. It never writes, renames or prunes.
- */
-function peekConsumedLedger(root: string): Set<string> | null {
-  const path = consumedLedgerPath(root);
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (err) {
-    if (isMissing(err)) return null;
-    throw unreadableHistory(path, err);
-  }
-  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
-}
-
-/**
- * Does this maildir record carry the envelope messageId? Counts both the
- * persisted `envelopeId` and, for legacy records, a body that is itself a
- * signed envelope.
- */
-function recordCarriesMessageId(msg: MailMessage, messageId: string): boolean {
-  if (msg.envelopeId === messageId) return true;
-  const parsed = tryParseEnvelope(msg.body);
-  if (parsed === "json-parse-error" || parsed === "missing-fields") return false;
-  return (parsed as { messageId?: unknown }).messageId === messageId;
-}
-
-/**
- * Has this envelope messageId already been consumed?
- *
- * The durable ledger is the authority (it survives maildir GC). The maildir
- * scan (cur/ + archive/, recursively) is kept as a MIGRATION fallback for
- * records consumed before this ledger existed — or by an older build — so an
- * upgrade does not open a window for records already on disk. Counts both the
- * persisted `envelopeId` and, for legacy records, a body that is itself a
- * signed envelope. This is the gate on replay of consumed history.
- *
- * It reads the ledger through readConsumedLedger, which may rewrite the ledger:
- * call it only while holding the mailbox lock.
- */
-function isConsumedMessageId(root: string, messageId: string): boolean {
-  if (readConsumedLedger(root).has(messageId)) return true;
-
-  const stack = [join(root, "cur"), join(root, "archive")];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    if (!existsSync(dir)) continue;
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!entry.name.endsWith(".json")) continue;
-      try {
-        const msg = JSON.parse(readFileSync(full, "utf-8")) as MailMessage;
-        if (recordCarriesMessageId(msg, messageId)) return true;
-      } catch {
-        // skip corrupt records
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * The maildir fallback of isConsumedMessageId: a directory or record that does
- * not exist is skipped, a corrupt record is skipped (as
- * isConsumedMessageId skips it), and any other read error throws.
- */
-function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
-  const stack = [join(root, "cur"), join(root, "archive")];
-  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
-    let entries: Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch (err) {
-      if (isMissing(err)) continue;
-      throw unreadableHistory(dir, err);
-    }
-    for (const entry of entries) {
-      const full = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(full);
-        continue;
-      }
-      if (!entry.name.endsWith(".json")) continue;
-      let raw: string;
-      try {
-        raw = readFileSync(full, "utf-8");
-      } catch (err) {
-        if (isMissing(err)) continue; // removed after the listing
-        throw unreadableHistory(full, err);
-      }
-      try {
-        if (recordCarriesMessageId(JSON.parse(raw) as MailMessage, messageId)) return true;
-      } catch {
-        // corrupt record — skipped, as isConsumedMessageId skips it
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Replay lookup for a reader that does not hold the mailbox lock (mail watch):
- * true when this envelope messageId is in the consumed ledger or, failing that,
- * in the maildir fallback — the history isConsumedMessageId consults. It writes,
- * renames, prunes and creates nothing. A missing ledger file counts as an empty
- * ledger; a ledger or maildir that cannot be read THROWS, and the caller must
- * withhold the record.
- */
+/** Replay lookup for a reader that does not hold the mailbox lock (mail watch); see peekConsumedForMailboxRoot. */
 export function isConsumedForMailbox(agent: string, messageId: string): boolean {
-  const root = mailboxRoot(agent);
-  if (peekConsumedLedger(root)?.has(messageId)) return true;
-  return maildirHistoryHasMessageId(root, messageId);
+  return peekConsumedForMailboxRoot(mailboxRoot(agent), messageId);
 }
 
 type EnvelopeBinding =
@@ -824,11 +580,11 @@ function recordMatchesEnvelope(
   record: MailMessage,
   envelope: Envelope,
 ): { ok: true } | { ok: false; reason: string } {
-  for (const key of Object.keys(ENVELOPE_BINDINGS) as Array<keyof Envelope>) {
+  for (const key of Object.keys(ENVELOPE_BINDINGS) as Array<keyof typeof ENVELOPE_BINDINGS>) {
     const rule = ENVELOPE_BINDINGS[key];
     if (rule.kind !== "bind") continue;
-    const envValue = (envelope as unknown as Record<string, unknown>)[key as string];
-    const recValue = (record as unknown as Record<string, unknown>)[rule.recordField as string];
+    const envValue = envelope[key];
+    const recValue = record[rule.recordField];
     if (envValue !== recValue) {
       return {
         ok: false,
@@ -837,12 +593,6 @@ function recordMatchesEnvelope(
     }
   }
   return { ok: true };
-}
-
-/** Describe a rejected id without echoing it: its type, and its length for a string. */
-function describeIdValue(value: unknown): string {
-  if (typeof value === "string") return value.length === 0 ? "an empty string" : `a ${value.length}-char string outside the rule`;
-  return value === null ? "null" : typeof value;
 }
 
 /**
@@ -926,23 +676,8 @@ function trustCeilingReject(
 }
 
 /**
- * The ONE mailbox decision for an enveloped record — the shared policy that BOTH
- * first delivery (`promote`) and re-presentation (`recoverPromoted`) run, so the
- * check set cannot diverge. Add a check here and both paths get it; there is no
- * second list to keep in sync.
- *
- * The checks, in order:
- *   1. signature, through an ALWAYS-constructed Flair client;
- *   2. wrapper/envelope `from` binding;
- *   3. recipient binding;
- *   4. `messageId` shape, and `replyToId` shape when present — the ONE id
- *      rule in envelope-id.ts, shared with the sender (cli#429);
- *   5. `timestamp` shape.
- *
- * Callers add only their path-specific step: `promote` adds the replay gate
- * (first delivery only); `recoverPromoted` requires provenance (recovery only).
- *
- * Throws only when Flair is unreachable — a retryable outage, not a verdict.
+ * The ONE mailbox decision (@tpsdev-ai/agent decideEnvelopeForMailbox), through
+ * an ALWAYS-constructed Flair client.
  */
 async function decideEnvelopeForMailbox(
   agent: string,
@@ -951,94 +686,9 @@ async function decideEnvelopeForMailbox(
   mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<EnvelopePolicyResult> {
-  // 1. Signature, through an ALWAYS-constructed client.
-  const client = await createMailVerifyClient(agent, verify);
-  const verified = await verifyEnvelope(envelope, client);
-  if (!verified.ok) {
-    // 1a. Topology, not forgery. `verifyEnvelope` resolves every agent-kind
-    //     chain entry PLUS `envelope.from`; an unresolvable principal is a
-    //     presence failure (Flair is UP — an outage throws above and becomes the
-    //     retryable `verify-unavailable`), which on a spoke is the normal shape
-    //     of any cross-office envelope. Classify it as its own TERMINAL class so
-    //     `invalid` once again means a resolvable principal whose signature is
-    //     bad — a trustworthy forgery signal — instead of firing on every
-    //     legitimate hub-origin message.
-    const missing = UNRESOLVABLE_PRINCIPAL_REASON_RE.exec(verified.reason);
-    if (missing) {
-      const entry = missing[1]!;
-      const reason =
-        `unresolvable-principal: ${entry} is not registered in the local Flair ` +
-        `(agent-kind delegation-chain entry or sender this mailbox cannot resolve). ` +
-        `Spoke-topology condition: a spoke holds only its own principal and hub ` +
-        `principals are not distributed downward (see cli#383). Not a signature or ` +
-        `forgery verdict. Terminal — message DEAD-LETTERED, NOT delivered.`;
-      return { ok: false, class: "unresolvable-principal", reason };
-    }
-    return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
-  }
-
-  // 1b. Validate non-bridge claims; bridge claims always map to external.
-  const ceiling = trustCeilingReject(envelope, mailRoot, verify);
-  if (ceiling) return ceiling;
-
-  // 2. The wrapper `from` is what consumers route by, and it is unverified; a
-  //    wrapper/envelope mismatch is itself a reject.
-  if (wrapperFrom !== envelope.from) {
-    return {
-      ok: false,
-      class: "invalid",
-      reason: `wrapper/envelope from mismatch (wrapper.from=${wrapperFrom}, envelope.from=${envelope.from})`,
-    };
-  }
-
-  const topicRecipient = typeof envelope.to === "string" && envelope.to.startsWith("topic:")
-    && (await import("./mail-topics.js")).isTopicRecipient(envelope.to, agent, envelope.from);
-  if (envelope.to !== agent && !topicRecipient) {
-    return {
-      ok: false,
-      class: "wrong-recipient",
-      reason: `wrong-recipient (envelope.to=${envelope.to}, mailbox=${agent})`,
-    };
-  }
-
-  // 4. `messageId` shape — the replay gate keys on it, a reply threads on it,
-  //    and verifyEnvelope does not enforce it. ONE shape rule (envelope-id.ts)
-  //    for messageId AND replyToId, the same rule the sender enforces on
-  //    --reply-to (cli#429). A malformed id is a terminal reject, not an
-  //    undefined key that silently never matches. The reason never echoes the
-  //    value (it may carry control characters); it names only the type/length.
-  if (!isValidEnvelopeId(envelope.messageId)) {
-    return {
-      ok: false,
-      class: "invalid",
-      reason: `invalid messageId (must be ${ENVELOPE_ID_SHAPE_TEXT}; got ${describeIdValue(envelope.messageId)})`,
-    };
-  }
-
-  // 4b. `replyToId` shape (cli#429): optional, but when the envelope carries
-  //    the field it must satisfy the same rule — a signed value outside it is
-  //    never presented, whoever signed it.
-  if ((envelope as { replyToId?: unknown }).replyToId !== undefined && !isValidEnvelopeId(envelope.replyToId)) {
-    return {
-      ok: false,
-      class: "invalid",
-      reason: `invalid replyToId (must be ${ENVELOPE_ID_SHAPE_TEXT}; got ${describeIdValue(envelope.replyToId)})`,
-    };
-  }
-
-  // 5. `timestamp` shape — a malformed/absent timestamp is rejected, never
-  //    silently replaced by the wrapper's unsigned value (that fallback would
-  //    let an unsigned field stand in for a signed one).
-  if (typeof envelope.timestamp !== "string" || Number.isNaN(Date.parse(envelope.timestamp))) {
-    const shown = typeof envelope.timestamp === "string" ? JSON.stringify(envelope.timestamp) : String(envelope.timestamp);
-    return {
-      ok: false,
-      class: "invalid",
-      reason: `invalid timestamp (must be an ISO-8601 string, got ${shown})`,
-    };
-  }
-
-  return { ok: true, envelope };
+  const decision = await decideEnvelope(agent, envelope, wrapperFrom, await createMailVerifyClient(agent, verify));
+  if (!decision.ok) return decision;
+  return trustCeilingReject(decision.envelope, mailRoot, verify) ?? decision;
 }
 
 export type VerifyRecordResult =
@@ -1062,17 +712,9 @@ export async function verifyRecordForMailbox(
   mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<VerifyRecordResult> {
-  const parsed = tryParseEnvelope(record.body);
-  if (parsed === "json-parse-error") {
-    return { ok: false, class: "invalid", reason: "body is not JSON (signed envelope required)" };
-  }
-  if (parsed === "missing-fields") {
-    return { ok: false, class: "invalid", reason: "body is not a v1 signed envelope" };
-  }
-  if (typeof parsed.body !== "string") {
-    return { ok: false, class: "invalid", reason: "envelope body is not a string" };
-  }
-  const envelope = parsed as unknown as Envelope;
+  const parsed = parseSignedEnvelope(record.body);
+  if (!parsed.ok) return parsed;
+  const envelope = parsed.envelope;
   const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, mailRoot, verify);
   if (!decision.ok) return { ok: false, class: decision.class, reason: decision.reason };
   return {
@@ -1147,14 +789,12 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
   // verification above deliberately ran BEFORE the lock.
   let lock: MailLock | null;
   try {
-    lock = await acquireMailLock(dirs.root);
+    lock = await acquireMailLock(dirs.root, { timeoutMs: 0 });
   } catch (err: any) {
     // Nested acquisition is a programming error, not a delivery decision.
     return { ok: false, class: "busy", reason: `mail lock error: ${err?.message ?? String(err)}` };
   }
   if (!lock) {
-    // Could not acquire within the bound. Fail-closed: do NOT deliver; the
-    // source stays in place for the next check.
     return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
   }
 
@@ -1174,7 +814,16 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     // Step 4 (first-delivery only): replay — a re-planted consumed envelope must
     // dead-letter. Consulted against the DURABLE ledger (and the maildir
     // fallback), not cur/ alone. The ledger prune runs here, under the lock.
-    if (isConsumedMessageId(dirs.root, envelope.messageId)) {
+    const replay = mailboxReplayStore(dirs.root);
+    let consumed: boolean;
+    try {
+      consumed = replay.isConsumed(envelope.messageId);
+    } catch (err: any) {
+      const reason = `replay history unavailable: ${err?.message ?? String(err)}`;
+      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+      return { ok: false, class: "storage-unavailable", reason };
+    }
+    if (consumed) {
       const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
       rejectToDlq(dirs, filename, filePath, "replay", reason);
       return { ok: false, class: "replay", reason };
@@ -1182,13 +831,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
 
     // Step 5: atomic → cur/ with verified metadata.
     //
-    // The promoted record is composed in a SCRATCH file FIRST, and the source is
-    // only removed once the promoted record is in cur/ AND the consumed id is
-    // durably recorded. A failure in this block is a STORAGE fault, NOT a
-    // verification verdict: the ORIGINAL bytes are never overwritten (a failed
-    // scratch write never touches the source), so we preserve them, class it
-    // RETRYABLE, and a later check re-drives it. The `envelope` is persisted so a
-    // later cur/ re-read can re-verify (see recoverPromoted).
+    // Append commits the cur/ copy; source removal is subsequent cleanup.
     const promoted: MailMessage = {
       ...msg,
       from: envelope.from,
@@ -1196,6 +839,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       body: envelope.body,
       timestamp: envelope.timestamp,
       read: false,
+      ackedAt: undefined,
+      bridgeSentAt: undefined,
       envelopeId: envelope.messageId,
       envelope,
       trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
@@ -1213,7 +858,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     try {
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
-      writeMessageFile(scratchPath, promoted);
+      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
       // Atomic into cur/.
       renameSync(scratchPath, curPath);
       movedToCur = true;
@@ -1221,11 +866,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
       // promotion that can't be recorded must not silently succeed (its id would
       // be replayable with no retry and no quarantine).
-      recordConsumedMessageId(dirs.root, envelope.messageId);
-      // Drop the source LAST, so a crash before here leaves the record in its
-      // original directory (re-promoted, and caught by the replay gate) rather
-      // than nowhere.
-      rmSync(filePath, { force: true });
+      replay.recordConsumed(envelope.messageId);
     } catch (err: any) {
       // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
       // non-file entry at the scratch path) is expected to persist so a later
@@ -1248,6 +889,10 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       return { ok: false, class: "storage-unavailable", reason };
     }
 
+    try {
+      rmSync(filePath, { force: true });
+    } catch {}
+
     // Success: clear any stale sidecar from a prior quarantine (best-effort
     // cleanup; cannot undo the promotion above).
     try {
@@ -1262,6 +907,21 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
   } finally {
     lock.release();
   }
+}
+
+/**
+ * Re-drive every dlq/ entry whose sidecar class is RETRYABLE through promote().
+ * Returns the entries it promoted.
+ */
+export async function redriveRetryable(agent: string, dlqDir: string, verify: MailVerifyConfig = {}): Promise<PromoteOk[]> {
+  const promoted: PromoteOk[] = [];
+  for (const f of listMessageFiles(dlqDir)) {
+    const side = readReasonSidecar(dlqDir, f);
+    if (!side || !RETRYABLE_REJECT_CLASSES.has(side.cls)) continue;
+    const result = await promote(agent, join(dlqDir, f), verify);
+    if (result.ok) promoted.push(result);
+  }
+  return promoted;
 }
 
 /**
@@ -1280,13 +940,10 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
   // Coordinate with in-flight promotions: hold the SAME lock promote() holds, so
   // a scratch being composed right now cannot be eaten (an age guard is cleanup
   // policy, not the safety property — a paused promoter outlives any threshold,
-  // and stat-then-delete still races with replacement of the same pathname). If
-  // the lock is busy, a promoter is active, so nothing is stranded: skip. The
-  // short timeout is deliberate — this is a second acquisition per check that
-  // competes with promotion, so it skips rather than waits and never delays mail.
+  // and stat-then-delete still races with replacement of the same pathname).
   let lock: MailLock | null;
   try {
-    lock = await acquireMailLock(root, { timeoutMs: 250 });
+    lock = await acquireMailLock(root, { timeoutMs: 0 });
   } catch {
     return 0;
   }
@@ -1318,10 +975,8 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
  * the binding table, and the envelope must verify through the shared policy
  * (signature, wrapper->envelope from, recipient, messageId, timestamp).
  *
- * No side effects. Throws only when Flair is unreachable; callers decide (an
- * outage withholds presentation and leaves recovery to retry).
  */
-async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}): Promise<EnvelopePolicyResult> {
+async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}, root = mailboxRoot(agent)): Promise<EnvelopePolicyResult> {
   // Provenance: only promote() stamps envelopeId + the signed envelope.
   if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
     return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
@@ -1334,7 +989,12 @@ async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot:
   if (!binding.ok) {
     return { ok: false, class: "unverified", reason: `record does not match its verified envelope: ${binding.reason}` };
   }
-  return decideEnvelopeForMailbox(agent, env, record.from, mailRoot, verify);
+  const decision = await decideEnvelopeForMailbox(agent, env, record.from, mailRoot, verify);
+  if (!decision.ok) return decision;
+  if (!hasCommittedMessageId(root, env.messageId)) {
+    throw new Error("promotion has no consumed ledger commit; not presented");
+  }
+  return decision;
 }
 
 /**
@@ -1366,10 +1026,8 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage,
  * stays for history (cur/ and archive are never swept as mail); LIVE
  * re-delivery is held to the same bar as first delivery.
  *
- * Throws only when Flair is unreachable — the caller should leave the record in
- * `cur/` and retry later (a transient outage is not a verdict about the mail).
  */
-export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
+export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteReject | (PromoteOk & { snapshot: MailMessage })> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
   const mailRoot = mailRootForRecordPath(curPath);
@@ -1380,7 +1038,15 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     msg = readMessageFile(curPath);
   } catch (err: any) {
     const reason = `corrupt cur/ record: ${err?.message ?? String(err)}`;
-    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    if (err?.code !== "ENOENT") {
+      const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
+      if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
+      try {
+        try { readMessageFile(curPath); } catch (freshError: any) {
+          if (freshError?.code !== "ENOENT") rejectToDlq(dirs, filename, curPath, "unverified", reason);
+        }
+      } finally { lock.release(); }
+    }
     return { ok: false, class: "unverified", reason };
   }
 
@@ -1389,9 +1055,16 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // includes the recipient binding, so a record carrying another mailbox's
   // genuine envelope cannot be presented here. (The first-delivery-only replay
   // gate is unnecessary: this id is already consumed.)
-  const decision = await checkPromotedRecord(agent, msg, mailRoot, verify);
+  const decision = await checkPromotedRecord(agent, msg, mailRoot, verify, dirs.root);
   if (!decision.ok) {
-    rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
+    const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
+    if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
+    try {
+      try {
+        if (JSON.stringify(readMessageFile(curPath)) === JSON.stringify(msg))
+          rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
+      } catch (err: any) { if (err?.code !== "ENOENT") throw err; }
+    } finally { lock.release(); }
     return { ok: false, class: decision.class, reason: decision.reason };
   }
   const env = decision.envelope;
@@ -1408,7 +1081,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     trustTier: verifiedMailTier(env, mailRoot, verify.bridgeAgentId),
     replyToId: env.replyToId,
   };
-  return { ok: true, message: presented, path: curPath };
+  return { ok: true, message: presented, path: curPath, snapshot: msg };
 }
 
 /**
@@ -1423,9 +1096,6 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
 
-  // Opportunistic cur/ archive — keeps the processed tail from accumulating
-  // indefinitely. Safe to no-op when there's nothing old; cost is one stat()
-  // per cur entry, capped at the directory size.
   try {
     archiveOldCur(agent);
   } catch (e: any) {
@@ -1457,12 +1127,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   // 2. Self-heal: re-drive quarantined RETRYABLE entries (a Flair outage or a
   //    transient storage fault). Terminal rejects (invalid/wrong-recipient/
   //    replay) are NOT retried.
-  for (const f of listMessageFiles(inbox.dlq)) {
-    const side = readReasonSidecar(inbox.dlq, f);
-    if (!side || !RETRYABLE_REJECT_CLASSES.has(side.cls)) continue;
-    const result = await promote(agent, join(inbox.dlq, f), verify);
-    if (result.ok) messages.push(result.message);
-  }
+  for (const result of await redriveRetryable(agent, inbox.dlq, verify)) messages.push(result.message);
 
   // 3. Lease sweep over cur/ — re-present un-acked records past their lease.
   //    cur/ is a DESTINATION, so this is LIVE delivery and goes through the same
@@ -1472,11 +1137,12 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   //    this branch.
   for (const f of listMessageFiles(inbox.cur)) {
     const full = join(inbox.cur, f);
-    const msg = readMessageFile(full);
+    let msg: MailMessage;
+    try { msg = readMessageFile(full); } catch { continue; }
     if (msg.read || msg.nackedAt) continue;
     if (msg.retryAfter && Date.parse(msg.retryAfter) > nowMs) continue;
     if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
-    let recovered: PromoteResult;
+    let recovered: Awaited<ReturnType<typeof recoverPromoted>>;
     try {
       recovered = await recoverPromoted(agent, full, verify);
     } catch {
@@ -1484,9 +1150,13 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       continue;
     }
     if (!recovered.ok) continue; // quarantined
-    const present: MailMessage = { ...recovered.message, checkedOutAt: nowIso, checkedOutBy };
-    writeMessageFile(full, present);
-    messages.push(present);
+    const result = updateExistingRecord<MailMessage>(full, (fresh) => {
+      if (fresh.read || fresh.ackedAt || fresh.nackedAt) return null;
+      if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
+      if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
+      return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
+    }, { snapshot: recovered.snapshot, nonBlocking: true });
+    if (result.status === "updated") messages.push(result.record);
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check
@@ -1533,56 +1203,71 @@ export async function verifyMailAction(agent: string, id: string): Promise<MailM
   return result.message;
 }
 
-export function ackMessage(agent: string, id: string): MailMessage | null {
-  const path = messagePathById(agent, id);
+export function ackMessage(agent: string, id: string, mailRoot?: string): MailMessage | null {
+  const path = messagePathById(agent, id, mailRoot);
   if (!path) return null;
-  const msg = readMessageFile(path);
-  msg.read = true;
-  msg.ackedAt = new Date().toISOString();
-  delete msg.nackedAt;
-  delete msg.nackReason;
-  delete msg.nackType;
-  delete msg.checkedOutAt;
-  delete msg.checkedOutBy;
-  delete msg.retryAfter;
-  writeMessageFile(path, msg);
-  // Remove the file from cur/ now that it's acked. There is NO ack audit trail
-  // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
-  // whose event set is only "sent" | "read" | "listed" — there is no "ack"
-  // event — and `logEvent` swallows every error. An ack is therefore not
-  // recorded anywhere, and nothing binds an archive row to the record's
-  // verification verdict or `envelopeId`. (Logging an event before the unlink
-  // would be better, but it would not be an ack trail without an ack event type
-  // and that binding — so the comment says what is true rather than claiming a
-  // trail we do not have.)
-  try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
-  return msg;
+  return ackMessageAtPath(path);
+}
+
+export function setBridgeSentAtPath(path: string, sentAt: string): void {
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
+    msg.bridgeSentAt = sentAt;
+    return msg;
+  });
+  if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
+}
+
+export function ackMessageAtPath(path: string): MailMessage {
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
+    msg.read = true;
+    msg.ackedAt = new Date().toISOString();
+    delete msg.nackedAt;
+    delete msg.nackReason;
+    delete msg.nackType;
+    delete msg.checkedOutAt;
+    delete msg.checkedOutBy;
+    delete msg.retryAfter;
+    return msg;
+  }, { afterWrite: () => {
+    // Remove the file from cur/ now that it's acked. There is NO ack audit trail
+    // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
+    // whose event set is only "sent" | "read" | "listed" — there is no "ack"
+    // event. No durable ack audit trail is guaranteed (if the unlink below fails,
+    // the ackedAt marker written above stays in the file), and nothing binds an archive row to the record's
+    // verification verdict or `envelopeId`. (Logging an event before the unlink
+    // would be better, but it would not be an ack trail without an ack event type
+    // and that binding — so the comment says what is true rather than claiming a
+    // trail we do not have.)
+    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
+  } });
+  if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
+  return result.record;
 }
 
 export function nackMessage(agent: string, id: string, reason: string, type: "transient" | "agent" | "permanent" = "transient", retryAfter?: string): MailMessage | null {
   const path = messagePathById(agent, id);
   if (!path) return null;
-  const msg = readMessageFile(path);
-  msg.read = false;
-  msg.nackedAt = new Date().toISOString();
-  msg.nackReason = reason;
-  msg.nackType = type;
-  msg.checkedOutAt = undefined;
-  msg.checkedOutBy = undefined;
-  if (type === "transient" && retryAfter) {
-    msg.retryAfter = new Date(Date.now() + parseDurationMs(retryAfter, 60_000)).toISOString();
-  } else {
-    delete msg.retryAfter;
-  }
-  if (type === "permanent") {
-    const inbox = getInbox(agent);
-    const target = join(inbox.dlq, path.split("/").pop()!);
-    writeMessageFile(path, msg);
-    renameSync(path, target);
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
+    if (msg.id !== id && !msg.id.startsWith(id)) return null;
+    msg.read = false;
+    msg.nackedAt = new Date().toISOString();
+    msg.nackReason = reason;
+    msg.nackType = type;
+    delete msg.checkedOutAt;
+    delete msg.checkedOutBy;
+    if (type === "transient" && retryAfter) {
+      msg.retryAfter = new Date(Date.now() + parseDurationMs(retryAfter, 60_000)).toISOString();
+    } else {
+      delete msg.retryAfter;
+    }
     return msg;
-  }
-  writeMessageFile(path, msg);
-  return msg;
+  }, { afterWrite: () => {
+    if (type === "permanent") {
+      const target = join(getInbox(agent).dlq, path.split("/").pop()!);
+      renameSync(path, target);
+    }
+  } });
+  return result.status === "updated" ? result.record : null;
 }
 
 export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, hardTtl = "48h"): number {
@@ -1592,21 +1277,25 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
   const hardCutoff = Date.now() - parseDurationMs(hardTtl, 48 * 60 * 60 * 1000);
   for (const a of agents) {
     const inbox = getInbox(a);
-    for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
-      for (const file of listMessageFiles(dir)) {
-        const full = join(dir, file);
-        const msg = readMessageFile(full);
-        const ts = Date.parse(msg.ackedAt ?? msg.timestamp);
-        const hardTs = Date.parse(msg.timestamp);
-        const done = msg.read && !!msg.ackedAt;
-        const prMatch = prNumber == null || msg.prNumber === prNumber || msg.body.includes(`#${prNumber}`) || msg.body.includes(`PR #${prNumber}`);
-        if (!prMatch) continue;
-        if ((done && ts < doneCutoff) || hardTs < hardCutoff) {
-          rmSync(full, { force: true });
-          removed++;
+    const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+    if (!lock) continue;
+    try {
+      for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
+        for (const file of listMessageFiles(dir)) {
+          const full = join(dir, file);
+          const msg = readMessageFile(full);
+          const ts = Date.parse(msg.ackedAt ?? msg.timestamp);
+          const hardTs = Date.parse(msg.timestamp);
+          const done = msg.read && !!msg.ackedAt;
+          const prMatch = prNumber == null || msg.prNumber === prNumber || msg.body.includes(`#${prNumber}`) || msg.body.includes(`PR #${prNumber}`);
+          if (!prMatch) continue;
+          if ((done && ts < doneCutoff) || hardTs < hardCutoff) {
+            rmSync(full, { force: true });
+            removed++;
+          }
         }
       }
-    }
+    } finally { lock.release(); }
   }
   return removed;
 }

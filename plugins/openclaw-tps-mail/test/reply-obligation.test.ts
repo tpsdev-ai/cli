@@ -1,3 +1,4 @@
+import { mailboxReplayStore } from "@tpsdev-ai/agent";
 /**
  * reply-obligation.test.ts — slice S2 of the reply-OBLIGATION work (the
  * follow-up to cli#392's S0/S1).
@@ -175,6 +176,8 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       warnCalls?: string[];
     } = {},
   ) {
+    if (abortController.signal.aborted) abortController = new AbortController();
+    const accountAbort = abortController;
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
@@ -242,17 +245,21 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       cfg,
       log: { info: () => {}, warn: (...a: any[]) => warnCalls.push(a.map(String).join(" ")), error: () => {} },
       channelRuntime,
-      abortSignal: abortController.signal,
+      abortSignal: accountAbort.signal,
     };
 
     if (opts.noInbound) {
       for (const file of readdirSafe(resolve(tempMailDir, agentId, "cur"))) {
         const path = resolve(tempMailDir, agentId, "cur", file);
         const record = JSON.parse(readFileSync(path, "utf8"));
-        if (record.envelope) continue;
+        if (record.envelope) {
+          mailboxReplayStore(resolve(tempMailDir, agentId)).recordConsumed(record.envelope.messageId);
+          continue;
+        }
         const envelope = JSON.parse(record.body);
         writeFileSync(path, JSON.stringify({ ...record, body: envelope.body, timestamp: envelope.timestamp,
           envelopeId: envelope.messageId, envelope, replyToId: envelope.replyToId }));
+        mailboxReplayStore(resolve(tempMailDir, agentId)).recordConsumed(envelope.messageId);
       }
     }
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
@@ -272,7 +279,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       // (onSkip); this drives that path.
       skip: (reason = "empty") => dispatchedArgs!.dispatcherOptions.onSkip?.({ text: "" }, { kind: "final", reason }),
       settle: () => settleFn?.(),
-      stop: async () => { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
+      stop: async () => { accountAbort.abort(); try { await startPromise; } catch { /* aborted */ } },
     };
   }
 

@@ -3,10 +3,16 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
-import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
+import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
+import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
+import {
+  decideEnvelopeForMailbox,
+  type MailboxPolicyRejectClass,
+  mailboxReplayStore,
+  parseSignedEnvelope,
+} from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
-import { isTopicRecipient } from "../lib/topic-recipient.js";
 
 export interface MailMessage {
   filename: string;
@@ -29,21 +35,11 @@ export interface MailMessage {
  * dead-lettered (the record stays in `new/`), so no retryable class is written
  * here.
  */
-type MailboxRejectClass = "invalid" | "unresolvable-principal" | "wrong-recipient";
+type MailboxRejectClass = MailboxPolicyRejectClass;
 
 type VerifyOutcome =
   | { pass: true; envelope: Envelope }
   | { pass: false; class: MailboxRejectClass; reason: string; from?: string };
-
-/**
- * The stable reason string `verifyEnvelope` returns when an agent-kind chain
- * entry or `envelope.from` cannot be resolved from the LOCAL Flair. An ABSENT
- * principal is a topology condition, not a forgery verdict, so it is labelled
- * `unresolvable-principal` rather than `invalid`. Duplicated from the shared
- * promotion boundary because `@tpsdev-ai/agent` cannot import `packages/cli`
- * (the dependency runs the other way: cli → agent).
- */
-const UNRESOLVABLE_PRINCIPAL_REASON_RE = /^agent (.+) not found in Flair$/;
 
 /**
  * Write the dlq sidecar for a TERMINAL rejection.
@@ -71,21 +67,30 @@ function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxReject
  * Writes outgoing mail to mailDir/outbox/new.
  */
 export class MailClient {
+  private mailboxRoot: string;
   private inboxNew: string;
   private inboxCur: string;
   private inboxDlq: string;
   private outboxNew: string;
-  /** One-shot guard so a misconfigured (verifier-less) mailbox warns once, not per poll. */
-  private warnedNoVerifier = false;
+  private readonly flairClient: FlairClient;
 
   constructor(
     public readonly mailDir: string,
     private readonly events?: EventLogger,
     private readonly agentId = "unknown",
-    private readonly flairClient?: FlairClient,
+    flairClient?: FlairClient,
     /** Configured Flair signing key, checked against both standard locations. */
     private readonly signingKeyPath?: string,
   ) {
+    // cli#380: construction without a verifier throws.
+    if (!flairClient) {
+      throw new Error(
+        `MailClient requires a Flair verifier for "${agentId}": refusing to construct a mailbox that ` +
+          `could promote unverified mail (cli#380).`,
+      );
+    }
+    this.flairClient = flairClient;
+    this.mailboxRoot = join(mailDir, agentId);
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
     this.inboxDlq = join(mailDir, agentId, "dlq");
@@ -96,46 +101,19 @@ export class MailClient {
   }
 
   /**
-   * Return all messages in inbox/new and move them to inbox/cur/.
-   *
-   * Verification is MANDATORY — a record is promoted ONLY after its signed
-   * envelope verifies against the local Flair. There is no unverified path:
-   *   - NO verifier configured → refuse; the record stays in new/ (an absent
-   *     client must never mean "promote without verifying");
+   * A record is promoted ONLY after the shared mailbox policy
+   * (decideEnvelopeForMailbox) passes and, under the mailbox lock, the shared
+   * replay store has not seen its messageId:
    *   - the verifier THROWS (Flair unreachable) → refuse; the record stays in
    *     new/ for a later check (a throw must never mean "pass");
-   *   - the verifier REJECTS → dead-letter to dlq/ with a `.reason` sidecar.
-   * Unverified input must never reach the tool-holding model.
+   *   - the policy or the replay gate REJECTS → attempt dead-lettering and a
+   *     `.reason` sidecar.
    */
   async checkNewMail(): Promise<MailMessage[]> {
     if (!existsSync(this.inboxNew)) return [];
 
     const files = readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
     const messages: MailMessage[] = [];
-
-    // No verifier → NOTHING is promotable. Refuse (never rename into cur/) and
-    // leave the records in new/ so a later check with a verifier — or the
-    // shared promote() path — can process them.
-    if (!this.flairClient) {
-      if (files.length === 0) return [];
-      this.events?.emit({
-        type: "mail.receive",
-        agent: this.agentId,
-        status: "rejected",
-        from: "unknown",
-        durationMs: 0,
-        error: "no verifier configured — refusing to promote unverified mail",
-      });
-      if (!this.warnedNoVerifier) {
-        this.warnedNoVerifier = true;
-        console.error(
-          `[MailClient] no Flair verifier configured for "${this.agentId}": refusing to promote ` +
-            `${files.length} unverified message(s) from new/. Unverified input must never reach the ` +
-            `model — configure flair (url + key) or promote through the shared promote() lifecycle.`,
-        );
-      }
-      return [];
-    }
 
     for (const file of files) {
       const started = Date.now();
@@ -176,28 +154,17 @@ export class MailClient {
       }
 
       if (!verifyResult.pass) {
-        const dlqPath = join(this.inboxDlq, file);
-        try {
-          if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
-          writeRejectSidecar(this.inboxDlq, file, verifyResult.class, verifyResult.reason);
-        } catch (err) {
-          console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`);
-        }
-        this.events?.emit({
-          type: "mail.receive",
-          agent: this.agentId,
-          status: "rejected",
-          from: verifyResult.from ?? "unknown",
-          durationMs: Date.now() - started,
-          error: verifyResult.reason,
-        });
+        this.deadLetter(file, srcPath, verifyResult, started);
         continue;
       }
 
-      // Promote to cur/ — verified, and addressed to this mailbox.
+      // Promote to cur/ under the mailbox lock, behind the replay gate.
       try {
-        const dstPath = join(this.inboxCur, file);
-        renameSync(srcPath, dstPath);
+        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope);
+        if (committed) {
+          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
+          continue;
+        }
         const from = verifyResult.envelope.from;
         messages.push({
           filename: file, body, receivedAt: new Date(), headers: {}, from,
@@ -224,6 +191,68 @@ export class MailClient {
     }
 
     return messages;
+  }
+
+  /**
+   * Under the mailbox lock: refuse a consumed messageId, else rename into cur/
+   * and record the id. Returns the replay rejection, or null once committed.
+   * On append failure, attempt to move the record back to new/; throw on failure.
+   */
+  private async commitToCur(
+    file: string,
+    srcPath: string,
+    body: string,
+    envelope: Envelope,
+  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | null> {
+    const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
+    if (!lock) throw new Error("mailbox lock busy; not promoted");
+    try {
+      if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      if (replay.isConsumed(envelope.messageId)) {
+        return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
+      }
+      const dstPath = join(this.inboxCur, file);
+      renameSync(srcPath, dstPath);
+      try {
+        replay.recordConsumed(envelope.messageId);
+      } catch (err) {
+        try {
+          renameSync(dstPath, srcPath);
+        } catch (rollbackErr) {
+          throw new AggregateError([err, rollbackErr],
+            `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
+        }
+        throw err;
+      }
+      return null;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Attempt the dlq/ move and sidecar write, then emit the rejection. */
+  private deadLetter(
+    file: string,
+    srcPath: string,
+    rejected: { class: MailboxRejectClass; reason: string; from?: string },
+    started: number,
+  ): void {
+    const dlqPath = join(this.inboxDlq, file);
+    try {
+      if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
+      writeRejectSidecar(this.inboxDlq, file, rejected.class, rejected.reason);
+    } catch (err) {
+      console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`);
+    }
+    this.events?.emit({
+      type: "mail.receive",
+      agent: this.agentId,
+      status: "rejected",
+      from: rejected.from ?? "unknown",
+      durationMs: Date.now() - started,
+      error: rejected.reason,
+    });
   }
 
   /** Write a message to outbox/new for relay delivery. */
@@ -313,19 +342,12 @@ export class MailClient {
   }
 
   /**
-   * Verify a mail body against the v1 signed envelope spec AND this mailbox's
-   * policy: signature, wrapper→envelope `from` binding, recipient binding
-   * and `messageId`/`timestamp`
-   * shape.
-   *
+   * Parse a mail file and run the shared mailbox policy on its signed envelope.
    * Returns a terminal `{ pass: false, class, reason }` on a deterministic
-   * rejection. Called ONLY when a verifier is configured; a THROW (Flair
-   * unreachable) is a refusal the caller acts on, never a pass.
+   * rejection; a THROW (Flair unreachable) is a refusal the caller acts on,
+   * never a pass.
    */
   private async verifyMailBody(body: string): Promise<VerifyOutcome> {
-    const client = this.flairClient!;
-
-    // 1. Parse the mail file as JSON
     let mailMsg: { from?: string; body: string };
     try {
       mailMsg = JSON.parse(body);
@@ -333,84 +355,11 @@ export class MailClient {
       return { pass: false, class: "invalid", reason: "json parse error: invalid JSON" };
     }
 
-    if (!mailMsg.body || typeof mailMsg.body !== "string") {
-      return { pass: false, class: "invalid", reason: "json parse error: missing body field" };
-    }
+    const parsed = parseSignedEnvelope(mailMsg.body);
+    if (!parsed.ok) return { pass: false, class: parsed.class, reason: parsed.reason, from: mailMsg.from };
 
-    // 2. Parse the body field as an envelope
-    let envelope: unknown;
-    try {
-      envelope = JSON.parse(mailMsg.body);
-    } catch {
-      return { pass: false, class: "invalid", reason: "json parse error: invalid envelope body", from: mailMsg.from };
-    }
-
-    if (envelope == null || typeof envelope !== "object" || Array.isArray(envelope)) {
-      return { pass: false, class: "invalid", reason: "unsigned envelope (v1 required)", from: mailMsg.from };
-    }
-
-    const env = envelope as Record<string, unknown>;
-    if (
-      typeof env.v !== "number" ||
-      !Array.isArray(env.delegationChain) ||
-      typeof env.signature !== "string"
-    ) {
-      return { pass: false, class: "invalid", reason: "unsigned envelope (v1 required)", from: mailMsg.from };
-    }
-
-    // 3. Verify the signature. A THROW here (Flair unreachable) is NOT a pass —
-    //    it propagates to checkNewMail(), which refuses to promote and leaves
-    //    the record in new/ for a later check. The verifier adapter throws on an
-    //    outage, so an outage is RETRYABLE rather than a terminal "not found".
-    const vr = await verifyEnvelope(env as any, client);
-    if (!vr.ok) {
-      const cls: MailboxRejectClass = UNRESOLVABLE_PRINCIPAL_REASON_RE.test(vr.reason)
-        ? "unresolvable-principal"
-        : "invalid";
-      return { pass: false, class: cls, reason: vr.reason, from: mailMsg.from };
-    }
-
-    // 4. The wrapper `from` is what consumers route by, and it is unverified; a
-    //    wrapper/envelope mismatch is itself a reject.
-    if (typeof mailMsg.from !== "string" || mailMsg.from !== env.from) {
-      return {
-        pass: false,
-        class: "invalid",
-        reason: `wrapper/envelope from mismatch (wrapper.from=${String(mailMsg.from)}, envelope.from=${String(env.from)})`,
-        from: mailMsg.from,
-      };
-    }
-
-    if (env.to !== this.agentId && !isTopicRecipient(env.to, this.agentId, mailMsg.from)) {
-      return {
-        pass: false,
-        class: "wrong-recipient",
-        reason: `wrong-recipient (envelope.to=${String(env.to)}, mailbox=${this.agentId})`,
-        from: mailMsg.from,
-      };
-    }
-
-    // 6. `messageId` shape.
-    if (typeof env.messageId !== "string" || env.messageId.trim() === "") {
-      return {
-        pass: false,
-        class: "invalid",
-        reason: `invalid messageId (must be a non-empty string, got ${JSON.stringify(env.messageId)})`,
-        from: mailMsg.from,
-      };
-    }
-
-    // 7. `timestamp` shape — a malformed/absent timestamp must not be silently
-    //    accepted (the shared path rejects it too).
-    if (typeof env.timestamp !== "string" || Number.isNaN(Date.parse(env.timestamp))) {
-      return {
-        pass: false,
-        class: "invalid",
-        reason: `invalid timestamp (must be an ISO-8601 string, got ${JSON.stringify(env.timestamp)})`,
-        from: mailMsg.from,
-      };
-    }
-
-    return { pass: true, envelope: env as unknown as Envelope };
+    const decision = await decideEnvelopeForMailbox(this.agentId, parsed.envelope, mailMsg.from, this.flairClient);
+    if (!decision.ok) return { pass: false, class: decision.class, reason: decision.reason, from: mailMsg.from };
+    return { pass: true, envelope: decision.envelope };
   }
 }
