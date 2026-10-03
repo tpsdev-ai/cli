@@ -1,0 +1,1 @@
+- **Fix symlinked entry checks in `scripts/test-suite.mjs` and `scripts/check-test-reports.mjs`.** Node’s default symlink resolution broke the old comparison; both scripts now compare canonical paths.

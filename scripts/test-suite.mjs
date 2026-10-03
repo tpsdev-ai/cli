@@ -82,10 +82,10 @@
  */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import {
   IsolationRefusal,
   assertNoReporterOutfile,
@@ -329,6 +329,13 @@ async function main() {
   }
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+/** Compare canonical entry paths (cli#475); an unresolvable argv[1] throws. */
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  return realpathSync(invoked) === realpathSync(fileURLToPath(import.meta.url));
+}
+
+if (isEntryPoint()) {
   await main();
 }
