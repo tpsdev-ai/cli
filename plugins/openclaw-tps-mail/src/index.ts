@@ -52,14 +52,14 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, mailRootForRecordPath, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -617,21 +617,10 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
   return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
-/** Patch an existing mail record in place. */
 export function patchMailFile(path: string, patch: Partial<TpsMailBody>): boolean {
   try {
-    const current = readMailFile(path);
-    if (!current) return false;
-    const content = JSON.stringify({ ...current, ...patch }, null, 2);
-    const fd = openSync(path, constants.O_WRONLY | constants.O_TRUNC);
-    try {
-      writeFileSync(fd, content, "utf-8");
-    } finally {
-      closeSync(fd);
-    }
-    return true;
+    return updateExistingRecord<TpsMailBody>(path, (current) => Object.assign(current, patch)).status === "updated";
   } catch {
-    // best effort — don't crash the watcher on state-transition errors
     return false;
   }
 }

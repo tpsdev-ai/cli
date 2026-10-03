@@ -178,32 +178,47 @@ function readMessageFile(path: string): MailMessage {
   try {
     return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
   } catch (err: any) {
-    throw new Error(`corrupt message file ${path}: ${err.message}`);
+    throw Object.assign(new Error(`corrupt message file ${path}: ${err.message}`), { code: err?.code });
   }
 }
 
-function writeMessageFile(path: string, msg: MailMessage, existingOnly = false, heldLock?: MailLock): void {
-  if (existingOnly) {
-    const lock = heldLock ?? acquireMailLockSync(dirname(dirname(path)));
-    if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
-    const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
-    let fd: number | undefined;
-    try {
-      fd = openSync(scratchPath, "wx", 0o600);
-      writeFileSync(fd, JSON.stringify(msg, null, 2), "utf-8");
-      fsyncSync(fd);
-      closeSync(fd);
-      fd = undefined;
-      statSync(path);
-      renameSync(scratchPath, path);
-    } finally {
-      if (fd !== undefined) { try { closeSync(fd); } catch {} }
-      try { rmSync(scratchPath, { force: true }); } catch {}
-      if (!heldLock) lock.release();
-    }
-    return;
+export type UpdateExistingResult<T> = { status: "updated"; record: T } | { status: "gone" | "changed" };
+
+export function updateExistingRecord<T extends object>(
+  path: string,
+  mutate: (record: T) => T | null,
+  options: { snapshot?: T; afterWrite?: (record: T) => void } = {},
+): UpdateExistingResult<T> {
+  const lock = acquireMailLockSync(dirname(dirname(path)));
+  if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
+  const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+  let fd: number | undefined;
+  let replaced = false;
+  try {
+    statSync(path);
+    const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
+    if (options.snapshot && JSON.stringify(fresh) !== JSON.stringify(options.snapshot)) return { status: "changed" };
+    const updated = mutate(fresh);
+    if (updated === null) return { status: "changed" };
+    statSync(path);
+    fd = openSync(scratchPath, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    statSync(path);
+    renameSync(scratchPath, path);
+    replaced = true;
+    options.afterWrite?.(updated);
+    return { status: "updated", record: updated };
+  } catch (err: any) {
+    if (!replaced && err?.code === "ENOENT") return { status: "gone" };
+    throw err;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch {} }
+    try { rmSync(scratchPath, { force: true }); } catch {}
+    lock.release();
   }
-  writeFileSync(path, JSON.stringify(msg, null, 2), "utf-8");
 }
 
 function isLeaseExpired(msg: MailMessage, now = Date.now()): boolean {
@@ -290,27 +305,31 @@ export function inboxFullMessage(recipient: string, count: number): string {
 export function archiveOldCur(agent: string, maxAgeDays = 30): number {
   const inbox = getInbox(agent);
   if (!existsSync(inbox.cur)) return 0;
-  const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-  const archiveRoot = join(inbox.root, "archive");
-  let moved = 0;
-  for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
-    const src = join(inbox.cur, file);
-    try {
-      const st = statSync(src);
-      // Use mtime as the archive boundary — covers both naturally-old files
-      // and ones manually touched. Most cur/ entries are written-once when
-      // ack'd, so mtime ≈ when the agent processed them.
-      if (st.mtimeMs > cutoffMs) continue;
-      const ts = new Date(st.mtimeMs);
-      const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
-      mkdirSync(monthDir, { recursive: true });
-      renameSync(src, join(monthDir, file));
-      moved++;
-    } catch {
-      // Skip on stat/rename failure — non-fatal; next call retries.
+  const lock = acquireMailLockSync(inbox.root);
+  if (!lock) return 0;
+  try {
+    const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
+    const archiveRoot = join(inbox.root, "archive");
+    let moved = 0;
+    for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
+      const src = join(inbox.cur, file);
+      try {
+        const st = statSync(src);
+        // Use mtime as the archive boundary — covers both naturally-old files
+        // and ones manually touched. Most cur/ entries are written-once when
+        // ack'd, so mtime ≈ when the agent processed them.
+        if (st.mtimeMs > cutoffMs) continue;
+        const ts = new Date(st.mtimeMs);
+        const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
+        mkdirSync(monthDir, { recursive: true });
+        renameSync(src, join(monthDir, file));
+        moved++;
+      } catch {
+        // Skip on stat/rename failure — non-fatal; next call retries.
+      }
     }
-  }
-  return moved;
+    return moved;
+  } finally { lock.release(); }
 }
 
 export function sendMessage(to: string, body: string, from?: string): MailMessage & { filePath: string } {
@@ -810,7 +829,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     try {
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
-      writeMessageFile(scratchPath, promoted);
+      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
       // Atomic into cur/.
       renameSync(scratchPath, curPath);
       movedToCur = true;
@@ -982,7 +1001,7 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage,
  * re-delivery is held to the same bar as first delivery.
  *
  */
-export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
+export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteReject | (PromoteOk & { snapshot: MailMessage })> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
   const mailRoot = mailRootForRecordPath(curPath);
@@ -993,7 +1012,15 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     msg = readMessageFile(curPath);
   } catch (err: any) {
     const reason = `corrupt cur/ record: ${err?.message ?? String(err)}`;
-    rejectToDlq(dirs, filename, curPath, "unverified", reason);
+    if (err?.code !== "ENOENT") {
+      const lock = acquireMailLockSync(dirs.root);
+      if (!lock) throw new Error(`mail lock contention timeout for ${curPath}`);
+      try {
+        try { readMessageFile(curPath); } catch (freshError: any) {
+          if (freshError?.code !== "ENOENT") rejectToDlq(dirs, filename, curPath, "unverified", reason);
+        }
+      } finally { lock.release(); }
+    }
     return { ok: false, class: "unverified", reason };
   }
 
@@ -1004,7 +1031,14 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // gate is unnecessary: this id is already consumed.)
   const decision = await checkPromotedRecord(agent, msg, mailRoot, verify, dirs.root);
   if (!decision.ok) {
-    rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
+    const lock = acquireMailLockSync(dirs.root);
+    if (!lock) throw new Error(`mail lock contention timeout for ${curPath}`);
+    try {
+      try {
+        if (JSON.stringify(readMessageFile(curPath)) === JSON.stringify(msg))
+          rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
+      } catch (err: any) { if (err?.code !== "ENOENT") throw err; }
+    } finally { lock.release(); }
     return { ok: false, class: decision.class, reason: decision.reason };
   }
   const env = decision.envelope;
@@ -1021,7 +1055,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     trustTier: verifiedMailTier(env, mailRoot, verify.bridgeAgentId),
     replyToId: env.replyToId,
   };
-  return { ok: true, message: presented, path: curPath };
+  return { ok: true, message: presented, path: curPath, snapshot: msg };
 }
 
 /**
@@ -1080,11 +1114,12 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   //    this branch.
   for (const f of listMessageFiles(inbox.cur)) {
     const full = join(inbox.cur, f);
-    const msg = readMessageFile(full);
+    let msg: MailMessage;
+    try { msg = readMessageFile(full); } catch { continue; }
     if (msg.read || msg.nackedAt) continue;
     if (msg.retryAfter && Date.parse(msg.retryAfter) > nowMs) continue;
     if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
-    let recovered: PromoteResult;
+    let recovered: Awaited<ReturnType<typeof recoverPromoted>>;
     try {
       recovered = await recoverPromoted(agent, full, verify);
     } catch {
@@ -1092,9 +1127,13 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       continue;
     }
     if (!recovered.ok) continue; // quarantined
-    const present: MailMessage = { ...recovered.message, checkedOutAt: nowIso, checkedOutBy };
-    writeMessageFile(full, present);
-    messages.push(present);
+    const result = updateExistingRecord<MailMessage>(full, (fresh) => {
+      if (fresh.read || fresh.ackedAt || fresh.nackedAt) return null;
+      if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
+      if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
+      return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
+    }, { snapshot: recovered.snapshot });
+    if (result.status === "updated") messages.push(result.record);
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check
@@ -1148,16 +1187,15 @@ export function ackMessage(agent: string, id: string, mailRoot?: string): MailMe
 }
 
 export function setBridgeSentAtPath(path: string, sentAt: string): void {
-  const msg = readMessageFile(path);
-  msg.bridgeSentAt = sentAt;
-  writeMessageFile(path, msg, true);
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
+    msg.bridgeSentAt = sentAt;
+    return msg;
+  });
+  if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
 }
 
 export function ackMessageAtPath(path: string): MailMessage {
-  const lock = acquireMailLockSync(dirname(dirname(path)));
-  if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
-  try {
-    const msg = readMessageFile(path);
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
     msg.ackedAt = new Date().toISOString();
     delete msg.nackedAt;
@@ -1166,38 +1204,38 @@ export function ackMessageAtPath(path: string): MailMessage {
     delete msg.checkedOutAt;
     delete msg.checkedOutBy;
     delete msg.retryAfter;
-    writeMessageFile(path, msg, true, lock);
-    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
     return msg;
-  } finally {
-    lock.release();
-  }
+  }, { afterWrite: () => {
+    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
+  } });
+  if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
+  return result.record;
 }
 
 export function nackMessage(agent: string, id: string, reason: string, type: "transient" | "agent" | "permanent" = "transient", retryAfter?: string): MailMessage | null {
   const path = messagePathById(agent, id);
   if (!path) return null;
-  const msg = readMessageFile(path);
-  msg.read = false;
-  msg.nackedAt = new Date().toISOString();
-  msg.nackReason = reason;
-  msg.nackType = type;
-  msg.checkedOutAt = undefined;
-  msg.checkedOutBy = undefined;
-  if (type === "transient" && retryAfter) {
-    msg.retryAfter = new Date(Date.now() + parseDurationMs(retryAfter, 60_000)).toISOString();
-  } else {
-    delete msg.retryAfter;
-  }
-  if (type === "permanent") {
-    const inbox = getInbox(agent);
-    const target = join(inbox.dlq, path.split("/").pop()!);
-    writeMessageFile(path, msg);
-    renameSync(path, target);
+  const result = updateExistingRecord<MailMessage>(path, (msg) => {
+    if (msg.id !== id && !msg.id.startsWith(id)) return null;
+    msg.read = false;
+    msg.nackedAt = new Date().toISOString();
+    msg.nackReason = reason;
+    msg.nackType = type;
+    delete msg.checkedOutAt;
+    delete msg.checkedOutBy;
+    if (type === "transient" && retryAfter) {
+      msg.retryAfter = new Date(Date.now() + parseDurationMs(retryAfter, 60_000)).toISOString();
+    } else {
+      delete msg.retryAfter;
+    }
     return msg;
-  }
-  writeMessageFile(path, msg);
-  return msg;
+  }, { afterWrite: () => {
+    if (type === "permanent") {
+      const target = join(getInbox(agent).dlq, path.split("/").pop()!);
+      renameSync(path, target);
+    }
+  } });
+  return result.status === "updated" ? result.record : null;
 }
 
 export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, hardTtl = "48h"): number {
@@ -1207,21 +1245,25 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
   const hardCutoff = Date.now() - parseDurationMs(hardTtl, 48 * 60 * 60 * 1000);
   for (const a of agents) {
     const inbox = getInbox(a);
-    for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
-      for (const file of listMessageFiles(dir)) {
-        const full = join(dir, file);
-        const msg = readMessageFile(full);
-        const ts = Date.parse(msg.ackedAt ?? msg.timestamp);
-        const hardTs = Date.parse(msg.timestamp);
-        const done = msg.read && !!msg.ackedAt;
-        const prMatch = prNumber == null || msg.prNumber === prNumber || msg.body.includes(`#${prNumber}`) || msg.body.includes(`PR #${prNumber}`);
-        if (!prMatch) continue;
-        if ((done && ts < doneCutoff) || hardTs < hardCutoff) {
-          rmSync(full, { force: true });
-          removed++;
+    const lock = acquireMailLockSync(inbox.root);
+    if (!lock) continue;
+    try {
+      for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
+        for (const file of listMessageFiles(dir)) {
+          const full = join(dir, file);
+          const msg = readMessageFile(full);
+          const ts = Date.parse(msg.ackedAt ?? msg.timestamp);
+          const hardTs = Date.parse(msg.timestamp);
+          const done = msg.read && !!msg.ackedAt;
+          const prMatch = prNumber == null || msg.prNumber === prNumber || msg.body.includes(`#${prNumber}`) || msg.body.includes(`PR #${prNumber}`);
+          if (!prMatch) continue;
+          if ((done && ts < doneCutoff) || hardTs < hardCutoff) {
+            rmSync(full, { force: true });
+            removed++;
+          }
         }
       }
-    }
+    } finally { lock.release(); }
   }
   return removed;
 }
