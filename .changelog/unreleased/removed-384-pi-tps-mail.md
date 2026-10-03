@@ -1,0 +1,1 @@
+- **The unpublished `@tpsdev-ai/pi-tps-mail` package is deleted (Closes #384).**

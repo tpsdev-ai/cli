@@ -55,8 +55,6 @@ jobs:
           cd packages/agent && bun run build
           # Build cli with agent types now available
           cd ../cli && bun run build
-          # Build pi-tps-mail if present
-          (cd ../pi-tps-mail && bun run build) || true
       - name: Build portable binary (${{ matrix.target }})
         run: bun run --filter @tpsdev-ai/cli build:binary:${{ matrix.target }}
       - name: Set up Rosetta 2 prefix (darwin-x64)
