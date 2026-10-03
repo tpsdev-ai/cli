@@ -1,1 +1,1 @@
-- **Reply-obligation state ends on account stop (Closes #403)**. Restart rebuilds unresolved obligations from disk.
+- **In-memory reply-obligation state ends on account stop (Closes #403)**. Restart rebuilds unresolved obligations from disk.

@@ -1,4 +1,5 @@
-import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -148,13 +149,12 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     skip(i: number): void;
     settle(i: number): void;
     stop(): Promise<void>;
-    stopAccount(): Promise<void>;
+    stopAccount(fresh?: boolean, unknownSignal?: boolean): Promise<void>;
     logs: string[];
   }
 
   /**
-   * Boot `specs`, one inbound per account (at startup, so the startup scan
-   * dispatches it), and hold every dispatch open until the test settles it.
+   * Write the requested number of inbounds per account and hold dispatches open.
    */
   async function boot(specs: AccountSpec[], inboundsPerAccount = 1): Promise<Handle[]> {
     for (const s of specs) { publicKeys[s.agentId] = s.seed; publicKeys[s.sender] = FLINT_SEED; }
@@ -233,7 +233,11 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         },
         settle(i) { dispatches[i]!.settle(); },
         async stop() { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
-        async stopAccount() { await capturedPlugin.gateway.stopAccount(ctx); },
+        async stopAccount(fresh = false, unknownSignal = false) {
+          await capturedPlugin.gateway.stopAccount(fresh
+            ? { ...ctx, ...(unknownSignal ? { abortSignal: new AbortController().signal } : {}) }
+            : ctx);
+        },
       };
       return h;
     });
@@ -241,6 +245,91 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     expect(await pollUntil(() => handles.every((h) => h.dispatchCount >= inboundsPerAccount), 5000)).toBe(true);
     return handles;
   }
+
+  for (const site of ["ack", "settle", "fail-transition"] as const) {
+    for (const failure of ["EIO", "INVALID_JSON", "ENOENT"] as const) {
+      it(`${site} cleanup ${failure === "ENOENT" ? "clears confirmed-missing state" : `retains state after ${failure}`}`, async () => {
+        process.env.TPS_OBLIGATION_DEADLINE_MS = "1500";
+        const A = single();
+        const [h] = await boot([A]);
+        const inb = h.inboundIdAt(0)!;
+        const obId = h.obligationIdAt(0)!;
+        const path = resolve(A.mailDir, A.agentId, ".obligations", `${inb}.json`);
+        capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(true);
+        if (site === "ack") await h.deliver(0, "final answer"); else h.skip(0);
+        const realRead = fs.readFileSync;
+        let reads = 0;
+        const read = spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+          if (String(args[0]) === path && ++reads > (site === "settle" ? 0 : 1)) {
+            if (failure === "INVALID_JSON") return "{";
+            if (failure === "ENOENT") {
+              rmSync(path, { force: true });
+              return realRead(...args);
+            }
+            throw Object.assign(new Error("transient obligation read"), { code: failure });
+          }
+          return realRead(...args);
+        });
+        try {
+          h.settle(0);
+          expect(await pollUntil(() => h.logs.some((s) => failure === "ENOENT"
+            ? s.includes(`refusing to ack ${inb}`) || !obligationStateForTests().contexts.some((c) => c.obligationId === obId)
+            : s.includes(`obligation-read-unverified: ${inb}`)))).toBe(true);
+          const st = obligationStateForTests();
+          expect(st.contexts.some((c) => c.obligationId === obId)).toBe(failure !== "ENOENT");
+          expect(st.deadlines.some((d) => d.obligationId === obId)).toBe(failure !== "ENOENT");
+          if (failure !== "ENOENT") {
+            expect(h.logs.some((s) => s.includes(`path=${path} code=${failure}`))).toBe(true);
+          }
+        } finally {
+          read.mockRestore();
+          if (failure === "ENOENT") await h.stop();
+        }
+        if (failure !== "ENOENT") {
+          expect(await pollUntil(() => ["acked", "failed"].includes(obFile(A, inb)?.state), 5000)).toBe(true);
+          expect(obFile(A, inb)?.state).toBe(site === "ack" ? "acked" : "failed");
+          expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+          await h.stop();
+        }
+      }, 10000);
+    }
+  }
+
+  it("a fresh stop context with the start signal invalidates its incarnation", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const A = single();
+    const [h] = await boot([A]);
+    const inb = h.inboundIdAt(0)!;
+    const obId = h.obligationIdAt(0)!;
+    capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+    const prior = obFile(A, inb);
+    await h.stopAccount(true);
+    expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+    expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+    h.settle(0);
+    await sleep(100);
+    expect(obFile(A, inb)).toEqual(prior);
+    await h.stop();
+  });
+
+  it("a delayed fresh stop context and an unknown signal leave the replacement live", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const A = single();
+    const [old] = await boot([A]);
+    const obId = old.obligationIdAt(0)!;
+    capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+    await old.stop();
+    const [replacement] = await boot([A], 0);
+    expect(await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obId))).toBe(true);
+    const prior = obligationStateForTests();
+    await old.stopAccount(true);
+    await replacement.stopAccount(true, true);
+    expect(obligationStateForTests()).toEqual(prior);
+    expect(replacement.logs.some((s) => s.includes("stop-account-unverified"))).toBe(true);
+    old.settle(0);
+    await replacement.stop();
+  });
 
   // ── F403-1 ─────────────────────────────────────────────────────────────────
   it("F403-1: aborting one account drops only its state; a sibling's deadline stays armed and fires", async () => {

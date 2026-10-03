@@ -71,6 +71,7 @@ import {
   nackOwed,
   newestSessionTranscript,
   readObligation,
+  readObligationResult,
   receiptThread,
   receiptsDir,
   scanForReceipt,
@@ -748,6 +749,7 @@ interface AccountLifetime {
 }
 const accountLifetimes = new Map<string, AccountLifetime>();
 const gatewayIncarnations = new WeakMap<object, symbol>();
+const signalIncarnations = new WeakMap<AbortSignal, symbol>();
 
 function isLiveContext(ctx: Pick<YieldContext, "accountId" | "incarnation">): boolean {
   return accountLifetimes.get(ctx.accountId)?.incarnation === ctx.incarnation;
@@ -854,6 +856,16 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
+function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
+  const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (result.status === "unverified") {
+    ctx.log?.warn?.(`tps-mail: obligation-read-unverified: ${ctx.inboundId} path=${result.path} code=${result.code}`);
+  } else if (result.status === "missing" || TERMINAL_STATES.has(result.record.state)) {
+    releaseObligationState(obligationId);
+  }
+  return result;
+}
+
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
   if (!isLiveContext(ctx)) return;
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
@@ -863,15 +875,12 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   // while the obligation stays failed (cli#400).
   const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
   if (!updated || updated.state !== "acked") {
-    // The transition was REFUSED, not landed (cli#389 round 9: a refused
-    // transition returns null) — so read the record to name WHY.
-    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "unverified") return;
+    const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
       `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
-    // The record is terminal or gone: there is no live obligation to keep in
-    // memory (cli#403).
-    releaseObligationState(obligationId);
     return;
   }
   patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
@@ -952,17 +961,13 @@ async function settleObligation(
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
   if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return "none";
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec) {
-    // Gone: no live obligation remains to keep in memory (cli#403).
-    releaseObligationState(obligationId);
-    return "none";
-  }
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found") return "none";
+  const rec = result.record;
   if (TERMINAL_STATES.has(rec.state)) {
     ctx.log?.info?.(
       `tps-mail: obligation ${rec.obligationId} is ${rec.state}; ignoring the ${s.verdict ?? s.reason} determination`,
     );
-    releaseObligationState(obligationId);
     return "none";
   }
   if (s.receipt === "found" && !s.verdict) {
@@ -984,14 +989,12 @@ async function settleObligation(
         ctx.log,
       );
       if (appliedUnconfirmed === null) {
-        // cli#389 round 13, item 3: a REFUSED transition (the record is gone or
-        // already terminal) is not a recorded outcome — say so and stop, exactly
-        // as the ack path does. Do not treat the refusal as a settled state.
-        const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+        const result = readObligationForCleanup(ctx, obligationId);
+        if (result.status === "unverified") return "none";
+        const cur = result.status === "found" ? result.record : null;
         ctx.log?.warn?.(
           `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
         );
-        releaseObligationState(obligationId);
         return "none";
       }
     } catch (err: any) {
@@ -1038,16 +1041,13 @@ async function settleObligation(
     return "none";
   }
   if (appliedFailed === null) {
-    // cli#389 round 13, item 3: the transition was REFUSED (the record is gone
-    // or already terminal) — do NOT stamp the inbound and do NOT send a nack
-    // mail for a failure that was never recorded. An await added to this window
-    // can therefore never leave a refused record stamped or nacked.
-    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "unverified") return "none";
+    const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
         `the inbound keeps no nack stamp and no nack mail is sent`,
     );
-    releaseObligationState(obligationId);
     return "none";
   }
   // The failure is terminal: drop the context and its timer before the nack is
@@ -1236,7 +1236,7 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
   if (!isLiveContext(ctx)) return;
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
+  if (!rec || TERMINAL_STATES.has(rec.state)) return;
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
   // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
   // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
@@ -1695,6 +1695,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     const lifetime: AccountLifetime = { incarnation, timers: new Set(), watchers: new Set(), resolveShutdown };
     accountLifetimes.set(account.accountId, lifetime);
     gatewayIncarnations.set(ctx, incarnation);
+    if (ctx.abortSignal) signalIncarnations.set(ctx.abortSignal, incarnation);
     const accountContext = { accountId: account.accountId, incarnation };
     const isLive = () => isLiveContext(accountContext);
     const abort = () => {
@@ -2378,7 +2379,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   },
 
   stopAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
-    endAccountLifetime(ctx.account.accountId, gatewayIncarnations.get(ctx));
+    const incarnation = gatewayIncarnations.get(ctx) ?? signalIncarnations.get(ctx.abortSignal);
+    if (incarnation === undefined) {
+      ctx.log?.warn?.(`tps-mail: stop-account-unverified: ${ctx.account.accountId}`);
+      return;
+    }
+    endAccountLifetime(ctx.account.accountId, incarnation);
     ctx.log?.info?.("tps-mail: stopAccount called");
   },
 };
