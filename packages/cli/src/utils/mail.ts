@@ -26,7 +26,7 @@ export interface MailMessage {
   timestamp: string;
   read: boolean;
   ackedAt?: string;
-  bridgeSendStartedAt?: string;
+  bridgeSentAt?: string;
   nackedAt?: string;
   nackReason?: string;
   nackType?: "transient" | "agent" | "permanent";
@@ -783,7 +783,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       timestamp: envelope.timestamp,
       read: false,
       ackedAt: undefined,
-      bridgeSendStartedAt: undefined,
+      bridgeSentAt: undefined,
       envelopeId: envelope.messageId,
       envelope,
       trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
@@ -1138,10 +1138,9 @@ export function ackMessage(agent: string, id: string, mailRoot?: string): MailMe
   return ackMessageAtPath(path);
 }
 
-export function setBridgeSendStartedAtPath(path: string, startedAt: string | undefined): void {
+export function setBridgeSentAtPath(path: string, sentAt: string): void {
   const msg = readMessageFile(path);
-  if (startedAt === undefined) delete msg.bridgeSendStartedAt;
-  else msg.bridgeSendStartedAt = startedAt;
+  msg.bridgeSentAt = sentAt;
   writeMessageFile(path, msg, true);
 }
 

@@ -64,7 +64,7 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why:
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(path, msg, true)",
     followedBy: "; }",
-    why: "setBridgeSendStartedAtPath — updates only an existing record",
+    why: "setBridgeSentAtPath — updates only an existing record",
   },
   {
     file: "packages/cli/src/utils/mail.ts",

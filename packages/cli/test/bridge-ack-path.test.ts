@@ -104,6 +104,7 @@ test("an acknowledgement write failure after send does not resend on restart", a
   });
   await waitFor(() => running.logs.some((line) => line.includes("fault")));
   expect(running.sent).toHaveLength(1);
+  expect(record().bridgeSentAt).toEqual(expect.any(String));
   for (const fault of faults.splice(0)) fault.mockRestore();
   await restartWithoutResend();
   expect(running.logs.some((line) => line.includes("ack failed"))).toBe(true);
@@ -121,6 +122,7 @@ test("a cleanup failure leaves an acknowledged record that is not resent (cli#48
     }));
   });
   await waitFor(() => running.logs.length > 0);
+  expect(record().bridgeSentAt).toEqual(expect.any(String));
   expect(record().read).toBe(true);
   expect(record().ackedAt).toEqual(expect.any(String));
   for (const fault of faults.splice(0)) fault.mockRestore();
@@ -131,7 +133,7 @@ test("a reported send failure can be retried on restart", async () => {
   plant();
   const running = start(() => { running.stop(); throw new Error("send fault"); });
   await waitFor(() => running.logs.some((line) => line.includes("Delivery failed")));
-  expect(record().bridgeSendStartedAt).toBeUndefined();
+  expect(record().bridgeSentAt).toBeUndefined();
   const restarted = start();
   await waitFor(() => !fs.existsSync(path("cur")));
   expect(restarted.sent).toHaveLength(1);
@@ -143,6 +145,7 @@ test("pending wrapper lifecycle fields cannot suppress first delivery", async ()
   pending.read = true;
   pending.ackedAt = "forged";
   pending.bridgeSendStartedAt = "forged";
+  pending.bridgeSentAt = "forged";
   fs.writeFileSync(path("new"), JSON.stringify(pending));
   const running = start();
   await waitFor(() => !fs.existsSync(path("cur")) && running.sent.length === 1);
@@ -169,20 +172,43 @@ test("acknowledgement does not recreate a file removed after its read", () => {
   expect(fs.existsSync(target)).toBe(false);
 });
 
-test("a send-start write failure withholds the send and allows a later retry", async () => {
+test("a sent-marker write failure after successful send allows a duplicate on restart", async () => {
   plant();
   const write = fs.writeFileSync;
   const fault = spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof write>) => {
-    if (String(args[1]).includes('"bridgeSendStartedAt"')) throw new Error("marker write fault");
+    if (String(args[1]).includes('"bridgeSentAt"')) throw new Error("marker write fault");
     return write(...args);
   });
   faults.push(fault);
   const running = start();
   await waitFor(() => running.logs.some((line) => line.includes("marker write fault")));
   running.stop();
-  expect(running.sent).toEqual([]);
+  expect(running.sent).toHaveLength(1);
+  expect(record().bridgeSentAt).toBeUndefined();
   fault.mockRestore();
   const restarted = start();
   await waitFor(() => !fs.existsSync(path("cur")));
   expect(restarted.sent).toHaveLength(1);
+});
+
+
+test("a crash after a legacy start marker but before send delivers on restart", async () => {
+  plant();
+  expect((await mail.promote(BRIDGE, path("new"))).ok).toBe(true);
+  const unsent = record();
+  unsent.bridgeSendStartedAt = new Date().toISOString();
+  fs.writeFileSync(path("cur"), JSON.stringify(unsent));
+  const restarted = start();
+  await waitFor(() => !fs.existsSync(path("cur")));
+  expect(restarted.sent.map((envelope) => envelope.content)).toEqual(["record.json"]);
+});
+
+test("the persisted sent marker is absent until adapter send succeeds", async () => {
+  plant();
+  let duringSend: Record<string, unknown> | undefined;
+  const running = start(() => { duringSend = record(); });
+  await waitFor(() => !fs.existsSync(path("cur")) && running.sent.length === 1);
+  expect(duringSend).toBeDefined();
+  expect(duringSend!.bridgeSendStartedAt).toBeUndefined();
+  expect(duringSend!.bridgeSentAt).toBeUndefined();
 });

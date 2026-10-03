@@ -17,7 +17,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridgeSendStartedAtPath, type PromoteOk } from "../utils/mail.js";
+import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridgeSentAtPath, type PromoteOk } from "../utils/mail.js";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -148,7 +148,7 @@ Message: ${envelope.content}`;
 
     const forward = async (result: PromoteOk) => {
       if (result.message.trustTier === "external") return;
-      if (result.message.read || result.message.ackedAt || result.message.bridgeSendStartedAt) return;
+      if (result.message.read || result.message.ackedAt || result.message.bridgeSentAt) return;
       const verifiedBody = result.message.body;
       let envelope: BridgeEnvelope;
       let parsedBody: unknown = null;
@@ -170,14 +170,13 @@ Message: ${envelope.content}`;
           timestamp: new Date().toISOString(),
         };
       }
-      setBridgeSendStartedAtPath(result.path, new Date().toISOString());
       try {
         await this.adapter.send(envelope);
       } catch (e) {
         this.log(`[bridge:outbound] Delivery failed: ${e}`);
-        setBridgeSendStartedAtPath(result.path, undefined);
         return;
       }
+      setBridgeSentAtPath(result.path, new Date().toISOString());
       this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
       try {
         ackMessageAtPath(result.path);
