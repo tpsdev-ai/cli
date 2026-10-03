@@ -582,3 +582,93 @@ for (const rt of RUNTIMES) {
     }
   });
 }
+
+// ---------------------------------------------------------------------------
+// cli#483 — a runtime directory or an inherited launch grant that overlaps a TPS
+// credential root is refused before any runner starts.
+// ---------------------------------------------------------------------------
+
+/**
+ * Run the launcher for a selected runtime in a non-TTY context (the attested
+ * path) with a dummy nono, so the ONLY control that can refuse is the
+ * credential guard. Without the extra directory the launcher would proceed to
+ * the attested launch.
+ */
+function runtimeDirProbe(sb: Sandbox, rt: string, extraEnv: Record<string, string | undefined>) {
+  const bin = writeFakeNono(sb, "#!/usr/bin/env bash\nexit 0\n");
+  const r = spawnSync(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", rt, SANDBOX_REQUIRED], {
+    cwd: sb.ws,
+    env: cliEnv(sb, { [NONO_BIN_ENV]: bin, ...extraEnv }),
+    encoding: "utf-8",
+    timeout: 20_000,
+    killSignal: "SIGKILL",
+  });
+  return { status: r.status, text: `${r.stdout ?? ""}${r.stderr ?? ""}` };
+}
+
+describe("cli#483 — a custom runtime directory overlapping a credential root is refused before any runner", () => {
+  const cases = [
+    { rt: "claude-code", variable: "CLAUDE_CONFIG_DIR", root: "auth" },
+    { rt: "codex", variable: "CODEX_HOME", root: "identity" },
+    { rt: "gemini", variable: "XDG_CONFIG_HOME", root: "auth" },
+  ] as const;
+
+  for (const { rt, variable, root } of cases) {
+    test(`${rt}: ${variable} resolving inside ~/.tps/${root} refuses 78, before any spawn`, () => {
+      const sb = makeSandbox();
+      try {
+        const value = join(sb.home, ".tps", root);
+        const { status, text } = runtimeDirProbe(sb, rt, { [variable]: value });
+        expect(status).toBe(78);
+        expect(text).toContain(variable);
+        expect(text).toContain(`~/.tps/${root}`);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("claude-code: a current directory inside ~/.tps/auth refuses 78, before any spawn", () => {
+    const sb = makeSandbox();
+    try {
+      const auth = join(sb.home, ".tps", "auth");
+      mkdirSync(auth, { recursive: true });
+      const bin = writeFakeNono(sb, "#!/usr/bin/env bash\nexit 0\n");
+      const r = spawnSync(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "claude-code", SANDBOX_REQUIRED], {
+        cwd: auth,
+        env: cliEnv(sb, { [NONO_BIN_ENV]: bin, HOME: sb.home }),
+        encoding: "utf-8",
+        timeout: 20_000,
+        killSignal: "SIGKILL",
+      });
+      expect(r.status).toBe(78);
+      expect(`${r.stdout ?? ""}${r.stderr ?? ""}`).toContain("current-directory grant");
+      expect(fakeNonoRuns(sb)).toEqual([]);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("cli#483 — an unrelated runtime directory still launches", () => {
+  test("claude-code: an unrelated CLAUDE_CONFIG_DIR is released and starts its runner", async () => {
+    const sb = makeSandbox();
+    try {
+      const bin = writeFakeNono(sb, CANARY_FAKE_NONO);
+      const custom = join(sb.root, "claude-custom");
+      const { text, stopped } = await runUntil(
+        sb,
+        ["agent", "start", "--id", "probe", "--runtime", "claude-code", SANDBOX_REQUIRED],
+        { [NONO_BIN_ENV]: bin, FAKE_NONO_PS_JSON: join(sb.root, "ps.json"), CLAUDE_CONFIG_DIR: custom },
+        (t) => t.includes(startup["claude-code"]),
+        30_000,
+      );
+      expect(stopped).toBe(true);
+      expect(text).toContain(startup["claude-code"]);
+      expect(text).not.toContain("overlaps the TPS credential root");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+});

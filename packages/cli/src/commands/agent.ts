@@ -28,6 +28,7 @@ import {
   harnessReadFiles,
   runtimeNonoOptions,
   runtimeNonoProfile,
+  runtimeDirCredentialRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -887,27 +888,40 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
             const runtimeGrants = runtimeNonoOptions(selectedRuntime);
+            const launchOptions = {
+              workdir: config.workspace,
+              // CHANGE (cli#341 S1b): this used to grant a read of the
+              // filesystem root. A root grant is refused outright by nono
+              // 0.70+ (exit 1). Use the explicit toolchain read set instead —
+              // the macOS roots Kern validated, and their Linux equivalents
+              // (systemReadPaths()).
+              read: harnessReadPaths(),
+              // Exactly this agent's own identity files, not the shared
+              // identity directory (cli#351 r4).
+              readFiles: harnessReadFiles(launchId),
+              allowFiles: runtimeGrants.allowFiles,
+              // Bun's own temp dir is /tmp regardless of TMPDIR, and an
+              // unreadable temp dir is fatal to it — grant BOTH /tmp and the
+              // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
+              // to /var/folders/…, so /tmp would otherwise not be granted at
+              // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
+              allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
+            };
+            // cli#483 — refuse a runtime directory or an inherited launch grant
+            // that overlaps a TPS credential root (or another runtime's
+            // credentials) before any runner starts, with the launch gate's
+            // refusal status. Scoped to a selected runtime: that is the profile
+            // the grants are widened for.
+            const dirRefusal = selectedRuntime
+              ? runtimeDirCredentialRefusal(selectedRuntime, { ...launchOptions, cwd: process.cwd() })
+              : null;
+            if (dirRefusal) {
+              console.error(`❌ refusing to launch runtime '${selectedRuntime}': ${dirRefusal}`);
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+            }
             const exitCode = await launchAttested(
               runtimeNonoProfile(selectedRuntime),
-              {
-                workdir: config.workspace,
-                // CHANGE (cli#341 S1b): this used to grant a read of the
-                // filesystem root. A root grant is refused outright by nono
-                // 0.70+ (exit 1). Use the explicit toolchain read set instead —
-                // the macOS roots Kern validated, and their Linux equivalents
-                // (systemReadPaths()).
-                read: harnessReadPaths(),
-                // Exactly this agent's own identity files, not the shared
-                // identity directory (cli#351 r4).
-                readFiles: harnessReadFiles(launchId),
-                allowFiles: runtimeGrants.allowFiles,
-                // Bun's own temp dir is /tmp regardless of TMPDIR, and an
-                // unreadable temp dir is fatal to it — grant BOTH /tmp and the
-                // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
-                // to /var/folders/…, so /tmp would otherwise not be granted at
-                // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
-              },
+              launchOptions,
               relaunch,
             );
             process.exit(exitCode);

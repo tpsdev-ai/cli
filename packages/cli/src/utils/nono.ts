@@ -43,9 +43,9 @@
 
 import meow from "meow";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
@@ -311,6 +311,172 @@ export function runtimeNonoOptions(
   }
   for (const path of allow) mkdirSync(path, { recursive: true, mode: 0o700 });
   return { allow: [...new Set(allow)], allowFiles };
+}
+
+// ---------------------------------------------------------------------------
+// cli#483 — a runtime directory must not overlap a TPS credential root
+// ---------------------------------------------------------------------------
+
+/**
+ * The directory a selected runtime takes from an environment variable, or none
+ * when the variable is unset (the default directory is still checked as an
+ * ordinary launch grant). Naming the variable is what lets the refusal say
+ * WHICH setting to fix (cli#483).
+ */
+function runtimeDirVariables(
+  runtime: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Array<{ variable: string; path: string }> {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  if (runtime === "claude-code") {
+    return env.CLAUDE_CONFIG_DIR ? [{ variable: "CLAUDE_CONFIG_DIR", path: env.CLAUDE_CONFIG_DIR }] : [];
+  }
+  if (runtime === "codex") {
+    return env.CODEX_HOME ? [{ variable: "CODEX_HOME", path: env.CODEX_HOME }] : [];
+  }
+  if (runtime === "gemini") {
+    return env.XDG_CONFIG_HOME ? [{ variable: "XDG_CONFIG_HOME", path: join(xdg, "gemini") }] : [];
+  }
+  return [];
+}
+
+/**
+ * The TPS credential roots a launch must never expose to a runtime: `<home>/
+ * .tps/auth`, `<home>/.tps/identity` and `<home>/.tps/secrets`. `<home>` is
+ * resolved the way the launch path resolves it, and the three directories are
+ * the ones `auth-proxy.ts`, `harnessReadFiles` and `credentials-manifest.ts`
+ * (`secretsRoot`) already name.
+ */
+function tpsCredentialRoots(
+  env: NodeJS.ProcessEnv = process.env,
+): Array<{ label: string; path: string }> {
+  const home = env.HOME || homedir();
+  return (["auth", "identity", "secrets"] as const).map((dir) => ({
+    label: `~/.tps/${dir}`,
+    path: join(home, ".tps", dir),
+  }));
+}
+
+/**
+ * The file a runtime keeps its own credentials in. Used to refuse a grant that
+ * lets one runtime reach another runtime's credentials (cli#483).
+ */
+function runtimeOwnCredentialFiles(
+  runtime: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string[] {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  if (runtime === "claude-code") {
+    return [join(env.CLAUDE_CONFIG_DIR || join(home, ".claude"), ".credentials.json")];
+  }
+  if (runtime === "codex") {
+    return [
+      join(env.CODEX_HOME || join(home, ".codex"), "auth.json"),
+      join(home, ".tps", "auth", "openai.json"),
+    ];
+  }
+  if (runtime === "gemini") {
+    return [join(home, ".gemini", "oauth_creds.json"), join(xdg, "gemini", "oauth_creds.json")];
+  }
+  return [];
+}
+
+/**
+ * Canonicalize a path: resolve symlinks on the nearest EXISTING ancestor, then
+ * re-append the segments that do not exist yet. Both sides of an overlap test
+ * go through this, so a symlink into a credential root is caught and a
+ * not-yet-existing runtime directory is compared at its real location (cli#483).
+ */
+function canonicalPath(p: string, cwd: string = process.cwd()): string {
+  let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return tail.length ? join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = dirname(cur);
+      if (parent === cur) return resolve(p); // no existing ancestor at all
+      tail.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/** True when `dir` equals or contains `p` (both already canonical). */
+function pathContainsOrEquals(dir: string, p: string): boolean {
+  if (dir === p) return true;
+  return p.startsWith(dir.endsWith("/") ? dir : `${dir}/`);
+}
+
+/** True when one of the two canonical paths equals or contains the other. */
+function pathsOverlap(a: string, b: string): boolean {
+  return pathContainsOrEquals(a, b) || pathContainsOrEquals(b, a);
+}
+
+/**
+ * Refuse, before a runtime starts, a selected runtime's custom directory or any
+ * inherited launch grant that overlaps a TPS credential root — or that reaches
+ * another runtime's credential file. Returns the refusal reason, or null.
+ *
+ * Part (1) names the environment variable and the overlapping root. Part (2)
+ * checks every directory grant the launch passes (the workdir, the implicit
+ * current-directory `--allow-cwd` grant, the read roots and the writable
+ * `--allow` roots) the same way. A refusal is the shape here: the launcher has
+ * no primitive for narrowing an individual grant. File grants (`--read-file`,
+ * `--allow-file`) are not checked against the roots — granting the launching
+ * agent its own identity key is their purpose.
+ */
+export function runtimeDirCredentialRefusal(
+  runtime: string | undefined,
+  grants: Pick<NonoOptions, "workdir" | "read" | "allow"> & { cwd?: string },
+  env: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const roots = tpsCredentialRoots(env).map((r) => ({ ...r, canon: canonicalPath(r.path) }));
+
+  // (1) a selected runtime's custom directory, naming the variable.
+  for (const { variable, path } of runtimeDirVariables(runtime, env)) {
+    const canon = canonicalPath(path);
+    const hit = roots.find((r) => pathsOverlap(canon, r.canon));
+    if (hit) {
+      return (
+        `${variable}=${path} overlaps the TPS credential root ${hit.label} (${hit.path}) — ` +
+        `the runtime profile would grant it read-write access to a credential root`
+      );
+    }
+  }
+
+  // (2) every inherited directory grant, the current-directory grant included.
+  const dirGrants: Array<{ label: string; path: string }> = [];
+  if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir });
+  if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd });
+  for (const p of grants.read ?? []) dirGrants.push({ label: `the read grant '${p}'`, path: p });
+  for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p });
+
+  const foreignFiles = (["claude-code", "codex", "gemini"] as const)
+    .filter((rt) => rt !== runtime)
+    .flatMap((rt) => runtimeOwnCredentialFiles(rt, env))
+    .map((f) => ({ path: f, canon: canonicalPath(f) }));
+
+  for (const grant of dirGrants) {
+    const canon = canonicalPath(grant.path);
+    const root = roots.find((r) => pathsOverlap(canon, r.canon));
+    if (root) {
+      return (
+        `${grant.label} (${grant.path}) overlaps the TPS credential root ${root.label} (${root.path}) — ` +
+        `refusing to hand the runtime a sandbox with read-write access to a credential root`
+      );
+    }
+    const foreign = foreignFiles.find((f) => pathContainsOrEquals(canon, f.canon));
+    if (foreign) {
+      return (
+        `${grant.label} (${grant.path}) covers ${foreign.path}, another runtime's credential file`
+      );
+    }
+  }
+  return null;
 }
 
 /**
