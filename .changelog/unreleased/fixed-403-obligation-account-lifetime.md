@@ -1,1 +1,1 @@
-- **In-memory reply-obligation state ends on account stop (Closes #403)**. Restart rebuilds unresolved obligations from disk.
+- **Reply-obligation timers and contexts clear on a stop matched to the active incarnation (Closes #403)**. Restart recovery requires readable obligations and verifiable inbound mail.

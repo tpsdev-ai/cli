@@ -150,6 +150,7 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     settle(i: number): void;
     stop(): Promise<void>;
     stopAccount(fresh?: boolean, unknownSignal?: boolean): Promise<void>;
+    replacementStart(reason: string): Promise<void>;
     logs: string[];
   }
 
@@ -233,6 +234,16 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         },
         settle(i) { dispatches[i]!.settle(); },
         async stop() { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
+        async replacementStart(reason) {
+          const replacement = { ...ctx, abortSignal: new AbortController().signal };
+          if (reason === "runtime") replacement.channelRuntime = undefined as any;
+          if (reason === "directory") replacement.account = { ...ctx.account, mailDir: join(tempRoot, "missing") };
+          if (reason === "conflict") replacement.cfg = {
+            ...cfg, channels: { "tps-mail": { accounts: { ...accounts, other: { mailDir: spec.mailDir } } } },
+          };
+          if (reason === "bindings") replacement.cfg = { ...cfg, bindings: [] };
+          await capturedPlugin.gateway.startAccount(replacement);
+        },
         async stopAccount(fresh = false, unknownSignal = false) {
           await capturedPlugin.gateway.stopAccount(fresh
             ? { ...ctx, ...(unknownSignal ? { abortSignal: new AbortController().signal } : {}) }
@@ -294,6 +305,80 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         }
       }, 10000);
     }
+  }
+
+  for (const site of ["settlement without timer", "deadline firing"] as const) {
+    it(`unreadable obligation retries after ${site} and resolves when reads recover`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
+      const A = single();
+      const [h] = await boot([A]);
+      const inb = h.inboundIdAt(0)!;
+      const obId = h.obligationIdAt(0)!;
+      const path = resolve(A.mailDir, A.agentId, ".obligations", `${inb}.json`);
+      if (site === "deadline firing") {
+        capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+      } else {
+        h.skip(0);
+        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+      }
+      const priorDeadline = obFile(A, inb)?.deadlineAt;
+      const realRead = fs.readFileSync;
+      let failedReads = 0;
+      const read = spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+        if (String(args[0]) === path) {
+          failedReads++;
+          throw Object.assign(new Error("transient obligation read"), { code: "EIO" });
+        }
+        return realRead(...args);
+      });
+      try {
+        if (site === "settlement without timer") h.settle(0);
+        expect(await pollUntil(() => h.logs.some((s) => s.includes(`obligation-read-unverified: ${inb}`)))).toBe(true);
+        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(true);
+        expect(h.logs.some((s) => s.includes(`path=${path} code=EIO`))).toBe(true);
+        expect(await pollUntil(() => failedReads >= 2)).toBe(true);
+        expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(true);
+      } catch (err) {
+        h.settle(0);
+        await h.stop();
+        throw err;
+      } finally {
+        read.mockRestore();
+      }
+      try {
+        expect(obFile(A, inb)?.deadlineAt).toBe(priorDeadline);
+        expect(await pollUntil(() => obFile(A, inb)?.state === "failed", 5000)).toBe(true);
+        if (site === "deadline firing") expect(obFile(A, inb)?.deadlineAt).toBe(priorDeadline);
+        expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+      } finally {
+        h.settle(0);
+        await h.stop();
+      }
+    }, 10000);
+  }
+
+  for (const reason of ["runtime", "directory", "conflict", "bindings"]) {
+    it(`replacement start rejected for ${reason} clears the prior incarnation`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
+      const A = single();
+      const [h] = await boot([A]);
+      const inb = h.inboundIdAt(0)!;
+      const obId = h.obligationIdAt(0)!;
+      capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+      const prior = obFile(A, inb);
+      try {
+        await h.replacementStart(reason);
+        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+        expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+        h.settle(0);
+        await sleep(250);
+        expect(obFile(A, inb)).toEqual(prior);
+      } finally {
+        h.settle(0);
+        await h.stop();
+      }
+    });
   }
 
   it("a fresh stop context with the start signal invalidates its incarnation", async () => {

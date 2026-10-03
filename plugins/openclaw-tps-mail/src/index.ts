@@ -856,9 +856,23 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
+function retryObligationRead(ctx: YieldContext, obligationId: string): void {
+  if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
+  const timer = accountTimer(ctx, () => {
+    armedDeadlines.delete(obligationId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "found" && !TERMINAL_STATES.has(result.record.state)) {
+      armDeadline(ctx, obligationId, result.record.deadlineAt);
+    }
+  }, 1000);
+  if (typeof (timer as any).unref === "function") (timer as any).unref();
+  armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
+}
+
 function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
   const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (result.status === "unverified") {
+    retryObligationRead(ctx, obligationId);
     ctx.log?.warn?.(`tps-mail: obligation-read-unverified: ${ctx.inboundId} path=${result.path} code=${result.code}`);
   } else if (result.status === "missing" || TERMINAL_STATES.has(result.record.state)) {
     releaseObligationState(obligationId);
@@ -1235,8 +1249,9 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
 function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
   if (!isLiveContext(ctx)) return;
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return;
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const rec = result.record;
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
   // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
   // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
@@ -1258,8 +1273,9 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
 
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
   if (!isLiveContext(ctx)) return;
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const rec = result.record;
   const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
   if (!isLiveContext(ctx)) return;
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
@@ -1654,6 +1670,7 @@ const outbound: ChannelOutboundAdapter = {
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
     const { account, cfg, log } = ctx;
+    endAccountLifetime(account.accountId);
     const channelRuntime = (ctx as any).channelRuntime;
 
     if (!channelRuntime) {
@@ -1688,7 +1705,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       `tps-mail: watching ${boundAgents.length} agent inbox(es): ${boundAgents.join(", ")}`,
     );
 
-    endAccountLifetime(account.accountId);
     const incarnation = Symbol(account.accountId);
     let resolveShutdown!: () => void;
     const shutdown = new Promise<void>((resolve) => { resolveShutdown = resolve; });
