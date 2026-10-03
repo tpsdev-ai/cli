@@ -57,9 +57,20 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why:
   },
   {
     file: "packages/cli/src/utils/mail.ts",
-    contains: "writeMessageFile(path, msg)",
+    contains: "ackMessageAtPath(path)",
+    why: "ackMessage — delegates the record found by id to the existing-only path acknowledgement",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(path, msg, true)",
+    followedBy: "; }",
+    why: "setBridgeSendStartedAtPath — updates only an existing record",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(path, msg, true)",
     followedBy: "; try { unlinkSync(path)",
-    why: "ackMessage — updates an existing record found by id, then unlinks it; presentation is separately gated",
+    why: "ackMessageAtPath — updates only the existing record at that path, then unlinks it",
   },
   {
     file: "packages/cli/src/utils/mail.ts",

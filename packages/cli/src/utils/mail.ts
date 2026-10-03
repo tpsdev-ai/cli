@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -26,6 +26,7 @@ export interface MailMessage {
   timestamp: string;
   read: boolean;
   ackedAt?: string;
+  bridgeSendStartedAt?: string;
   nackedAt?: string;
   nackReason?: string;
   nackType?: "transient" | "agent" | "permanent";
@@ -181,7 +182,18 @@ function readMessageFile(path: string): MailMessage {
   }
 }
 
-function writeMessageFile(path: string, msg: MailMessage): void {
+function writeMessageFile(path: string, msg: MailMessage, existingOnly = false): void {
+  if (existingOnly) {
+    const fd = openSync(path, "r+");
+    try {
+      const data = JSON.stringify(msg, null, 2);
+      writeFileSync(fd, data, "utf-8");
+      ftruncateSync(fd, Buffer.byteLength(data));
+    } finally {
+      closeSync(fd);
+    }
+    return;
+  }
   writeFileSync(path, JSON.stringify(msg, null, 2), "utf-8");
 }
 
@@ -770,6 +782,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       body: envelope.body,
       timestamp: envelope.timestamp,
       read: false,
+      ackedAt: undefined,
+      bridgeSendStartedAt: undefined,
       envelopeId: envelope.messageId,
       envelope,
       trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
@@ -1121,6 +1135,17 @@ export async function verifyMailAction(agent: string, id: string): Promise<MailM
 export function ackMessage(agent: string, id: string, mailRoot?: string): MailMessage | null {
   const path = messagePathById(agent, id, mailRoot);
   if (!path) return null;
+  return ackMessageAtPath(path);
+}
+
+export function setBridgeSendStartedAtPath(path: string, startedAt: string | undefined): void {
+  const msg = readMessageFile(path);
+  if (startedAt === undefined) delete msg.bridgeSendStartedAt;
+  else msg.bridgeSendStartedAt = startedAt;
+  writeMessageFile(path, msg, true);
+}
+
+export function ackMessageAtPath(path: string): MailMessage {
   const msg = readMessageFile(path);
   msg.read = true;
   msg.ackedAt = new Date().toISOString();
@@ -1130,16 +1155,7 @@ export function ackMessage(agent: string, id: string, mailRoot?: string): MailMe
   delete msg.checkedOutAt;
   delete msg.checkedOutBy;
   delete msg.retryAfter;
-  writeMessageFile(path, msg);
-  // Remove the file from cur/ now that it's acked. There is NO ack audit trail
-  // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
-  // whose event set is only "sent" | "read" | "listed" — there is no "ack"
-  // event — and `logEvent` swallows every error. An ack is therefore not
-  // recorded anywhere, and nothing binds an archive row to the record's
-  // verification verdict or `envelopeId`. (Logging an event before the unlink
-  // would be better, but it would not be an ack trail without an ack event type
-  // and that binding — so the comment says what is true rather than claiming a
-  // trail we do not have.)
+  writeMessageFile(path, msg, true);
   try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
   return msg;
 }
