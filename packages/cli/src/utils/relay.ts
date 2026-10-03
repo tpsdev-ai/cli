@@ -369,15 +369,6 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
-/**
- * Deliver ONE message that a remote branch relayed to us into the LOCAL
- * recipient's inbox. A failed local write is NEVER silent (cli#494): the error
- * is logged by message id, recipient and error, and the message is dead-lettered
- * into the recipient's dlq/ (same reason-sidecar convention as promote())
- * instead of being dropped. An over-cap inbox is TRANSIENT — it drains with
- * `mail check` — so the class is "inbox-full", which `checkMessages` re-drives.
- * Returns true when the message landed in the inbox.
- */
 export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
   try {
     sendMessage(body.to, body.content, body.from);
@@ -397,9 +388,16 @@ export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
       console.error(
         `[relay] dead-letter failed for message ${body.id} to ${body.to}: ${dlqErr instanceof Error ? dlqErr.message : String(dlqErr)}`,
       );
+      throw dlqErr;
     }
     return false;
   }
+}
+
+async function acceptRelayedMail(channel: TransportChannel, msg: TpsMessage, body: MailDeliverBody): Promise<boolean> {
+  const delivered = deliverRelayedToLocal(body);
+  await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
+  return delivered;
 }
 
 export function startRelay(agentId: string): () => void {
@@ -624,7 +622,11 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
         if (msg.type !== MSG_MAIL_DELIVER) return;
         const parsed = MailDeliverBodySchema.safeParse(msg.body);
         if (!parsed.success) return;
-        if (deliverRelayedToLocal(parsed.data)) received++;
+        void acceptRelayedMail(channel, msg, parsed.data).then((delivered) => {
+          if (delivered) received++;
+        }).catch((error: unknown) => {
+          console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
+        });
       };
 
       channel.onMessage(handler);
@@ -737,7 +739,11 @@ export async function connectAndKeepAlive(
           } else if (msg.type === MSG_MAIL_DELIVER) {
             state.lastHeartbeatAck = now; // any traffic = alive
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
-            if (parsed.success) deliverRelayedToLocal(parsed.data);
+            if (parsed.success) {
+              void acceptRelayedMail(channel, msg, parsed.data).catch((error: unknown) => {
+                console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
+              });
+            }
           } else {
             state.lastHeartbeatAck = now;
           }

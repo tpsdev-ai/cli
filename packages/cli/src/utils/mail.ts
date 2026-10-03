@@ -433,19 +433,6 @@ function readReasonSidecar(dlqDir: string, filename: string): { cls: PromoteReje
   }
 }
 
-/**
- * Dead-letter a message that could not be DELIVERED into `agent`'s mailbox (as
- * opposed to one that arrived and failed verification): write it to the
- * recipient's dlq/ with the same `.reason` sidecar convention promote() uses.
- * The office relay calls this when a local write fails — e.g. the recipient's
- * new/ is at its cap and `sendMessage` throws "Inbox full" — so the message is
- * RETAINED instead of dropped (cli#494). `cls` should be "inbox-full" for an
- * over-cap inbox: it is RETRYABLE, so a later `mail check` drains new/ and
- * re-drives the record rather than stranding it. Returns the dlq file path.
- *
- * Throws if the record id is not a valid message id or the write fails; the
- * caller decides how to report that (the relay logs it — never silent).
- */
 export function deadLetterUndelivered(
   agent: string,
   record: { id: string; from: string; to: string; body: string; timestamp: string },
@@ -455,15 +442,12 @@ export function deadLetterUndelivered(
   assertValidAgentId(agent);
   validateMessageId(record.id);
   const inbox = getInbox(agent);
-  // Same filename rule as sendMessage's new/ records (the timestamp is
-  // flattened) plus the id, which validateMessageId has already bounded to a
-  // path-safe token.
-  const safeTs = record.timestamp.replace(/[^0-9A-Za-z._-]/g, "-");
-  const filename = `${safeTs}-${record.id}.json`;
+  const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
+  const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
   writeFileSync(tmpPath, JSON.stringify({ ...record, read: false }, null, 2), "utf-8");
-  renameSync(tmpPath, join(inbox.dlq, filename));
   writeReasonSidecar(inbox.dlq, filename, cls, reason);
+  renameSync(tmpPath, join(inbox.dlq, filename));
   return join(inbox.dlq, filename);
 }
 

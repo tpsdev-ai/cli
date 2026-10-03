@@ -76,7 +76,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
   if (writeFailed) throw writeError;
 }
 
-export function drainOutbox(): OutboxMessage[] {
+export function drainOutbox(archive = true): OutboxMessage[] {
   const newDir = outboxDir("new");
   const sentDir = outboxDir("sent");
   mkdirSync(newDir, { recursive: true });
@@ -101,8 +101,19 @@ export function drainOutbox(): OutboxMessage[] {
       }
       continue;
     }
-    renameSync(src, join(sentDir, f));
+    if (archive) renameSync(src, join(sentDir, f));
     out.push(msg);
   }
   return out;
+}
+
+export function acknowledgeOutbox(id: string): void {
+  const newDir = outboxDir("new");
+  const sentDir = outboxDir("sent");
+  mkdirSync(sentDir, { recursive: true });
+  for (const filename of readdirSync(newDir).filter((f) => f.endsWith(".json") && !f.startsWith("."))) {
+    const path = join(newDir, filename);
+    const record = JSON.parse(readFileSync(path, "utf-8")) as OutboxMessage;
+    if (record.id === id) renameSync(path, join(sentDir, filename));
+  }
 }

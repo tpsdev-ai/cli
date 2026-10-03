@@ -1,2 +1,1 @@
-- **A relayed message the office relay cannot deliver locally is logged and
-  dead-lettered, not dropped (Closes #494).**
+- **The office relay logs local write failures and attempts dead-letter storage (Closes #494).**
