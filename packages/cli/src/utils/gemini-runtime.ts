@@ -189,7 +189,10 @@ export async function runGeminiRuntime(config: GeminiConfig): Promise<void> {
         if (workspaceProvider && preState) await onTaskComplete(workspaceProvider, flair, msg.id, preState, result).catch(() => {});
       } catch (err: unknown) {
         serror(`Task failed: ${(err as Error).message}`);
-        try { sendRuntimeMail(mailCfg, msg.from, `Error: ${(err as Error).message}`); } catch { /* best effort */ }
+        try { sendRuntimeMail(mailCfg, msg.from, `Error: ${(err as Error).message}`); } catch (noticeErr: unknown) {
+          // A failed error notice must not be a silent loss (cli#494).
+          console.error(`[gemini-runtime] error notice to ${msg.from} for ${msg.id} failed: ${(noticeErr as Error).message}`);
+        }
         if (workspaceProvider) {
           const preState = await onTaskStart(workspaceProvider, flair, msg.id).catch(() => undefined);
           if (preState) await onTaskFailure(workspaceProvider, flair, msg.id, preState, (err as Error).message).catch(() => {});

@@ -3,14 +3,14 @@ import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
 import { WsNoiseTransport } from "./ws-noise-transport.js";
 import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
-import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema } from "./wire-mail.js";
+import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
 import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
@@ -369,6 +369,39 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
+/**
+ * Deliver ONE message that a remote branch relayed to us into the LOCAL
+ * recipient's inbox. A failed local write is NEVER silent (cli#494): the error
+ * is logged by message id, recipient and error, and the message is dead-lettered
+ * into the recipient's dlq/ (same reason-sidecar convention as promote())
+ * instead of being dropped. An over-cap inbox is TRANSIENT — it drains with
+ * `mail check` — so the class is "inbox-full", which `checkMessages` re-drives.
+ * Returns true when the message landed in the inbox.
+ */
+export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
+  try {
+    sendMessage(body.to, body.content, body.from);
+    return true;
+  } catch (e: unknown) {
+    const reason = e instanceof Error ? e.message : String(e);
+    const cls: PromoteRejectClass = /inbox full/i.test(reason) ? "inbox-full" : "invalid";
+    console.error(`[relay] local delivery failed for message ${body.id} to ${body.to}: ${reason}`);
+    try {
+      deadLetterUndelivered(
+        body.to,
+        { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
+        cls,
+        reason,
+      );
+    } catch (dlqErr: unknown) {
+      console.error(
+        `[relay] dead-letter failed for message ${body.id} to ${body.to}: ${dlqErr instanceof Error ? dlqErr.message : String(dlqErr)}`,
+      );
+    }
+    return false;
+  }
+}
+
 export function startRelay(agentId: string): () => void {
   assertAgent(agentId);
 
@@ -591,11 +624,7 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
         if (msg.type !== MSG_MAIL_DELIVER) return;
         const parsed = MailDeliverBodySchema.safeParse(msg.body);
         if (!parsed.success) return;
-        const b = parsed.data;
-        try {
-          sendMessage(b.to, b.content, b.from);
-          received++;
-        } catch {}
+        if (deliverRelayedToLocal(parsed.data)) received++;
       };
 
       channel.onMessage(handler);
@@ -708,10 +737,7 @@ export async function connectAndKeepAlive(
           } else if (msg.type === MSG_MAIL_DELIVER) {
             state.lastHeartbeatAck = now; // any traffic = alive
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
-            if (parsed.success) {
-              const b = parsed.data;
-              try { sendMessage(b.to, b.content, b.from); } catch {}
-            }
+            if (parsed.success) deliverRelayedToLocal(parsed.data);
           } else {
             state.lastHeartbeatAck = now;
           }
