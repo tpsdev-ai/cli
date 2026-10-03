@@ -17,7 +17,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { signEnvelope, type Envelope, type ChainEntry, type TrustLevel } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey, agentKeyCandidates, AgentKeyError, AgentKeyConflictError } from "./agent-keys.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "./envelope-id.js";
 
@@ -58,6 +58,13 @@ export interface SignOutboundOptions {
   rationale?: string;
   /** Envelope subject. */
   subject?: string;
+  /**
+   * The SIGNED trust tier for this envelope. cli#433 slice B2-2: the channel
+   * bridge signs its inbound messages as `external`. Setting it here puts the
+   * value inside the signed envelope, so a receiver verifies it; an absent
+   * value leaves the envelope without a claim (unchanged caller behaviour).
+   */
+  trust?: TrustLevel;
   /** Override the generated messageId (tests). */
   messageId?: string;
   /**
@@ -140,6 +147,11 @@ export function signOutboundBody(
     timestamp: now,
     delegationChain: chain,
   };
+
+  // cli#433 B2-2: the trust tier, when asked for, is a top-level envelope field,
+  // so JCS canonicalization covers it with the signature exactly like `body`:
+  // a receiver that flips the tier invalidates the outer signature.
+  if (opts.trust !== undefined) envelope.trust = opts.trust;
 
   // cli#429: thread the reply. Validated above, before any key was read, and
   // only set when present, so an absent --reply-to produces byte-for-byte the

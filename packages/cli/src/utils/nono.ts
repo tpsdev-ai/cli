@@ -21,12 +21,8 @@
  *   - A non-interactive invocation that launches an agent MUST carry
  *     `--sandbox-required`; a launcher that dropped it is refused rather than
  *     silently running unsandboxed. See `evaluateLaunchControl`.
- *   - an `agent start --runtime claude-code|codex|gemini` invocation carrying
- *     `--sandbox-required` is refused, by this rule unless an earlier one
- *     already refused it: those runtimes are spawned directly and never
- *     reach the attested launch, so the flag would assert an isolation that
- *     path cannot deliver (cli#363 slice A; routing them through the attested
- *     launch is slice B).
+ *   - CLI selected runtime runners require launcher release or an interactive
+ *     TTY `--no-sandbox` opt-out. `--sandbox-required` conflicts with that opt-out.
  *   - Under `--sandboxed` the child must hold the launcher's release for a live
  *     nono session bound to its own pid (cli#350 round 4e): see
  *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
@@ -45,12 +41,14 @@
  *   });
  */
 
+import meow from "meow";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -63,9 +61,13 @@ export type NonoProfile =
   | "tps-backup"
   | "tps-restore"
   | "tps-status"
-  | "tps-agent-run";
+  | "tps-agent-run"
+  | "tps-agent-run-claude-code"
+  | "tps-agent-run-codex"
+  | "tps-agent-run-gemini";
 
 export interface NonoOptions {
+  cwd?: string;
   /** Override workdir for the nono sandbox (--workdir flag) */
   workdir?: string;
   /** Extra read-only paths to allow */
@@ -79,6 +81,7 @@ export interface NonoOptions {
   readFiles?: string[];
   /** Extra read-write paths to allow */
   allow?: string[];
+  allowFiles?: string[];
 }
 
 /**
@@ -285,6 +288,280 @@ export function harnessReadFiles(agentId?: string): string[] {
   return files;
 }
 
+export function runtimeNonoProfile(runtime?: string): NonoProfile {
+  return runtime === "claude-code" || runtime === "codex" || runtime === "gemini"
+    ? `tps-agent-run-${runtime}`
+    : "tps-agent-run";
+}
+
+export function runtimeNonoOptions(
+  runtime?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonoOptions {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  let allow: string[] = [];
+  let allowFiles: string[] = [];
+  if (runtime === "claude-code") {
+    allow = [env.CLAUDE_CONFIG_DIR || join(home, ".claude"), join(home, ".claude")];
+    allowFiles = [join(home, ".claude.json"), join(home, ".claude.lock")];
+  } else if (runtime === "codex") {
+    allow = [env.CODEX_HOME || join(home, ".codex"), join(home, ".config", "codex")];
+    allowFiles = [providerAuthPath(runtimeProviders.codex, env)];
+  } else if (runtime === "gemini") {
+    allow = [join(home, ".gemini"), join(xdg, "gemini")];
+  }
+  return { allow: [...new Set(allow)], allowFiles };
+}
+
+function runtimeDirVariables(
+  runtime: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Array<{ variable: string; path: string }> {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  if (runtime === "claude-code") {
+    return env.CLAUDE_CONFIG_DIR ? [{ variable: "CLAUDE_CONFIG_DIR", path: env.CLAUDE_CONFIG_DIR }] : [];
+  }
+  if (runtime === "codex") {
+    return env.CODEX_HOME ? [{ variable: "CODEX_HOME", path: env.CODEX_HOME }] : [];
+  }
+  if (runtime === "gemini") {
+    return env.XDG_CONFIG_HOME ? [{ variable: "XDG_CONFIG_HOME", path: join(xdg, "gemini") }] : [];
+  }
+  return [];
+}
+
+function tpsCredentialRoots(
+  env: NodeJS.ProcessEnv = process.env,
+): Array<{ label: string; path: string }> {
+  const home = env.HOME || homedir();
+  return (["auth", "identity", "secrets"] as const).map((dir) => ({
+    label: `~/.tps/${dir}`,
+    path: join(home, ".tps", dir),
+  }));
+}
+
+function caseInsensitivePath(p: string): boolean {
+  let ancestor = p;
+  for (;;) {
+    try {
+      if (!statSync(ancestor).isDirectory()) ancestor = dirname(ancestor);
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw err;
+      ancestor = parent;
+    }
+  }
+  const toggleCase = (name: string) => name.replace(/[a-zA-Z]/, (c) => c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase());
+  let parent = ancestor;
+  let names = readdirSync(parent);
+  let name = names.find((entry) => toggleCase(entry) !== entry);
+  if (!name) {
+    parent = dirname(ancestor);
+    if (parent === ancestor || statSync(parent).dev !== statSync(ancestor).dev) return true;
+    name = basename(ancestor);
+    if (toggleCase(name) === name) return caseInsensitivePath(parent);
+    names = readdirSync(parent);
+  }
+  const alternateName = toggleCase(name);
+  if (names.includes(alternateName)) return false;
+  const probe = join(parent, name);
+  const original = lstatSync(probe);
+  try {
+    const alternate = lstatSync(join(parent, alternateName));
+    return original.dev === alternate.dev && original.ino === alternate.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function appendUnresolved(ancestor: string, tail: string[]): string {
+  if (!tail.length) return ancestor;
+  const components = caseInsensitivePath(ancestor) ? tail.map((part) => part.toLowerCase()) : tail;
+  return join(ancestor, ...components);
+}
+
+function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
+  if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
+  let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return appendUnresolved(real, tail.reverse());
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      try {
+        if (lstatSync(cur).isSymbolicLink()) {
+          const target = canonicalPath(readlinkSync(cur), dirname(cur), links + 1);
+          return appendUnresolved(target, tail.reverse());
+        }
+      } catch (linkErr) {
+        const linkCode = (linkErr as NodeJS.ErrnoException).code;
+        if (linkCode !== "ENOENT" && linkCode !== "ENOTDIR") throw linkErr;
+      }
+      const parent = dirname(cur);
+      if (parent === cur) throw err;
+      tail.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function pathContainsOrEquals(dir: string, p: string): boolean {
+  if (dir === p) return true;
+  return p.startsWith(dir.endsWith("/") ? dir : `${dir}/`);
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  return pathContainsOrEquals(a, b) || pathContainsOrEquals(b, a);
+}
+
+export function approveRuntimeNonoOptions(
+  runtime: string | undefined,
+  grants: NonoOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  agentId?: string,
+): { options: NonoOptions; runtimeDirectories: string[]; refusal: string | null } {
+  const options: NonoOptions = {};
+  const runtimeDirectories: string[] = [];
+  const result = (refusal: string | null) => ({ options, runtimeDirectories, refusal });
+  const resolved = new Map<string, string>();
+  const canonical = (p: string): string => {
+    if (!resolved.has(p)) resolved.set(p, canonicalPath(p));
+    return resolved.get(p)!;
+  };
+  const comparisonPaths = new Map<string, string>();
+  const comparisonPath = (p: string): string => {
+    if (!comparisonPaths.has(p)) comparisonPaths.set(p, caseInsensitivePath(p) ? p.toLowerCase() : p);
+    return comparisonPaths.get(p)!;
+  };
+  const overlaps = (a: string, b: string) => pathsOverlap(comparisonPath(a), comparisonPath(b));
+  const contains = (a: string, b: string) => pathContainsOrEquals(comparisonPath(a), comparisonPath(b));
+  const equals = (a: string, b: string) => comparisonPath(a) === comparisonPath(b);
+  try {
+    const roots = tpsCredentialRoots(env).map((r) => {
+      try {
+        return { ...r, canon: canonical(r.path) };
+      } catch (err) {
+        throw new Error(`cannot resolve TPS credential root ${r.label} (${r.path}): ${(err as Error).message}`);
+      }
+    });
+
+    for (const { variable, path } of runtimeDirVariables(runtime, env)) {
+      let canon: string;
+      try {
+        canon = canonical(path);
+      } catch (err) {
+        const root = roots.find((r) => pathsOverlap(resolve(path).toLowerCase(), resolve(r.path).toLowerCase()));
+        return result(
+          `${variable}=${path} cannot be resolved` +
+          (root ? ` at TPS credential root ${root.label} (${root.path})` : "") +
+          `: ${(err as Error).message}`,
+        );
+      }
+      const hit = roots.find((r) => overlaps(canon, r.canon));
+      if (hit) {
+        return result(
+          `${variable}=${path} overlaps the TPS credential root ${hit.label} (${hit.path}) — ` +
+          `the runtime profile would grant it read-write access to a credential root`
+        );
+      }
+    }
+
+    const dirGrants: Array<{ label: string; path: string }> = [];
+    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir });
+    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd });
+    for (const p of grants.read ?? []) dirGrants.push({ label: `the read grant '${p}'`, path: p });
+    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p });
+    for (const p of runtimeNonoOptions(runtime, env).allow ?? []) {
+      runtimeDirectories.push(canonical(p));
+      dirGrants.push({ label: `the runtime directory '${p}'`, path: p });
+    }
+
+    const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
+    const foreignFiles = runtimes
+      .filter((rt) => rt !== runtime)
+      .flatMap((rt) => [...runtimeCredentialFiles(rt, env), providerAuthPath(runtimeProviders[rt], env)])
+      .map((f) => ({ path: f, canon: canonical(f) }));
+
+    for (const grant of dirGrants) {
+      const canon = canonical(grant.path);
+      const root = roots.find((r) => overlaps(canon, r.canon));
+      if (root) {
+        return result(
+          `${grant.label} (${grant.path}) overlaps the TPS credential root ${root.label} (${root.path}) — ` +
+          (grant.label === "the current-directory grant"
+            ? `launch from a workspace directory outside the credential roots`
+            : grant.label === "the workdir grant"
+              ? `set the workspace to a directory outside the credential roots`
+              : `remove or narrow this grant to a directory outside the credential roots`)
+        );
+      }
+      const foreign = foreignFiles.find((f) => contains(canon, f.canon));
+      if (foreign) {
+        return result(
+          `${grant.label} (${grant.path}) covers ${foreign.path}, another runtime's credential file`
+        );
+      }
+    }
+    const identityRoot = roots.find((r) => r.label === "~/.tps/identity")!.canon;
+    const ownIdentity = agentId
+      ? [join(identityRoot, `${agentId}.key`), join(identityRoot, `${agentId}.pub`)]
+      : [];
+    const ownAuth = runtime === "codex"
+      ? [join(roots.find((r) => r.label === "~/.tps/auth")!.canon, `${runtimeProviders.codex}.json`)]
+      : [];
+    const ownFiles = runtimes.includes(runtime as CredentialRuntime)
+      ? [...runtimeCredentialFiles(runtime as CredentialRuntime, env), ...(runtimeNonoOptions(runtime, env).allowFiles ?? [])]
+      : [];
+    const ownTargets = ownFiles.map((p) => join(canonical(dirname(resolve(p))), basename(p)));
+    const systemTargets = systemReadFiles().map(canonical);
+    const fileGrants = [
+      ...(grants.readFiles ?? []).map((p) => ({ path: p, label: `the read-file grant '${p}'`, readOnly: true })),
+      ...(grants.allowFiles ?? []).map((p) => ({ path: p, label: `the writable-file grant '${p}'`, readOnly: false })),
+    ];
+    for (const grant of fileGrants) {
+      const canon = canonical(grant.path);
+      const foreign = foreignFiles.find((f) => equals(f.canon, canon));
+      if (foreign) return result(`${grant.label} targets ${foreign.path}, another runtime's credential file`);
+      const root = roots.find((r) => overlaps(canon, r.canon));
+      const permittedTpsFile = ownAuth.some((p) => equals(p, canon)) || (grant.readOnly && ownIdentity.some((p) => equals(p, canon)));
+      if (root && !permittedTpsFile) {
+        return result(`${grant.label} (${canon}) overlaps the TPS credential root ${root.label} (${root.path})`);
+      }
+      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && systemTargets.some((p) => equals(p, canon)))) {
+        return result(`${grant.label} (${canon}) is not a permitted file for runtime '${runtime}'`);
+      }
+    }
+    for (const key of ["workdir", "cwd"] as const) {
+      if (grants[key]) options[key] = canonical(grants[key]);
+    }
+    for (const key of ["read", "allow", "readFiles", "allowFiles"] as const) {
+      options[key] = (grants[key] ?? []).map(canonical);
+    }
+    return result(null);
+  } catch (err) {
+    const settings = runtimeDirVariables(runtime, env).map(({ variable, path }) => `${variable}=${path}`).join(", ");
+    return result(`cannot resolve launch grants${settings ? ` for ${settings}` : ""}: ${(err as Error).message}`);
+  }
+}
+
+export function runtimeDirCredentialRefusal(
+  runtime: string | undefined,
+  grants: NonoOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  agentId?: string,
+): string | null {
+  return approveRuntimeNonoOptions(runtime, grants, env, agentId).refusal;
+}
+
 /**
  * Build the nono command args for a given profile and subcommand.
  *
@@ -302,7 +579,9 @@ export function buildNonoArgs(
   // (the user dir). Passing the path makes what we validate the artifact that
   // actually runs.
   const profilePath = resolveProfilePath(profile, env) ?? profile;
-  const args = ["run", "--profile", profilePath, "--allow-cwd"];
+  const args = ["run", "--profile", profilePath];
+  if (options.cwd) args.push("--allow", options.cwd);
+  else args.push("--allow-cwd");
 
   if (options.workdir) {
     args.push("--workdir", options.workdir);
@@ -314,6 +593,10 @@ export function buildNonoArgs(
 
   for (const p of options.readFiles ?? []) {
     args.push("--read-file", p);
+  }
+
+  for (const p of options.allowFiles ?? []) {
+    args.push("--allow-file", p);
   }
 
   for (const p of options.allow ?? []) {
@@ -671,28 +954,50 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   return false;
 }
 
-/**
- * The three runtimes that skip the attested launch (cli#363). `bin/tps.ts`
- * branches on `--runtime <one of these>` BEFORE `runAgent({action:"start"})`,
- * spawns the runtime directly, and never reaches `launchAttested()`: a launch on
- * that path is NOT confined by nono, so it cannot honour `--sandbox-required`.
- */
-export const ATTESTATION_EXEMPT_RUNTIMES: readonly string[] = ["claude-code", "codex", "gemini"];
+export const launchFlagDefinitions = {
+  sandboxRequired: { type: "boolean" as const, default: false },
+};
 
-/** The exempt runtime `argv` selects via `--runtime <value>`, or undefined. */
-export function attestationExemptRuntime(argv: readonly string[] = process.argv): string | undefined {
-  const i = argv.indexOf("--runtime");
-  const value = i >= 0 ? argv[i + 1] : undefined;
-  return value !== undefined && ATTESTATION_EXEMPT_RUNTIMES.includes(value) ? value : undefined;
-}
-
-/** The refusal for `--sandbox-required` on a path that does not run attested. */
-export function attestationExemptRefusal(runtime: string): string {
-  return (
-    `${SANDBOX_REQUIRED_FLAG} is refused on the \`--runtime ${runtime}\` path: that runtime is spawned ` +
-    `directly and is not launched through the attested sandbox yet (cli#363), so the flag would ` +
-    `assert an isolation this path cannot deliver. Refusing to launch.`
-  );
+export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<string, unknown>): {
+  sandboxRequired: boolean; noSandbox: boolean; refusal?: string;
+} {
+  const title = process.title;
+  const parse = (args: readonly string[], flags: typeof launchFlagDefinitions | Record<string, never>) =>
+    meow("", { importMeta: import.meta, argv: [...args], flags, autoHelp: false, autoVersion: false }).flags;
+  const booleanValue = (value: unknown): boolean => {
+    if (value === undefined || value === false || value === "false") return false;
+    if (value === true || value === "true") return true;
+    throw new Error("cannot interpret sandbox flag value");
+  };
+  try {
+    for (let i = 2; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--") break;
+      if (!arg.startsWith("--")) continue;
+      const equals = arg.indexOf("=");
+      const name = equals === -1 ? arg : arg.slice(0, equals);
+      const raw = parse([name], {});
+      if (!["sandboxRequired", "noSandbox", "sandbox", "noSandboxRequired", "sandboxed", "noSandboxed"]
+        .some(key => Object.hasOwn(raw, key))) continue;
+      const next = argv[i + 1];
+      const value = equals !== -1 ? arg.slice(equals + 1)
+        : next !== undefined && (!next.startsWith("-") || /^-\d/.test(next)) ? next : undefined;
+      if (value !== undefined && value !== "true" && value !== "false") {
+        throw new Error(`${name} accepts only 'true' or 'false'; received ${JSON.stringify(value)}`);
+      }
+    }
+    const flags = parsedFlags ?? parse(argv.slice(2), launchFlagDefinitions);
+    const noSandbox = booleanValue(flags.noSandbox);
+    return {
+      sandboxRequired: booleanValue(flags.sandboxRequired),
+      noSandbox: flags.sandbox === false || noSandbox,
+    };
+  } catch (error) {
+    return { sandboxRequired: false, noSandbox: false,
+      refusal: `cannot interpret sandbox flag: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    process.title = title;
+  }
 }
 
 export interface LaunchControlInput {
@@ -704,6 +1009,7 @@ export interface LaunchControlInput {
   argv?: readonly string[];
   /** Override TTY detection (tests). */
   interactiveTty?: boolean;
+  parsedFlags?: Record<string, unknown>;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
   /** The launcher's release verdict (see `launch-attestation.ts`). Absent when
@@ -719,10 +1025,6 @@ export interface LaunchControlResult {
   refusalExitCode: number;
 }
 
-/**
- * Pure decision function for the launch-path control. Never touches the
- * process; the caller applies the result.
- */
 export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchControlResult {
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
@@ -730,8 +1032,14 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
+  const flags = readLaunchFlags(argv, input.parsedFlags);
+  if (flags.refusal) return deny(flags.refusal);
+  if (flags.sandboxRequired && flags.noSandbox) {
+    return deny(`${SANDBOX_REQUIRED_FLAG} conflicts with ${NO_SANDBOX_FLAG}; remove ${NO_SANDBOX_FLAG} to require isolation.`);
+  }
+
   // (1) --no-sandbox is honoured only from an interactive TTY.
-  if (argv.includes(NO_SANDBOX_FLAG) && !tty) {
+  if (flags.noSandbox && !tty) {
     return deny(
       `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
         "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
@@ -762,7 +1070,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   }
 
   // (2) Non-interactive agent launch must assert --sandbox-required.
-  if (launchesAgent(input.command, input.rest) && !tty && !argv.includes(SANDBOX_REQUIRED_FLAG)) {
+  if (launchesAgent(input.command, input.rest) && !tty && !flags.sandboxRequired) {
     const sub = input.rest?.[0] ?? "";
     return deny(
       `${SANDBOX_REQUIRED_FLAG} is required: this non-interactive context is launching an agent ` +
@@ -770,23 +1078,6 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
         `a stale wrapper or a dropped argument would otherwise run the agent unsandboxed. ` +
         `Refusing to launch.`,
     );
-  }
-
-  // (2b) cli#363 — a launch on the `--runtime` branch cannot honour
-  // `--sandbox-required`, because it never reaches the attested launch. The
-  // command-name check above is satisfied by `agent start`, so before this rule
-  // the flag passed the gate and the process then ran unconfined: a guarantee
-  // the path cannot deliver, read as delivered. Refused, TTY included, unless an
-  // earlier rule has already refused, until those runtimes are routed through
-  // `launchAttested()`.
-  const exemptRuntime = attestationExemptRuntime(argv);
-  if (
-    exemptRuntime !== undefined &&
-    input.command === "agent" &&
-    input.rest?.[0] === "start" &&
-    argv.includes(SANDBOX_REQUIRED_FLAG)
-  ) {
-    return deny(attestationExemptRefusal(exemptRuntime));
   }
 
   return { allowed: true, refusalExitCode: 0 };

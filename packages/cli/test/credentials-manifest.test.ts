@@ -246,20 +246,26 @@ describe("inferTypeFromPath", () => {
 // ---------------------------------------------------------------------------
 
 describe("inferOwnerFromName", () => {
-  test("matches known agent prefix", () => {
-    expect(inferOwnerFromName("anvil-github-pat")).toBe("anvil");
-    expect(inferOwnerFromName("ember-keys")).toBe("ember");
-    expect(inferOwnerFromName("flint-secret")).toBe("flint");
-    expect(inferOwnerFromName("sherlock-something")).toBe("sherlock");
-    expect(inferOwnerFromName("pulse-thing")).toBe("pulse");
+  test("matches a configured agent prefix", () => {
+    const known = ["anvil", "ember", "flint", "sherlock", "pulse"];
+    expect(inferOwnerFromName("anvil-github-pat", known)).toBe("anvil");
+    expect(inferOwnerFromName("ember-keys", known)).toBe("ember");
+    expect(inferOwnerFromName("flint-secret", known)).toBe("flint");
+    expect(inferOwnerFromName("sherlock-something", known)).toBe("sherlock");
+    expect(inferOwnerFromName("pulse-thing", known)).toBe("pulse");
   });
 
   test("returns null for unknown prefix", () => {
-    expect(inferOwnerFromName("random-thing")).toBeNull();
-    expect(inferOwnerFromName("xyz-api-key")).toBeNull();
+    const known = ["anvil", "ember", "flint", "sherlock", "pulse"];
+    expect(inferOwnerFromName("random-thing", known)).toBeNull();
+    expect(inferOwnerFromName("xyz-api-key", known)).toBeNull();
   });
 
-  test("uses custom known agents list", () => {
+  test("has no default agent list (cli#397)", () => {
+    expect(inferOwnerFromName("anvil-github-pat")).toBeNull();
+  });
+
+  test("uses a custom known agents list", () => {
     expect(inferOwnerFromName("robot-key", ["robot"])).toBe("robot");
     expect(inferOwnerFromName("robot-key")).toBeNull();
   });
@@ -848,7 +854,7 @@ describe("walkAdoptCandidates", () => {
     writeFixtureFile(dirs.secretsDir, "ember-secret", "test", 0o600);
     writeFixtureFile(dirs.secretsDir, "unknown-file", "test", 0o600);
 
-    const result = walkAdoptCandidates(dirs);
+    const result = walkAdoptCandidates(dirs, ["anvil", "ember"]);
 
     const anvilCand = result.candidates.find(c => c.name === "anvil-github-pat")!;
     expect(anvilCand.entry.owners).toEqual(["anvil"]);

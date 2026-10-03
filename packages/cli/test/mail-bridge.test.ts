@@ -2,7 +2,7 @@
  * ops-36 Phase 2 — OpenClaw Mail Bridge tests (Ed25519 auth)
  */
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, rmSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import crypto, { randomUUID } from "node:crypto";
@@ -30,72 +30,36 @@ function makeTmpDir(): string {
   return dir;
 }
 
-describe("ops-36p2: sendMail utility", () => {
-  let mailDir: string;
-  beforeEach(() => { mailDir = makeTmpDir(); });
-  afterEach(() => { rmSync(mailDir, { recursive: true, force: true }); });
 
-  test("writes JSON message to agent new/ inbox", async () => {
-    const { sendMail } = await import("../src/utils/mail-bridge.js");
-    sendMail(mailDir, "anvil", "openclaw-bridge", '{"content":"hello"}');
-    const newDir = join(mailDir, "anvil", "new");
-    const files = readdirSync(newDir).filter((f) => f.endsWith(".json"));
-    expect(files.length).toBe(1);
-    const msg = JSON.parse(readFileSync(join(newDir, files[0]), "utf-8"));
-    expect(msg.from).toBe("openclaw-bridge");
-    expect(msg.to).toBe("anvil");
-    expect(msg.body).toBe('{"content":"hello"}');
-  });
-
-  test("writes trust headers when provided", async () => {
-    const { sendMail } = await import("../src/utils/mail-bridge.js");
-    sendMail(mailDir, "anvil", "openclaw-bridge", '{"content":"hello"}', {
-      "X-TPS-Trust": "external",
-      "X-TPS-Sender": "284437008405757953",
-      "X-TPS-Channel": "discord:123",
-    });
-    const newDir = join(mailDir, "anvil", "new");
-    const files = readdirSync(newDir).filter((f) => f.endsWith(".json"));
-    const msg = JSON.parse(readFileSync(join(newDir, files[0]), "utf-8"));
-    expect(msg.headers["X-TPS-Trust"]).toBe("external");
-    expect(msg.headers["X-TPS-Sender"]).toBe("284437008405757953");
-    expect(msg.headers["X-TPS-Channel"]).toBe("discord:123");
-  });
-
-  test("creates inbox directory if missing", async () => {
-    const { sendMail } = await import("../src/utils/mail-bridge.js");
-    sendMail(mailDir, "new-agent", "bridge", "payload");
-    expect(existsSync(join(mailDir, "new-agent", "new"))).toBe(true);
-  });
-
-  test("unique filenames for multiple messages", async () => {
-    const { sendMail } = await import("../src/utils/mail-bridge.js");
-    sendMail(mailDir, "anvil", "bridge", "msg1");
-    sendMail(mailDir, "anvil", "bridge", "msg2");
-    const files = readdirSync(join(mailDir, "anvil", "new")).filter((f) => f.endsWith(".json"));
-    expect(files.length).toBe(2);
-    expect(new Set(files).size).toBe(2);
-  });
-});
 
 describe("ops-36p2: inbound HTTP security", () => {
   let mailDir: string;
   let testHome: string;
+  let keysDir: string;
   let origHome: string | undefined;
+  let origKeysDir: string | undefined;
   let keys: ReturnType<typeof setupTestKeys>;
 
   beforeEach(() => {
     mailDir = makeTmpDir();
     testHome = makeTmpDir();
+    keysDir = makeTmpDir();
     origHome = process.env.HOME;
+    origKeysDir = process.env.TPS_TEST_KEYS_DIR;
     process.env.HOME = testHome;
+    // The bridge signs inbound mail as its own principal; give it a key.
+    writeFileSync(join(keysDir, "test-bridge.key"), Buffer.alloc(32, 0x24));
+    process.env.TPS_TEST_KEYS_DIR = keysDir;
     keys = setupTestKeys(testHome);
   });
 
   afterEach(() => {
     process.env.HOME = origHome;
+    if (origKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+    else process.env.TPS_TEST_KEYS_DIR = origKeysDir;
     rmSync(mailDir, { recursive: true, force: true });
     rmSync(testHome, { recursive: true, force: true });
+    rmSync(keysDir, { recursive: true, force: true });
   });
 
   test("health endpoint returns ok (no auth)", async () => {
@@ -162,7 +126,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     }
   });
 
-  test("POST /inbound with valid auth delivers mail with trust headers", async () => {
+  test("POST /inbound with valid auth delivers a signed envelope from the bridge identity", async () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17894;
     const origExit = process.exit;
@@ -188,9 +152,12 @@ describe("ops-36p2: inbound HTTP security", () => {
       const files = readdirSync(newDir).filter((f) => f.endsWith(".json"));
       expect(files.length).toBe(1);
       const msg = JSON.parse(readFileSync(join(newDir, files[0]), "utf-8"));
-      expect(msg.headers["X-TPS-Trust"]).toBe("external");
-      expect(msg.headers["X-TPS-Sender"]).toBe("456");
-      expect(msg.headers["X-TPS-Channel"]).toBe("discord:123");
+      expect(msg.from).toBe("test-bridge");
+      expect(msg.headers?.["X-TPS-Sender"]).toBeUndefined();
+      const signed = JSON.parse(msg.body);
+      expect(signed.from).toBe("test-bridge");
+      expect(signed.trust).toBe("external");
+      expect(JSON.parse(signed.body).content).toBe("Hello agent");
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));

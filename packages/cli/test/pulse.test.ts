@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  loadConfig,
   computePrState,
   handleTransition,
   checkReminders,
@@ -16,6 +17,11 @@ import {
   type MailSender,
   type FlairPublisher,
 } from "../src/commands/pulse.js";
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { startFetchFlair } from "./helpers/fetch-flair.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -447,8 +453,27 @@ describe("pruneState", () => {
 // ---------------------------------------------------------------------------
 
 describe("startPollLoop", () => {
+  let root: string;
+  let saved: Record<string, string | undefined>;
+  let flair: ReturnType<typeof startFetchFlair>;
+  beforeEach(() => {
+    saved = { HOME: process.env.HOME, TPS_TEST_KEYS_DIR: process.env.TPS_TEST_KEYS_DIR };
+    root = mkdtempSync(join(tmpdir(), "pulse-loop-"));
+    process.env.HOME = root;
+    delete process.env.TPS_TEST_KEYS_DIR;
+    const dir = join(root, ".tps", "identity");
+    mkdirSync(dir, { recursive: true });
+    const seed = Buffer.alloc(32, 0x78);
+    writeFileSync(join(dir, "pulse.key"), seed);
+    flair = startFetchFlair({ pulse: seed });
+  });
+  afterEach(() => {
+    flair.stop();
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(root, { recursive: true, force: true });
+  });
   test("does not resolve immediately after the first poll", async () => {
-    const config = makeConfig({ pollIntervalMs: 120000 });
+    const config = makeConfig({ pollIntervalMs: 120000, flairUrl: flair.url });
     const state = makeState();
 
     let pollCalls = 0;
@@ -477,7 +502,7 @@ describe("startPollLoop", () => {
       resolved = true;
     });
 
-    await Promise.resolve();
+    for (let i = 0; i < 20 && handles.length === 0; i++) await Promise.resolve();
 
     expect(pollCalls).toBe(1);
     expect(handles).toHaveLength(2);
@@ -752,5 +777,206 @@ describe("mail send failure resilience", () => {
       console.error = originalError;
       setSendTimeoutMs(5_000);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pulse notification mail uses its own principal.
+
+describe("pulse identity (cli#397)", () => {
+  test("notification sender receives pulse rather than the gh agent", () => {
+    const config = makeConfig({ ghAgent: "some-gh-agent" });
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "reviewing" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].agentId).toBe("pulse");
+  });
+
+  for (const [newState, missing, message] of [
+    ["approved", "mergeAuthority", /merge authority/],
+    ["changes-requested", "author", /author/],
+    ["merged", "author", /author/],
+  ] as const) {
+    test(`handleTransition refuses ${newState} without ${missing} before state or publish`, () => {
+      const config = makeConfig();
+      delete config[missing];
+      const { calls, sender } = trackMails();
+      const instance = makeInstance({ state: "reviewing" });
+      const before = structuredClone(instance);
+      let publishes = 0;
+      const publisher = async () => { publishes++; };
+      expect(() => handleTransition("pr:tpsdev-ai/cli#42", instance, newState, config, sender, publisher)).toThrow(message);
+      expect(instance).toEqual(before);
+      expect(publishes).toBe(0);
+      expect(calls).toEqual([]);
+    });
+  }
+
+  test("pollOnce refuses to poll with no ghAgent", () => {
+    const config = makeConfig();
+    delete config.ghAgent;
+    const state = makeState();
+    const runner: SyncRunner = () =>
+      ({ status: 0, stdout: "[]", stderr: "" }) as ReturnType<SyncRunner>;
+
+    expect(() => pollOnce(config, state, runner, () => {})).toThrow(/gh agent/);
+  });
+});
+
+
+describe("polling recipient refusal", () => {
+  for (const path of ["new", "pre-existing", "existing"] as const) {
+    for (const [computed, review, missing, message] of [
+      ["approved", "APPROVED", "mergeAuthority", /merge authority/],
+      ["changes-requested", "CHANGES_REQUESTED", "author", /author/],
+      ["merged", "APPROVED", "author", /author/],
+    ] as const) {
+      test(`${path} ${computed} leaves state unchanged without ${missing}`, () => {
+        const config = makeConfig();
+        delete config[missing];
+        const key = "pr:tpsdev-ai/cli#42";
+        const state = makeState(path === "existing" ? { [key]: makeInstance({ state: "reviewing" }) } : {});
+        const before = structuredClone(state);
+        const { calls, sender } = trackMails();
+        let publishes = 0;
+        const runner: SyncRunner = (_cmd, args) => ({
+          status: 0,
+          stdout: JSON.stringify(args[2].includes("/reviews")
+            ? [{ state: review, user: { login: "tps-sherlock" } }]
+            : [{ number: 42, title: "Changed title", state: "open",
+                merged_at: computed === "merged" ? new Date().toISOString() : null,
+                created_at: new Date(Date.now() + (path === "pre-existing" ? -60000 : 60000)).toISOString() }]),
+          stderr: "",
+        }) as ReturnType<SyncRunner>;
+        expect(() => pollOnce(config, state, runner, sender, async () => { publishes++; })).toThrow(message);
+        expect(state).toEqual(before);
+        expect(calls).toEqual([]);
+        expect(publishes).toBe(0);
+      });
+    }
+  }
+
+  test("tracked closed PR refuses missing author before changing state", () => {
+    const config = makeConfig({ author: undefined });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": makeInstance({ state: "approved" }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    let publishes = 0;
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "",
+      stdout: JSON.stringify(args[2].includes("/pulls?") ? [] : { merged_at: new Date().toISOString() }),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender, async () => { publishes++; })).toThrow(/author/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+    expect(publishes).toBe(0);
+  });
+
+  test("unchanged approved PR refuses missing merge recipient before changing title", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": makeInstance({ state: "approved" }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "", stdout: JSON.stringify(
+      args[2].includes("/reviews") ? [{ state: "APPROVED", user: { login: "tps-sherlock" } }]
+      : args[2].includes("/status") ? { state: "success" }
+      : [{ number: 42, title: "Changed title", state: "open", merged_at: null, head: { sha: "test" } }]),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender)).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  test("poll reminder escalation refuses before an existing title changes", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const key = "pr:tpsdev-ai/cli#42";
+    const state = makeState({ [key]: makeInstance({ reviewRequestedAt: new Date(0).toISOString() }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "", stdout: JSON.stringify(
+      args[2].includes("/reviews") ? [] : [{ number: 42, title: "Changed title", state: "open", merged_at: null }]),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender)).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  test("missing escalation recipient prevents reminders for earlier instances", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const state = makeState({
+      first: makeInstance({ reviewRequestedAt: "2026-01-01T00:30:00Z" }),
+      second: makeInstance({ reviewRequestedAt: "2026-01-01T00:00:00Z" }),
+    });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    expect(() => checkReminders(state, config, sender, { first: ["sherlock"], second: ["kern"] }, new Date("2026-01-01T01:05:00Z"))).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  for (const lastRemindedAt of [undefined, "2026-01-01T00:01:00Z"]) {
+    test(`escalation refuses before reminder mail or state (${lastRemindedAt ?? "first reminder"})`, () => {
+      const config = makeConfig({ mergeAuthority: undefined });
+      const key = "pr:tpsdev-ai/cli#42";
+      const state = makeState({ [key]: makeInstance({
+        reviewRequestedAt: "2026-01-01T00:00:00Z", lastRemindedAt,
+      }) });
+      const before = structuredClone(state);
+      const { calls, sender } = trackMails();
+      expect(() => checkReminders(state, config, sender, { [key]: ["sherlock"] }, new Date("2026-01-01T01:05:00Z"))).toThrow(/merge authority/);
+      expect(state).toEqual(before);
+      expect(calls).toEqual([]);
+    });
+  }
+});
+
+
+describe("identity shape preflight", () => {
+  let root: string;
+  let savedHome: string | undefined;
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    root = mkdtempSync(join(tmpdir(), "pulse-config-"));
+    process.env.HOME = root;
+    mkdirSync(join(root, ".tps", "pulse"), { recursive: true });
+  });
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    rmSync(root, { recursive: true, force: true });
+  });
+  for (const field of ["mergeAuthority", "ghAgent", "author"] as const) {
+    for (const value of [undefined, null, false, 42, {}, [], "", "   "]) {
+      test(`${field} refuses ${JSON.stringify(value)} at load and every preflight`, async () => {
+        const config = makeConfig({ [field]: value } as Partial<PulseConfig>);
+        const path = join(root, ".tps", "pulse", "config.json");
+        writeFileSync(path, JSON.stringify(config));
+        const originalFile = readFileSync(path, "utf8");
+        const error = new RegExp(field);
+        expect(() => loadConfig()).toThrow(error);
+        const instance = makeInstance({ state: "reviewing" });
+        const state = makeState({ pr: instance });
+        const original = structuredClone(state);
+        let calls = 0;
+        const sender: MailSender = () => { calls++; };
+        const publisher: FlairPublisher = async () => { calls++; };
+        const runner: SyncRunner = () => { calls++; throw new Error("must not poll"); };
+        expect(() => handleTransition("pr", instance, "approved", config, sender, publisher)).toThrow(error);
+        expect(() => checkReminders(state, config, sender, { pr: ["reviewer"] })).toThrow(error);
+        expect(() => pollOnce(config, state, runner, sender, publisher)).toThrow(error);
+        await expect(startPollLoop(config, state, { dryRun: true, runner, sender, publisher,
+          setIntervalFn: (() => { calls++; }) as typeof setInterval })).rejects.toThrow(error);
+        expect(calls).toBe(0);
+        expect(state).toEqual(original);
+        expect(readFileSync(path, "utf8")).toBe(originalFile);
+        expect(existsSync(join(root, ".tps", "pulse", "state.json"))).toBe(false);
+      });
+    }
+  }
+  test("valid configured identities load unchanged", () => {
+    const config = makeConfig({ ghAgent: " github ", author: " author ", mergeAuthority: " merger " });
+    writeFileSync(join(root, ".tps", "pulse", "config.json"), JSON.stringify(config));
+    expect(loadConfig()).toMatchObject(config);
   });
 });

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { createFlairClient, defaultFlairKeyPath, type FlairAgent } from "../utils/flair-client.js";
 import { homeDir } from "../utils/home.js";
+import { localAgentIds } from "../utils/credentials-manifest.js";
 
 const DEFAULT_INTERVAL_SECONDS = 60;
 const STALE_MS = 5 * 60 * 1000;
@@ -22,7 +23,6 @@ function stateDir(): string {
 function statePath(): string {
   return join(stateDir(), "state.json");
 }
-const LOCAL_AGENT_IDS = ["ember", "sherlock", "kern", "pixel"] as const;
 
 export interface OfficeHealthArgs {
   interval?: number;
@@ -186,7 +186,7 @@ function readPids(pattern: string): number[] {
 }
 
 export function checkLocalHealth(): LocalHealthResult {
-  const agents = LOCAL_AGENT_IDS.map((agentId) => {
+  const agents = localAgentIds().map((agentId) => {
     const pids = readPids(`agent start --id ${agentId}`);
     return {
       agentId,
@@ -302,7 +302,7 @@ export async function runOfficeHealthTick(args: {
 }
 
 export async function runOfficeHealth(args: OfficeHealthArgs): Promise<void> {
-  const viewerId = requireAgentId(args.viewerId ?? process.env.TPS_AGENT_ID ?? "anvil", "viewer id");
+  const viewerId = requireAgentId(args.viewerId ?? process.env.TPS_AGENT_ID, "viewer id");
   const intervalSeconds = normalizeIntervalSeconds(args.interval);
   let state = readState();
   let stop = false;

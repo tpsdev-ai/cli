@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridgeSentAtPath, type PromoteOk } from "../utils/mail.js";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+import { signOutboundBody } from "../utils/mail-sign.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -98,6 +99,22 @@ export class BridgeCore {
     }
 
     const targetAgent = rawAgentId ?? this.defaultAgentId;
+
+    // cli#433 slice B2-2: the bridge signs every inbound channel message as ITS
+    // OWN identity — the existing bridgeAgentId and its own key, never the host
+    // agent's — through the shared signing helper `signOutboundBody`. The
+    // channel author and content travel as data inside the signed body; the
+    // wrapper carries no trust claim. Signing runs FIRST, before the recipient
+    // inbox is created: with no bridge key this throws the named missing-key
+    // error, and no mail record (and no inbox) is written. (The bridge-principal
+    // record is written separately, by the constructor.)
+    const body = signOutboundBody(this.bridgeAgentId, targetAgent, this.buildInboundBody(envelope), {
+      requireKey: true,
+      trust: "external",
+      subject: `channel message from ${envelope.channel}`,
+      rationale: `bridge ${this.bridgeAgentId} inbound ${envelope.channel}`,
+    });
+
     const { fresh } = this.mailboxDir(targetAgent);
     mkdirSync(fresh, { recursive: true });
 
@@ -107,12 +124,8 @@ export class BridgeCore {
       from: this.bridgeAgentId,
       to: targetAgent,
       timestamp: new Date().toISOString(),
-      headers: {
-        "X-TPS-Trust": "external",
-        "X-TPS-Sender": envelope.senderId,
-        "X-TPS-Channel": `${envelope.channel}:${envelope.channelId}`,
-      },
-      body: this.buildInboundBody(envelope),
+      read: false,
+      body,
     };
 
     writeFileSync(join(fresh, `${id}.json`), JSON.stringify(msg, null, 2), "utf-8");
@@ -125,7 +138,7 @@ export class BridgeCore {
       return JSON.stringify(envelope);
     }
 
-    return `[Discord message from ${envelope.senderName}]
+    return `[Discord message from ${envelope.senderName} (sender ${envelope.senderId}, channel ${envelope.channelId})]
 Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
 
 Message: ${envelope.content}`;

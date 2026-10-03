@@ -1,0 +1,12 @@
+{
+  "$schema": "https://nono.sh/schemas/nono-profile.schema.json",
+  "extends": "tps-agent-run",
+  "meta": {
+    "name": "tps-agent-run-gemini"
+  },
+  "groups": {
+    "exclude": [
+      "system_read_macos"
+    ]
+  }
+}

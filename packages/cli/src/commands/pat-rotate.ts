@@ -23,15 +23,18 @@ import { spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import * as readline from "node:readline";
 import { homeDir } from "../utils/home.js";
+import { keyringAgentIds } from "../utils/credentials-manifest.js";
 
 function secretsDir(): string {
   return resolve(homeDir(), ".tps", "secrets");
 }
 
-// Agents whose PAT lives in the macOS keychain via `gh auth login`
-// (not in a file). Currently only `flint` — the gh-as helper resolves
-// `flint` PAT through the keyring, not a file.
-const KEYRING_AGENTS = new Set(["flint"]);
+// Agents whose PAT lives in the OS keychain via `gh auth login` (not in a
+// file) are configured in the credentials manifest (cli#397); no agent id is
+// hardcoded here. An absent or empty list means no keyring agents.
+function keyringAgents(): Set<string> {
+  return new Set(keyringAgentIds());
+}
 
 // ─── Validation helpers (pure, exported for tests) ───────────────────────────
 
@@ -154,7 +157,7 @@ export async function runRotateGithubPat(agent: string): Promise<void> {
     process.exit(1);
   }
 
-  const isKeyring = KEYRING_AGENTS.has(agent);
+  const isKeyring = keyringAgents().has(agent);
   const target = isKeyring ? "keyring (gh auth login)" : `file ${patFilePath(agent)}`;
   process.stderr.write(`Rotating GitHub PAT for ${agent} → ${target}\n`);
 
@@ -249,7 +252,7 @@ export async function runListGithubPats(opts: { json?: boolean } = {}): Promise<
   }
 
   // Probe keyring agents via gh-as
-  for (const agent of KEYRING_AGENTS) {
+  for (const agent of keyringAgents()) {
     const ghVerify = spawnSync("gh-as", [agent, "api", "user", "--jq", ".login"], {
       encoding: "utf-8",
       timeout: 5_000,

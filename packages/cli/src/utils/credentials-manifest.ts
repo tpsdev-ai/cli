@@ -43,9 +43,22 @@ export interface CredentialEntry {
   notes?: string;
 }
 
+export interface ConfiguredAgent {
+  id: string;
+  /** The agent's GitHub PAT lives in the OS keyring via `gh auth login`. */
+  keyringPat?: boolean;
+  /** The agent runs on this host (office-health local checks). */
+  local?: boolean;
+}
+
 export interface CredentialsManifest {
   version: 1;
   credentials: Record<string, CredentialEntry>;
+  /**
+   * Agent ids known to this host (cli#397): callers read the list from here
+   * instead of naming an agent. Absent ⇒ empty.
+   */
+  agents?: ConfiguredAgent[];
 }
 
 export const RESERVED_TYPES = ["vaulted-secret"] as const;
@@ -81,11 +94,6 @@ export interface OpenClawTokenProposal {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-const KNOWN_AGENTS = [
-  "anvil", "ember", "flint", "kern", "sherlock",
-  "pulse", "quill", "reed", "nathan",
-];
 
 const TYPE_SENSITIVITY: Record<CredentialType, Sensitivity> = {
   "ed25519-seed": "high",
@@ -138,7 +146,7 @@ export function readManifest(): CredentialsManifest | null {
   try {
     const obj = JSON.parse(raw) as CredentialsManifest;
     if (obj.version !== 1) return null;
-    return obj;
+    return { ...obj, agents: agentsOf(obj) };
   } catch {
     return null;
   }
@@ -208,16 +216,53 @@ export function inferTypeFromPath(
   return "api-key";
 }
 
-/** Try to infer which agent owns a credential from its filename prefix. */
+/** Try to infer which agent owns a credential from its filename prefix.
+ *
+ * The known-agent list is configuration (cli#397), never a hardcoded default:
+ * with no list this returns null. */
 export function inferOwnerFromName(
   name: string,
-  knownAgents: string[] = KNOWN_AGENTS
+  knownAgents: string[] = []
 ): string | null {
   const base = basename(name).toLowerCase();
   for (const agent of knownAgents) {
     if (base.startsWith(`${agent}-`)) return agent;
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Configured agent list (cli#397)
+// ---------------------------------------------------------------------------
+
+function agentsOf(manifest: CredentialsManifest | null): ConfiguredAgent[] {
+  const agents = manifest?.agents;
+  if (!Array.isArray(agents) || !agents.every((a) =>
+    a !== null && typeof a === "object" && typeof a.id === "string" &&
+    /^[a-zA-Z0-9_-]{1,64}$/.test(a.id)
+  )) return [];
+  return agents.map((a) => ({ id: a.id, local: a.local === true, keyringPat: a.keyringPat === true }));
+}
+
+/** Agent ids configured in the manifest. Absent/empty ⇒ [] (no default). */
+export function configuredAgentIds(
+  manifest: CredentialsManifest | null = readManifest()
+): string[] {
+  return agentsOf(manifest).map((a) => a.id);
+}
+
+/** Agent ids whose GitHub PAT lives in the OS keyring. Absent ⇒ []. */
+export function keyringAgentIds(
+  manifest: CredentialsManifest | null = readManifest()
+): string[] {
+  return agentsOf(manifest).filter((a) => a.keyringPat).map((a) => a.id);
+}
+
+/** Agent ids that run on this host. Absent ⇒ []. */
+export function localAgentIds(
+  manifest: CredentialsManifest | null = readManifest()
+): string[] {
+  return agentsOf(manifest).filter((a) => a.local).map((a) => a.id);
 }
 
 /** Get the prescribed sensitivity level for a credential type (Sherlock revision). */
@@ -406,9 +451,13 @@ export interface AdoptDirs {
 /** Public-file extensions that should never appear in a credentials manifest. */
 const PUBLIC_EXTENSIONS = new Set([".pub", ".public", ".crt", ".cert"]);
 
-/** Walk the filesystem and produce adoption candidates (non-interactive core). */
+/** Walk the filesystem and produce adoption candidates (non-interactive core).
+ *
+ * `knownAgents` is the configured agent list (cli#397) used to infer an
+ * entry's owner from its filename; with none, owners stay empty. */
 export function walkAdoptCandidates(
-  dirs: AdoptDirs
+  dirs: AdoptDirs,
+  knownAgents: string[] = []
 ): AdoptResult {
   const candidates: AdoptCandidate[] = [];
   const openclawTokens: OpenClawTokenProposal[] = [];
@@ -432,7 +481,7 @@ export function walkAdoptCandidates(
       }
 
       const type = inferTypeFromPath(absPath, content);
-      const owner = inferOwnerFromName(file);
+      const owner = inferOwnerFromName(file, knownAgents);
       const sensitivity = type !== "unknown"
         ? sensitivityForType(type as CredentialType)
         : "medium";
@@ -457,7 +506,7 @@ export function walkAdoptCandidates(
     );
     for (const file of keyFiles) {
       const absPath = join(dirs.identityDir, file);
-      const owner = inferOwnerFromName(file);
+      const owner = inferOwnerFromName(file, knownAgents);
       candidates.push({
         name: file,
         entry: {
@@ -479,7 +528,7 @@ export function walkAdoptCandidates(
     );
     for (const file of xKeyFiles) {
       const absPath = join(dirs.identityDir, file);
-      const owner = inferOwnerFromName(file);
+      const owner = inferOwnerFromName(file, knownAgents);
       candidates.push({
         name: file,
         entry: {
@@ -516,7 +565,7 @@ export function walkAdoptCandidates(
     );
     for (const file of flairKeyFiles) {
       const absPath = join(dirs.flairKeysDir, file);
-      const owner = inferOwnerFromName(file);
+      const owner = inferOwnerFromName(file, knownAgents);
       candidates.push({
         name: `flair-${file}`,
         entry: {
@@ -538,7 +587,7 @@ export function walkAdoptCandidates(
     );
     for (const file of flairXKeyFiles) {
       const absPath = join(dirs.flairKeysDir, file);
-      const owner = inferOwnerFromName(file);
+      const owner = inferOwnerFromName(file, knownAgents);
       candidates.push({
         name: `flair-${file}`,
         entry: {
@@ -757,7 +806,7 @@ export function scanOrphans(
   dirs: AdoptDirs,
   manifest: CredentialsManifest
 ): AdoptCandidate[] {
-  const result = walkAdoptCandidates(dirs);
+  const result = walkAdoptCandidates(dirs, configuredAgentIds(manifest));
   const registeredPaths = new Set(
     Object.values(manifest.credentials).map(e => expandPath(e.path))
   );
@@ -834,7 +883,7 @@ export function adoptSingle(
   const type = inferTypeFromPath(resolvedPath, content);
   const credType: CredentialType = type === "unknown" ? "api-key" : type as CredentialType;
   const inferredName = name ?? basename(resolvedPath);
-  const owner = inferOwnerFromName(inferredName);
+  const owner = inferOwnerFromName(inferredName, configuredAgentIds());
   const sensitivity = sensitivityForType(credType);
 
   const entry: CredentialEntry = {

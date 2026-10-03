@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homeDir } from "../utils/home.js";
+import { providerAuthPath, runtimeCredentialFiles } from "../utils/runtime-credentials.js";
 
 /**
  * The TPS auth store, `~/.tps/auth`, resolved on every call from the HOME in
@@ -49,7 +50,7 @@ export interface StoredCredentials {
 }
 
 function authPath(provider: string): string {
-  return join(authDir(), `${provider}.json`);
+  return providerAuthPath(provider);
 }
 
 function ensureAuthDir(): void {
@@ -151,34 +152,31 @@ async function loginGoogle(): Promise<void> {
 }
 
 function readClaudeCodeCredentials(): StoredCredentials | null {
-  const credPath = join(homeDir(), ".claude", ".credentials.json");
-  if (!existsSync(credPath)) return null;
+  for (const credPath of runtimeCredentialFiles("claude-code")) {
+    if (!existsSync(credPath)) continue;
 
-  try {
-    const data = JSON.parse(readFileSync(credPath, "utf-8"));
-    const oauth = data.claudeAiOauth;
-    if (!oauth?.accessToken || !oauth?.refreshToken) return null;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      const oauth = data.claudeAiOauth;
+      if (!oauth?.accessToken || !oauth?.refreshToken) continue;
 
-    return {
-      provider: "anthropic",
-      refreshToken: oauth.refreshToken,
-      accessToken: oauth.accessToken,
-      expiresAt: oauth.expiresAt || 0,
-      clientId: ANTHROPIC_CLIENT_ID,
-      scopes: oauth.scopes || "",
-    };
-  } catch {
-    return null;
+      return {
+        provider: "anthropic",
+        refreshToken: oauth.refreshToken,
+        accessToken: oauth.accessToken,
+        expiresAt: oauth.expiresAt || 0,
+        clientId: ANTHROPIC_CLIENT_ID,
+        scopes: oauth.scopes || "",
+      };
+    } catch {
+      continue;
+    }
   }
+  return null;
 }
 
 function readGeminiCredentials(): StoredCredentials | null {
-  const home = homeDir();
-  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
-  const candidates = [
-    join(home, ".gemini", "oauth_creds.json"),
-    join(xdg, "gemini", "oauth_creds.json"),
-  ];
+  const candidates = runtimeCredentialFiles("gemini");
 
   for (const credPath of candidates) {
     if (!existsSync(credPath)) continue;
@@ -203,30 +201,27 @@ function readGeminiCredentials(): StoredCredentials | null {
 }
 
 function syncToClaudeCode(creds: StoredCredentials): void {
-  const credPath = join(homeDir(), ".claude", ".credentials.json");
-  if (!existsSync(credPath)) return;
+  for (const credPath of runtimeCredentialFiles("claude-code")) {
+    if (!existsSync(credPath)) continue;
 
-  try {
-    const data = JSON.parse(readFileSync(credPath, "utf-8"));
-    if (!data.claudeAiOauth) return;
+    try {
+      const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      if (!data.claudeAiOauth) continue;
 
-    data.claudeAiOauth.accessToken = creds.accessToken;
-    data.claudeAiOauth.refreshToken = creds.refreshToken;
-    data.claudeAiOauth.expiresAt = creds.expiresAt;
+      data.claudeAiOauth.accessToken = creds.accessToken;
+      data.claudeAiOauth.refreshToken = creds.refreshToken;
+      data.claudeAiOauth.expiresAt = creds.expiresAt;
 
-    writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
-  } catch {
-    // Best-effort
+      writeFileSync(credPath, JSON.stringify(data, null, 2), { mode: 0o600 });
+      return;
+    } catch {
+      // Best-effort
+    }
   }
 }
 
 function syncToGeminiCli(creds: StoredCredentials): void {
-  const home = homeDir();
-  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
-  const candidates = [
-    join(home, ".gemini", "oauth_creds.json"),
-    join(xdg, "gemini", "oauth_creds.json"),
-  ];
+  const candidates = runtimeCredentialFiles("gemini");
 
   for (const credPath of candidates) {
     if (!existsSync(credPath)) continue;
@@ -303,12 +298,7 @@ async function loginOpenAI(): Promise<void> {
  * Format: { accessToken, refreshToken, expiresAt, clientId, scopes, ... }
  */
 function readCodexCredentials(): StoredCredentials | null {
-  const home = homeDir();
-  const codexHome = process.env.CODEX_HOME || join(home, ".codex");
-  const candidates = [
-    join(codexHome, "auth.json"),
-    join(home, ".config", "codex", "auth.json"),
-  ];
+  const candidates = runtimeCredentialFiles("codex");
 
   for (const credPath of candidates) {
     if (!existsSync(credPath)) continue;
@@ -353,12 +343,7 @@ function readCodexCredentials(): StoredCredentials | null {
  * Atomic write: write to .tmp then rename to prevent partial reads.
  */
 function syncToCodexCli(creds: StoredCredentials): void {
-  const home = homeDir();
-  const codexHome = process.env.CODEX_HOME || join(home, ".codex");
-  const candidates = [
-    join(codexHome, "auth.json"),
-    join(home, ".config", "codex", "auth.json"),
-  ];
+  const candidates = runtimeCredentialFiles("codex");
 
   for (const credPath of candidates) {
     if (!existsSync(credPath)) continue;

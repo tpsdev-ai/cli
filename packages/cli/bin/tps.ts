@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
+import { enforceLaunchControl, launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
@@ -25,11 +27,7 @@ const FLAGS = {
   // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
   quietNonoCheck: { type: "boolean", default: false },
   nonono: { type: "boolean", default: false },
-  // Launch-path control (cli#341 S1a): --sandbox-required is asserted by every
-  // generated agent unit. (--no-sandbox is the interactive-TTY-only escape hatch;
-  // it is read from process.argv directly because yargs parses `--no-x` as a
-  // negation, which would shadow a declared `noSandbox` key.)
-  sandboxRequired: { type: "boolean", default: false },
+  ...launchFlagDefinitions,
   inject: { type: "boolean", default: true },
   runtime: { type: "string", default: "openclaw" },
   baseModel: { type: "string" },
@@ -129,6 +127,9 @@ const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
 
 const helpArgs = parseHelpArgs(process.argv.slice(2));
 
+const launchFlags = readLaunchFlags(process.argv);
+if (launchFlags.refusal) enforceLaunchControl({ argv: process.argv });
+
 const cli = meow(
   `
   Usage
@@ -166,6 +167,9 @@ const cli = meow(
     --help            Show this help text
     --version         Show version number
     --config <path>   Path to openclaw.json (default: auto-discover)
+    --sandbox-required[=true|false]  Require isolation (alias: --sandboxRequired)
+    --no-sandbox      Interactive TTY opt-out; conflicts with required isolation
+    Sandbox flag values: true or false only; --sandbox=false does not opt out
 
   Examples
     $ tps hire developer --name Fred
@@ -236,8 +240,8 @@ async function enforceLaunchControlOrExit(): Promise<void> {
       confinement = { released: attestation.ok, reason: attestation.reason };
     }
   }
-  enforceLaunchControl({ command, rest, argv: process.argv, confinement });
-  if (process.argv.includes(NO_SANDBOX_FLAG) && isInteractiveTty()) {
+  enforceLaunchControl({ command, rest, argv: process.argv, parsedFlags: cli.flags, confinement });
+  if (launchFlags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
 }
@@ -278,7 +282,7 @@ const USAGE: Record<string, string> = {
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
-          "  tps agent start --id <agent-id>\n" +
+          "  tps agent start --id <agent-id> [--runtime <runtime>] [--sandbox-required[=true|false]] [--no-sandbox]\n" +
           "  tps agent health --id <agent-id>\n" +
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
@@ -545,7 +549,7 @@ async function main() {
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
-          "  tps agent start --id <agent-id>\n" +
+          "  tps agent start --id <agent-id> [--runtime <runtime>] [--sandbox-required[=true|false]] [--no-sandbox]\n" +
           "  tps agent health --id <agent-id>\n" +
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
@@ -641,8 +645,17 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          const runtimeArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : undefined;
-          if (runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini") {
+          const runtimeArg = process.argv.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
+          const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
+          if (runtimeArg !== undefined && runtimeArg !== "openclaw" && !attestedRuntime) {
+            console.error(`❌ refusing to launch runtime '${runtimeArg}': unsupported runtime`);
+            process.exit(78);
+          }
+          const sandboxed = process.argv.includes("--sandboxed");
+          const noSandbox = launchFlags.noSandbox;
+          // Selected runners execute after launcher release or an interactive
+          // TTY `--no-sandbox` opt-out.
+          if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
             const { join } = await import("node:path");
             const { homedir } = await import("node:os");
@@ -764,7 +777,17 @@ async function main() {
               if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
             }
           } else {
-            await runAgent({ action: "start", config: configPath, id: agentId, sandbox: !process.argv.includes("--no-sandbox"), sandboxed: process.argv.includes("--sandboxed"), sandboxRequired: process.argv.includes("--sandbox-required") });
+            await runAgent({
+              action: "start",
+              config: configPath,
+              id: agentId,
+              sandbox: !noSandbox,
+              sandboxed,
+              sandboxRequired: launchFlags.sandboxRequired,
+              // Carry the runtime into the re-exec so the sandboxed child runs the
+              // runtime runner (cli#363 slice B); undefined for the default path.
+              runtime: attestedRuntime ? runtimeArg : undefined,
+            });
           }
         } else {
           await runAgent({ action: "health", config: configPath, id: agentId });
@@ -802,7 +825,7 @@ async function main() {
         const healthInterval = process.argv.find((a: string) => a.startsWith("--interval="))?.split("=")[1];
         await runOfficeHealth({
           flairUrl: process.env.FLAIR_URL,
-          viewerId: process.env.TPS_AGENT_ID ?? "anvil",
+          viewerId: requireLocalAgentId("office health viewer id", cli.flags.agent ?? cli.flags.id ?? rest[1]),
           interval: healthInterval ? Number(healthInterval) : 60,
           json: cli.flags.json as boolean | undefined,
           local: process.argv.includes("--local"),
@@ -1590,13 +1613,13 @@ async function main() {
 
     case "tui":
     case "ui": {
+      const tuiAgentId = requireLocalAgentId("TUI agent id", cli.flags.agent ?? cli.flags.id ?? rest[0]);
       const { TuiApp } = await import("../src/commands/tui.js");
       const { render } = await import("ink");
       const React = (await import("react")).default;
       const { join: tuiJoin } = await import("node:path");
       const { homedir: tuiHomedir } = await import("node:os");
       const tuiMailDir = (cli.flags["mail-dir"] as string | undefined) ?? tuiJoin(tuiHomedir(), ".tps", "mail");
-      const tuiAgentId = (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined) ?? rest[0] ?? "anvil";
       const tuiRepoRaw = (cli.flags.repo as string | undefined) ?? "tpsdev-ai/cli";
       const tuiRepo = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(tuiRepoRaw) ? tuiRepoRaw : "tpsdev-ai/cli";
       if (tuiRepo !== tuiRepoRaw) console.warn(`[tui] Invalid --repo value ignored: ${tuiRepoRaw}`);
