@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -52,6 +52,62 @@ afterEach(() => {
 });
 
 describe("cli#483 — credential files and approved targets", () => {
+  for (const writable of [true, false]) {
+    test.skipIf(!writable && process.getuid?.() === 0)(`an overlapping workspace is refused without filesystem creation (writable=${writable})`, () => {
+      const sb = makeSandbox();
+      const auth = join(sb.home, ".tps", "auth");
+      mkdirSync(auth);
+      const workspace = join(auth, "workspace");
+      const configPath = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+      writeFileSync(configPath, readFileSync(configPath, "utf8")
+        .replace(`workspace: ${sb.ws}`, `workspace: ${workspace}`)
+        .replace(`mailDir: ${join(sb.home, ".tps", "mail")}`, `mailDir: ${join(sb.root, "new-mail")}`)
+        .replace(`memoryPath: ${join(sb.home, ".tps", "agents", "probe", "memory.jsonl")}`, `memoryPath: ${join(sb.root, "new-memory", "memory.jsonl")}`));
+      if (!writable) chmodSync(auth, 0o500);
+      try {
+        const before = readdirSync(sb.root, { recursive: true }).sort();
+        const r = spawnSync(process.execPath, [join(import.meta.dir, "helpers/runtime-dir-launch-driver.ts")], {
+          cwd: sb.ws, env: cliEnv(sb, { HOME: sb.home }), encoding: "utf8", timeout: 10_000,
+        });
+        const text = `${r.stdout}${r.stderr}`;
+        expect(r.status, text).toBe(78);
+        expect(text).toContain("refusing to launch runtime 'claude-code'");
+        expect(text).toContain("workdir grant");
+        expect(text).toContain("~/.tps/auth");
+        expect(text).not.toContain("HANDOFF ");
+        expect(readdirSync(sb.root, { recursive: true }).sort()).toEqual(before);
+      } finally {
+        chmodSync(auth, 0o700);
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const component of [".tps", ".TPS"]) {
+    test(`an absent credential root is protected on a case-insensitive volume (${component})`, () => {
+      const sb = makeSandbox();
+      try {
+        const custom = join(sb.home, component, "AUTH", "Runtime");
+        expect(existsSync(join(sb.home, ".tps", "auth"))).toBe(false);
+        const before = readdirSync(sb.root, { recursive: true }).sort();
+        const r = spawnSync(process.execPath, [join(import.meta.dir, "helpers/runtime-dir-launch-driver.ts")], {
+          cwd: sb.ws,
+          env: cliEnv(sb, { HOME: sb.home, CLAUDE_CONFIG_DIR: custom,
+            TPS_TEST_CASE_INSENSITIVE_ROOT: existsSync(join(sb.root, "HOME")) ? undefined : sb.root }),
+          encoding: "utf8", timeout: 10_000,
+        });
+        const text = `${r.stdout}${r.stderr}`;
+        expect(r.status, text).toBe(78);
+        expect(text).toContain("CLAUDE_CONFIG_DIR");
+        expect(text).toContain("~/.tps/auth");
+        expect(text).not.toContain("HANDOFF ");
+        expect(readdirSync(sb.root, { recursive: true }).sort()).toEqual(before);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   for (const runtime of Object.keys(runtimeProviders) as CredentialRuntime[]) {
     test(`${runtime}: every auth reader candidate is protected from other runtimes`, () => {
       const sb = makeSandbox();

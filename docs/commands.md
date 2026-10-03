@@ -14,11 +14,7 @@ The `tps` CLI is the control plane for the Agent OS.
 
 Sandbox flag values must be exactly `true` or `false`; other values are refused by name.
 
-Selected runtimes use default config directories unless `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME` or `XDG_CONFIG_HOME` overrides them. Their sandboxed launches check
-canonical grants before creating runtime directories and pass approved paths
-to nono. File exceptions permit named files of the launching runtime, the
-launching agent's identity files and named system read files.
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` affect runtime grants.
 
 ---
 

@@ -43,7 +43,7 @@
 
 import meow from "meow";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -314,10 +314,6 @@ export function runtimeNonoOptions(
   return { allow: [...new Set(allow)], allowFiles };
 }
 
-// ---------------------------------------------------------------------------
-// cli#483 — a runtime directory must not overlap a TPS credential root
-// ---------------------------------------------------------------------------
-
 function runtimeDirVariables(
   runtime: string | undefined,
   env: NodeJS.ProcessEnv,
@@ -346,6 +342,50 @@ function tpsCredentialRoots(
   }));
 }
 
+function caseInsensitivePath(p: string): boolean {
+  let ancestor = p;
+  for (;;) {
+    try {
+      if (!statSync(ancestor).isDirectory()) ancestor = dirname(ancestor);
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw err;
+      ancestor = parent;
+    }
+  }
+  const toggleCase = (name: string) => name.replace(/[a-zA-Z]/, (c) => c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase());
+  let parent = ancestor;
+  let names = readdirSync(parent);
+  let name = names.find((entry) => toggleCase(entry) !== entry);
+  if (!name) {
+    parent = dirname(ancestor);
+    if (parent === ancestor || statSync(parent).dev !== statSync(ancestor).dev) return true;
+    name = basename(ancestor);
+    if (toggleCase(name) === name) return caseInsensitivePath(parent);
+    names = readdirSync(parent);
+  }
+  const alternateName = toggleCase(name);
+  if (names.includes(alternateName)) return false;
+  const probe = join(parent, name);
+  const original = lstatSync(probe);
+  try {
+    const alternate = lstatSync(join(parent, alternateName));
+    return original.dev === alternate.dev && original.ino === alternate.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function appendUnresolved(ancestor: string, tail: string[]): string {
+  if (!tail.length) return ancestor;
+  const components = caseInsensitivePath(ancestor) ? tail.map((part) => part.toLowerCase()) : tail;
+  return join(ancestor, ...components);
+}
+
 function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
   if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
   let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
@@ -353,14 +393,14 @@ function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): strin
   for (;;) {
     try {
       const real = realpathSync(cur);
-      return tail.length ? join(real, ...tail.reverse()) : real;
+      return appendUnresolved(real, tail.reverse());
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
       try {
         if (lstatSync(cur).isSymbolicLink()) {
           const target = canonicalPath(readlinkSync(cur), dirname(cur), links + 1);
-          return join(target, ...tail.reverse());
+          return appendUnresolved(target, tail.reverse());
         }
       } catch (linkErr) {
         const linkCode = (linkErr as NodeJS.ErrnoException).code;
@@ -374,13 +414,11 @@ function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): strin
   }
 }
 
-/** True when `dir` equals or contains `p` (both already canonical). */
 function pathContainsOrEquals(dir: string, p: string): boolean {
   if (dir === p) return true;
   return p.startsWith(dir.endsWith("/") ? dir : `${dir}/`);
 }
 
-/** True when one of the two canonical paths equals or contains the other. */
 function pathsOverlap(a: string, b: string): boolean {
   return pathContainsOrEquals(a, b) || pathContainsOrEquals(b, a);
 }
@@ -399,6 +437,14 @@ export function approveRuntimeNonoOptions(
     if (!resolved.has(p)) resolved.set(p, canonicalPath(p));
     return resolved.get(p)!;
   };
+  const comparisonPaths = new Map<string, string>();
+  const comparisonPath = (p: string): string => {
+    if (!comparisonPaths.has(p)) comparisonPaths.set(p, caseInsensitivePath(p) ? p.toLowerCase() : p);
+    return comparisonPaths.get(p)!;
+  };
+  const overlaps = (a: string, b: string) => pathsOverlap(comparisonPath(a), comparisonPath(b));
+  const contains = (a: string, b: string) => pathContainsOrEquals(comparisonPath(a), comparisonPath(b));
+  const equals = (a: string, b: string) => comparisonPath(a) === comparisonPath(b);
   try {
     const roots = tpsCredentialRoots(env).map((r) => {
       try {
@@ -413,14 +459,14 @@ export function approveRuntimeNonoOptions(
       try {
         canon = canonical(path);
       } catch (err) {
-        const root = roots.find((r) => pathsOverlap(resolve(path), resolve(r.path)));
+        const root = roots.find((r) => pathsOverlap(resolve(path).toLowerCase(), resolve(r.path).toLowerCase()));
         return result(
           `${variable}=${path} cannot be resolved` +
           (root ? ` at TPS credential root ${root.label} (${root.path})` : "") +
           `: ${(err as Error).message}`,
         );
       }
-      const hit = roots.find((r) => pathsOverlap(canon, r.canon));
+      const hit = roots.find((r) => overlaps(canon, r.canon));
       if (hit) {
         return result(
           `${variable}=${path} overlaps the TPS credential root ${hit.label} (${hit.path}) — ` +
@@ -447,7 +493,7 @@ export function approveRuntimeNonoOptions(
 
     for (const grant of dirGrants) {
       const canon = canonical(grant.path);
-      const root = roots.find((r) => pathsOverlap(canon, r.canon));
+      const root = roots.find((r) => overlaps(canon, r.canon));
       if (root) {
         return result(
           `${grant.label} (${grant.path}) overlaps the TPS credential root ${root.label} (${root.path}) — ` +
@@ -458,7 +504,7 @@ export function approveRuntimeNonoOptions(
               : `remove or narrow this grant to a directory outside the credential roots`)
         );
       }
-      const foreign = foreignFiles.find((f) => pathContainsOrEquals(canon, f.canon));
+      const foreign = foreignFiles.find((f) => contains(canon, f.canon));
       if (foreign) {
         return result(
           `${grant.label} (${grant.path}) covers ${foreign.path}, another runtime's credential file`
@@ -483,14 +529,14 @@ export function approveRuntimeNonoOptions(
     ];
     for (const grant of fileGrants) {
       const canon = canonical(grant.path);
-      const foreign = foreignFiles.find((f) => f.canon === canon);
+      const foreign = foreignFiles.find((f) => equals(f.canon, canon));
       if (foreign) return result(`${grant.label} targets ${foreign.path}, another runtime's credential file`);
-      const root = roots.find((r) => pathsOverlap(canon, r.canon));
-      const permittedTpsFile = ownAuth.includes(canon) || (grant.readOnly && ownIdentity.includes(canon));
+      const root = roots.find((r) => overlaps(canon, r.canon));
+      const permittedTpsFile = ownAuth.some((p) => equals(p, canon)) || (grant.readOnly && ownIdentity.some((p) => equals(p, canon)));
       if (root && !permittedTpsFile) {
         return result(`${grant.label} (${canon}) overlaps the TPS credential root ${root.label} (${root.path})`);
       }
-      if (!root && !ownTargets.includes(canon) && !(grant.readOnly && systemTargets.includes(canon))) {
+      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && systemTargets.some((p) => equals(p, canon)))) {
         return result(`${grant.label} (${canon}) is not a permitted file for runtime '${runtime}'`);
       }
     }

@@ -796,18 +796,20 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
       // The runtime's own key resolution (this same value) is now the validated id.
       config.agentId = launchId;
-      if (config.flair) {
-        const flair = createFlairClient(
-          config.agentId,
-          config.flair.url ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
-          config.flair.keyPath ?? join(homedir(), ".tps", "identity", `${config.agentId}.key`),
-        );
-        loadPlugins({ slots: { memory: "flair" } }, { flair });
-      }
-      if (config.role) {
-        applyRole({ role: config.role, ...(config.roleConfig ?? {}) }, config.agentId);
-      }
-      const runtime = new AgentRuntime(config);
+      const createRuntime = () => {
+        if (config.flair) {
+          const flair = createFlairClient(
+            config.agentId,
+            config.flair.url ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+            config.flair.keyPath ?? join(homedir(), ".tps", "identity", `${config.agentId}.key`),
+          );
+          loadPlugins({ slots: { memory: "flair" } }, { flair });
+        }
+        if (config.role) {
+          applyRole({ role: config.role, ...(config.roleConfig ?? {}) }, config.agentId);
+        }
+        return new AgentRuntime(config);
+      };
 
       if (args.action === "run") {
         const message = args.message || process.env.TPS_AGENT_MESSAGE;
@@ -815,7 +817,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
           console.error("Usage: tps agent run --id <agent-id> --message <text>");
           process.exit(1);
         }
-        await runtime.runOnce(message);
+        await createRuntime().runOnce(message);
         return;
       }
 
@@ -927,7 +929,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         }
 
         try {
-          await runtime.start();
+          await createRuntime().start();
         } catch (_err) {
           console.error("❌ Agent runtime crashed:", _err);
           process.exit(1);
@@ -936,7 +938,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       if (args.action === "health") {
-        const healthy = runtime.isHealthy();
+        const healthy = createRuntime().isHealthy();
         process.stdout.write(healthy ? "healthy\n" : "unhealthy\n");
         process.exit(healthy ? 0 : 1);
       }

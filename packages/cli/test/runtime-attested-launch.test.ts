@@ -513,11 +513,6 @@ for (const rt of RUNTIMES) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// cli#483 — a runtime directory or an inherited launch grant that overlaps a TPS
-// credential root is refused before any runner starts.
-// ---------------------------------------------------------------------------
-
 /**
  * Run the launcher for a selected runtime in a non-TTY context (the attested
  * path) with a dummy nono.
