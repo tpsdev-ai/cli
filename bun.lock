@@ -139,6 +139,7 @@
         "tps-mail-watcher": "./dist/bin.js",
       },
       "dependencies": {
+        "@tpsdev-ai/agent": "workspace:*",
         "minimist": "^1.2.8",
       },
       "devDependencies": {

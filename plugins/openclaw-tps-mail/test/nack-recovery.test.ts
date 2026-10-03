@@ -1,3 +1,4 @@
+import { buildSignedEnvelope, pubkeyFromSeed } from "../../../packages/cli/test/helpers/stub-flair.js";
 /**
  * nack-recovery.test.ts — cli#389 round 12, item 1 (CodeRabbit, Major).
  *
@@ -86,6 +87,15 @@ afterEach(() => {
 
 /** The durable shape an owed nack leaves: a `failed` record with nackPending. */
 function seedOwedNack(inboundId: string, reason: string): void {
+  const seed = Buffer.alloc(32, 1);
+  mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({ createMailVerifyClient: async () => ({
+    getAgent: async (name: string) => name === SENDER ? { publicKey: pubkeyFromSeed(seed) } : null,
+  }) }));
+  const cur = resolve(mailDir, AGENT, "cur");
+  mkdirSync(cur, { recursive: true });
+  const envelope = buildSignedEnvelope(SENDER, AGENT, "inbound", { [SENDER]: seed });
+  writeFileSync(resolve(cur, `${inboundId}.json`), JSON.stringify({ id: inboundId, from: SENDER, to: AGENT,
+    body: envelope.body, timestamp: envelope.timestamp, read: false, envelopeId: envelope.messageId, envelope }));
   const dir = resolve(mailDir, AGENT, ".obligations");
   mkdirSync(dir, { recursive: true });
   writeFileSync(

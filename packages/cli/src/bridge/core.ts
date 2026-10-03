@@ -10,8 +10,6 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
-  renameSync,
   watch,
   writeFileSync,
   rmSync,
@@ -26,6 +24,9 @@ const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export function validateAgentId(id: string): boolean {
   return AGENT_ID_RE.test(id);
 }
+
+export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
+import { configureBridgeIdentity } from "@tpsdev-ai/agent";
 
 export interface BridgeCoreConfig {
   bridgeAgentId?: string;
@@ -50,8 +51,8 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    this.bridgeAgentId = config.bridgeAgentId ?? "bridge-" + adapter.name;
-    this.mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
+    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(process.env.HOME ?? homedir(), ".tps", "mail");
+    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
@@ -130,55 +131,66 @@ Message: ${envelope.content}`;
     mkdirSync(fresh, { recursive: true });
     mkdirSync(cur, { recursive: true });
 
-    const processFile = (file: string) => {
+    const pending = new Set<string>();
+    const processFile = async (file: string, recovery = false) => {
       if (!file.endsWith(".json")) return;
-      const fullPath = join(fresh, file);
-      if (!existsSync(fullPath)) return;
-
-      let envelope: BridgeEnvelope;
+      const fullPath = join(recovery ? cur : fresh, file);
+      if (!existsSync(fullPath) || pending.has(fullPath)) return;
+      pending.add(fullPath);
       try {
-        const raw = readFileSync(fullPath, "utf-8");
-        const msg = JSON.parse(raw);
-        // If body is a JSON-serialized BridgeEnvelope, use it directly.
-        // Otherwise treat as plain text and route to the default channel.
-        let parsedBody: unknown = null;
-        if (typeof msg.body === "string") {
-          try { parsedBody = JSON.parse(msg.body); } catch { /* plain text */ }
-        }
-        if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
-          envelope = parsedBody as BridgeEnvelope;
-        } else {
-          // Plain text reply — route back to the channel this agent is bridging
-          envelope = {
-            channel: this.adapter.name,
-            channelId: this.defaultChannelId ?? "",
-            content: typeof msg.body === "string" ? msg.body : String(msg.body ?? ""),
-            senderId: "agent",
-            senderName: "agent",
-            timestamp: new Date().toISOString(),
-          };
-        }
-      } catch (e) {
-        this.log(`[bridge:outbound] Failed to parse ${file}: ${e}`);
-        renameSync(fullPath, join(cur, file));
-        return;
-      }
+        const { promote, recoverPromoted, ackMessage } = await import("../utils/mail.js");
+        const result = await (recovery ? recoverPromoted : promote)(this.bridgeAgentId, fullPath);
+        if (!result.ok || result.message.trustTier === "external") return;
 
-      renameSync(fullPath, join(cur, file));
+        let envelope: BridgeEnvelope;
+        try {
+          const msg = result.message;
+          // If body is a JSON-serialized BridgeEnvelope, use it directly.
+          // Otherwise treat as plain text and route to the default channel.
+          let parsedBody: unknown = null;
+          if (typeof msg.body === "string") {
+            try { parsedBody = JSON.parse(msg.body); } catch { /* plain text */ }
+          }
+          if (parsedBody && typeof parsedBody === "object" && "channel" in (parsedBody as object)) {
+            envelope = parsedBody as BridgeEnvelope;
+          } else {
+            // Plain text reply — route back to the channel this agent is bridging
+            envelope = {
+              channel: this.adapter.name,
+              channelId: this.defaultChannelId ?? "",
+              content: typeof msg.body === "string" ? msg.body : String(msg.body ?? ""),
+              senderId: "agent",
+              senderName: "agent",
+              timestamp: new Date().toISOString(),
+            };
+          }
+        } catch (e) {
+          this.log(`[bridge:outbound] Failed to parse ${file}: ${e}`);
+          return;
+        }
 
-      this.adapter.send(envelope).then(() => {
-        this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
-      }).catch((e) => {
-        this.log(`[bridge:outbound] Delivery failed: ${e}`);
-      });
+        await this.adapter.send(envelope).then(() => {
+          ackMessage(this.bridgeAgentId, result.message.id);
+          this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
+        }).catch((e) => {
+          this.log(`[bridge:outbound] Delivery failed: ${e}`);
+        });
+      } catch (error) {
+        this.log(`[bridge:outbound] Deferred ${file}: ${error}`);
+      } finally { pending.delete(fullPath); }
     };
 
+    let inflight = Promise.resolve();
+    const enqueue = (file: string, recovery = false) => {
+      inflight = inflight.then(() => processFile(file, recovery));
+    };
     try {
-      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach(processFile);
+      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach((file) => { enqueue(file); });
+      readdirSync(cur).filter((f) => f.endsWith(".json")).forEach((file) => { enqueue(file, true); });
     } catch {}
 
     const watcher = watch(fresh, (_event, filename) => {
-      if (filename) processFile(filename.toString());
+      if (filename) enqueue(filename.toString());
     });
 
     return () => { try { watcher.close(); } catch {} };

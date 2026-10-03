@@ -532,3 +532,32 @@ describe("S43-D: scratch path traversal", () => {
     }
   });
 });
+
+test("bridge internal claim cannot dispatch an out-of-scratch write in the real event loop", async () => {
+  const root = mkdtempSync(join(tmpdir(), "bridge-tool-tier-"));
+  try {
+    const received = await receiveSignedMail({
+      root, from: "openclaw-bridge", body: "write outside scratch", trust: "internal",
+      messageId: "bridge-write", seed: Buffer.alloc(32, 0x39),
+    });
+    const tools = makeToolRegistry();
+    let executed = 0;
+    tools.register({ name: "write", description: "write", input_schema: {}, execute: async () => {
+      executed++; return { content: "wrote" };
+    } });
+    let turns = 0;
+    const provider = { complete: async () => (++turns === 1 ? {
+      content: "", toolCalls: [{ id: "write-1", name: "write", input: { path: join(root, "outside.txt"), content: "bad" } }],
+      inputTokens: 1, outputTokens: 1,
+    } : { content: "done", inputTokens: 1, outputTokens: 1 }) } as any;
+    const loop = new EventLoop({ config: makeConfig({ workspace: root }), memory: makeMemory(),
+      context: makeContext(), provider, tools });
+    let polled = false;
+    await loop.run(async () => {
+      if (!polled) { polled = true; return [received]; }
+      await loop.stop(); return [];
+    });
+    expect(turns).toBe(2);
+    expect(executed).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

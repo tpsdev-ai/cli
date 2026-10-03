@@ -1475,6 +1475,7 @@ async function main() {
         discordContextPrompt: getFlag("discord-prompt"),
         json: cli.flags.json,
       });
+      if (action === "start") await new Promise<void>(() => {});
       break;
     }
 

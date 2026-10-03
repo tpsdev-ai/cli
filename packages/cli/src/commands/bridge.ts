@@ -63,7 +63,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         requireMention: args.requireMention,
         });
         const core = new BridgeCore(discordAdapter, {
-          bridgeAgentId: args.bridgeAgentId ?? "discord-bridge",
+          bridgeAgentId: args.bridgeAgentId,
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId ?? "ember",
           defaultChannelId: channelId,
@@ -80,7 +80,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
       if (adapter === "stdio") {
         const stdioAdapter = new StdioAdapter();
         const core = new BridgeCore(stdioAdapter, {
-          bridgeAgentId: args.bridgeAgentId ?? "stdio-bridge",
+          bridgeAgentId: args.bridgeAgentId,
           mailDir: args.mailDir,
           defaultAgentId: args.defaultAgentId,
         });

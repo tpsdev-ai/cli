@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type Envelope, verifyEnvelope } from "@tpsdev-ai/agent";
+import { type Envelope, verifyEnvelope, verifiedMailTier, bridgePrincipalIds } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
 import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
@@ -41,6 +41,7 @@ export interface MailMessage {
    * the two either breaks this envelope's signature or fails the field match.
    */
   envelope?: Envelope;
+  trustTier?: "user" | "internal" | "external";
   /**
    * cli#429: the signed `messageId` this message replies to, stamped from the
    * VERIFIED envelope at promotion (it is also bound to the envelope by
@@ -451,6 +452,10 @@ function rejectToDlq(
   } catch (err: any) {
     console.error(`[mail] failed to dead-letter ${filename}: ${err?.message ?? err}`);
   }
+}
+
+export function mailRootForRecordPath(filePath: string): string {
+  return dirname(dirsForRecordPath(filePath).root);
 }
 
 /** The new/tmp/cur/dlq siblings of a record at <root>/<dir>/<file>. */
@@ -864,6 +869,34 @@ type EnvelopePolicyResult =
   | { ok: true; envelope: Envelope }
   | { ok: false; class: PromoteRejectClass; reason: string };
 
+/** Non-bridge claims must use these values; bridge claims always map to external. */
+const VALID_SIGNED_TRUST: ReadonlySet<string> = new Set(["user", "internal", "external"]);
+
+function trustCeilingReject(
+  envelope: Envelope,
+  mailRoot: string,
+  verify: MailVerifyConfig,
+): { ok: false; class: PromoteRejectClass; reason: string } | null {
+  const trust = (envelope as { trust?: unknown }).trust;
+  if (bridgePrincipalIds(mailRoot, verify.bridgeAgentId).has(envelope.from)) return null;
+  if (trust !== undefined && !VALID_SIGNED_TRUST.has(trust as string)) {
+    const shown =
+      typeof trust === "string"
+        ? trust.length === 0
+          ? "an empty string"
+          : `a ${trust.length}-char string outside the rule`
+        : trust === null
+          ? "null"
+          : typeof trust;
+    return {
+      ok: false,
+      class: "invalid",
+      reason: `invalid trust value (must be "user", "internal" or "external"; got ${shown})`,
+    };
+  }
+  return null;
+}
+
 /**
  * The ONE mailbox decision for an enveloped record — the shared policy that BOTH
  * first delivery (`promote`) and re-presentation (`recoverPromoted`) run, so the
@@ -887,6 +920,7 @@ async function decideEnvelopeForMailbox(
   agent: string,
   envelope: Envelope,
   wrapperFrom: string,
+  mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<EnvelopePolicyResult> {
   // 1. Signature, through an ALWAYS-constructed client.
@@ -914,6 +948,10 @@ async function decideEnvelopeForMailbox(
     }
     return { ok: false, class: "invalid", reason: `signature verification failed: ${verified.reason}` };
   }
+
+  // 1b. Validate non-bridge claims; bridge claims always map to external.
+  const ceiling = trustCeilingReject(envelope, mailRoot, verify);
+  if (ceiling) return ceiling;
 
   // 2. The wrapper `from` is what consumers route by, and it is unverified; a
   //    wrapper/envelope mismatch is itself a reject.
@@ -993,6 +1031,7 @@ export type VerifyRecordResult =
 export async function verifyRecordForMailbox(
   agent: string,
   record: MailMessage,
+  mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<VerifyRecordResult> {
   const parsed = tryParseEnvelope(record.body);
@@ -1006,7 +1045,7 @@ export async function verifyRecordForMailbox(
     return { ok: false, class: "invalid", reason: "envelope body is not a string" };
   }
   const envelope = parsed as unknown as Envelope;
-  const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, verify);
+  const decision = await decideEnvelopeForMailbox(agent, envelope, record.from, mailRoot, verify);
   if (!decision.ok) return { ok: false, class: decision.class, reason: decision.reason };
   return {
     ok: true,
@@ -1019,6 +1058,7 @@ export async function verifyRecordForMailbox(
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
       replyToId: envelope.replyToId,
     },
   };
@@ -1037,6 +1077,7 @@ export async function verifyRecordForMailbox(
 export async function promote(agent: string, filePath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(filePath);
+  const mailRoot = mailRootForRecordPath(filePath);
   const filename = filePath.split("/").pop()!;
 
   // Step 0: read the wrapper.
@@ -1057,7 +1098,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
   // the two cannot diverge. `promote` adds the move below.
   let verified: VerifyRecordResult;
   try {
-    verified = await verifyRecordForMailbox(agent, msg, verify);
+    verified = await verifyRecordForMailbox(agent, msg, mailRoot, verify);
   } catch (err: any) {
     // Flair did not answer — RETRYABLE, not terminal. Quarantine it and let a
     // later check re-drive it, so an outage self-heals when Flair returns.
@@ -1129,6 +1170,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       read: false,
       envelopeId: envelope.messageId,
       envelope,
+      trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
       // Stamp the verified reply-to (or clear it): the binding table checks
       // record.replyToId against envelope.replyToId, so presentation cannot
       // show a reply-to that is not the one that was signed.
@@ -1251,7 +1293,7 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
  * No side effects. Throws only when Flair is unreachable; callers decide (an
  * outage withholds presentation and leaves recovery to retry).
  */
-async function checkPromotedRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<EnvelopePolicyResult> {
+async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}): Promise<EnvelopePolicyResult> {
   // Provenance: only promote() stamps envelopeId + the signed envelope.
   if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
     return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
@@ -1264,7 +1306,7 @@ async function checkPromotedRecord(agent: string, record: MailMessage, verify: M
   if (!binding.ok) {
     return { ok: false, class: "unverified", reason: `record does not match its verified envelope: ${binding.reason}` };
   }
-  return decideEnvelopeForMailbox(agent, env, record.from, verify);
+  return decideEnvelopeForMailbox(agent, env, record.from, mailRoot, verify);
 }
 
 /**
@@ -1272,9 +1314,12 @@ async function checkPromotedRecord(agent: string, record: MailMessage, verify: M
  * and re-verifies (see checkPromotedRecord). Any failure — including a Flair
  * outage — withholds the body (fail-closed).
  */
-export async function isPresentableCurRecord(agent: string, record: MailMessage, verify: MailVerifyConfig = {}): Promise<boolean> {
+export async function isPresentableCurRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}): Promise<boolean> {
   try {
-    return (await checkPromotedRecord(agent, record, verify)).ok;
+    const decision = await checkPromotedRecord(agent, record, mailRoot, verify);
+    if (!decision.ok) return false;
+    record.trustTier = verifiedMailTier(decision.envelope, mailRoot, verify.bridgeAgentId);
+    return true;
   } catch {
     return false;
   }
@@ -1299,6 +1344,7 @@ export async function isPresentableCurRecord(agent: string, record: MailMessage,
 export async function recoverPromoted(agent: string, curPath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
+  const mailRoot = mailRootForRecordPath(curPath);
   const filename = curPath.split("/").pop()!;
 
   let msg: MailMessage;
@@ -1315,7 +1361,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // includes the recipient binding, so a record carrying another mailbox's
   // genuine envelope cannot be presented here. (The first-delivery-only replay
   // gate is unnecessary: this id is already consumed.)
-  const decision = await checkPromotedRecord(agent, msg, verify);
+  const decision = await checkPromotedRecord(agent, msg, mailRoot, verify);
   if (!decision.ok) {
     rejectToDlq(dirs, filename, curPath, decision.class, decision.reason);
     return { ok: false, class: decision.class, reason: decision.reason };
@@ -1331,6 +1377,7 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
     body: env.body,
     timestamp: env.timestamp,
     envelopeId: env.messageId,
+    trustTier: verifiedMailTier(env, mailRoot, verify.bridgeAgentId),
     replyToId: env.replyToId,
   };
   return { ok: true, message: presented, path: curPath };
@@ -1432,10 +1479,30 @@ export async function listMessages(agent: string): Promise<MailMessage[]> {
   // stored signed envelope is re-checked through the shared policy. Any failure
   // (including an outage) withholds the record like new/ and dlq/.
   const cur: MailMessage[] = [];
-  for (const m of readMessagesFromDir(inbox.cur, true, "cur")) {
-    cur.push((await isPresentableCurRecord(agent, m)) ? m : withholdUnverified(m));
+  for (const file of listMessageFiles(inbox.cur)) {
+    const path = join(inbox.cur, file);
+    try {
+      const m = readMessageFile(path);
+      m.read = true;
+      m.location = "cur";
+      cur.push((await isPresentableCurRecord(agent, m, mailRootForRecordPath(path))) ? m : withholdUnverified(m));
+    } catch (err: any) {
+      console.error(`[mail] skipping corrupt message ${file}: ${err.message}`);
+    }
   }
   return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+}
+
+export async function verifyMailAction(agent: string, id: string): Promise<MailMessage | null> {
+  const path = messagePathById(agent, id);
+  if (!path) return null;
+  const record = readMessageFile(path);
+  const result = dirname(path).endsWith("/cur")
+    ? await recoverPromoted(agent, path)
+    : await verifyRecordForMailbox(agent, record, mailRootForRecordPath(path));
+  if (!result.ok) throw new Error(`mail action refused: ${result.reason}`);
+  if (result.message.trustTier === "external") throw new Error("external-tier mail cannot be acknowledged or nacked by an internal consumer");
+  return result.message;
 }
 
 export function ackMessage(agent: string, id: string): MailMessage | null {

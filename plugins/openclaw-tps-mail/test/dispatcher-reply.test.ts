@@ -76,13 +76,13 @@ function makeMailEnvelope(body: string, overrides: Partial<{ id: string; from: s
 }
 
 /** Sign an envelope AS `from` (seed) and wrap it as a mail body. */
-function buildSignedBody(from: string, to: string, body: string, seed: Buffer): string {
+function buildSignedBody(from: string, to: string, body: string, seed: Buffer, trust?: Envelope["trust"]): string {
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: new Date().toISOString(), rationale: "originates", signature: null },
     { agent: from, kind: "agent", timestamp: new Date().toISOString(), rationale: `agent ${from} dispatches`, signature: null },
   ];
   const env = signEnvelope(
-    { v: 1, from, to, body, messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, timestamp: new Date().toISOString(), delegationChain: chain },
+    { v: 1, from, to, body, ...(trust === undefined ? {} : { trust }), messageId: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, timestamp: new Date().toISOString(), delegationChain: chain },
     { [from]: seed },
   );
   return JSON.stringify(env);
@@ -140,7 +140,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   async function startDispatcher(
     agentId: string,
     sender: string,
-    opts: { localSender?: boolean; branchHost?: boolean; bodyFrom?: string; bodySeed?: Buffer; warnCalls?: string[] } = {},
+    opts: { localSender?: boolean; branchHost?: boolean; bodyFrom?: string; bodySeed?: Buffer; trust?: Envelope["trust"]; warnCalls?: string[] } = {},
   ) {
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
@@ -166,7 +166,7 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
 
     const bodyFrom = opts.bodyFrom ?? sender;
     const seed = opts.bodySeed ?? FLINT_SEED;
-    const signedBody = buildSignedBody(bodyFrom, agentId, "inbound payload", seed);
+    const signedBody = buildSignedBody(bodyFrom, agentId, "inbound payload", seed, opts.trust);
     const envelope = makeMailEnvelope(signedBody, { from: sender, to: agentId, id: `msg-${Date.now()}` });
     const filename = `2026-05-26T00-00-00-${envelope.id}.json`;
     writeFileSync(resolve(newDir, filename), JSON.stringify(envelope, null, 2), "utf-8");
@@ -214,6 +214,17 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     };
   }
 
+
+  for (const sender of ["flint", "openclaw-bridge"]) {
+    it(`signed tier gates actual OpenClaw dispatch and replies for ${sender}`, async () => {
+      const h = await startDispatcher("anvil", sender, { localSender: true, ...(sender === "flint" ? { trust: "external" as const } : {}) });
+      await new Promise((r) => setTimeout(r, 100));
+      expect(h.dispatched).toBeNull();
+      expect(readdirSafe(resolve(tempMailDir, sender, "new"))).toEqual([]);
+      expect(readdirSafe(resolve(tempMailDir, "anvil", "cur"))).toHaveLength(1);
+      h.settle();
+    });
+  }
   it("F-S0a: a LOCAL recipient gets exactly one signed reply in its maildir, zero in the outbox", async () => {
     const h = await startDispatcher("anvil", "flint", { localSender: true });
     expect(h.dispatched).not.toBeNull();

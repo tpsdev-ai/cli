@@ -5,6 +5,7 @@ import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
 import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
+import { verifiedMailTier } from "../lib/bridge-identity.js";
 import { isTopicRecipient } from "../lib/topic-recipient.js";
 
 export interface MailMessage {
@@ -17,6 +18,7 @@ export interface MailMessage {
   from: string;
   /** Present only after signature and mailbox policy both passed. */
   verifiedEnvelope?: Envelope;
+  trustTier?: "user" | "internal" | "external";
 }
 
 /**
@@ -200,6 +202,7 @@ export class MailClient {
         messages.push({
           filename: file, body, receivedAt: new Date(), headers: {}, from,
           verifiedEnvelope: verifyResult.envelope,
+          trustTier: verifiedMailTier(verifyResult.envelope, this.mailDir),
         });
         this.events?.emit({
           type: "mail.receive",
@@ -313,8 +316,7 @@ export class MailClient {
    * Verify a mail body against the v1 signed envelope spec AND this mailbox's
    * policy: signature, wrapper→envelope `from` binding, recipient binding
    * and `messageId`/`timestamp`
-   * shape. These are the checks the shared `promote()` applies, so this path
-   * cannot present mail the shared path would reject.
+   * shape.
    *
    * Returns a terminal `{ pass: false, class, reason }` on a deterministic
    * rejection. Called ONLY when a verifier is configured; a THROW (Flair

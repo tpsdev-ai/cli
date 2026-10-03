@@ -28,6 +28,8 @@ import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
 import { handlePrOpened } from "./pr-review-trigger.js";
 import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
+import { externalDispatchRefusal } from "./mail-tier.js";
+import type { Envelope } from "@tpsdev-ai/agent";
 import { formatTaskCompleteMailBody } from "./task-result-mail.js";
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
 
@@ -125,6 +127,15 @@ interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
+}
+
+/**
+ * cli#433 (slice B2-1): the consumer-side tier gate for the Codex runtime. A
+ * verified record whose SIGNED tier is external is not dispatched with the
+ * internal capability set; returns the named reason, or null to dispatch.
+ */
+export function codexDispatchRefusal(envelope: Envelope | undefined, from: string, tier?: string): string | null {
+  return externalDispatchRefusal(envelope, from, tier);
 }
 
 export function composeSystemPrompt(
@@ -869,6 +880,11 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
     for (const msg of await pollRuntimeMail(mailCfg)) {
       console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+      const refusal = codexDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
+      if (refusal) {
+        console.warn(`[${agentId}] ${refusal}; not dispatched`);
+        continue;
+      }
       let preTaskState;
       if (workspaceProvider) {
         try { preTaskState = await onTaskStart(workspaceProvider, flair, msg.id); } catch (err: any) {

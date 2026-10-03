@@ -49,6 +49,8 @@ import {
   onTaskFailure,
 } from "./agent-lifecycle.js";
 import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
+import { externalDispatchRefusal } from "./mail-tier.js";
+import type { Envelope } from "@tpsdev-ai/agent";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:agent");
@@ -86,6 +88,15 @@ interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
+}
+
+/**
+ * cli#433 (slice B2-1): the consumer-side tier gate for the Claude Code runtime.
+ * A verified record whose SIGNED tier is external is not dispatched with the
+ * internal capability set; returns the named reason, or null to dispatch.
+ */
+export function claudeCodeDispatchRefusal(envelope: Envelope | undefined, from: string, tier?: string): string | null {
+  return externalDispatchRefusal(envelope, from, tier);
 }
 
 // ─── System prompt (delegates to agent-lifecycle) ────────────────────────────
@@ -301,6 +312,12 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
 
     for (const msg of messages) {
       slog(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+
+      const refusal = claudeCodeDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
+      if (refusal) {
+        swarn(`[${agentId}] ${refusal}; not dispatched`);
+        continue;
+      }
 
       // Task start: snapshot workspace via lifecycle hook (OPS-47 Phase 2)
       const taskId = msg.id;
