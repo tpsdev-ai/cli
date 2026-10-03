@@ -363,10 +363,16 @@ export async function runClaudeCodeRuntime(config: ClaudeCodeConfig): Promise<vo
           try {
             sendRuntimeMail(mailCfg, config.supervisorId ?? msg.from,
               `Agent ${agentId} cannot start task: ${err.message}`);
-          } catch { /* best effort */ }
+          } catch (noticeErr: any) {
+            // A failed error notice must not be a silent loss (cli#494).
+            console.error(`[${agentId}] supervisor notice for ${taskId} failed: ${noticeErr.message}`);
+          }
         } else {
           serror(`[${agentId}] Task failed:`, err.message);
-          try { sendRuntimeMail(mailCfg, msg.from, `Task failed: ${err.message}`); } catch { /* best effort */ }
+          try { sendRuntimeMail(mailCfg, msg.from, `Task failed: ${err.message}`); } catch (noticeErr: any) {
+            // A failed error notice must not be a silent loss (cli#494).
+            console.error(`[${agentId}] task-failure notice to ${msg.from} failed: ${noticeErr.message}`);
+          }
 
           // Task failure: checkpoint + failure record via lifecycle hook (OPS-47 Phase 2)
           if (workspaceProvider && preTaskState) {
