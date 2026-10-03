@@ -15,6 +15,13 @@
  *  - the plugin's promote() path, run under node, logs the `read` event
  *    (cli#377/#395: the plugin is bound to promote()).
  *
+ * The `node:sqlite`-dependent cases are gated on the `node` under test actually
+ * exposing the binding (probed ONCE below). Where it is absent — Node < 22.13
+ * without `--experimental-sqlite`, e.g. Debian bookworm's apt `nodejs` — the
+ * documented fallback is exercised instead: one named warning, no throw,
+ * nothing written. The absent path is never a silent skip; the probe logs the
+ * node version and which suite it selected.
+ *
  * Precondition: the CLI is built (`dist/src/utils/*.js` exists) — root `bun run
  * build` does that before `bun run test`.
  */
@@ -37,6 +44,25 @@ const mailJs = resolve(utilsDir, "mail.js");
 const DEADLINE_MS = 30_000;
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const KERN_SEED = Buffer.alloc(32, 0x02);
+
+// Must match the adapter's one-per-process warning in `src/utils/archive.ts`.
+const ARCHIVE_UNAVAILABLE_WARNING =
+  "tps-mail archive: no sqlite backend in this runtime (neither bun:sqlite nor node:sqlite); mail events are not being logged";
+
+// The node under test is the one the cases below spawn. Probe it ONCE for
+// `node:sqlite` (the same bare specifier the adapter resolves) and announce the
+// choice with the node version, so a missing binding is visible in the log and
+// never silently skipped.
+const nodeHasSqlite = spawnSync("node", ["-e", "require('node:sqlite')"], {
+  encoding: "utf8",
+  timeout: DEADLINE_MS,
+}).status === 0;
+const nodeVersion = (spawnSync("node", ["--version"], { encoding: "utf8" }).stdout || "unknown").trim();
+console.log(
+  `[archive-runtime-adapter] node ${nodeVersion}: node:sqlite ${
+    nodeHasSqlite ? "available — running the cross-runtime suite" : "UNAVAILABLE — running the fallback suite"
+  }`,
+);
 
 function runNode(script: string, env: NodeJS.ProcessEnv) {
   return spawnSync("node", ["--input-type=module", "-e", script], {
@@ -91,7 +117,7 @@ describe("archive runtime adapter (cli#395)", () => {
     rmSync(tempRoot, { recursive: true, force: true });
   });
 
-  test(
+  test.if(nodeHasSqlite)(
     "node writes through the adapter; the bun path reads it back",
     () => {
       expect(existsSync(archiveJs)).toBe(true);
@@ -117,7 +143,7 @@ describe("archive runtime adapter (cli#395)", () => {
     DEADLINE_MS + 5_000,
   );
 
-  test(
+  test.if(nodeHasSqlite)(
     "node reads back an event the bun path wrote (reverse)",
     () => {
       logEvent({ event: "read", from: "kern", to: "flint", messageId: "bun-msg-1" }, "written by bun");
@@ -141,7 +167,7 @@ describe("archive runtime adapter (cli#395)", () => {
     DEADLINE_MS + 5_000,
   );
 
-  test(
+  test.if(nodeHasSqlite)(
     "each runtime writes a batch to one file while the other runs (WAL + busy-timeout)",
     async () => {
       const N = 20;
@@ -170,7 +196,7 @@ describe("archive runtime adapter (cli#395)", () => {
     DEADLINE_MS + 5_000,
   );
 
-  test(
+  test.if(nodeHasSqlite)(
     "the plugin's promote() path under node logs a 'read' event into archive.db",
     async () => {
       const stub: StubFlair = startStubFlair({ flint: FLINT_SEED, kern: KERN_SEED });
@@ -209,6 +235,34 @@ describe("archive runtime adapter (cli#395)", () => {
       } finally {
         stub.stop();
       }
+    },
+    DEADLINE_MS + 5_000,
+  );
+
+  test.skipIf(nodeHasSqlite)(
+    "no node:sqlite in the node under test: logEvent/queryArchive are a visible no-op",
+    () => {
+      expect(existsSync(archiveJs)).toBe(true);
+      const script = `
+        const a = await import(${JSON.stringify(archiveJs)});
+        let threw = false;
+        try {
+          a.logEvent({ event: "sent", from: "node", to: "kern", messageId: "noop-1" }, "x");
+          a.logEvent({ event: "sent", from: "node", to: "kern", messageId: "noop-2" }, "y");
+        } catch { threw = true; }
+        console.log("THREW=" + threw);
+        console.log("QUERY=" + JSON.stringify(a.queryArchive()));
+      `;
+      const res = runNode(script, process.env);
+      expect(res.signal).toBeNull();
+      expect(res.status).toBe(0);
+      expect(res.stdout).toContain("THREW=false");
+      expect(res.stdout).toContain("QUERY=[]");
+      // One named warning for the process, however many entry points hit it.
+      const hits = res.stderr.split(ARCHIVE_UNAVAILABLE_WARNING).length - 1;
+      expect(hits).toBe(1);
+      // Nothing was written: no archive.db under the isolated mail dir.
+      expect(existsSync(join(tempRoot, "mail", "archive.db"))).toBe(false);
     },
     DEADLINE_MS + 5_000,
   );
