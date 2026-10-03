@@ -164,7 +164,6 @@ describe("cli#433 slice A: every CLI-internal producer signs its mail", () => {
       message: "Welcome to TPS",
       flairUrl: stub.url,
       keyPath: join(keysDir, "anvil.key"),
-      mailDir,
       json: true,
       configPath,
     });

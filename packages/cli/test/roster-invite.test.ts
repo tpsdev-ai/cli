@@ -8,6 +8,7 @@ describe("tps roster invite", () => {
   let configPath: string;
   let originalHome: string | undefined;
   let originalAgentId: string | undefined;
+  let originalMailDir: string | undefined;
   let originalFetch: typeof globalThis.fetch;
   let originalLog: typeof console.log;
   let originalError: typeof console.error;
@@ -18,6 +19,7 @@ describe("tps roster invite", () => {
     configPath = join(tempHome, "openclaw.json");
     originalHome = process.env.HOME;
     originalAgentId = process.env.TPS_AGENT_ID;
+    originalMailDir = process.env.TPS_MAIL_DIR;
     originalFetch = globalThis.fetch;
     originalLog = console.log;
     originalError = console.error;
@@ -25,6 +27,7 @@ describe("tps roster invite", () => {
 
     process.env.HOME = tempHome;
     process.env.TPS_AGENT_ID = "anvil";
+    process.env.TPS_MAIL_DIR = join(tempHome, ".tps", "mail");
 
     writeFileSync(configPath, JSON.stringify({ agents: { list: [] } }, null, 2));
     mkdirSync(join(tempHome, ".tps", "identity"), { recursive: true });
@@ -37,6 +40,11 @@ describe("tps roster invite", () => {
       delete process.env.TPS_AGENT_ID;
     } else {
       process.env.TPS_AGENT_ID = originalAgentId;
+    }
+    if (originalMailDir === undefined) {
+      delete process.env.TPS_MAIL_DIR;
+    } else {
+      process.env.TPS_MAIL_DIR = originalMailDir;
     }
     globalThis.fetch = originalFetch;
     console.log = originalLog;
@@ -79,7 +87,6 @@ describe("tps roster invite", () => {
       message: "Welcome to TPS",
       flairUrl: "http://127.0.0.1:9926",
       keyPath: join(tempHome, ".tps", "identity", "anvil.key"),
-      mailDir: join(tempHome, ".tps", "mail"),
       json: true,
       configPath,
     });
@@ -98,9 +105,11 @@ describe("tps roster invite", () => {
     const mail = JSON.parse(readFileSync(join(newDir, files[0]!), "utf-8"));
     expect(mail.from).toBe("anvil");
     expect(mail.to).toBe("flint");
-    expect(mail.body).toContain("You have been invited to join TPS.");
-    expect(mail.body).toContain("Invited by: anvil");
-    expect(mail.headers["X-TPS-Message-Type"]).toBe("org.invite");
+    // The invite is a SIGNED envelope (the legacy unsigned writer is retired).
+    const signed = JSON.parse(mail.body);
+    expect(signed.from).toBe("anvil");
+    expect(signed.body).toContain("You have been invited to join TPS.");
+    expect(signed.body).toContain("Invited by: anvil");
 
     expect(JSON.parse(logs[0]!)).toEqual({
       status: "invited",
@@ -132,7 +141,6 @@ describe("tps roster invite", () => {
       agent: "flint",
       flairUrl: "http://127.0.0.1:9926",
       keyPath: join(tempHome, ".tps", "identity", "anvil.key"),
-      mailDir: join(tempHome, ".tps", "mail"),
       configPath,
     });
 

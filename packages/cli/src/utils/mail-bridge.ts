@@ -71,29 +71,3 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
 }
-
-// Re-export sendMail and mailboxDir for test compat
-export function sendMail(mailDir: string, to: string, from: string, body: string, headers?: Record<string, string>): void {
-  const { mkdirSync, writeFileSync } = require("node:fs");
-  const { join } = require("node:path");
-  const { randomUUID } = require("node:crypto");
-  const fresh = join(mailDir, to, "new");
-  mkdirSync(fresh, { recursive: true });
-  const id = `${Date.now()}-${randomUUID()}`;
-  const msg = {
-    id, from, to,
-    timestamp: new Date().toISOString(),
-    headers: headers ?? {
-      "X-TPS-Trust": "external",
-      "X-TPS-Sender": from,
-    },
-    body,
-  };
-  writeFileSync(join(fresh, `${id}.json`), JSON.stringify(msg, null, 2), "utf-8");
-}
-
-export function mailboxDir(mailDir: string, agentId: string) {
-  const { join } = require("node:path");
-  const base = join(mailDir, agentId);
-  return { fresh: join(base, "new"), cur: join(base, "cur") };
-}
