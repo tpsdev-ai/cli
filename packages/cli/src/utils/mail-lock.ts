@@ -1,9 +1,6 @@
 /**
  * mail-lock.ts — a small inter-process lock for maildir mutation.
  *
- * There is no existing lock primitive in this tree to reuse (the only
- * "lockfile" hit is an npm package-lock), so this is a purpose-built one.
- *
  * Why it exists: the replay ledger is read-modify-written (prune) and appended,
  * and the promotion moves files; without mutual exclusion, two concurrent
  * promotions can both pass the replay gate before either records the id, and an
@@ -12,7 +9,7 @@
  * including the ledger prune and append.
  *
  * Properties:
- *  - acquisition is atomic and bounded (timeout): a POPULATED lock directory is
+ *  - acquisition is atomic: a POPULATED lock directory is
  *    built in a unique temp dir and RENAMED onto the lock path. Renaming a dir
  *    onto a non-empty dir fails (EEXIST/ENOTEMPTY), so claim+ownership is
  *    all-or-nothing — an UNOWNED lock cannot exist, and a crash mid-acquire can
@@ -20,14 +17,11 @@
  *  - an owner is identified by pid AND process start time, never pid alone:
  *    pids are reused, so a pid-only stamp eventually mistakes a live process for
  *    a dead one, or the reverse;
- *  - a lock with no USABLE owner (owner.json missing, unreadable, unparseable,
- *    or without a numeric pid) may be broken — there is no owner to protect;
  *  - a lock whose owner is provably gone may be broken; a lock whose owner
  *    cannot be verified may NOT be broken on age alone;
  *  - release is guaranteed by the caller (finally) and is ownership-checked, so
  *    a process whose lock was broken and re-taken cannot delete the new owner's
  *    lock;
- *  - nested (re)acquisition in one process fails loudly rather than deadlocking;
  *  - failure to acquire returns null — callers MUST treat that as "do not
  *    proceed" (fail-closed), never as "proceed without the lock".
  *
@@ -37,10 +31,10 @@
  * populated and mistake concurrency for nesting.
  */
 
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 export const MAIL_LOCK_DIR = ".mail-lock";
 const OWNER_FILE = "owner.json";
@@ -148,10 +142,12 @@ function readOwner(lockDir: string): LockOwner | null {
 function ownerState(
   owner: LockOwner | null,
   resolveToken: (pid: number) => string | null = processStartToken,
+  strict = false,
 ): OwnerState {
   if (!owner || typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
     return "unowned";
   }
+  if (strict && (typeof owner.startToken !== "string" || !/^(proc|ps):.+/.test(owner.startToken))) return "unverifiable";
   if (!isPidAlive(owner.pid)) return "dead";
   const token = resolveToken(owner.pid);
   if (token !== null && typeof owner.startToken === "string") {
@@ -159,7 +155,7 @@ function ownerState(
     return token === owner.startToken ? "alive" : "dead";
   }
   // pid is alive and we cannot disprove it — never break.
-  return "unverifiable";
+  return isPidAlive(owner.pid) ? "unverifiable" : "dead";
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -183,6 +179,97 @@ function reapStrandedLockTemps(root: string): void {
       rmSync(p, { recursive: true, force: true });
     } catch {
       /* best effort */
+    }
+  }
+}
+
+function claimLock(lockDir: string, myToken: string | null): boolean {
+  const tmpDir = join(dirname(lockDir), `${TEMP_PREFIX}${process.pid}.${randomBytes(6).toString("hex")}`);
+  try {
+    mkdirSync(tmpDir);
+    writeFileSync(join(tmpDir, OWNER_FILE), JSON.stringify({ pid: process.pid, startToken: myToken }), "utf-8");
+    try {
+      renameSync(tmpDir, lockDir);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EISDIR" && code !== "ENOTDIR") throw error;
+      return false;
+    }
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+export class MailLockOwnerError extends Error {
+  constructor(lockDir: string) {
+    super(`MailLockOwnerError: cannot verify owner of ${lockDir}`);
+    this.name = "MailLockOwnerError";
+  }
+}
+
+function removeClaim(lockDir: string): void {
+  const retired = join(dirname(lockDir), `${TEMP_PREFIX}${process.pid}.${randomBytes(6).toString("hex")}`);
+  renameSync(lockDir, retired);
+  rmSync(retired, { recursive: true, force: true });
+}
+
+export function tryAcquireMailLock(lockDir: string): MailLock | null {
+  const myToken = processStartToken(process.pid);
+  if (myToken === null) throw new MailLockOwnerError(lockDir);
+  for (;;) {
+    if (!existsSync(lockDir) && claimLock(lockDir, myToken)) {
+      let released = false;
+      return { release() {
+        if (released) return;
+        released = true;
+        const owner = readOwner(lockDir);
+        if (owner?.pid === process.pid && owner.startToken === myToken) {
+          removeClaim(lockDir);
+        }
+      } };
+    }
+    try {
+      if (!statSync(lockDir).isDirectory()) throw new MailLockOwnerError(lockDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    const owner = readOwner(lockDir);
+    const state = ownerState(owner, processStartToken, true);
+    if (JSON.stringify(owner) !== JSON.stringify(readOwner(lockDir))) continue;
+    if (state === "alive") {
+      if (owner?.pid === process.pid) throw new MailLockOwnerError(lockDir);
+      return null;
+    }
+    if (state !== "dead") {
+      if (!existsSync(lockDir)) continue;
+      throw new MailLockOwnerError(lockDir);
+    }
+    let reclaim: MailLock | null;
+    try {
+      reclaim = tryAcquireMailLock(`${lockDir}.reclaim`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
+    if (!reclaim) return null;
+    try {
+      const currentOwner = readOwner(lockDir);
+      const current = ownerState(currentOwner, processStartToken, true);
+      if (current === "alive") {
+        if (currentOwner?.pid === process.pid) throw new MailLockOwnerError(lockDir);
+        return null;
+      }
+      if (current !== "dead") {
+        if (!existsSync(lockDir)) continue;
+        throw new MailLockOwnerError(lockDir);
+      }
+      removeClaim(lockDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    } finally {
+      reclaim.release();
     }
   }
 }
@@ -229,33 +316,9 @@ export async function acquireMailLock(
   };
 
   for (;;) {
-    // Build a POPULATED lock in a unique temp dir, then rename it onto the lock
-    // path. The rename is the atomic claim: renaming a dir onto a non-empty dir
-    // fails (EEXIST/ENOTEMPTY), so there is no window where the lock exists
-    // unowned, and a crash mid-acquire leaves only a harmless temp dir.
-    const tmpDir = join(root, `${TEMP_PREFIX}${process.pid}.${randomBytes(6).toString("hex")}`);
-    try {
-      mkdirSync(tmpDir);
-      writeFileSync(
-        join(tmpDir, OWNER_FILE),
-        JSON.stringify({ pid: process.pid, startToken: myToken }),
-        "utf-8",
-      );
-    } catch (err) {
-      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      throw err;
-    }
-
-    try {
-      renameSync(tmpDir, lockDir);
+    if (claimLock(lockDir, myToken)) {
       heldByThisProcess.add(lockDir);
       return makeLock();
-    } catch (err: any) {
-      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
-      const code = err?.code;
-      if (code !== "EEXIST" && code !== "ENOTEMPTY" && code !== "EISDIR" && code !== "ENOTDIR") {
-        throw err;
-      }
     }
 
     // Break ONLY a lock with no owner to protect — an UNOWNED lock (owner.json

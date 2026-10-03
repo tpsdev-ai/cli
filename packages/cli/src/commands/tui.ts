@@ -9,6 +9,7 @@ import { join } from "node:path";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
+import { configuredAgentIds } from "../utils/credentials-manifest.js";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -48,14 +49,6 @@ interface ComposeData {
   focusField: ComposeField;
 }
 
-type PRAction = "approve" | "merge" | null;
-
-interface PRActionState {
-  action: PRAction;
-  prNumber: number;
-  repo: string;
-  confirming: boolean;
-}
 const PANEL_KEYS: Record<string, Panel> = {
   "1": "agents",
   "2": "mail",
@@ -92,7 +85,7 @@ function fetchAgents(): AgentStatus[] {
   } catch {
     // fall through to process check
   }
-  const ids = ["flint", "anvil", "ember", "pixel", "kern", "sherlock"];
+  const ids = configuredAgentIds();
   return ids.map((id) => {
     const psCheck = spawnSync("pgrep", ["-f", `agent start.*${id}`], { encoding: "utf-8" });
     const running = (psCheck.stdout?.trim().length ?? 0) > 0;
@@ -117,11 +110,11 @@ function fetchMail(_mailDir: string, agentId: string): MailMessage[] {
 
 const REPO_RE = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
 
-function fetchPRs(repo: string): PullRequest[] {
-  if (!REPO_RE.test(repo)) return [];
+function fetchPRs(repo: string, ghAgent: string): PullRequest[] {
+  if (!REPO_RE.test(repo) || !ghAgent) return [];
   try {
     const out = runCmd("gh-as", [
-      "anvil", "pr", "list", "--repo", repo,
+      ghAgent, "pr", "list", "--repo", repo,
       "--json", "number,title,author,statusCheckRollup", "--limit", "10",
     ]);
     if (!out) return [];
@@ -154,11 +147,16 @@ function fetchTasks(): string[] {
 
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
-function sendMailAction(agentId: string, to: string, body: string): { ok: boolean; err?: string } {
+export function sendMailAction(
+  agentId: string, to: string, body: string,
+  execFn: typeof spawnSync = spawnSync,
+): { ok: boolean; err?: string } {
+  if (!configuredAgentIds().includes(to)) return { ok: false, err: `Unknown agent: ${to}` };
+  if (!body.trim()) return { ok: false, err: "Body cannot be empty" };
   if (!AGENT_NAME_RE.test(to)) return { ok: false, err: `invalid recipient: ${to}` };
   try {
     const tpsBin = join(homedir(), "ops", "tps", "packages", "cli", "bin", "tps.ts");
-    const r = spawnSync("bun", [tpsBin, "mail", "send", to, body], {
+    const r = execFn("bun", [tpsBin, "mail", "send", to, body], {
       encoding: "utf-8",
       timeout: 8000,
       env: { ...process.env, TPS_AGENT_ID: agentId },
@@ -169,38 +167,6 @@ function sendMailAction(agentId: string, to: string, body: string): { ok: boolea
     return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "send failed" };
   }
 }
-
-function approvePRAction(repo: string, prNumber: number): { ok: boolean; err?: string } {
-  if (!REPO_RE.test(repo)) return { ok: false, err: `invalid repo: ${repo}` };
-  if (!Number.isInteger(prNumber) || prNumber <= 0) return { ok: false, err: `invalid PR number: ${prNumber}` };
-  try {
-    const r = spawnSync("gh-as", ["flint", "pr", "review", String(prNumber), "--repo", repo, "--approve"], {
-      encoding: "utf-8",
-      timeout: 15000,
-    });
-    if (r.status !== 0) return { ok: false, err: (r.stderr || r.stdout || "approve failed").slice(0, 80) };
-    return { ok: true };
-  } catch (e: unknown) {
-    return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "approve failed" };
-  }
-}
-
-function mergePRAction(repo: string, prNumber: number): { ok: boolean; err?: string } {
-  if (!REPO_RE.test(repo)) return { ok: false, err: `invalid repo: ${repo}` };
-  if (!Number.isInteger(prNumber) || prNumber <= 0) return { ok: false, err: `invalid PR number: ${prNumber}` };
-  try {
-    const r = spawnSync("gh-as", ["flint", "pr", "merge", String(prNumber), "--repo", repo, "--squash", "--delete-branch"], {
-      encoding: "utf-8",
-      timeout: 20000,
-    });
-    if (r.status !== 0) return { ok: false, err: (r.stderr || r.stdout || "merge failed").slice(0, 80) };
-    return { ok: true };
-  } catch (e: unknown) {
-    return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "merge failed" };
-  }
-}
-
-const KNOWN_AGENTS = ["flint", "anvil", "ember", "kern", "sherlock", "pulse", "pixel"];
 
 // ── Components ─────────────────────────────────────────────────────────────────
 
@@ -240,7 +206,7 @@ function TasksPanel({ tasks }: { tasks: string[] }) {
 
 function LogsPanel({ lines }: { lines: string[] }) {
   return React.createElement(Box, { flexDirection: "column" },
-    React.createElement(Text, { bold: true, color: "cyan" }, "── Logs (ember) ──"),
+    React.createElement(Text, { bold: true, color: "cyan" }, "── Logs ──"),
     ...lines.slice(-20).map((l, i) =>
       React.createElement(Text, { key: i, color: "gray", wrap: "truncate" }, l || " "),
     ),
@@ -302,29 +268,6 @@ function ComposeBar({ data, state, error, onToChange, onBodyChange, onTabField, 
   );
 }
 
-// ── PRActionBar ────────────────────────────────────────────────────────────────
-
-interface PRActionBarProps {
-  state: PRActionState;
-  result: string | null;
-  onConfirm: (yes: boolean) => void;
-}
-
-function PRActionBar({ state, result, onConfirm: _onConfirm }: PRActionBarProps) {
-  const verb = state.action === "approve" ? "Approve" : "Merge";
-  const color = state.action === "merge" ? "red" : "yellow";
-  if (result) {
-    const isErr = result.startsWith("✗");
-    return React.createElement(Box, { paddingX: 1, borderStyle: "single", borderColor: isErr ? "red" : "green" },
-      React.createElement(Text, { color: isErr ? "red" : "green" }, `${result}  [any key to dismiss]`),
-    );
-  }
-  return React.createElement(Box, { gap: 1, paddingX: 1, borderStyle: "single", borderColor: color },
-    React.createElement(Text, { color }, `${verb} PR #${state.prNumber} (${state.repo})?`),
-    React.createElement(Text, { color: "white" }, " [y/n]"),
-  );
-}
-
 // ── Interactive MailPanel ──────────────────────────────────────────────────────
 
 interface MailPanelInteractiveProps {
@@ -367,12 +310,12 @@ interface PRsPanelInteractiveProps {
 function PRsPanelInteractive({ prs, selectedIdx }: PRsPanelInteractiveProps) {
   if (prs.length === 0) {
     return React.createElement(Box, { flexDirection: "column" },
-      React.createElement(Text, { bold: true, color: "cyan" }, "── PRs  [a: approve  m: merge] ──"),
+      React.createElement(Text, { bold: true, color: "cyan" }, "── PRs ──"),
       React.createElement(Text, { color: "gray" }, "(none open)"),
     );
   }
   return React.createElement(Box, { flexDirection: "column" },
-    React.createElement(Text, { bold: true, color: "cyan" }, "── PRs  [a: approve  m: merge  ↑↓: select] ──"),
+    React.createElement(Text, { bold: true, color: "cyan" }, "── PRs  [↑↓: select] ──"),
     ...prs.map((pr, i) => {
       const rollup = pr.statusCheckRollup;
       const state = Array.isArray(rollup)
@@ -416,7 +359,6 @@ function StatusBar({
 }) {
   const hints =
     panel === "mail" ? "Tab/1-5  r: refresh  c: compose  r: reply  q: quit" :
-    panel === "prs"  ? "Tab/1-5  r: refresh  a: approve  m: merge  q: quit" :
     "Tab/1-5: panel  r: refresh  q: quit";
   return React.createElement(Box, { gap: 3, marginTop: 1 },
     React.createElement(Text, { color: "gray" }, hints),
@@ -439,7 +381,7 @@ export interface TuiOptions {
 
 export function TuiApp({
   mailDir = join(homedir(), ".tps", "mail"),
-  agentId = "anvil",
+  agentId = process.env.TPS_AGENT_ID ?? "",
   repo = "tpsdev-ai/cli",
 }: TuiOptions) {
   const { exit } = useApp();
@@ -462,10 +404,6 @@ export function TuiApp({
   const [composeData, setComposeData] = useState<ComposeData>({ to: "", body: "", focusField: "to" });
   const [composeError, setComposeError] = useState<string | null>(null);
 
-  // PR action state
-  const [prActionState, setPRActionState] = useState<PRActionState | null>(null);
-  const [prActionResult, setPRActionResult] = useState<string | null>(null);
-
   const refresh = useCallback(() => {
     if (refreshing.current) return;
     refreshing.current = true;
@@ -473,8 +411,8 @@ export function TuiApp({
     try {
       setAgents(fetchAgents());
       setMail(fetchMail(mailDir, agentId));
-      setPRs(fetchPRs(repo));
-      setLogs(fetchLogs("ember"));
+      setPRs(fetchPRs(repo, agentId));
+      setLogs(fetchLogs(agentId));
       setTasks(fetchTasks());
       setLastRefresh(new Date());
     } catch (e: unknown) {
@@ -494,11 +432,6 @@ export function TuiApp({
   // Compose submit
   const handleComposeSubmit = useCallback(() => {
     if (!composeData.to.trim() || !composeData.body.trim()) return;
-    if (!KNOWN_AGENTS.includes(composeData.to.trim())) {
-      setComposeState("error");
-      setComposeError(`Unknown agent: ${composeData.to}`);
-      return;
-    }
     setComposeState("sending");
     const result = sendMailAction(agentId, composeData.to.trim(), composeData.body.trim());
     if (result.ok) {
@@ -513,31 +446,6 @@ export function TuiApp({
       setComposeError(result.err ?? "send failed");
     }
   }, [composeData, agentId, refresh]);
-
-  // PR action confirm
-  const handlePRActionConfirm = useCallback((yes: boolean) => {
-    if (!prActionState) return;
-    if (!yes) {
-      setPRActionState(null);
-      setPRActionResult(null);
-      return;
-    }
-    const { action, prNumber, repo: prRepo } = prActionState;
-    const result = action === "approve"
-      ? approvePRAction(prRepo, prNumber)
-      : mergePRAction(prRepo, prNumber);
-    const msg = result.ok
-      ? `✓ ${action === "approve" ? "Approved" : "Merged"} #${prNumber}`
-      : `✗ ${result.err}`;
-    setPRActionResult(msg);
-    if (result.ok) {
-      setTimeout(() => {
-        setPRActionState(null);
-        setPRActionResult(null);
-        refresh();
-      }, 2000);
-    }
-  }, [prActionState, refresh]);
 
   const resetCompose = useCallback(() => {
     setComposeState("idle");
@@ -578,30 +486,8 @@ export function TuiApp({
     return false;
   }, [mail, mailIdx]);
 
-  const handlePRHotkeys = useCallback((input: string) => {
-    const selectedPR = prs[prIdx];
-    if (selectedPR && (input === "a" || input === "m")) {
-      setPRActionResult(null);
-      setPRActionState({
-        action: input === "a" ? "approve" : "merge",
-        prNumber: selectedPR.number,
-        repo,
-        confirming: true,
-      });
-      return true;
-    }
-    return false;
-  }, [prs, prIdx, repo]);
-
   /** Returns true if the input was consumed by a modal overlay. */
   const handleOverlayInput = useCallback((input: string, key: { escape: boolean }): boolean => {
-    if (prActionResult && !prActionState?.confirming) {
-      setPRActionState(null); setPRActionResult(null); return true;
-    }
-    if (prActionState && !prActionResult) {
-      if (input === "y" || input === "Y") { handlePRActionConfirm(true); return true; }
-      handlePRActionConfirm(false); return true;
-    }
     if (composeState === "composing") {
       if (key.escape) resetCompose();
       return true;
@@ -611,13 +497,12 @@ export function TuiApp({
       return true;
     }
     return false;
-  }, [prActionResult, prActionState, handlePRActionConfirm, composeState, resetCompose]);
+  }, [composeState, resetCompose]);
 
   useInput((input, key) => {
     if (handleOverlayInput(input, key)) return;
     handleNav(input, key);
     if (panel === "mail") handleMailHotkeys(input);
-    if (panel === "prs") handlePRHotkeys(input);
   });
 
   const content =
@@ -627,7 +512,7 @@ export function TuiApp({
     panel === "prs"    ? React.createElement(PRsPanelInteractive, { prs, selectedIdx: prIdx, onSelectChange: setPRIdx }) :
                          React.createElement(LogsPanel, { lines: logs });
 
-  // Overlay: compose bar or PR action bar
+  // Overlay: compose bar
   const overlay =
     composeState !== "idle"
       ? React.createElement(ComposeBar, {
@@ -640,13 +525,7 @@ export function TuiApp({
           onSubmit: handleComposeSubmit,
           onCancel: () => { setComposeState("idle"); setComposeData({ to: "", body: "", focusField: "to" }); },
         })
-      : prActionState
-        ? React.createElement(PRActionBar, {
-            state: prActionState,
-            result: prActionResult,
-            onConfirm: handlePRActionConfirm,
-          })
-        : null;
+      : null;
 
   return React.createElement(Box, { flexDirection: "column" },
     React.createElement(TabBar, { active: panel }),

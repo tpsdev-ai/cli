@@ -7,6 +7,7 @@
  *   status  Show bridge status
  */
 
+import { requireLocalAgentId } from "../utils/local-agent.js";
 import { bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
@@ -65,7 +66,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         const core = new BridgeCore(discordAdapter, {
           bridgeAgentId: args.bridgeAgentId,
           mailDir: args.mailDir,
-          defaultAgentId: args.defaultAgentId ?? "ember",
+          defaultAgentId: requireLocalAgentId("bridge default agent id", args.defaultAgentId),
           defaultChannelId: channelId,
           discordContextPrompt: args.discordContextPrompt,
         });

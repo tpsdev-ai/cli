@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
 import { queueOutboxMessage } from "./outbox.js";
@@ -31,7 +31,9 @@ function webhookTarget(): string {
 }
 
 function webhookAgentId(): string {
-  return process.env.GITHUB_WEBHOOK_AGENT_ID ?? "ember";
+  const id = process.env.GITHUB_WEBHOOK_AGENT_ID;
+  if (!id?.trim()) throw new Error("GITHUB_WEBHOOK_AGENT_ID env var required");
+  return id;
 }
 
 function defaultReviewEventPublisher(agentId: string): ReviewRerequestedPublisher {
@@ -115,10 +117,22 @@ function formatEvent(event: string, payload: Record<string, unknown>): string {
   }
 }
 
+function reviewAgentId(event: string, payload: Record<string, unknown>): string | undefined {
+  const review = payload.review as { user?: { login?: unknown } } | undefined;
+  const pr = payload.pull_request as { number?: unknown } | undefined;
+  const repo = payload.repository as { full_name?: unknown } | undefined;
+  if (event === "pull_request_review" && payload.action === "dismissed" &&
+      typeof review?.user?.login === "string" && review.user.login &&
+      typeof pr?.number === "number" && pr.number &&
+      typeof repo?.full_name === "string" && repo.full_name) return webhookAgentId();
+  return undefined;
+}
+
 export async function processGithubWebhookEvent(
   event: string,
   payload: Record<string, unknown>,
   deps: GithubWebhookDeps = {},
+  resolvedAgentId?: string,
 ): Promise<void> {
   if (event !== "pull_request_review" || payload.action !== "dismissed") return;
   const review = payload.review as Record<string, unknown> | undefined;
@@ -133,7 +147,7 @@ export async function processGithubWebhookEvent(
     return;
   }
 
-  const agentId = webhookAgentId();
+  const agentId = resolvedAgentId ?? webhookAgentId();
   const reRequested = reRequestReviewer(prNumber, reviewer, { agentId, repo }, deps.reviewRequestDeps);
   if (!reRequested) return;
 
@@ -188,9 +202,31 @@ export async function handleGithubWebhook(
     return;
   }
 
+  let agentId: string | undefined;
+  try {
+    agentId = reviewAgentId(event, payload);
+  } catch (error) {
+    res.statusCode = 503;
+    res.end((error as Error).message);
+    return;
+  }
+  const delivery = req.headers["x-github-delivery"];
+  const deliveryId = typeof delivery === "string" && delivery
+    ? createHash("sha256").update(delivery).digest("hex") : undefined;
   const queueMessage = deps.queueOutboxMessageImpl ?? queueOutboxMessage;
-  queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook");
-  await processGithubWebhookEvent(event, payload, deps);
+  try {
+    const result = queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
+    if (result === "duplicate in progress") {
+      res.statusCode = 200;
+      res.end(result);
+      return;
+    }
+  } catch (error) {
+    res.statusCode = 503;
+    res.end((error as Error).message);
+    return;
+  }
+  await processGithubWebhookEvent(event, payload, deps, agentId);
   res.statusCode = 200;
   res.end("ok");
 }

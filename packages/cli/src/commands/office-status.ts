@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 
 interface FlairAgent {
   id?: string;
@@ -122,7 +123,7 @@ function gitBranchStatus(workspace: string | undefined): string {
 // ── Main ──────────────────────────────────────────────────────────────────────
 export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   const flairUrl = opts.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
-  const viewerId = opts.agentId ?? process.env.TPS_AGENT_ID ?? "anvil";
+  const viewerId = requireLocalAgentId("viewer id", opts.agentId);
   const kp = opts.keyPath ?? join(homedir(), ".tps", "identity", `${viewerId}.key`);
   const repo = opts.repo ?? process.env.TPS_REPO ?? "";
   const ghAgent = opts.ghAgent ?? viewerId;

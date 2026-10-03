@@ -1,7 +1,15 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { tryAcquireMailLock } from "./mail-lock.js";
+
+export class OutboxLockError extends Error {
+  constructor(lockPath: string, cause: unknown) {
+    super(`OutboxLockError: ${lockPath}: ${(cause as Error).message}`, { cause });
+    this.name = "OutboxLockError";
+  }
+}
 
 export interface OutboxMessage {
   id: string;
@@ -15,20 +23,57 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-export function queueOutboxMessage(to: string, body: string, from: string): void {
+export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): "duplicate in progress" | void {
+  if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
-  const id = randomUUID();
-  const timestamp = new Date().toISOString();
-  const filename = `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-  const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
-  // Atomic write: stage to a dot-prefixed tmp file in the same directory, then
-  // rename into place. drainOutbox filters out dot-prefixed files so a reader
-  // running concurrently never sees a half-written file. rename(2) within the
-  // same filesystem is atomic on POSIX.
-  const tmp = join(dir, `.${filename}.tmp`);
-  writeFileSync(tmp, content, "utf-8");
-  renameSync(tmp, join(dir, filename));
+  const lockPath = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
+  let lock;
+  if (lockPath) {
+    try {
+      lock = tryAcquireMailLock(lockPath);
+    } catch (error) {
+      throw new OutboxLockError(lockPath, error);
+    }
+    if (!lock) return "duplicate in progress";
+  }
+  const write = (): void => {
+    const id = deliveryId ?? randomUUID();
+    const timestamp = new Date().toISOString();
+    const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
+    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) return;
+    const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
+    const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
+    writeFileSync(tmp, content, "utf-8");
+    if (deliveryId) {
+      try {
+        linkSync(tmp, join(dir, filename));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      } finally {
+        unlinkSync(tmp);
+      }
+    } else {
+      renameSync(tmp, join(dir, filename));
+    }
+  };
+  let writeFailed = false;
+  let writeError: unknown;
+  try {
+    write();
+  } catch (error) {
+    writeFailed = true;
+    writeError = error;
+  }
+  if (lock) {
+    try {
+      lock.release();
+    } catch (error) {
+      // When the write itself failed, its error is the one the caller needs.
+      if (!writeFailed) throw new OutboxLockError(lockPath!, error);
+    }
+  }
+  if (writeFailed) throw writeError;
 }
 
 export function drainOutbox(): OutboxMessage[] {
