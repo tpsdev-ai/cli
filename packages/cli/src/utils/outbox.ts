@@ -87,8 +87,15 @@ export function drainOutbox(archive = true): OutboxMessage[] {
   for (const f of files) {
     const src = join(newDir, f);
     let msg: OutboxMessage;
+    let raw: string;
     try {
-      msg = JSON.parse(readFileSync(src, "utf-8")) as OutboxMessage;
+      raw = readFileSync(src, "utf-8");
+    } catch (err) {
+      console.error(`drainOutbox: failed to read ${f}: ${(err as Error).message}; leaving in place`);
+      continue;
+    }
+    try {
+      msg = JSON.parse(raw) as OutboxMessage;
     } catch (err) {
       // Defense-in-depth: even with atomic writes, a partial file could appear
       // (manual edit, crash mid-write before rename). Don't take the whole

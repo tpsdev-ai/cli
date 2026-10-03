@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { queueOutboxMessage, drainOutbox } from "../src/utils/outbox.js";
@@ -68,6 +68,16 @@ describe("outbox", () => {
     expect(readdirSync(newDir).length).toBe(0);
     // Bad file lands in sent/ with a .malformed- prefix for forensics
     expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
+  });
+
+  test("drainOutbox leaves a source it cannot read in place", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    queueOutboxMessage("host", "good", "austin");
+    mkdirSync(join(newDir, "unreadable.json"));
+    const rows = drainOutbox(false);
+    expect(rows.length).toBe(1);
+    expect(existsSync(join(newDir, "unreadable.json"))).toBe(true);
+    expect(existsSync(join(root, ".tps", "outbox", "sent", ".malformed-unreadable.json"))).toBe(false);
   });
 
   test("concurrent redelivery and drain enqueue a delivery only once", async () => {

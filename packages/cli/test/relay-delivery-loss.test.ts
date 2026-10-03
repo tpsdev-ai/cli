@@ -197,6 +197,35 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
+    test("a one-shot local write failure is dead-lettered retryable and the next mail check delivers it", async () => {
+      const env = buildSignedEnvelope("remote", "local", "write fault", SEEDS);
+      queue(JSON.stringify(env));
+      const inbox = getInbox("local");
+      spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const write = fs.writeFileSync;
+      let failed = false;
+      const injected = spyOn(fs, "writeFileSync").mockImplementation((path, data, opts) => {
+        if (!failed && String(path).startsWith(inbox.tmp)) {
+          failed = true;
+          throw new Error("injected transient write failure");
+        }
+        return write(path, data, opts);
+      });
+      try { await emit(); } finally { injected.mockRestore(); }
+      expect(failed).toBe(true);
+      expect(acks.length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+      expect(jsonFiles(inbox.dlq).length).toBe(1);
+      for (const file of jsonFiles(inbox.dlq)) expect(fs.readFileSync(join(inbox.dlq, `${file}.reason`), "utf8")).toContain("class: storage-unavailable");
+      expect(jsonFiles(inbox.cur)).toEqual([]);
+      const output = spyOn(console, "log").mockImplementation(() => {});
+      await runMail({ action: "check", agent: "local", json: true });
+      const delivered = JSON.parse(String(output.mock.calls.at(-1)![0]));
+      expect(delivered.map((m: { envelopeId: string }) => m.envelopeId)).toEqual([env.messageId]);
+      expect(delivered[0].body).toBe("write fault");
+    });
+
     test("with room the entry point writes the inbox and acknowledges the source", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "hello", SEEDS)));
       await start();

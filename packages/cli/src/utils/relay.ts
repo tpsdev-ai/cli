@@ -375,7 +375,9 @@ export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
     return true;
   } catch (e: unknown) {
     const reason = e instanceof Error ? e.message : String(e);
-    const cls: PromoteRejectClass = /inbox full/i.test(reason) ? "inbox-full" : "invalid";
+    const cls: PromoteRejectClass = /inbox full/i.test(reason)
+      ? "inbox-full"
+      : /^(Invalid agent id|Message body)/.test(reason) ? "invalid" : "storage-unavailable";
     console.error(`[relay] local delivery failed for message ${body.id} to ${body.to}: ${reason}`);
     try {
       deadLetterUndelivered(
