@@ -371,6 +371,7 @@ async function routeViaOutbound(to: string, bound: string[] = []): Promise<{ ok:
 }
 
 interface DispatchOutcome {
+  stop: () => Promise<void>;
   /** Where the reply landed, or "failure" when nothing was delivered. */
   route: "local" | "outbox" | "remote-branch" | "bridge" | "failure";
   /** The reply record's id (never the inbound's). */
@@ -405,7 +406,7 @@ interface DispatchOutcome {
 async function routeViaDispatcher(
   sender: string,
   bound: string[] = [],
-  opts: { flairAgentSeed?: Buffer } = {},
+  opts: { flairAgentSeed?: Buffer; keepAccountLive?: boolean } = {},
 ): Promise<DispatchOutcome> {
   // ONE key per principal (cli#429: the receipt scan verifies the reply's
   // signature too): the bound agent signs with ANVIL_SEED — its inbound too,
@@ -550,14 +551,14 @@ async function routeViaDispatcher(
       replyId = receipt[0]?.rec.replyId ?? null;
     }
 
-    abort.abort();
-    try {
-      await startPromise;
-    } catch {
-      /* expected */
-    }
+    const stop = async () => {
+      abort.abort();
+      try { await startPromise; } catch { /* expected */ }
+    };
+    if (!opts.keepAccountLive) await stop();
 
     return {
+      stop,
       route,
       replyId,
       replyRecord,
@@ -1375,10 +1376,10 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
   const obligationOf = (o: DispatchOutcome) => readJsonSafe(join(mailDir, "anvil", ".obligations", `${o.inboundId}.json`));
 
   /** Deliver the reply with the turn's own scan failing, so the obligation stays open. */
-  async function deliverWithOpenObligation(recipient: string, route: string): Promise<DispatchOutcome> {
+  async function deliverWithOpenObligation(recipient: string, route: string, keepAccountLive = false): Promise<DispatchOutcome> {
     obligations.failReceiptScan = true;
     try {
-      const o = await routeViaDispatcher(recipient, ["anvil"]);
+      const o = await routeViaDispatcher(recipient, ["anvil"], { keepAccountLive });
       expect(o.route).toBe(route);
       expect(o.obligation?.state, "the obligation is still open after the delivery").toBe("posted");
       return o;
@@ -1459,10 +1460,12 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
     it(`${r.route}: the recipient PROMOTES the reply → the DEADLINE scan finds it → acked, no nack`, async () => {
       process.env.TPS_OBLIGATION_DEADLINE_MS = "5000"; // fires after the turn has returned
       const out = await inFreshHome(r.setup, async () => {
-        const o = await deliverWithOpenObligation(r.recipient, r.route);
-        await recipientPromotes(r.recipient, r.box(), o);
-        await waitFor(() => obligationOf(o)?.state === "acked", 8000);
-        return { o, ob: obligationOf(o) };
+        const o = await deliverWithOpenObligation(r.recipient, r.route, true);
+        try {
+          await recipientPromotes(r.recipient, r.box(), o);
+          await waitFor(() => obligationOf(o)?.state === "acked", 8000);
+          return { o, ob: obligationOf(o) };
+        } finally { await o.stop(); }
       });
       expect(out.ob?.state).toBe("acked");
       expect(out.ob?.failure).toBeUndefined();
@@ -1489,11 +1492,13 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
     it(`${r.route}: the recipient PROMOTES and ACKS the reply → the DEADLINE scan still finds this obligation's receipt → acked`, async () => {
       process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
       const out = await inFreshHome(r.setup, async () => {
-        const o = await deliverWithOpenObligation(r.recipient, r.route);
-        const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
-        recipientAcks(r.recipient, id, curPath);
-        await waitFor(() => ["acked", "unconfirmed", "failed"].includes(obligationOf(o)?.state), 8000);
-        return { o, ob: obligationOf(o) };
+        const o = await deliverWithOpenObligation(r.recipient, r.route, true);
+        try {
+          const { curPath, id } = await recipientPromotes(r.recipient, r.box(), o);
+          recipientAcks(r.recipient, id, curPath);
+          await waitFor(() => ["acked", "unconfirmed", "failed"].includes(obligationOf(o)?.state), 8000);
+          return { o, ob: obligationOf(o) };
+        } finally { await o.stop(); }
       });
       expect(out.ob?.state).toBe("acked");
       expect(out.ob?.failure).toBeUndefined();

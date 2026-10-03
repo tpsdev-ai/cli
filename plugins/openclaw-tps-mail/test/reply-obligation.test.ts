@@ -175,6 +175,8 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       warnCalls?: string[];
     } = {},
   ) {
+    if (abortController.signal.aborted) abortController = new AbortController();
+    const accountAbort = abortController;
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
@@ -242,7 +244,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       cfg,
       log: { info: () => {}, warn: (...a: any[]) => warnCalls.push(a.map(String).join(" ")), error: () => {} },
       channelRuntime,
-      abortSignal: abortController.signal,
+      abortSignal: accountAbort.signal,
     };
 
     if (opts.noInbound) {
@@ -272,7 +274,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       // (onSkip); this drives that path.
       skip: (reason = "empty") => dispatchedArgs!.dispatcherOptions.onSkip?.({ text: "" }, { kind: "final", reason }),
       settle: () => settleFn?.(),
-      stop: async () => { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
+      stop: async () => { accountAbort.abort(); try { await startPromise; } catch { /* aborted */ } },
     };
   }
 

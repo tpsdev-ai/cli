@@ -1,27 +1,5 @@
-/**
- * account-lifetime.test.ts — cli#403.
- *
- * The reply-obligation state (`yieldContexts`, `armedDeadlines`) is
- * module-level and used to outlive an account: contexts grew for the process
- * lifetime, and an armed deadline timer survived an account abort, so after an
- * account restart a stale timer could transition an obligation and nack under a
- * stopped account's context.
- *
- * This file pins the account lifetime the issue asks for:
- *   F403-1 two accounts: aborting one drops ONLY its state; a sibling account's
- *            deadline stays armed and still fires;
- *   F403-2 after an ACK the context AND its timer are gone;
- *   F403-3 after a FAIL the context AND its timer are gone;
- *   F403-4 a late lifecycle event after the abort arms nothing;
- *   F403-5 an in-flight dispatch that settles after the abort arms nothing;
- *   F403-6 contexts do not grow across many obligations.
- *
- * It drives the real gateway lifecycle: a held-open fake dispatch per account,
- * the module-level yield subscription, and (for the ownership assertions) the
- * plugin's own `obligationStateForTests()` snapshot of the in-memory state.
- */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -40,6 +18,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 import pluginModule, { obligationStateForTests } from "../src/index.js";
+import { transitionObligation, writeReceipt } from "../src/obligations.js";
 
 let capturedPlugin: any;
 let capturedSubscription: any;
@@ -50,14 +29,14 @@ const mockApi: any = {
 };
 pluginModule.register(mockApi);
 
-function buildSignedBody(from: string, to: string, body: string, seed: Buffer): string {
+function buildSignedBody(from: string, to: string, body: string, seed: Buffer, replyToId?: string): string {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
     { agent: from, kind: "agent", timestamp: now, rationale: `agent ${from} dispatches`, signature: null },
   ];
   const env = signEnvelope(
-    { v: 1, from, to, body, messageId: `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain },
+    { v: 1, from, to, body, messageId: `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain, ...(replyToId ? { replyToId } : {}) },
     { [from]: seed },
   );
   return JSON.stringify(env);
@@ -89,8 +68,13 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
   let origHome: string | undefined;
   let origKeys: string | undefined;
   let origDeadline: string | undefined;
+  let receiptGate: (() => Promise<void>) | undefined;
+  let rejectReceipt = false;
+  const publicKeys: Record<string, Buffer> = {};
 
   beforeEach(() => {
+    receiptGate = undefined;
+    rejectReceipt = false;
     tempRoot = mkdtempSync(join(tmpdir(), "tps-al-root-"));
     tempHome = mkdtempSync(join(tmpdir(), "tps-al-home-"));
     keysDir = mkdtempSync(join(tmpdir(), "tps-al-keys-"));
@@ -124,7 +108,6 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     } catch { return null; }
   }
 
-  /** A new/ file for this account's agent; id is deterministic per (agent, i). */
   function writeInbound(spec: AccountSpec, i: number): { inboundId: string; envelopeId: string } {
     const signedBody = buildSignedBody(spec.sender, spec.agentId, "inbound payload", FLINT_SEED);
     const inboundId = `msg-${spec.agentId}-${i}-${Math.random().toString(36).slice(2, 8)}`;
@@ -143,6 +126,17 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     return { inboundId, envelopeId: JSON.parse(signedBody).messageId as string };
   }
 
+  function mailFiles(spec: AccountSpec): Record<string, string> {
+    const files: Record<string, string> = {};
+    for (const path of readdirSync(spec.mailDir, { recursive: true, withFileTypes: true })) {
+      if (!path.isFile()) continue;
+      const full = join(path.parentPath, path.name);
+      const relative = full.slice(spec.mailDir.length + 1);
+      if (!relative.includes(".obligations/")) files[relative] = readFileSync(full, "utf8");
+    }
+    return files;
+  }
+
   interface Handle {
     spec: AccountSpec;
     dispatchCount: number;
@@ -154,6 +148,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     skip(i: number): void;
     settle(i: number): void;
     stop(): Promise<void>;
+    stopAccount(): Promise<void>;
+    logs: string[];
   }
 
   /**
@@ -161,12 +157,15 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
    * dispatches it), and hold every dispatch open until the test settles it.
    */
   async function boot(specs: AccountSpec[], inboundsPerAccount = 1): Promise<Handle[]> {
-    const seeds: Record<string, Buffer> = {};
-    for (const s of specs) { seeds[s.agentId] = s.seed; seeds[s.sender] = FLINT_SEED; }
+    for (const s of specs) { publicKeys[s.agentId] = s.seed; publicKeys[s.sender] = FLINT_SEED; }
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
-          const seed = seeds[name];
+          if (receiptGate && name !== "flint") {
+            await receiptGate();
+            if (rejectReceipt) return null;
+          }
+          const seed = publicKeys[name];
           return seed ? { publicKey: pubkeyFromSeed(seed) } : null;
         },
       }),
@@ -208,10 +207,11 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         },
       };
 
+      const logs: string[] = [];
       const ctx = {
         account: { accountId: spec.accountId, mailDir: spec.mailDir, enabled: true },
         cfg,
-        log: { info: () => {}, warn: () => {}, error: () => {} },
+        log: { info: (s: string) => logs.push(s), warn: (s: string) => logs.push(s), error: (s: string) => logs.push(s) },
         channelRuntime,
         abortSignal: abortController.signal,
       };
@@ -219,6 +219,7 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
 
       const h: Handle = {
         spec,
+        logs,
         get dispatchCount() { return dispatchCount; },
         get dispatched() { return dispatches[0]?.args ?? null; },
         dispatchAt: (i) => dispatches[i]?.args ?? null,
@@ -232,11 +233,12 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         },
         settle(i) { dispatches[i]!.settle(); },
         async stop() { abortController.abort(); try { await startPromise; } catch { /* aborted */ } },
+        async stopAccount() { await capturedPlugin.gateway.stopAccount(ctx); },
       };
       return h;
     });
 
-    await pollUntil(() => handles.every((h) => h.dispatchCount >= inboundsPerAccount), 5000);
+    expect(await pollUntil(() => handles.every((h) => h.dispatchCount >= inboundsPerAccount), 5000)).toBe(true);
     return handles;
   }
 
@@ -267,6 +269,7 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     expect(st.contexts.some((c) => c.obligationId === obA), "A's context is gone after the abort").toBe(false);
     expect(st.deadlines.some((d) => d.obligationId === obA), "A's timer is cleared after the abort").toBe(false);
     expect(st.deadlines.some((d) => d.obligationId === obB), "B's deadline is STILL armed").toBe(true);
+    expect(st.contexts.some((c) => c.obligationId === obB), "B's context is still live").toBe(true);
 
     const bFailed = await pollUntil(() => obFile(B, inbB)?.state === "failed", 5000);
     expect(bFailed, "B's deadline still fires under its live account").toBe(true);
@@ -290,7 +293,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
 
     await h.deliver(0, "final answer");
     h.settle(0);
-    await pollUntil(() => obFile(A, inb)?.state === "acked", 4000);
+    expect(await pollUntil(() => obFile(A, inb)?.state === "acked", 4000)).toBe(true);
+    expect(obFile(A, inb)?.state).toBe("acked");
 
     const st = obligationStateForTests();
     expect(st.contexts.some((c) => c.obligationId === obId), "context released on ack").toBe(false);
@@ -313,7 +317,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     // A definitive non-delivery verdict (empty final) fails it at once.
     h.skip(0);
     h.settle(0);
-    await pollUntil(() => obFile(A, inb)?.state === "failed", 4000);
+    expect(await pollUntil(() => obFile(A, inb)?.state === "failed", 4000)).toBe(true);
+    expect(obFile(A, inb)?.state).toBe("failed");
 
     const st = obligationStateForTests();
     expect(st.contexts.some((c) => c.obligationId === obId), "context released on fail").toBe(false);
@@ -329,8 +334,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     const inb = h.inboundIdAt(0)!;
     const obId = h.obligationIdAt(0)!;
 
-    // Abort while the dispatch is still in flight; then fire a yielded event for
-    // the obligation that was in flight at the abort.
+    const prior = obFile(A, inb);
+    const priorFiles = mailFiles(A);
     await h.stop();
     capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
     await sleep(150);
@@ -338,12 +343,15 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     const st = obligationStateForTests();
     expect(st.contexts.some((c) => c.obligationId === obId), "the aborted account's context is gone").toBe(false);
     expect(st.deadlines.some((d) => d.obligationId === obId), "the late event armed nothing").toBe(false);
-    expect(obFile(A, inb)?.state, "the obligation was not transitioned under the stopped account").not.toBe("failed");
+    expect(obFile(A, inb)).toEqual(prior);
+    expect(mailFiles(A)).toEqual(priorFiles);
 
     // Let the held dispatch finish; its tail must not re-arm either.
     h.settle(0);
     await sleep(250);
     expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId), "the settling tail armed nothing").toBe(false);
+    expect(obFile(A, inb)).toEqual(prior);
+    expect(mailFiles(A)).toEqual(priorFiles);
   }, 20000);
 
   // ── F403-5 ─────────────────────────────────────────────────────────────────
@@ -354,6 +362,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     const inb = h.inboundIdAt(0)!;
     const obId = h.obligationIdAt(0)!;
 
+    const prior = obFile(A, inb);
+    const priorFiles = mailFiles(A);
     await h.stop(); // abort first
     h.settle(0);    // the dispatch now settles, AFTER the abort
     await sleep(300); // let its tail run
@@ -361,7 +371,8 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     const st = obligationStateForTests();
     expect(st.contexts.some((c) => c.obligationId === obId), "the abort dropped the context").toBe(false);
     expect(st.deadlines.some((d) => d.obligationId === obId), "the settling dispatch armed nothing").toBe(false);
-    expect(obFile(A, inb)?.state, "no transition under the stopped account").not.toBe("failed");
+    expect(obFile(A, inb)).toEqual(prior);
+    expect(mailFiles(A)).toEqual(priorFiles);
   }, 20000);
 
   // ── F403-6 ─────────────────────────────────────────────────────────────────
@@ -371,9 +382,6 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     const N = 4;
     const obIds: string[] = [];
 
-    // One inbound per start (the startup scan promotes one file at a time), so
-    // each obligation is dispatched, posted and acked without a concurrency race
-    // on the mailbox lock.
     for (let i = 0; i < N; i++) {
       const [h] = await boot([A], 1);
       const inb = h.inboundIdAt(0)!;
@@ -398,4 +406,93 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
     }
     expect(st.contexts.length, "acked obligations do not accumulate contexts").toBeLessThan(N);
   }, 30000);
+  for (const state of ["delivering", "posted"] as const) {
+    it(`stop clears ${state} state; restart recovers its durable obligation`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+      const A = single();
+      const [h] = await boot([A]);
+      const inb = h.inboundIdAt(0)!;
+      const obId = h.obligationIdAt(0)!;
+      transitionObligation(A.mailDir, A.agentId, inb, state);
+      capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+      expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(true);
+      const prior = obFile(A, inb);
+      const priorFiles = mailFiles(A);
+      if (state === "posted") await h.stopAccount(); else await h.stop();
+      expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+      expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+      h.settle(0);
+      await sleep(100);
+      expect(obFile(A, inb)).toEqual(prior);
+      expect(mailFiles(A)).toEqual(priorFiles);
+      const [restart] = await boot([A], 0);
+      expect(await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obId))).toBe(true);
+      expect(obFile(A, inb)?.state).toBe(state);
+      expect(restart.dispatchCount).toBe(0);
+      await restart.stop();
+    });
+  }
+
+  for (const found of [true, false]) {
+    it(`a deadline awaiting a receipt across stop cannot ${found ? "ack" : "fail and nack"}`, async () => {
+      process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
+      const A = single();
+      const [h] = await boot([A]);
+      const inb = h.inboundIdAt(0)!;
+      const obId = h.obligationIdAt(0)!;
+      let release!: () => void;
+      let scanning = false;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      receiptGate = () => { scanning = true; return gate; };
+      rejectReceipt = !found;
+      const replyToId = obFile(A, inb).inboundEnvelopeId;
+      writeReceipt(A.mailDir, A.agentId, {
+        obligationId: obId, replyId: "paused-receipt", replyToId, route: "local",
+        ts: new Date().toISOString(),
+        signedReply: buildSignedBody(A.agentId, A.sender, "reply", A.seed, replyToId),
+      });
+      capturedSubscription.handle({ runId: obId, stream: "lifecycle", data: { yielded: true } });
+      expect(await pollUntil(() => scanning)).toBe(true);
+      const prior = obFile(A, inb);
+      const priorFiles = mailFiles(A);
+      await h.stop();
+      release();
+      await sleep(200);
+      expect(obFile(A, inb)).toEqual(prior);
+      expect(mailFiles(A)).toEqual(priorFiles);
+      expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
+      expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+      receiptGate = undefined;
+      h.settle(0);
+    });
+  }
+
+  it("old-incarnation dispatch settles after restart without touching recovery or a live sibling", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
+    const A = single();
+    const B: AccountSpec = { accountId: "acct-b", agentId: "beta", sender: "flint", mailDir: newMailDir("acct-b"), seed: BETA_SEED };
+    const [old, sibling] = await boot([A, B]);
+    const inb = old.inboundIdAt(0)!;
+    const obId = old.obligationIdAt(0)!;
+    sibling.settle(0);
+    expect(await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === sibling.obligationIdAt(0)))).toBe(true);
+    await old.deliver(0, "old final");
+    await old.stop();
+    const [restart] = await boot([A], 0);
+    expect(await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obId))).toBe(true);
+    const prior = obFile(A, inb);
+    const priorFiles = mailFiles(A);
+    const priorSibling = obFile(B, sibling.inboundIdAt(0)!);
+    const state = obligationStateForTests();
+    old.settle(0);
+    expect(await pollUntil(() => old.logs.some((s) => s.includes(`old-incarnation-dispatch-ignored: ${inb}`)) || obFile(A, inb)?.state !== prior.state)).toBe(true);
+    expect(obFile(A, inb)).toEqual(prior);
+    expect(mailFiles(A)).toEqual(priorFiles);
+    expect(obFile(B, sibling.inboundIdAt(0)!)).toEqual(priorSibling);
+    expect(obligationStateForTests()).toEqual(state);
+    expect(old.logs.some((s) => s.includes(`old-incarnation-dispatch-ignored: ${inb}`))).toBe(true);
+    await restart.stop();
+    await sibling.stop();
+  });
+
 });
