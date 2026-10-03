@@ -11,11 +11,14 @@
  * nothing can skip it.
  *
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
- * `FlairAgent.publicKey` as a base64 string, while signEnvelope's verifyEnvelope
+ * `FlairAgent.publicKey` as a string, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).
+ * The string is decoded by the ONE parser for hub-returned keys
+ * (parseFlairPublicKey), which accepts the encodings the hub stores.
  */
 
 import { createFlairClient } from "./flair-client.js";
+import { parseFlairPublicKey } from "@tpsdev-ai/agent";
 import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -65,8 +68,10 @@ export async function createMailVerifyClient(
     async getAgent(name: string) {
       const info = await cliClient.getAgentForVerification(name);
       if (!info) return null;
-      const publicKey = Buffer.from(info.publicKey, "base64");
-      if (publicKey.length !== 32 || publicKey.toString("base64") !== info.publicKey) {
+      let publicKey: Buffer;
+      try {
+        publicKey = parseFlairPublicKey(info.publicKey);
+      } catch {
         throw new Error(`Flair returned an invalid public key for ${name}`);
       }
       return { publicKey };
