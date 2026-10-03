@@ -1,14 +1,17 @@
 /**
- * cli#394 — NODE behaviour of the CLI's mail-archive utility.
+ * cli#394 / cli#395 — NODE behaviour of the CLI's mail-archive utility.
  *
  * `utils/mail.js` statically imports `utils/archive.js`; the OpenClaw gateway
  * loads the plugin under NODE, so BOTH must load there. These tests spawn the
  * REAL `node` binary against the built CLI dist:
  *
  *  - importing `utils/mail.js` (calling nothing) must exit 0;
- *  - calling `logEvent` under node must return without throwing, `queryArchive`
- *    must return an empty list, and the "archive unavailable" note must be
- *    printed exactly ONCE per process (visible gap, never silent, never spammy).
+ *  - when no SQLite backend exists (cli#395: `--no-experimental-sqlite` removes
+ *    `node:sqlite`, the pre-22.13 shape), calling `logEvent` must return without
+ *    throwing, `queryArchive` must return an empty list, and the named warning
+ *    must be printed exactly ONCE per process (visible gap, never silent, never
+ *    spammy). The live node path — with `node:sqlite` present — is covered by
+ *    archive-runtime-adapter.test.ts.
  *
  * Precondition: the CLI is built (`dist/src/utils/*.js` exists) — root `bun run
  * build` does that before `bun run test`.
@@ -25,10 +28,11 @@ const mailJs = resolve(utilsDir, "mail.js");
 const archiveJs = resolve(utilsDir, "archive.js");
 
 const DEADLINE_MS = 30_000;
-const NOTE = "mail archive unavailable under this runtime (no bun:sqlite); events are not being logged";
+const NOTE =
+  "tps-mail archive: no sqlite backend in this runtime (neither bun:sqlite nor node:sqlite); mail events are not being logged";
 
-function runNode(script: string) {
-  return spawnSync("node", ["--input-type=module", "-e", script], {
+function runNode(script: string, nodeArgs: string[] = []) {
+  return spawnSync("node", [...nodeArgs, "--input-type=module", "-e", script], {
     encoding: "utf8",
     timeout: DEADLINE_MS,
     killSignal: "SIGKILL",
@@ -49,7 +53,7 @@ describe("archive under node (cli#394)", () => {
   );
 
   test(
-    "logEvent is a visible no-op under node: returns, prints the note once",
+    "no SQLite backend (old node): logEvent is a visible no-op, prints the warning once",
     () => {
       expect(existsSync(archiveJs)).toBe(true);
       const script = `
@@ -60,7 +64,9 @@ describe("archive under node (cli#394)", () => {
         console.log("THREW=" + threw);
         console.log("QUERY=" + JSON.stringify(a.queryArchive()));
       `;
-      const res = runNode(script);
+      // `--no-experimental-sqlite` makes `node:sqlite` unresolvable, reproducing
+      // a node older than 22.13 on this modern runner.
+      const res = runNode(script, ["--no-experimental-sqlite"]);
       expect(res.signal).toBeNull();
       expect(res.status).toBe(0);
       expect(res.stdout).toContain("THREW=false");
