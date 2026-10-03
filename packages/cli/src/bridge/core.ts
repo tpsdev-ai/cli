@@ -222,8 +222,8 @@ Message: ${envelope.content}`;
     };
 
     try {
-      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach((f) => processFile(f));
-      readdirSync(cur).filter((f) => f.endsWith(".json")).forEach((f) => processFile(f, true));
+      for (const f of readdirSync(fresh).filter((name) => name.endsWith(".json"))) processFile(f);
+      for (const f of readdirSync(cur).filter((name) => name.endsWith(".json"))) processFile(f, true);
     } catch {}
 
     const watcher = watch(fresh, (_event, filename) => {
