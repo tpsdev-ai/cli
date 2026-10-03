@@ -1,10 +1,3 @@
-/**
- * public-key.test.ts — cli#493: the ONE parser for a hub-returned public key.
- *
- * `parseFlairPublicKey` decodes the encodings the Flair hub stores — unpadded
- * base64url and standard base64 (padded or unpadded) — to the raw 32 bytes
- * verifyEnvelope needs, and refuses everything else.
- */
 import { expect, test } from "bun:test";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
@@ -72,8 +65,8 @@ test("refuses a non-string or empty value", () => {
 });
 
 test("refuses a value that mixes the base64 and base64url alphabets", () => {
-  const mixed = "ab+cd-efgh";
-  expect(mixed).toMatch(/\+/);
+  const mixed = Buffer.alloc(32, 0xfb).toString("base64").replace(/\+/, "-");
+  expect(mixed).toMatch(/\//);
   expect(mixed).toMatch(/-/);
   expect(() => parseFlairPublicKey(mixed)).toThrow(PublicKeyFormatError);
 });
@@ -86,3 +79,30 @@ test("refuses a non-canonical encoding that decodes to the same 32 bytes", () =>
   expect(mutated).not.toBe(canonical);
   expect(() => parseFlairPublicKey(mutated)).toThrow(PublicKeyFormatError);
 });
+
+for (const encoded of [KEY.toString("hex"), KEY.toString("hex").toUpperCase()]) {
+  test(`accepts uniform-case hex ${encoded}`, () => {
+    expect(parseFlairPublicKey(encoded)).toEqual(KEY);
+  });
+}
+
+test("accepts canonical padded base64url", () => {
+  expect(parseFlairPublicKey(KEY.toString("base64url") + "=")).toEqual(KEY);
+});
+
+for (const encoded of [
+  KEY.toString("base64") + "=",
+  KEY.toString("base64url") + "==",
+  KEY.toString("base64") + "junk",
+  KEY.toString("base64") + "\n",
+  KEY.toString("hex") + "junk",
+  KEY.toString("hex") + "\n",
+  "aA" + KEY.toString("hex").slice(2),
+  KEY.toString("hex").slice(2),
+  KEY.toString("hex") + "00",
+  Buffer.alloc(32, 0xab),
+]) {
+  test(`refuses malformed or mixed-case input ${JSON.stringify(encoded)}`, () => {
+    expect(() => parseFlairPublicKey(encoded)).toThrow(PublicKeyFormatError);
+  });
+}

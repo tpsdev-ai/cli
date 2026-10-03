@@ -1,14 +1,3 @@
-/**
- * hub-key-encoding.test.ts — cli#493 end-to-end.
- *
- * Every inbound envelope the plugin promotes is verified through the REAL
- * createMailVerifyClient, which reads the sender's public key from the Flair
- * hub. This drill stubs the hub (global fetch) with the shape the hub actually
- * returns — an UNPADDED base64url key, 43 characters, carrying '-' or '_' — and
- * asserts the plugin DELIVERS the mail instead of dead-lettering it. The
- * verification seam is pinned to the real implementation, so the key parse
- * under test runs against the hub response.
- */
 import { beforeEach, afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";

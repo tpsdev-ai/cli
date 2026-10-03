@@ -1,5 +1,1 @@
-- **Mail verification accepts the Flair hub's public-key encodings (unpadded base64url and standard base64), so hub-verified inbound mail is no longer dead-lettered (Closes #493).**
-
-  Every hub-returned public key is decoded by one parser that accepts the
-  encodings the hub stores and refuses anything that is not a 32-byte Ed25519
-  key.
+- **Mail verification decodes uniform-case hex and canonical base64/base64url public keys to exactly 32 bytes (Closes #493).**

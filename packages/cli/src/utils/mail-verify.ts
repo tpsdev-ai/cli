@@ -13,8 +13,6 @@
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
  * `FlairAgent.publicKey` as a string, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).
- * The string is decoded by the ONE parser for hub-returned keys
- * (parseFlairPublicKey), which accepts the encodings the hub stores.
  */
 
 import { createFlairClient } from "./flair-client.js";

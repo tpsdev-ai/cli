@@ -1,18 +1,3 @@
-/**
- * mail-verify-key-encoding.test.ts — cli#493.
- *
- * createMailVerifyClient turns the public key Flair returns into the raw 32
- * bytes verifyEnvelope needs. The hub stores and returns an agent's Ed25519
- * public key as unpadded base64url (43 chars for a 32-byte key); standard
- * base64 (padded or unpadded) is accepted too. #467 tightened the parse to
- * standard PADDED base64 only, so a mailbox that verifies against the hub
- * dead-lettered with `Flair returned an invalid public key for <sender>`.
- *
- * These drills run the REAL client against a stubbed hub (a fetch stub that
- * serves `/Agent/<name>`): a signed envelope verifies for each accepted shape,
- * and a key that is not a 32-byte Ed25519 key still refuses with the existing
- * error.
- */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -143,6 +128,7 @@ for (const [label, key] of [
   ["33 bytes", Buffer.alloc(33, 0x01).toString("base64url")],
   ["invalid characters", "not-a-key!!"],
   ["empty", ""],
+  ["overpadding", SENDER_PUB.toString("base64") + "="],
 ] as const) {
   test(`a malformed hub key (${label}) refuses with the existing error`, async () => {
     stubHub(() => key);
@@ -153,5 +139,12 @@ for (const [label, key] of [
     await expect(client.getAgent(SENDER)).rejects.toThrow(
       `Flair returned an invalid public key for ${SENDER}`,
     );
+  });
+}
+
+for (const encoding of ["hex", "base64url", "base64"] as const) {
+  test(`${encoding} stored key verifies`, async () => {
+    expect(await verifyAgainst(SENDER_PUB.toString(encoding),
+      signedEnvelope(SENDER, MAILBOX, "hello", SENDER_SEED))).toEqual({ ok: true });
   });
 }
