@@ -1,4 +1,5 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -216,6 +217,35 @@ describe("handleGithubWebhook", () => {
       "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(body).digest("hex")}` },
       lock: join(root, ".tps", "outbox", "new", `.github-${createHash("sha256").update(delivery).digest("hex")}.lock`) };
   }
+
+  test("write and release failures preserve the write error and refuse redelivery", async () => {
+    const request = deliveryRequest("write-and-release-fail");
+    const writeError = new Error("injected outbox write failure");
+    const originalWrite = fs.writeFileSync;
+    const originalRename = fs.renameSync;
+    const write = spyOn(fs, "writeFileSync").mockImplementation((...args) => {
+      if (String(args[0]).endsWith(".tmp")) throw writeError;
+      return originalWrite(...args);
+    });
+    const release = spyOn(fs, "renameSync").mockImplementation((...args) => {
+      if (String(args[0]) === request.lock) throw new Error("injected lock release failure");
+      return originalRename(...args);
+    });
+    try {
+      expect(await post(request.headers, request.body)).toEqual({ status: 503, text: writeError.message });
+      expect(release).toHaveBeenCalled();
+    } finally {
+      write.mockRestore();
+      release.mockRestore();
+    }
+    expect(existsSync(request.lock)).toBe(true);
+    expect(drainOutbox()).toEqual([]);
+    const redelivery = await post(request.headers, request.body);
+    expect(redelivery.status).toBe(503);
+    expect(redelivery.text).toContain("OutboxLockError");
+    expect(redelivery.text).toContain(request.lock);
+    expect(drainOutbox()).toEqual([]);
+  });
 
   test("cross-process redelivery returns 200 for an old live owner's lock and enqueues once", async () => {
     const request = deliveryRequest("cross-process");

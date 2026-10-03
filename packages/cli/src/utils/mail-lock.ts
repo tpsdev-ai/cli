@@ -238,7 +238,10 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
     const owner = readOwner(lockDir);
     const state = ownerState(owner, processStartToken, true);
     if (JSON.stringify(owner) !== JSON.stringify(readOwner(lockDir))) continue;
-    if (state === "alive") return null;
+    if (state === "alive") {
+      if (owner?.pid === process.pid) throw new MailLockOwnerError(lockDir);
+      return null;
+    }
     if (state !== "dead") {
       if (!existsSync(lockDir)) continue;
       throw new MailLockOwnerError(lockDir);
@@ -252,8 +255,12 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
     }
     if (!reclaim) return null;
     try {
-      const current = ownerState(readOwner(lockDir), processStartToken, true);
-      if (current === "alive") return null;
+      const currentOwner = readOwner(lockDir);
+      const current = ownerState(currentOwner, processStartToken, true);
+      if (current === "alive") {
+        if (currentOwner?.pid === process.pid) throw new MailLockOwnerError(lockDir);
+        return null;
+      }
       if (current !== "dead") {
         if (!existsSync(lockDir)) continue;
         throw new MailLockOwnerError(lockDir);
