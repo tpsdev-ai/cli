@@ -1,7 +1,7 @@
 // cli#486 — the last three `?? "anvil"` identity defaults are gone: the bridge
 // core, the roster dashboard and `tps agent commit` take a configured identity
 // and refuse by name when none is set.
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -66,13 +66,21 @@ describe("cli#486 — configured identity, no anvil default", () => {
 
   test("roster dashboard refuses without a configured viewer and runs when set", async () => {
     const stub = startFetchFlair({});
+    const requests: string[] = [];
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
+      requests.push(url.pathname);
+      return Response.json(url.pathname === "/Agent/" ? [{ id: "ember" }] : []);
+    });
     try {
       delete process.env.TPS_AGENT_ID;
       await expect(runDashboard({ flairUrl: stub.url })).rejects.toThrow(/no roster viewer id/);
 
       process.env.TPS_AGENT_ID = "kern";
       await expect(runDashboard({ flairUrl: stub.url })).resolves.toBeUndefined();
+      expect(requests).toEqual(["/Agent/", "/OrgEventCatchup/kern"]);
     } finally {
+      fetchSpy.mockRestore();
       stub.stop();
     }
   });
