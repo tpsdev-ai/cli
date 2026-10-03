@@ -70,10 +70,10 @@
  * wiring together, and the boundary there is review of the diff. What it holds
  * is that coverage cannot go quiet.
  */
-import { readdirSync, readFileSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /** The repo root, from this file's own location: `<root>/scripts/check-test-reports.mjs`. */
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -375,4 +375,11 @@ function main() {
   process.exitCode = exitCodeFor(result);
 }
 
-if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) main();
+/** Compare canonical entry paths (cli#475); an unresolvable argv[1] throws. */
+function isEntryPoint() {
+  const invoked = process.argv[1];
+  if (invoked === undefined) return false;
+  return realpathSync(invoked) === realpathSync(fileURLToPath(import.meta.url));
+}
+
+if (isEntryPoint()) main();

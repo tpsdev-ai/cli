@@ -37,6 +37,11 @@ const WRITE_CALLS: Record<string, Dest> = {
 const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why: string }> = [
   {
     file: "packages/cli/src/utils/mail.ts",
+    contains: 'writeFileSync(path, JSON.stringify(msg, null, 2), "utf-8")',
+    why: "writeMessageFile primitive — its call sites are enumerated below",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
     contains: "renameSync(scratchPath, curPath)",
     why: "promote() — first delivery into a mailbox's cur/",
   },

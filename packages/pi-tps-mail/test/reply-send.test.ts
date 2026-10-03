@@ -20,14 +20,16 @@
 // root: HOME, the maildirs and the key dirs are all under it, so nothing
 // touches a real ~/.tps or ~/.flair.
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@tpsdev-ai/agent";
-import { buildSignedEnvelope, pubkeyFromSeed, startStubFlair, type StubFlair } from "../../cli/test/helpers/stub-flair.js";
+import { buildSignedEnvelope, pubkeyFromSeed, type StubFlair } from "../../cli/test/helpers/stub-flair.js";
+import { startFetchFlair } from "../../cli/test/helpers/fetch-flair.js";
 import { watchMail } from "../src/index.js";
 
-const TPS_TS = resolve(import.meta.dir, "../../cli/bin/tps.ts");
+const TPS_TS = resolve(import.meta.dir, "../../cli/test/helpers/cli-fetch-driver.ts");
 const THREAD = "5f0c8a52-3d1e-4b7a-9c2f-7e6d5c4b3a21"; // the inbound envelope's signed messageId
 const FLINT_SEED = Buffer.alloc(32, 0x0f); // the sender
 const EMBER_SEED = Buffer.alloc(32, 0x0e); // the watched agent (signs replies)
@@ -41,6 +43,7 @@ const ENV_KEYS = [
   "TPS_AGENT_ID",
   "FLAIR_URL",
   "FLAIR_KEY_PATH",
+  "TEST_FLAIR_SEEDS",
 ] as const;
 
 let root: string;
@@ -94,7 +97,7 @@ beforeEach(() => {
   // The key the verifying Flair client authenticates its reads with (the stub
   // ignores it). Separate from ember's SIGNING key, which a test may withhold.
   writeFileSync(join(root, "flair-auth.key"), Buffer.alloc(32, 0x0c));
-  stub = startStubFlair({ flint: FLINT_SEED, ember: EMBER_SEED });
+  stub = startFetchFlair({ flint: FLINT_SEED, ember: EMBER_SEED });
 
   // The launcher: records each call and the body it was given, answers with a fixed reply.
   writeFileSync(p.launcher(), `#!/bin/sh\nprintf 'call %s\\n' "$1" >> "${p.launcherLog()}"\nprintf 'reply from ember'\n`);
@@ -126,6 +129,8 @@ beforeEach(() => {
 
   saved = {};
   for (const k of ENV_KEYS) saved[k] = process.env[k];
+  process.env.TEST_FLAIR_SEEDS = join(root, "seeds.json");
+  writeFileSync(process.env.TEST_FLAIR_SEEDS, JSON.stringify({ flint: FLINT_SEED.toString("hex"), ember: EMBER_SEED.toString("hex") }));
   process.env.HOME = root;
   process.env.TPS_MAIL_DIR = p.mail();
   process.env.TPS_TEST_KEYS_DIR = p.keys();
@@ -159,14 +164,19 @@ function plantInbound(body?: string): string {
 
 /** The real CLI, as `agent`, against this root (for fixtures and for reading flint's side). */
 async function cli(agent: string, args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn([process.execPath, TPS_TS, ...args], {
+  const proc = spawn(process.execPath, [TPS_TS, ...args], {
     cwd: root,
     env: { ...process.env, TPS_AGENT_ID: agent, TPS_MAIL_DIR: p.mail() },
-    stdin: "ignore",
-    stdout: "pipe",
-    stderr: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
   });
-  const [stdout, stderr, status] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+  let stdout = "";
+  let stderr = "";
+  proc.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  proc.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  const status = await new Promise<number>((resolve, reject) => {
+    proc.on("error", reject);
+    proc.on("close", (code) => resolve(code ?? 1));
+  });
   return { status, stdout, stderr };
 }
 

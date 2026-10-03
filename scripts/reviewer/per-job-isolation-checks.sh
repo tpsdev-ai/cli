@@ -147,12 +147,28 @@ const r = runReviewJobs({
   job: "review",
   base: "main",
   docker,
+  evidence: {
+    file: process.env.FIXTURE_EVIDENCE_FILE,
+    keyFile: process.env.FIXTURE_EVIDENCE_KEY,
+    repo: "fixture/repo",
+    pr: 1,
+    dispatchId: "fixture-dispatch",
+    reviewer: "fixture",
+    sessionKey: "fixture-session",
+    commit: process.env.FIXTURE_COMMIT,
+  },
 });
 process.stdout.write(`${JSON.stringify(r.ok ? { status: r.status, image: r.image, jobs: r.jobs } : { status: "refused", ...r.refusal, jobs: r.jobs })}\n`);
 process.exitCode = r.ok ? 0 : 1;
 JS
 
+# The APPROVE evidence store and key (#426): outside the jobs' scratch and the source.
+mkdir -p "$SCRATCH/hostkeys"
+head -c 32 /dev/urandom | base64 >"$SCRATCH/hostkeys/approval.key"
+FIXTURE_COMMIT="$(git -C "$SCRATCH/source.git" rev-parse HEAD)"
+
 FIXTURE_IMAGE="$IMG" FIXTURE_SOURCE="$SCRATCH/source.git" FIXTURE_SCRATCH="$SCRATCH/jobs" FIXTURE_EVIDENCE="$SCRATCH/evidence" \
+  FIXTURE_EVIDENCE_FILE="$SCRATCH/hostkeys/approval-evidence.json" FIXTURE_EVIDENCE_KEY="$SCRATCH/hostkeys/approval.key" FIXTURE_COMMIT="$FIXTURE_COMMIT" \
   node "$HOSTMOD/scripts/reviewer/evidence-harness.mjs" >"$SCRATCH/run.out" 2>"$SCRATCH/run.err"
 RUN_RC=$?
 
@@ -198,6 +214,31 @@ if [ -f "$obs" ]; then
   fi
 else
   fail "job 2 wrote no observations ($obs missing)"
+fi
+
+# The record: one entry, both jobs with their planned scripts and exit status 0,
+# the source's commit, and a MAC that verifies under the host key.
+if EV_OUT="$(FIXTURE_EVIDENCE_FILE="$SCRATCH/hostkeys/approval-evidence.json" FIXTURE_EVIDENCE_KEY="$SCRATCH/hostkeys/approval.key" FIXTURE_COMMIT="$FIXTURE_COMMIT" \
+  node --input-type=module -e '
+import { readFileSync } from "node:fs";
+import { createHmac } from "node:crypto";
+const { approvalEvidenceBytes, readHostKey } = await import(process.argv[1]);
+const { approvals } = JSON.parse(readFileSync(process.env.FIXTURE_EVIDENCE_FILE, "utf8"));
+const r = approvals.length === 1 ? approvals[0] : null;
+const { digest: _d, mac, ...fields } = r ?? {};
+const ok =
+  r !== null &&
+  r.commit === process.env.FIXTURE_COMMIT &&
+  r.job === "review" &&
+  JSON.stringify(r.jobs.map((j) => [j.job, j.exitCode])) === JSON.stringify([["build", 0], ["review", 0]]) &&
+  r.jobs[0].commands.length === 1 && r.jobs[0].commands[0].includes("echo changed > tracked.txt") &&
+  r.jobs[1].commands.length === 1 && r.jobs[1].commands[0].includes("/evidence/job2.txt") &&
+  createHmac("sha256", readHostKey(process.env.FIXTURE_EVIDENCE_KEY)).update(approvalEvidenceBytes(fields), "utf8").digest("hex") === mac;
+console.log(ok ? "ok" : JSON.stringify(r));
+' "$HOSTMOD/scripts/reviewer/approval-evidence.mjs" 2>&1)" && [ "$EV_OUT" = "ok" ]; then
+  pass "the driver wrote one approval-evidence record: planned scripts, exit status 0, the source commit, a MAC under the host key"
+else
+  fail "approval evidence: ${EV_OUT:-no output}"
 fi
 
 if ! leftover="$(docker ps -aq --filter 'label=tps.reviewer.job')"; then

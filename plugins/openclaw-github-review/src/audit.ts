@@ -60,6 +60,9 @@ export interface BuildOrgEventParams {
   event: ReviewEvent;
   bodySha256: string;
   receipt: ReviewReceipt;
+  /** The reviewer's APPROVE evidence digest for this commit, or null for an
+   *  event that requires no evidence. */
+  approvalEvidenceSha256: string | null;
   /** Opaque session/dispatch correlation id. */
   sessionCorrelationId: string;
   runtime: RuntimeEvidence;
@@ -77,6 +80,7 @@ export function buildOrgEvent(p: BuildOrgEventParams): OrgEventDraft {
     commit_id: p.commitId,
     event: p.event,
     body_sha256: p.bodySha256,
+    approval_evidence_sha256: p.approvalEvidenceSha256,
     review_id: p.receipt.id,
     review_url: p.receipt.url,
     commit_sha: p.receipt.commitId,

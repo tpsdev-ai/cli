@@ -1,0 +1,1 @@
+- **Verified bridge mail receives the external tier.**

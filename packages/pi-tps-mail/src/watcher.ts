@@ -30,6 +30,7 @@
 // re-presents it when its lease expires and the launcher runs again
 // (at-least-once). A journal entry that cannot be written blocks the send (the
 // same re-presentation applies), so every reply that leaves has an entry.
+import { signedTrustTier } from "@tpsdev-ai/agent";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
@@ -317,10 +318,19 @@ async function attemptAck(state: WatcherState, entry: ReplyJournalEntry): Promis
   }
 }
 
-/** Finish every reply the journal still owes: re-send `prepared`, re-ack `sent`. */
-async function recoverJournal(state: WatcherState): Promise<void> {
+async function recoverJournal(state: WatcherState, verified: MailMessage[]): Promise<void> {
   for (const entry of await readJournal(state.paths)) {
     if (state.stopped) return;
+    let inbound = verified.find((msg) => msg.id === entry.inboundId);
+    if (!inbound) {
+      const read = await runTps(state.paths, ["mail", "read", state.paths.agentId, entry.inboundId, "--json"], {
+        timeoutMs: state.options.checkTimeoutMs ?? CLI_TIMEOUT_MS, label: "mail read",
+      });
+      if (read.code === 0) {
+        try { inbound = JSON.parse(read.stdout); } catch { /* withhold */ }
+      }
+    }
+    if (!inbound?.envelope || inbound.id !== entry.inboundId || externalTier(inbound) || inbound.from !== entry.to || inbound.envelopeId !== entry.threadId) continue;
     if (entry.state === "sent") await attemptAck(state, entry);
     else await attemptSend(state, entry);
   }
@@ -328,12 +338,6 @@ async function recoverJournal(state: WatcherState): Promise<void> {
 
 // ─── verified inbound ───────────────────────────────────────────────────────
 
-/**
- * `tps mail check <agent> --json`: the CLI's promotion path. Returns ONLY the
- * records it verified (and re-verified cur/ records whose lease expired). A
- * failed or unparseable run returns nothing — no inbound is ever read any
- * other way.
- */
 async function checkVerified(state: WatcherState): Promise<MailMessage[]> {
   const res = await runTps(state.paths, ["mail", "check", state.paths.agentId, "--json"], {
     timeoutMs: state.options.checkTimeoutMs ?? CLI_TIMEOUT_MS,
@@ -351,6 +355,10 @@ async function checkVerified(state: WatcherState): Promise<MailMessage[]> {
     return [];
   }
   return Array.isArray(parsed) ? (parsed as MailMessage[]) : [];
+}
+
+function externalTier(msg: MailMessage): boolean {
+  return (msg.trustTier ?? (msg.envelope?.trust === undefined ? undefined : signedTrustTier(msg.envelope.trust))) === "external";
 }
 
 async function newHasMail(paths: Paths): Promise<boolean> {
@@ -373,6 +381,10 @@ async function dispatchVerified(state: WatcherState, msg: MailMessage): Promise<
     typeof msg.body !== "string"
   ) {
     console.error(`[${ts()}] a verified record lacks a usable id, sender or envelope id; not dispatched`);
+    return;
+  }
+  if (externalTier(msg)) {
+    console.error(`[${ts()}] not dispatching ${id}: external-tier mail`);
     return;
   }
   // A reply already produced for this inbound is finished from the journal
@@ -403,7 +415,7 @@ async function dispatchVerified(state: WatcherState, msg: MailMessage): Promise<
     );
     return;
   }
-  if (state.stopped) return; // journaled: the next start sends it
+  if (state.stopped) return;
   await attemptSend(state, entry);
 }
 
@@ -462,17 +474,20 @@ async function runLauncher(
 }
 
 /**
- * One poll: finish the journal, then — when new/ holds anything, or the rescan
+ * One poll: when new/ holds anything, or the rescan
  * interval has passed (lease-expired cur/ records, a retryable dlq/ entry) —
  * run the verified check and dispatch what it returns.
  */
 async function pollOnce(state: WatcherState): Promise<void> {
-  await recoverJournal(state);
   const rescanDue = Date.now() - state.lastCheckAt >= (state.options.rescanIntervalMs ?? RESCAN_INTERVAL_MS);
-  if (!rescanDue && !(await newHasMail(state.paths))) return;
   if (state.stopped) return;
-  state.lastCheckAt = Date.now();
-  for (const msg of await checkVerified(state)) {
+  let verified: MailMessage[] = [];
+  if (rescanDue || await newHasMail(state.paths)) {
+    state.lastCheckAt = Date.now();
+    verified = await checkVerified(state);
+  }
+  await recoverJournal(state, verified);
+  for (const msg of verified) {
     if (state.stopped) return;
     try {
       await dispatchVerified(state, msg);

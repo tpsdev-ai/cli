@@ -26,6 +26,15 @@ export interface GithubReviewConfig {
   reviewerIdentity: string | null;
   /** Where a pending (unacknowledged) audit record is retained for retry. */
   pendingAuditFile: string | null;
+  /** Host-only store of the review-build evidence APPROVE requires. */
+  approvalEvidenceFile: string | null;
+  /** The host-held key that authenticates approval-evidence records. */
+  approvalEvidenceKeyFile: string | null;
+  /** The CI workflow and job an APPROVE's evidence must be for. */
+  approvalCiWorkflow: string | null;
+  approvalCiJob: string | null;
+  /** Every host path a review sandbox mounts; empty = unusable. */
+  sandboxMountRoots: string[];
   /** Durable per-dispatch latch for outcomes whose external state is unknown. */
   reconcileFile: string | null;
   flairUrl: string;
@@ -38,6 +47,19 @@ export const DEFAULT_PROVISIONING_MAX_AGE_DAYS = 90;
 
 function asString(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v : null;
+}
+
+/** An absolute path, or null. */
+function asAbsolutePath(v: unknown): string | null {
+  const s = asString(v);
+  return s !== null && s.startsWith("/") ? s : null;
+}
+
+/** A non-empty list of absolute paths, or empty when any entry is not one. */
+function asAbsolutePaths(v: unknown): string[] {
+  if (!Array.isArray(v) || v.length === 0) return [];
+  const paths = v.map(asAbsolutePath);
+  return paths.every((p): p is string => p !== null) ? paths : [];
 }
 
 function asPositiveInt(v: unknown): number | null {
@@ -63,6 +85,11 @@ export function resolveConfig(raw: unknown, pluginVersion: string): GithubReview
     signingKeyFile: asString(cfg.signingKeyFile),
     reviewerIdentity: asString(cfg.reviewerIdentity),
     pendingAuditFile: asString(cfg.pendingAuditFile),
+    approvalEvidenceFile: asAbsolutePath(cfg.approvalEvidenceFile),
+    approvalEvidenceKeyFile: asAbsolutePath(cfg.approvalEvidenceKeyFile),
+    approvalCiWorkflow: asString(cfg.approvalCiWorkflow),
+    approvalCiJob: asString(cfg.approvalCiJob),
+    sandboxMountRoots: asAbsolutePaths(cfg.sandboxMountRoots),
     reconcileFile: asString(cfg.reconcileFile),
     flairUrl: asString(cfg.flairUrl) ?? "http://127.0.0.1:9926",
     sandboxImageDigest: asString(cfg.sandboxImageDigest),

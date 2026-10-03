@@ -35,6 +35,7 @@ export interface MailVerifyConfig {
   flairUrl?: string;
   /** Key path authenticating the verification reads. Falls back to FLAIR_KEY_PATH, then the per-agent default. */
   flairKeyPath?: string;
+  bridgeAgentId?: string;
 }
 
 /**

@@ -42,9 +42,9 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function plant(file: string, body: string) {
-  const envelope = buildSignedEnvelope("kern", BRIDGE, body, { kern: SEED });
-  const record = JSON.stringify({ from: "kern", to: BRIDGE, body: JSON.stringify(envelope) });
+function plant(file: string, body: string, trust?: string) {
+  const envelope = buildSignedEnvelope("kern", BRIDGE, body, { kern: SEED }, { trust });
+  const record = JSON.stringify({ id: file.replace(/\.json$/, ""), from: "kern", to: BRIDGE, body: JSON.stringify(envelope) });
   fs.writeFileSync(join(root, BRIDGE, "new", file), record);
   return record;
 }
@@ -95,10 +95,11 @@ test("many startup records and an overlapping timer produce no busy promotions",
   const { sent, logs } = start();
   tick();
   tick();
-  await settle();
+  for (let attempt = 0; attempt < 100 && sent.length < 24; attempt++) await settle();
   expect(logs.filter((line) => line.includes("(busy)"))).toEqual([]);
   expect(sent).toHaveLength(24);
   expect(new Set(sent.map((envelope) => envelope.content)).size).toBe(24);
+  expect(fs.readdirSync(join(root, BRIDGE, "cur")).filter((file) => file.endsWith(".json"))).toEqual([]);
 });
 
 test("timer retries, watcher notifications and a replay never forward a record twice", async () => {
@@ -120,4 +121,35 @@ test("timer retries, watcher notifications and a replay never forward a record t
   await settle();
   expect(sent.map((envelope) => envelope.content)).toEqual(["only once"]);
   expect(fs.readdirSync(join(root, BRIDGE, "new"))).toEqual([]);
+});
+
+test("queued promotion caps a bridge principal from the configured mail root before send or ack", async () => {
+  const { configureBridgeIdentity } = await import("@tpsdev-ai/agent");
+  configureBridgeIdentity(root, "test", "kern");
+  plant("capped.json", "external channel input", "internal");
+  const { sent } = start();
+  await settle();
+  expect(sent).toEqual([]);
+  const record = JSON.parse(fs.readFileSync(join(root, BRIDGE, "cur", "capped.json"), "utf8"));
+  expect(record.trustTier).toBe("external");
+  expect(record.ackedAt).toBeUndefined();
+});
+
+test("retryable redrive keeps the external tier before send or ack", async () => {
+  const lookup = spyOn(FlairClient.prototype, "getAgentForVerification")
+    .mockImplementationOnce(async () => { throw new Error("verifier outage"); })
+    .mockImplementation(async (name: string) => (
+      name === "kern" ? { id: name, name, publicKey: pubkeyFromSeed(SEED).toString("base64") } : null
+    ));
+  spies.push(lookup);
+  plant("external-retry.json", "external", "external");
+  const { sent } = start();
+  await settle();
+  expect(fs.existsSync(join(root, BRIDGE, "dlq", "external-retry.json"))).toBe(true);
+  tick();
+  await settle();
+  expect(sent).toEqual([]);
+  const record = JSON.parse(fs.readFileSync(join(root, BRIDGE, "cur", "external-retry.json"), "utf8"));
+  expect(record.trustTier).toBe("external");
+  expect(record.ackedAt).toBeUndefined();
 });

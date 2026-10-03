@@ -21,6 +21,12 @@
  *   - A non-interactive invocation that launches an agent MUST carry
  *     `--sandbox-required`; a launcher that dropped it is refused rather than
  *     silently running unsandboxed. See `evaluateLaunchControl`.
+ *   - an `agent start --runtime claude-code|codex|gemini` invocation carrying
+ *     `--sandbox-required` is refused, by this rule unless an earlier one
+ *     already refused it: those runtimes are spawned directly and never
+ *     reach the attested launch, so the flag would assert an isolation that
+ *     path cannot deliver (cli#363 slice A; routing them through the attested
+ *     launch is slice B).
  *   - Under `--sandboxed` the child must hold the launcher's release for a live
  *     nono session bound to its own pid (cli#350 round 4e): see
  *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
@@ -665,6 +671,30 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   return false;
 }
 
+/**
+ * The three runtimes that skip the attested launch (cli#363). `bin/tps.ts`
+ * branches on `--runtime <one of these>` BEFORE `runAgent({action:"start"})`,
+ * spawns the runtime directly, and never reaches `launchAttested()`: a launch on
+ * that path is NOT confined by nono, so it cannot honour `--sandbox-required`.
+ */
+export const ATTESTATION_EXEMPT_RUNTIMES: readonly string[] = ["claude-code", "codex", "gemini"];
+
+/** The exempt runtime `argv` selects via `--runtime <value>`, or undefined. */
+export function attestationExemptRuntime(argv: readonly string[] = process.argv): string | undefined {
+  const i = argv.indexOf("--runtime");
+  const value = i >= 0 ? argv[i + 1] : undefined;
+  return value !== undefined && ATTESTATION_EXEMPT_RUNTIMES.includes(value) ? value : undefined;
+}
+
+/** The refusal for `--sandbox-required` on a path that does not run attested. */
+export function attestationExemptRefusal(runtime: string): string {
+  return (
+    `${SANDBOX_REQUIRED_FLAG} is refused on the \`--runtime ${runtime}\` path: that runtime is spawned ` +
+    `directly and is not launched through the attested sandbox yet (cli#363), so the flag would ` +
+    `assert an isolation this path cannot deliver. Refusing to launch.`
+  );
+}
+
 export interface LaunchControlInput {
   /** Top-level command word (argv[2]). */
   command?: string;
@@ -740,6 +770,23 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
         `a stale wrapper or a dropped argument would otherwise run the agent unsandboxed. ` +
         `Refusing to launch.`,
     );
+  }
+
+  // (2b) cli#363 — a launch on the `--runtime` branch cannot honour
+  // `--sandbox-required`, because it never reaches the attested launch. The
+  // command-name check above is satisfied by `agent start`, so before this rule
+  // the flag passed the gate and the process then ran unconfined: a guarantee
+  // the path cannot deliver, read as delivered. Refused, TTY included, unless an
+  // earlier rule has already refused, until those runtimes are routed through
+  // `launchAttested()`.
+  const exemptRuntime = attestationExemptRuntime(argv);
+  if (
+    exemptRuntime !== undefined &&
+    input.command === "agent" &&
+    input.rest?.[0] === "start" &&
+    argv.includes(SANDBOX_REQUIRED_FLAG)
+  ) {
+    return deny(attestationExemptRefusal(exemptRuntime));
   }
 
   return { allowed: true, refusalExitCode: 0 };

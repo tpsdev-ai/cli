@@ -33,7 +33,8 @@ import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { MailMessage } from "../utils/mail.js";
-import { getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
+import { mailRootForRecordPath, getInbox, isConsumedForMailbox, type VerifyRecordResult, verifyRecordForMailbox } from "../utils/mail.js";
+import { externalDispatchRefusal } from "../utils/mail-tier.js";
 import { SANDBOX_REQUIRED_FLAG } from "../utils/nono.js";
 
 // ---------------------------------------------------------------------------
@@ -313,7 +314,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         let result: VerifyRecordResult;
         try {
           if (opts.beforeVerify) await opts.beforeVerify();
-          result = await verifyRecordForMailbox(opts.agent, record);
+          result = await verifyRecordForMailbox(opts.agent, record, mailRootForRecordPath(path));
         } catch (err) {
           // A verification ERROR — Flair unreachable, or a malformed envelope
           // structure — is not a verdict. The record is withheld and logged, and
@@ -331,6 +332,15 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         const envId = result.message.envelopeId;
         if (envId === undefined) {
           classified.set(file, "refused:no-envelope-id");
+          continue;
+        }
+        // cli#433 (slice B2-1): honour the SIGNED tier. An arbitrary hook command
+        // has no external capability set, so external-tier mail is not presented
+        // (the hook does not run), with a named reason.
+        const refusal = externalDispatchRefusal(result.message.envelope, result.message.from, result.message.trustTier);
+        if (refusal) {
+          classified.set(file, "refused:external-tier");
+          console.error(`[mail-watch] ${envId}: not presented (${refusal})`);
           continue;
         }
         // Skip a verified record whose id the consumed history holds. When that

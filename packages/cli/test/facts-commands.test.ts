@@ -187,6 +187,13 @@ describe("register", () => {
     expect(stderr).toContain("Validation error");
   });
 
+  test("rejects missing credential type", async () => {
+    const stderr = await captureStderr(() =>
+      runFacts({ action: "register", name: "test.notype", command: "/bin/echo", parsedArgs: ["hi"], rationale: "Test." })
+    );
+    expect(stderr).toContain("--cred-type is required");
+  });
+
   test("rejects missing rationale", async () => {
     const stderr = await captureStderr(() =>
       runFacts({
@@ -198,7 +205,7 @@ describe("register", () => {
       })
     );
 
-    expect(stderr).toContain("--rationale is required");
+    expect(stderr).toContain("--reason is required");
   });
 
   test("rejects invalid TTL", async () => {

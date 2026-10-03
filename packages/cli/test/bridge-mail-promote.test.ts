@@ -85,7 +85,7 @@ function plant(name: string, from: string, signWith: Buffer, body: string): void
   const envelope = buildSignedEnvelope(from, BRIDGE, body, { [from]: signWith });
   writeFileSync(
     join(inbox("new"), name),
-    JSON.stringify({ from, to: BRIDGE, body: JSON.stringify(envelope) }),
+    JSON.stringify({ id: name.replace(/\.json$/, ""), from, to: BRIDGE, body: JSON.stringify(envelope) }),
     "utf-8",
   );
 }
@@ -106,7 +106,7 @@ describe("the channel bridge promotes before forwarding (cli#380)", () => {
     await waitFor(() => sent.length === 1);
 
     expect(sent[0]!.content).toBe("hello from the agent");
-    expect(files("cur")).toContain("ok.json");
+    await waitFor(() => !files("cur").includes("ok.json"));
     expect(files("new")).not.toContain("ok.json");
   });
 
@@ -137,7 +137,7 @@ describe("the channel bridge promotes before forwarding (cli#380)", () => {
 
     await waitFor(() => sent.length === 1);
     expect(sent[0]!.content).toBe("after the outage");
-    expect(files("cur")).toContain("outage.json");
+    await waitFor(() => !files("cur").includes("outage.json"));
     expect(files("dlq")).not.toContain("outage.json");
   });
 });

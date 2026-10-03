@@ -55,7 +55,7 @@ export function startBridgeDaemon(config: BridgeConfig = {}): void {
 
   const adapter = new OpenClawAdapter(adapterConfig);
   const core = new BridgeCore(adapter, {
-    bridgeAgentId: config.bridgeAgentId ?? "openclaw-bridge",
+    bridgeAgentId: config.bridgeAgentId,
     mailDir: config.mailDir,
     defaultAgentId: config.defaultAgentId,
   });

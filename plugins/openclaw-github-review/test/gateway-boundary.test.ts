@@ -42,7 +42,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { CI_PROBE_ENV, CI_PROBE_TOOL_NAME, HOST_MARKER_ENV, registerGithubReview, TOOL_NAME } from "../src/index.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../../../scripts/reviewer/approval-evidence.mjs";
 import {
+  CI_JOB,
+  CI_WORKFLOW,
   COMMIT,
   fakeCredentialFiles,
   FakeGitHub,
@@ -54,7 +57,9 @@ import {
   TOKEN,
   validAssignment,
   validInput,
+  PASSING_JOBS,
   writeEd25519Key,
+  writeHostKey,
 } from "./helpers.js";
 import {
   createProbeOverlay,
@@ -129,6 +134,28 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
   writeFileSync(markerPath, MARKER, { mode: 0o600 });
   const reconcileFile = join(dir, "reconcile.json");
   const pendingAuditFile = join(dir, "pending.json");
+  const approvalEvidenceFile = join(dir, "approval-evidence.json");
+  const approvalEvidenceKeyFile = join(dir, "approval-evidence.key");
+  const approvalKey = writeHostKey(approvalEvidenceKeyFile);
+  writeApprovalEvidence(
+    approvalEvidenceFile,
+    buildApprovalEvidence(
+      {
+        repo: REPO,
+        pr: PR,
+        dispatchId,
+        reviewer: REVIEWER,
+        sessionKey: SESSION,
+        commit: COMMIT,
+        workflow: CI_WORKFLOW,
+        job: CI_JOB,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        finishedAt: new Date().toISOString(),
+        jobs: PASSING_JOBS,
+      },
+      approvalKey,
+    ),
+  );
   return {
     pluginConfig: {
       allowedRepositories: [REPO],
@@ -140,6 +167,11 @@ function laneHost(dir: string, dispatchId: string): LaneHost {
       reviewerIdentity: REVIEWER,
       pendingAuditFile,
       reconcileFile,
+      approvalEvidenceFile,
+      approvalEvidenceKeyFile,
+      approvalCiWorkflow: CI_WORKFLOW,
+      approvalCiJob: CI_JOB,
+      sandboxMountRoots: [join(dir, "workspace")],
       flairUrl: FLAIR,
     },
     credentialFile,
@@ -385,6 +417,11 @@ describe("A11 — secret scans through registerGithubReview, every outcome path 
         reviewerIdentity: REVIEWER,
         pendingAuditFile: s.config.pendingAuditFile,
         reconcileFile: s.config.reconcileFile,
+        approvalEvidenceFile: s.config.approvalEvidenceFile,
+        approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
+        approvalCiWorkflow: s.config.approvalCiWorkflow,
+        approvalCiJob: s.config.approvalCiJob,
+        sandboxMountRoots: s.config.sandboxMountRoots,
       },
       tools,
       logs,

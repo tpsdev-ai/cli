@@ -5,10 +5,11 @@
  * outside the test's own temp root.
  */
 
-import { createHash, generateKeyPairSync, type KeyObject } from "node:crypto";
+import { createHash, generateKeyPairSync, randomBytes, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { StaticAssignmentResolver } from "../src/assignment.js";
+import { buildApprovalEvidence, writeApprovalEvidence } from "../../../scripts/reviewer/approval-evidence.mjs";
 import { MemoryReconcileStore } from "../src/audit.js";
 import { CredentialCustody } from "../src/credential.js";
 import { resolveConfig, type GithubReviewConfig } from "../src/config.js";
@@ -142,6 +143,11 @@ export function pluginConfigOf(s: Scenario, flairUrl = "http://flair.test.invali
     signingKeyFile: s.config.signingKeyFile,
     reviewerIdentity: s.config.reviewerIdentity,
     pendingAuditFile: s.config.pendingAuditFile,
+    approvalEvidenceFile: s.config.approvalEvidenceFile,
+    approvalEvidenceKeyFile: s.config.approvalEvidenceKeyFile,
+    approvalCiWorkflow: s.config.approvalCiWorkflow,
+    approvalCiJob: s.config.approvalCiJob,
+    sandboxMountRoots: s.config.sandboxMountRoots,
     reconcileFile: s.config.reconcileFile,
     flairUrl,
   };
@@ -244,6 +250,15 @@ export function fakeCredentialFiles(
 export interface Scenario {
   config: GithubReviewConfig;
   custody: CredentialCustody;
+  /** The host key that authenticates the approval-evidence records. */
+  approvalKey: Buffer;
+}
+
+/** Write a fresh 32-byte host key as base64, returning its bytes. */
+export function writeHostKey(path: string): Buffer {
+  const key = randomBytes(32);
+  writeFileSync(path, key.toString("base64"), { mode: 0o600 });
+  return key;
 }
 
 /** The standard, fully-valid host configuration for a test. */
@@ -256,6 +271,8 @@ export function scenario(
   const files = fakeCredentialFiles(root, credOpts);
   const signingKeyFile = join(root, "anvil.key");
   writeEd25519Key(signingKeyFile);
+  const approvalEvidenceKeyFile = join(root, "approval-evidence.key");
+  const approvalKey = writeHostKey(approvalEvidenceKeyFile);
   const config = resolveConfig(
     {
       allowedRepositories: [REPO],
@@ -266,6 +283,11 @@ export function scenario(
       reviewerIdentity: REVIEWER,
       pendingAuditFile: join(root, "pending.json"),
       reconcileFile: join(root, "reconcile.json"),
+      approvalEvidenceFile: join(root, "approval-evidence.json"),
+      approvalEvidenceKeyFile,
+      approvalCiWorkflow: CI_WORKFLOW,
+      approvalCiJob: CI_JOB,
+      sandboxMountRoots: [join(root, "workspace")],
       sandboxImageDigest: "sha256:deadbeef",
       ...configOverrides,
     },
@@ -277,7 +299,49 @@ export function scenario(
     maxAgeDays: config.provisioningMaxAgeDays,
     clock: () => new Date(),
   });
-  return { config, custody };
+  // A passing record for the standard dispatch, session and commit.
+  recordEvidence({ config, approvalKey });
+  return { config, custody, approvalKey };
+}
+
+export const CI_WORKFLOW = ".github/workflows/test.yml";
+export const CI_JOB = "test";
+export const PASSING_JOBS = [
+  { job: "build", commands: ["bun install --frozen-lockfile", "bun run build"], exitCode: 0 },
+  { job: CI_JOB, commands: ["bun install --frozen-lockfile", "bun run test"], exitCode: 0 },
+];
+
+/** Write a passing, host-signed evidence record for one dispatch (the standard
+ *  dispatch by default). */
+export function recordEvidence({
+  config,
+  approvalKey,
+  dispatchId = "dispatch-1",
+}: {
+  config: GithubReviewConfig;
+  approvalKey: Buffer;
+  dispatchId?: string;
+}): void {
+  if (!config.approvalEvidenceFile || !config.approvalEvidenceKeyFile) return;
+  writeApprovalEvidence(
+    config.approvalEvidenceFile,
+    buildApprovalEvidence(
+      {
+        repo: REPO,
+        pr: PR,
+        dispatchId,
+        reviewer: REVIEWER,
+        sessionKey: "sess-1",
+        commit: COMMIT,
+        workflow: CI_WORKFLOW,
+        job: CI_JOB,
+        startedAt: new Date(Date.now() - 60_000).toISOString(),
+        finishedAt: new Date().toISOString(),
+        jobs: PASSING_JOBS,
+      },
+      approvalKey,
+    ),
+  );
 }
 
 export function resolver(assignments: DispatchAssignment[]): AssignmentResolver {

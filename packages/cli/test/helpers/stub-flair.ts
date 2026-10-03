@@ -69,23 +69,24 @@ export function buildSignedEnvelope(
   to: string,
   body: string,
   seeds: Record<string, Buffer>,
-  opts: { messageId?: string; chain?: ChainEntry[] } = {},
+  opts: { messageId?: string; chain?: ChainEntry[]; trust?: string } = {},
 ): Envelope {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = opts.chain ?? [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
     { agent: from, kind: "agent", timestamp: now, rationale: `agent ${from} dispatches`, signature: null },
   ];
-  return signEnvelope(
-    {
-      v: 1,
-      from,
-      to,
-      body,
-      messageId: opts.messageId ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      timestamp: now,
-      delegationChain: chain,
-    },
-    seeds,
-  );
+  const envelope: Envelope = {
+    v: 1,
+    from,
+    to,
+    body,
+    messageId: opts.messageId ?? `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: now,
+    delegationChain: chain,
+  };
+  // `trust` is a signed envelope field. The cast lets a test plant an
+  // out-of-union value (the unknown-trust-refused case).
+  if (opts.trust !== undefined) (envelope as { trust?: unknown }).trust = opts.trust;
+  return signEnvelope(envelope, seeds);
 }

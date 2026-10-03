@@ -86,11 +86,11 @@ describe("this repository's test job", () => {
   test("every run: step of test, in order, in its working directory — including the HOME-isolated suite, both plugin launchers and the report guard", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
-      [4, ".", false],
       [5, ".", false],
       [6, ".", false],
       [7, ".", false],
-      [8, "plugins/openclaw-tps-mail", false],
+      [8, ".", false],
+      [9, "plugins/openclaw-tps-mail", false],
       [10, "plugins/openclaw-github-review", false],
       [11, ".", true],
     ]);
@@ -137,23 +137,23 @@ describe("this repository's test job", () => {
     const t = jobOf(p, "test");
     expect(t.skipped.map((s: { uses: string; tag: string }) => `${s.uses.split("@")[0]}@${s.tag}`)).toEqual([
       "actions/checkout@v4.2.2",
+      "actions/setup-node@v4.4.0",
       "oven-sh/setup-bun@v2.0.2",
       "socketdev/action@v1.3.2",
-      "actions/setup-node@v4.4.0",
     ]);
     if (!p.ok) return;
-    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["1.3.10", "1.3.10", "24.21.0"]);
+    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["24.21.0", "1.3.10", "24.21.0", "1.3.10"]);
     expect(p.shims).toEqual(["sfw"]);
   });
 
-  test("the plan annotates the steps of test with node: default up to its setup-node, 24.21.0 after it", () => {
+  test("every run: step of the test job is planned on Node 24.21.0", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
-      [4, "default"],
-      [5, "default"],
-      [6, "default"],
-      [7, "default"],
-      [8, "default"],
+      [5, "24.21.0"],
+      [6, "24.21.0"],
+      [7, "24.21.0"],
+      [8, "24.21.0"],
+      [9, "24.21.0"],
       [10, "24.21.0"],
       [11, "24.21.0"],
     ]);

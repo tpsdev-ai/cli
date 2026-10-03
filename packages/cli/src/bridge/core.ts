@@ -17,7 +17,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { promote, redriveRetryable } from "../utils/mail.js";
+import { promote, recoverPromoted, redriveRetryable, ackMessage, mailRootForRecordPath, type PromoteOk } from "../utils/mail.js";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -25,6 +25,9 @@ const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export function validateAgentId(id: string): boolean {
   return AGENT_ID_RE.test(id);
 }
+
+export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
+import { configureBridgeIdentity } from "@tpsdev-ai/agent";
 
 export interface BridgeCoreConfig {
   bridgeAgentId?: string;
@@ -52,8 +55,8 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    this.bridgeAgentId = config.bridgeAgentId ?? "bridge-" + adapter.name;
-    this.mailDir = config.mailDir ?? join(homedir(), ".tps", "mail");
+    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(process.env.HOME ?? homedir(), ".tps", "mail");
+    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
     this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
@@ -129,8 +132,9 @@ Message: ${envelope.content}`;
   }
 
   private watchOutbox(): () => void {
-    const { fresh, dlq } = this.mailboxDir(this.bridgeAgentId);
+    const { fresh, cur, dlq } = this.mailboxDir(this.bridgeAgentId);
     mkdirSync(fresh, { recursive: true });
+    mkdirSync(cur, { recursive: true });
 
     let stopped = false;
     let work = Promise.resolve();
@@ -142,54 +146,9 @@ Message: ${envelope.content}`;
       return work;
     };
 
-    const promoteFile = async (file: string) => {
-      if (!file.endsWith(".json")) return;
-      const fullPath = join(fresh, file);
-      if (!existsSync(fullPath)) return;
-
-      // Only a record promote() verified is forwarded (cli#380).
-      let promoted: Awaited<ReturnType<typeof promote>>;
-      try {
-        promoted = await promote(this.bridgeAgentId, fullPath);
-      } catch (e) {
-        this.log(`[bridge:outbound] promotion failed for ${file}: ${e}`);
-        return;
-      }
-      if (!promoted.ok) {
-        this.log(`[bridge:outbound] ${file} not promoted (${promoted.class}); not forwarded`);
-        return;
-      }
-      forward(promoted.message.body);
-    };
-
-    const processFile = (file: string) => {
-      if (!file.endsWith(".json") || pending.has(file) || stopped) return;
-      pending.add(file);
-      void enqueue(async () => {
-        try {
-          await promoteFile(file);
-        } finally {
-          pending.delete(file);
-        }
-      });
-    };
-
-    let redriving = false;
-    const redrive = () => {
-      if (redriving || stopped) return;
-      redriving = true;
-      void enqueue(async () => {
-        try {
-          for (const file of readdirSync(fresh)) await promoteFile(file);
-          for (const promoted of await redriveRetryable(this.bridgeAgentId, dlq)) forward(promoted.message.body);
-        } finally {
-          redriving = false;
-        }
-      });
-    };
-
-    // The promoted body is the verified payload (the envelope's body).
-    const forward = (verifiedBody: string) => {
+    const forward = async (result: PromoteOk) => {
+      if (result.message.trustTier === "external") return;
+      const verifiedBody = result.message.body;
       let envelope: BridgeEnvelope;
       let parsedBody: unknown = null;
       try {
@@ -210,20 +169,65 @@ Message: ${envelope.content}`;
           timestamp: new Date().toISOString(),
         };
       }
-
-      this.adapter.send(envelope).then(() => {
+      try {
+        await this.adapter.send(envelope);
+        ackMessage(this.bridgeAgentId, result.message.id, mailRootForRecordPath(result.path));
         this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
-      }).catch((e) => {
+      } catch (e) {
         this.log(`[bridge:outbound] Delivery failed: ${e}`);
+      }
+    };
+
+    const promoteFile = async (file: string, recovery = false) => {
+      if (!file.endsWith(".json")) return;
+      const fullPath = join(recovery ? cur : fresh, file);
+      if (!existsSync(fullPath)) return;
+      try {
+        const result = await (recovery ? recoverPromoted : promote)(this.bridgeAgentId, fullPath);
+        if (!result.ok) {
+          this.log(`[bridge:outbound] ${file} not promoted (${result.class}); not forwarded`);
+          return;
+        }
+        await forward(result);
+      } catch (e) {
+        this.log(`[bridge:outbound] promotion failed for ${file}: ${e}`);
+      }
+    };
+
+    const processFile = (file: string, recovery = false) => {
+      const fullPath = join(recovery ? cur : fresh, file);
+      if (!file.endsWith(".json") || pending.has(fullPath) || stopped) return;
+      pending.add(fullPath);
+      void enqueue(async () => {
+        try {
+          await promoteFile(file, recovery);
+        } finally {
+          pending.delete(fullPath);
+        }
+      });
+    };
+
+    let redriving = false;
+    const redrive = () => {
+      if (redriving || stopped) return;
+      redriving = true;
+      void enqueue(async () => {
+        try {
+          for (const file of readdirSync(fresh)) await promoteFile(file);
+          for (const promoted of await redriveRetryable(this.bridgeAgentId, dlq)) await forward(promoted);
+        } finally {
+          redriving = false;
+        }
       });
     };
 
     try {
-      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach((f) => void processFile(f));
+      readdirSync(fresh).filter((f) => f.endsWith(".json")).forEach((f) => processFile(f));
+      readdirSync(cur).filter((f) => f.endsWith(".json")).forEach((f) => processFile(f, true));
     } catch {}
 
     const watcher = watch(fresh, (_event, filename) => {
-      if (filename) void processFile(filename.toString());
+      if (filename) processFile(filename.toString());
     });
     const redriveTimer = setInterval(() => void redrive(), this.redriveMs);
 
