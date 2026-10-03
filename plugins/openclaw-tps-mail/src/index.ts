@@ -71,6 +71,7 @@ import {
   nackOwed,
   newestSessionTranscript,
   readObligation,
+  readObligationResult,
   receiptThread,
   receiptsDir,
   scanForReceipt,
@@ -712,6 +713,7 @@ interface YieldContext {
   agent: string;
   sender: string;
   accountId: string;
+  incarnation: symbol;
   curPath: string;
   inboundId: string;
   /** cli#429: the inbound's SIGNED envelope messageId, from the obligation
@@ -732,7 +734,87 @@ interface YieldContext {
 
 /** obligationId → the context needed to ack/nack it after the dispatch is gone. */
 const yieldContexts = new Map<string, YieldContext>();
-const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
+
+interface ArmedDeadline {
+  accountId: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+const armedDeadlines = new Map<string, ArmedDeadline>();
+
+interface AccountLifetime {
+  incarnation: symbol;
+  timers: Set<ReturnType<typeof setTimeout>>;
+  watchers: Set<FSWatcher>;
+  resolveShutdown: () => void;
+}
+const accountLifetimes = new Map<string, AccountLifetime>();
+const gatewayIncarnations = new WeakMap<object, symbol>();
+const signalIncarnations = new WeakMap<AbortSignal, symbol>();
+
+function isLiveContext(ctx: Pick<YieldContext, "accountId" | "incarnation">): boolean {
+  return accountLifetimes.get(ctx.accountId)?.incarnation === ctx.incarnation;
+}
+
+function accountTimer(ctx: Pick<YieldContext, "accountId" | "incarnation">, fn: () => void, ms: number): ReturnType<typeof setTimeout> {
+  const lifetime = accountLifetimes.get(ctx.accountId)!;
+  const timer = setTimeout(() => {
+    lifetime.timers.delete(timer);
+    if (isLiveContext(ctx)) fn();
+  }, ms);
+  lifetime.timers.add(timer);
+  return timer;
+}
+
+function clearAccountTimer(accountId: string, timer: ReturnType<typeof setTimeout>): void {
+  clearTimeout(timer);
+  accountLifetimes.get(accountId)?.timers.delete(timer);
+}
+
+function releaseObligationState(obligationId: string): void {
+  yieldContexts.delete(obligationId);
+  const armed = armedDeadlines.get(obligationId);
+  if (armed) {
+    clearAccountTimer(armed.accountId, armed.timer);
+    armedDeadlines.delete(obligationId);
+  }
+}
+
+function releaseAccountState(accountId: string): void {
+  for (const [obligationId, ctx] of yieldContexts) {
+    if (ctx.accountId === accountId) yieldContexts.delete(obligationId);
+  }
+  for (const [obligationId, armed] of armedDeadlines) {
+    if (armed.accountId === accountId) {
+      clearAccountTimer(armed.accountId, armed.timer);
+      armedDeadlines.delete(obligationId);
+    }
+  }
+}
+
+function endAccountLifetime(accountId: string, incarnation?: symbol): void {
+  const lifetime = accountLifetimes.get(accountId);
+  if (incarnation !== undefined && lifetime?.incarnation !== incarnation) return;
+  accountLifetimes.delete(accountId);
+  if (lifetime) {
+    lifetime.resolveShutdown();
+    for (const timer of lifetime.timers) clearTimeout(timer);
+    for (const watcher of lifetime.watchers) {
+      try { watcher.close(); } catch { /* ignore */ }
+    }
+  }
+  releaseAccountState(accountId);
+}
+
+/** Test-only snapshot of obligation contexts and deadlines. */
+export function obligationStateForTests(): {
+  contexts: { obligationId: string; accountId: string }[];
+  deadlines: { obligationId: string; accountId: string }[];
+} {
+  return {
+    contexts: [...yieldContexts].map(([obligationId, ctx]) => ({ obligationId, accountId: ctx.accountId })),
+    deadlines: [...armedDeadlines].map(([obligationId, armed]) => ({ obligationId, accountId: armed.accountId })),
+  };
+}
 
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
@@ -774,7 +856,32 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
+function retryObligationRead(ctx: YieldContext, obligationId: string): void {
+  if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
+  const timer = accountTimer(ctx, () => {
+    armedDeadlines.delete(obligationId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "found" && !TERMINAL_STATES.has(result.record.state)) {
+      armDeadline(ctx, obligationId, result.record.deadlineAt);
+    }
+  }, 1000);
+  if (typeof (timer as any).unref === "function") (timer as any).unref();
+  armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
+}
+
+function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
+  const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (result.status === "unverified") {
+    retryObligationRead(ctx, obligationId);
+    ctx.log?.warn?.(`tps-mail: obligation-read-unverified: ${ctx.inboundId} path=${result.path} code=${result.code}`);
+  } else if (result.status === "missing" || TERMINAL_STATES.has(result.record.state)) {
+    releaseObligationState(obligationId);
+  }
+  return result;
+}
+
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
+  if (!isLiveContext(ctx)) return;
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
   // record (e.g. a deadline that already FAILED the obligation) refuses the
   // transition (obligations.ts: TERMINAL_STATES is final, never resurrected)
@@ -782,9 +889,9 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   // while the obligation stays failed (cli#400).
   const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
   if (!updated || updated.state !== "acked") {
-    // The transition was REFUSED, not landed (cli#389 round 9: a refused
-    // transition returns null) — so read the record to name WHY.
-    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "unverified") return;
+    const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
       `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
@@ -792,6 +899,7 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
   }
   patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
+  releaseObligationState(obligationId);
 }
 
 /**
@@ -835,13 +943,14 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
  * terminal, or could not be settled (the store itself rejected the write).
  */
 async function internalInbound(ctx: YieldContext): Promise<boolean> {
+  if (!isLiveContext(ctx)) return false;
   try {
     const record = readMailFile(ctx.curPath);
     if (!record) return false;
     const recovered = record.envelope
       ? await recoverPromoted(ctx.agent, ctx.curPath)
       : await verifyRecordForMailbox(ctx.agent, record as any, mailRootForRecordPath(ctx.curPath));
-    if (!recovered.ok || recovered.message.trustTier === "external") return false;
+    if (!isLiveContext(ctx) || !recovered.ok || recovered.message.trustTier === "external") return false;
     return recovered.message.from === ctx.sender && recovered.message.id === ctx.inboundId
       && (ctx.inboundEnvelopeId === undefined || recovered.message.envelopeId === ctx.inboundEnvelopeId);
   } catch { return false; }
@@ -865,9 +974,10 @@ async function settleObligation(
     alreadyStamped?: boolean;
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
-  if (!(await internalInbound(ctx))) return "none";
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec) return "none";
+  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return "none";
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found") return "none";
+  const rec = result.record;
   if (TERMINAL_STATES.has(rec.state)) {
     ctx.log?.info?.(
       `tps-mail: obligation ${rec.obligationId} is ${rec.state}; ignoring the ${s.verdict ?? s.reason} determination`,
@@ -893,10 +1003,9 @@ async function settleObligation(
         ctx.log,
       );
       if (appliedUnconfirmed === null) {
-        // cli#389 round 13, item 3: a REFUSED transition (the record is gone or
-        // already terminal) is not a recorded outcome — say so and stop, exactly
-        // as the ack path does. Do not treat the refusal as a settled state.
-        const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+        const result = readObligationForCleanup(ctx, obligationId);
+        if (result.status === "unverified") return "none";
+        const cur = result.status === "found" ? result.record : null;
         ctx.log?.warn?.(
           `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
         );
@@ -909,6 +1018,7 @@ async function settleObligation(
       );
       return "none";
     }
+    releaseObligationState(obligationId);
     ctx.log?.warn?.(
       `tps-mail: obligation for ${ctx.inboundId} UNCONFIRMED: ${s.reason} — the reply was committed (${rec.state}) ` +
         `and no receipt evidence was found by its deadline; NOT failed, no nack sent`,
@@ -945,23 +1055,25 @@ async function settleObligation(
     return "none";
   }
   if (appliedFailed === null) {
-    // cli#389 round 13, item 3: the transition was REFUSED (the record is gone
-    // or already terminal) — do NOT stamp the inbound and do NOT send a nack
-    // mail for a failure that was never recorded. An await added to this window
-    // can therefore never leave a refused record stamped or nacked.
-    const cur = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "unverified") return "none";
+    const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
         `the inbound keeps no nack stamp and no nack mail is sent`,
     );
     return "none";
   }
+  // The failure is terminal: drop the context and its timer before the nack is
+  // handed off (cli#403).
+  releaseObligationState(obligationId);
   if (!s.alreadyStamped) {
     patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
   const nackHandedOff = await deliverNack(ctx, failedOn);
+  if (!isLiveContext(ctx)) return "none";
   ctx.log?.warn?.(
     `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
       (s.alreadyStamped ? ", the inbound already carried its nack" : "") +
@@ -992,13 +1104,16 @@ async function settleObligation(
  * the caller can say what actually happened to the sender.
  */
 async function deliverNack(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
+  if (!isLiveContext(ctx)) return false;
   let handedOff = false;
   try {
     handedOff = await sendNackMail(ctx, reason, opts);
   } catch (err: any) {
+    if (!isLiveContext(ctx)) return false;
     ctx.log?.warn?.(`tps-mail: could not deliver the nack for ${ctx.inboundId}: ${err?.message ?? err}`);
     handedOff = false;
   }
+  if (!isLiveContext(ctx)) return false;
   if (handedOff) {
     // cli#389 round 11, item 2: the hand-off LANDED, but the record that says so
     // may not have. A failed write is logged BY NAME inside markNackSent, never
@@ -1038,8 +1153,10 @@ function retryOwedNackInBackground(
   accountId: string,
   cfg: any,
   log: any,
+  incarnation: symbol,
   inboundEnvelopeId?: string,
 ): void {
+  if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
   // BACKSTOP, deliberately ABOVE the delivery's own bound: the relay closes the
   // transport at `timeoutMs` and reports the timeout (logged by name in
@@ -1057,11 +1174,12 @@ function retryOwedNackInBackground(
     inboundId,
     cfg,
     log,
+    incarnation,
     inboundEnvelopeId,
   );
   let timer: ReturnType<typeof setTimeout> | null = null;
   const expired = new Promise<"expired">((res) => {
-    timer = setTimeout(() => res("expired"), backstopMs);
+    timer = accountTimer(ctx, () => res("expired"), backstopMs);
     if (timer && typeof (timer as { unref?: () => void }).unref === "function") {
       (timer as { unref: () => void }).unref();
     }
@@ -1074,6 +1192,7 @@ function retryOwedNackInBackground(
     expired,
   ])
     .then((outcome) => {
+      if (!isLiveContext(ctx)) return;
       if (outcome === "expired") {
         log?.warn?.(
           `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not complete within ${backstopMs}ms ` +
@@ -1082,10 +1201,11 @@ function retryOwedNackInBackground(
       }
     })
     .catch((err: any) => {
+      if (!isLiveContext(ctx)) return;
       log?.warn?.(`tps-mail: nack-retry-failed: the owed nack for ${inboundId} to ${sender} threw: ${err?.message ?? err}`);
     })
     .finally(() => {
-      if (timer) clearTimeout(timer);
+      if (timer) clearAccountTimer(accountId, timer);
     });
 }
 
@@ -1128,8 +1248,10 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
 function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
+  if (!isLiveContext(ctx)) return;
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const rec = result.record;
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
   // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
   // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
@@ -1140,19 +1262,22 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
   transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
-  if (prev) clearTimeout(prev);
-  const timer = setTimeout(() => {
+  if (prev) clearAccountTimer(prev.accountId, prev.timer);
+  const timer = accountTimer(ctx, () => {
     armedDeadlines.delete(obligationId);
     void onDeadline(ctx, obligationId);
   }, remaining);
   if (typeof (timer as any).unref === "function") (timer as any).unref();
-  armedDeadlines.set(obligationId, timer);
+  armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
 }
 
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
-  const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec || TERMINAL_STATES.has(rec.state)) return; // late event after a terminal state: no-op
+  if (!isLiveContext(ctx)) return;
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const rec = result.record;
   const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
+  if (!isLiveContext(ctx)) return;
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
   // record) is a definitive non-delivery: the obligation fails and nacks even
@@ -1183,9 +1308,10 @@ function makeYieldCtx(
   inboundId: string,
   cfg: any,
   log: any,
+  incarnation: symbol,
   inboundEnvelopeId?: string,
 ): YieldContext {
-  return { mailDir, agent, sender, accountId, curPath, inboundId, inboundEnvelopeId, cfg, log };
+  return { mailDir, agent, sender, accountId, incarnation, curPath, inboundId, inboundEnvelopeId, cfg, log };
 }
 
 /**
@@ -1201,11 +1327,16 @@ function makeYieldCtx(
 function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
   let client: ReturnType<typeof createMailVerifyClient> | null = null;
   return async (envelope) => {
+    if (!isLiveContext(ctx)) return false;
     try {
       client ??= createMailVerifyClient(ctx.agent);
-      const verdict = await verifyEnvelope(envelope, await client);
+      const verifier = await client;
+      if (!isLiveContext(ctx)) return false;
+      const verdict = await verifyEnvelope(envelope, verifier);
+      if (!isLiveContext(ctx)) return false;
       return verdict.ok && verifiedMailTier(envelope, ctx.mailDir) !== "external";
     } catch (err: any) {
+      if (!isLiveContext(ctx)) return false;
       ctx.log?.warn?.(
         `tps-mail: receipt-verify-unavailable: the reply carried by a receipt for ${ctx.inboundId} could not be verified ` +
           `(${err?.message ?? err}); it is not evidence until a later scan verifies it`,
@@ -1256,7 +1387,7 @@ async function reconcileObligation(
   ctx: YieldContext,
   rec: { obligationId: string; deadlineAt: string | null; inboundId: string; inboundEnvelopeId?: string; replyId?: string },
 ): Promise<void> {
-  if (!(await internalInbound(ctx))) return;
+  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return;
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
@@ -1277,6 +1408,7 @@ async function reconcileObligation(
     }
   }
   const receipt = await scanObligationReceipt(ctx, rec.obligationId, rec, rec.replyId);
+  if (!isLiveContext(ctx)) return;
   if (receipt.status === "found") {
     await settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
     return;
@@ -1297,7 +1429,7 @@ async function reconcileObligation(
  * error, so an operator can tell a dead branch from a refused one.
  */
 async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs?: number } = {}): Promise<boolean> {
-  if (!(await internalInbound(ctx))) return false;
+  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -1344,6 +1476,7 @@ async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs
       writeOutboxFile(message);
     } else if (route.kind === "remote-branch") {
       await deliverRemote(message, route.branchId, { timeoutMs: opts.timeoutMs });
+      if (!isLiveContext(ctx)) return false;
     } else if (route.kind === "bridge") {
       deliverToSandbox(route.branchId, { to: ctx.sender, from: ctx.agent, body: message.body });
     } else {
@@ -1355,6 +1488,7 @@ async function sendNackMail(ctx: YieldContext, reason: string, opts: { timeoutMs
     }
     return true;
   } catch (err: any) {
+    if (!isLiveContext(ctx)) return false;
     if (isRemoteDeliveryTimeout(err)) {
       // cli#389 round 12, item 1: the connection (or the ACK wait) exceeded the
       // overall bound and the relay CLOSED the transport. Logged BY NAME so the
@@ -1536,6 +1670,7 @@ const outbound: ChannelOutboundAdapter = {
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
     const { account, cfg, log } = ctx;
+    endAccountLifetime(account.accountId);
     const channelRuntime = (ctx as any).channelRuntime;
 
     if (!channelRuntime) {
@@ -1570,7 +1705,25 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       `tps-mail: watching ${boundAgents.length} agent inbox(es): ${boundAgents.join(", ")}`,
     );
 
-    const watchers: FSWatcher[] = [];
+    const incarnation = Symbol(account.accountId);
+    let resolveShutdown!: () => void;
+    const shutdown = new Promise<void>((resolve) => { resolveShutdown = resolve; });
+    const lifetime: AccountLifetime = { incarnation, timers: new Set(), watchers: new Set(), resolveShutdown };
+    accountLifetimes.set(account.accountId, lifetime);
+    gatewayIncarnations.set(ctx, incarnation);
+    if (ctx.abortSignal) signalIncarnations.set(ctx.abortSignal, incarnation);
+    const accountContext = { accountId: account.accountId, incarnation };
+    const isLive = () => isLiveContext(accountContext);
+    const abort = () => {
+      endAccountLifetime(account.accountId, incarnation);
+      resolveShutdown();
+    };
+    ctx.abortSignal?.addEventListener("abort", abort, { once: true });
+    if (ctx.abortSignal?.aborted) {
+      abort();
+      return;
+    }
+    const watchers = lifetime.watchers;
     // seenFiles dedupes inotify events (fs.watch can fire multiple times per
     // write — see the debounce in the watcher callback). It is intentionally
     // NOT pre-populated from the existing new/ snapshot at startup: any file
@@ -1587,7 +1740,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     const seenFiles = new Set<string>();
 
     async function processNewFile(recipient: string, filePath: string): Promise<void> {
-      if (seenFiles.has(filePath)) return;
+      if (!isLive() || seenFiles.has(filePath)) return;
       seenFiles.add(filePath);
 
       // ONE enforcement point, shared with the CLI: parse wrapper → envelope,
@@ -1595,6 +1748,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // replay, and move new/ → cur/ (or dlq/ with a `.reason` sidecar). The
       // plugin carries no verification implementation of its own.
       const promoted = await promote(recipient, filePath);
+      if (!isLive()) return;
       if (!promoted.ok) {
         log?.warn?.(
           `tps-mail: not promoted (${promoted.class}) for ${recipient}: ${promoted.reason}`,
@@ -1615,7 +1769,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
      */
     async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
       try {
+        if (!isLive()) return;
         const recovered = await recoverPromoted(recipient, curPath);
+        if (!isLive()) return;
         if (!recovered.ok) {
           log?.warn?.(
             `tps-mail: cur/ recovery refused ${record.id} (${recovered.class}): ${recovered.reason}`,
@@ -1643,6 +1799,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
      * for the re-check instead.
      */
     async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
+      if (!isLive()) return;
       if (msg.trustTier === "external") {
         log?.warn?.(`tps-mail: external-tier mail ${msg.id} not dispatched`);
         return;
@@ -1698,6 +1855,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       const msgCtx = channelRuntime.reply?.finalizeInboundContext
         ? await channelRuntime.reply.finalizeInboundContext(rawMsgCtx)
         : { ...rawMsgCtx, CommandAuthorized: false };
+      if (!isLive()) return;
 
       // ONE obligation-discharging post per inbound (cli#338 + S2). The
       // dispatcher's deliver callback receives blocks in order; we emit only
@@ -1737,6 +1895,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         msg.id,
         cfg,
         log,
+        incarnation,
         created.record.inboundEnvelopeId,
       );
       yieldContexts.set(obId, yieldCtx);
@@ -1781,7 +1940,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // a host that rewrites NO_REPLY to a canned phrase is not filtered
             // (see SUPPRESSED_FINAL_TOKENS).
             deliver: async (payload: any, info: any) => {
-              if (info?.kind !== "final") return;
+              if (!isLiveContext(yieldCtx) || info?.kind !== "final") return;
               const text = extractFinalText(payload);
               if (!isPostableFinalText(text)) {
                 // A raw silent token reached `deliver` (a host that rewrites
@@ -1798,10 +1957,15 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // (normalizeReplyPayload → onSkip); observe the skip so a turn
             // whose only finals were silent is a NAMED failure.
             onSkip: (_payload: any, info: any) => {
-              if (info?.kind === "final") sawSuppressedFinal = true;
+              if (isLiveContext(yieldCtx) && info?.kind === "final") sawSuppressedFinal = true;
             },
           },
         });
+
+        if (!isLiveContext(yieldCtx)) {
+          log?.info?.(`tps-mail: old-incarnation-dispatch-ignored: ${msg.id}`);
+          return;
+        }
 
         // POST EXACTLY ONCE, after the dispatch has resolved.
         if (latestFinalText !== null) {
@@ -1858,6 +2022,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // branches; the transition is EVIDENCE UPKEEP, guarded by postCommit so
             // it can never fail a delivered reply.
             const commit = () => {
+              if (!isLiveContext(yieldCtx)) return;
               posted = true;
               postCommit(
                 log,
@@ -1878,7 +2043,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                     : `tps-mail: no delivery route for reply recipient ${msg.from} ` +
                         `(not bound to this gateway, no local maildir, no registered remote branch); refusing to write where nothing reads it`,
                 );
-              } else if (await internalInbound(yieldCtx) && markDelivering(account.mailDir, recipient, msg.id, log)) {
+              } else if (await internalInbound(yieldCtx) && isLiveContext(yieldCtx) && markDelivering(account.mailDir, recipient, msg.id, log)) {
                 // WRITE-AHEAD (item 1): `delivering` is persisted BEFORE the call.
                 if (route.kind === "local") {
                   writeMailFile(account.mailDir, msg.from, reply);
@@ -1888,6 +2053,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                   commit();
                 } else if (route.kind === "remote-branch") {
                   await deliverRemote(reply, route.branchId);
+                  if (!isLiveContext(yieldCtx)) return;
                   commit();
                 } else {
                   // The record carries the obligation ids, so this delivery stays
@@ -1901,6 +2067,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                   commit();
                 }
               } else {
+                if (!isLiveContext(yieldCtx)) return;
                 // Either the write-ahead write ITSELF failed — nothing has been
                 // sent, so this is a pre-commit failure and the obligation fails
                 // and nacks as before — or the record is already TERMINAL and
@@ -1924,6 +2091,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               // throw resolves by EVIDENCE OR DEADLINE instead of failing the
               // obligation and nacking the sender. Only a throw before the
               // write-ahead landed (nothing sent) fails and nacks as before.
+              if (!isLiveContext(yieldCtx)) return;
               const at = readObligation(account.mailDir, recipient, msg.id);
               if (at && (at.state === "delivering" || at.state === "posted")) {
                 log?.warn?.(
@@ -1940,6 +2108,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // runs OUTSIDE the delivery try and under its own guard: it is
             // logged by name and NEVER sets postFailure, so a delivered reply is
             // never reported as failed and its inbound is never nacked.
+            if (!isLiveContext(yieldCtx)) return;
             if (posted && route) {
               const r = route;
               postedReplyId = reply.id;
@@ -1997,6 +2166,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
         const receipt = await scanObligationReceipt(yieldCtx, obId, created.record, postedReplyId ?? undefined);
+        if (!isLiveContext(yieldCtx)) return;
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";
           await settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });
@@ -2041,6 +2211,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           }
         }
       } catch (err: any) {
+        if (!isLiveContext(yieldCtx)) {
+          log?.info?.(`tps-mail: old-incarnation-dispatch-ignored: ${msg.id}`);
+          return;
+        }
         const reason = `dispatch failed: ${err?.message ?? String(err)}`;
         log?.warn?.(`tps-mail: dispatch failed for ${msg.id}: ${err?.message ?? String(err)}`);
         // cli#389 round 8: the PERSISTED RECORD tells a post-commit evidence step
@@ -2066,23 +2240,24 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
     // Launch a watcher per agent inbox.
     for (const agentId of boundAgents) {
+      if (!isLive()) break;
       const newDir = resolve(account.mailDir, agentId, "new");
       if (!existsSync(newDir)) {
         mkdirSync(newDir, { recursive: true });
       }
       try {
         const watcher = fsWatch(newDir, { persistent: true }, (_event, filename) => {
-          if (!filename) return;
+          if (!isLive() || !filename) return;
           const filePath = resolve(newDir, String(filename));
           if (!existsSync(filePath)) return;
           // Debounce: fs.watch can fire multiple events per file write.
-          setTimeout(() => {
+          accountTimer(accountContext, () => {
             processNewFile(agentId, filePath).catch((err) => {
               log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
             });
           }, 50);
         });
-        watchers.push(watcher);
+        watchers.add(watcher);
 
         // Process any files already present (but not in seenFiles) in case
         // the gateway starts up after mail was already written.
@@ -2122,6 +2297,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // sweep can see).
         try {
           await sweepStrandedPromoteScratch(resolve(account.mailDir, agentId));
+          if (!isLive()) break;
         } catch { /* ignore */ }
 
         // UNSENT NACKS (cli#389 round 10, item 1): a TERMINAL failure whose nack
@@ -2145,6 +2321,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // is inside the bounded hold, so an owed mail survives whether the retry
         // or the sweep runs first.
         for (const rec of listObligations(account.mailDir, agentId)) {
+          if (!isLive()) break;
           if (!nackOwed(rec)) continue;
           retryOwedNackInBackground(
             account.mailDir,
@@ -2155,6 +2332,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             account.accountId,
             cfg,
             log,
+            incarnation,
             rec.inboundEnvelopeId,
           );
         }
@@ -2187,6 +2365,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // reconcile every durable obligation record against the maildir/outbox
         // and RE-ARM the deadline where work is still outstanding.
         for (const rec of listObligations(account.mailDir, agentId)) {
+          if (!isLive()) break;
           if (TERMINAL_STATES.has(rec.state)) continue;
           const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
           const ctx = makeYieldCtx(
@@ -2198,6 +2377,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             rec.inboundId,
             cfg,
             log,
+            incarnation,
             rec.inboundEnvelopeId,
           );
           yieldContexts.set(rec.obligationId, ctx);
@@ -2210,34 +2390,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       }
     }
 
-    // Keep the promise alive until the gateway signals shutdown. If we
-    // return immediately after setting up watchers, the gateway interprets
-    // it as "the account went down" and enters an auto-restart loop.
-    //
-    // We resolve the promise only when ctx.abortSignal fires. That's the
-    // signal from the gateway that startAccount should terminate — at that
-    // point we close watchers and return.
-    await new Promise<void>((resolveShutdown) => {
-      if (ctx.abortSignal?.aborted) {
-        resolveShutdown();
-        return;
-      }
-      ctx.abortSignal?.addEventListener(
-        "abort",
-        () => {
-          for (const w of watchers) {
-            try { w.close(); } catch { /* ignore */ }
-          }
-          log?.info?.("tps-mail: stopped all watchers");
-          resolveShutdown();
-        },
-        { once: true },
-      );
-    });
+    await shutdown;
+    ctx.abortSignal?.removeEventListener("abort", abort);
   },
 
   stopAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
-    // Cleanup happens via abortSignal in startAccount. Nothing to do here.
+    const incarnation = gatewayIncarnations.get(ctx) ?? signalIncarnations.get(ctx.abortSignal);
+    if (incarnation === undefined) {
+      ctx.log?.warn?.(`tps-mail: stop-account-unverified: ${ctx.account.accountId}`);
+      return;
+    }
+    endAccountLifetime(ctx.account.accountId, incarnation);
     ctx.log?.info?.("tps-mail: stopAccount called");
   },
 };
