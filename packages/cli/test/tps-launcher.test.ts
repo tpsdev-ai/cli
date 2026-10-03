@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -121,7 +121,7 @@ describe("tps launcher exit status", () => {
   });
 });
 
-function runWithSpawnError(error: { status: number; signal: string } | null) {
+function runWithSpawnError(error: { status?: number; signal?: string; code?: string } | null) {
   const launcher = makeIsolatedLauncher();
   const dir = join(launcher, "..");
   const marker = join(dir, "spawned");
@@ -151,7 +151,7 @@ function runWithSpawnError(error: { status: number; signal: string } | null) {
 
 test("a signal takes precedence over numeric status zero", () => {
   const result = runWithSpawnError({ status: 0, signal: "SIGTERM" });
-  expect(result.status).toBe(143);
+  expect(result.status).toBe(128 + constants.signals.SIGTERM);
   expect(result.spawned).toBe(1);
   expect(result.stderr).toBe("");
 });
@@ -159,6 +159,33 @@ test("a signal takes precedence over numeric status zero", () => {
 test("missing platform package and JS entry print guidance without spawning node", () => {
   const result = runWithSpawnError(null);
   expect(result.status).toBe(1);
+  expect(result.stderr).toContain("Failed to load native binding");
+  expect(result.stderr).toContain("no binary package available");
   expect(result.stderr).toContain("Try reinstalling main package:");
   expect(result.spawned).toBe(0);
+});
+
+test("uses the platform signal number for SIGUSR1", () => {
+  const result = runWithSpawnError({ signal: "SIGUSR1" });
+  expect(result.status).toBe(128 + constants.signals.SIGUSR1);
+  expect(result.spawned).toBe(1);
+  expect(result.stderr).toBe("");
+});
+
+test("an unknown signal exits non-zero without falling back", () => {
+  const result = runWithSpawnError({ signal: "UNKNOWN_SIGNAL" });
+  expect(result.status).not.toBe(0);
+  expect(result.spawned).toBe(1);
+  expect(result.stderr).toBe("");
+});
+
+test("a resolved binary that cannot start with no JS entry prints accurate guidance", () => {
+  const result = runWithSpawnError({ code: "EACCES" });
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("TPS: platform binary could not be started.");
+  expect(result.stderr).not.toContain("no binary package available");
+  expect(result.stderr).not.toContain("Failed to load native binding");
+  expect(result.stderr).toContain("Try reinstalling main package:");
+  expect(result.stderr).toContain("Or install platform binary directly:");
+  expect(result.spawned).toBe(1);
 });
