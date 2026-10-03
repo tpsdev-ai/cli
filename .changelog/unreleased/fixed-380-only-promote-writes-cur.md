@@ -1,4 +1,4 @@
-- **The deploy bot and the channel bridge promote mail through `promote()` instead of writing `cur/` directly (Closes #380).**
+- **For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/; re-stamps of already-promoted records are allowed and enumerated (Closes #380).**
 
   The deploy bot (`scripts/deploy-bot.ts` and its copy under
   `packages/cli/scripts/`) and the channel bridge's outbound consumer
@@ -10,4 +10,5 @@
   and runs the same mailbox policy and consumed-id replay store as `promote()`,
   which now live in `@tpsdev-ai/agent`.
 
-  A source scan checks detected writes into `cur` against an explicit list.
+  The source scan enumerates eleven sites, including MailClient's shared-policy
+  delivery, staging, re-stamps, and the separate outbox and internal-mail stores.

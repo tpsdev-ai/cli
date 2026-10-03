@@ -1,13 +1,10 @@
 /**
- * mail-cur-writers.test.ts — cli#380: a source scan for writes into a `cur`
- * directory that are not on the list below.
- *
- * It scans .ts/.tsx/.mts/.cts/.js/.mjs files under scripts/ and package src/
- * and scripts/, excluding .d.ts and SKIP_DIRS. WRITE_CALLS and same-file
- * function declarations or parenthesized const/let arrow wrappers are matched
- * by text patterns. Destination heuristics use CUR_LITERAL, cur-word names
- * and curNames(); other destinations may be missed. Each listed site must
- * match exactly one detected call.
+ * For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/; re-stamps of
+ * already-promoted records are allowed and enumerated below.
+ * MailClient applies the same policy; outbox and internal mail are separate stores.
+ * Scans scripts/, package src/ and scripts/, and plugin src/ with text patterns.
+ * mail.ts's writeMessageFile calls are always cur candidates; other destinations
+ * use cur literals and names. Unrecognized destinations may be missed.
  */
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -37,7 +34,7 @@ const WRITE_CALLS: Record<string, Dest> = {
  * Each entry must match exactly one call: a stale entry, or a
  * second call matching an entry, fails the test.
  */
-const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
+const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why: string }> = [
   {
     file: "packages/cli/src/utils/mail.ts",
     contains: "renameSync(scratchPath, curPath)",
@@ -47,6 +44,39 @@ const ALLOWED: Array<{ file: string; contains: string; why: string }> = [
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(full, present)",
     why: "checkMessages' lease sweep — re-stamps a record already in cur/ after recoverPromoted re-verified it",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(scratchPath, promoted)",
+    why: "promote() — writes tmp/ staging before the checked atomic cur/ commit",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(path, msg)",
+    followedBy: "; try { unlinkSync(path)",
+    why: "ackMessage — reads an existing record by id, stamps ack metadata, then unlinks it; cur/ targets are already promoted",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(path, msg)",
+    followedBy: "; renameSync(path, target)",
+    why: "nackMessage permanent — reads an existing record by id, stamps nack metadata, then moves it to dlq/; cur/ targets are already promoted",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
+    contains: "writeMessageFile(path, msg)",
+    followedBy: "; return msg",
+    why: "nackMessage transient/agent — reads an existing record by id and re-stamps nack/retry metadata; cur/ targets are already promoted",
+  },
+  {
+    file: "plugins/openclaw-tps-mail/src/index.ts",
+    contains: "patchMailFile(ctx.curPath, { ackedAt:",
+    why: "ack enrichment only — patchMailFile returns unless an existing record parses; it never creates a record",
+  },
+  {
+    file: "plugins/openclaw-tps-mail/src/index.ts",
+    contains: "patchMailFile(ctx.curPath, { nackedAt:",
+    why: "nack enrichment only — patchMailFile returns unless an existing record parses; it never creates a record",
   },
   {
     file: "packages/agent/src/io/mail.ts",
@@ -78,6 +108,14 @@ function sourceFiles(): string[] {
       } catch {
         /* package has no such dir */
       }
+    }
+  }
+  for (const plugin of readdirSync("plugins")) {
+    const dir = join("plugins", plugin, "src");
+    try {
+      if (statSync(dir).isDirectory()) roots.push(dir);
+    } catch {
+      /* plugin has no src dir */
     }
   }
   const out: string[] = [];
@@ -172,6 +210,7 @@ const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 function callsOf(text: string, fn: string): Array<{ at: number; args: string[] }> {
   const out: Array<{ at: number; args: string[] }> = [];
   for (const m of text.matchAll(new RegExp(`(?<![\\w$])${escape(fn)}\\s*\\(`, "g"))) {
+    if (/\bfunction\s+$/.test(text.slice(0, m.index))) continue;
     out.push({ at: m.index!, args: callArgs(text, m.index! + m[0].length - 1) });
   }
   return out;
@@ -226,26 +265,37 @@ function writeCallsFor(text: string): Record<string, Dest> {
   return calls;
 }
 
-function curWritersInText(text: string): string[] {
+function curWriterCalls(text: string, file?: string): Array<{ call: string; following: string }> {
   const names = curNames(text);
-  const found: string[] = [];
+  const found: Array<{ call: string; following: string }> = [];
   for (const [fn, spec] of Object.entries(writeCallsFor(text))) {
     for (const c of callsOf(text, fn)) {
       if (c.args.length === 0) continue;
       const dest = destOf(c.args, spec);
-      if (dest === undefined || !isCurDestination(dest, names)) continue;
-      found.push(`${fn}(${c.args.map((a) => a.replace(/\s+/g, " ").trim()).join(", ")})`);
+      const recordPrimitive = file === "packages/cli/src/utils/mail.ts" && fn === "writeMessageFile";
+      if (dest === undefined || (!recordPrimitive && !isCurDestination(dest, names))) continue;
+      found.push({
+        call: `${fn}(${c.args.map((a) => a.replace(/\s+/g, " ").trim()).join(", ")})`,
+        following: codeOnly(text.slice(groupEnd(text, text.indexOf("(", c.at)))).replace(/\s+/g, " ").trim(),
+      });
     }
   }
   return found;
 }
 
+function curWritersInText(text: string): string[] {
+  return curWriterCalls(text).map(({ call }) => call);
+}
+
 /** Match found calls against ALLOWED: each entry admits exactly one call. */
-function classify(found: Array<{ file: string; call: string }>): { offenders: string[]; stale: string[] } {
+function classify(found: Array<{ file: string; call: string; following: string }>): { offenders: string[]; stale: string[] } {
   const offenders: string[] = [];
   const used = new Set<number>();
-  for (const { file, call } of found) {
-    const idx = ALLOWED.findIndex((entry, i) => !used.has(i) && entry.file === file && call.includes(entry.contains));
+  for (const { file, call, following } of found) {
+    const idx = ALLOWED.findIndex((entry, i) =>
+      !used.has(i) && entry.file === file && call.includes(entry.contains) &&
+      (!entry.followedBy || following.startsWith(entry.followedBy)),
+    );
     if (idx === -1) offenders.push(`${file}: ${call}`);
     else used.add(idx);
   }
@@ -253,12 +303,12 @@ function classify(found: Array<{ file: string; call: string }>): { offenders: st
   return { offenders, stale };
 }
 
-function scanTree(override?: { file: string; text: string }): Array<{ file: string; call: string }> {
-  const found: Array<{ file: string; call: string }> = [];
+function scanTree(override?: { file: string; text: string }): Array<{ file: string; call: string; following: string }> {
+  const found: Array<{ file: string; call: string; following: string }> = [];
   for (const path of sourceFiles()) {
     const file = relative(process.cwd(), path);
     const text = override && override.file === file ? override.text : readFileSync(path, "utf-8");
-    for (const call of curWritersInText(text)) found.push({ file, call });
+    for (const site of curWriterCalls(text, file)) found.push({ file, ...site });
   }
   return found;
 }
@@ -284,6 +334,27 @@ describe("cli#380: no unlisted detected writer of a cur/ directory", () => {
     expect(dup).not.toBe(text);
     expect(classify(scanTree({ file, text: dup })).offenders).toEqual([
       `${file}: renameSync(srcPath, dstPath)`,
+    ]);
+  });
+
+  test("plugin source writers are reported", () => {
+    const file = "plugins/openclaw-tps-mail/src/index.ts";
+    const text = readFileSync(file, "utf-8") + '\nwriteFileSync(join(root, "cur", "probe.json"), body);';
+    expect(sourceFiles()).toContain(file);
+    expect(classify(scanTree({ file, text })).offenders).toEqual([
+      `${file}: writeFileSync(join(root, "cur", "probe.json"), body)`,
+    ]);
+  });
+
+  test("a new resolve-by-id record writer is reported", () => {
+    const file = "packages/cli/src/utils/mail.ts";
+    const text = readFileSync(file, "utf-8") + `
+function probe(agent: string, id: string) {
+  const destination = messagePathById(agent, id);
+  if (destination) writeMessageFile(destination, readMessageFile(destination));
+}`;
+    expect(classify(scanTree({ file, text })).offenders).toEqual([
+      `${file}: writeMessageFile(destination, readMessageFile(destination))`,
     ]);
   });
 
