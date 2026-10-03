@@ -17,7 +17,7 @@ describe("MailClient", () => {
     // sendMail signs as the agent; give it a raw 32-byte Ed25519 seed.
     keyPath = join(tmpDir, "testagent.key");
     writeFileSync(keyPath, Buffer.alloc(32, 3));
-    client = new MailClient(tmpDir, undefined, "testagent", undefined, keyPath);
+    client = new MailClient(tmpDir, undefined, "testagent", { getAgent: async () => null }, keyPath);
   });
 
   afterEach(() => {
@@ -36,16 +36,8 @@ describe("MailClient", () => {
     expect(msgs).toEqual([]);
   });
 
-  test("checkNewMail refuses to promote when no verifier is configured (cli#380 F1)", async () => {
-    const { writeFileSync, existsSync } = await import("node:fs");
-    writeFileSync(join(tmpDir, "testagent", "new", "test-1.json"), "hello world", "utf-8");
-
-    // No FlairClient → verification cannot run. An absent verifier must never
-    // mean "promote without verifying": the record is NOT moved.
-    const msgs = await client.checkNewMail();
-    expect(msgs.length).toBe(0);
-    expect(existsSync(join(tmpDir, "testagent", "new", "test-1.json"))).toBe(true);
-    expect(existsSync(join(tmpDir, "testagent", "cur", "test-1.json"))).toBe(false);
+  test("constructing a MailClient without a verifier throws (cli#380)", () => {
+    expect(() => new MailClient(tmpDir, undefined, "testagent")).toThrow(/requires a Flair verifier/);
   });
 
   test("sendMail writes a signed envelope to outbox/new", async () => {
@@ -65,7 +57,7 @@ describe("MailClient", () => {
   });
 
   test("sendMail refuses with a named error and writes nothing when no key exists", async () => {
-    const keyless = new MailClient(tmpDir, undefined, "nokeyagent");
+    const keyless = new MailClient(tmpDir, undefined, "nokeyagent", { getAgent: async () => null });
     await expect(keyless.sendMail("host@tps", "hi")).rejects.toThrow(/no Ed25519 private key/);
     const { readdirSync } = await import("node:fs");
     expect(readdirSync(join(tmpDir, "nokeyagent", "outbox")).filter((f) => f.endsWith(".json")).length).toBe(0);
@@ -97,7 +89,7 @@ describe("MailClient", () => {
       mkdirSync(identity, { recursive: true });
       writeFileSync(join(flair, "conflict.key"), Buffer.alloc(32, 1));
       writeFileSync(join(identity, "conflict.key"), Buffer.alloc(32, 2));
-      const conflicting = new MailClient(tmpDir, undefined, "conflict");
+      const conflicting = new MailClient(tmpDir, undefined, "conflict", { getAgent: async () => null });
       await expect(conflicting.sendMail("host", "no delivery")).rejects.toThrow(/two different Ed25519 private keys/);
       expect(readdirSync(join(tmpDir, "conflict", "outbox")).filter((f) => f.endsWith(".json"))).toHaveLength(0);
     } finally {

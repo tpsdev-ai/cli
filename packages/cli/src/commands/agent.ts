@@ -33,6 +33,7 @@ import {
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
 import { launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
@@ -1049,7 +1050,7 @@ async function commitAgentChanges(args: AgentArgs): Promise<void> {
   if (!gitCheck.ok || gitCheck.stdout !== "true") failWith(`Not a git repository: ${repoPath}`);
 
   // Scope expansion guardrail (ops-43zd)
-  const scopeAgentId = process.env.TPS_AGENT_ID ?? "anvil";
+  const scopeAgentId = requireLocalAgentId("agent commit agent id");
   const taskMailBody = getMostRecentTaskMailBody(scopeAgentId);
   if (taskMailBody !== null) {
     const hintFileCount = countFilesInText(taskMailBody, repoPath);

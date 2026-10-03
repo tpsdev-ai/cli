@@ -10,6 +10,7 @@ import { getInbox, MAX_INBOX_MESSAGES, promote, recoverPromoted, sendMessage } f
 import { signOutboundBody } from "../src/utils/mail-sign.js";
 import { catchUpTopics, createTopic, publishToTopic, subscribe, updateCursor } from "../src/utils/mail-topics.js";
 import { MailClient } from "../../agent/src/io/mail.js";
+import { signEnvelope } from "../../agent/src/lib/signEnvelope.js";
 
 const seed = Buffer.alloc(32, 0x11);
 let home: string;
@@ -84,6 +85,64 @@ test("native MailClient delivers publisher-signed topic fan-out", async () => {
   expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
   expect(readdirSync(getInbox("kern").cur)).toHaveLength(1);
 });
+
+for (const reader of ["MailClient", "promote"] as const) {
+  for (const field of ["messageId", "replyToId"] as const) {
+    test(`${reader} rejects a topic envelope with an invalid ${field}`, async () => {
+      createTopic("alerts", "", ["flint"]);
+      subscribe("alerts", "kern", true);
+      const envelope = JSON.parse(signOutboundBody("flint", "topic:alerts", "original", { requireKey: true }));
+      envelope[field] = "invalid/id";
+      const signed = signEnvelope(envelope, { flint: seed });
+      const sent = sendMessage("kern", JSON.stringify(signed), "flint");
+      if (reader === "MailClient") {
+        const client = new MailClient(join(home, "mail"), undefined, "kern", {
+          async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+        });
+        expect(await client.checkNewMail()).toEqual([]);
+      } else {
+        expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: "invalid" });
+      }
+      expect(readdirSync(getInbox("kern").cur)).toEqual([]);
+      const file = sent.filePath.split("/").pop()!;
+      expect(readFileSync(join(home, "mail", "kern", "dlq", `${file}.reason`), "utf8")).toContain(`invalid ${field}`);
+    });
+  }
+}
+
+test("topic replay stays consumed across MailClient and promote after cur removal", async () => {
+  createTopic("alerts", "", ["flint"]);
+  subscribe("alerts", "kern", true);
+  const entry = publishToTopic("alerts", "flint", "original");
+  const client = new MailClient(join(home, "mail"), undefined, "kern", {
+    async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+  });
+  expect(await client.checkNewMail()).toHaveLength(1);
+  const inbox = getInbox("kern");
+  for (const file of readdirSync(inbox.cur)) rmSync(join(inbox.cur, file));
+  const replay = sendMessage("kern", entry.envelope!, "flint");
+  expect(await promote("kern", replay.filePath)).toMatchObject({ ok: false, class: "replay" });
+  expect(readdirSync(inbox.cur)).toEqual([]);
+});
+
+for (const field of ["messageId", "replyToId"] as const) {
+  test(`catch-up skips an invalid signed ${field} and delivers the following publication`, async () => {
+    createTopic("alerts");
+    publishToTopic("alerts", "flint", "invalid");
+    const entry = stored();
+    const envelope = JSON.parse(entry.envelope);
+    envelope[field] = "invalid/id";
+    entry.id = envelope.messageId;
+    entry.envelope = JSON.stringify(signEnvelope(envelope, { flint: seed }));
+    replaceEntry(entry);
+    const next = publishToTopic("alerts", "flint", "valid");
+    subscribe("alerts", "kern", true);
+    expect(await catchUpTopics("kern")).toBe(1);
+    expect(warnings).toContain("topic-catch-up-invalid-envelope");
+    expect(JSON.parse(cursorBytes()).alerts).toBe(`@${next.id}`);
+    expect(await promotedBodies()).toEqual(["valid"]);
+  });
+}
 
 for (const policy of ["unsubscribed", "disallowed-publisher", "ordinary-recipient", "invalid-topic", "unreadable-meta"] as const) {
   test(`native MailClient rejects topic policy violation: ${policy}`, async () => {

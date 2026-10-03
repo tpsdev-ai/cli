@@ -1,8 +1,9 @@
 #!/usr/bin/env bun
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promote, redriveRetryable } from "../packages/cli/src/utils/mail.js";
 
 const HOME = homedir();
 
@@ -33,6 +34,7 @@ const ALLOWED_SENDERS = (process.env.DEPLOY_BOT_ALLOWED_SENDERS ?? HOST_AGENT)
 
 const MAIL_NEW_DIR = join(HOME, ".tps", "mail", AGENT_ID, "new");
 const MAIL_CUR_DIR = join(HOME, ".tps", "mail", AGENT_ID, "cur");
+const MAIL_DLQ_DIR = join(HOME, ".tps", "mail", AGENT_ID, "dlq");
 
 type MailRow = { id: string; from: string; body: string };
 
@@ -45,19 +47,30 @@ function log(msg: string) {
   console.log(`[deploy-bot ${new Date().toISOString()}] ${msg}`);
 }
 
-function pollNewMail(): MailRow[] {
-  if (!existsSync(MAIL_NEW_DIR)) return [];
+/**
+ * This script must never rename into `cur/` itself (cli#380).
+ */
+export async function pollNewMail(): Promise<MailRow[]> {
   const out: MailRow[] = [];
-  for (const file of readdirSync(MAIL_NEW_DIR)) {
+  for (const file of existsSync(MAIL_NEW_DIR) ? readdirSync(MAIL_NEW_DIR).sort() : []) {
     const src = join(MAIL_NEW_DIR, file);
     try {
-      const row = JSON.parse(readFileSync(src, "utf-8")) as MailRow;
-      if (!row?.id || typeof row.body !== "string") continue;
-      out.push(row);
-      renameSync(src, join(MAIL_CUR_DIR, file));
+      const result = await promote(AGENT_ID, src);
+      if (!result.ok) {
+        log(`WARN promote refused ${file}: ${result.class}`);
+        continue;
+      }
+      out.push({ id: result.message.id, from: result.message.from, body: result.message.body });
     } catch (e: any) {
-      log(`WARN parse failed for ${file}: ${e.message}`);
+      log(`WARN promote failed for ${file}: ${e.message}`);
     }
+  }
+  try {
+    for (const result of await redriveRetryable(AGENT_ID, MAIL_DLQ_DIR)) {
+      out.push({ id: result.message.id, from: result.message.from, body: result.message.body });
+    }
+  } catch (e: any) {
+    log(`WARN dlq re-drive failed: ${e.message}`);
   }
   return out;
 }
@@ -163,15 +176,23 @@ export function dispatch(body: string): string {
   return `❓ unknown command: ${trimmed}\nKnown commands: deploy, status, run <cmd>`;
 }
 
-function tick() {
-  for (const msg of pollNewMail()) {
-    log(`← command from ${msg.from}: ${msg.body.slice(0, 80)}`);
-    if (!ALLOWED_SENDERS.includes(msg.from)) {
-      log(`WARN: rejected command from unauthorized sender: ${msg.from}`);
-      continue;
+let ticking = false;
+
+async function tick() {
+  if (ticking) return; // a slow promotion must not overlap the next poll
+  ticking = true;
+  try {
+    for (const msg of await pollNewMail()) {
+      log(`← command from ${msg.from}: ${msg.body.slice(0, 80)}`);
+      if (!ALLOWED_SENDERS.includes(msg.from)) {
+        log(`WARN: rejected command from unauthorized sender: ${msg.from}`);
+        continue;
+      }
+      const out = dispatch(msg.body);
+      reply(msg.from || HOST_AGENT, out);
     }
-    const out = dispatch(msg.body);
-    reply(msg.from || HOST_AGENT, out);
+  } finally {
+    ticking = false;
   }
 }
 
@@ -180,7 +201,7 @@ if (import.meta.main) {
   log(`Run allowlist: ${RUN_ALLOWLIST.join(", ")}`);
   log(`Allowed senders: ${ALLOWED_SENDERS.join(", ")}`);
   ensureDirs();
-  tick();
+  await tick();
   setInterval(tick, POLL_MS);
 
   process.on("SIGTERM", () => {

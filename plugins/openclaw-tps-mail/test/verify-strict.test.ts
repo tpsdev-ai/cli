@@ -548,7 +548,8 @@ describe("verify-strict: signed envelope verification", () => {
 
     const reason = readDlqReason(tempMailDir, agentId);
     expect(reason).not.toBeNull();
-    expect(reason!).toContain("not a v1 signed envelope");
+    expect(reason!).toContain("class: invalid");
+    expect(reason!).toContain("body is not envelope-shaped");
     expect(dispatchCount).toBe(0);
   });
 });
