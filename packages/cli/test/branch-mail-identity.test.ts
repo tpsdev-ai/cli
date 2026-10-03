@@ -17,17 +17,17 @@ afterEach(() => {
 
 describe("branch mail identity (fix #240, cli#499)", () => {
   it("uses TPS_AGENT_ID when set", () => {
-    process.env.TPS_AGENT_ID = "tps-anvil";
-    expect(branchAgentId(undefined)).toBe("tps-anvil");
+    process.env.TPS_AGENT_ID = "host-a";
+    expect(branchAgentId(undefined)).toBe("host-a");
   });
 
   it("uses the persisted conf id when TPS_AGENT_ID is not set", () => {
-    expect(branchAgentId("tps-rockit")).toBe("tps-rockit");
+    expect(branchAgentId("host-b")).toBe("host-b");
   });
 
   it("TPS_AGENT_ID takes precedence over the persisted conf id", () => {
-    process.env.TPS_AGENT_ID = "tps-anvil";
-    expect(branchAgentId("tps-rockit")).toBe("tps-anvil");
+    process.env.TPS_AGENT_ID = "host-a";
+    expect(branchAgentId("host-b")).toBe("host-a");
   });
 
   it("refuses by name when neither env nor conf is set", () => {
@@ -35,10 +35,10 @@ describe("branch mail identity (fix #240, cli#499)", () => {
   });
 
   it("does not use the wire 'to' field (e.g. GAL alias 'anvil') for storage", () => {
-    // When TPS_AGENT_ID is set to 'tps-anvil', a message sent to GAL alias 'anvil'
-    // should still be stored under 'tps-anvil', not 'anvil'.
-    process.env.TPS_AGENT_ID = "tps-anvil";
-    expect(branchAgentId(undefined)).toBe("tps-anvil");
+    // When TPS_AGENT_ID is set to 'host-a', a message sent to GAL alias 'anvil'
+    // should still be stored under 'host-a', not 'anvil'.
+    process.env.TPS_AGENT_ID = "host-a";
+    expect(branchAgentId(undefined)).toBe("host-a");
     expect(branchAgentId(undefined)).not.toBe("anvil");
   });
 });
