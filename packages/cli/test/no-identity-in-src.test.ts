@@ -21,9 +21,6 @@ const ALLOWLIST: AllowEntry[] = [
   { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'export const PULSE_AGENT_ID = "pulse";', reason: "notification sender's own principal" },
   { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'return join(homeDir(), ".tps", "pulse");', reason: "state-path segment" },
   { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'tags: ["pulse", "pr-lifecycle", to],', reason: "memory tag" },
-  { file: "src/bridge/core.ts", literal: '"anvil"', context: 'this.defaultAgentId = config.defaultAgentId ?? "anvil";', reason: "follow-up: cli#484 merged, but this default remains on the merge base" },
-  { file: "src/commands/agent.ts", literal: '"anvil"', context: 'const scopeAgentId = process.env.TPS_AGENT_ID ?? "anvil";', reason: "cli#474 merged; not incorporated here; cli#486 removes this default" },
-  { file: "src/commands/roster.ts", literal: '"anvil"', context: 'const viewerId = opts.agentId ?? process.env.TPS_AGENT_ID ?? "anvil";', reason: "follow-up: cli#484 merged, but this default remains on the merge base" },
   { file: "bin/tps.ts", literal: '"pulse"', context: 'case "pulse": {', reason: "command dispatch" },
 ];
 

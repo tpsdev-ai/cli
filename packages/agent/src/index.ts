@@ -19,7 +19,6 @@ export type {
 
 // I/O
 export { MailClient } from "./io/mail.js";
-export { isTopicRecipient } from "./lib/topic-recipient.js";
 export type { MailMessage } from "./io/mail.js";
 export { MemoryStore } from "./io/memory.js";
 export type { MemoryEvent } from "./io/memory.js";
@@ -47,10 +46,20 @@ export type { FlairConfig } from "./runtime/types.js";
 // Signing
 export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
 export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";
+
+// Mailbox policy (cli#380)
+export {
+  ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId, tryParseEnvelope, parseSignedEnvelope,
+  decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
+} from "./lib/mailbox-policy.js";
+export type { MailboxPolicyRejectClass, MailboxPolicyResult, ReplayStore } from "./lib/mailbox-policy.js";
+export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
+export type { MailLock } from "./lib/mail-lock.js";
 export {
   KeyFormatError, AgentKeyError, AgentKeyConflictError,
   agentKeyCandidates, existingAgentKeyPaths, resolveAgentKeyPath,
   readAgentPrivateKey, readPrivateKeyAtPath, toEd25519Seed,
 } from "./lib/agent-keys.js";
 
+export { decodeRegistryPublicKey } from "./lib/registry-key.js";
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId, configureBridgeIdentity, bridgePrincipalIds, verifiedMailTier } from "./lib/bridge-identity.js";

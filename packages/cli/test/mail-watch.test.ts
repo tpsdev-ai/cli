@@ -823,49 +823,73 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 15_000);
 
-  it("with no ledger file, an unreadable maildir history withholds a replay, logs it and retries it", async () => {
-    const { env, file, bytes } = await consumeAndDropRecord("maildir unreadable");
-    const inbox = getInbox(AGENT);
-    const ledger = join(inbox.root, "consumed.jsonl");
-    const aside = join(tempRoot, "consumed.jsonl.aside");
-    // No ledger file, so the lookup falls back to the maildir — whose cur/ listing fails.
-    renameSync(ledger, aside);
-    const log = captureErrors();
-    const { fault, restore } = failReadsOf("readdirSync", inbox.cur);
-    const received: string[] = [];
-    let watcher: MailWatcher | undefined;
-    try {
-      watcher = watchMail({
-        agent: AGENT,
-        debounceMs: 20,
-        pollMs: 30,
-        watchImpl: NO_FS_EVENTS,
-        onMessage: (msg) => { received.push(msg.id); },
+  for (const initialized of [false, true]) {
+    it(`with no ledger file (${initialized ? "initialized" : "legacy"} mailbox), unavailable history withholds a replay, logs it and retries it`, async () => {
+      const { env, file, bytes } = await consumeAndDropRecord("maildir unreadable");
+      const inbox = getInbox(AGENT);
+      const ledger = join(inbox.root, "consumed.jsonl");
+      const aside = join(tempRoot, "consumed.jsonl.aside");
+      renameSync(ledger, aside);
+      if (!initialized) rmSync(join(inbox.root, ".consumed-initialized"));
+      const lines: string[] = [];
+      let scanFinished: () => void = () => {};
+      const logSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+        scanFinished();
       });
-      writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
+      let poll: () => void = () => { throw new Error("poll not registered"); };
+      const intervalSpy = spyOn(globalThis, "setInterval").mockImplementation(((callback: () => void) => {
+        poll = callback;
+        return 0;
+      }) as typeof setInterval);
+      const nextScan = () => new Promise<void>((resolve) => { scanFinished = resolve; });
+      const { fault, restore } = failReadsOf("readdirSync", inbox.cur);
+      const received: string[] = [];
+      let watcher: MailWatcher | undefined;
+      try {
+        writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
+        const startup = nextScan();
+        watcher = watchMail({
+          agent: AGENT,
+          debounceMs: 20,
+          pollMs: 30,
+          watchImpl: NO_FS_EVENTS,
+          onMessage: (msg) => { received.push(msg.id); scanFinished(); },
+        });
+        await startup;
 
-      const withheld = () =>
-        log.lines.filter(
-          (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${inbox.cur} is unreadable (EACCES)`) && l.includes("Remedy:"),
-        ).length;
-      await waitFor(() => withheld() >= 2 || received.length > 0, 5000);
-      expect(received).toEqual([]);
-      expect(withheld()).toBeGreaterThanOrEqual(2);
-      expect(fault.injected).toBeGreaterThanOrEqual(2); // the failure came from the injection
+        const withheld = () =>
+          lines.filter(
+            (l) => l.includes(`${env.messageId} not presented`) && l.includes(initialized ? `${ledger} is missing after initialization` : `${inbox.cur} is unreadable (EACCES)`) && l.includes("Remedy:"),
+          ).length;
+        expect(received).toEqual([]);
+        expect(withheld()).toBe(1);
+        const retry = nextScan();
+        poll();
+        await retry;
+        expect(received).toEqual([]);
+        expect(withheld()).toBeGreaterThanOrEqual(2);
+        if (initialized) expect(fault.injected).toBe(0);
+        else expect(fault.injected).toBeGreaterThanOrEqual(2);
 
-      // History restored: the retry reaches the replay verdict, still not presented.
-      renameSync(aside, ledger);
-      fault.armed = false;
-      await waitFor(() => log.lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`)), 5000);
-      await sleep(100);
-      expect(received).toEqual([]);
-    } finally {
-      watcher?.stop();
-      restore();
-      log.restore();
-      if (existsSync(aside)) renameSync(aside, ledger);
-    }
-  }, 15_000);
+        renameSync(aside, ledger);
+        fault.armed = false;
+        const recovered = nextScan();
+        poll();
+        await recovered;
+        expect(lines.some((l) => l.includes(`${env.messageId}: not presented (already consumed)`))).toBe(true);
+        expect(received).toEqual([]);
+        expect(readFileSync(join(inbox.fresh, `replay-${file}`))).toEqual(bytes);
+        expect(jsonFiles(inbox.cur)).toEqual([]);
+      } finally {
+        watcher?.stop();
+        intervalSpy.mockRestore();
+        restore();
+        logSpy.mockRestore();
+        if (existsSync(aside)) renameSync(aside, ledger);
+      }
+    }, 15_000);
+  }
 
   it("a scan request that runs during an active scan rescans once, so two files in one burst are both presented without the poll", async () => {
     const bodies: string[] = [];

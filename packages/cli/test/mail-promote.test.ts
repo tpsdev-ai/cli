@@ -9,7 +9,8 @@
  * an optional parameter and the only live caller passed two arguments).
  */
 
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -360,18 +361,29 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const inbox = getInbox("kern");
     const [file] = newJsonFiles(inbox.fresh);
 
-    // Force the ledger append to fail: a DIRECTORY at the ledger path.
     const ledger = join(inbox.root, "consumed.jsonl");
-    mkdirSync(ledger, { recursive: true });
-
-    const during = await checkMessages("kern");
-    expect(during.length).toBe(0); // NOT silently delivered
-    expect(jsonFiles(inbox.cur).length).toBe(0); // the move was rolled back
-    expect(newJsonFiles(inbox.dlq).length).toBe(1);
-    expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: storage-unavailable");
+    const append = fs.appendFileSync;
+    let appendAttempted = false;
+    const fault = spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof append>) => {
+      if (args[0] === ledger) {
+        appendAttempted = true;
+        expect(jsonFiles(inbox.cur)).toContain(file!);
+        throw new Error("ledger append fault");
+      }
+      return append(...args);
+    });
+    try {
+      const during = await checkMessages("kern");
+      expect(appendAttempted).toBe(true);
+      expect(during.length).toBe(0);
+      expect(jsonFiles(inbox.cur).length).toBe(0);
+      expect(newJsonFiles(inbox.dlq).length).toBe(1);
+      expect(reasonFor(process.env.TPS_MAIL_DIR!, "kern", file!)).toContain("class: storage-unavailable");
+    } finally {
+      fault.mockRestore();
+    }
 
     // Clear the fault; the quarantined record self-heals.
-    rmSync(ledger, { recursive: true, force: true });
     const after = await checkMessages("kern");
     expect(after.length).toBe(1);
     expect(after[0]!.body).toBe("ledger-fault");
@@ -546,18 +558,15 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     }
   });
 
-  // ── Lock: crash mid-acquire must not wedge; birth token must be portable ──
-  test("an unowned .mail-lock (crash between claim and stamp) is broken, not a permanent wedge", async () => {
+  test("a .mail-lock with no owner withholds delivery", async () => {
     const env = buildSignedEnvelope("flint", "kern", "wedge-recovery", { flint: FLINT_SEED });
     sendMessage("kern", JSON.stringify(env), "flint");
     const inbox = getInbox("kern");
-    // The state the OLD mkdir-then-stamp code could leave on a crash between the
-    // two: a lock directory with no owner.json.
     mkdirSync(join(inbox.root, ".mail-lock"), { recursive: true });
 
     const msgs = await checkMessages("kern");
-    expect(msgs.length).toBe(1); // recovered, not wedged forever
-    expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
+    expect(msgs.length).toBe(0);
+    expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(true);
   });
 
   test("a lock whose live owner's start token mismatches (same source) is broken (pid reuse)", async () => {
@@ -614,22 +623,21 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(after.length).toBe(1);
   });
 
-  // ── Unowned locks: classified by USABLE owner, not by corruption shape ─────
-  const unownedShapes: Array<[string, string]> = [
+  const unverifiableShapes: Array<[string, string]> = [
     ["a truncated owner.json", '{"pid":'],
     ["an empty owner.json", ""],
     ["an owner.json with no numeric pid", JSON.stringify({ startToken: "x" })],
   ];
-  for (const [label, content] of unownedShapes) {
-    test(`a .mail-lock with ${label} is unowned and broken, not a wedge`, async () => {
+  for (const [label, content] of unverifiableShapes) {
+    test(`a .mail-lock with ${label} withholds delivery`, async () => {
       const env = buildSignedEnvelope("flint", "kern", `unowned-${label}`, { flint: FLINT_SEED });
       sendMessage("kern", JSON.stringify(env), "flint");
       const inbox = getInbox("kern");
       plantLockRaw(inbox.root, content);
 
       const msgs = await checkMessages("kern");
-      expect(msgs.length).toBe(1); // recovered, not timed out
-      expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(false);
+      expect(msgs.length).toBe(0);
+      expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(true);
     });
   }
 });

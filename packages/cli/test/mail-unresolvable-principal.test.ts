@@ -138,7 +138,7 @@ describe("unresolvable-principal release gate (cli#383)", () => {
     expect(reason).toMatch(/local Flair/i); // names the topology
     expect(reason).toMatch(/spoke/i);
     expect(reason).toContain("383"); // the issue
-    expect(reason).toMatch(/DEAD-LETTERED, NOT delivered/); // disposition, plainly
+    expect(reason).toMatch(/delivery refused/);
   });
 
   // ── (b) the no-downgrade pin ──────────────────────────────────────────────
