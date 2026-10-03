@@ -43,11 +43,12 @@
 
 import meow from "meow";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -66,6 +67,7 @@ export type NonoProfile =
   | "tps-agent-run-gemini";
 
 export interface NonoOptions {
+  cwd?: string;
   /** Override workdir for the nono sandbox (--workdir flag) */
   workdir?: string;
   /** Extra read-only paths to allow */
@@ -305,12 +307,259 @@ export function runtimeNonoOptions(
     allowFiles = [join(home, ".claude.json"), join(home, ".claude.lock")];
   } else if (runtime === "codex") {
     allow = [env.CODEX_HOME || join(home, ".codex"), join(home, ".config", "codex")];
-    allowFiles = [join(home, ".tps", "auth", "openai.json")];
+    allowFiles = [providerAuthPath(runtimeProviders.codex, env)];
   } else if (runtime === "gemini") {
     allow = [join(home, ".gemini"), join(xdg, "gemini")];
   }
-  for (const path of allow) mkdirSync(path, { recursive: true, mode: 0o700 });
   return { allow: [...new Set(allow)], allowFiles };
+}
+
+function runtimeDirVariables(
+  runtime: string | undefined,
+  env: NodeJS.ProcessEnv,
+): Array<{ variable: string; path: string }> {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  if (runtime === "claude-code") {
+    return env.CLAUDE_CONFIG_DIR ? [{ variable: "CLAUDE_CONFIG_DIR", path: env.CLAUDE_CONFIG_DIR }] : [];
+  }
+  if (runtime === "codex") {
+    return env.CODEX_HOME ? [{ variable: "CODEX_HOME", path: env.CODEX_HOME }] : [];
+  }
+  if (runtime === "gemini") {
+    return env.XDG_CONFIG_HOME ? [{ variable: "XDG_CONFIG_HOME", path: join(xdg, "gemini") }] : [];
+  }
+  return [];
+}
+
+function tpsCredentialRoots(
+  env: NodeJS.ProcessEnv = process.env,
+): Array<{ label: string; path: string }> {
+  const home = env.HOME || homedir();
+  return (["auth", "identity", "secrets"] as const).map((dir) => ({
+    label: `~/.tps/${dir}`,
+    path: join(home, ".tps", dir),
+  }));
+}
+
+function caseInsensitivePath(p: string): boolean {
+  let ancestor = p;
+  for (;;) {
+    try {
+      if (!statSync(ancestor).isDirectory()) ancestor = dirname(ancestor);
+      break;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw err;
+      ancestor = parent;
+    }
+  }
+  const toggleCase = (name: string) => name.replace(/[a-zA-Z]/, (c) => c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase());
+  let parent = ancestor;
+  let names = readdirSync(parent);
+  let name = names.find((entry) => toggleCase(entry) !== entry);
+  if (!name) {
+    parent = dirname(ancestor);
+    if (parent === ancestor || statSync(parent).dev !== statSync(ancestor).dev) return true;
+    name = basename(ancestor);
+    if (toggleCase(name) === name) return caseInsensitivePath(parent);
+    names = readdirSync(parent);
+  }
+  const alternateName = toggleCase(name);
+  if (names.includes(alternateName)) return false;
+  const probe = join(parent, name);
+  const original = lstatSync(probe);
+  try {
+    const alternate = lstatSync(join(parent, alternateName));
+    return original.dev === alternate.dev && original.ino === alternate.ino;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+function appendUnresolved(ancestor: string, tail: string[]): string {
+  if (!tail.length) return ancestor;
+  const components = caseInsensitivePath(ancestor) ? tail.map((part) => part.toLowerCase()) : tail;
+  return join(ancestor, ...components);
+}
+
+function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
+  if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
+  let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      const real = realpathSync(cur);
+      return appendUnresolved(real, tail.reverse());
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      try {
+        if (lstatSync(cur).isSymbolicLink()) {
+          const target = canonicalPath(readlinkSync(cur), dirname(cur), links + 1);
+          return appendUnresolved(target, tail.reverse());
+        }
+      } catch (linkErr) {
+        const linkCode = (linkErr as NodeJS.ErrnoException).code;
+        if (linkCode !== "ENOENT" && linkCode !== "ENOTDIR") throw linkErr;
+      }
+      const parent = dirname(cur);
+      if (parent === cur) throw err;
+      tail.push(basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+function pathContainsOrEquals(dir: string, p: string): boolean {
+  if (dir === p) return true;
+  return p.startsWith(dir.endsWith("/") ? dir : `${dir}/`);
+}
+
+function pathsOverlap(a: string, b: string): boolean {
+  return pathContainsOrEquals(a, b) || pathContainsOrEquals(b, a);
+}
+
+export function approveRuntimeNonoOptions(
+  runtime: string | undefined,
+  grants: NonoOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  agentId?: string,
+): { options: NonoOptions; runtimeDirectories: string[]; refusal: string | null } {
+  const options: NonoOptions = {};
+  const runtimeDirectories: string[] = [];
+  const result = (refusal: string | null) => ({ options, runtimeDirectories, refusal });
+  const resolved = new Map<string, string>();
+  const canonical = (p: string): string => {
+    if (!resolved.has(p)) resolved.set(p, canonicalPath(p));
+    return resolved.get(p)!;
+  };
+  const comparisonPaths = new Map<string, string>();
+  const comparisonPath = (p: string): string => {
+    if (!comparisonPaths.has(p)) comparisonPaths.set(p, caseInsensitivePath(p) ? p.toLowerCase() : p);
+    return comparisonPaths.get(p)!;
+  };
+  const overlaps = (a: string, b: string) => pathsOverlap(comparisonPath(a), comparisonPath(b));
+  const contains = (a: string, b: string) => pathContainsOrEquals(comparisonPath(a), comparisonPath(b));
+  const equals = (a: string, b: string) => comparisonPath(a) === comparisonPath(b);
+  try {
+    const roots = tpsCredentialRoots(env).map((r) => {
+      try {
+        return { ...r, canon: canonical(r.path) };
+      } catch (err) {
+        throw new Error(`cannot resolve TPS credential root ${r.label} (${r.path}): ${(err as Error).message}`);
+      }
+    });
+
+    for (const { variable, path } of runtimeDirVariables(runtime, env)) {
+      let canon: string;
+      try {
+        canon = canonical(path);
+      } catch (err) {
+        const root = roots.find((r) => pathsOverlap(resolve(path).toLowerCase(), resolve(r.path).toLowerCase()));
+        return result(
+          `${variable}=${path} cannot be resolved` +
+          (root ? ` at TPS credential root ${root.label} (${root.path})` : "") +
+          `: ${(err as Error).message}`,
+        );
+      }
+      const hit = roots.find((r) => overlaps(canon, r.canon));
+      if (hit) {
+        return result(
+          `${variable}=${path} overlaps the TPS credential root ${hit.label} (${hit.path}) — ` +
+          `the runtime profile would grant it read-write access to a credential root`
+        );
+      }
+    }
+
+    const dirGrants: Array<{ label: string; path: string }> = [];
+    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir });
+    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd });
+    for (const p of grants.read ?? []) dirGrants.push({ label: `the read grant '${p}'`, path: p });
+    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p });
+    for (const p of runtimeNonoOptions(runtime, env).allow ?? []) {
+      runtimeDirectories.push(canonical(p));
+      dirGrants.push({ label: `the runtime directory '${p}'`, path: p });
+    }
+
+    const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
+    const foreignFiles = runtimes
+      .filter((rt) => rt !== runtime)
+      .flatMap((rt) => [...runtimeCredentialFiles(rt, env), providerAuthPath(runtimeProviders[rt], env)])
+      .map((f) => ({ path: f, canon: canonical(f) }));
+
+    for (const grant of dirGrants) {
+      const canon = canonical(grant.path);
+      const root = roots.find((r) => overlaps(canon, r.canon));
+      if (root) {
+        return result(
+          `${grant.label} (${grant.path}) overlaps the TPS credential root ${root.label} (${root.path}) — ` +
+          (grant.label === "the current-directory grant"
+            ? `launch from a workspace directory outside the credential roots`
+            : grant.label === "the workdir grant"
+              ? `set the workspace to a directory outside the credential roots`
+              : `remove or narrow this grant to a directory outside the credential roots`)
+        );
+      }
+      const foreign = foreignFiles.find((f) => contains(canon, f.canon));
+      if (foreign) {
+        return result(
+          `${grant.label} (${grant.path}) covers ${foreign.path}, another runtime's credential file`
+        );
+      }
+    }
+    const identityRoot = roots.find((r) => r.label === "~/.tps/identity")!.canon;
+    const ownIdentity = agentId
+      ? [join(identityRoot, `${agentId}.key`), join(identityRoot, `${agentId}.pub`)]
+      : [];
+    const ownAuth = runtime === "codex"
+      ? [join(roots.find((r) => r.label === "~/.tps/auth")!.canon, `${runtimeProviders.codex}.json`)]
+      : [];
+    const ownFiles = runtimes.includes(runtime as CredentialRuntime)
+      ? [...runtimeCredentialFiles(runtime as CredentialRuntime, env), ...(runtimeNonoOptions(runtime, env).allowFiles ?? [])]
+      : [];
+    const ownTargets = ownFiles.map((p) => join(canonical(dirname(resolve(p))), basename(p)));
+    const systemTargets = systemReadFiles().map(canonical);
+    const fileGrants = [
+      ...(grants.readFiles ?? []).map((p) => ({ path: p, label: `the read-file grant '${p}'`, readOnly: true })),
+      ...(grants.allowFiles ?? []).map((p) => ({ path: p, label: `the writable-file grant '${p}'`, readOnly: false })),
+    ];
+    for (const grant of fileGrants) {
+      const canon = canonical(grant.path);
+      const foreign = foreignFiles.find((f) => equals(f.canon, canon));
+      if (foreign) return result(`${grant.label} targets ${foreign.path}, another runtime's credential file`);
+      const root = roots.find((r) => overlaps(canon, r.canon));
+      const permittedTpsFile = ownAuth.some((p) => equals(p, canon)) || (grant.readOnly && ownIdentity.some((p) => equals(p, canon)));
+      if (root && !permittedTpsFile) {
+        return result(`${grant.label} (${canon}) overlaps the TPS credential root ${root.label} (${root.path})`);
+      }
+      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && systemTargets.some((p) => equals(p, canon)))) {
+        return result(`${grant.label} (${canon}) is not a permitted file for runtime '${runtime}'`);
+      }
+    }
+    for (const key of ["workdir", "cwd"] as const) {
+      if (grants[key]) options[key] = canonical(grants[key]);
+    }
+    for (const key of ["read", "allow", "readFiles", "allowFiles"] as const) {
+      options[key] = (grants[key] ?? []).map(canonical);
+    }
+    return result(null);
+  } catch (err) {
+    const settings = runtimeDirVariables(runtime, env).map(({ variable, path }) => `${variable}=${path}`).join(", ");
+    return result(`cannot resolve launch grants${settings ? ` for ${settings}` : ""}: ${(err as Error).message}`);
+  }
+}
+
+export function runtimeDirCredentialRefusal(
+  runtime: string | undefined,
+  grants: NonoOptions,
+  env: NodeJS.ProcessEnv = process.env,
+  agentId?: string,
+): string | null {
+  return approveRuntimeNonoOptions(runtime, grants, env, agentId).refusal;
 }
 
 /**
@@ -330,7 +579,9 @@ export function buildNonoArgs(
   // (the user dir). Passing the path makes what we validate the artifact that
   // actually runs.
   const profilePath = resolveProfilePath(profile, env) ?? profile;
-  const args = ["run", "--profile", profilePath, "--allow-cwd"];
+  const args = ["run", "--profile", profilePath];
+  if (options.cwd) args.push("--allow", options.cwd);
+  else args.push("--allow-cwd");
 
   if (options.workdir) {
     args.push("--workdir", options.workdir);

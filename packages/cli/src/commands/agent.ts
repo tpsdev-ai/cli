@@ -28,6 +28,7 @@ import {
   harnessReadFiles,
   runtimeNonoOptions,
   runtimeNonoProfile,
+  approveRuntimeNonoOptions,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -795,18 +796,20 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
       // The runtime's own key resolution (this same value) is now the validated id.
       config.agentId = launchId;
-      if (config.flair) {
-        const flair = createFlairClient(
-          config.agentId,
-          config.flair.url ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
-          config.flair.keyPath ?? join(homedir(), ".tps", "identity", `${config.agentId}.key`),
-        );
-        loadPlugins({ slots: { memory: "flair" } }, { flair });
-      }
-      if (config.role) {
-        applyRole({ role: config.role, ...(config.roleConfig ?? {}) }, config.agentId);
-      }
-      const runtime = new AgentRuntime(config);
+      const createRuntime = () => {
+        if (config.flair) {
+          const flair = createFlairClient(
+            config.agentId,
+            config.flair.url ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926",
+            config.flair.keyPath ?? join(homedir(), ".tps", "identity", `${config.agentId}.key`),
+          );
+          loadPlugins({ slots: { memory: "flair" } }, { flair });
+        }
+        if (config.role) {
+          applyRole({ role: config.role, ...(config.roleConfig ?? {}) }, config.agentId);
+        }
+        return new AgentRuntime(config);
+      };
 
       if (args.action === "run") {
         const message = args.message || process.env.TPS_AGENT_MESSAGE;
@@ -814,7 +817,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
           console.error("Usage: tps agent run --id <agent-id> --message <text>");
           process.exit(1);
         }
-        await runtime.runOnce(message);
+        await createRuntime().runOnce(message);
         return;
       }
 
@@ -887,28 +890,37 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
             const runtimeGrants = runtimeNonoOptions(selectedRuntime);
+            const launchOptions = {
+              workdir: config.workspace,
+              // CHANGE (cli#341 S1b): this used to grant a read of the
+              // filesystem root. A root grant is refused outright by nono
+              // 0.70+ (exit 1). Use the explicit toolchain read set instead —
+              // the macOS roots Kern validated, and their Linux equivalents
+              // (systemReadPaths()).
+              read: harnessReadPaths(),
+              // Exactly this agent's own identity files, not the shared
+              // identity directory (cli#351 r4).
+              readFiles: harnessReadFiles(launchId),
+              allowFiles: runtimeGrants.allowFiles,
+              // Bun's own temp dir is /tmp regardless of TMPDIR, and an
+              // unreadable temp dir is fatal to it — grant BOTH /tmp and the
+              // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
+              // to /var/folders/…, so /tmp would otherwise not be granted at
+              // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
+              allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
+            };
+            const approval = selectedRuntime
+              ? approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId)
+              : null;
+            if (approval?.refusal) {
+              console.error(`❌ refusing to launch runtime '${selectedRuntime}': ${approval.refusal}`);
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+            }
             const exitCode = await launchAttested(
               runtimeNonoProfile(selectedRuntime),
-              {
-                workdir: config.workspace,
-                // CHANGE (cli#341 S1b): this used to grant a read of the
-                // filesystem root. A root grant is refused outright by nono
-                // 0.70+ (exit 1). Use the explicit toolchain read set instead —
-                // the macOS roots Kern validated, and their Linux equivalents
-                // (systemReadPaths()).
-                read: harnessReadPaths(),
-                // Exactly this agent's own identity files, not the shared
-                // identity directory (cli#351 r4).
-                readFiles: harnessReadFiles(launchId),
-                allowFiles: runtimeGrants.allowFiles,
-                // Bun's own temp dir is /tmp regardless of TMPDIR, and an
-                // unreadable temp dir is fatal to it — grant BOTH /tmp and the
-                // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
-                // to /var/folders/…, so /tmp would otherwise not be granted at
-                // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
-              },
+              approval?.options ?? launchOptions,
               relaunch,
+              { runtimeDirectories: approval?.runtimeDirectories },
             );
             process.exit(exitCode);
           }
@@ -917,7 +929,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         }
 
         try {
-          await runtime.start();
+          await createRuntime().start();
         } catch (_err) {
           console.error("❌ Agent runtime crashed:", _err);
           process.exit(1);
@@ -926,7 +938,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       if (args.action === "health") {
-        const healthy = runtime.isHealthy();
+        const healthy = createRuntime().isHealthy();
         process.stdout.write(healthy ? "healthy\n" : "unhealthy\n");
         process.exit(healthy ? 0 : 1);
       }

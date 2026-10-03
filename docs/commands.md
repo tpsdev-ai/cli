@@ -14,6 +14,8 @@ The `tps` CLI is the control plane for the Agent OS.
 
 Sandbox flag values must be exactly `true` or `false`; other values are refused by name.
 
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` affect runtime grants.
+
 ---
 
 ## Provisioning
