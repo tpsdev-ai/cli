@@ -9,6 +9,10 @@ The `tps` CLI is the control plane for the Agent OS.
 | `--config <path>` | Path to `openclaw.json` (defaults to auto-discovery). |
 | `--version` | Show version number. |
 | `--help` | Show help. |
+| `--sandbox-required[=true|false]` / `--sandboxRequired[=true|false]` | Require isolation; conflicts with `--no-sandbox`. |
+| `--no-sandbox` | Interactive TTY opt-out. `--sandbox=false` does not opt out. |
+
+Sandbox flag values must be exactly `true` or `false`; other values are refused by name.
 
 ---
 

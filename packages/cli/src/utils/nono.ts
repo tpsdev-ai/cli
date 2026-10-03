@@ -21,12 +21,8 @@
  *   - A non-interactive invocation that launches an agent MUST carry
  *     `--sandbox-required`; a launcher that dropped it is refused rather than
  *     silently running unsandboxed. See `evaluateLaunchControl`.
- *   - an `agent start --runtime claude-code|codex|gemini` invocation carrying
- *     `--sandbox-required` is refused, by this rule unless an earlier one
- *     already refused it: those runtimes are spawned directly and never
- *     reach the attested launch, so the flag would assert an isolation that
- *     path cannot deliver (cli#363 slice A; routing them through the attested
- *     launch is slice B).
+ *   - CLI selected runtime runners require launcher release or an interactive
+ *     TTY `--no-sandbox` opt-out. `--sandbox-required` conflicts with that opt-out.
  *   - Under `--sandboxed` the child must hold the launcher's release for a live
  *     nono session bound to its own pid (cli#350 round 4e): see
  *     `launch-attestation.ts`. `--sandboxed` means "my launcher released me" —
@@ -45,6 +41,7 @@
  *   });
  */
 
+import meow from "meow";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -63,7 +60,10 @@ export type NonoProfile =
   | "tps-backup"
   | "tps-restore"
   | "tps-status"
-  | "tps-agent-run";
+  | "tps-agent-run"
+  | "tps-agent-run-claude-code"
+  | "tps-agent-run-codex"
+  | "tps-agent-run-gemini";
 
 export interface NonoOptions {
   /** Override workdir for the nono sandbox (--workdir flag) */
@@ -79,6 +79,7 @@ export interface NonoOptions {
   readFiles?: string[];
   /** Extra read-write paths to allow */
   allow?: string[];
+  allowFiles?: string[];
 }
 
 /**
@@ -285,6 +286,33 @@ export function harnessReadFiles(agentId?: string): string[] {
   return files;
 }
 
+export function runtimeNonoProfile(runtime?: string): NonoProfile {
+  return runtime === "claude-code" || runtime === "codex" || runtime === "gemini"
+    ? `tps-agent-run-${runtime}`
+    : "tps-agent-run";
+}
+
+export function runtimeNonoOptions(
+  runtime?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonoOptions {
+  const home = env.HOME || homedir();
+  const xdg = env.XDG_CONFIG_HOME || join(home, ".config");
+  let allow: string[] = [];
+  let allowFiles: string[] = [];
+  if (runtime === "claude-code") {
+    allow = [env.CLAUDE_CONFIG_DIR || join(home, ".claude"), join(home, ".claude")];
+    allowFiles = [join(home, ".claude.json"), join(home, ".claude.lock")];
+  } else if (runtime === "codex") {
+    allow = [env.CODEX_HOME || join(home, ".codex"), join(home, ".config", "codex")];
+    allowFiles = [join(home, ".tps", "auth", "openai.json")];
+  } else if (runtime === "gemini") {
+    allow = [join(home, ".gemini"), join(xdg, "gemini")];
+  }
+  for (const path of allow) mkdirSync(path, { recursive: true, mode: 0o700 });
+  return { allow: [...new Set(allow)], allowFiles };
+}
+
 /**
  * Build the nono command args for a given profile and subcommand.
  *
@@ -314,6 +342,10 @@ export function buildNonoArgs(
 
   for (const p of options.readFiles ?? []) {
     args.push("--read-file", p);
+  }
+
+  for (const p of options.allowFiles ?? []) {
+    args.push("--allow-file", p);
   }
 
   for (const p of options.allow ?? []) {
@@ -671,28 +703,50 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   return false;
 }
 
-/**
- * The three runtimes that skip the attested launch (cli#363). `bin/tps.ts`
- * branches on `--runtime <one of these>` BEFORE `runAgent({action:"start"})`,
- * spawns the runtime directly, and never reaches `launchAttested()`: a launch on
- * that path is NOT confined by nono, so it cannot honour `--sandbox-required`.
- */
-export const ATTESTATION_EXEMPT_RUNTIMES: readonly string[] = ["claude-code", "codex", "gemini"];
+export const launchFlagDefinitions = {
+  sandboxRequired: { type: "boolean" as const, default: false },
+};
 
-/** The exempt runtime `argv` selects via `--runtime <value>`, or undefined. */
-export function attestationExemptRuntime(argv: readonly string[] = process.argv): string | undefined {
-  const i = argv.indexOf("--runtime");
-  const value = i >= 0 ? argv[i + 1] : undefined;
-  return value !== undefined && ATTESTATION_EXEMPT_RUNTIMES.includes(value) ? value : undefined;
-}
-
-/** The refusal for `--sandbox-required` on a path that does not run attested. */
-export function attestationExemptRefusal(runtime: string): string {
-  return (
-    `${SANDBOX_REQUIRED_FLAG} is refused on the \`--runtime ${runtime}\` path: that runtime is spawned ` +
-    `directly and is not launched through the attested sandbox yet (cli#363), so the flag would ` +
-    `assert an isolation this path cannot deliver. Refusing to launch.`
-  );
+export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<string, unknown>): {
+  sandboxRequired: boolean; noSandbox: boolean; refusal?: string;
+} {
+  const title = process.title;
+  const parse = (args: readonly string[], flags: typeof launchFlagDefinitions | Record<string, never>) =>
+    meow("", { importMeta: import.meta, argv: [...args], flags, autoHelp: false, autoVersion: false }).flags;
+  const booleanValue = (value: unknown): boolean => {
+    if (value === undefined || value === false || value === "false") return false;
+    if (value === true || value === "true") return true;
+    throw new Error("cannot interpret sandbox flag value");
+  };
+  try {
+    for (let i = 2; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--") break;
+      if (!arg.startsWith("--")) continue;
+      const equals = arg.indexOf("=");
+      const name = equals === -1 ? arg : arg.slice(0, equals);
+      const raw = parse([name], {});
+      if (!["sandboxRequired", "noSandbox", "sandbox", "noSandboxRequired", "sandboxed", "noSandboxed"]
+        .some(key => Object.hasOwn(raw, key))) continue;
+      const next = argv[i + 1];
+      const value = equals !== -1 ? arg.slice(equals + 1)
+        : next !== undefined && (!next.startsWith("-") || /^-\d/.test(next)) ? next : undefined;
+      if (value !== undefined && value !== "true" && value !== "false") {
+        throw new Error(`${name} accepts only 'true' or 'false'; received ${JSON.stringify(value)}`);
+      }
+    }
+    const flags = parsedFlags ?? parse(argv.slice(2), launchFlagDefinitions);
+    const noSandbox = booleanValue(flags.noSandbox);
+    return {
+      sandboxRequired: booleanValue(flags.sandboxRequired),
+      noSandbox: flags.sandbox === false || noSandbox,
+    };
+  } catch (error) {
+    return { sandboxRequired: false, noSandbox: false,
+      refusal: `cannot interpret sandbox flag: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    process.title = title;
+  }
 }
 
 export interface LaunchControlInput {
@@ -704,6 +758,7 @@ export interface LaunchControlInput {
   argv?: readonly string[];
   /** Override TTY detection (tests). */
   interactiveTty?: boolean;
+  parsedFlags?: Record<string, unknown>;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
   /** The launcher's release verdict (see `launch-attestation.ts`). Absent when
@@ -719,10 +774,6 @@ export interface LaunchControlResult {
   refusalExitCode: number;
 }
 
-/**
- * Pure decision function for the launch-path control. Never touches the
- * process; the caller applies the result.
- */
 export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchControlResult {
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
@@ -730,8 +781,14 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
+  const flags = readLaunchFlags(argv, input.parsedFlags);
+  if (flags.refusal) return deny(flags.refusal);
+  if (flags.sandboxRequired && flags.noSandbox) {
+    return deny(`${SANDBOX_REQUIRED_FLAG} conflicts with ${NO_SANDBOX_FLAG}; remove ${NO_SANDBOX_FLAG} to require isolation.`);
+  }
+
   // (1) --no-sandbox is honoured only from an interactive TTY.
-  if (argv.includes(NO_SANDBOX_FLAG) && !tty) {
+  if (flags.noSandbox && !tty) {
     return deny(
       `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
         "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
@@ -762,7 +819,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   }
 
   // (2) Non-interactive agent launch must assert --sandbox-required.
-  if (launchesAgent(input.command, input.rest) && !tty && !argv.includes(SANDBOX_REQUIRED_FLAG)) {
+  if (launchesAgent(input.command, input.rest) && !tty && !flags.sandboxRequired) {
     const sub = input.rest?.[0] ?? "";
     return deny(
       `${SANDBOX_REQUIRED_FLAG} is required: this non-interactive context is launching an agent ` +
@@ -770,23 +827,6 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
         `a stale wrapper or a dropped argument would otherwise run the agent unsandboxed. ` +
         `Refusing to launch.`,
     );
-  }
-
-  // (2b) cli#363 — a launch on the `--runtime` branch cannot honour
-  // `--sandbox-required`, because it never reaches the attested launch. The
-  // command-name check above is satisfied by `agent start`, so before this rule
-  // the flag passed the gate and the process then ran unconfined: a guarantee
-  // the path cannot deliver, read as delivered. Refused, TTY included, unless an
-  // earlier rule has already refused, until those runtimes are routed through
-  // `launchAttested()`.
-  const exemptRuntime = attestationExemptRuntime(argv);
-  if (
-    exemptRuntime !== undefined &&
-    input.command === "agent" &&
-    input.rest?.[0] === "start" &&
-    argv.includes(SANDBOX_REQUIRED_FLAG)
-  ) {
-    return deny(attestationExemptRefusal(exemptRuntime));
   }
 
   return { allowed: true, refusalExitCode: 0 };

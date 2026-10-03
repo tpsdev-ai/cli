@@ -167,6 +167,8 @@ for f in "${PROFILE_DIR}"/*.json; do
   esac
 done
 
+(cd "${REPO_ROOT}" && NONO_BIN="${NONO_BIN}" bun run scripts/check-runtime-nono-paths.ts)
+
 # ── 5. WORKLOAD smoke under the EXACT launch args (cli#351 r5) ───────────────
 # Built with the SAME helper the launch uses (harnessReadPaths/harnessReadFiles),
 # so the gate exercises what the agent actually gets: a shell redirect to

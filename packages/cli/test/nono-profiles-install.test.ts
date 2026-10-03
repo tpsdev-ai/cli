@@ -117,7 +117,7 @@ describe("installNonoProfiles migration", () => {
     installNonoProfiles(profilesDir, true);
 
     const names = readdirSync(profilesDir);
-    expect(names.filter((f) => f.endsWith(".json")).length).toBe(13);
+    expect(names.filter((f) => f.endsWith(".json")).length).toBe(16);
     expect(names).toContain("tps-base.json");
     const child = JSON.parse(readFileSync(join(profilesDir, "tps-agent-run.json"), "utf-8"));
     expect(child.meta.version).toBe("2.0.0"); // bundled wins over the stale child

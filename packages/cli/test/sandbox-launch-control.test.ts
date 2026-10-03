@@ -30,6 +30,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { evaluateLaunchControl } from "../src/utils/nono.js";
+import meow from "meow";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
 
@@ -62,7 +64,7 @@ beforeAll(() => {
 
 describe("T2 — env bypass gone / --no-sandbox is TTY-only", () => {
   test("TPS_FORCE_NO_NONO=1 cannot rescue a non-TTY --no-sandbox (refused, exit 78)", () => {
-    const r = runLauncher(["agent", "start", "--id", "ghost", NO_SANDBOX, SANDBOX_REQUIRED], {
+    const r = runLauncher(["agent", "start", "--id", "ghost", NO_SANDBOX], {
       TPS_FORCE_NO_NONO: "1",
     });
     const out = output(r).toLowerCase();
@@ -238,4 +240,50 @@ describe("T4 — KeepAlive {SuccessfulExit:false} only with exit-0-on-refusal", 
     expect(output(r)).toContain(SANDBOX_REQUIRED);
     expect(r.status).toBe(0);
   });
+});
+
+for (const spelling of ["sandbox-required", "sandboxRequired"]) {
+  for (const value of ["true", "false"]) {
+    test(`launch gate matches parser for --${spelling}=${value}`, () => {
+      const argv = ["node", "tps", "agent", "start", `--${spelling}=${value}`];
+      const flags = meow("", {importMeta: import.meta, argv: argv.slice(2),
+        autoHelp: false, autoVersion: false,
+        flags: {sandboxRequired: {type: "boolean", default: false}},
+      }).flags;
+      const result = evaluateLaunchControl({command: "agent", rest: ["start"], argv,
+        interactiveTty: false, supervised: false});
+      expect(flags.sandboxRequired).toBe(value === "true");
+      expect(result.allowed).toBe(flags.sandboxRequired);
+    });
+  }
+}
+for (const spelling of ["no-sandbox", "noSandbox", "no_sandbox"]) {
+  for (const value of ["true", "false"]) {
+    test(`non-TTY launch gate interprets --${spelling}=${value}`, () => {
+      const result = evaluateLaunchControl({argv: ["node", "tps", `--${spelling}=${value}`],
+        interactiveTty: false, supervised: false});
+      expect(result.allowed).toBe(value === "false");
+    });
+  }
+}
+
+for (const spelling of ["sandbox-required", "sandboxRequired", "sandbox_required",
+  "sandbox", "no-sandbox", "noSandbox", "no_sandbox", "no-sandbox-required", "noSandboxRequired",
+  "sandboxed", "no-sandboxed", "noSandboxed"]) {
+  for (const value of ["1", "0", "yes", "", "TRUE"]) {
+    for (const equals of [true, false]) {
+      test(`invalid raw sandbox value --${spelling}${equals ? "=" : " "}${value} is refused by name`, () => {
+        const args = equals ? [`--${spelling}=${value}`] : [`--${spelling}`, value];
+        const r = runLauncher(["agent", "start", "--runtime", "codex", ...args, "--no-sandbox"]);
+        expect(r.status).toBe(78);
+        expect(output(r)).toContain(`--${spelling} accepts only 'true' or 'false'`);
+      });
+    }
+  }
+}
+
+test("an invalid required value cannot be overwritten by a later valid value", () => {
+  const r = runLauncher(["agent", "start", "--sandbox-required=1", "--sandboxRequired=false", "--no-sandbox"]);
+  expect(r.status).toBe(78);
+  expect(output(r)).toContain("--sandbox-required accepts only 'true' or 'false'");
 });

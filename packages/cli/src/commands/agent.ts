@@ -26,6 +26,8 @@ import {
   isSupervised,
   harnessReadPaths,
   harnessReadFiles,
+  runtimeNonoOptions,
+  runtimeNonoProfile,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -61,6 +63,12 @@ export interface AgentArgs {
   sandboxed?: boolean;
   /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
   sandboxRequired?: boolean;
+  /**
+   * The selected agent runtime (`--runtime claude-code|codex|gemini`). Carried
+   * into the attested re-exec so the sandboxed child runs the runtime runner
+   * (cli#363 slice B); undefined for the default AgentRuntime path.
+   */
+  runtime?: string;
   lines?: number;
   follow?: boolean;
   ackScopeExpansion?: boolean;
@@ -814,6 +822,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         const sandbox = (args as any).sandbox ?? true; // default ON — nono is the required isolation layer
         const sandboxed = (args as any).sandboxed ?? false;
         const sandboxRequired = (args as any).sandboxRequired ?? process.argv.includes("--sandbox-required");
+        // cli#363 slice B: carry the selected runtime into the re-exec so the
+        // sandboxed child runs the runtime runner rather than the default
+        // AgentRuntime. Its CLI caller selects only those three runtimes.
+        const selectedRuntime = args.runtime;
         // The pinned ABSOLUTE path (never PATH) — the same resolution the
         // launcher performs, so the decision to launch and the launch itself
         // cannot disagree about which nono is in play (cli#350 round 4e). Using
@@ -827,20 +839,16 @@ export async function runAgent(args: AgentArgs): Promise<void> {
           // to runtime. Whether that claim is TRUE was settled by the gate: this
           // process only reaches here holding the launcher's release
           // (cli#350 round 4e).
-        } else if (sandbox || isNonoStrict()) {
+        } else if (sandbox || selectedRuntime || isNonoStrict()) {
           if (!nonoAvailable) {
-            // Fail closed, in every context the launch control governs. A
-            // non-interactive launch MUST NOT fall back to running the agent
-            // unsandboxed: that is the silent no-op the unit cannot see (under
-            // TPS_SUPERVISED the refusal exits 0 and KeepAlive never
-            // relaunches). An interactive human keeps the old warning — they
-            // can see it and decide.
-            if (isNonoStrict() || sandboxRequired || !isInteractiveTty()) {
-              const why = isNonoStrict()
-                ? "TPS_NONO_STRICT=1"
-                : "this launch is not interactive";
+            if (selectedRuntime || isNonoStrict() || sandboxRequired || !isInteractiveTty()) {
+              const why = selectedRuntime
+                ? `runtime '${selectedRuntime}' requires isolation; use --no-sandbox in an interactive TTY to opt out`
+                : isNonoStrict()
+                  ? "TPS_NONO_STRICT=1"
+                  : "this launch is not interactive";
               console.error(
-                `❌ refusing to launch the agent: no nono at the pinned absolute path ` +
+                `❌ refusing to launch ${selectedRuntime ? `runtime '${selectedRuntime}'` : "the agent"}: no nono at the pinned absolute path ` +
                   `(${resolveNonoBinary().reason ?? "unknown"}) — ${why}, so the agent cannot ` +
                   `run without isolation. Install nono >= 0.70 or set NONO_BIN.`
               );
@@ -869,13 +877,18 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               "--sandboxed",
             ];
             if (sandboxRequired) relaunch.push("--sandbox-required");
+            // Carry the runtime through the attested launch (cli#363 slice B):
+            // the sandboxed child re-enters bin/tps.ts, which runs the runtime
+            // runner on the execution side.
+            if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
+            const runtimeGrants = runtimeNonoOptions(selectedRuntime);
             const exitCode = await launchAttested(
-              "tps-agent-run",
+              runtimeNonoProfile(selectedRuntime),
               {
                 workdir: config.workspace,
                 // CHANGE (cli#341 S1b): this used to grant a read of the
@@ -887,12 +900,13 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 // Exactly this agent's own identity files, not the shared
                 // identity directory (cli#351 r4).
                 readFiles: harnessReadFiles(launchId),
+                allowFiles: runtimeGrants.allowFiles,
                 // Bun's own temp dir is /tmp regardless of TMPDIR, and an
                 // unreadable temp dir is fatal to it — grant BOTH /tmp and the
                 // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
                 // to /var/folders/…, so /tmp would otherwise not be granted at
                 // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir])],
+                allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
               },
               relaunch,
             );
