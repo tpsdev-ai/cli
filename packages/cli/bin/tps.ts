@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import meow from "meow";
+import { launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
@@ -93,11 +94,7 @@ const cli = meow(
       // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
       quietNonoCheck: { type: "boolean", default: false },
       nonono: { type: "boolean", default: false },
-      // Launch-path control (cli#341 S1a): --sandbox-required is asserted by every
-      // generated agent unit. (--no-sandbox is the interactive-TTY-only escape hatch;
-      // it is read from process.argv directly because yargs parses `--no-x` as a
-      // negation, which would shadow a declared `noSandbox` key.)
-      sandboxRequired: { type: "boolean", default: false },
+      ...launchFlagDefinitions,
       inject: { type: "boolean", default: true },
       runtime: { type: "string", default: "openclaw" },
       baseModel: { type: "string" },
@@ -185,6 +182,7 @@ const cli = meow(
 );
 
 const [command, ...rest] = cli.input;
+const launchFlags = readLaunchFlags(process.argv, cli.flags);
 
 /**
  * Launch-path control (cli#341 S1a). Fail-closed: refuses `--no-sandbox` outside
@@ -218,8 +216,8 @@ async function enforceLaunchControlOrExit(): Promise<void> {
       confinement = { released: attestation.ok, reason: attestation.reason };
     }
   }
-  enforceLaunchControl({ command, rest, argv: process.argv, confinement });
-  if (process.argv.includes(NO_SANDBOX_FLAG) && isInteractiveTty()) {
+  enforceLaunchControl({ command, rest, argv: process.argv, parsedFlags: cli.flags, confinement });
+  if (launchFlags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
 }
@@ -466,12 +464,12 @@ async function main() {
         } else if (action === "start") {
           const runtimeArg = process.argv.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
           const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
-          if (runtimeArg !== undefined && !attestedRuntime) {
+          if (runtimeArg !== undefined && runtimeArg !== "openclaw" && !attestedRuntime) {
             console.error(`❌ refusing to launch runtime '${runtimeArg}': unsupported runtime`);
             process.exit(78);
           }
           const sandboxed = process.argv.includes("--sandboxed");
-          const noSandbox = process.argv.includes("--no-sandbox");
+          const noSandbox = launchFlags.noSandbox;
           // Selected runners execute after launcher release or an interactive
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
@@ -602,7 +600,7 @@ async function main() {
               id: agentId,
               sandbox: !noSandbox,
               sandboxed,
-              sandboxRequired: process.argv.includes("--sandbox-required"),
+              sandboxRequired: launchFlags.sandboxRequired,
               // Carry the runtime into the re-exec so the sandboxed child runs the
               // runtime runner (cli#363 slice B); undefined for the default path.
               runtime: attestedRuntime ? runtimeArg : undefined,

@@ -30,6 +30,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { evaluateLaunchControl } from "../src/utils/nono.js";
+import meow from "meow";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
 
@@ -239,3 +241,28 @@ describe("T4 — KeepAlive {SuccessfulExit:false} only with exit-0-on-refusal", 
     expect(r.status).toBe(0);
   });
 });
+
+for (const spelling of ["sandbox-required", "sandboxRequired"]) {
+  for (const value of ["true", "false", "1", "0"]) {
+    test(`launch gate matches parser for --${spelling}=${value}`, () => {
+      const argv = ["node", "tps", "agent", "start", `--${spelling}=${value}`];
+      const flags = meow("", {importMeta: import.meta, argv: argv.slice(2),
+        autoHelp: false, autoVersion: false,
+        flags: {sandboxRequired: {type: "boolean", default: false}},
+      }).flags;
+      const result = evaluateLaunchControl({command: "agent", rest: ["start"], argv,
+        interactiveTty: false, supervised: false});
+      expect(flags.sandboxRequired).toBe(value === "true");
+      expect(result.allowed).toBe(flags.sandboxRequired);
+    });
+  }
+}
+for (const spelling of ["no-sandbox", "noSandbox", "no_sandbox"]) {
+  for (const value of ["true", "false", "1", "0"]) {
+    test(`non-TTY launch gate interprets --${spelling}=${value}`, () => {
+      const result = evaluateLaunchControl({argv: ["node", "tps", `--${spelling}=${value}`],
+        interactiveTty: false, supervised: false});
+      expect(result.allowed).toBe(value === "false" || value === "0");
+    });
+  }
+}

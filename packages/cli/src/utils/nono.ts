@@ -41,6 +41,7 @@
  *   });
  */
 
+import meow from "meow";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -702,6 +703,45 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   return false;
 }
 
+export const launchFlagDefinitions = {
+  sandboxRequired: { type: "boolean" as const, default: false },
+};
+
+export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<string, unknown>): {
+  sandboxRequired: boolean; noSandbox: boolean; refusal?: string;
+} {
+  const title = process.title;
+  const parse = (args: readonly string[], flags: typeof launchFlagDefinitions | Record<string, never>) =>
+    meow("", { importMeta: import.meta, argv: [...args], flags, autoHelp: false, autoVersion: false }).flags;
+  const booleanValue = (value: unknown): boolean => {
+    if (value === undefined || value === false || value === "false" || value === 0 || value === "0") return false;
+    if (value === true || value === "true" || value === 1 || value === "1") return true;
+    throw new Error("cannot interpret sandbox flag value");
+  };
+  try {
+    for (const arg of argv.slice(2)) {
+      if (!arg.startsWith("--") || !arg.includes("=")) continue;
+      const raw = parse([arg], {});
+      if (["sandboxRequired", "noSandbox", "sandbox", "noSandboxRequired"].some(key => Object.hasOwn(raw, key))) {
+        if (!["true", "false", "1", "0"].includes(arg.slice(arg.indexOf("=") + 1))) {
+          throw new Error(`cannot interpret sandbox flag ${arg}`);
+        }
+      }
+    }
+    const flags = parsedFlags ?? parse(argv.slice(2), launchFlagDefinitions);
+    const noSandbox = booleanValue(flags.noSandbox);
+    return {
+      sandboxRequired: booleanValue(flags.sandboxRequired),
+      noSandbox: flags.sandbox === false || noSandbox,
+    };
+  } catch (error) {
+    return { sandboxRequired: false, noSandbox: false,
+      refusal: `cannot interpret sandbox flag: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    process.title = title;
+  }
+}
+
 export interface LaunchControlInput {
   /** Top-level command word (argv[2]). */
   command?: string;
@@ -711,6 +751,7 @@ export interface LaunchControlInput {
   argv?: readonly string[];
   /** Override TTY detection (tests). */
   interactiveTty?: boolean;
+  parsedFlags?: Record<string, unknown>;
   /** Override supervisor detection (tests). */
   supervised?: boolean;
   /** The launcher's release verdict (see `launch-attestation.ts`). Absent when
@@ -726,10 +767,6 @@ export interface LaunchControlResult {
   refusalExitCode: number;
 }
 
-/**
- * Pure decision function for the launch-path control. Never touches the
- * process; the caller applies the result.
- */
 export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchControlResult {
   const argv = input.argv ?? process.argv;
   const tty = input.interactiveTty ?? isInteractiveTty();
@@ -737,12 +774,14 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   const refusalExitCode = supervised ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE;
   const deny = (refusal: string): LaunchControlResult => ({ allowed: false, refusal, refusalExitCode });
 
-  if (argv.includes(SANDBOX_REQUIRED_FLAG) && argv.includes(NO_SANDBOX_FLAG)) {
+  const flags = readLaunchFlags(argv, input.parsedFlags);
+  if (flags.refusal) return deny(flags.refusal);
+  if (flags.sandboxRequired && flags.noSandbox) {
     return deny(`${SANDBOX_REQUIRED_FLAG} conflicts with ${NO_SANDBOX_FLAG}; remove ${NO_SANDBOX_FLAG} to require isolation.`);
   }
 
   // (1) --no-sandbox is honoured only from an interactive TTY.
-  if (argv.includes(NO_SANDBOX_FLAG) && !tty) {
+  if (flags.noSandbox && !tty) {
     return deny(
       `${NO_SANDBOX_FLAG} is refused: it is only honoured from an interactive TTY ` +
         "(stdin AND stdout must both be terminals). This invocation is not interactive, " +
@@ -773,7 +812,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   }
 
   // (2) Non-interactive agent launch must assert --sandbox-required.
-  if (launchesAgent(input.command, input.rest) && !tty && !argv.includes(SANDBOX_REQUIRED_FLAG)) {
+  if (launchesAgent(input.command, input.rest) && !tty && !flags.sandboxRequired) {
     const sub = input.rest?.[0] ?? "";
     return deny(
       `${SANDBOX_REQUIRED_FLAG} is required: this non-interactive context is launching an agent ` +

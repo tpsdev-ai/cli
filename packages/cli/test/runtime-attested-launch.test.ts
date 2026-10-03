@@ -345,7 +345,7 @@ describe("selected runner startup with interactive opt-out", () => {
   }
 });
 
-function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false) {
+function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false, flags: string[] = []) {
   const defaultMarker = join(sb.root, "default-started");
   const selectedMarker = join(sb.root, "selected-started");
   const preload = join(sb.root, "interactive.mjs");
@@ -371,7 +371,7 @@ for (const stream of [process.stdout, process.stderr]) {
   };
 }
 `);
-  const result = spawnSync(NODE, ["--import", preload, TPS_BIN, "agent", "start", "--id", "probe", ...(rt ? equals ? [`--runtime=${rt}`] : ["--runtime", rt] : []), ...(noSandbox ? ["--no-sandbox"] : [])], {
+  const result = spawnSync(NODE, ["--import", preload, TPS_BIN, "agent", "start", "--id", "probe", ...(rt ? equals ? [`--runtime=${rt}`] : ["--runtime", rt] : []), ...(noSandbox ? ["--no-sandbox"] : []), ...flags], {
     cwd: sb.ws,
     env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined }),
     encoding: "utf8", timeout: 5000, killSignal: "SIGKILL",
@@ -461,4 +461,92 @@ for (const rt of RUNTIMES) {
       rmSync(sb.root, {recursive: true, force: true});
     }
   });
+}
+
+for (const rt of RUNTIMES) {
+  for (const flags of [
+    ["--sandbox-required=true", "--no-sandbox"],
+    ["--sandboxRequired=true", "--noSandbox"],
+    ["--sandbox-required=true", "--no_sandbox=true"],
+    ["--sandbox-required=true", "--no-sandbox=true"],
+    ["--sandbox-required=true", "--no-sandbox=1"],
+    ["--sandbox-required=unknown", "--no-sandbox"],
+    ["--no-sandbox=unknown"],
+    ["--noSandbox", "unknown", "--no-sandbox"],
+  ]) {
+    test(`${rt}: TTY refuses ${flags.join(" ")} before either runner starts`, () => {
+      const sb = makeSandbox();
+      try {
+        const result = interactiveRuntimeProbe(sb, rt, false, false, flags);
+        expect(result.status).toBe(78);
+        expect(result.text).toContain(flags.some(f => f.includes("unknown")) ? "cannot interpret sandbox flag" : "--sandbox-required conflicts with --no-sandbox");
+        expect(existsSync(result.defaultMarker)).toBe(false);
+        expect(existsSync(result.selectedMarker)).toBe(false);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+  }
+  for (const value of ["false", "1", "0"]) {
+    test(`${rt}: --sandbox-required=${value} reads as false and allows TTY opt-out`, () => {
+      const sb = makeSandbox();
+      try {
+        const result = interactiveRuntimeProbe(sb, rt, true, false, [`--sandbox-required=${value}`]);
+        expect(result.status).toBe(0);
+        expect(existsSync(result.selectedMarker)).toBe(true);
+        expect(existsSync(result.defaultMarker)).toBe(false);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+  }
+  for (const value of ["false", "0"]) {
+    test(`${rt}: --no-sandbox=${value} does not opt out`, () => {
+      const sb = makeSandbox();
+      try {
+        const result = interactiveRuntimeProbe(sb, rt, false, false, [`--no-sandbox=${value}`]);
+        expect(result.status).toBe(78);
+        expect(result.text).toContain("no nono at the pinned absolute path");
+        expect(existsSync(result.defaultMarker)).toBe(false);
+        expect(existsSync(result.selectedMarker)).toBe(false);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+  }
+}
+for (const equals of [false, true]) {
+  test(`explicit openclaw keeps the default runtime (equals=${equals})`, () => {
+    const sb = makeSandbox();
+    try {
+      const result = interactiveRuntimeProbe(sb, "openclaw", false, equals);
+      expect(result.status).toBe(0);
+      expect(result.text).toContain("nono not found — starting WITHOUT sandbox isolation");
+      expect(existsSync(result.defaultMarker)).toBe(true);
+      expect(existsSync(result.selectedMarker)).toBe(false);
+    } finally {
+      rmSync(sb.root, {recursive: true, force: true});
+    }
+  });
+}
+
+for (const rt of RUNTIMES) {
+  for (const spelling of ["no-sandbox", "noSandbox"]) {
+    for (const value of ["true", "1"]) {
+      test(`${rt}: TTY --${spelling}=${value} starts only the selected runner`, () => {
+        const sb = makeSandbox();
+        try {
+          const result = interactiveRuntimeProbe(sb, rt, false, false, [`--${spelling}=${value}`]);
+          expect(result.status).toBe(0);
+          expect(existsSync(result.selectedMarker)).toBe(true);
+          expect(existsSync(result.defaultMarker)).toBe(false);
+          expect(fakeNonoRuns(sb)).toEqual([]);
+        } finally {
+          rmSync(sb.root, {recursive: true, force: true});
+        }
+      });
+    }
+  }
 }
