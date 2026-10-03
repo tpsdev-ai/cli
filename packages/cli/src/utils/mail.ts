@@ -182,15 +182,18 @@ function readMessageFile(path: string): MailMessage {
   }
 }
 
-export type UpdateExistingResult<T> = { status: "updated"; record: T } | { status: "gone" | "changed" };
+export type UpdateExistingResult<T> = { status: "updated"; record: T } | { status: "gone" | "changed" | "busy" };
 
 export function updateExistingRecord<T extends object>(
   path: string,
   mutate: (record: T) => T | null,
-  options: { snapshot?: T; afterWrite?: (record: T) => void } = {},
+  options: { snapshot?: T; afterWrite?: (record: T) => void; nonBlocking?: boolean } = {},
 ): UpdateExistingResult<T> {
-  const lock = acquireMailLockSync(dirname(dirname(path)));
-  if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
+  const lock = acquireMailLockSync(dirname(dirname(path)), options.nonBlocking ? { timeoutMs: 0 } : {});
+  if (!lock) {
+    if (options.nonBlocking) return { status: "busy" };
+    throw new Error(`mail lock contention timeout for ${path}`);
+  }
   const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
@@ -305,7 +308,7 @@ export function inboxFullMessage(recipient: string, count: number): string {
 export function archiveOldCur(agent: string, maxAgeDays = 30): number {
   const inbox = getInbox(agent);
   if (!existsSync(inbox.cur)) return 0;
-  const lock = acquireMailLockSync(inbox.root);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
   if (!lock) return 0;
   try {
     const cutoffMs = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
@@ -549,11 +552,11 @@ function recordMatchesEnvelope(
   record: MailMessage,
   envelope: Envelope,
 ): { ok: true } | { ok: false; reason: string } {
-  for (const key of Object.keys(ENVELOPE_BINDINGS) as Array<keyof Envelope>) {
+  for (const key of Object.keys(ENVELOPE_BINDINGS) as Array<keyof typeof ENVELOPE_BINDINGS>) {
     const rule = ENVELOPE_BINDINGS[key];
     if (rule.kind !== "bind") continue;
-    const envValue = (envelope as unknown as Record<string, unknown>)[key as string];
-    const recValue = (record as unknown as Record<string, unknown>)[rule.recordField as string];
+    const envValue = envelope[key];
+    const recValue = record[rule.recordField];
     if (envValue !== recValue) {
       return {
         ok: false,
@@ -758,14 +761,12 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
   // verification above deliberately ran BEFORE the lock.
   let lock: MailLock | null;
   try {
-    lock = await acquireMailLock(dirs.root);
+    lock = await acquireMailLock(dirs.root, { timeoutMs: 0 });
   } catch (err: any) {
     // Nested acquisition is a programming error, not a delivery decision.
     return { ok: false, class: "busy", reason: `mail lock error: ${err?.message ?? String(err)}` };
   }
   if (!lock) {
-    // Could not acquire within the bound. Fail-closed: do NOT deliver; the
-    // source stays in place for the next check.
     return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
   }
 
@@ -911,13 +912,10 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
   // Coordinate with in-flight promotions: hold the SAME lock promote() holds, so
   // a scratch being composed right now cannot be eaten (an age guard is cleanup
   // policy, not the safety property — a paused promoter outlives any threshold,
-  // and stat-then-delete still races with replacement of the same pathname). If
-  // the lock is busy, a promoter is active, so nothing is stranded: skip. The
-  // short timeout is deliberate — this is a second acquisition per check that
-  // competes with promotion, so it skips rather than waits and never delays mail.
+  // and stat-then-delete still races with replacement of the same pathname).
   let lock: MailLock | null;
   try {
-    lock = await acquireMailLock(root, { timeoutMs: 250 });
+    lock = await acquireMailLock(root, { timeoutMs: 0 });
   } catch {
     return 0;
   }
@@ -1013,8 +1011,8 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   } catch (err: any) {
     const reason = `corrupt cur/ record: ${err?.message ?? String(err)}`;
     if (err?.code !== "ENOENT") {
-      const lock = acquireMailLockSync(dirs.root);
-      if (!lock) throw new Error(`mail lock contention timeout for ${curPath}`);
+      const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
+      if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
       try {
         try { readMessageFile(curPath); } catch (freshError: any) {
           if (freshError?.code !== "ENOENT") rejectToDlq(dirs, filename, curPath, "unverified", reason);
@@ -1031,8 +1029,8 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // gate is unnecessary: this id is already consumed.)
   const decision = await checkPromotedRecord(agent, msg, mailRoot, verify, dirs.root);
   if (!decision.ok) {
-    const lock = acquireMailLockSync(dirs.root);
-    if (!lock) throw new Error(`mail lock contention timeout for ${curPath}`);
+    const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
+    if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
     try {
       try {
         if (JSON.stringify(readMessageFile(curPath)) === JSON.stringify(msg))
@@ -1070,9 +1068,6 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
 
-  // Opportunistic cur/ archive — keeps the processed tail from accumulating
-  // indefinitely. Safe to no-op when there's nothing old; cost is one stat()
-  // per cur entry, capped at the directory size.
   try {
     archiveOldCur(agent);
   } catch (e: any) {
@@ -1132,7 +1127,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
       if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
       return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
-    }, { snapshot: recovered.snapshot });
+    }, { snapshot: recovered.snapshot, nonBlocking: true });
     if (result.status === "updated") messages.push(result.record);
   }
 
@@ -1245,7 +1240,7 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
   const hardCutoff = Date.now() - parseDurationMs(hardTtl, 48 * 60 * 60 * 1000);
   for (const a of agents) {
     const inbox = getInbox(a);
-    const lock = acquireMailLockSync(inbox.root);
+    const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
     if (!lock) continue;
     try {
       for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
