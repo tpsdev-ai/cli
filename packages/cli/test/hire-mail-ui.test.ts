@@ -11,6 +11,7 @@ describe("hire onboarding mail UI", () => {
   let root: string;
   let emptyKeys: string;
   let savedEnv: Record<string, string | undefined>;
+  let savedCwd: string;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-hire-mail-ui-"));
@@ -26,9 +27,15 @@ describe("hire onboarding mail UI", () => {
     process.env.TPS_AGENT_ID = "host";
     process.env.TPS_TEST_KEYS_DIR = emptyKeys;
     process.env.TPS_MAIL_DIR = join(root, ".tps", "mail");
+    // findOpenClawConfig walks up from the cwd; start it inside the throwaway
+    // HOME so the fixture config is found immediately, never a host config on
+    // the repo cwd's ancestor path (cli#478).
+    savedCwd = process.cwd();
+    process.chdir(root);
   });
 
   afterEach(() => {
+    process.chdir(savedCwd);
     for (const [name, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
