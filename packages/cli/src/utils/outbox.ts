@@ -37,7 +37,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     }
     if (!lock) return "duplicate in progress";
   }
-  try {
+  const write = (): void => {
     const id = deliveryId ?? randomUUID();
     const timestamp = new Date().toISOString();
     const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
@@ -56,11 +56,24 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     } else {
       renameSync(tmp, join(dir, filename));
     }
-  } finally {
-    if (lock) {
-      try { lock.release(); } catch (error) { throw new OutboxLockError(lockPath!, error); }
+  };
+  let writeFailed = false;
+  let writeError: unknown;
+  try {
+    write();
+  } catch (error) {
+    writeFailed = true;
+    writeError = error;
+  }
+  if (lock) {
+    try {
+      lock.release();
+    } catch (error) {
+      // When the write itself failed, its error is the one the caller needs.
+      if (!writeFailed) throw new OutboxLockError(lockPath!, error);
     }
   }
+  if (writeFailed) throw writeError;
 }
 
 export function drainOutbox(): OutboxMessage[] {
