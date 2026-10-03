@@ -183,7 +183,7 @@ describe("handleGithubWebhook", () => {
       expect(existsSync(join(root, ".tps", "outbox"))).toBe(false);
     });
   }
-  test("redelivery enqueues once, including after outbox drain", async () => {
+  test("redelivery enqueues once and re-requests once, including after outbox drain", async () => {
     const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
       pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
     const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-success",
@@ -196,11 +196,75 @@ describe("handleGithubWebhook", () => {
     expect(results.map(r => r.status)).toEqual([200, 200]);
     expect(readdirSync(join(root, ".tps", "outbox", "new"))).toHaveLength(1);
     expect(drainOutbox()).toHaveLength(1);
+    // The racing pair performed the GitHub re-request exactly once.
+    expect(agents).toEqual(["webhook-agent"]);
+    // A redelivery after the record moved to sent/ makes no second GitHub call.
     expect((await post(headers, payload, deps)).status).toBe(200);
     expect(drainOutbox()).toEqual([]);
-    expect(agents).toEqual(["webhook-agent", "webhook-agent", "webhook-agent"]);
+    expect(agents).toEqual(["webhook-agent"]);
+    // A different delivery id is a new delivery: one call, one outbox entry.
     expect((await post({ ...headers, "x-github-delivery": "another-delivery" }, payload, deps)).status).toBe(200);
     expect(drainOutbox()).toHaveLength(1);
+    expect(agents).toEqual(["webhook-agent", "webhook-agent"]);
+  });
+  test("a first delivery re-requests the dismissed reviewer exactly once", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
+      pull_request: { number: 146, html_url: "https://github.com/tpsdev-ai/cli/pull/146" }, review: { user: { login: "tps-kern" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-first",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    let ghCalls = 0;
+    let published = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
+      ghCalls++; return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => { published++; } };
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(ghCalls).toBe(1);
+    expect(published).toBe(1);
+  });
+  test("a redelivered dismissed-review event makes no second GitHub call", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
+      pull_request: { number: 147, html_url: "https://github.com/tpsdev-ai/cli/pull/147" }, review: { user: { login: "tps-kern" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-redelivered",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    let ghCalls = 0;
+    let published = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
+      ghCalls++; return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => { published++; } };
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(ghCalls).toBe(1);
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(ghCalls).toBe(1);
+    expect(published).toBe(1);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toHaveLength(1);
+  });
+  test("a redelivery after the record moved to sent/ makes no second GitHub call", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
+      pull_request: { number: 148, html_url: "https://github.com/tpsdev-ai/cli/pull/148" }, review: { user: { login: "tps-kern" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-drained",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    let ghCalls = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
+      ghCalls++; return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => {} };
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(ghCalls).toBe(1);
+    expect(drainOutbox()).toHaveLength(1);
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(ghCalls).toBe(1);
+  });
+  test("a failed delivery record makes no GitHub call (fails closed)", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
+      pull_request: { number: 149, html_url: "https://github.com/tpsdev-ai/cli/pull/149" }, review: { user: { login: "tps-kern" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-record-fails",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    let ghCalls = 0;
+    const deps = { queueOutboxMessageImpl: (() => { throw new Error("record write refused"); }) as any,
+      reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
+        ghCalls++; return { status: 0, stdout: "", stderr: "" };
+      }) as any }, publishReviewRerequestedEvent: async () => {} };
+    expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "record write refused" });
+    expect(ghCalls).toBe(0);
   });
   test("invalid dismissed review does not require an agent id", async () => {
     delete process.env.GITHUB_WEBHOOK_AGENT_ID;

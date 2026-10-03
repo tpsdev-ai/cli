@@ -23,7 +23,12 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): "duplicate in progress" | void {
+/** "queued" — this call wrote the record; "duplicate" — a record for this
+ * delivery already exists (new/ or sent/), so an earlier call recorded it;
+ * "duplicate in progress" — another writer holds the per-delivery lock. */
+export type QueueOutboxResult = "queued" | "duplicate" | "duplicate in progress";
+
+export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): QueueOutboxResult {
   if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
@@ -37,11 +42,15 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     }
     if (!lock) return "duplicate in progress";
   }
+  let alreadyRecorded = false;
   const write = (): void => {
     const id = deliveryId ?? randomUUID();
     const timestamp = new Date().toISOString();
     const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) return;
+    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) {
+      alreadyRecorded = true;
+      return;
+    }
     const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
     const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
     writeFileSync(tmp, content, "utf-8");
@@ -74,6 +83,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     }
   }
   if (writeFailed) throw writeError;
+  return alreadyRecorded ? "duplicate" : "queued";
 }
 
 export function drainOutbox(): OutboxMessage[] {

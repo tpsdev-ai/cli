@@ -216,7 +216,10 @@ export async function handleGithubWebhook(
   const queueMessage = deps.queueOutboxMessageImpl ?? queueOutboxMessage;
   try {
     const result = queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
-    if (result === "duplicate in progress") {
+    // A delivery that an earlier call recorded (or that another writer is
+    // recording) must not repeat the GitHub action: it runs at most once per
+    // delivery id.
+    if (result === "duplicate" || result === "duplicate in progress") {
       res.statusCode = 200;
       res.end(result);
       return;
