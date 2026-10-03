@@ -52,7 +52,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { closeSync, constants, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
@@ -615,19 +615,22 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
   return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
-/**
- * Patch a mail record in place. Used to ack/nack a message that the shared
- * promote() enforcement point has already moved new/ → cur/. The promotion
- * itself is atomic inside promote() (new/ → tmp/ → cur/); this only enriches
- * the cur/ record after dispatch, so a crash here cannot replay a message.
- */
-function patchMailFile(path: string, patch: Partial<TpsMailBody>): void {
+/** Patch an existing mail record in place. */
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>): boolean {
   try {
     const current = readMailFile(path);
-    if (!current) return;
-    writeFileSync(path, JSON.stringify({ ...current, ...patch }, null, 2), "utf-8");
+    if (!current) return false;
+    const content = JSON.stringify({ ...current, ...patch }, null, 2);
+    const fd = openSync(path, constants.O_WRONLY | constants.O_TRUNC);
+    try {
+      writeFileSync(fd, content, "utf-8");
+    } finally {
+      closeSync(fd);
+    }
+    return true;
   } catch {
     // best effort — don't crash the watcher on state-transition errors
+    return false;
   }
 }
 

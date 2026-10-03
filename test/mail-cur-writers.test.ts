@@ -1,6 +1,6 @@
 /**
- * For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/; re-stamps of
- * already-promoted records are allowed and enumerated below.
+ * For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/.
+ * Updates to existing records are enumerated below; presentation is separately gated.
  * MailClient applies the same policy; outbox and internal mail are separate stores.
  * Scans scripts/, package src/ and scripts/, and plugin src/ with text patterns.
  * mail.ts's writeMessageFile calls are always cur candidates; other destinations
@@ -54,19 +54,19 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why:
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(path, msg)",
     followedBy: "; try { unlinkSync(path)",
-    why: "ackMessage — reads an existing record by id, stamps ack metadata, then unlinks it; cur/ targets are already promoted",
+    why: "ackMessage — updates an existing record found by id, then unlinks it; presentation is separately gated",
   },
   {
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(path, msg)",
     followedBy: "; renameSync(path, target)",
-    why: "nackMessage permanent — reads an existing record by id, stamps nack metadata, then moves it to dlq/; cur/ targets are already promoted",
+    why: "nackMessage permanent — updates an existing record found by id, then moves it to dlq/; presentation is separately gated",
   },
   {
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(path, msg)",
     followedBy: "; return msg",
-    why: "nackMessage transient/agent — reads an existing record by id and re-stamps nack/retry metadata; cur/ targets are already promoted",
+    why: "nackMessage transient/agent — updates an existing record found by id; presentation is separately gated",
   },
   {
     file: "plugins/openclaw-tps-mail/src/index.ts",
@@ -245,12 +245,21 @@ function writeCallsFor(text: string): Record<string, Dest> {
     changed = false;
     for (const { name, params, body } of decls) {
       if (name in calls) continue;
+      const fdPaths = new Map<string, string>();
+      for (const c of callsOf(body, "openSync")) {
+        const binding = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*$/.exec(body.slice(0, c.at));
+        if (binding && c.args[0] !== undefined) fdPaths.set(binding[1]!, c.args[0]);
+      }
       for (const [fn, spec] of Object.entries(calls)) {
         if (fn === name) continue;
         for (const c of callsOf(body, fn)) {
           const dest = destOf(c.args, spec);
           if (dest === undefined) continue;
           const ids = identifiers(dest);
+          for (const id of [...ids]) {
+            const path = fdPaths.get(id);
+            if (path !== undefined) ids.push(...identifiers(path));
+          }
           const idx = params.findIndex((p) => p !== "" && ids.includes(p));
           if (idx !== -1) {
             calls[name] = idx;
@@ -361,15 +370,18 @@ function probe(agent: string, id: string) {
   test("a write through a local wrapper, and Bun.write, are reported", () => {
     const text = [
       "function put(target: string, data: string) { writeFileSync(target, data); }",
+      "function patch(target: string, data: string) { const fd = openSync(target, constants.O_WRONLY); writeFileSync(fd, data); }",
       "const move = (from: string, to: string) => { renameSync(from, to); };",
       "const inboxCur = join(root, \"cur\");",
       "put(join(inboxCur, f), body);",
+      "patch(join(inboxCur, f), body);",
       "move(src, join(root, \"cur\", f));",
       "Bun.write(join(root, \"cur\", f), body);",
     ].join("\n");
     expect(curWritersInText(text).sort()).toEqual([
       "Bun.write(join(root, \"cur\", f), body)",
       "move(src, join(root, \"cur\", f))",
+      "patch(join(inboxCur, f), body)",
       "put(join(inboxCur, f), body)",
     ]);
   });
