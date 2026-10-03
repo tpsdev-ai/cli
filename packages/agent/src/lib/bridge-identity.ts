@@ -29,9 +29,14 @@ export function bridgePrincipalIds(mailRoot: string, configured?: string): Set<s
   }
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
-    const record = JSON.parse(readFileSync(join(dir, file), "utf8"));
-    if (typeof record.id !== "string" || !ID.test(record.id)) throw new Error("Invalid bridge principal configuration");
-    ids.add(record.id);
+    const path = join(dir, file);
+    let record: { id?: unknown } | null;
+    try { record = JSON.parse(readFileSync(path, "utf8")); } catch (error) {
+      throw new Error(`Invalid bridge principal configuration in ${path}: ${(error as Error).message}`);
+    }
+    const id = record?.id;
+    if (typeof id !== "string" || !ID.test(id)) throw new Error(`Invalid bridge principal configuration in ${path}`);
+    ids.add(id);
   }
   return ids;
 }
