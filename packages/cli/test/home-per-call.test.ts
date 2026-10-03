@@ -137,7 +137,7 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.HOME = homeB;
     const dir = join(homeB, ".tps", "pulse");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ author: "beta-author" }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ author: "beta-author", mergeAuthority: "merger", ghAgent: "github" }));
 
     expect(mod.loadConfig().author).toBe("beta-author");
     mod.saveState({ version: 1, lastPollAt: "2026-01-01T00:00:00.000Z", instances: {} });

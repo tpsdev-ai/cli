@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  loadConfig,
   computePrState,
   handleTransition,
   checkReminders,
@@ -16,6 +17,11 @@ import {
   type MailSender,
   type FlairPublisher,
 } from "../src/commands/pulse.js";
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { startFetchFlair } from "./helpers/fetch-flair.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -447,8 +453,27 @@ describe("pruneState", () => {
 // ---------------------------------------------------------------------------
 
 describe("startPollLoop", () => {
+  let root: string;
+  let saved: Record<string, string | undefined>;
+  let flair: ReturnType<typeof startFetchFlair>;
+  beforeEach(() => {
+    saved = { HOME: process.env.HOME, TPS_TEST_KEYS_DIR: process.env.TPS_TEST_KEYS_DIR };
+    root = mkdtempSync(join(tmpdir(), "pulse-loop-"));
+    process.env.HOME = root;
+    delete process.env.TPS_TEST_KEYS_DIR;
+    const dir = join(root, ".tps", "identity");
+    mkdirSync(dir, { recursive: true });
+    const seed = Buffer.alloc(32, 0x78);
+    writeFileSync(join(dir, "pulse.key"), seed);
+    flair = startFetchFlair({ pulse: seed });
+  });
+  afterEach(() => {
+    flair.stop();
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    rmSync(root, { recursive: true, force: true });
+  });
   test("does not resolve immediately after the first poll", async () => {
-    const config = makeConfig({ pollIntervalMs: 120000 });
+    const config = makeConfig({ pollIntervalMs: 120000, flairUrl: flair.url });
     const state = makeState();
 
     let pollCalls = 0;
@@ -477,7 +502,7 @@ describe("startPollLoop", () => {
       resolved = true;
     });
 
-    await Promise.resolve();
+    for (let i = 0; i < 20 && handles.length === 0; i++) await Promise.resolve();
 
     expect(pollCalls).toBe(1);
     expect(handles).toHaveLength(2);
@@ -905,4 +930,53 @@ describe("polling recipient refusal", () => {
       expect(calls).toEqual([]);
     });
   }
+});
+
+
+describe("identity shape preflight", () => {
+  let root: string;
+  let savedHome: string | undefined;
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    root = mkdtempSync(join(tmpdir(), "pulse-config-"));
+    process.env.HOME = root;
+    mkdirSync(join(root, ".tps", "pulse"), { recursive: true });
+  });
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    rmSync(root, { recursive: true, force: true });
+  });
+  for (const field of ["mergeAuthority", "ghAgent", "author"] as const) {
+    for (const value of [undefined, null, false, 42, {}, [], "", "   "]) {
+      test(`${field} refuses ${JSON.stringify(value)} at load and every preflight`, async () => {
+        const config = makeConfig({ [field]: value } as Partial<PulseConfig>);
+        const path = join(root, ".tps", "pulse", "config.json");
+        writeFileSync(path, JSON.stringify(config));
+        const originalFile = readFileSync(path, "utf8");
+        const error = new RegExp(field);
+        expect(() => loadConfig()).toThrow(error);
+        const instance = makeInstance({ state: "reviewing" });
+        const state = makeState({ pr: instance });
+        const original = structuredClone(state);
+        let calls = 0;
+        const sender: MailSender = () => { calls++; };
+        const publisher: FlairPublisher = async () => { calls++; };
+        const runner: SyncRunner = () => { calls++; throw new Error("must not poll"); };
+        expect(() => handleTransition("pr", instance, "approved", config, sender, publisher)).toThrow(error);
+        expect(() => checkReminders(state, config, sender, { pr: ["reviewer"] })).toThrow(error);
+        expect(() => pollOnce(config, state, runner, sender, publisher)).toThrow(error);
+        await expect(startPollLoop(config, state, { dryRun: true, runner, sender, publisher,
+          setIntervalFn: (() => { calls++; }) as typeof setInterval })).rejects.toThrow(error);
+        expect(calls).toBe(0);
+        expect(state).toEqual(original);
+        expect(readFileSync(path, "utf8")).toBe(originalFile);
+        expect(existsSync(join(root, ".tps", "pulse", "state.json"))).toBe(false);
+      });
+    }
+  }
+  test("valid configured identities load unchanged", () => {
+    const config = makeConfig({ ghAgent: " github ", author: " author ", mergeAuthority: " merger " });
+    writeFileSync(join(root, ".tps", "pulse", "config.json"), JSON.stringify(config));
+    expect(loadConfig()).toMatchObject(config);
+  });
 });

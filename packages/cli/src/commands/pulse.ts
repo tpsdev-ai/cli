@@ -5,12 +5,15 @@
  * Polls GitHub for open PRs, tracks state transitions, sends TPS mail notifications.
  */
 
+import { createPublicKey, createPrivateKey } from "node:crypto";
+import { agentKeyCandidates, readAgentPrivateKey, resolveAgentKeyPath } from "../utils/agent-keys.js";
 import { spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createFlairClient } from "../utils/flair-client.js";
 import { gcMessages } from "../utils/mail.js";
 import { sendSignedMail } from "../utils/mail-producer.js";
+import { createMailVerifyClient } from "../utils/mail-verify.js";
 import { homeDir } from "../utils/home.js";
 
 // ---------------------------------------------------------------------------
@@ -102,30 +105,62 @@ const DEFAULT_CONFIG: PulseConfig = {
 
 /** Refuse (named error) when a needed identity value is not configured. */
 function requireMergeAuthority(config: PulseConfig): string {
-  if (!config.mergeAuthority) {
+  if (typeof config.mergeAuthority !== "string" || !config.mergeAuthority.trim()) {
     throw new Error(
-      "pulse: no merge authority configured — set \"mergeAuthority\" in ~/.tps/pulse/config.json",
+      "pulse: invalid mergeAuthority (merge authority) — set \"mergeAuthority\" in ~/.tps/pulse/config.json",
     );
   }
   return config.mergeAuthority;
 }
 
 function requireAuthor(config: PulseConfig): string {
-  if (!config.author) {
+  if (typeof config.author !== "string" || !config.author.trim()) {
     throw new Error(
-      "pulse: no author configured — set \"author\" in ~/.tps/pulse/config.json",
+      "pulse: invalid author — set \"author\" in ~/.tps/pulse/config.json",
     );
   }
   return config.author;
 }
 
 function requireGhAgent(config: PulseConfig): string {
-  if (!config.ghAgent) {
+  if (typeof config.ghAgent !== "string" || !config.ghAgent.trim()) {
     throw new Error(
-      "pulse: no gh agent configured — set \"ghAgent\" in ~/.tps/pulse/config.json",
+      "pulse: invalid ghAgent (gh agent) — set \"ghAgent\" in ~/.tps/pulse/config.json",
     );
   }
   return config.ghAgent;
+}
+
+function requireIdentities(config: PulseConfig): void {
+  requireGhAgent(config);
+  requireMergeAuthority(config);
+  requireAuthor(config);
+}
+
+function requireSigningKey(): string {
+  try {
+    if (!readAgentPrivateKey(PULSE_AGENT_ID)) {
+      throw new Error(`missing pulse signing key; looked at ${agentKeyCandidates(PULSE_AGENT_ID).join(", ")}`);
+    }
+    return resolveAgentKeyPath(PULSE_AGENT_ID)!;
+  } catch (error) {
+    throw new Error(`pulse: signing identity refused: ${(error as Error).message}. Run tps agent create --id pulse with Flair available.`);
+  }
+}
+
+async function requireSigningIdentity(config: PulseConfig): Promise<void> {
+  const keyPath = requireSigningKey();
+  const client = await createMailVerifyClient(PULSE_AGENT_ID, { flairUrl: config.flairUrl, flairKeyPath: keyPath });
+  try {
+    const agent = await client.getAgent(PULSE_AGENT_ID);
+    if (!agent) throw new Error("pulse is not registered in Flair");
+    const seed = readAgentPrivateKey(PULSE_AGENT_ID)!;
+    const privateKey = createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]), format: "der", type: "pkcs8" });
+    const publicKey = createPublicKey(privateKey).export({ format: "jwk" }).x!;
+    if (!agent.publicKey.equals(Buffer.from(publicKey, "base64url"))) throw new Error("pulse signing key does not match its Flair public key");
+  } catch (error) {
+    throw new Error(`pulse: Flair identity refused: ${(error as Error).message}. Run tps agent create --id pulse with Flair available.`);
+  }
 }
 
 function pulseDir(): string {
@@ -145,15 +180,11 @@ function statePath(): string {
 // ---------------------------------------------------------------------------
 
 export function loadConfig(): PulseConfig {
-  if (existsSync(configPath())) {
-    try {
-      const raw = JSON.parse(readFileSync(configPath(), "utf-8"));
-      return { ...DEFAULT_CONFIG, ...raw };
-    } catch (e: unknown) {
-      console.warn(`[pulse] Failed to parse config: ${(e as Error).message}, using defaults`);
-    }
-  }
-  return { ...DEFAULT_CONFIG };
+  const config = existsSync(configPath())
+    ? { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(configPath(), "utf-8")) }
+    : { ...DEFAULT_CONFIG };
+  requireIdentities(config);
+  return config;
 }
 
 export function loadState(): PulseState {
@@ -313,11 +344,10 @@ export function handleTransition(
   sender: MailSender,
   publisher?: FlairPublisher,
 ): void {
+  requireIdentities(config);
+  if (sender === defaultMailSender) requireSigningKey();
   const oldState = instance.state;
   if (oldState === newState) return;
-
-  if (newState === "approved") requireMergeAuthority(config);
-  if (newState === "changes-requested" || newState === "merged") requireAuthor(config);
 
   const now = new Date().toISOString();
   instance.history.push({ at: now, from: oldState, to: newState });
@@ -412,6 +442,8 @@ export function checkReminders(
   pendingReviews: Record<string, string[]>,
   now: Date = new Date(),
 ): void {
+  requireIdentities(config);
+  if (sender === defaultMailSender) requireSigningKey();
   const reminders = Object.entries(state.instances).flatMap(([key, instance]) => {
     if (instance.state === "merged") return [];
     const pending = pendingReviews[key] ?? [];
@@ -471,6 +503,7 @@ export function pollOnce(
   const ghAgent = requireGhAgent(config);
   requireMergeAuthority(config);
   requireAuthor(config);
+  if (sender === defaultMailSender) requireSigningKey();
 
   for (const repo of config.repos) {
     let prs: GhPr[];
@@ -652,6 +685,8 @@ export async function startPollLoop(
     clearIntervalFn?: typeof clearInterval;
   } = {},
 ): Promise<void> {
+  requireIdentities(config);
+  await requireSigningIdentity(config);
   const runner = opts.runner ?? (spawnSync as unknown as SyncRunner);
   const setIntervalFn = opts.setIntervalFn ?? setInterval;
   const clearIntervalFn = opts.clearIntervalFn ?? clearInterval;

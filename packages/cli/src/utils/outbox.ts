@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -15,20 +15,34 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-export function queueOutboxMessage(to: string, body: string, from: string): void {
+export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): void {
+  if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
-  const id = randomUUID();
-  const timestamp = new Date().toISOString();
-  const filename = `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-  const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
-  // Atomic write: stage to a dot-prefixed tmp file in the same directory, then
-  // rename into place. drainOutbox filters out dot-prefixed files so a reader
-  // running concurrently never sees a half-written file. rename(2) within the
-  // same filesystem is atomic on POSIX.
-  const tmp = join(dir, `.${filename}.tmp`);
-  writeFileSync(tmp, content, "utf-8");
-  renameSync(tmp, join(dir, filename));
+  const lock = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
+  if (lock) mkdirSync(lock);
+  try {
+    const id = deliveryId ?? randomUUID();
+    const timestamp = new Date().toISOString();
+    const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
+    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) return;
+    const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
+    const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
+    writeFileSync(tmp, content, "utf-8");
+    if (deliveryId) {
+      try {
+        linkSync(tmp, join(dir, filename));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      } finally {
+        unlinkSync(tmp);
+      }
+    } else {
+      renameSync(tmp, join(dir, filename));
+    }
+  } finally {
+    if (lock) rmdirSync(lock);
+  }
 }
 
 export function drainOutbox(): OutboxMessage[] {

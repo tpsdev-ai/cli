@@ -69,4 +69,31 @@ describe("outbox", () => {
     // Bad file lands in sent/ with a .malformed- prefix for forensics
     expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
   });
+
+  test("concurrent redelivery and drain enqueue a delivery only once", async () => {
+    const modulePath = new URL("../src/utils/outbox.ts", import.meta.url).pathname;
+    const id = "a".repeat(64);
+    const producers = Array.from({ length: 8 }, () => Bun.spawn([process.execPath, "-e", `
+      import { queueOutboxMessage } from ${JSON.stringify(modulePath)};
+      try { queueOutboxMessage("host", "body", "github-webhook", ${JSON.stringify(id)}); }
+      catch (error) { if (error.code !== "EEXIST") throw error; }
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" }));
+    const drainer = Bun.spawn([process.execPath, "-e", `
+      import { drainOutbox } from ${JSON.stringify(modulePath)};
+      let count = 0;
+      for (let i = 0; i < 100; i++) { count += drainOutbox().length; await Bun.sleep(2); }
+      console.log(count);
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" });
+    for (const producer of producers) {
+      const error = await new Response(producer.stderr).text();
+      expect(await producer.exited, error).toBe(0);
+    }
+    const count = Number(await new Response(drainer.stdout).text());
+    const error = await new Response(drainer.stderr).text();
+    expect(await drainer.exited, error).toBe(0);
+    expect(count + drainOutbox().length).toBe(1);
+    queueOutboxMessage("host", "body", "github-webhook", id);
+    expect(drainOutbox()).toEqual([]);
+  });
+
 });

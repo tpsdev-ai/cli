@@ -1,9 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { createHmac } from "node:crypto";
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { drainOutbox } from "../src/utils/outbox.js";
 import { handleGithubWebhook, processGithubWebhookEvent } from "../src/utils/github-webhook.js";
 
 async function post(
@@ -164,4 +165,49 @@ describe("handleGithubWebhook", () => {
     expect(String(row.body)).toContain("pull_request_review");
     expect(published).toHaveLength(1);
   });
+  for (const id of [undefined, "   "]) {
+    test(`missing webhook agent ${JSON.stringify(id)} refuses without enqueue on redelivery`, async () => {
+      if (id === undefined) delete process.env.GITHUB_WEBHOOK_AGENT_ID; else process.env.GITHUB_WEBHOOK_AGENT_ID = id;
+      const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+        pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+      const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-refused",
+        "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+      let calls = 0;
+      const deps = { reviewRequestDeps: { spawnSyncImpl: (() => { calls++; }) as any },
+        publishReviewRerequestedEvent: async () => { calls++; } };
+      for (let attempt = 0; attempt < 2; attempt++) {
+        expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "GITHUB_WEBHOOK_AGENT_ID env var required" });
+      }
+      expect(calls).toBe(0);
+      expect(existsSync(join(root, ".tps", "outbox"))).toBe(false);
+    });
+  }
+  test("redelivery enqueues once, including after outbox drain", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+      pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-success",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    const agents: string[] = [];
+    const deps = { reviewRequestDeps: { spawnSyncImpl: ((_: string, args: string[]) => {
+      agents.push(args[0]!); return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => {} };
+    const results = await Promise.all([post(headers, payload, deps), post(headers, payload, deps)]);
+    expect(results.map(r => r.status)).toEqual([200, 200]);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toHaveLength(1);
+    expect(drainOutbox()).toHaveLength(1);
+    expect((await post(headers, payload, deps)).status).toBe(200);
+    expect(drainOutbox()).toEqual([]);
+    expect(agents).toEqual(["webhook-agent", "webhook-agent", "webhook-agent"]);
+    expect((await post({ ...headers, "x-github-delivery": "another-delivery" }, payload, deps)).status).toBe(200);
+    expect(drainOutbox()).toHaveLength(1);
+  });
+  test("invalid dismissed review does not require an agent id", async () => {
+    delete process.env.GITHUB_WEBHOOK_AGENT_ID;
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" } });
+    const headers = { "x-github-event": "pull_request_review",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    expect((await post(headers, payload)).status).toBe(200);
+    expect(drainOutbox()).toHaveLength(1);
+  });
+
 });
