@@ -148,15 +148,15 @@ describe("Renovate @tpsdev-ai scope (cli#424)", () => {
     expect(violations).toEqual([]);
   });
 
-  for (const specifier of ["workspace:*", "file:../pi-tps-mail"]) {
+  for (const specifier of ["workspace:*", "file:../example-pkg"]) {
     it(`rejects a nonrelease package with ${specifier}`, () => {
       const violations = dependencyViolations(
         "fixtures/package.json",
-        { dependencies: { "@tpsdev-ai/pi-tps-mail": specifier } },
+        { dependencies: { "@tpsdev-ai/example-pkg": specifier } },
         new Set(releasePackages()),
       );
       expect(violations).toEqual([
-        `fixtures/package.json: dependencies["@tpsdev-ai/pi-tps-mail"] = ${JSON.stringify(specifier)}`,
+        `fixtures/package.json: dependencies["@tpsdev-ai/example-pkg"] = ${JSON.stringify(specifier)}`,
       ]);
     });
   }

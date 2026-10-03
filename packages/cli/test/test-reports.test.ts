@@ -273,7 +273,6 @@ describe("check-test-reports", () => {
       "agent",
       "cli",
       "github-review",
-      "pi-tps-mail",
       "plugin",
       "root-test",
     ]);
