@@ -71,7 +71,8 @@ for (const runtime of ["bun", "node"]) {
       `);
       expect(result.stderr).toContain(result.archivePath);
       expect(result.stderr).toContain("no such table: missing");
-      expect(result.stderr).toContain(runtime === "bun" ? "[SQLITE_ERRNO_1]" : "[ERR_SQLITE_ERROR]");
+      // bun reports this error as SQLITE_ERRNO_1 or SQLITE_ERROR (the Docker lane reports SQLITE_ERROR).
+      expect(result.stderr).toMatch(runtime === "bun" ? /\[SQLITE_(ERRNO_1|ERROR)\]/ : /\[ERR_SQLITE_ERROR\]/);
     });
 
     test.if(enabled)("PRAGMA values are read back on each open", () => {
