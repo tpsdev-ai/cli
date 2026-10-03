@@ -9,11 +9,11 @@
  * These tests inject a write failure (the cur/ DIRECTORY is made unwritable, so
  * the atomic stamp's temp file cannot be created) and assert:
  *   (a) a diagnostic naming the message id, the record path and the error code;
- *   (b) a later scan reconciles the record to the terminal state.
- * A third test pins the successful path as unchanged.
- *
- * The first two FAIL on the pre-fix tree: the write failure is silent and no
- * scan ever reconciles the record.
+ *   (b) a bounded in-process retry fixes a transient failure without a restart;
+ *   (c) a persistent failure stops after the bound and the next account start
+ *       re-stamps the record;
+ *   (d) stopping the account cancels pending retries.
+ * A further test pins the successful path as unchanged.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -30,7 +30,7 @@ const FLINT_SEED = Buffer.alloc(32, 0x01);
 const ANVIL_SEED = Buffer.alloc(32, 0x02);
 const pubkeyFromSeed = (s: Buffer): Buffer => Buffer.from(ed.getPublicKey(new Uint8Array(s)));
 
-import pluginModule from "../src/index.js";
+import pluginModule, { setStampRetryDelaysForTests } from "../src/index.js";
 
 let capturedPlugin: any;
 const mockApi: any = {
@@ -45,6 +45,7 @@ let keysDir: string;
 let home: string;
 let origHome: string | undefined;
 let origKeys: string | undefined;
+let prevDelays: number[];
 
 beforeEach(() => {
   mailDir = mkdtempSync(join(tmpdir(), "tps-492-mail-"));
@@ -52,6 +53,7 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "tps-492-home-"));
   writeFileSync(join(keysDir, "anvil.key"), ANVIL_SEED);
   writeFileSync(join(keysDir, "flint.key"), FLINT_SEED);
+  prevDelays = setStampRetryDelaysForTests([100, 100, 100]);
   origHome = process.env.HOME; process.env.HOME = home;
   origKeys = process.env.TPS_TEST_KEYS_DIR; process.env.TPS_TEST_KEYS_DIR = keysDir;
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
@@ -66,6 +68,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setStampRetryDelaysForTests(prevDelays);
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
   for (const d of [mailDir, keysDir, home]) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
@@ -160,77 +163,105 @@ async function boot(withInbound: boolean): Promise<Boot> {
   };
 }
 
-describe("cli#492 — a failed cur/ stamp write is surfaced and reconciled", () => {
-  it("ack: a failed ackedAt write logs id/path/code and is reconciled on the next scan", async () => {
-    const h = await boot(true);
-    expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
-    const cur = readCur();
-    expect(cur, "the inbound was promoted to cur/").not.toBeNull();
+const failedLogs = (h: Boot, tag: string) => h.logs.filter((m) => m.includes(tag) && m.includes(h.inboundId));
 
-    // The cur/ DIRECTORY and the record are both unwritable: a direct overwrite
-    // of the record AND the atomic stamp's temp file fail, so the write FAILS
-    // after the durable `acked` transition.
-    const curDir = resolve(mailDir, "anvil", "cur");
-    chmodSync(cur!.path, 0o444);
-    chmodSync(curDir, 0o555);
-    try {
-      await h.deliver("verdict");
-      h.settle();
-      expect(await pollUntil(() => obligation(h.inboundId)?.state === "acked", 4000), "the acked transition is durable").toBe(true);
-      expect(readCur()?.record?.ackedAt, "the stamp did NOT land").toBeUndefined();
-      expect(
-        await pollUntil(
-          () => h.logs.some((m) => m.includes("ack-stamp-failed") && m.includes(h.inboundId) && m.includes(cur!.path) && m.includes("EACCES")),
-          4000,
-        ),
-        "the failed write is logged by id, path and code",
-      ).toBe(true);
-    } finally {
-      chmodSync(curDir, 0o755);
-      chmodSync(cur!.path, 0o644);
-    }
-    await h.stop();
+/** Make the cur/ record and directory unwritable so the stamp write fails with EACCES. */
+function breakCur(path: string): () => void {
+  const curDir = resolve(mailDir, "anvil", "cur");
+  chmodSync(path, 0o444);
+  chmodSync(curDir, 0o555);
+  return () => { chmodSync(curDir, 0o755); chmodSync(path, 0o644); };
+}
 
-    // NEXT SCAN: a fresh start reconciles the durable terminal state onto the record.
-    const h2 = await boot(false);
-    expect(await pollUntil(() => !!readCur()?.record?.ackedAt, 4000), "reconciled on the next scan").toBe(true);
-    expect(readCur()?.record?.read).toBe(true);
-    expect(obligation(h.inboundId)?.state).toBe("acked");
-    await h2.stop();
-  }, 20000);
-
-  it("nack: a failed nackedAt write logs id/path/code and is reconciled on the next scan", async () => {
-    const h = await boot(true);
-    expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
-    const cur = readCur();
-    expect(cur, "the inbound was promoted to cur/").not.toBeNull();
-
-    const curDir = resolve(mailDir, "anvil", "cur");
-    chmodSync(cur!.path, 0o444);
-    chmodSync(curDir, 0o555);
-    try {
+describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => {
+  for (const kind of ["ack", "nack"] as const) {
+    const stampKey = kind === "ack" ? "ackedAt" : "nackedAt";
+    const state = kind === "ack" ? "acked" : "failed";
+    const finish = (h: Boot) => {
+      if (kind === "ack") return h.deliver("verdict").then(() => h.settle());
       h.skip("empty"); // an empty/silent final → the named failure path
       h.settle();
-      expect(await pollUntil(() => obligation(h.inboundId)?.state === "failed", 4000), "the failed transition is durable").toBe(true);
-      expect(readCur()?.record?.nackedAt, "the stamp did NOT land").toBeUndefined();
-      expect(
-        await pollUntil(
-          () => h.logs.some((m) => m.includes("nack-stamp-failed") && m.includes(h.inboundId) && m.includes(cur!.path) && m.includes("EACCES")),
-          4000,
-        ),
-        "the failed write is logged by id, path and code",
-      ).toBe(true);
-    } finally {
-      chmodSync(curDir, 0o755);
-      chmodSync(cur!.path, 0o644);
-    }
-    await h.stop();
+      return Promise.resolve();
+    };
 
-    const h2 = await boot(false);
-    expect(await pollUntil(() => !!readCur()?.record?.nackedAt, 4000), "reconciled on the next scan").toBe(true);
-    expect(obligation(h.inboundId)?.state).toBe("failed");
-    await h2.stop();
-  }, 20000);
+    it(`${kind}: a transient failed ${stampKey} write is logged by id/path/code and fixed by the in-process retry, no restart`, async () => {
+      const h = await boot(true);
+      expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
+      const cur = readCur();
+      expect(cur, "the inbound was promoted to cur/").not.toBeNull();
+      const restore = breakCur(cur!.path);
+      let restored = false;
+      try {
+        await finish(h);
+        expect(await pollUntil(() => obligation(h.inboundId)?.state === state, 4000), "the terminal transition is durable").toBe(true);
+        expect(readCur()?.record?.[stampKey], "the stamp did NOT land").toBeUndefined();
+        expect(
+          await pollUntil(
+            () => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes(cur!.path) && m.includes("EACCES")),
+            4000,
+          ),
+          "the failed write is logged by id, path and code",
+        ).toBe(true);
+      } finally {
+        restore();
+        restored = true;
+      }
+      expect(restored).toBe(true);
+      expect(await pollUntil(() => !!readCur()?.record?.[stampKey], 4000), "the in-process retry stamped the record").toBe(true);
+      expect(obligation(h.inboundId)?.state).toBe(state);
+      await h.stop();
+    }, 20000);
+
+    it(`${kind}: a persistent failure stops after the bound and the next account start re-stamps the record`, async () => {
+      const h = await boot(true);
+      expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
+      const cur = readCur();
+      expect(cur, "the inbound was promoted to cur/").not.toBeNull();
+      const restore = breakCur(cur!.path);
+      try {
+        await finish(h);
+        // initial attempt + 3 retries = 4 logged failures, then no more.
+        expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length >= 4, 4000), "initial attempt + 3 retries").toBe(true);
+        await sleep(400);
+        const logged = failedLogs(h, `${kind}-stamp-failed`);
+        expect(logged.length, "no attempt beyond the bound").toBe(4);
+        expect(logged[3]).toContain("no retries left");
+        expect(readCur()?.record?.[stampKey]).toBeUndefined();
+      } finally {
+        restore();
+      }
+      await sleep(300);
+      expect(readCur()?.record?.[stampKey], "nothing retries after the bound").toBeUndefined();
+      await h.stop();
+
+      // NEXT ACCOUNT START: the durable terminal state is re-stamped onto the record.
+      const h2 = await boot(false);
+      expect(await pollUntil(() => !!readCur()?.record?.[stampKey], 4000), "re-stamped at the next account start").toBe(true);
+      if (kind === "ack") expect(readCur()?.record?.read).toBe(true);
+      expect(obligation(h.inboundId)?.state).toBe(state);
+      await h2.stop();
+    }, 20000);
+
+    it(`${kind}: stopping the account cancels the pending stamp retries`, async () => {
+      setStampRetryDelaysForTests([300, 300, 300]);
+      const h = await boot(true);
+      expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
+      const cur = readCur();
+      expect(cur, "the inbound was promoted to cur/").not.toBeNull();
+      const restore = breakCur(cur!.path);
+      try {
+        await finish(h);
+        expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length >= 1, 4000), "first failure logged").toBe(true);
+        await h.stop();
+      } finally {
+        restore();
+      }
+      const before = failedLogs(h, `${kind}-stamp-failed`).length;
+      await sleep(1200);
+      expect(failedLogs(h, `${kind}-stamp-failed`).length, "no retry ran after stop").toBe(before);
+      expect(readCur()?.record?.[stampKey], "the cancelled retry never stamped").toBeUndefined();
+    }, 20000);
+  }
 
   it("the successful write path is unchanged: a normal ack stamps ackedAt with no diagnostic", async () => {
     const h = await boot(true);

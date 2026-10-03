@@ -634,7 +634,7 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
  *
  * It never throws. The caller gets a structured outcome it must ACT on, so a
  * failed write is surfaced (logged by message id, record path and error code)
- * and reconciled on the next scan — never silently ignored (cli#492).
+ * and retried — never silently ignored (cli#492).
  */
 type CurRecordUpdate =
   | { ok: true }
@@ -718,10 +718,10 @@ function updateExistingCurRecord(path: string, patch: Partial<TpsMailBody>): Cur
 /**
  * Re-stamp an `acked` or `failed` obligation whose cur/ record never received
  * its stamp (the write failed after the durable transition — cli#492). The
- * obligation record is the durable truth, so on a scan the record and the
- * maildir are made to agree: an `acked` obligation re-stamps `ackedAt`/`read`,
- * a `failed` one `nackedAt`/`nackReason`. Idempotent; a failure here is logged
- * by name so the next scan tries again.
+ * obligation record is the durable truth, so at account start the record and
+ * the maildir are made to agree: an `acked` obligation re-stamps
+ * `ackedAt`/`read`, a `failed` one `nackedAt`/`nackReason`. Idempotent; a
+ * failure here is logged by name.
  */
 function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): void {
   for (const rec of listObligations(mailDir, agent)) {
@@ -729,7 +729,7 @@ function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): v
     const curPath = findCurPath(mailDir, agent, rec.inboundId);
     if (!curPath) continue;
     const cur = readMailFile(curPath);
-    if (!cur) continue; // absent/unreadable now; the next scan retries
+    if (!cur) continue;
     if (rec.state === "acked" && !cur.ackedAt) {
       const r = updateExistingCurRecord(curPath, { ackedAt: new Date().toISOString(), read: true });
       if (r.ok) log?.info?.(`tps-mail: reconciled the acked stamp for ${rec.inboundId} at ${curPath}`);
@@ -992,6 +992,52 @@ function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
   return result;
 }
 
+/** Delays before each in-process retry of a failed terminal stamp (cli#492). */
+let stampRetryDelaysMs = [1000, 4000, 16000];
+
+/** Test-only: shorten the stamp retry delays. Returns the previous delays. */
+export function setStampRetryDelaysForTests(delays: number[]): number[] {
+  const prev = stampRetryDelaysMs;
+  stampRetryDelaysMs = delays;
+  return prev;
+}
+
+/**
+ * Stamp the cur/ record after a durable terminal transition. A failure is
+ * logged by id, path and code, then retried under the account's live
+ * incarnation after each delay in `stampRetryDelaysMs`; the timers are
+ * cancelled when the account stops. After the last retry the stamp is left to
+ * `reconcileTerminalCurStamps` at the next account start.
+ */
+function stampTerminalCur(
+  ctx: YieldContext,
+  kind: "ack" | "nack",
+  patch: Partial<TpsMailBody>,
+  attempt = 0,
+): void {
+  const key = kind === "ack" ? "ackedAt" : "nackedAt";
+  if (attempt > 0) {
+    const cur = readCurRecord(ctx.curPath);
+    if (cur.status === "ok" && cur.record[key]) return;
+  }
+  const stamped = updateExistingCurRecord(ctx.curPath, patch);
+  if (stamped.ok) {
+    if (attempt > 0) ctx.log?.info?.(`tps-mail: ${kind}-stamp-retry-ok: ${ctx.inboundId} at ${ctx.curPath} (retry ${attempt})`);
+    return;
+  }
+  if (stamped.reason === "record-missing") return;
+  const delay = stampRetryDelaysMs[attempt];
+  ctx.log?.warn?.(
+    `tps-mail: ${kind}-stamp-failed: could not stamp ${key} on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
+      (delay === undefined
+        ? `no retries left, the next account start re-stamps it`
+        : `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`),
+  );
+  if (delay === undefined || !isLiveContext(ctx)) return;
+  const timer = accountTimer(ctx, () => stampTerminalCur(ctx, kind, patch, attempt + 1), delay);
+  if (typeof (timer as any).unref === "function") (timer as any).unref();
+}
+
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
   if (!isLiveContext(ctx)) return;
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
@@ -1009,13 +1055,7 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     );
     return;
   }
-  const stamped = updateExistingCurRecord(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
-  if (!stamped.ok && stamped.reason !== "record-missing") {
-    ctx.log?.warn?.(
-      `tps-mail: ack-stamp-failed: could not stamp ackedAt on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
-        `the obligation is acked and the stamp is reconciled on the next scan`,
-    );
-  }
+  stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
   releaseObligationState(obligationId);
 }
@@ -1186,13 +1226,7 @@ async function settleObligation(
   // handed off (cli#403).
   releaseObligationState(obligationId);
   if (!s.alreadyStamped) {
-    const stamped = updateExistingCurRecord(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
-    if (!stamped.ok && stamped.reason !== "record-missing") {
-      ctx.log?.warn?.(
-        `tps-mail: nack-stamp-failed: could not stamp nackedAt on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
-          `the obligation is failed and the stamp is reconciled on the next scan`,
-      );
-    }
+    stampTerminalCur(ctx, "nack", { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
@@ -2398,8 +2432,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // cur/ record never received its stamp — the write failed AFTER the
         // durable transition — is re-stamped here, under the same lock that
         // write uses, BEFORE the recovery loop below decides whether to
-        // re-dispatch the record. Idempotent; a failure here is logged by name
-        // and retried on the next scan.
+        // re-dispatch the record. Idempotent; a failure here is logged by name.
         reconcileTerminalCurStamps(account.mailDir, agentId, log);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
