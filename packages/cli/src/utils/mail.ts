@@ -919,9 +919,10 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
  * A crash between composing the scratch and renaming it into cur/ leaves one
  * behind. The promote catch only runs on a THROWN error, not a kill, and
  * `listMessageFiles` filters `.endsWith(".json")`, so `.promote` orphans are
- * invisible to every sweep. They are always safe to remove: the rename into
- * cur/ deletes the scratch, so any surviving scratch is either incomplete or
- * still has its untouched source, which a later check re-promotes.
+ * invisible to every sweep. They are always safe to remove: the move into cur/
+ * is a link followed by removal of the scratch, so a surviving scratch is
+ * incomplete, already linked into cur/, or still has its untouched source,
+ * which a later check re-promotes.
  */
 export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
   const tmpDir = join(root, "tmp");

@@ -353,7 +353,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   // A second record under the SAME filename must not replace the delivered
   // record. Identical content is an idempotent duplicate (replay); different
   // content is an integrity error. Both leave cur/ untouched.
-  test("a second delivery with the same filename and identical content is a duplicate no-op", async () => {
+  test("a second delivery with the same filename and identical content is dead-lettered as a duplicate (replay)", async () => {
     const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-1" });
     plant(wrapper("flint", first), "collide.json");
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));

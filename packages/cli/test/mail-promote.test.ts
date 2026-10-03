@@ -187,7 +187,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     );
   }
 
-  test("a second delivery with the same filename and identical content is a duplicate no-op", async () => {
+  test("a second delivery with the same filename and identical content is dead-lettered as a duplicate (replay)", async () => {
     const inbox = getInbox("kern");
     const file = "collide.json";
     const delivered = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-1" });
