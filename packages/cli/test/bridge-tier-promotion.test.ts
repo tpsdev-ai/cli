@@ -89,7 +89,7 @@ test("bridge outbound dispatch and cur recovery refuse external mail before adap
     }
     const delivered: string[] = [];
     core = new BridgeCore({ name: "stdio", start: async () => {}, stop: async () => {}, send: async (msg) => { delivered.push(msg.content); } },
-      { mailDir: process.env.TPS_MAIL_DIR }, () => {});
+      { mailDir: process.env.TPS_MAIL_DIR, defaultAgentId: "kern" }, () => {});
     await core.start();
     await sleep(200);
     expect(delivered).toEqual(["fresh-internal"]);
