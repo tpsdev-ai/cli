@@ -407,7 +407,7 @@ function handleEmit(args: SecretsArgs): void {
 function handleRegister(args: SecretsArgs): void {
   if (!args.key || !args.registerPath) {
     console.error(
-      "Usage: tps secrets register <name> --path <p> --type <t> --owner <o> [--scope <s>] [--expires <iso8601>] [--sensitivity <level>]"
+      "Usage: tps secrets register <name> --path <p> [--cred-type <t>] [--owner <o>] [--scope <s>] [--expires <iso8601>] [--sensitivity <level>]"
     );
     process.exit(1);
   }

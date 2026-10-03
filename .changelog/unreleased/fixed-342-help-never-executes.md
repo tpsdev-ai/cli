@@ -1,0 +1,1 @@
+- **TPS help requests print usage before dispatch.** Option values and wrapped-command arguments remain data.
