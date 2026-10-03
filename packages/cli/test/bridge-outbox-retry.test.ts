@@ -58,7 +58,7 @@ function start() {
     async stop() {},
     async send(envelope) { sent.push(envelope); },
   };
-  const core = new BridgeCore(adapter, { bridgeAgentId: BRIDGE, mailDir: root }, (line) => logs.push(line));
+  const core = new BridgeCore(adapter, { bridgeAgentId: BRIDGE, defaultAgentId: "agent-a", mailDir: root }, (line) => logs.push(line));
   stop = (core as unknown as { watchOutbox(): () => void }).watchOutbox();
   return { sent, logs };
 }
