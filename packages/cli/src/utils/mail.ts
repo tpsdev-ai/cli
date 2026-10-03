@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { type Envelope, verifyEnvelope, verifiedMailTier, bridgePrincipalIds } from "@tpsdev-ai/agent";
+import { type Envelope, PublicKeyFormatError, verifyEnvelope, verifiedMailTier, bridgePrincipalIds } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
 import { ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId } from "./envelope-id.js";
@@ -914,7 +914,6 @@ function trustCeilingReject(
  * Callers add only their path-specific step: `promote` adds the replay gate
  * (first delivery only); `recoverPromoted` requires provenance (recovery only).
  *
- * Throws only when Flair is unreachable — a retryable outage, not a verdict.
  */
 async function decideEnvelopeForMailbox(
   agent: string,
@@ -925,7 +924,10 @@ async function decideEnvelopeForMailbox(
 ): Promise<EnvelopePolicyResult> {
   // 1. Signature, through an ALWAYS-constructed client.
   const client = await createMailVerifyClient(agent, verify);
-  const verified = await verifyEnvelope(envelope, client);
+  const verified = await verifyEnvelope(envelope, client).catch((err: unknown) => {
+    if (err instanceof PublicKeyFormatError) return { ok: false as const, reason: err.message };
+    throw err;
+  });
   if (!verified.ok) {
     // 1a. Topology, not forgery. `verifyEnvelope` resolves every agent-kind
     //     chain entry PLUS `envelope.from`; an unresolvable principal is a

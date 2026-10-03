@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ed from "@noble/ed25519";
@@ -27,6 +27,8 @@ afterEach(() => {
 });
 
 for (const [format, key] of [
+  ["malformed", "not-a-key!!"],
+  ["unreachable", ""],
   ["lowercase hex", PUBLIC_KEY.toString("hex")],
   ["uppercase hex", PUBLIC_KEY.toString("hex").toUpperCase()],
   ["base64url", PUBLIC_KEY.toString("base64url")],
@@ -34,7 +36,7 @@ for (const [format, key] of [
   ["base64", PUBLIC_KEY.toString("base64")],
   ["unpadded base64", PUBLIC_KEY.toString("base64").replace(/=+$/, "")],
 ] as const) {
-  test(`AgentRuntime promotes signed mail with a ${format} Flair key`, async () => {
+  test(`AgentRuntime handles a ${format} Flair key`, async () => {
     expect(PUBLIC_KEY.toString("base64url")).toMatch(/[-_]/);
     const keyPath = join(root, "reader.pem");
     const { privateKey } = generateKeyPairSync("ed25519");
@@ -43,6 +45,7 @@ for (const [format, key] of [
     fetchSpy.mockImplementation(async (input, init) => {
       const url = new URL(String(input));
       expect(url.origin).toBe("http://flair.test");
+      if (format === "unreachable") { reads++; throw new Error("Flair unreachable"); }
       if (url.pathname === "/Health") return new Response("ok");
       expect(url.pathname).toBe("/Agent/flint");
       expect(new Headers(init?.headers).get("Authorization")).toMatch(/^TPS-Ed25519 anvil:/);
@@ -78,10 +81,25 @@ for (const [format, key] of [
     }));
     const messages = await (runtime as unknown as { mail: MailClient }).mail.checkNewMail();
     expect(reads).toBeGreaterThan(0);
+    if (format === "malformed" || format === "unreachable") {
+      expect(messages).toEqual([]);
+      expect(readdirSync(join(inbox, "cur"))).toEqual([]);
+      if (format === "malformed") {
+        expect(readdirSync(join(inbox, "new"))).toEqual([]);
+        expect(readdirSync(join(inbox, "dlq")).sort()).toEqual(["message.json", "message.json.reason"]);
+        const reason = readFileSync(join(inbox, "dlq", "message.json.reason"), "utf8");
+        expect(reason).toContain("class: invalid");
+        expect(reason).toContain("malformed public key for flint");
+      } else {
+        expect(readdirSync(join(inbox, "new"))).toEqual(["message.json"]);
+        expect(readdirSync(join(inbox, "dlq")).sort()).toEqual([]);
+      }
+      return;
+    }
     expect(messages).toHaveLength(1);
     expect(messages[0]?.verifiedEnvelope?.body).toBe("verified delivery");
     expect(readdirSync(join(inbox, "new"))).toEqual([]);
     expect(readdirSync(join(inbox, "cur"))).toEqual(["message.json"]);
-    expect(readdirSync(join(inbox, "dlq"))).toEqual([]);
+    expect(readdirSync(join(inbox, "dlq")).sort()).toEqual([]);
   });
 }

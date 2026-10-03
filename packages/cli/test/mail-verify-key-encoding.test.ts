@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
+import { promote, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
 import { createMailVerifyClient } from "../src/utils/mail-verify.js";
 
 // Wire sha512 for the sync signing operations (same pattern as the other mail tests).
@@ -137,7 +138,7 @@ for (const [label, key] of [
       flairKeyPath,
     });
     await expect(client.getAgent(SENDER)).rejects.toThrow(
-      `Flair returned an invalid public key for ${SENDER}`,
+      `Flair returned a malformed public key for ${SENDER}`,
     );
   });
 }
@@ -146,5 +147,27 @@ for (const encoding of ["hex", "base64url", "base64"] as const) {
   test(`${encoding} stored key verifies`, async () => {
     expect(await verifyAgainst(SENDER_PUB.toString(encoding),
       signedEnvelope(SENDER, MAILBOX, "hello", SENDER_SEED))).toEqual({ ok: true });
+  });
+}
+
+for (const failure of ["malformed", "unreachable"] as const) {
+  test(`promote keeps a ${failure} Flair key failure in its proper rejection class`, async () => {
+    if (failure === "malformed") stubHub(() => "not-a-key!!");
+    else fetchSpy.mockImplementation(async () => { throw new Error("Flair unreachable"); });
+    const inbox = join(home, "mail", MAILBOX);
+    const fresh = join(inbox, "new");
+    mkdirSync(fresh, { recursive: true });
+    const file = join(fresh, "message.json");
+    const envelope = signedEnvelope(SENDER, MAILBOX, "hello", SENDER_SEED);
+    writeFileSync(file, JSON.stringify({ id: envelope.messageId, from: SENDER, to: MAILBOX, body: JSON.stringify(envelope) }));
+    const result = await promote(MAILBOX, file, { flairUrl: "http://flair.test", flairKeyPath });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("unexpected promotion");
+    expect(result.class).toBe(failure === "malformed" ? "invalid" : "verify-unavailable");
+    expect(RETRYABLE_REJECT_CLASSES.has(result.class)).toBe(failure === "unreachable");
+    expect(readdirSync(fresh)).toEqual([]);
+    const reason = readFileSync(join(inbox, "dlq", "message.json.reason"), "utf8");
+    expect(reason).toContain(`class: ${result.class}`);
+    expect(reason).toContain(failure === "malformed" ? "malformed public key for flint" : "Flair unreachable");
   });
 }

@@ -16,7 +16,7 @@
  */
 
 import { createFlairClient } from "./flair-client.js";
-import { parseFlairPublicKey } from "@tpsdev-ai/agent";
+import { parseFlairPublicKey, PublicKeyFormatError } from "@tpsdev-ai/agent";
 import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -69,8 +69,11 @@ export async function createMailVerifyClient(
       let publicKey: Buffer;
       try {
         publicKey = parseFlairPublicKey(info.publicKey);
-      } catch {
-        throw new Error(`Flair returned an invalid public key for ${name}`);
+      } catch (err) {
+        if (err instanceof PublicKeyFormatError) {
+          throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
+        }
+        throw err;
       }
       return { publicKey };
     },

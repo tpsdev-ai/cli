@@ -11,7 +11,7 @@ import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
 import type { FlairClient } from "../lib/signEnvelope.js";
-import { parseFlairPublicKey } from "../lib/public-key.js";
+import { parseFlairPublicKey, PublicKeyFormatError } from "../lib/public-key.js";
 
 export class AgentRuntime {
   private loop: EventLoop;
@@ -36,7 +36,14 @@ export class AgentRuntime {
         getAgent: async (name: string) => {
           const a = await this.flair!.getAgent(name);
           if (!a) return null;
-          return { publicKey: parseFlairPublicKey(a.publicKey) };
+          try {
+            return { publicKey: parseFlairPublicKey(a.publicKey) };
+          } catch (err) {
+            if (err instanceof PublicKeyFormatError) {
+              throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
+            }
+            throw err;
+          }
         },
       };
     }

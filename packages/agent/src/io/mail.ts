@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
 import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
+import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 import { isTopicRecipient } from "../lib/topic-recipient.js";
@@ -358,11 +359,10 @@ export class MailClient {
       return { pass: false, class: "invalid", reason: "unsigned envelope (v1 required)", from: mailMsg.from };
     }
 
-    // 3. Verify the signature. A THROW here (Flair unreachable) is NOT a pass —
-    //    it propagates to checkNewMail(), which refuses to promote and leaves
-    //    the record in new/ for a later check. The verifier adapter throws on an
-    //    outage, so an outage is RETRYABLE rather than a terminal "not found".
-    const vr = await verifyEnvelope(env as any, client);
+    const vr = await verifyEnvelope(env as any, client).catch((err: unknown) => {
+      if (err instanceof PublicKeyFormatError) return { ok: false as const, reason: err.message };
+      throw err;
+    });
     if (!vr.ok) {
       const cls: MailboxRejectClass = UNRESOLVABLE_PRINCIPAL_REASON_RE.test(vr.reason)
         ? "unresolvable-principal"
