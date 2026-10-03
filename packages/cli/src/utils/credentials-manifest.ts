@@ -55,8 +55,8 @@ export interface CredentialsManifest {
   version: 1;
   credentials: Record<string, CredentialEntry>;
   /**
-   * Agent ids known to this host (cli#397). No agent id or agent-id list is
-   * hardcoded in source; callers read the list from here. Absent ⇒ empty.
+   * Agent ids known to this host (cli#397): callers read the list from here
+   * instead of naming an agent. Absent ⇒ empty.
    */
   agents?: ConfiguredAgent[];
 }

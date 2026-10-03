@@ -1,9 +1,9 @@
 /**
  * local-agent.ts — the invoking agent's own id, resolved from configuration.
  *
- * No source file names a person (cli#397): the local agent id comes from an
- * explicit argument or `TPS_AGENT_ID`. A caller that needs it and has neither
- * refuses with a named error instead of falling back to a real agent id.
+ * The local agent id comes from an explicit argument or `TPS_AGENT_ID`; a
+ * caller that needs it and has neither refuses with a named error instead of
+ * falling back to a real agent id (cli#397).
  */
 
 export function requireLocalAgentId(what: string, explicit?: string): string {
