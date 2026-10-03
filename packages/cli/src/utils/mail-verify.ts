@@ -2,12 +2,13 @@
  * mail-verify.ts — the verify-ready Flair client for mail promotion.
  *
  * The adapter bridges two FlairClient shapes: the CLI's FlairClient returns
- * `FlairAgent.publicKey` as hex or canonical base64, while signEnvelope's verifyEnvelope
+ * `FlairAgent.publicKey` as a string, while signEnvelope's verifyEnvelope
  * expects `getAgent()` to return `{ publicKey: Buffer }` (raw 32-byte Ed25519).
  */
 
 import { createFlairClient } from "./flair-client.js";
-import { decodeRegistryPublicKey, type FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
+import { parseFlairPublicKey, PublicKeyFormatError } from "@tpsdev-ai/agent";
+import type { FlairClient as VerifyFlairClient } from "@tpsdev-ai/agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -56,7 +57,15 @@ export async function createMailVerifyClient(
     async getAgent(name: string) {
       const info = await cliClient.getAgentForVerification(name);
       if (!info) return null;
-      const publicKey = decodeRegistryPublicKey(info.publicKey);
+      let publicKey: Buffer;
+      try {
+        publicKey = parseFlairPublicKey(info.publicKey);
+      } catch (err) {
+        if (err instanceof PublicKeyFormatError) {
+          throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
+        }
+        throw err;
+      }
       return { publicKey };
     },
   };

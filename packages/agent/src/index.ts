@@ -46,6 +46,7 @@ export type { FlairConfig } from "./runtime/types.js";
 // Signing
 export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
 export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";
+export { parseFlairPublicKey, PublicKeyFormatError } from "./lib/public-key.js";
 
 // Mailbox policy (cli#380)
 export {

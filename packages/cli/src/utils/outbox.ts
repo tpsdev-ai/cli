@@ -118,7 +118,7 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
   return { result: alreadyRecorded ? "duplicate" : "queued" };
 }
 
-export function drainOutbox(): OutboxMessage[] {
+export function drainOutbox(archive = true): OutboxMessage[] {
   const newDir = outboxDir("new");
   const sentDir = outboxDir("sent");
   mkdirSync(newDir, { recursive: true });
@@ -129,8 +129,15 @@ export function drainOutbox(): OutboxMessage[] {
   for (const f of files) {
     const src = join(newDir, f);
     let msg: OutboxMessage;
+    let raw: string;
     try {
-      msg = JSON.parse(readFileSync(src, "utf-8")) as OutboxMessage;
+      raw = readFileSync(src, "utf-8");
+    } catch (err) {
+      console.error(`drainOutbox: failed to read ${f}: ${(err as Error).message}; leaving in place`);
+      continue;
+    }
+    try {
+      msg = JSON.parse(raw) as OutboxMessage;
     } catch (err) {
       // Defense-in-depth: even with atomic writes, a partial file could appear
       // (manual edit, crash mid-write before rename). Don't take the whole
@@ -143,8 +150,59 @@ export function drainOutbox(): OutboxMessage[] {
       }
       continue;
     }
-    renameSync(src, join(sentDir, f));
+    if (archive) renameSync(src, join(sentDir, f));
     out.push(msg);
   }
   return out;
+}
+
+export function acknowledgeOutbox(id: string): void {
+  const newDir = outboxDir("new");
+  const sentDir = outboxDir("sent");
+  mkdirSync(sentDir, { recursive: true });
+  mkdirSync(newDir, { recursive: true });
+  for (const filename of readdirSync(newDir).filter((f) => f.endsWith(".json") && !f.startsWith("."))) {
+    const path = join(newDir, filename);
+    let record: OutboxMessage;
+    try {
+      record = JSON.parse(readFileSync(path, "utf-8")) as OutboxMessage;
+    } catch (err) {
+      console.error(`acknowledgeOutbox: skipping ${filename}: ${(err as Error).message}`);
+      continue;
+    }
+    if (record.id === id) renameSync(path, join(sentDir, filename));
+  }
+}
+
+export const OUTBOX_RESEND_BASE_MS = 60_000;
+export const OUTBOX_MAX_SENDS = 5;
+
+export class OutboxSendTracker {
+  private readonly sends = new Map<string, { at: number; count: number }>();
+
+  due(now = Date.now()): OutboxMessage[] {
+    const out: OutboxMessage[] = [];
+    for (const item of drainOutbox(false)) {
+      const prev = this.sends.get(item.id);
+      if (prev && prev.count >= OUTBOX_MAX_SENDS) continue;
+      if (prev && now - prev.at < OUTBOX_RESEND_BASE_MS * 2 ** (prev.count - 1)) continue;
+      const count = (prev?.count ?? 0) + 1;
+      this.sends.set(item.id, { at: now, count });
+      if (count === OUTBOX_MAX_SENDS) console.error(`outbox: ${item.id} sent ${count} times without an ACK; not resending until restart`);
+      out.push(item);
+    }
+    return out;
+  }
+
+  sendFailed(id: string): void {
+    const prev = this.sends.get(id);
+    if (!prev) return;
+    if (prev.count <= 1) this.sends.delete(id);
+    else this.sends.set(id, { at: 0, count: prev.count - 1 });
+  }
+
+  acknowledge(id: string): void {
+    acknowledgeOutbox(id);
+    this.sends.delete(id);
+  }
 }
