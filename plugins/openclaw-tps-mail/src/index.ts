@@ -732,7 +732,89 @@ interface YieldContext {
 
 /** obligationId → the context needed to ack/nack it after the dispatch is gone. */
 const yieldContexts = new Map<string, YieldContext>();
-const armedDeadlines = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** An armed deadline and the account that owns it (cli#403), so an account
+ *  lifetime boundary can address exactly its own timers and never a sibling's. */
+interface ArmedDeadline {
+  accountId: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+const armedDeadlines = new Map<string, ArmedDeadline>();
+
+/** Accounts whose startAccount has been aborted or stopped (cli#403). A timer is
+ *  never armed for one: a late lifecycle event, or an in-flight dispatch that
+ *  settles after the abort, would otherwise re-arm a deadline under a stopped
+ *  account. Cleared when the account starts again. */
+const stoppedAccounts = new Set<string>();
+
+/**
+ * Drop ONE obligation's in-memory state — its context AND its armed timer
+ * TOGETHER (cli#403). Called on every terminal transition, so a closed
+ * obligation leaves nothing behind to fire under a stopped account, and the
+ * context map does not grow for the life of the process.
+ */
+function releaseObligationState(obligationId: string): void {
+  yieldContexts.delete(obligationId);
+  const armed = armedDeadlines.get(obligationId);
+  if (armed) {
+    clearTimeout(armed.timer);
+    armedDeadlines.delete(obligationId);
+  }
+}
+
+/**
+ * Drop only `accountId`'s in-memory obligation state (cli#403): its contexts
+ * and its timers. Called as the account (re)starts so a previous incarnation's
+ * state cannot survive into the new one; a sibling account (a different
+ * `accountId`) is never touched.
+ */
+function releaseAccountState(accountId: string): void {
+  for (const [obligationId, ctx] of yieldContexts) {
+    if (ctx.accountId === accountId) yieldContexts.delete(obligationId);
+  }
+  for (const [obligationId, armed] of armedDeadlines) {
+    if (armed.accountId === accountId) {
+      clearTimeout(armed.timer);
+      armedDeadlines.delete(obligationId);
+    }
+  }
+}
+
+/**
+ * End ONE account's lifetime in memory (cli#403). The account is STOPPED — the
+ * guard refuses any later arm — and its contexts and timers are dropped, except
+ * a COMMITTED obligation's deadline (`delivering`/`posted`), which is kept so
+ * the deadline can still resolve a send that already committed. Only this
+ * account's entries are touched; a sibling account (a different `accountId`) is
+ * never affected.
+ */
+function endAccountLifetime(accountId: string): void {
+  stoppedAccounts.add(accountId);
+  for (const [obligationId, ctx] of [...yieldContexts]) {
+    if (ctx.accountId !== accountId) continue;
+    const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
+    if (rec && (rec.state === "delivering" || rec.state === "posted")) continue; // committed: keep
+    releaseObligationState(obligationId);
+  }
+}
+
+/**
+ * TEST-ONLY (cli#403): a snapshot of the in-memory obligation state — the live
+ * contexts and the armed deadline timers, each with the account that owns it.
+ * The account-lifetime tests assert that a terminal transition drops a context
+ * and its timer TOGETHER, that an account abort touches only its own entries,
+ * and that contexts do not grow across many obligations. Not part of the
+ * plugin's runtime contract.
+ */
+export function obligationStateForTests(): {
+  contexts: { obligationId: string; accountId: string }[];
+  deadlines: { obligationId: string; accountId: string }[];
+} {
+  return {
+    contexts: [...yieldContexts].map(([obligationId, ctx]) => ({ obligationId, accountId: ctx.accountId })),
+    deadlines: [...armedDeadlines].map(([obligationId, armed]) => ({ obligationId, accountId: armed.accountId })),
+  };
+}
 
 let yieldDetection: "subscription" | "settlement-inference" = "settlement-inference";
 
@@ -788,10 +870,14 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     ctx.log?.warn?.(
       `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
+    // The record is terminal or gone: there is no live obligation to keep in
+    // memory (cli#403).
+    releaseObligationState(obligationId);
     return;
   }
   patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
+  releaseObligationState(obligationId);
 }
 
 /**
@@ -867,11 +953,16 @@ async function settleObligation(
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
   if (!(await internalInbound(ctx))) return "none";
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-  if (!rec) return "none";
+  if (!rec) {
+    // Gone: no live obligation remains to keep in memory (cli#403).
+    releaseObligationState(obligationId);
+    return "none";
+  }
   if (TERMINAL_STATES.has(rec.state)) {
     ctx.log?.info?.(
       `tps-mail: obligation ${rec.obligationId} is ${rec.state}; ignoring the ${s.verdict ?? s.reason} determination`,
     );
+    releaseObligationState(obligationId);
     return "none";
   }
   if (s.receipt === "found" && !s.verdict) {
@@ -900,6 +991,7 @@ async function settleObligation(
         ctx.log?.warn?.(
           `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
         );
+        releaseObligationState(obligationId);
         return "none";
       }
     } catch (err: any) {
@@ -909,6 +1001,7 @@ async function settleObligation(
       );
       return "none";
     }
+    releaseObligationState(obligationId);
     ctx.log?.warn?.(
       `tps-mail: obligation for ${ctx.inboundId} UNCONFIRMED: ${s.reason} — the reply was committed (${rec.state}) ` +
         `and no receipt evidence was found by its deadline; NOT failed, no nack sent`,
@@ -954,8 +1047,12 @@ async function settleObligation(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
         `the inbound keeps no nack stamp and no nack mail is sent`,
     );
+    releaseObligationState(obligationId);
     return "none";
   }
+  // The failure is terminal: drop the context and its timer before the nack is
+  // handed off (cli#403).
+  releaseObligationState(obligationId);
   if (!s.alreadyStamped) {
     patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
@@ -1128,6 +1225,9 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
 function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
+  // cli#403: never arm for a stopped account — a late lifecycle event or an
+  // in-flight dispatch that settles after the abort must not re-arm a deadline.
+  if (stoppedAccounts.has(ctx.accountId)) return;
   const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (!rec || TERMINAL_STATES.has(rec.state)) return; // terminal or gone — nothing to arm
   const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
@@ -1140,13 +1240,13 @@ function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: strin
   transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
-  if (prev) clearTimeout(prev);
+  if (prev) clearTimeout(prev.timer);
   const timer = setTimeout(() => {
     armedDeadlines.delete(obligationId);
     void onDeadline(ctx, obligationId);
   }, remaining);
   if (typeof (timer as any).unref === "function") (timer as any).unref();
-  armedDeadlines.set(obligationId, timer);
+  armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
 }
 
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
@@ -1569,6 +1669,13 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     log?.info?.(
       `tps-mail: watching ${boundAgents.length} agent inbox(es): ${boundAgents.join(", ")}`,
     );
+
+    // cli#403: this account is live again — clear any stopped guard left by a
+    // previous abort so new obligations can arm deadlines, and drop only THIS
+    // account's leftover contexts and timers so a previous incarnation's stale
+    // deadline cannot survive into this one (a sibling account is untouched).
+    stoppedAccounts.delete(account.accountId);
+    releaseAccountState(account.accountId);
 
     const watchers: FSWatcher[] = [];
     // seenFiles dedupes inotify events (fs.watch can fire multiple times per
@@ -2219,12 +2326,18 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     // point we close watchers and return.
     await new Promise<void>((resolveShutdown) => {
       if (ctx.abortSignal?.aborted) {
+        // cli#403: already stopped — hold the guard and end this account's
+        // in-memory lifetime (siblings untouched).
+        endAccountLifetime(account.accountId);
         resolveShutdown();
         return;
       }
       ctx.abortSignal?.addEventListener(
         "abort",
         () => {
+          // cli#403: end this account's in-memory lifetime so a sibling
+          // account's live deadlines are never cleared.
+          endAccountLifetime(account.accountId);
           for (const w of watchers) {
             try { w.close(); } catch { /* ignore */ }
           }
@@ -2237,7 +2350,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   },
 
   stopAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
-    // Cleanup happens via abortSignal in startAccount. Nothing to do here.
+    // cli#403: end the account's in-memory lifetime even if the abortSignal
+    // never fired, so a late event or an in-flight dispatch cannot re-arm under
+    // a stopped account and a sibling account is never touched.
+    endAccountLifetime(ctx.account.accountId);
     ctx.log?.info?.("tps-mail: stopAccount called");
   },
 };
