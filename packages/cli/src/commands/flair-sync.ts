@@ -18,6 +18,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { homeDir } from "../utils/home.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 import { FlairClient, Memory, defaultFlairKeyPath } from "../utils/flair-client.js";
 
 function configPath(): string {
@@ -41,7 +42,7 @@ function loadConfig(): FlairSyncConfig {
   const defaults: FlairSyncConfig = {
     localUrl: "http://localhost:9926",
     remoteUrl: "http://localhost:9927",
-    agentId: "anvil",
+    agentId: "",
     lastSyncTimestamp: new Date(0).toISOString(),
   };
   if (!existsSync(configPath())) return defaults;
@@ -99,7 +100,7 @@ export async function runFlairSync(opts: {
           const defaults: FlairSyncConfig = {
             localUrl: "http://localhost:9926",
             remoteUrl: "http://localhost:9927",
-            agentId: "anvil",
+            agentId: "",
             lastSyncTimestamp: new Date(0).toISOString(),
           };
           if (!existsSync(opts.configPath!)) return defaults;
@@ -107,6 +108,7 @@ export async function runFlairSync(opts: {
           catch { return defaults; }
         })()
       : loadConfig();
+    if (!cfg.agentId) cfg.agentId = requireLocalAgentId("agent id");
     const keyPath = opts.keyPath ?? defaultFlairKeyPath(cfg.agentId);
 
     if (!existsSync(keyPath)) {

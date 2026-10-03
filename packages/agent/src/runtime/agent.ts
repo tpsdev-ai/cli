@@ -26,27 +26,22 @@ export class AgentRuntime {
     );
     this.flair = config.flair ? new FlairContextProvider(config.agentId, config.flair) : null;
 
-    // Build FlairClient adapter for envelope verification. The provider's
-    // getAgent() disambiguates a Flair outage (throws → retryable) from an
-    // absent principal (null → terminal), so a signature verifier built on it
-    // does not dead-letter every message while Flair is down.
-    let flairClient: FlairClient | undefined;
-    if (this.flair) {
-      flairClient = {
-        getAgent: async (name: string) => {
-          const a = await this.flair!.getAgent(name);
+    // Verification uses config.flair?.url, FLAIR_URL, then http://127.0.0.1:9926.
+    const verifyProvider = new FlairContextProvider(config.agentId, config.flair ?? {});
+    const flairClient: FlairClient = {
+      getAgent: async (name: string) => {
+        try {
+          const a = await verifyProvider.getAgent(name);
           if (!a) return null;
-          try {
-            return { publicKey: parseFlairPublicKey(a.publicKey) };
-          } catch (err) {
-            if (err instanceof PublicKeyFormatError) {
-              throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
-            }
-            throw err;
+          return { publicKey: parseFlairPublicKey(a.publicKey) };
+        } catch (err) {
+          if (err instanceof PublicKeyFormatError) {
+            throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
           }
-        },
-      };
-    }
+          throw err;
+        }
+      },
+    };
 
     const mail = new MailClient(config.mailDir, events, config.agentId, flairClient, config.flair?.keyPath);
     const memory = new MemoryStore(config.memoryPath);

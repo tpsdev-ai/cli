@@ -302,22 +302,22 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const origKeysDir = process.env.TPS_TEST_KEYS_DIR;
     process.env.TPS_TEST_KEYS_DIR = keysDir;
 
-    // A GENUINE promoted cur/ record: it carries the envelopeId and the signed
-    // envelope that promote() stamps, was never acked, and its inner body.
     const env = buildEnvelopeObj("flint", agentId, "recovered after crash", "msg-crash-001");
     const record = {
       id: "msg-crash-001",
       from: "flint",
       to: agentId,
-      body: env.body,
+      body: JSON.stringify(env),
       timestamp: env.timestamp,
       read: false,
-      envelopeId: env.messageId,
-      envelope: env,
-      deliveryAttempts: 1,
     };
     const filename = `2026-04-27T00-00-00-${record.id}.json`;
-    writeFileSync(resolve(curDir, filename), JSON.stringify(record, null, 2), "utf-8");
+    const newDir = resolve(tempMailDir, agentId, "new");
+    mkdirSync(newDir, { recursive: true });
+    const source = resolve(newDir, filename);
+    writeFileSync(source, JSON.stringify(record, null, 2), "utf-8");
+    const { promote } = await import("@tpsdev-ai/cli/utils/mail");
+    expect((await promote(agentId, source)).ok).toBe(true);
 
     let capturedArgs: any = null;
     let settleFn: () => void = () => {};

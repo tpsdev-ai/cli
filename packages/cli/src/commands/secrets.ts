@@ -35,6 +35,7 @@ import {
   AdoptCandidate,
   inferTypeFromPath,
   inferOwnerFromName,
+  configuredAgentIds,
 } from "../utils/credentials-manifest.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -484,7 +485,7 @@ function handleAdopt(args: SecretsArgs): void {
     openclawConfigPath: join(homedir(), ".openclaw", "openclaw.json"),
   };
 
-  const result: AdoptResult = walkAdoptCandidates(dirs);
+  const result: AdoptResult = walkAdoptCandidates(dirs, configuredAgentIds());
 
   if (isDryRun) {
     printAdoptDryRun(result, args);
@@ -793,7 +794,7 @@ function handleAdoptSingle(args: SecretsArgs): void {
   const type = inferTypeFromPath(resolvedPath, content);
   const credType: CredentialType = type === "unknown" ? "api-key" : type as CredentialType;
   const name = basename(resolvedPath);
-  const owner = inferOwnerFromName(name);
+  const owner = inferOwnerFromName(name, configuredAgentIds());
   const sensitivity = sensitivityForType(credType);
 
   // Load manifest

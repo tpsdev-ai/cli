@@ -137,7 +137,7 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.HOME = homeB;
     const dir = join(homeB, ".tps", "pulse");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "config.json"), JSON.stringify({ author: "beta-author" }));
+    writeFileSync(join(dir, "config.json"), JSON.stringify({ author: "beta-author", mergeAuthority: "merger", ghAgent: "github" }));
 
     expect(mod.loadConfig().author).toBe("beta-author");
     mod.saveState({ version: 1, lastPollAt: "2026-01-01T00:00:00.000Z", instances: {} });
@@ -382,7 +382,7 @@ afterAll(() => {
 });
 
 /** Start a child bun under a fresh home, import `module`, switch HOME to a second fresh home, run `body`. */
-function runAfterHomeSwitch(module: string, body: (homeB: string) => string) {
+function runAfterHomeSwitch(module: string, body: (homeB: string) => string, extraEnv: Record<string, string> = {}) {
   const startHome = mkdtempSync(join(tmpdir(), "tps-home-start-"));
   const homeB = mkdtempSync(join(tmpdir(), "tps-home-switched-"));
   childDirs.push(startHome, homeB);
@@ -393,7 +393,7 @@ function runAfterHomeSwitch(module: string, body: (homeB: string) => string) {
     "process.exit(0);",
   ].join("\n");
   const r = spawnSync(process.execPath, ["-e", script], {
-    env: { ...process.env, HOME: startHome },
+    env: { ...process.env, HOME: startHome, ...extraEnv },
     encoding: "utf-8",
     timeout: 30_000, // bounded: the child exits itself, or is killed here
   });
@@ -430,6 +430,7 @@ globalThis.fetch = async (input, init) => {
 };
 console.log = () => {};
 await mod.runFlairSync({ once: true, keyPath: ${JSON.stringify(keyPath)} });`,
+      { TPS_AGENT_ID: "anvil" },
     );
 
     expectCleanExit(r);
