@@ -24,6 +24,7 @@ import { tmpdir } from "node:os";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "../src/lib/signEnvelope.js";
+import { parseFlairPublicKey } from "../src/lib/public-key.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
 
@@ -63,7 +64,7 @@ function providerVerifier(provider: FlairContextProvider): FlairClient {
     async getAgent(name: string) {
       const a = await provider.getAgent(name);
       if (!a) return null;
-      return { publicKey: Buffer.from(a.publicKey, "hex") };
+      return { publicKey: parseFlairPublicKey(a.publicKey) };
     },
   };
 }

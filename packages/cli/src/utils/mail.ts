@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   decideEnvelopeForMailbox as decideEnvelope,
-  type Envelope, verifiedMailTier, bridgePrincipalIds,
+  type Envelope, PublicKeyFormatError, verifiedMailTier, bridgePrincipalIds,
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
@@ -658,7 +658,13 @@ async function decideEnvelopeForMailbox(
   mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<EnvelopePolicyResult> {
-  const decision = await decideEnvelope(agent, envelope, wrapperFrom, await createMailVerifyClient(agent, verify));
+  const decision = await decideEnvelope(agent, envelope, wrapperFrom, await createMailVerifyClient(agent, verify))
+    .catch((err: unknown) => {
+      if (err instanceof PublicKeyFormatError) {
+        return { ok: false as const, class: "invalid" as const, reason: `signature verification failed: ${err.message}` };
+      }
+      throw err;
+    });
   if (!decision.ok) return decision;
   return trustCeilingReject(decision.envelope, mailRoot, verify) ?? decision;
 }
