@@ -5,6 +5,127 @@ import { launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
 
+const FLAGS = {
+  reason: { type: "string" },
+  expiresIn: { type: "string" },
+  trust: { type: "string" },
+  pubkey: { type: "string" },
+  encPubkey: { type: "string" },
+  name: { type: "string" },
+  workspace: { type: "string" },
+  dryRun: { type: "boolean", default: false },
+  json: { type: "boolean", default: false },
+  config: { type: "string" },
+  deep: { type: "boolean", default: false },
+  summary: { type: "string" },
+  channel: { type: "string" },
+  branch: { type: "boolean", default: false },
+  manifest: { type: "string" },
+  soundstage: { type: "boolean", default: false },
+  // --quiet-nono-check: skips only the loud availability check; it is NOT a
+  // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
+  quietNonoCheck: { type: "boolean", default: false },
+  nonono: { type: "boolean", default: false },
+  ...launchFlagDefinitions,
+  inject: { type: "boolean", default: true },
+  runtime: { type: "string", default: "openclaw" },
+  baseModel: { type: "string" },
+  since: { type: "string" },
+  limit: { type: "number" },
+  interval: { type: "number" },
+  daemon: { type: "string" },
+  from: { type: "string" },
+  clone: { type: "boolean", default: false },
+  overwrite: { type: "boolean", default: false },
+  schedule: { type: "string" },
+  keep: { type: "number" },
+  sanitize: { type: "boolean", default: true },
+  listen: { type: "number" },
+  host: { type: "string" },
+  force: { type: "boolean", default: false },
+  follow: { type: "boolean", default: false },
+  lines: { type: "number" },
+  transport: { type: "string" },
+  port: { type: "number" },
+  autoPrune: { type: "boolean", default: false },
+  prune: { type: "boolean", default: false },
+  staleMinutes: { type: "number" },
+  offlineHours: { type: "number" },
+  shared: { type: "boolean", default: false },
+  cost: { type: "boolean", default: false },
+  costs: { type: "boolean", default: false },
+  today: { type: "boolean", default: false },
+  agent: { type: "string" },
+  statusOverride: { type: "string" },
+  desc: { type: "string" },
+  id: { type: "string" },
+  fromBeginning: { type: "boolean", default: false },
+  count: { type: "boolean", default: false },
+  priority: { type: "string" },
+  version: { type: "string" },
+  verbose: { type: "boolean", default: false },
+  // ops-7x9y: office join supervision flags (--force is already declared above)
+  tunnelVia: { type: "string" },
+  keepUnits: { type: "boolean", default: false },
+  // ops-209a: Flair spoke provisioning flags
+  noFlair: { type: "boolean", default: false },
+  forceReinstallFlair: { type: "boolean", default: false },
+  purgeFlair: { type: "boolean", default: false },
+  // ops-568p: Cred substrate S1+S2 (credentials manifest)
+  apply: { type: "boolean", default: false },
+  expires: { type: "string" },
+  expiresWithin: { type: "string" },
+  fix: { type: "boolean", default: false },
+  flairKeysDir: { type: "string" },
+  identityDir: { type: "string" },
+  keysDir: { type: "string" },
+  nonInteractive: { type: "boolean", default: false },
+  owner: { type: "string" },
+  path: { type: "string" },
+  scope: { type: "string" },
+  secretsDir: { type: "string" },
+  sensitivity: { type: "string" },
+  credType: { type: "string" },
+  check: { type: "boolean", default: false },
+  noGuard: { type: "boolean", default: false },
+  staleOnly: { type: "boolean", default: false },
+  root: { type: "string" },
+  // Facts substrate flags
+  failOnDrift: { type: "boolean", default: false },
+  noVerify: { type: "boolean", default: false },
+  verifyPreview: { type: "boolean", default: false },
+  // Task envelope flags (mail send --task)
+  task: { type: "string" },
+  taskId: { type: "string" },
+  title: { type: "string" },
+  spec: { type: "string" },
+  output: { type: "string" },
+  taskContext: { type: "string" },
+  // cli#429: mail send --stdin / --reply-to. `--unsigned` is parsed only so
+  // that `mail send` can REFUSE it by name (there is no unsigned send).
+  stdin: { type: "boolean", default: false },
+  unsigned: { type: "boolean", default: false },
+  replyTo: { type: "string" },
+  // mail send --message-id: sign with a caller-chosen envelope messageId,
+  // so a re-send after an unknown outcome is the same message.
+  messageId: { type: "string" },
+} as const;
+
+// Value-taking options read directly from process.argv rather than FLAGS.
+const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
+  init: ["model", "flair-url"],
+  agent: ["model", "flair-url", "display-name", "soul-file", "repo", "message", "pr-title", "scope-warn-threshold"],
+  mail: ["type", "retry-after", "max-age", "pr", "status"],
+  facts: ["command", "args"],
+  memory: ["focus", "tag", "older-than", "flair-url"],
+  bridge: ["adapter", "openclaw-url", "discord-token", "discord-token-file", "discord-channel", "webhook-url", "bridge-agent-id", "default-agent", "mail-dir", "bot-user-id", "require-mention", "discord-poll-ms", "discord-prompt"],
+  skill: ["flair-url", "include-rules", "rule-name-format", "registry"],
+  flair: ["flair-dir", "auth-mode", "auth-path", "flair-url"],
+  secrets: ["window"],
+};
+
+const helpArgs = parseHelpArgs(process.argv.slice(2));
+
 const cli = meow(
   `
   Usage
@@ -17,7 +138,7 @@ const cli = meow(
     review <name>     Performance review for a specific agent
     office <action>   Branch office sandbox lifecycle (start/stop/list/status/kill)
     bootstrap <agent-id>  Bring a hired agent to operational state
-    backup            Archive critical TPS host files
+    backup <agent-id>|keys  Archive an agent workspace or host keys
     restore <agent-id> <archive> [--clone] [--overwrite] [--from <archive>] Restore agent workspace from a backup
     status [agent-id] [--auto-prune] [--prune] [--json] [--cost] [--shared]
     heartbeat <agent-id> [--quiet-nono-check] Send a heartbeat/ping for an agent
@@ -60,7 +181,7 @@ const cli = meow(
     $ tps office start branch-a
     $ tps office status branch-a
     $ tps bootstrap flint
-    $ tps backup
+    $ tps backup flint
     $ tps restore flint ~/.tps/backups/flint/old.tps-backup.tar.gz
     $ tps status
     $ tps status flint --cost
@@ -73,111 +194,8 @@ const cli = meow(
 `,
   {
     importMeta: import.meta,
-    flags: {
-      reason: { type: "string" },
-      expiresIn: { type: "string" },
-      trust: { type: "string" },
-      pubkey: { type: "string" },
-      encPubkey: { type: "string" },
-      name: { type: "string" },
-      workspace: { type: "string" },
-      dryRun: { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
-      config: { type: "string" },
-      deep: { type: "boolean", default: false },
-      summary: { type: "string" },
-      channel: { type: "string" },
-      branch: { type: "boolean", default: false },
-      manifest: { type: "string" },
-      soundstage: { type: "boolean", default: false },
-      // --quiet-nono-check: skips only the loud availability check; it is NOT a
-      // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
-      quietNonoCheck: { type: "boolean", default: false },
-      nonono: { type: "boolean", default: false },
-      ...launchFlagDefinitions,
-      inject: { type: "boolean", default: true },
-      runtime: { type: "string", default: "openclaw" },
-      baseModel: { type: "string" },
-      since: { type: "string" },
-      limit: { type: "number" },
-      interval: { type: "number" },
-      daemon: { type: "string" },
-      from: { type: "string" },
-      clone: { type: "boolean", default: false },
-      overwrite: { type: "boolean", default: false },
-      schedule: { type: "string" },
-      keep: { type: "number" },
-      sanitize: { type: "boolean", default: true },
-      listen: { type: "number" },
-      host: { type: "string" },
-      force: { type: "boolean", default: false },
-      follow: { type: "boolean", default: false },
-      lines: { type: "number" },
-      transport: { type: "string" },
-      port: { type: "number" },
-      autoPrune: { type: "boolean", default: false },
-      prune: { type: "boolean", default: false },
-      staleMinutes: { type: "number" },
-      offlineHours: { type: "number" },
-      shared: { type: "boolean", default: false },
-      cost: { type: "boolean", default: false },
-      costs: { type: "boolean", default: false },
-      today: { type: "boolean", default: false },
-      agent: { type: "string" },
-      statusOverride: { type: "string" },
-      desc: { type: "string" },
-      id: { type: "string" },
-      fromBeginning: { type: "boolean", default: false },
-      count: { type: "boolean", default: false },
-      priority: { type: "string" },
-      version: { type: "string" },
-      verbose: { type: "boolean", default: false },
-      // ops-7x9y: office join supervision flags (--force is already declared above)
-      tunnelVia: { type: "string" },
-      keepUnits: { type: "boolean", default: false },
-      // ops-209a: Flair spoke provisioning flags
-      noFlair: { type: "boolean", default: false },
-      forceReinstallFlair: { type: "boolean", default: false },
-      purgeFlair: { type: "boolean", default: false },
-      // ops-568p: Cred substrate S1+S2 (credentials manifest)
-      apply: { type: "boolean", default: false },
-      expires: { type: "string" },
-      expiresWithin: { type: "string" },
-      fix: { type: "boolean", default: false },
-      flairKeysDir: { type: "string" },
-      identityDir: { type: "string" },
-      keysDir: { type: "string" },
-      nonInteractive: { type: "boolean", default: false },
-      owner: { type: "string" },
-      path: { type: "string" },
-      scope: { type: "string" },
-      secretsDir: { type: "string" },
-      sensitivity: { type: "string" },
-      credType: { type: "string" },
-      check: { type: "boolean", default: false },
-      noGuard: { type: "boolean", default: false },
-      staleOnly: { type: "boolean", default: false },
-      root: { type: "string" },
-      // Facts substrate flags
-      failOnDrift: { type: "boolean", default: false },
-      noVerify: { type: "boolean", default: false },
-      verifyPreview: { type: "boolean", default: false },
-      // Task envelope flags (mail send --task)
-      task: { type: "string" },
-      taskId: { type: "string" },
-      title: { type: "string" },
-      spec: { type: "string" },
-      output: { type: "string" },
-      taskContext: { type: "string" },
-      // cli#429: mail send --stdin / --reply-to. `--unsigned` is parsed only so
-      // that `mail send` can REFUSE it by name (there is no unsigned send).
-      stdin: { type: "boolean", default: false },
-      unsigned: { type: "boolean", default: false },
-      replyTo: { type: "string" },
-      // mail send --message-id: sign with a caller-chosen envelope messageId,
-      // so a re-send after an unknown outcome is the same message.
-      messageId: { type: "string" },
-    },
+    flags: FLAGS,
+    argv: helpArgs.argv,
   }
 );
 
@@ -246,6 +264,161 @@ async function checkNono() {
   }
 }
 
+const USAGE: Record<string, string> = {
+  init: "Usage: tps init [--id <agent-id>] [--name <name>] [--model <provider/model>]",
+  hire: "I'm gonna need you to specify a TPS report file or persona.\n\n  tps hire <report.tps | persona> [--name Name]\n\nBuilt-in personas: developer, designer, support, ea, ops, strategy, security",
+  roster: "Usage:\n  tps roster\n  tps roster list\n  tps roster show <agent> [--json]\n  tps roster find --channel <channel> [--json]\n  tps roster dashboard [--json]",
+  review: "Review who? I'm gonna need a name.\n\n  tps review <agent-name>",
+  bootstrap: "Usage: tps bootstrap <agent-id>",
+  agent: "Usage:\n" +
+          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent list [--json]\n" +
+          "  tps agent status --id <agent-id> [--json]\n" +
+          "  tps agent decommission --id <agent-id> [--force]\n" +
+          "  tps agent run --id <agent-id> --message <text>\n" +
+          "  tps agent start --id <agent-id>\n" +
+          "  tps agent health --id <agent-id>\n" +
+          "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
+          "  tps agent healthcheck <agent-id>\n" +
+          "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>] [--ack-scope-expansion] [--scope-warn-threshold <factor>]",
+  auth: "Usage:\n  tps auth login <provider>\n  tps auth status\n  tps auth revoke <provider>\n  tps auth refresh <provider>",
+  office: "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill",
+  context: "Usage:\n  tps context read <workstream>\n  tps context update <workstream> --summary \"...\"\n  tps context list",
+  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
+  identity: "Usage:\n  tps identity init [--expires-in 90d]\n  tps identity show\n  tps identity register <branch> [--expires-in 90d] [--trust standard]\n  tps identity list\n  tps identity revoke <branch> --reason \"...\"\n  tps identity verify <branch>",
+  secrets: [
+          "Usage:",
+          "  tps secrets set <KEY>=<VALUE>",
+          "  tps secrets list [--json]",
+          "  tps secrets remove <KEY>",
+          "  tps secrets show <name> [--json]",
+          "  tps secrets emit <name>",
+          "  tps secrets register <name> --path <p> [--cred-type <t>] [--owner <o>] [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
+          "  tps secrets unregister <name>",
+          "  tps secrets adopt [--apply] [--non-interactive] [--secrets-dir <dir>] [--identity-dir <dir>] [--flair-keys-dir <dir>]",
+          "  tps secrets adopt <path-or-name>  (single candidate)",
+          "  tps secrets verify [--scope <s>] [--cred-type <t>] [--fix] [--fail-on-drift] [--json]",
+          "  tps secrets scan [--root <path>] [--json]",
+          "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
+          "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
+          "  tps secrets audit tail [-n <count>]       Show last N audit log entries",
+          "  tps secrets audit grep <pattern>           Filter audit log by op or name",
+          "  tps secrets audit stats [--window <d>] [--json]   Audit log statistics",
+        ].join("\n"),
+  "secrets-guard": "Usage:\n  tps secrets-guard [--no-guard] <cmd> [args...]\n  tps secrets-guard --check",
+  backup: "Usage: tps backup <agent-id>\n  tps backup keys",
+  restore: "Usage: tps restore <agent-id> <archive> [--from <archive>] [--clone] [--overwrite] [--force]",
+  heartbeat: "Usage: tps heartbeat <agent-id>",
+  stats: "Usage: tps stats [--today] [--agent <id>] [--costs]",
+  status: "Usage: tps status [agent-id] [--json] [--cost] [--shared] [--auto-prune] [--prune]",
+  facts: [
+          "Usage:",
+          "  tps facts list [--scope <s>] [--json]",
+          "  tps facts show <name> [--json]",
+          "  tps facts get <name> [--no-verify] [--verify-preview] [--json]",
+          "  tps facts verify [--scope <s>] [--fail-on-drift]",
+          "  tps facts register <name> --command <cmd> --args <json-array> --cred-type <t> [--schedule <ttl>] [--scope <s>] --reason <text>",
+          "  tps facts unregister <name>",
+          "  tps facts init [--strict] [--json]",
+          "  tps facts refresh [--strict] [--json]",
+          "  tps facts schemas [--json]",
+          "  tps facts which <name> [--json]",
+        ].join("\n"),
+  gal: "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations",
+  branch: "Usage:\n  tps branch init [--listen <port>] [--host <hostname>] [--transport ws|tcp] [--agent <id>]\n  tps branch start\n  tps branch stop\n  tps branch status\n  tps branch log [--lines N] [--follow]",
+  git: "Usage: tps git worktree <agent> <repo-path> [branch-name]",
+  service: "Usage:\n  tps service register <name> <url> [--port <local-port>] [--desc <text>]\n  tps service list [--json]\n  tps service remove <name>",
+  memory: "Usage:\n" +
+          "  tps memory reflect <agentId> [--scope recent|tagged|all] [--since ISO] [--focus lessons_learned|patterns|decisions|errors] [--limit N]\n" +
+          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]",
+  proxy: "Usage:\n  tps proxy start [--port 6459]\n  tps proxy stop\n  tps proxy status",
+  bridge: "Usage:\n" +
+          "  tps bridge start [--port 7891] [--openclaw-url <url>] [--bridge-agent-id openclaw-bridge] [--default-agent <id>]\n" +
+          "  tps bridge start --adapter discord [--discord-token <token>] [--discord-token-file <path>] [--discord-channel <id>] [--webhook-url <url>]\n" +
+          "  tps bridge stop\n" +
+          "  tps bridge status [--json]",
+  skill: "Usage:\n" +
+          "  tps skill list --agent <id>                                    List skills assigned to an agent\n" +
+          "  tps skill register <source> --name <n> --version <hash> --agent <id> [--priority standard]\n" +
+          "  tps skill scan <file>                                          Static analysis of skill content\n" +
+          "  tps skill revoke <name> --agent <id>                           Remove skill assignment\n" +
+          "  tps skill show <name> --agent <id>                             Show skill details\n" +
+          "  tps skill add-pack <npm-package> --agent <id>                  Bulk-import npm-shipped skill pack",
+  flair: "Usage:\n" +
+          "  tps flair install [--flair-dir ~/ops/flair] [--dev]\n" +
+          "  tps flair uninstall\n" +
+          "  tps flair start|stop|restart\n" +
+          "  tps flair status\n" +
+          "  tps flair logs\n" +
+          "  tps flair health [--agent <id>] [--flair-url <url>] [--verbose]\n" +
+          "  tps flair sync [--once] [--interval <seconds>] [--dry-run]\n" +
+          "  tps flair set-hub <url> [--auth-mode admin-pass-file --auth-path <path>] [--port <n>]\n" +
+          "  tps flair clear-hub\n" +
+          "  tps flair show [--json]\n" +
+          "  tps flair probe [--json]",
+  tui: "Usage: tps tui [--agent <id>] [--repo <owner/name>]",
+  ui: "Usage: tps tui [--agent <id>] [--repo <owner/name>]",
+  pulse: "Usage: tps pulse [start|status|list] [--json] [--dry-run] [--interval <seconds>] [--repo <owner/name>]",
+};
+
+/** `--` ends TPS help detection; option values and command tails are data. */
+function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: string[] } {
+  const parsed: string[] = [];
+  const values = new Set(Object.entries(FLAGS)
+    .filter(([, flag]) => flag.type !== "boolean")
+    .map(([name]) => `--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`));
+  const booleans = new Set(Object.entries(FLAGS)
+    .filter(([, flag]) => flag.type === "boolean")
+    .map(([name]) => `--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`));
+  const positionals: string[] = [];
+  let requested = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const [cmd, action] = positionals;
+    if (arg === "--") {
+      parsed.push(...argv.slice(i));
+      break;
+    }
+    if ((cmd === "secrets-guard" && !arg.startsWith("-")) || (cmd === "office" && action === "exec" && positionals.length === 3)) {
+      parsed.push("--", ...argv.slice(i));
+      break;
+    }
+    if ((cmd === "mail" && action === "watch" && arg === "--exec") ||
+        (cmd === "agent" && action === "run" && arg === "--message")) {
+      parsed.push(arg, "--", ...argv.slice(i + 1));
+      break;
+    }
+    parsed.push(arg);
+    if (arg === "--help" || arg === "-h") {
+      requested = true;
+      continue;
+    }
+    const rawValue = RAW_VALUE_FLAGS[cmd ?? ""]?.some((name) => arg === `--${name}`);
+    const author = cmd === "agent" && action === "commit" && arg === "--author";
+    const branch = cmd === "agent" && action === "commit" && arg === "--branch";
+    if (values.has(arg) || rawValue || author || branch || (cmd === "secrets" && arg === "-n")) {
+      if (argv[i + 1] === "--") {
+        parsed.push(...argv.slice(i + 1));
+        break;
+      }
+      if (!author && (argv[i + 1] === "-h" || argv[i + 1] === "--help")) {
+        parsed[parsed.length - 1] = `${arg}=${argv[i + 1]}`;
+      } else {
+        parsed.push(...argv.slice(i + 1, i + (author ? 3 : 2)));
+      }
+      i += author ? 2 : 1;
+    } else if (booleans.has(arg)) {
+      if (argv[i + 1] === "true" || argv[i + 1] === "false") parsed.push(argv[++i]);
+    } else if (arg.startsWith("-") && !arg.startsWith("--no-") && !arg.includes("=") &&
+               argv[i + 1] && !argv[i + 1].startsWith("-")) {
+      parsed.push(argv[++i]);
+    } else if (!arg.startsWith("-")) {
+      positionals.push(arg);
+    }
+  }
+  return { requested, argv: parsed };
+}
+
 async function main() {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
     // Version is injected at build time to avoid runtime package.json reads,
@@ -254,6 +427,11 @@ async function main() {
     // INJECTED_VERSION is replaced by the build script with the actual semver.
     const version = typeof INJECTED_VERSION !== "undefined" ? INJECTED_VERSION : "dev";
     console.log(version);
+    return;
+  }
+
+  if (helpArgs.requested) {
+    console.log(USAGE[command ?? ""] ?? cli.help);
     return;
   }
 
@@ -276,7 +454,7 @@ async function main() {
       const reportPath = rest[0];
       if (!reportPath) {
         console.error(
-          "I'm gonna need you to specify a TPS report file or persona.\n\n  tps hire <report.tps | persona> [--name Name]\n\nBuilt-in personas: developer, designer, support, ea, ops, strategy"
+          "I'm gonna need you to specify a TPS report file or persona.\n\n  tps hire <report.tps | persona> [--name Name]\n\nBuilt-in personas: developer, designer, support, ea, ops, strategy, security"
         );
         process.exit(1);
       }
@@ -369,7 +547,6 @@ async function main() {
           "  tps agent health --id <agent-id>\n" +
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
-          "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent commit --repo <path> --branch <name> --message <msg> --author <name> <email> [--path <f>] [--push] [--pr-title <t>] [--ack-scope-expansion] [--scope-warn-threshold <factor>]",
         );
         process.exit(1);
@@ -731,11 +908,11 @@ async function main() {
     case "mail": {
       const action = rest[0] as "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc" | undefined;
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
-      if (cli.flags.help || !action || !validMailActions.includes(action)) {
+      if (!action || !validMailActions.includes(action)) {
         console.log(
           "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
-        process.exit(cli.flags.help ? 0 : 1);
+        process.exit(1);
       }
 
       const getFlag = (name: string): string | undefined => {
@@ -886,15 +1063,15 @@ async function main() {
         console.error([
           "Usage:",
           "  tps secrets set <KEY>=<VALUE>",
-          "  tps secrets list [--owner <id>] [--scope <s>] [--type <t>] [--stale-only] [--expires-within <d>] [--json]",
+          "  tps secrets list [--json]",
           "  tps secrets remove <KEY>",
           "  tps secrets show <name> [--json]",
           "  tps secrets emit <name>",
-          "  tps secrets register <name> --path <p> --type <t> --owner <o> [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
+          "  tps secrets register <name> --path <p> [--cred-type <t>] [--owner <o>] [--scope <s>] [--expires <iso>] [--sensitivity <level>]",
           "  tps secrets unregister <name>",
-          "  tps secrets adopt [--dry-run] [--apply] [--non-interactive] [--secrets-dir <dir>] [--keys-dir <dir>]",
+          "  tps secrets adopt [--apply] [--non-interactive] [--secrets-dir <dir>] [--identity-dir <dir>] [--flair-keys-dir <dir>]",
           "  tps secrets adopt <path-or-name>  (single candidate)",
-          "  tps secrets verify [--scope <s>] [--type <t>] [--fix] [--fail-on-drift] [--json]",
+          "  tps secrets verify [--scope <s>] [--cred-type <t>] [--fix] [--fail-on-drift] [--json]",
           "  tps secrets scan [--root <path>] [--json]",
           "  tps secrets rotate-github-pat <agent>     (reads token from stdin/pipe; never on argv)",
           "  tps secrets list-github-pats              (probes all PATs + keyring entries)",
@@ -1073,7 +1250,7 @@ async function main() {
           "  tps facts show <name> [--json]",
           "  tps facts get <name> [--no-verify] [--verify-preview] [--json]",
           "  tps facts verify [--scope <s>] [--fail-on-drift]",
-          "  tps facts register <name> --command <cmd> --args <json-array> --type <t> [--ttl <ttl>] [--scope <s>] --rationale <text>",
+          "  tps facts register <name> --command <cmd> --args <json-array> --cred-type <t> [--schedule <ttl>] [--scope <s>] --reason <text>",
           "  tps facts unregister <name>",
           "  tps facts init [--strict] [--json]",
           "  tps facts refresh [--strict] [--json]",
@@ -1127,11 +1304,11 @@ async function main() {
     case "gal": {
       const action = rest[0] as "list" | "set" | "remove" | "sync" | undefined;
       const valid = ["list", "set", "remove", "sync"];
-      if (cli.flags.help || !action || !valid.includes(action)) {
+      if (!action || !valid.includes(action)) {
         console.log(
           "Usage:\n  tps gal list                      List all GAL entries\n  tps gal set <agentId> <branchId>  Map agent name → branch ID\n  tps gal remove <agentId>          Remove a GAL entry\n  tps gal sync                      Seed GAL from branch-office registrations"
         );
-        process.exit(cli.flags.help ? 0 : 1);
+        process.exit(1);
       }
       const { runGal } = await import("../src/commands/gal.js");
       runGal({
