@@ -247,18 +247,22 @@ describe("mail utils", () => {
 
     // Plant a 60-day-old entry in cur/
     const oldFile = join(inbox.cur, "ancient.json");
-    writeFileSync(oldFile, JSON.stringify({ id: "ancient", from: "anvil", to: "kern", body: "x", timestamp: new Date().toISOString() }));
+    const oldBytes = JSON.stringify({ id: "ancient", from: "anvil", to: "kern", body: signedBody("anvil", "kern", "x"), timestamp: new Date().toISOString() });
+    writeFileSync(oldFile, oldBytes);
     const sixtyDaysAgo = new Date(Date.now() - 60 * 86_400_000);
     utimesSync(oldFile, sixtyDaysAgo, sixtyDaysAgo);
 
     // Send a new signed msg + check — should trigger auto-archive
     sendMessage("kern", signedBody("flint", "kern", "fresh"), "flint");
-    await checkMessages("kern");
+    const checked = await checkMessages("kern");
+    expect(checked.map((m) => m.body)).toEqual(["fresh"]);
 
     // Ancient should be archived, fresh should be in cur/
     const curContents = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
     expect(curContents).not.toContain("ancient.json");
     expect(curContents.length).toBe(1); // just the freshly-checked one
+    const month = `${sixtyDaysAgo.getUTCFullYear()}-${String(sixtyDaysAgo.getUTCMonth() + 1).padStart(2, "0")}`;
+    expect(readFileSync(join(inbox.root, "archive", month, "ancient.json"), "utf-8")).toBe(oldBytes);
   });
 });
 

@@ -59,7 +59,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, mailRootForRecordPath, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -618,19 +618,11 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
   return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
-/**
- * Patch a mail record in place. Used to ack/nack a message that the shared
- * promote() enforcement point has already moved new/ → cur/. The promotion
- * itself is atomic inside promote() (new/ → tmp/ → cur/); this only enriches
- * the cur/ record after dispatch, so a crash here cannot replay a message.
- */
-function patchMailFile(path: string, patch: Partial<TpsMailBody>): void {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>): boolean {
   try {
-    const current = readMailFile(path);
-    if (!current) return;
-    writeFileSync(path, JSON.stringify({ ...current, ...patch }, null, 2), "utf-8");
+    return updateExistingRecord<TpsMailBody>(path, (current) => Object.assign(current, patch)).status === "updated";
   } catch {
-    // best effort — don't crash the watcher on state-transition errors
+    return false;
   }
 }
 
