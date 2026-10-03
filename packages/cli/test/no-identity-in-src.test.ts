@@ -27,6 +27,16 @@ const ALLOWLIST: AllowEntry[] = [
   { file: "bin/tps.ts", literal: '"pulse"', context: 'case "pulse": {', reason: "command dispatch" },
 ];
 
+// cli#499 — branch and memory resolve their identity from configuration and
+// refuse by name when none is set; neither may fall back to an identity. The
+// fallback expressions that were removed are pinned here, so re-adding one turns
+// this guard red. (Known-id literals are already covered by the ALLOWLIST scan
+// above.)
+const IDENTITY_FALLBACKS: { file: string; pattern: RegExp; fallback: string }[] = [
+  { file: "src/commands/branch.ts", pattern: /hostname\(\)\.split\(/, fallback: 'hostname().split(".")[0]' },
+  { file: "src/commands/memory.ts", pattern: /"admin"/, fallback: '"admin"' },
+];
+
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir).flatMap((name) => {
     const path = join(dir, name);
@@ -74,5 +84,21 @@ describe("known identity literals (cli#397)", () => {
   });
   test("all known ids, including manifest agents, are detected in bin", () => {
     for (const id of IDS) expect(offenders("bin/probe.ts", `const regression = ${JSON.stringify(id)};`)).toHaveLength(1);
+  });
+});
+
+describe("no identity fallback in branch and memory (cli#499)", () => {
+  test("coverage pins exactly the two covered files", () => {
+    expect(IDENTITY_FALLBACKS.map((e) => e.file)).toEqual(["src/commands/branch.ts", "src/commands/memory.ts"]);
+  });
+  test("each covered file resolves its identity without a fallback", () => {
+    for (const { file, pattern } of IDENTITY_FALLBACKS) {
+      expect(pattern.test(readFileSync(join(CLI, file), "utf8"))).toBe(false);
+    }
+  });
+  test("each fallback pattern matches the expression it guards", () => {
+    for (const { pattern, fallback } of IDENTITY_FALLBACKS) {
+      expect(pattern.test(`const id = ${fallback};`)).toBe(true);
+    }
   });
 });

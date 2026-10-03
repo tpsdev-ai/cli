@@ -14,6 +14,7 @@
  */
 
 import { createFlairClient, defaultFlairKeyPath, type Memory } from "../utils/flair-client.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface MemoryArgs {
   action: "review" | "approve" | "reject" | "archive" | "unarchive" | "purge" | "list" | "show" | "search";
@@ -43,9 +44,10 @@ function formatMemoryRow(m: Memory): string {
 export async function runMemory(args: MemoryArgs): Promise<void> {
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
 
-  // For governance ops (approve/reject/archive/purge) the admin authenticates as themselves
-  // The agentId used for signing is the CLI operator's configured agent (default: from env)
-  const operatorId = process.env.TPS_AGENT_ID ?? args.agentId ?? "admin";
+  // For governance ops (approve/reject/archive/purge) the admin authenticates as themselves.
+  // The signing identity is the CLI operator's configured agent (TPS_AGENT_ID, or
+  // the explicit agentId); with neither, refuse by name (cli#499).
+  const operatorId = requireLocalAgentId("memory operator id", process.env.TPS_AGENT_ID ?? args.agentId);
   const flair = createFlairClient(operatorId, flairUrl, args.keyPath ?? defaultFlairKeyPath(operatorId));
 
   switch (args.action) {
