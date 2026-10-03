@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
-    command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts
+    command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts packages/cli/test/runtime-attested-launch.test.ts
     user: tps
     working_dir: /app
     environment:

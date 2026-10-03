@@ -3,9 +3,9 @@
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { cliEnv, makeSandbox, type Sandbox } from "./helpers/runtime-launch-fixture.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const NODE =
@@ -13,7 +13,6 @@ const NODE =
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
 const SANDBOX_REQUIRED = "--sandbox-required";
 const NONO_BIN_ENV = "NONO_BIN";
-const TIMEOUT_ENV = "TPS_LAUNCH_TIMEOUT_MS";
 const RUNTIMES = ["claude-code", "codex", "gemini"] as const;
 
 const startup = {
@@ -28,59 +27,6 @@ setDefaultTimeout(60_000);
 beforeAll(() => {
   if (!existsSync(TPS_BIN)) throw new Error(`tps binary not found at ${TPS_BIN}. Run 'bun run build' first.`);
 });
-
-interface Sandbox {
-  root: string;
-  home: string;
-  tmp: string;
-  ws: string;
-  nonoDir: string;
-  nonoLog: string;
-}
-
-/** A fixture HOME (agent.yaml, mail, identity, JSON profile pair) + a nono dir. */
-function seedHome(home: string, ws: string): void {
-  const agentDir = join(home, ".tps", "agents", "probe");
-  const profileDir = join(home, ".config", "nono", "profiles");
-  for (const d of [agentDir, profileDir, join(home, ".tps", "mail"), join(home, ".tps", "identity")]) {
-    mkdirSync(d, { recursive: true });
-  }
-  const base = {
-    $schema: "https://nono.sh/schemas/nono-profile.schema.json",
-    meta: { name: "tps-base-fixture" },
-    workdir: { access: "readwrite" },
-    filesystem: { read: ["/usr", "/bin", "/lib", "/lib64"], deny: [] },
-  };
-  const run = {
-    $schema: "https://nono.sh/schemas/nono-profile.schema.json",
-    extends: "tps-base-fixture",
-    meta: { name: "tps-agent-run" },
-    workdir: { access: "readwrite" },
-  };
-  writeFileSync(join(profileDir, "tps-base-fixture.json"), JSON.stringify(base, null, 2));
-  writeFileSync(join(profileDir, "tps-agent-run.json"), JSON.stringify(run, null, 2));
-  writeFileSync(
-    join(agentDir, "agent.yaml"),
-    `agentId: probe\nname: probe\nworkspace: ${ws}\n` +
-      `mailDir: ${join(home, ".tps", "mail")}\n` +
-      `memoryPath: ${join(agentDir, "memory.jsonl")}\n` +
-      `llm:\n  provider: ollama\n  model: probe-model\n`
-  );
-  writeFileSync(join(home, ".tps", "identity", "probe.key"), "fixture-key\n");
-  writeFileSync(join(home, ".tps", "identity", "probe.pub"), "fixture-pub\n");
-}
-
-function makeSandbox(): Sandbox {
-  const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
-  const root = mkdtempSync(join(base, "tps-363-rt-"));
-  const home = join(root, "home");
-  const tmp = join(root, "tmp");
-  const ws = join(root, "ws");
-  const nonoDir = join(root, "nono");
-  for (const d of [home, tmp, ws, nonoDir]) mkdirSync(d, { recursive: true });
-  seedHome(home, ws);
-  return { root, home, tmp, ws, nonoDir, nonoLog: join(root, "nono.log") };
-}
 
 /** Simulates canary denial and a session record; provides no sandbox. */
 const CANARY_FAKE_NONO = `#!/usr/bin/env bash
@@ -115,22 +61,6 @@ function writeFakeNono(sb: Sandbox, script: string): string {
   writeFileSync(path, script);
   chmodSync(path, 0o755);
   return path;
-}
-
-function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Record<string, string> {
-  const base: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    HOME: "../home",
-    SNOOPLOGG: "tps:agent*",
-    TMPDIR: sb.tmp,
-    FAKE_NONO_LOG: sb.nonoLog,
-    [TIMEOUT_ENV]: "8000",
-  };
-  for (const [k, v] of Object.entries(extra)) {
-    if (v === undefined) delete base[k];
-    else base[k] = v;
-  }
-  return base;
 }
 
 /** ARGV lines the fake nono logged for a `run` (the launcher's spawn). */
@@ -590,9 +520,7 @@ for (const rt of RUNTIMES) {
 
 /**
  * Run the launcher for a selected runtime in a non-TTY context (the attested
- * path) with a dummy nono, so the ONLY control that can refuse is the
- * credential guard. Without the extra directory the launcher would proceed to
- * the attested launch.
+ * path) with a dummy nono.
  */
 function runtimeDirProbe(sb: Sandbox, rt: string, extraEnv: Record<string, string | undefined>) {
   const bin = writeFakeNono(sb, "#!/usr/bin/env bash\nexit 0\n");
@@ -651,7 +579,7 @@ describe("cli#483 — a custom runtime directory overlapping a credential root i
   });
 });
 
-describe("cli#483 — an unrelated runtime directory still launches", () => {
+real("cli#483 — an unrelated runtime directory still launches", () => {
   test("claude-code: an unrelated CLAUDE_CONFIG_DIR is released and starts its runner", async () => {
     const sb = makeSandbox();
     try {
@@ -664,8 +592,8 @@ describe("cli#483 — an unrelated runtime directory still launches", () => {
         (t) => t.includes(startup["claude-code"]),
         30_000,
       );
-      expect(stopped).toBe(true);
       expect(text).toContain(startup["claude-code"]);
+      expect(stopped).toBe(true);
       expect(text).not.toContain("overlaps the TPS credential root");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });

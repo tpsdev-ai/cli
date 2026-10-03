@@ -466,7 +466,11 @@ export function runtimeDirCredentialRefusal(
     if (root) {
       return (
         `${grant.label} (${grant.path}) overlaps the TPS credential root ${root.label} (${root.path}) — ` +
-        `refusing to hand the runtime a sandbox with read-write access to a credential root`
+        (grant.label === "the current-directory grant"
+          ? `launch from a workspace directory outside the credential roots`
+          : grant.label === "the workdir grant"
+            ? `set the workspace to a directory outside the credential roots`
+            : `remove or narrow this grant to a directory outside the credential roots`)
       );
     }
     const foreign = foreignFiles.find((f) => pathContainsOrEquals(canon, f.canon));

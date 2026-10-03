@@ -13,7 +13,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import * as nono from "../src/utils/nono.js";
+import { cliEnv, makeSandbox } from "./helpers/runtime-launch-fixture.js";
 
 interface Grants {
   workdir?: string;
@@ -131,6 +133,43 @@ describe("cli#483 — the codex and gemini directory variables are checked the s
 });
 
 describe("cli#483 — every inherited launch grant is checked the same way", () => {
+  for (const fromHome of [false, true]) {
+    test(`the positive fixture reaches attestation only from its workspace (fromHome=${fromHome})`, () => {
+      const sb = makeSandbox();
+      try {
+        const custom = join(sb.root, "claude-custom");
+        const r = spawnSync(process.execPath, [join(import.meta.dir, "helpers/runtime-dir-launch-driver.ts")], {
+          cwd: fromHome ? sb.home : sb.ws,
+          env: cliEnv(sb, { HOME: fromHome ? sb.home : "../home", CLAUDE_CONFIG_DIR: custom }),
+          encoding: "utf8", timeout: 10_000,
+        });
+        const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+        expect(r.error).toBeUndefined();
+        expect(r.status, text).toBe(fromHome ? 78 : 0);
+        if (fromHome) {
+          expect(text).toContain(`current-directory grant (${sb.home})`);
+          expect(text).toContain(`~/.tps/auth (${join(sb.home, ".tps", "auth")})`);
+          expect(text).toContain("launch from a workspace directory outside the credential roots");
+          expect(text).not.toContain("HANDOFF ");
+        } else {
+          const line = text.split("\n").find((l) => l.startsWith("HANDOFF "));
+          expect(line, text).toBeDefined();
+          const handoff = JSON.parse(line!.slice(8));
+          expect(handoff.profile).toBe("tps-agent-run-claude-code");
+          expect(handoff.cwd).toBe(sb.ws);
+          expect(handoff.options.workdir).toBe(sb.ws);
+          expect(handoff.options.allow).toContain(custom);
+          expect(handoff.options.read.length).toBeGreaterThan(0);
+          expect(handoff.cmd.slice(-2)).toEqual(["--runtime", "claude-code"]);
+          expect(handoff.cmd).toContain("--sandboxed");
+          expect(handoff.cmd).toContain("--sandbox-required");
+        }
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   test("a current-directory grant inside a credential root is refused", () => {
     const home = makeHome();
     const reason = refusal("claude-code", { cwd: join(home, ".tps", "auth") }, envFor(home));
