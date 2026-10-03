@@ -12,6 +12,7 @@
  */
 
 import { createFlairClient } from "../utils/flair-client.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
@@ -36,7 +37,7 @@ export async function runFlairHealth(opts: {
   flairKeyPath?: string;
   verbose?: boolean;
 }): Promise<void> {
-  const agentId  = opts.agentId    ?? process.env.TPS_AGENT_ID ?? "anvil";
+  const agentId  = requireLocalAgentId("agent id", opts.agentId);
   const flairUrl = opts.flairUrl   ?? process.env.FLAIR_URL    ?? "http://127.0.0.1:9926";
   const keyPath  = opts.flairKeyPath ?? process.env.FLAIR_KEY_PATH ?? defaultKeyPath(agentId);
 

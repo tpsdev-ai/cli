@@ -754,3 +754,46 @@ describe("mail send failure resilience", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// pulse identity (cli#397)
+//
+// pulse runs under its own principal and never sends mail as another agent.
+// mergeAuthority and ghAgent come from configuration; with neither set, the
+// feature that needs it refuses with a named error rather than falling back
+// to a person's id.
+// ---------------------------------------------------------------------------
+
+describe("pulse identity (cli#397)", () => {
+  test("notification mail is signed as pulse, never as the gh agent", () => {
+    const config = makeConfig({ ghAgent: "some-gh-agent" });
+    const { calls, sender } = trackMails();
+    const instance = makeInstance({ state: "reviewing" });
+
+    handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender);
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].agentId).toBe("pulse");
+  });
+
+  test("handleTransition refuses a merge-ready mail with no mergeAuthority", () => {
+    const config = makeConfig();
+    delete config.mergeAuthority;
+    const { sender } = trackMails();
+    const instance = makeInstance({ state: "reviewing" });
+
+    expect(() =>
+      handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender),
+    ).toThrow(/merge authority/);
+  });
+
+  test("pollOnce refuses to poll with no ghAgent", () => {
+    const config = makeConfig();
+    delete config.ghAgent;
+    const state = makeState();
+    const runner: SyncRunner = () =>
+      ({ status: 0, stdout: "[]", stderr: "" }) as ReturnType<SyncRunner>;
+
+    expect(() => pollOnce(config, state, runner, () => {})).toThrow(/gh agent/);
+  });
+});

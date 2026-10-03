@@ -50,12 +50,17 @@ export interface PulseState {
 export interface PulseConfig {
   repos: string[];
   reviewers: string[];
-  mergeAuthority: string;
-  author: string;
-  human: string;
+  /** Who receives merge-ready and escalation mail. Configured; unset ⇒ the
+   *  notification refuses (named error), never a hardcoded person. */
+  mergeAuthority?: string;
+  /** The PR author's mail id. Configured; unset ⇒ the transition mail refuses. */
+  author?: string;
+  human?: string;
   pollIntervalMs: number;
   remindAfterMs: number;
-  ghAgent: string;
+  /** gh-as identity used to read the GitHub API. Configured; unset ⇒ pulse
+   *  refuses to poll rather than act as a hardcoded agent. */
+  ghAgent?: string;
   pruneAfterDays: number;
   flairUrl?: string;
   flairAgentId?: string;
@@ -83,17 +88,45 @@ export type FlairPublisher = (
 // Defaults
 // ---------------------------------------------------------------------------
 
+/** pulse's own mail principal. pulse signs its notifications as itself and
+ * never as another agent (cli#397). */
+export const PULSE_AGENT_ID = "pulse";
+
 const DEFAULT_CONFIG: PulseConfig = {
   repos: ["tpsdev-ai/cli", "tpsdev-ai/flair"],
-  reviewers: ["sherlock", "kern"],
-  mergeAuthority: "flint",
-  author: "anvil",
-  human: "nathan",
+  reviewers: [],
   pollIntervalMs: 120000,
   remindAfterMs: 1800000,
-  ghAgent: "flint",
   pruneAfterDays: 7,
 };
+
+/** Refuse (named error) when a needed identity value is not configured. */
+function requireMergeAuthority(config: PulseConfig): string {
+  if (!config.mergeAuthority) {
+    throw new Error(
+      "pulse: no merge authority configured — set \"mergeAuthority\" in ~/.tps/pulse/config.json",
+    );
+  }
+  return config.mergeAuthority;
+}
+
+function requireAuthor(config: PulseConfig): string {
+  if (!config.author) {
+    throw new Error(
+      "pulse: no author configured — set \"author\" in ~/.tps/pulse/config.json",
+    );
+  }
+  return config.author;
+}
+
+function requireGhAgent(config: PulseConfig): string {
+  if (!config.ghAgent) {
+    throw new Error(
+      "pulse: no gh agent configured — set \"ghAgent\" in ~/.tps/pulse/config.json",
+    );
+  }
+  return config.ghAgent;
+}
 
 function pulseDir(): string {
   return join(homeDir(), ".tps", "pulse");
@@ -205,7 +238,7 @@ export function defaultMailSender(to: string, body: string, agentId: string): vo
 function sendMail(to: string, body: string, config: PulseConfig, sender: MailSender): void {
   console.log(`[pulse] mail → ${to}: ${body.slice(0, 80)}…`);
   try {
-    const result = sender(to, body, config.ghAgent);
+    const result = sender(to, body, PULSE_AGENT_ID);
     if (result instanceof Promise) {
       // Async sender — race against timeout so one hung delivery cannot
       // wedge the daemon.
@@ -317,7 +350,7 @@ export function handleTransition(
     }
     case "changes-requested": {
       sendMail(
-        config.author,
+        requireAuthor(config),
         `Changes requested on PR #${instance.prNumber} (${instance.repo}): ${instance.title}`,
         config,
         sender,
@@ -340,7 +373,7 @@ export function handleTransition(
     }
     case "approved": {
       sendMail(
-        config.mergeAuthority,
+        requireMergeAuthority(config),
         `PR #${instance.prNumber} is merge-ready: ${instance.title} (${instance.repo})`,
         config,
         sender,
@@ -349,7 +382,7 @@ export function handleTransition(
     }
     case "merged": {
       sendMail(
-        config.author,
+        requireAuthor(config),
         `PR #${instance.prNumber} merged: ${instance.title} (${instance.repo})`,
         config,
         sender,
@@ -402,7 +435,7 @@ export function checkReminders(
 
     if (elapsed >= (2 * config.remindAfterMs) && !instance.escalatedAt) {
       sendMail(
-        config.mergeAuthority,
+        requireMergeAuthority(config),
         `ESCALATE: PR #${instance.prNumber} has no review after 60 min. Repo: ${instance.repo}. Missing: ${pending.join(", ")}`,
         config,
         sender,
@@ -427,11 +460,12 @@ export function pollOnce(
   const pollStartedAt = new Date().toISOString();
   const now = new Date().toISOString();
   const pendingReviews: Record<string, string[]> = {};
+  const ghAgent = requireGhAgent(config);
 
   for (const repo of config.repos) {
     let prs: GhPr[];
     try {
-      prs = ghApi(`repos/${repo}/pulls?state=open&sort=updated`, config.ghAgent, runner) as GhPr[];
+      prs = ghApi(`repos/${repo}/pulls?state=open&sort=updated`, ghAgent, runner) as GhPr[];
     } catch (e: unknown) {
       console.warn(`[pulse] Failed to fetch PRs for ${repo}: ${(e as Error).message}`);
       continue;
@@ -446,7 +480,7 @@ export function pollOnce(
       const key = `pr:${repo}#${pr.number}`;
       let reviews: GhReview[];
       try {
-        reviews = ghApi(`repos/${repo}/pulls/${pr.number}/reviews`, config.ghAgent, runner) as GhReview[];
+        reviews = ghApi(`repos/${repo}/pulls/${pr.number}/reviews`, ghAgent, runner) as GhReview[];
       } catch (e: unknown) {
         console.warn(`[pulse] Failed to fetch reviews for ${key}: ${(e as Error).message}`);
         continue;
@@ -464,7 +498,7 @@ export function pollOnce(
       let ciGreen = false;
       if (pr.head?.sha) {
         try {
-          const status = ghApi(`repos/${repo}/commits/${pr.head.sha}/status`, config.ghAgent, runner) as GhCommitStatus;
+          const status = ghApi(`repos/${repo}/commits/${pr.head.sha}/status`, ghAgent, runner) as GhCommitStatus;
           ciGreen = status.state === "success";
         } catch {
           ciGreen = false;
@@ -530,7 +564,7 @@ export function pollOnce(
       }
       if (instance.state === "approved" && ciGreen && !instance.mergeReadyNotifiedAt) {
         sendMail(
-          config.mergeAuthority,
+          requireMergeAuthority(config),
           `MERGE READY: PR #${instance.prNumber} — all reviews in, CI green. Repo: ${instance.repo}`,
           config,
           sender,
@@ -546,7 +580,7 @@ export function pollOnce(
       if (openNumbers.has(inst.prNumber)) continue;
       // PR is no longer open — check if merged
       try {
-        const prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, config.ghAgent, runner) as GhPr;
+        const prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, ghAgent, runner) as GhPr;
         if (prData.merged_at) {
           handleTransition(key, inst, "merged", config, sender, publisher);
         }
@@ -712,6 +746,14 @@ export async function runPulse(args: PulseArgs): Promise<void> {
       }
       if (args.interval) {
         config.pollIntervalMs = args.interval * 1000;
+      }
+      try {
+        requireGhAgent(config);
+        requireMergeAuthority(config);
+        requireAuthor(config);
+      } catch (e: unknown) {
+        console.error((e as Error).message);
+        process.exit(1);
       }
       const state = loadState();
       await startPollLoop(config, state, { dryRun: args.dryRun });

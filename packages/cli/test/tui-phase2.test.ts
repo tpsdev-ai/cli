@@ -1,9 +1,12 @@
 /**
  * tui-phase2.test.ts — Unit tests for TUI Phase 2 interactive logic
  * ops-90
+ *
+ * Updated for cli#397: the TUI no longer approves or merges PRs, and its
+ * recipient list is configuration (the credentials manifest), not a
+ * hardcoded agent list.
  */
-import { describe, expect, it, mock, beforeEach, afterEach } from "bun:test";
-import { execSync } from "node:child_process";
+import { describe, expect, it } from "bun:test";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -13,9 +16,9 @@ function sendMailAction(
   to: string,
   body: string,
   execFn: (cmd: string) => void,
+  knownAgents: string[] = [],
 ): { ok: boolean; err?: string } {
-  const KNOWN_AGENTS = ["flint", "anvil", "ember", "kern", "sherlock"];
-  if (!KNOWN_AGENTS.includes(to)) {
+  if (!knownAgents.includes(to)) {
     return { ok: false, err: `Unknown agent: ${to}` };
   }
   if (!body.trim()) {
@@ -59,34 +62,42 @@ function transitionCompose(
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 describe("sendMailAction", () => {
-  it("rejects unknown agent", () => {
-    const result = sendMailAction("anvil", "badbot", "hello", () => {});
+  const known = ["alice", "bob"];
+
+  it("rejects an unknown agent", () => {
+    const result = sendMailAction("carol", "stranger", "hello", () => {}, known);
+    expect(result.ok).toBe(false);
+    expect(result.err).toContain("Unknown agent");
+  });
+
+  it("rejects an empty recipient list (unconfigured)", () => {
+    const result = sendMailAction("carol", "alice", "hello", () => {});
     expect(result.ok).toBe(false);
     expect(result.err).toContain("Unknown agent");
   });
 
   it("rejects empty body", () => {
-    const result = sendMailAction("anvil", "flint", "   ", () => {});
+    const result = sendMailAction("carol", "alice", "   ", () => {}, known);
     expect(result.ok).toBe(false);
     expect(result.err).toContain("empty");
   });
 
   it("returns ok on successful exec", () => {
-    const result = sendMailAction("anvil", "flint", "hello", () => {});
+    const result = sendMailAction("carol", "alice", "hello", () => {}, known);
     expect(result.ok).toBe(true);
   });
 
   it("returns error on exec failure", () => {
-    const result = sendMailAction("anvil", "kern", "test", () => {
+    const result = sendMailAction("carol", "bob", "test", () => {
       throw new Error("mail daemon unavailable");
-    });
+    }, known);
     expect(result.ok).toBe(false);
     expect(result.err).toContain("mail daemon unavailable");
   });
 
-  it("accepts all known agents", () => {
-    for (const agent of ["flint", "anvil", "ember", "kern", "sherlock"]) {
-      const result = sendMailAction("anvil", agent, "ping", () => {});
+  it("accepts every configured agent", () => {
+    for (const agent of known) {
+      const result = sendMailAction("carol", agent, "ping", () => {}, known);
       expect(result.ok).toBe(true);
     }
   });
@@ -136,54 +147,5 @@ describe("compose state machine", () => {
   it("ignores irrelevant events in idle", () => {
     expect(transitionCompose("idle", "submit_ok")).toBe("idle");
     expect(transitionCompose("idle", "dismiss")).toBe("idle");
-  });
-});
-
-describe("PR action confirmation", () => {
-  /** Mirrors PR action flow. */
-  function prActionFlow(
-    action: "approve" | "merge",
-    userInput: "y" | "n",
-    execFn: (cmd: string) => void,
-  ): { confirmed: boolean; ok?: boolean; err?: string } {
-    if (userInput === "n") return { confirmed: false };
-    try {
-      const cmd = action === "approve"
-        ? `gh-as flint pr review 42 --repo tpsdev-ai/cli --approve`
-        : `gh-as flint pr merge 42 --repo tpsdev-ai/cli --squash --delete-branch`;
-      execFn(cmd);
-      return { confirmed: true, ok: true };
-    } catch (e: unknown) {
-      return { confirmed: true, ok: false, err: (e as Error).message?.slice(0, 80) };
-    }
-  }
-
-  it("n input skips exec", () => {
-    let called = false;
-    const result = prActionFlow("approve", "n", () => { called = true; });
-    expect(result.confirmed).toBe(false);
-    expect(called).toBe(false);
-  });
-
-  it("y input runs approve", () => {
-    let cmd = "";
-    const result = prActionFlow("approve", "y", (c) => { cmd = c; });
-    expect(result.ok).toBe(true);
-    expect(cmd).toContain("--approve");
-  });
-
-  it("y input runs merge", () => {
-    let cmd = "";
-    const result = prActionFlow("merge", "y", (c) => { cmd = c; });
-    expect(result.ok).toBe(true);
-    expect(cmd).toContain("--squash");
-  });
-
-  it("exec error returns ok=false", () => {
-    const result = prActionFlow("merge", "y", () => {
-      throw new Error("PR not mergeable");
-    });
-    expect(result.ok).toBe(false);
-    expect(result.err).toContain("not mergeable");
   });
 });
