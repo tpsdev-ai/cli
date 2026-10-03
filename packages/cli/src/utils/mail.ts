@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, ftruncateSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -11,7 +11,7 @@ import {
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { acquireMailLock, type MailLock } from "./mail-lock.js";
+import { acquireMailLock, acquireMailLockSync, type MailLock } from "./mail-lock.js";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
@@ -184,13 +184,22 @@ function readMessageFile(path: string): MailMessage {
 
 function writeMessageFile(path: string, msg: MailMessage, existingOnly = false): void {
   if (existingOnly) {
-    const fd = openSync(path, "r+");
+    const lock = acquireMailLockSync(dirname(dirname(path)));
+    if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
+    const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+    let fd: number | undefined;
     try {
-      const data = JSON.stringify(msg, null, 2);
-      writeFileSync(fd, data, "utf-8");
-      ftruncateSync(fd, Buffer.byteLength(data));
-    } finally {
+      fd = openSync(scratchPath, "wx", 0o600);
+      writeFileSync(fd, JSON.stringify(msg, null, 2), "utf-8");
+      fsyncSync(fd);
       closeSync(fd);
+      fd = undefined;
+      statSync(path);
+      renameSync(scratchPath, path);
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }
+      try { rmSync(scratchPath, { force: true }); } catch {}
+      lock.release();
     }
     return;
   }

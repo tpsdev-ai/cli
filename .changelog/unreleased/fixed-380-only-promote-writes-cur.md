@@ -10,5 +10,5 @@
   and runs the same mailbox policy and consumed-id replay store as `promote()`,
   which now live in `@tpsdev-ai/agent`.
 
-  The source scan enumerates twelve sites, including MailClient's shared-policy
+  The source scan enumerates MailClient's shared-policy
   delivery, staging, updates, and the separate outbox and internal-mail stores.

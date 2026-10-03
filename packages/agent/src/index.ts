@@ -53,7 +53,7 @@ export {
   decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
 } from "./lib/mailbox-policy.js";
 export type { MailboxPolicyRejectClass, MailboxPolicyResult, ReplayStore } from "./lib/mailbox-policy.js";
-export { acquireMailLock, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
+export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
 export type { MailLock } from "./lib/mail-lock.js";
 export {
   KeyFormatError, AgentKeyError, AgentKeyConflictError,

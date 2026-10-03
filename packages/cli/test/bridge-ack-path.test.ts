@@ -92,19 +92,24 @@ test("an invalid wrapper id does not interfere with acknowledgement", async () =
   expect(fs.existsSync(path("cur"))).toBe(false);
 });
 
-test("an acknowledgement write failure after send does not resend on restart", async () => {
+test("a partial acknowledgement write failure preserves the sent record on restart", async () => {
   plant();
   const write = fs.writeFileSync;
   const running = start(() => {
     running.stop();
     faults.push(spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof write>) => {
-      if (JSON.parse(String(args[1])).ackedAt) throw new Error("ack write fault");
+      if (JSON.parse(String(args[1])).ackedAt) {
+        write(args[0], String(args[1]).slice(0, -1), "utf8");
+        throw new Error("partial ack write fault");
+      }
       return write(...args);
     }));
   });
   await waitFor(() => running.logs.some((line) => line.includes("fault")));
   expect(running.sent).toHaveLength(1);
   expect(record().bridgeSentAt).toEqual(expect.any(String));
+  expect(record().ackedAt).toBeUndefined();
+  expect(fs.readdirSync(path("cur", ""))).toEqual(["record.json"]);
   for (const fault of faults.splice(0)) fault.mockRestore();
   await restartWithoutResend();
   expect(running.logs.some((line) => line.includes("ack failed"))).toBe(true);
@@ -211,4 +216,48 @@ test("the persisted sent marker is absent until adapter send succeeds", async ()
   expect(duringSend).toBeDefined();
   expect(duringSend!.bridgeSendStartedAt).toBeUndefined();
   expect(duringSend!.bridgeSentAt).toBeUndefined();
+});
+
+for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "statSync"] as const) {
+  test(`an ack ${operation} failure leaves the original sent record intact`, () => {
+    const target = path("cur");
+    const original = JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" });
+    fs.writeFileSync(target, original);
+    const originalOperation = fs[operation] as (...args: any[]) => any;
+    let injected = false;
+    const fault = spyOn(fs, operation).mockImplementation(((...args: any[]) => {
+      const ackOperation = operation === "fsyncSync" || operation === "closeSync"
+        || (operation === "statSync" ? args[0] === target : String(args[0]).includes(".ack-"));
+      if (ackOperation && !injected) {
+        injected = true;
+        throw new Error(`${operation} fault`);
+      }
+      return originalOperation(...args);
+    }) as any);
+    faults.push(fault);
+    expect(() => mail.ackMessageAtPath(target)).toThrow(`${operation} fault`);
+    expect(injected).toBe(true);
+    expect(fs.readFileSync(target, "utf8")).toBe(original);
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).bridgeSentAt).toBe("sent");
+    expect(fs.readdirSync(path("cur", ""))).toEqual(["record.json"]);
+  });
+}
+
+test("ack holds the shared mail lock while checking for the existing record", () => {
+  const target = path("cur");
+  fs.writeFileSync(target, JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" }));
+  const stat = fs.statSync;
+  let checked = false;
+  faults.push(spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof stat>) => {
+    if (args[0] === target) {
+      checked = true;
+      expect(fs.existsSync(path(".mail-lock", "owner.json"))).toBe(true);
+      fs.unlinkSync(target);
+    }
+    return stat(...args);
+  }) as typeof stat));
+  expect(() => mail.ackMessageAtPath(target)).toThrow();
+  expect(checked).toBe(true);
+  expect(fs.existsSync(target)).toBe(false);
+  expect(fs.readdirSync(path("cur", ""))).toEqual([]);
 });

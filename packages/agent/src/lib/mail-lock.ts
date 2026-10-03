@@ -18,8 +18,7 @@
  *  - a stranded claim requires operator recovery;
  *  - release checks the acquisition nonce;
  *  - nested (re)acquisition in one process fails loudly rather than deadlocking;
- *  - failure to acquire returns null — callers MUST treat that as "do not
- *    proceed" (fail-closed), never as "proceed without the lock".
+ *  - contention timeout returns null; filesystem errors throw.
  *
  * The critical section a holder runs must be SYNCHRONOUS (no await while held):
  * the in-process reentrancy guard tracks a plain set, and an await inside the
@@ -180,6 +179,31 @@ export async function acquireMailLock(
   root: string,
   opts: { timeoutMs?: number; pollMs?: number } = {},
 ): Promise<MailLock | null> {
+  const attempt = mailLockAttempts(root, opts);
+  for (;;) {
+    const step = attempt.next();
+    if (step.done) return step.value;
+    await sleep(step.value);
+  }
+}
+
+export function acquireMailLockSync(
+  root: string,
+  opts: { timeoutMs?: number; pollMs?: number } = {},
+): MailLock | null {
+  const attempt = mailLockAttempts(root, opts);
+  const wait = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    const step = attempt.next();
+    if (step.done) return step.value;
+    Atomics.wait(wait, 0, 0, step.value);
+  }
+}
+
+function* mailLockAttempts(
+  root: string,
+  opts: { timeoutMs?: number; pollMs?: number },
+): Generator<number, MailLock | null, void> {
   const { timeoutMs = 2000, pollMs = 25 } = opts;
   const lockDir = mailLockPath(root);
 
@@ -244,7 +268,7 @@ export async function acquireMailLock(
       if (claimed) rmSync(claimDir, { recursive: true });
     }
     if (Date.now() >= deadline) return null;
-    await sleep(pollMs);
+    yield pollMs;
   }
 }
 

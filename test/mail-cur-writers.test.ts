@@ -37,6 +37,11 @@ const WRITE_CALLS: Record<string, Dest> = {
 const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why: string }> = [
   {
     file: "packages/cli/src/utils/mail.ts",
+    contains: "renameSync(scratchPath, path)",
+    why: "writeMessageFile existingOnly — fsynced replacement after an existence check under the mail lock; first delivery stays promote()'s",
+  },
+  {
+    file: "packages/cli/src/utils/mail.ts",
     contains: 'writeFileSync(path, JSON.stringify(msg, null, 2), "utf-8")',
     why: "writeMessageFile primitive — its call sites are enumerated below",
   },
@@ -70,7 +75,7 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why:
     file: "packages/cli/src/utils/mail.ts",
     contains: "writeMessageFile(path, msg, true)",
     followedBy: "; try { unlinkSync(path)",
-    why: "ackMessageAtPath — updates only the existing record at that path, then unlinks it",
+    why: "ackMessageAtPath — atomically replaces an existing record after a locked existence check, then unlinks it; first delivery stays promote()'s",
   },
   {
     file: "packages/cli/src/utils/mail.ts",
