@@ -1,7 +1,15 @@
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { tryAcquireMailLock } from "./mail-lock.js";
+
+export class OutboxLockError extends Error {
+  constructor(lockPath: string, cause: unknown) {
+    super(`OutboxLockError: ${lockPath}: ${(cause as Error).message}`, { cause });
+    this.name = "OutboxLockError";
+  }
+}
 
 export interface OutboxMessage {
   id: string;
@@ -15,12 +23,20 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): void {
+export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): "duplicate in progress" | void {
   if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
-  const lock = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
-  if (lock) mkdirSync(lock);
+  const lockPath = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
+  let lock;
+  if (lockPath) {
+    try {
+      lock = tryAcquireMailLock(lockPath);
+    } catch (error) {
+      throw new OutboxLockError(lockPath, error);
+    }
+    if (!lock) return "duplicate in progress";
+  }
   try {
     const id = deliveryId ?? randomUUID();
     const timestamp = new Date().toISOString();
@@ -41,7 +57,9 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
       renameSync(tmp, join(dir, filename));
     }
   } finally {
-    if (lock) rmdirSync(lock);
+    if (lock) {
+      try { lock.release(); } catch (error) { throw new OutboxLockError(lockPath!, error); }
+    }
   }
 }
 

@@ -214,7 +214,18 @@ export async function handleGithubWebhook(
   const deliveryId = typeof delivery === "string" && delivery
     ? createHash("sha256").update(delivery).digest("hex") : undefined;
   const queueMessage = deps.queueOutboxMessageImpl ?? queueOutboxMessage;
-  queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
+  try {
+    const result = queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
+    if (result === "duplicate in progress") {
+      res.statusCode = 200;
+      res.end(result);
+      return;
+    }
+  } catch (error) {
+    res.statusCode = 503;
+    res.end((error as Error).message);
+    return;
+  }
   await processGithubWebhookEvent(event, payload, deps, agentId);
   res.statusCode = 200;
   res.end("ok");

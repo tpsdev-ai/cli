@@ -75,8 +75,7 @@ describe("outbox", () => {
     const id = "a".repeat(64);
     const producers = Array.from({ length: 8 }, () => Bun.spawn([process.execPath, "-e", `
       import { queueOutboxMessage } from ${JSON.stringify(modulePath)};
-      try { queueOutboxMessage("host", "body", "github-webhook", ${JSON.stringify(id)}); }
-      catch (error) { if (error.code !== "EEXIST") throw error; }
+      queueOutboxMessage("host", "body", "github-webhook", ${JSON.stringify(id)});
     `], { env: process.env, stdout: "pipe", stderr: "pipe" }));
     const drainer = Bun.spawn([process.execPath, "-e", `
       import { drainOutbox } from ${JSON.stringify(modulePath)};
