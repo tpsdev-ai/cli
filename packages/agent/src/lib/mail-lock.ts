@@ -18,7 +18,7 @@
  *  - a stranded claim requires operator recovery;
  *  - release checks the acquisition nonce;
  *  - nested (re)acquisition in one process fails loudly rather than deadlocking;
- *  - contention timeout returns null; filesystem errors throw.
+ *  - an unreadable owner can cause a contention timeout returning null; other filesystem errors may throw.
  *
  * The critical section a holder runs must be SYNCHRONOUS (no await while held):
  * the in-process reentrancy guard tracks a plain set, and an await inside the

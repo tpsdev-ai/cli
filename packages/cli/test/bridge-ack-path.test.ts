@@ -261,3 +261,83 @@ test("ack holds the shared mail lock while checking for the existing record", ()
   expect(fs.existsSync(target)).toBe(false);
   expect(fs.readdirSync(path("cur", ""))).toEqual([]);
 });
+
+
+test("concurrent acknowledgements never recreate the removed cur record", async () => {
+  const target = path("cur");
+  fs.writeFileSync(target, JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" }));
+  const worker = join(root, "ack-worker.ts");
+  fs.writeFileSync(worker, `
+    import { spyOn } from "bun:test";
+    import * as fs from "node:fs";
+    import { join } from "node:path";
+    const [role, root, target, source] = process.argv.slice(2);
+    const signal = (name) => fs.writeFileSync(join(root, name), "ready");
+    const wait = (name) => {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(join(root, name))) {
+        if (Date.now() > deadline) throw new Error("barrier timeout: " + name);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      }
+    };
+    const unlink = fs.unlinkSync;
+    spyOn(fs, "unlinkSync").mockImplementation((file) => {
+      if (file !== target) return unlink(file);
+      if (role === "second") throw new Error("second cleanup fault");
+      signal("first-at-unlink");
+      wait("release-first");
+      unlink(file);
+      signal("removed");
+    });
+    if (role === "second") {
+      const read = fs.readFileSync;
+      spyOn(fs, "readFileSync").mockImplementation((...args) => {
+        const result = read(...args);
+        if (String(args[0]).endsWith(".mail-lock/owner.json") && JSON.parse(String(result)).pid !== process.pid)
+          signal("second-contended");
+        return result;
+      });
+      const stat = fs.statSync;
+      spyOn(fs, "statSync").mockImplementation((...args) => {
+        const result = stat(...args);
+        if (args[0] === target) { signal("second-checked"); wait("release-second"); }
+        return result;
+      });
+      const rename = fs.renameSync;
+      spyOn(fs, "renameSync").mockImplementation((from, to) => {
+        rename(from, to);
+        if (to === target && fs.existsSync(join(root, "removed"))) signal("recreated");
+      });
+    }
+    const { ackMessageAtPath } = await import(source);
+    try { ackMessageAtPath(target); signal(role + "-acked"); }
+    catch (error) {
+      if (role !== "second" || !String(error).includes("ENOENT")) throw error;
+      signal("second-missing");
+    }
+  `);
+  const children: ReturnType<typeof Bun.spawn>[] = [];
+  const spawn = (role: string) => {
+    const child = Bun.spawn([process.execPath, worker, role, root, target,
+      new URL("../src/utils/mail.ts", import.meta.url).href], { stdout: "pipe", stderr: "pipe" });
+    children.push(child);
+    return child;
+  };
+  try {
+    const first = spawn("first");
+    await waitFor(() => fs.existsSync(join(root, "first-at-unlink")));
+    const second = spawn("second");
+    await waitFor(() => ["second-checked", "second-contended"].some((name) => fs.existsSync(join(root, name))));
+    fs.writeFileSync(join(root, "release-first"), "ready");
+    expect(await first.exited).toBe(0);
+    expect(fs.existsSync(target)).toBe(false);
+    fs.writeFileSync(join(root, "release-second"), "ready");
+    expect(await second.exited).toBe(0);
+    expect(fs.existsSync(join(root, "recreated"))).toBe(false);
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.existsSync(join(root, "second-missing"))).toBe(true);
+  } finally {
+    for (const child of children) child.kill();
+    await Promise.all(children.map((child) => child.exited));
+  }
+});

@@ -182,9 +182,9 @@ function readMessageFile(path: string): MailMessage {
   }
 }
 
-function writeMessageFile(path: string, msg: MailMessage, existingOnly = false): void {
+function writeMessageFile(path: string, msg: MailMessage, existingOnly = false, heldLock?: MailLock): void {
   if (existingOnly) {
-    const lock = acquireMailLockSync(dirname(dirname(path)));
+    const lock = heldLock ?? acquireMailLockSync(dirname(dirname(path)));
     if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
     const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
     let fd: number | undefined;
@@ -199,7 +199,7 @@ function writeMessageFile(path: string, msg: MailMessage, existingOnly = false):
     } finally {
       if (fd !== undefined) { try { closeSync(fd); } catch {} }
       try { rmSync(scratchPath, { force: true }); } catch {}
-      lock.release();
+      if (!heldLock) lock.release();
     }
     return;
   }
@@ -1154,18 +1154,24 @@ export function setBridgeSentAtPath(path: string, sentAt: string): void {
 }
 
 export function ackMessageAtPath(path: string): MailMessage {
-  const msg = readMessageFile(path);
-  msg.read = true;
-  msg.ackedAt = new Date().toISOString();
-  delete msg.nackedAt;
-  delete msg.nackReason;
-  delete msg.nackType;
-  delete msg.checkedOutAt;
-  delete msg.checkedOutBy;
-  delete msg.retryAfter;
-  writeMessageFile(path, msg, true);
-  try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
-  return msg;
+  const lock = acquireMailLockSync(dirname(dirname(path)));
+  if (!lock) throw new Error(`mail lock contention timeout for ${path}`);
+  try {
+    const msg = readMessageFile(path);
+    msg.read = true;
+    msg.ackedAt = new Date().toISOString();
+    delete msg.nackedAt;
+    delete msg.nackReason;
+    delete msg.nackType;
+    delete msg.checkedOutAt;
+    delete msg.checkedOutBy;
+    delete msg.retryAfter;
+    writeMessageFile(path, msg, true, lock);
+    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
+    return msg;
+  } finally {
+    lock.release();
+  }
 }
 
 export function nackMessage(agent: string, id: string, reason: string, type: "transient" | "agent" | "permanent" = "transient", retryAfter?: string): MailMessage | null {

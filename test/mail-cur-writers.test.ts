@@ -73,7 +73,7 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; why:
   },
   {
     file: "packages/cli/src/utils/mail.ts",
-    contains: "writeMessageFile(path, msg, true)",
+    contains: "writeMessageFile(path, msg, true, lock)",
     followedBy: "; try { unlinkSync(path)",
     why: "ackMessageAtPath — atomically replaces an existing record after a locked existence check, then unlinks it; first delivery stays promote()'s",
   },
