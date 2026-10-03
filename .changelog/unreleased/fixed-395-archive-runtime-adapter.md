@@ -1,0 +1,1 @@
+- **Mail events are logged under Node when `node:sqlite` is available, as well as Bun: a `node:sqlite` adapter writes the same `archive.db` (Closes #395).** Setup, migration, read, write and close failures produce diagnostics per archive path, operation and error code.
