@@ -1,1 +1,1 @@
-- **Mail events are logged under Node as well as Bun: a `node:sqlite` adapter writes the same `archive.db` (Closes #395).**
+- **Mail events are logged under Node when `node:sqlite` is available, as well as Bun: a `node:sqlite` adapter writes the same `archive.db` (Closes #395).**

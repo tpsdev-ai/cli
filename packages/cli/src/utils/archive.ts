@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -34,15 +34,11 @@ export interface ArchiveQuery {
  * importer. The binding is resolved lazily and synchronously below, so the
  * module graph stays loadable under both `import()` and `require()`.
  *
- * cli#395 — the adapter. `bun:sqlite` under bun, `node:sqlite` (`DatabaseSync`,
- * Node >= 22.13) under node, behind ONE interface (`open`, `run`, `all`). Same
- * file path and same schema, so a host's archive is one database whichever
- * runtime wrote it. Where NEITHER backend exists (a node older than 22.13, or
- * `node:sqlite` disabled) the archive degrades to a visible no-op: one named
- * warning per process, never a crash, never a silent loss without a trace.
+ * cli#395 — resolves `bun:sqlite` or `node:sqlite` at runtime.
+ * Missing bindings produce one warning per process.
  */
 interface SqliteAdapter {
-  /** Open (creating it if needed) the DB at `dbPath`, set the shared PRAGMAs, apply the schema. */
+  /** Open `dbPath`, attempt and verify the shared PRAGMAs, apply the schema. */
   open(dbPath: string): void;
   /** Run one parameterised write statement. */
   run(sql: string, params: readonly unknown[]): void;
@@ -82,25 +78,20 @@ const SCHEMA_SQL = `
     END;
 `;
 
-// migration (cli#429): reply-to threading. `CREATE TABLE IF NOT EXISTS` does not
-// add a column to a table that already exists, so a pre-#429 archive.db needs an
-// explicit ALTER; a fresh DB has no such column either, so the ALTER adds it
-// there too. The second call on an already-migrated DB throws "duplicate column
-// name", which is the idempotence guard and is swallowed.
+// cli#429: add reply threading; only a duplicate-column error is ignored.
 const MIGRATE_SQL = "ALTER TABLE archive ADD COLUMN replyToId TEXT";
 
-/**
- * Both runtimes may write the same file, so both set the SAME concurrency
- * settings: WAL (a writer never blocks a reader) and a 5 s busy timeout (a
- * second writer waits rather than failing with SQLITE_BUSY). Best-effort: a
- * transient failure to set them must not drop the event this open exists for.
- */
-function applyPragmas(exec: (sql: string) => void): void {
-  for (const sql of ["PRAGMA busy_timeout = 5000;", "PRAGMA journal_mode = WAL;"]) {
+function applyPragmas(db: SqliteHandle, dbPath: string): void {
+  for (const [setting, expected] of [["busy_timeout", 5000], ["journal_mode", "wal"]] as const) {
     try {
-      exec(sql);
-    } catch {
-      /* best effort — the write below still runs */
+      db.exec(`PRAGMA ${setting} = ${expected};`);
+      const row = db.prepare(`PRAGMA ${setting}`).all()[0];
+      const actual = row && Object.values(row)[0];
+      if (actual !== expected) {
+        throw Object.assign(new Error(`expected ${expected}, read ${String(actual)}`), { code: "PRAGMA_MISMATCH" });
+      }
+    } catch (error) {
+      warnArchiveError(dbPath, setting, error);
     }
   }
 }
@@ -119,12 +110,12 @@ class BunSqliteAdapter implements SqliteAdapter {
   open(dbPath: string): void {
     const db = new this.Database(dbPath, { create: true });
     this.db = db;
-    applyPragmas((sql) => db.exec(sql));
+    applyPragmas(db, dbPath);
     db.exec(SCHEMA_SQL);
     try {
       db.exec(MIGRATE_SQL);
-    } catch {
-      /* column already present */
+    } catch (error) {
+      if (!isDuplicateColumn(error, "bun")) throw error;
     }
   }
   run(sql: string, params: readonly unknown[]): void {
@@ -147,12 +138,12 @@ class NodeSqliteAdapter implements SqliteAdapter {
   open(dbPath: string): void {
     const db = new this.DatabaseSync(dbPath);
     this.db = db;
-    applyPragmas((sql) => db.exec(sql));
+    applyPragmas(db, dbPath);
     db.exec(SCHEMA_SQL);
     try {
       db.exec(MIGRATE_SQL);
-    } catch {
-      /* column already present */
+    } catch (error) {
+      if (!isDuplicateColumn(error, "node")) throw error;
     }
   }
   run(sql: string, params: readonly unknown[]): void {
@@ -178,7 +169,8 @@ function loadBunSqlite(): { Database: new (path: string, opts: { create: true })
   try {
     // bun resolves its own `bun:` builtins through require(); node never reaches this.
     bunSqlite = createRequire(import.meta.url)("bun:sqlite");
-  } catch {
+  } catch (error) {
+    if (!isAbsentBinding(error, "bun:sqlite")) throw error;
     bunSqlite = null;
   }
   return bunSqlite as ReturnType<typeof loadBunSqlite>;
@@ -189,7 +181,8 @@ function loadNodeSqlite(): { DatabaseSync: new (path: string) => SqliteHandle } 
   if (nodeSqlite !== undefined) return nodeSqlite as ReturnType<typeof loadNodeSqlite>;
   try {
     nodeSqlite = createRequire(import.meta.url)("node:sqlite");
-  } catch {
+  } catch (error) {
+    if (!isAbsentBinding(error, "node:sqlite")) throw error;
     nodeSqlite = null;
   }
   return nodeSqlite as ReturnType<typeof loadNodeSqlite>;
@@ -203,12 +196,10 @@ function createAdapter(): SqliteAdapter | null {
   const bun = loadBunSqlite();
   if (bun) return new BunSqliteAdapter(bun.Database);
   const node = loadNodeSqlite();
-  if (node?.DatabaseSync) return new NodeSqliteAdapter(node.DatabaseSync);
+  if (node) return new NodeSqliteAdapter(node.DatabaseSync);
   return null;
 }
 
-// ONE stderr line per process, however many entry points hit the degraded path:
-// the audit gap must be visible, never silent — but it must not flood logs.
 let warnedArchiveUnavailable = false;
 
 const ARCHIVE_UNAVAILABLE_WARNING =
@@ -220,40 +211,76 @@ function warnArchiveUnavailable(): void {
   console.error(ARCHIVE_UNAVAILABLE_WARNING);
 }
 
+function isAbsentBinding(error: unknown, binding: string): boolean {
+  const err = error as { code?: string; message?: string };
+  return (err?.code === "ERR_UNKNOWN_BUILTIN_MODULE" && err.message === `No such built-in module: ${binding}`)
+    || (err?.code === "MODULE_NOT_FOUND" && err.message?.startsWith(`Cannot find module '${binding}'`) === true);
+}
+
+function isDuplicateColumn(error: unknown, backend: "bun" | "node"): boolean {
+  const err = error as { code?: string; errno?: number; errcode?: number; message?: string };
+  const matchesBackend = backend === "bun" ? err?.errno === 1 : err?.code === "ERR_SQLITE_ERROR" && err.errcode === 1;
+  return matchesBackend && err.message === "duplicate column name: replyToId";
+}
+
+const warnedArchiveErrors = new Set<string>();
+function warnArchiveError(dbPath: string, operation: string, error: unknown): void {
+  const err = error as { code?: string; errno?: number; errcode?: number; message?: string };
+  const sqliteCode = err?.errno ?? err?.errcode;
+  const code = err?.code ?? (sqliteCode === undefined ? "UNKNOWN_ERROR" : `SQLITE_ERRNO_${sqliteCode}`);
+  const kind = `${operation}:${code}`;
+  if (warnedArchiveErrors.has(kind)) return;
+  warnedArchiveErrors.add(kind);
+  console.error(`tps-mail archive: ${dbPath}: ${operation} [${code}]: ${err?.message ?? String(error)}`);
+}
+
 function archiveDbPath(): string {
   const dir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
-  mkdirSync(dir, { recursive: true });
   return join(dir, "archive.db");
 }
 
-export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string): void {
-  const adapter = createAdapter();
-  if (adapter === null) {
-    warnArchiveUnavailable();
-    return;
-  }
+function closeAdapter(adapter: SqliteAdapter | null, dbPath: string): void {
   try {
-    adapter.open(archiveDbPath());
+    adapter?.close();
+  } catch (error) {
+    warnArchiveError(dbPath, "close", error);
+  }
+}
+
+export function logEvent(event: Omit<ArchiveEvent, "timestamp">, body?: string): void {
+  const dbPath = archiveDbPath();
+  let adapter: SqliteAdapter | null = null;
+  try {
+    adapter = createAdapter();
+    if (adapter === null) {
+      warnArchiveUnavailable();
+      return;
+    }
+    mkdirSync(dirname(dbPath), { recursive: true });
+    adapter.open(dbPath);
     adapter.run(
       `INSERT INTO archive (event, timestamp, sender, recipient, messageId, replyToId, body)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
       [event.event, new Date().toISOString(), event.from, event.to, event.messageId, event.replyToId ?? null, body || null],
     );
-  } catch {
-    // Best-effort audit logging.
+  } catch (error) {
+    warnArchiveError(dbPath, "write", error);
   } finally {
-    adapter.close();
+    closeAdapter(adapter, dbPath);
   }
 }
 
 export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
-  const adapter = createAdapter();
-  if (adapter === null) {
-    warnArchiveUnavailable();
-    return [];
-  }
+  const dbPath = archiveDbPath();
+  let adapter: SqliteAdapter | null = null;
   try {
-    adapter.open(archiveDbPath());
+    adapter = createAdapter();
+    if (adapter === null) {
+      warnArchiveUnavailable();
+      return [];
+    }
+    mkdirSync(dirname(dbPath), { recursive: true });
+    adapter.open(dbPath);
     let sql = "SELECT archive.event, archive.timestamp, archive.sender as 'from', archive.recipient as 'to', archive.messageId, archive.replyToId, archive.body FROM archive";
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -294,9 +321,10 @@ export function queryArchive(query: ArchiveQuery = {}): ArchiveEvent[] {
       ...r,
       bodyPreview: r.body ? (String(r.body).length > 100 ? String(r.body).slice(0, 100) + "..." : String(r.body)) : undefined,
     })) as ArchiveEvent[];
-  } catch {
+  } catch (error) {
+    warnArchiveError(dbPath, "read", error);
     return [];
   } finally {
-    adapter.close();
+    closeAdapter(adapter, dbPath);
   }
 }

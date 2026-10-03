@@ -10,10 +10,8 @@
  *  - node writes an event; the in-process (bun) reader sees it, and node reads it
  *    back;
  *  - bun writes an event; node reads it back;
- *  - each runtime writes a batch to one file while the other runs (WAL +
- *    busy-timeout);
- *  - the plugin's promote() path, run under node, logs the `read` event
- *    (cli#377/#395: the plugin is bound to promote()).
+ *  - each runtime writes a batch to one file while the other runs;
+ *  - the shared CLI promote(), run under node, logs the `read` event.
  *
  * The `node:sqlite`-dependent cases are gated on the `node` under test actually
  * exposing the binding (probed ONCE below). Where it is absent — Node < 22.13
@@ -40,7 +38,6 @@ const utilsDir = resolve(here, "..", "dist", "src", "utils");
 const archiveJs = resolve(utilsDir, "archive.js");
 const mailJs = resolve(utilsDir, "mail.js");
 
-/** Hard deadline for every spawned child: a hung process must fail, not hang CI. */
 const DEADLINE_MS = 30_000;
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const KERN_SEED = Buffer.alloc(32, 0x02);
@@ -57,7 +54,7 @@ const nodeHasSqlite = spawnSync("node", ["-e", "require('node:sqlite')"], {
   encoding: "utf8",
   timeout: DEADLINE_MS,
 }).status === 0;
-const nodeVersion = (spawnSync("node", ["--version"], { encoding: "utf8" }).stdout || "unknown").trim();
+const nodeVersion = (spawnSync("node", ["--version"], { encoding: "utf8", timeout: DEADLINE_MS }).stdout || "unknown").trim();
 console.log(
   `[archive-runtime-adapter] node ${nodeVersion}: node:sqlite ${
     nodeHasSqlite ? "available — running the cross-runtime suite" : "UNAVAILABLE — running the fallback suite"
@@ -168,7 +165,7 @@ describe("archive runtime adapter (cli#395)", () => {
   );
 
   test.if(nodeHasSqlite)(
-    "each runtime writes a batch to one file while the other runs (WAL + busy-timeout)",
+    "each runtime writes a batch to one file while the other runs",
     async () => {
       const N = 20;
       const script = `
@@ -197,7 +194,7 @@ describe("archive runtime adapter (cli#395)", () => {
   );
 
   test.if(nodeHasSqlite)(
-    "the plugin's promote() path under node logs a 'read' event into archive.db",
+    "the shared CLI promote() under node logs a 'read' event into archive.db",
     async () => {
       const stub: StubFlair = startStubFlair({ flint: FLINT_SEED, kern: KERN_SEED });
       try {
