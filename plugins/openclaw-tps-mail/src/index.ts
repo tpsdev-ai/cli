@@ -51,10 +51,10 @@
  *     (hook always landed in `main` session, accumulating noise).
  */
 
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
-import { basename, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
@@ -62,6 +62,7 @@ import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
 import { isValidEnvelopeId, mailRootForRecordPath, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
+import { mailLockPath, tryAcquireMailLock } from "@tpsdev-ai/cli/utils/mail-lock";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
 import {
   TERMINAL_STATES,
@@ -619,18 +620,129 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
 }
 
 /**
- * Patch a mail record in place. Used to ack/nack a message that the shared
- * promote() enforcement point has already moved new/ → cur/. The promotion
- * itself is atomic inside promote() (new/ → tmp/ → cur/); this only enriches
- * the cur/ record after dispatch, so a crash here cannot replay a message.
+ * ONE locked, existing-only writer for a cur/ record — cli#469's rule, applied
+ * where it reaches the plugin. Every ack/nack stamp written AFTER a durable
+ * terminal transition goes through this, and only this:
+ *
+ *   - it REUSES the CLI's own mailbox lock (`tryAcquireMailLock` from
+ *     `@tpsdev-ai/cli/utils/mail-lock`), so the plugin's stamp coordinates with
+ *     the CLI's `promote()` — both lock the same `<mailDir>/<agent>/.mail-lock`;
+ *   - it is EXISTING-ONLY: a missing or unreadable record is a NAMED refusal,
+ *     never a create;
+ *   - it re-reads under the lock and REPLACES atomically (dot-temp + rename),
+ *     so a crash can never leave a torn record.
+ *
+ * It never throws. The caller gets a structured outcome it must ACT on, so a
+ * failed write is surfaced (logged by message id, record path and error code)
+ * and reconciled on the next scan — never silently ignored (cli#492).
  */
-function patchMailFile(path: string, patch: Partial<TpsMailBody>): void {
+type CurRecordUpdate =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: "record-missing" | "record-unreadable" | "lock-busy" | "lock-unverified" | "write-failed";
+      path: string;
+      code: string;
+    };
+
+/** Read a cur/ record (existing-only), distinguishing absent from unreadable. */
+function readCurRecord(path: string):
+  | { status: "ok"; record: TpsMailBody }
+  | { status: "missing" }
+  | { status: "unreadable"; code: string } {
   try {
-    const current = readMailFile(path);
-    if (!current) return;
-    writeFileSync(path, JSON.stringify({ ...current, ...patch }, null, 2), "utf-8");
-  } catch {
-    // best effort — don't crash the watcher on state-transition errors
+    const record = JSON.parse(readFileSync(path, "utf-8")) as TpsMailBody;
+    if (!record || typeof record !== "object" || typeof record.id !== "string") {
+      return { status: "unreadable", code: "INVALID_RECORD" };
+    }
+    return { status: "ok", record };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "INVALID_JSON";
+    return code === "ENOENT" ? { status: "missing" } : { status: "unreadable", code };
+  }
+}
+
+function updateExistingCurRecord(path: string, patch: Partial<TpsMailBody>): CurRecordUpdate {
+  // The mailbox root is the record's grandparent: <mailDir>/<agent>/cur/<file>.
+  const root = dirname(dirname(path));
+  // EXISTING-ONLY: refuse by name before taking the lock when there is nothing
+  // to update. A missing record is benign (there is no stamp to diverge from);
+  // an UNREADABLE one is refused, never replaced.
+  let current = readCurRecord(path);
+  if (current.status !== "ok") {
+    return {
+      ok: false,
+      reason: current.status === "missing" ? "record-missing" : "record-unreadable",
+      path,
+      code: current.status === "missing" ? "ENOENT" : current.code,
+    };
+  }
+  let lock: ReturnType<typeof tryAcquireMailLock>;
+  try {
+    lock = tryAcquireMailLock(mailLockPath(root));
+  } catch (err: any) {
+    // An unverifiable lock owner is NOT "no lock": fail closed, never write
+    // outside the lock (cli#469's rule and this plugin's unknown-evidence rule).
+    return { ok: false, reason: "lock-unverified", path, code: err?.name ?? "LOCK_ERROR" };
+  }
+  if (!lock) return { ok: false, reason: "lock-busy", path, code: "EEXIST" };
+  try {
+    // Re-read under the lock: lock, re-read, mutate, atomically replace.
+    current = readCurRecord(path);
+    if (current.status !== "ok") {
+      return {
+        ok: false,
+        reason: current.status === "missing" ? "record-missing" : "record-unreadable",
+        path,
+        code: current.status === "missing" ? "ENOENT" : current.code,
+      };
+    }
+    const tmp = resolve(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
+    try {
+      writeFileSync(tmp, JSON.stringify({ ...current.record, ...patch }, null, 2), "utf-8");
+      renameSync(tmp, path);
+    } catch (err: any) {
+      try {
+        rmSync(tmp, { force: true });
+      } catch {
+        /* the fault persists — the caller's diagnostic names it */
+      }
+      return { ok: false, reason: "write-failed", path, code: err?.code ?? "WRITE_FAILED" };
+    }
+    return { ok: true };
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Re-stamp an `acked` or `failed` obligation whose cur/ record never received
+ * its stamp (the write failed after the durable transition — cli#492). The
+ * obligation record is the durable truth, so on a scan the record and the
+ * maildir are made to agree: an `acked` obligation re-stamps `ackedAt`/`read`,
+ * a `failed` one `nackedAt`/`nackReason`. Idempotent; a failure here is logged
+ * by name so the next scan tries again.
+ */
+function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): void {
+  for (const rec of listObligations(mailDir, agent)) {
+    if (rec.state !== "acked" && rec.state !== "failed") continue;
+    const curPath = findCurPath(mailDir, agent, rec.inboundId);
+    if (!curPath) continue;
+    const cur = readMailFile(curPath);
+    if (!cur) continue; // absent/unreadable now; the next scan retries
+    if (rec.state === "acked" && !cur.ackedAt) {
+      const r = updateExistingCurRecord(curPath, { ackedAt: new Date().toISOString(), read: true });
+      if (r.ok) log?.info?.(`tps-mail: reconciled the acked stamp for ${rec.inboundId} at ${curPath}`);
+      else if (r.reason !== "record-missing") {
+        log?.warn?.(`tps-mail: ack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
+      }
+    } else if (rec.state === "failed" && !cur.nackedAt) {
+      const r = updateExistingCurRecord(curPath, { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" });
+      if (r.ok) log?.info?.(`tps-mail: reconciled the nacked stamp for ${rec.inboundId} at ${curPath}`);
+      else if (r.reason !== "record-missing") {
+        log?.warn?.(`tps-mail: nack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
+      }
+    }
   }
 }
 
@@ -897,7 +1009,13 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     );
     return;
   }
-  patchMailFile(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
+  const stamped = updateExistingCurRecord(ctx.curPath, { ackedAt: new Date().toISOString(), read: true });
+  if (!stamped.ok && stamped.reason !== "record-missing") {
+    ctx.log?.warn?.(
+      `tps-mail: ack-stamp-failed: could not stamp ackedAt on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
+        `the obligation is acked and the stamp is reconciled on the next scan`,
+    );
+  }
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
   releaseObligationState(obligationId);
 }
@@ -1068,7 +1186,13 @@ async function settleObligation(
   // handed off (cli#403).
   releaseObligationState(obligationId);
   if (!s.alreadyStamped) {
-    patchMailFile(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
+    const stamped = updateExistingCurRecord(ctx.curPath, { nackedAt: new Date().toISOString(), nackReason: failedOn });
+    if (!stamped.ok && stamped.reason !== "record-missing") {
+      ctx.log?.warn?.(
+        `tps-mail: nack-stamp-failed: could not stamp nackedAt on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
+          `the obligation is failed and the stamp is reconciled on the next scan`,
+      );
+    }
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
@@ -2269,6 +2393,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             }
           }
         } catch { /* ignore */ }
+
+        // STAMP RECONCILIATION (cli#492): an acked or failed obligation whose
+        // cur/ record never received its stamp — the write failed AFTER the
+        // durable transition — is re-stamped here, under the same lock that
+        // write uses, BEFORE the recovery loop below decides whether to
+        // re-dispatch the record. Idempotent; a failure here is logged by name
+        // and retried on the next scan.
+        reconcileTerminalCurStamps(account.mailDir, agentId, log);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record

@@ -1,0 +1,1 @@
+- **A failed cur/ record write after a terminal transition is logged by id, path and code and reconciled on the next scan (Closes #492)**. Every ack/nack stamp now goes through one locked, existing-only, atomic writer that reuses the CLI's mailbox lock, so a failed write no longer leaves the on-disk record and the plugin's view diverged in silence.
