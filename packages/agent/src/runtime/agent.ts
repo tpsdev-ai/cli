@@ -10,8 +10,8 @@ import { BoundaryManager } from "../governance/boundary.js";
 import { createDefaultToolset } from "../tools/index.js";
 import { EventLogger } from "../telemetry/events.js";
 import { FlairContextProvider } from "../io/flair.js";
-import { decodeRegistryPublicKey } from "../lib/registry-key.js";
 import type { FlairClient } from "../lib/signEnvelope.js";
+import { parseFlairPublicKey, PublicKeyFormatError } from "../lib/public-key.js";
 
 export class AgentRuntime {
   private loop: EventLoop;
@@ -30,9 +30,16 @@ export class AgentRuntime {
     const verifyProvider = new FlairContextProvider(config.agentId, config.flair ?? {});
     const flairClient: FlairClient = {
       getAgent: async (name: string) => {
-        const a = await verifyProvider.getAgent(name);
-        if (!a) return null;
-        return { publicKey: decodeRegistryPublicKey(a.publicKey) };
+        try {
+          const a = await verifyProvider.getAgent(name);
+          if (!a) return null;
+          return { publicKey: parseFlairPublicKey(a.publicKey) };
+        } catch (err) {
+          if (err instanceof PublicKeyFormatError) {
+            throw new PublicKeyFormatError(`Flair returned a malformed public key for ${name}`);
+          }
+          throw err;
+        }
       },
     };
 

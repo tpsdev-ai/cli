@@ -5,12 +5,12 @@ import { spawn } from "node:child_process";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
-import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema } from "../utils/wire-mail.js";
+import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema, MailAckBodySchema } from "../utils/wire-mail.js";
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
 import { sendMessage, inboxExists } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
+import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
@@ -328,6 +328,7 @@ async function runStart(): Promise<void> {
   const localAgentId = getLocalAgentId();
 
   let serviceProxies: ServiceProxySet | null = null;
+  const outboxSends = new OutboxSendTracker();
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {
@@ -342,13 +343,13 @@ async function runStart(): Promise<void> {
     if (msg.type === MSG_HEARTBEAT) {
       // Echo heartbeat back so host can track bidirectional liveness
       await channel.send({ type: MSG_HEARTBEAT, seq: msg.seq, ts: new Date().toISOString(), body: {} }).catch(() => {});
-      for (const item of drainOutbox()) {
+      for (const item of outboxSends.due()) {
         await channel.send({
           type: MSG_MAIL_DELIVER,
           seq: msg.seq + 1,
           ts: new Date().toISOString(),
           body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-        }).catch(() => {});
+        }).catch(() => outboxSends.sendFailed(item.id));
       }
       logLine("SYNC", "Heartbeat received — drained outbox");
       return;
@@ -368,6 +369,11 @@ async function runStart(): Promise<void> {
       return;
     }
 
+    if (msg.type === MSG_MAIL_ACK) {
+      const ack = MailAckBodySchema.safeParse(msg.body);
+      if (ack.success && ack.data.accepted) outboxSends.acknowledge(ack.data.id);
+      return;
+    }
     if (msg.type !== MSG_MAIL_DELIVER) return;
     const parsed = MailDeliverBodySchema.safeParse(msg.body);
     if (!parsed.success) {
@@ -439,13 +445,13 @@ async function runStart(): Promise<void> {
         : { id: body.id, accepted: false, error: deliveryError },
     }).catch(() => {});
 
-    for (const item of drainOutbox()) {
+    for (const item of outboxSends.due()) {
       await channel.send({
         type: MSG_MAIL_DELIVER,
         seq: msg.seq + 1,
         ts: new Date().toISOString(),
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => {});
+      }).catch(() => outboxSends.sendFailed(item.id));
     }
 
     logLine("MAIL", `Received message for ${body.to} (id: ${body.id})`);
@@ -471,13 +477,13 @@ async function runStart(): Promise<void> {
   mkdirSync(outboxNewDir, { recursive: true });
   const outboxWatcher = watch(outboxNewDir, async () => {
     if (!activeHostChannel || !activeHostChannel.isAlive()) return;
-    for (const item of drainOutbox()) {
+    for (const item of outboxSends.due()) {
       await activeHostChannel.send({
         type: MSG_MAIL_DELIVER,
         seq: 0,
         ts: new Date().toISOString(),
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => {});
+      }).catch(() => outboxSends.sendFailed(item.id));
     }
   });
 

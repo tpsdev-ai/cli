@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
 import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
+import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
 import {
@@ -358,7 +359,13 @@ export class MailClient {
     const parsed = parseSignedEnvelope(mailMsg.body);
     if (!parsed.ok) return { pass: false, class: parsed.class, reason: parsed.reason, from: mailMsg.from };
 
-    const decision = await decideEnvelopeForMailbox(this.agentId, parsed.envelope, mailMsg.from, this.flairClient);
+    const decision = await decideEnvelopeForMailbox(this.agentId, parsed.envelope, mailMsg.from, this.flairClient)
+      .catch((err: unknown) => {
+        if (err instanceof PublicKeyFormatError) {
+          return { ok: false as const, class: "invalid" as const, reason: `signature verification failed: ${err.message}` };
+        }
+        throw err;
+      });
     if (!decision.ok) return { pass: false, class: decision.class, reason: decision.reason, from: mailMsg.from };
     return { pass: true, envelope: decision.envelope };
   }
