@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, type Dirent, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.js";
@@ -449,4 +449,108 @@ export function hasCommittedMessageId(root: string, messageId: string): boolean 
   const ids = peekConsumedLedger(root);
   if (ids === null) return false;
   return ids.has(messageId);
+}
+
+// ─── First delivery into cur/ (cli#482) ──────────────────────────────────────
+//
+// Both mailbox first-delivery writers (the CLI's `promote()` and this package's
+// `MailClient`) place a record in `cur/` under its filename. The placement uses
+// an EXCLUSIVE link, so an existing record is never replaced — a plain rename
+// would silently overwrite an already-delivered record when a filename collides.
+// On the EEXIST collision the two records are compared by content; see
+// `placeCurRecord`.
+
+/** The result of a first-delivery placement. */
+export type FirstDelivery =
+  | { status: "placed" }
+  /** An identical delivery already sits at the destination: an idempotent duplicate. */
+  | { status: "duplicate"; existingId?: string }
+  /** A DIFFERENT record already sits at the destination: an integrity error. */
+  | { status: "collision"; existingId?: string };
+
+/** Parse a record file, or null when it is unreadable or not a JSON object. */
+function readRecordJson(path: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return parsed as Record<string, unknown>;
+}
+
+/** The record's signed envelope: its stored `envelope`, or a signed JSON body. */
+function storedEnvelope(record: Record<string, unknown>): Record<string, unknown> | null {
+  const env = record.envelope;
+  if (env !== null && typeof env === "object") return env as Record<string, unknown>;
+  if (typeof record.body === "string") {
+    const parsed = tryParseEnvelope(record.body);
+    if (parsed !== "json-parse-error" && parsed !== "missing-fields") return parsed;
+  }
+  return null;
+}
+
+/**
+ * The delivery content that decides a same-filename collision: the signed
+ * message a consumer receives. Only `from`, `to`, `subject`, `body` and
+ * `replyToId` are compared; the transport identity (`messageId`), the signing
+ * timestamp, the signature, the `trust` tier and the delegation chain are
+ * excluded, so a re-signed re-delivery of the same message compares equal. A
+ * different message, or a record with no usable envelope, does not.
+ */
+function deliveryContent(record: Record<string, unknown>): string | null {
+  const env = storedEnvelope(record);
+  if (!env) return null;
+  return JSON.stringify({ from: env.from, to: env.to, subject: env.subject, body: env.body, replyToId: env.replyToId });
+}
+
+/** The record's envelope id: a promoted `envelopeId`, else a signed body's messageId. */
+function recordEnvelopeId(record: Record<string, unknown>): string | null {
+  if (typeof record.envelopeId === "string") return record.envelopeId;
+  const env = storedEnvelope(record);
+  return env && typeof env.messageId === "string" ? env.messageId : null;
+}
+
+/**
+ * Place `sourcePath` at `curPath` for a mailbox's FIRST delivery, never
+ * replacing an existing record. The placement is an exclusive `link`, which
+ * fails with EEXIST rather than overwriting. On a collision the records are
+ * compared by delivery content: an identical record is a `duplicate` (the
+ * caller dead-letters it as a replay, leaving the delivered record untouched);
+ * a different record under the same filename is a `collision` (an integrity
+ * error). An unreadable destination — or one with no usable envelope — is never
+ * treated as identical. A non-EEXIST link failure is thrown.
+ *
+ * On `placed`, the source and destination are hard links to one inode: the
+ * caller unlinks the source to leave a single copy.
+ */
+export function placeCurRecord(sourcePath: string, curPath: string): FirstDelivery {
+  try {
+    linkSync(sourcePath, curPath);
+    return { status: "placed" };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  // EEXIST means a NAME is taken, not that a delivered record is there. Only a
+  // regular file can be a first-delivered record: a directory or any other entry
+  // at the destination is a storage fault, which the caller treats as retryable.
+  let entry: ReturnType<typeof statSync>;
+  try {
+    entry = statSync(curPath);
+  } catch (err) {
+    throw new Error(`cannot place ${curPath}: destination stat failed (${(err as NodeJS.ErrnoException).code ?? String(err)})`);
+  }
+  if (!entry.isFile()) {
+    throw new Error(`cannot place ${curPath}: destination exists and is not a regular file`);
+  }
+  const existing = readRecordJson(curPath);
+  const existingId = existing ? recordEnvelopeId(existing) : null;
+  const incoming = readRecordJson(sourcePath);
+  const incomingContent = incoming ? deliveryContent(incoming) : null;
+  const existingContent = existing ? deliveryContent(existing) : null;
+  if (incomingContent !== null && incomingContent === existingContent) {
+    return { status: "duplicate", existingId: existingId ?? undefined };
+  }
+  return { status: "collision", existingId: existingId ?? undefined };
 }

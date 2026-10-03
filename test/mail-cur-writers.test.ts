@@ -2,9 +2,12 @@
  * For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/.
  * Updates touch only existing records through updateExistingRecord().
  * MailClient applies the same policy; outbox and internal mail are separate stores.
+ * First delivery into cur/ uses placeCurRecord()'s exclusive link, so it never replaces
+ * an existing record: an identical same-filename record is a duplicate, a different one
+ * is an integrity error.
  * Scans scripts/, package src/ and scripts/, and plugin src/ with text patterns.
  * Unrecognized destinations may be missed.
- * Follow-ups: #482 same-filename promotion overwrite; the per-process bridge queue.
+ * Follow-up: the per-process bridge queue.
  */
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
@@ -43,15 +46,9 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; scop
     why: "updateExistingRecord — locked fresh read and fsynced existing-only replacement",
   },
   {
-    file: "packages/cli/src/utils/mail.ts",
-    contains: "renameSync(scratchPath, curPath)",
-    scope: "promote",
-    why: "promote() — first delivery into a mailbox's cur/",
-  },
-  {
-    file: "packages/agent/src/io/mail.ts",
-    contains: "renameSync(srcPath, dstPath)",
-    why: "MailClient — shared mailbox policy and replay store",
+    file: "packages/agent/src/lib/mailbox-policy.ts",
+    contains: "linkSync(sourcePath, curPath)",
+    why: "placeCurRecord — the shared exclusive first-delivery into cur/ (never replaces)",
   },
   {
     file: "packages/cli/src/utils/relay.ts",
@@ -348,15 +345,15 @@ describe("cli#380: no unlisted detected writer of a cur/ directory", () => {
   });
 
   test("a second copy of an allowed call is reported", () => {
-    const file = "packages/agent/src/io/mail.ts";
+    const file = "packages/agent/src/lib/mailbox-policy.ts";
     const text = readFileSync(file, "utf-8");
     const dup = text.replace(
-      "renameSync(srcPath, dstPath);",
-      "renameSync(srcPath, dstPath);\n      renameSync(srcPath, dstPath);",
+      "linkSync(sourcePath, curPath);",
+      "linkSync(sourcePath, curPath);\n    linkSync(sourcePath, curPath);",
     );
     expect(dup).not.toBe(text);
     expect(classify(scanTree({ file, text: dup })).offenders).toEqual([
-      `${file}: renameSync(srcPath, dstPath)`,
+      `${file}: linkSync(sourcePath, curPath)`,
     ]);
   });
 

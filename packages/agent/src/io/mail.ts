@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -11,6 +11,7 @@ import {
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
   parseSignedEnvelope,
+  placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 
@@ -194,9 +195,12 @@ export class MailClient {
   }
 
   /**
-   * Under the mailbox lock: refuse a consumed messageId, else rename into cur/
-   * and record the id. Returns the replay rejection, or null once committed.
-   * On append failure, attempt to move the record back to new/; throw on failure.
+   * Under the mailbox lock: refuse a consumed messageId, else place the record
+   * in cur/ with an EXCLUSIVE link and record the id. Returns the rejection, or
+   * null once committed. The placement never replaces an existing record: on a
+   * filename collision the two are compared by content — an identical record is
+   * a duplicate (refused like a replay); a different one is an integrity error.
+   * On append failure, move the record back to new/; throw on failure.
    */
   private async commitToCur(
     file: string,
@@ -213,7 +217,24 @@ export class MailClient {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
       const dstPath = join(this.inboxCur, file);
-      renameSync(srcPath, dstPath);
+      const placement = placeCurRecord(srcPath, dstPath);
+      if (placement.status === "duplicate") {
+        return {
+          pass: false,
+          class: "replay",
+          reason: `duplicate delivery: ${file} already delivered as ${placement.existingId ?? envelope.messageId}`,
+        };
+      }
+      if (placement.status === "collision") {
+        return {
+          pass: false,
+          class: "invalid",
+          reason: `filename collision: ${file} already delivered as ${placement.existingId ?? "unknown"}; incoming record ${envelope.messageId} differs`,
+        };
+      }
+      // Placed: cur/ and the source are hard links to one inode. Drop the
+      // source link, then commit the consumed id durably.
+      unlinkSync(srcPath);
       try {
         replay.recordConsumed(envelope.messageId);
       } catch (err) {

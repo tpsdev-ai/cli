@@ -348,6 +348,48 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
   });
 
+  // ── cli#482: a first-delivery filename collision must not replace ──────────
+  //
+  // A second record under the SAME filename must not replace the delivered
+  // record. Identical content is an idempotent duplicate (replay); different
+  // content is an integrity error. Both leave cur/ untouched.
+  test("a second delivery with the same filename and identical content is a duplicate no-op", async () => {
+    const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-1" });
+    plant(wrapper("flint", first), "collide.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(1);
+    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
+
+    const again = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-2" });
+    plant(wrapper("flint", again), "collide.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before); // delivered record untouched
+    expect(files("new").length).toBe(0); // the duplicate left new/
+    const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: replay");
+    expect(sidecar).toContain("guard482-id-1");
+  });
+
+  test("a second delivery with the same filename and different content is an integrity error", async () => {
+    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
+    plant(wrapper("flint", first), "clash.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(1);
+    const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+
+    const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT }, { messageId: "guard482-id-4" });
+    plant(wrapper("flint", other), "clash.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+
+    expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before); // delivered record untouched
+    expect(files("dlq")).toContain("clash.json");
+    const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: invalid");
+    expect(sidecar).toContain("guard482-id-3"); // the delivered record id
+    expect(sidecar).toContain("guard482-id-4"); // the incoming record id
+  });
+
   for (const code of ["EACCES", "EISDIR"]) {
     test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
       const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
