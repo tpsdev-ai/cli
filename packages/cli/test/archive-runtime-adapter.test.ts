@@ -7,10 +7,9 @@
  * the REAL `node` binary against the built CLI dist and read/write the same
  * `archive.db` from both runtimes:
  *
- *  - node writes an event; the in-process (bun) reader sees it, and node reads it
- *    back;
- *  - bun writes an event; node reads it back;
- *  - each runtime writes a batch to one file while the other runs;
+ *  - bun reads a node-written event;
+ *  - node reads a bun-written event;
+ *  - bun checks row counts for both runtimes’ batches;
  *  - the shared CLI promote(), run under node, logs the `read` event.
  *
  * The `node:sqlite`-dependent cases are gated on the `node` under test actually
@@ -165,7 +164,7 @@ describe("archive runtime adapter (cli#395)", () => {
   );
 
   test.if(nodeHasSqlite)(
-    "each runtime writes a batch to one file while the other runs",
+    "bun checks row counts for both runtimes’ batches",
     async () => {
       const N = 20;
       const script = `

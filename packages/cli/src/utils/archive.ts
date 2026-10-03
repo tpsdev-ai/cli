@@ -228,7 +228,7 @@ function warnArchiveError(dbPath: string, operation: string, error: unknown): vo
   const err = error as { code?: string; errno?: number; errcode?: number; message?: string };
   const sqliteCode = err?.errno ?? err?.errcode;
   const code = err?.code ?? (sqliteCode === undefined ? "UNKNOWN_ERROR" : `SQLITE_ERRNO_${sqliteCode}`);
-  const kind = `${operation}:${code}`;
+  const kind = JSON.stringify([dbPath, operation, code]);
   if (warnedArchiveErrors.has(kind)) return;
   warnedArchiveErrors.add(kind);
   console.error(`tps-mail archive: ${dbPath}: ${operation} [${code}]: ${err?.message ?? String(error)}`);

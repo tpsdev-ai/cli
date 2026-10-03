@@ -62,6 +62,27 @@ for (const runtime of ["bun", "node"]) {
       expect(result.stderr.split("migration denied")).toHaveLength(2);
     });
 
+    test.if(enabled)("the same failure is reported at each archive path", () => {
+      const result = run(`
+        const exec = Database.prototype.exec;
+        Database.prototype.exec = function(sql) {
+          if (sql.startsWith("ALTER TABLE")) throw Object.assign(new Error("migration denied"), { code: "SQLITE_AUTH" });
+          return exec.call(this, sql);
+        };
+      `, `
+        a.logEvent({ event: "sent", from: "a", to: "b", messageId: "1" });
+        a.logEvent({ event: "sent", from: "a", to: "b", messageId: "2" });
+        process.env.TPS_MAIL_DIR += "/second";
+        a.logEvent({ event: "sent", from: "a", to: "b", messageId: "3" });
+        a.logEvent({ event: "sent", from: "a", to: "b", messageId: "4" });
+      `);
+      const warnings = result.stderr.split("\n").filter((line) => line.includes("migration denied"));
+      expect(warnings).toEqual([
+        `tps-mail archive: ${result.archivePath}: write [SQLITE_AUTH]: migration denied`,
+        `tps-mail archive: ${join(result.archivePath, "..", "second", "archive.db")}: write [SQLITE_AUTH]: migration denied`,
+      ]);
+    });
+
     test.if(enabled)("native non-duplicate migration errors retain their backend code", () => {
       const result = run(`
         const exec = Database.prototype.exec;
@@ -77,18 +98,31 @@ for (const runtime of ["bun", "node"]) {
 
     test.if(enabled)("PRAGMA values are read back on each open", () => {
       const result = run(`
+        const opens = new WeakMap();
+        let nextOpen = 0;
         const prepare = Database.prototype.prepare;
         Database.prototype.prepare = function(sql) {
           const statement = prepare.call(this, sql);
           if (/^PRAGMA (journal_mode|busy_timeout)$/.test(sql)) {
-            const rows = statement.all();
-            console.log(sql + "=" + JSON.stringify(rows));
+            if (!opens.has(this)) opens.set(this, ++nextOpen);
+            const open = opens.get(this);
+            const all = statement.all;
+            statement.all = function(...args) {
+              const rows = all.apply(this, args);
+              console.log("OPEN=" + open + " " + sql + "=" + JSON.stringify(rows));
+              return rows;
+            };
           }
           return statement;
         };
       `);
-      expect(result.stdout).toContain('PRAGMA journal_mode=[{"journal_mode":"wal"}]');
-      expect(result.stdout).toContain('PRAGMA busy_timeout=[{"timeout":5000}]');
+      const readbacks = result.stdout.split("\n").filter((line) => line.startsWith("OPEN="));
+      expect(readbacks).toEqual([
+        'OPEN=1 PRAGMA busy_timeout=[{"timeout":5000}]',
+        'OPEN=1 PRAGMA journal_mode=[{"journal_mode":"wal"}]',
+        'OPEN=2 PRAGMA busy_timeout=[{"timeout":5000}]',
+        'OPEN=2 PRAGMA journal_mode=[{"journal_mode":"wal"}]',
+      ]);
       expect(result.stderr).not.toContain("tps-mail archive:");
     });
 
