@@ -8,7 +8,7 @@ import { runMail } from "../src/commands/mail.js";
 import { syncRemoteBranch, connectAndKeepAlive } from "../src/utils/relay.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 import { generateKeyPair, initHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
-import { drainOutbox, queueOutboxMessage } from "../src/utils/outbox.js";
+import { drainOutbox, OUTBOX_RESEND_BASE_MS, queueOutboxMessage } from "../src/utils/outbox.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, MSG_HEARTBEAT, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { writeKeyFile, buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
@@ -191,6 +191,10 @@ for (const entry of ["sync", "connect"] as const) {
         expect(logs).toContain("local");
         expect(logs).toContain(fault === "crash-before-publish" ? "simulated crash" : `injected ${fault}`);
         await emit();
+        expect(acks).toEqual([]);
+        const later = Date.now() + OUTBOX_RESEND_BASE_MS;
+        const clock = spyOn(Date, "now").mockReturnValue(later);
+        try { await emit(); } finally { clock.mockRestore(); }
         expect(acks.length).toBe(1);
         expect(drainOutbox(false)).toEqual([]);
         expect(jsonFiles(inbox.dlq).length).toBe(1);
@@ -224,6 +228,32 @@ for (const entry of ["sync", "connect"] as const) {
       const delivered = JSON.parse(String(output.mock.calls.at(-1)![0]));
       expect(delivered.map((m: { envelopeId: string }) => m.envelopeId)).toEqual([env.messageId]);
       expect(delivered[0].body).toBe("write fault");
+    });
+
+    test("a replayed delivery is acknowledged without a second inbox record", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
+      await start();
+      const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+      for (const handler of handlers) handler(msg);
+      await Bun.sleep(0);
+      for (const handler of handlers) handler(msg);
+      await Bun.sleep(0);
+      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+      expect(acks.length).toBe(2);
+    });
+
+    test("an invalid recipient is dead-lettered to the host-level dlq and acknowledged", async () => {
+      queueOutboxMessage("bad.recipient", "nowhere", "remote");
+      spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      await emit();
+      expect(acks.length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+      const dlq = join(process.env.TPS_MAIL_DIR!, ".undeliverable", "dlq");
+      const [file] = jsonFiles(dlq);
+      expect(JSON.parse(fs.readFileSync(join(dlq, file!), "utf8")).to).toBe("bad.recipient");
+      expect(fs.readFileSync(join(dlq, `${file}.reason`), "utf8")).toContain("class: invalid");
+      expect(fs.existsSync(join(process.env.TPS_MAIL_DIR!, "bad.recipient"))).toBe(false);
     });
 
     test("with room the entry point writes the inbox and acknowledges the source", async () => {

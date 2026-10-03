@@ -439,9 +439,17 @@ export function deadLetterUndelivered(
   cls: PromoteRejectClass,
   reason: string,
 ): string {
-  assertValidAgentId(agent);
   validateMessageId(record.id);
-  const inbox = getInbox(agent);
+  let inbox: { tmp: string; dlq: string };
+  try {
+    assertValidAgentId(agent);
+    inbox = getInbox(agent);
+  } catch (error) {
+    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
+    inbox = { tmp: join(getMailDir(), ".undeliverable", "tmp"), dlq: join(getMailDir(), ".undeliverable", "dlq") };
+    mkdirSync(inbox.tmp, { recursive: true });
+    mkdirSync(inbox.dlq, { recursive: true });
+  }
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);

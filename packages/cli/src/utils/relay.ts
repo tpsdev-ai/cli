@@ -3,7 +3,7 @@ import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, getMailDir, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -370,9 +370,13 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
 }
 
 export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
+  MailDeliverBodySchema.shape.id.parse(body.id);
+  const marker = join(getMailDir(), ".relay-accepted", body.id);
+  if (existsSync(marker)) return false;
+  let delivered: boolean;
   try {
     sendMessage(body.to, body.content, body.from);
-    return true;
+    delivered = true;
   } catch (e: unknown) {
     const reason = e instanceof Error ? e.message : String(e);
     const cls: PromoteRejectClass = /inbox full/i.test(reason)
@@ -392,8 +396,15 @@ export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
       );
       throw dlqErr;
     }
-    return false;
+    delivered = false;
   }
+  try {
+    mkdirSync(join(getMailDir(), ".relay-accepted"), { recursive: true });
+    writeFileSync(marker, "", "utf-8");
+  } catch (e: unknown) {
+    console.error(`[relay] could not record message ${body.id} as accepted: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return delivered;
 }
 
 async function acceptRelayedMail(channel: TransportChannel, msg: TpsMessage, body: MailDeliverBody): Promise<boolean> {

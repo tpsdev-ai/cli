@@ -118,9 +118,49 @@ export function acknowledgeOutbox(id: string): void {
   const newDir = outboxDir("new");
   const sentDir = outboxDir("sent");
   mkdirSync(sentDir, { recursive: true });
+  mkdirSync(newDir, { recursive: true });
   for (const filename of readdirSync(newDir).filter((f) => f.endsWith(".json") && !f.startsWith("."))) {
     const path = join(newDir, filename);
-    const record = JSON.parse(readFileSync(path, "utf-8")) as OutboxMessage;
+    let record: OutboxMessage;
+    try {
+      record = JSON.parse(readFileSync(path, "utf-8")) as OutboxMessage;
+    } catch (err) {
+      console.error(`acknowledgeOutbox: skipping ${filename}: ${(err as Error).message}`);
+      continue;
+    }
     if (record.id === id) renameSync(path, join(sentDir, filename));
+  }
+}
+
+export const OUTBOX_RESEND_BASE_MS = 60_000;
+export const OUTBOX_MAX_SENDS = 5;
+
+export class OutboxSendTracker {
+  private readonly sends = new Map<string, { at: number; count: number }>();
+
+  due(now = Date.now()): OutboxMessage[] {
+    const out: OutboxMessage[] = [];
+    for (const item of drainOutbox(false)) {
+      const prev = this.sends.get(item.id);
+      if (prev && prev.count >= OUTBOX_MAX_SENDS) continue;
+      if (prev && now - prev.at < OUTBOX_RESEND_BASE_MS * 2 ** (prev.count - 1)) continue;
+      const count = (prev?.count ?? 0) + 1;
+      this.sends.set(item.id, { at: now, count });
+      if (count === OUTBOX_MAX_SENDS) console.error(`outbox: ${item.id} sent ${count} times without an ACK; not resending until restart`);
+      out.push(item);
+    }
+    return out;
+  }
+
+  sendFailed(id: string): void {
+    const prev = this.sends.get(id);
+    if (!prev) return;
+    if (prev.count <= 1) this.sends.delete(id);
+    else this.sends.set(id, { at: 0, count: prev.count - 1 });
+  }
+
+  acknowledge(id: string): void {
+    acknowledgeOutbox(id);
+    this.sends.delete(id);
   }
 }
