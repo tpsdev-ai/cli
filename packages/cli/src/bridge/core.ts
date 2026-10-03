@@ -94,21 +94,24 @@ export class BridgeCore {
     }
 
     const targetAgent = rawAgentId ?? this.defaultAgentId;
-    const { fresh } = this.mailboxDir(targetAgent);
-    mkdirSync(fresh, { recursive: true });
 
     // cli#433 slice B2-2: the bridge signs every inbound channel message as ITS
     // OWN identity — the existing bridgeAgentId and its own key, never the host
-    // agent's — through the same signing path the other producers use. The
+    // agent's — through the shared signing helper `signOutboundBody`. The
     // channel author and content travel as data inside the signed body; the
-    // wrapper carries no trust claim. With no bridge key this throws the named
-    // missing-key error BEFORE anything is written.
+    // wrapper carries no trust claim. Signing runs FIRST, before the recipient
+    // inbox is created: with no bridge key this throws the named missing-key
+    // error, and no mail record (and no inbox) is written. (The bridge-principal
+    // record is written separately, by the constructor.)
     const body = signOutboundBody(this.bridgeAgentId, targetAgent, this.buildInboundBody(envelope), {
       requireKey: true,
       trust: "external",
       subject: `channel message from ${envelope.channel}`,
       rationale: `bridge ${this.bridgeAgentId} inbound ${envelope.channel}`,
     });
+
+    const { fresh } = this.mailboxDir(targetAgent);
+    mkdirSync(fresh, { recursive: true });
 
     const id = `${Date.now()}-${randomUUID()}`;
     const msg = {
@@ -130,7 +133,7 @@ export class BridgeCore {
       return JSON.stringify(envelope);
     }
 
-    return `[Discord message from ${envelope.senderName}]
+    return `[Discord message from ${envelope.senderName} (sender ${envelope.senderId}, channel ${envelope.channelId})]
 Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
 
 Message: ${envelope.content}`;

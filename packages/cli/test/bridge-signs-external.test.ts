@@ -2,17 +2,18 @@
  * bridge-signs-external.test.ts — cli#433 slice B2-2.
  *
  * The channel bridge signs every inbound channel message as ITS OWN identity
- * (the bridgeAgentId and its own key, never the host agent's) through the same
- * signing path the other producers use. This suite exercises the REAL producer:
+ * (the bridgeAgentId and its own key, never the host agent's) through the shared
+ * signing helper `signOutboundBody`. This suite exercises the REAL producer:
  * `BridgeCore.handleInbound` writes into a recipient's `new/` and the recipient's
- * real `checkMessages()` promotes it.
+ * real `checkMessages()` promotes it; the `mail watch` consumer then refuses the
+ * external-tier record it emits.
  *
- * Covered here: no bridge key → no write; the bridge identity is the signed
- * sender; the channel author is present only as signed data; a tampered tier
- * fails verification. The bridge-principal-signing-`internal` refusal at
- * promotion is B2-1's (bridge-tier-promotion / mail-trust-ceiling); it is reused,
- * not duplicated. The consumer gate is exercised end to end on the message this
- * producer emits.
+ * Covered here: no bridge key → no mail record is written; the bridge identity is
+ * the signed sender; the channel author is present only as signed data; a tampered
+ * tier fails verification; the real `mail watch` consumer does not present the
+ * external-tier record. A bridge principal's signed tier is CAPPED at `external`
+ * at promotion (the bridge-tier promotion suite is B2-1's); this suite reuses that,
+ * it does not duplicate it.
  */
 import { startFetchFlair } from "./helpers/fetch-flair.js";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -22,8 +23,7 @@ import { tmpdir } from "node:os";
 import { BridgeCore } from "../src/bridge/core.js";
 import type { BridgeAdapter, BridgeEnvelope } from "../src/bridge/adapter.js";
 import { checkMessages, verifyRecordForMailbox } from "../src/utils/mail.js";
-import { externalDispatchRefusal } from "../src/utils/mail-tier.js";
-import { claudeCodeDispatchRefusal } from "../src/utils/claude-code-runtime.js";
+import { watchMail } from "../src/commands/mail-watch.js";
 
 const BRIDGE_ID = "openclaw-bridge"; // a default bridge principal name
 const KERN_SEED = Buffer.alloc(32, 0x61);
@@ -36,6 +36,14 @@ const noopAdapter: BridgeAdapter = {
   async send() {},
   async stop() {},
 };
+
+// A hook that would write a marker file if the consumer presented the record.
+const HOOK_SCRIPT =
+  'const fs=require("fs");let d="";process.stdin.setEncoding("utf8");process.stdin.on("data",(c)=>{d+=c;});process.stdin.on("end",()=>{fs.writeFileSync(process.env.HOOK_OUT,d);});';
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function jsonFiles(dir: string): string[] {
   return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
@@ -111,7 +119,7 @@ describe("channel bridge signs as its own identity (cli#433 slice B2-2)", () => 
     return { record: JSON.parse(readFileSync(join(newDir, file), "utf8")), file };
   }
 
-  test("no bridge key refuses with the named missing-key error and writes nothing", () => {
+  test("no bridge key refuses with the named missing-key error and writes no mail record", () => {
     process.env.TPS_TEST_KEYS_DIR = emptyKeys;
     const c = core();
     let thrown: Error | null = null;
@@ -122,6 +130,11 @@ describe("channel bridge signs as its own identity (cli#433 slice B2-2)", () => 
     }
     expect(thrown).not.toBeNull();
     expect(thrown!.message).toContain(`no Ed25519 private key for agent "${BRIDGE_ID}"`);
+    // The constructor registers the bridge principal regardless of a key, so
+    // "no write" here means no MAIL record: signing runs first, so not even the
+    // recipient inbox is created.
+    expect(existsSync(join(mailDir, ".bridge-principals", `${BRIDGE_ID}.json`))).toBe(true);
+    expect(existsSync(join(mailDir, "kern", "new"))).toBe(false);
     expect(jsonFiles(join(mailDir, "kern", "new"))).toHaveLength(0);
   });
 
@@ -172,13 +185,30 @@ describe("channel bridge signs as its own identity (cli#433 slice B2-2)", () => 
     expect(reason).toContain("signature verification failed");
   });
 
-  test("a consumer applies the external capability set to bridge mail end to end", async () => {
+  test("the real mail watch consumer does not present the external-tier record", async () => {
     emit();
-    const messages = await checkMessages("kern");
-    expect(messages).toHaveLength(1);
-    const msg = messages[0]!;
-    expect(msg.trustTier).toBe("external");
-    expect(externalDispatchRefusal(msg.envelope, msg.from)).not.toBeNull();
-    expect(claudeCodeDispatchRefusal(msg.envelope, msg.from)).toContain("external-tier");
+    const out = join(root, "hook.txt");
+    const seen: string[] = [];
+    let verifications = 0;
+    const watcher = watchMail({
+      agent: "kern",
+      debounceMs: 20,
+      pollMs: 30,
+      watchImpl: () => ({ close() {} }),
+      beforeVerify: async () => { verifications++; },
+      hook: { args: [process.execPath, "-e", HOOK_SCRIPT], env: { HOOK_OUT: out } },
+      onMessage: (msg) => { seen.push(msg.body); },
+    });
+    try {
+      await sleep(300);
+    } finally {
+      watcher.stop();
+    }
+    // The consumer actually processed the record (so the refusal below is the
+    // gate, not a watcher that never ran)…
+    expect(verifications).toBeGreaterThanOrEqual(1);
+    // …and refused it: neither the callback nor the hook saw external-tier mail.
+    expect(seen).toEqual([]);
+    expect(existsSync(out), "the hook never ran").toBe(false);
   });
 });

@@ -71,10 +71,12 @@ describe("BridgeCore inbound formatting", () => {
     expect(from).toBe("test-bridge");
     expect(envelope.from).toBe("test-bridge");
     expect(envelope.trust).toBe("external");
-    expect(envelope.body).toBe(`[Discord message from Anvil]
+    expect(envelope.body).toBe(`[Discord message from Anvil (sender 456, channel 123)]
 Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
 
 Message: hey`);
+    expect(envelope.body).toContain("456");
+    expect(envelope.body).toContain("123");
   });
 
   test("does not prepend conversational header for non-discord messages", async () => {

@@ -4,7 +4,6 @@ import { getAgentInfo } from "../utils/agent-info.js";
 import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js";
 import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
-import { join } from "node:path";
 
 interface RosterArgs {
   action: "list" | "show" | "find" | "invite";
@@ -13,7 +12,6 @@ interface RosterArgs {
   message?: string;
   flairUrl?: string;
   keyPath?: string;
-  mailDir?: string;
   json?: boolean;
   configPath?: string;
 }
@@ -181,10 +179,12 @@ export async function runRoster(args: RosterArgs): Promise<void> {
       }
       const inviteMessage = buildInviteMessage(args.agent, invitedBy);
       const inviteTarget: string = args.agent;
-      // Sign the invite as the inviter and write it through the same signed
-      // delivery path every other producer uses, so the recipient's promote()
-      // can verify it under the recipient's Flair and mailbox policy. With no
-      // inviter key this throws the named missing-key error and writes nothing.
+      // Sign the invite as the inviter and write it through the shared signed
+      // delivery helper (`sendSignedMail` → `sendMessage`), so the recipient's
+      // promote() can verify it under the recipient's Flair and mailbox policy.
+      // `sendMessage` routes to an existing branch-office mailbox for the
+      // recipient, else TPS_MAIL_DIR, else ~/.tps/mail. With no inviter key this
+      // throws the named missing-key error and no mail record is written.
       sendSignedMail(invitedBy, inviteTarget, inviteMessage, {
         rationale: `agent ${invitedBy} roster invite`,
       });
