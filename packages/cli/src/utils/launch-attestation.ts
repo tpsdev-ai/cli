@@ -45,6 +45,7 @@ import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
   buildNonoArgs,
+  approveRuntimeNonoOptions,
   checkProfileLoadable,
   EX_CONFIG,
   isSupervised,
@@ -260,8 +261,6 @@ export interface GrantList {
   allow: string[];
 }
 
-/** The grant list the launcher actually passes, as absolute paths. `--allow-cwd`
- * is always passed by buildNonoArgs, so the cwd is a grant too. */
 export function grantsOfOptions(
   options: NonoOptions,
   extraAllow: readonly string[] = [],
@@ -269,7 +268,7 @@ export function grantsOfOptions(
 ): GrantList {
   return {
     workdir: options.workdir,
-    cwd,
+    cwd: options.cwd ?? cwd,
     read: [...(options.read ?? [])],
     readFiles: [...(options.readFiles ?? []), ...(options.allowFiles ?? [])],
     allow: [...(options.allow ?? []), ...extraAllow],
@@ -735,6 +734,7 @@ export function findBoundSession(
 
 export interface LaunchOptions {
   env?: NodeJS.ProcessEnv;
+  runtimeDirectories?: readonly string[];
   /** Test seam: where the private dir is created (default: $HOME). */
   home?: string;
   /** Test seam: the handshake window for this launch (fixtures shorten it). */
@@ -811,6 +811,10 @@ export async function launchAttested(
   };
 
   try {
+    const socketApproval = approveRuntimeNonoOptions(undefined, { allow: [priv.sockDir] }, env);
+    if (socketApproval.refusal) return refuse(socketApproval.refusal);
+    const socketDirectory = socketApproval.options.allow![0]!;
+
     // (4a) the launcher's own ground truth: IT can read OUTSIDE, outside the
     // sandbox. If not, the canary is not a canary.
     const ownRead = readCanary(priv.outsideCanary);
@@ -822,7 +826,7 @@ export async function launchAttested(
     }
 
     // (4b) the canary must be outside EVERY grant this launch passes.
-    const grants = grantsOfOptions(options, [priv.sockDir]);
+    const grants = grantsOfOptions(options, [socketDirectory]);
     const overlap = coveringGrant(priv.outsideCanary, grants);
     if (overlap) {
       return refuse(
@@ -830,6 +834,10 @@ export async function launchAttested(
           `passes — the private dir must sit at a root no grant covers (a naive mkdtemp under ` +
           `TMPDIR lands in the granted tmpdir)`
       );
+    }
+
+    for (const directory of opts.runtimeDirectories ?? []) {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
     }
 
     // (5) listen BEFORE spawning: the child may connect the moment nono starts it.
@@ -841,7 +849,7 @@ export async function launchAttested(
     // the store `ps` reads is the store this session writes (never inherited).
     const args = buildNonoArgs(
       profile,
-      { ...options, allow: [...(options.allow ?? []), priv.sockDir] },
+      { ...options, allow: [...(options.allow ?? []), socketDirectory] },
       cmd,
       env
     );

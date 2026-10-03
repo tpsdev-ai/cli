@@ -14,14 +14,11 @@ The `tps` CLI is the control plane for the Agent OS.
 
 Sandbox flag values must be exactly `true` or `false`; other values are refused by name.
 
-A selected runtime (`agent start --runtime claude-code|codex|gemini`) takes its
-config directory from an environment variable — `CLAUDE_CONFIG_DIR`,
-`CODEX_HOME`, or the gemini directory under `XDG_CONFIG_HOME`. A directory that
-equals, contains or sits inside `~/.tps/auth`, `~/.tps/identity` or
-`~/.tps/secrets` (compared canonically, symlinks resolved) refuses the sandboxed
-launch before any runner starts, naming the variable and the overlapping root.
-The launch's own directory grants are checked the same way, so a runtime profile
-does not reach another runtime's credentials.
+Selected runtimes use default config directories unless `CLAUDE_CONFIG_DIR`,
+`CODEX_HOME` or `XDG_CONFIG_HOME` overrides them. Their sandboxed launches check
+canonical grants before creating runtime directories and pass approved paths
+to nono. File exceptions permit named files of the launching runtime, the
+launching agent's identity files and named system read files.
 
 ---
 

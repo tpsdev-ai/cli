@@ -28,7 +28,7 @@ import {
   harnessReadFiles,
   runtimeNonoOptions,
   runtimeNonoProfile,
-  runtimeDirCredentialRefusal,
+  approveRuntimeNonoOptions,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -907,22 +907,18 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
               allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
             };
-            // cli#483 — refuse a runtime directory or an inherited launch grant
-            // that overlaps a TPS credential root (or another runtime's
-            // credentials) before any runner starts, with the launch gate's
-            // refusal status. Scoped to a selected runtime: that is the profile
-            // the grants are widened for.
-            const dirRefusal = selectedRuntime
-              ? runtimeDirCredentialRefusal(selectedRuntime, { ...launchOptions, cwd: process.cwd() })
+            const approval = selectedRuntime
+              ? approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId)
               : null;
-            if (dirRefusal) {
-              console.error(`❌ refusing to launch runtime '${selectedRuntime}': ${dirRefusal}`);
+            if (approval?.refusal) {
+              console.error(`❌ refusing to launch runtime '${selectedRuntime}': ${approval.refusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             const exitCode = await launchAttested(
               runtimeNonoProfile(selectedRuntime),
-              launchOptions,
+              approval?.options ?? launchOptions,
               relaunch,
+              { runtimeDirectories: approval?.runtimeDirectories },
             );
             process.exit(exitCode);
           }
