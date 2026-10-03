@@ -469,7 +469,6 @@ for (const rt of RUNTIMES) {
     ["--sandboxRequired=true", "--noSandbox"],
     ["--sandbox-required=true", "--no_sandbox=true"],
     ["--sandbox-required=true", "--no-sandbox=true"],
-    ["--sandbox-required=true", "--no-sandbox=1"],
     ["--sandbox-required=unknown", "--no-sandbox"],
     ["--no-sandbox=unknown"],
     ["--noSandbox", "unknown", "--no-sandbox"],
@@ -488,7 +487,7 @@ for (const rt of RUNTIMES) {
       }
     });
   }
-  for (const value of ["false", "1", "0"]) {
+  for (const value of ["false"]) {
     test(`${rt}: --sandbox-required=${value} reads as false and allows TTY opt-out`, () => {
       const sb = makeSandbox();
       try {
@@ -502,7 +501,7 @@ for (const rt of RUNTIMES) {
       }
     });
   }
-  for (const value of ["false", "0"]) {
+  for (const value of ["false"]) {
     test(`${rt}: --no-sandbox=${value} does not opt out`, () => {
       const sb = makeSandbox();
       try {
@@ -534,7 +533,7 @@ for (const equals of [false, true]) {
 
 for (const rt of RUNTIMES) {
   for (const spelling of ["no-sandbox", "noSandbox"]) {
-    for (const value of ["true", "1"]) {
+    for (const value of ["true"]) {
       test(`${rt}: TTY --${spelling}=${value} starts only the selected runner`, () => {
         const sb = makeSandbox();
         try {
@@ -549,4 +548,37 @@ for (const rt of RUNTIMES) {
       });
     }
   }
+}
+
+for (const rt of RUNTIMES) {
+  for (const spelling of ["sandbox-required", "sandboxRequired", "sandbox", "no-sandbox", "noSandbox", "sandboxed"]) {
+    for (const value of ["1", "0", "yes", "", "TRUE"]) {
+      test(`${rt}: invalid --${spelling}=${value} refuses before any runner`, () => {
+        const sb = makeSandbox();
+        try {
+          const result = interactiveRuntimeProbe(sb, rt, true, false, [`--${spelling}=${value}`]);
+          expect(result.status).toBe(78);
+          expect(result.text).toContain(`--${spelling} accepts only 'true' or 'false'`);
+          expect(existsSync(result.selectedMarker)).toBe(false);
+          expect(existsSync(result.defaultMarker)).toBe(false);
+          expect(fakeNonoRuns(sb)).toEqual([]);
+        } finally {
+          rmSync(sb.root, {recursive: true, force: true});
+        }
+      });
+    }
+  }
+  test(`${rt}: --sandbox=false does not opt out with missing nono`, () => {
+    const sb = makeSandbox();
+    try {
+      const result = interactiveRuntimeProbe(sb, rt, false, false, ["--sandbox=false"]);
+      expect(result.status).toBe(78);
+      expect(result.text).toContain("no nono at the pinned absolute path");
+      expect(existsSync(result.selectedMarker)).toBe(false);
+      expect(existsSync(result.defaultMarker)).toBe(false);
+      expect(fakeNonoRuns(sb)).toEqual([]);
+    } finally {
+      rmSync(sb.root, {recursive: true, force: true});
+    }
+  });
 }

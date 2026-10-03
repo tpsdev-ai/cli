@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import meow from "meow";
-import { launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
+import { enforceLaunchControl, launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
@@ -126,6 +126,9 @@ const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
 
 const helpArgs = parseHelpArgs(process.argv.slice(2));
 
+const launchFlags = readLaunchFlags(process.argv);
+if (launchFlags.refusal) enforceLaunchControl({ argv: process.argv });
+
 const cli = meow(
   `
   Usage
@@ -163,6 +166,9 @@ const cli = meow(
     --help            Show this help text
     --version         Show version number
     --config <path>   Path to openclaw.json (default: auto-discover)
+    --sandbox-required[=true|false]  Require isolation (alias: --sandboxRequired)
+    --no-sandbox      Interactive TTY opt-out; conflicts with required isolation
+    Sandbox flag values: true or false only; --sandbox=false does not opt out
 
   Examples
     $ tps hire developer --name Fred
@@ -200,7 +206,6 @@ const cli = meow(
 );
 
 const [command, ...rest] = cli.input;
-const launchFlags = readLaunchFlags(process.argv, cli.flags);
 
 /**
  * Launch-path control (cli#341 S1a). Fail-closed: refuses `--no-sandbox` outside
@@ -276,7 +281,7 @@ const USAGE: Record<string, string> = {
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
-          "  tps agent start --id <agent-id>\n" +
+          "  tps agent start --id <agent-id> [--runtime <runtime>] [--sandbox-required[=true|false]] [--no-sandbox]\n" +
           "  tps agent health --id <agent-id>\n" +
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +
@@ -543,7 +548,7 @@ async function main() {
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
           "  tps agent run --id <agent-id> --message <text>\n" +
-          "  tps agent start --id <agent-id>\n" +
+          "  tps agent start --id <agent-id> [--runtime <runtime>] [--sandbox-required[=true|false]] [--no-sandbox]\n" +
           "  tps agent health --id <agent-id>\n" +
           "  tps agent logs --id <agent-id> [--lines <N>] [--follow]\n" +
           "  tps agent healthcheck <agent-id>\n" +

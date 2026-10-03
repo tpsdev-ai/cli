@@ -714,18 +714,25 @@ export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<st
   const parse = (args: readonly string[], flags: typeof launchFlagDefinitions | Record<string, never>) =>
     meow("", { importMeta: import.meta, argv: [...args], flags, autoHelp: false, autoVersion: false }).flags;
   const booleanValue = (value: unknown): boolean => {
-    if (value === undefined || value === false || value === "false" || value === 0 || value === "0") return false;
-    if (value === true || value === "true" || value === 1 || value === "1") return true;
+    if (value === undefined || value === false || value === "false") return false;
+    if (value === true || value === "true") return true;
     throw new Error("cannot interpret sandbox flag value");
   };
   try {
-    for (const arg of argv.slice(2)) {
-      if (!arg.startsWith("--") || !arg.includes("=")) continue;
-      const raw = parse([arg], {});
-      if (["sandboxRequired", "noSandbox", "sandbox", "noSandboxRequired"].some(key => Object.hasOwn(raw, key))) {
-        if (!["true", "false", "1", "0"].includes(arg.slice(arg.indexOf("=") + 1))) {
-          throw new Error(`cannot interpret sandbox flag ${arg}`);
-        }
+    for (let i = 2; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg === "--") break;
+      if (!arg.startsWith("--")) continue;
+      const equals = arg.indexOf("=");
+      const name = equals === -1 ? arg : arg.slice(0, equals);
+      const raw = parse([name], {});
+      if (!["sandboxRequired", "noSandbox", "sandbox", "noSandboxRequired", "sandboxed", "noSandboxed"]
+        .some(key => Object.hasOwn(raw, key))) continue;
+      const next = argv[i + 1];
+      const value = equals !== -1 ? arg.slice(equals + 1)
+        : next !== undefined && (!next.startsWith("-") || /^-\d/.test(next)) ? next : undefined;
+      if (value !== undefined && value !== "true" && value !== "false") {
+        throw new Error(`${name} accepts only 'true' or 'false'; received ${JSON.stringify(value)}`);
       }
     }
     const flags = parsedFlags ?? parse(argv.slice(2), launchFlagDefinitions);

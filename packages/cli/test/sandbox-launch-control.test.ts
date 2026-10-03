@@ -243,7 +243,7 @@ describe("T4 — KeepAlive {SuccessfulExit:false} only with exit-0-on-refusal", 
 });
 
 for (const spelling of ["sandbox-required", "sandboxRequired"]) {
-  for (const value of ["true", "false", "1", "0"]) {
+  for (const value of ["true", "false"]) {
     test(`launch gate matches parser for --${spelling}=${value}`, () => {
       const argv = ["node", "tps", "agent", "start", `--${spelling}=${value}`];
       const flags = meow("", {importMeta: import.meta, argv: argv.slice(2),
@@ -258,11 +258,32 @@ for (const spelling of ["sandbox-required", "sandboxRequired"]) {
   }
 }
 for (const spelling of ["no-sandbox", "noSandbox", "no_sandbox"]) {
-  for (const value of ["true", "false", "1", "0"]) {
+  for (const value of ["true", "false"]) {
     test(`non-TTY launch gate interprets --${spelling}=${value}`, () => {
       const result = evaluateLaunchControl({argv: ["node", "tps", `--${spelling}=${value}`],
         interactiveTty: false, supervised: false});
-      expect(result.allowed).toBe(value === "false" || value === "0");
+      expect(result.allowed).toBe(value === "false");
     });
   }
 }
+
+for (const spelling of ["sandbox-required", "sandboxRequired", "sandbox_required",
+  "sandbox", "no-sandbox", "noSandbox", "no_sandbox", "no-sandbox-required", "noSandboxRequired",
+  "sandboxed", "no-sandboxed", "noSandboxed"]) {
+  for (const value of ["1", "0", "yes", "", "TRUE"]) {
+    for (const equals of [true, false]) {
+      test(`invalid raw sandbox value --${spelling}${equals ? "=" : " "}${value} is refused by name`, () => {
+        const args = equals ? [`--${spelling}=${value}`] : [`--${spelling}`, value];
+        const r = runLauncher(["agent", "start", "--runtime", "codex", ...args, "--no-sandbox"]);
+        expect(r.status).toBe(78);
+        expect(output(r)).toContain(`--${spelling} accepts only 'true' or 'false'`);
+      });
+    }
+  }
+}
+
+test("an invalid required value cannot be overwritten by a later valid value", () => {
+  const r = runLauncher(["agent", "start", "--sandbox-required=1", "--sandboxRequired=false", "--no-sandbox"]);
+  expect(r.status).toBe(78);
+  expect(output(r)).toContain("--sandbox-required accepts only 'true' or 'false'");
+});
