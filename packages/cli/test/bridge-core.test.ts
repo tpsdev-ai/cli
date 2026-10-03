@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -14,30 +14,50 @@ function makeTmpDir(): string {
 
 describe("BridgeCore inbound formatting", () => {
   let mailDir: string;
+  let keysDir: string;
+  let savedKeysDir: string | undefined;
 
   beforeEach(() => {
     mailDir = makeTmpDir();
+    keysDir = makeTmpDir();
+    // The bridge signs as its own principal; give it a key.
+    writeFileSync(join(keysDir, "test-bridge.key"), Buffer.alloc(32, 0x42));
+    savedKeysDir = process.env.TPS_TEST_KEYS_DIR;
+    process.env.TPS_TEST_KEYS_DIR = keysDir;
   });
 
   afterEach(() => {
+    if (savedKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+    else process.env.TPS_TEST_KEYS_DIR = savedKeysDir;
     rmSync(mailDir, { recursive: true, force: true });
+    rmSync(keysDir, { recursive: true, force: true });
   });
 
-  test("prepends conversational header for discord metadata channel", async () => {
+  function makeCore(): BridgeCore {
     const adapter: BridgeAdapter = {
       name: "test",
       async start() {},
       async send() {},
       async stop() {},
     };
-
-    const core = new BridgeCore(adapter, {
+    return new BridgeCore(adapter, {
       bridgeAgentId: "test-bridge",
       defaultAgentId: "ember",
       mailDir,
     }, () => {});
+  }
 
-    (core as any).handleInbound({
+  /** The single signed record the bridge wrote into `agent`'s new/. */
+  function readRecord(agent: string): { from: string; envelope: any } {
+    const inbox = join(mailDir, agent, "new");
+    const files = readdirSync(inbox).filter((file) => file.endsWith(".json"));
+    expect(files.length).toBe(1);
+    const record = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
+    return { from: record.from, envelope: JSON.parse(record.body) };
+  }
+
+  test("prepends conversational header for discord metadata channel", async () => {
+    makeCore().handleInbound({
       channel: "openclaw",
       channelId: "123",
       senderId: "456",
@@ -47,30 +67,18 @@ describe("BridgeCore inbound formatting", () => {
       metadata: { channel: "discord" },
     });
 
-    const inbox = join(mailDir, "ember", "new");
-    const files = readdirSync(inbox).filter((file) => file.endsWith(".json"));
-    const msg = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
-    expect(msg.body).toBe(`[Discord message from Anvil]
+    const { from, envelope } = readRecord("ember");
+    expect(from).toBe("test-bridge");
+    expect(envelope.from).toBe("test-bridge");
+    expect(envelope.trust).toBe("external");
+    expect(envelope.body).toBe(`[Discord message from Anvil]
 Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.
 
 Message: hey`);
   });
 
   test("does not prepend conversational header for non-discord messages", async () => {
-    const adapter: BridgeAdapter = {
-      name: "test",
-      async start() {},
-      async send() {},
-      async stop() {},
-    };
-
-    const core = new BridgeCore(adapter, {
-      bridgeAgentId: "test-bridge",
-      defaultAgentId: "ember",
-      mailDir,
-    }, () => {});
-
-    (core as any).handleInbound({
+    makeCore().handleInbound({
       channel: "discord",
       channelId: "123",
       senderId: "456",
@@ -79,10 +87,8 @@ Message: hey`);
       timestamp: new Date().toISOString(),
     });
 
-    const inbox = join(mailDir, "ember", "new");
-    const files = readdirSync(inbox).filter((file) => file.endsWith(".json"));
-    const msg = JSON.parse(readFileSync(join(inbox, files[0]!), "utf-8"));
-    const deliveredEnvelope = JSON.parse(msg.body);
+    const { envelope } = readRecord("ember");
+    const deliveredEnvelope = JSON.parse(envelope.body);
 
     expect(deliveredEnvelope).toMatchObject({
       channel: "discord",

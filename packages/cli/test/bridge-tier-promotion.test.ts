@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { checkMessages, getInbox, recoverPromoted, sendMessage } from "../src/utils/mail.js";
@@ -22,6 +22,11 @@ test("--bridge-agent-id binds sender and receiver; defaults remain external; rec
     process.env.FLAIR_URL = stub.url;
     delete process.env.TPS_BRIDGE_AGENT_ID;
     writeFileSync(process.env.FLAIR_KEY_PATH, seeds.kern);
+    // The bridge signs the inbound as its own principal; give it a key.
+    const bridgeKeys = join(root, "bridge-keys");
+    mkdirSync(bridgeKeys, { recursive: true });
+    writeFileSync(join(bridgeKeys, "custom-bridge.key"), seeds["custom-bridge"]);
+    process.env.TPS_TEST_KEYS_DIR = bridgeKeys;
     const inbox = getInbox("kern");
     child = spawn(process.execPath, [resolve(import.meta.dir, "../bin/tps.ts"), "bridge", "start",
       "--adapter", "stdio", "--bridge-agent-id", "custom-bridge", "--default-agent", "kern", "--mail-dir", process.env.TPS_MAIL_DIR],
@@ -33,6 +38,9 @@ test("--bridge-agent-id binds sender and receiver; defaults remain external; rec
     expect(file, childError).toBeDefined();
     const emitted = JSON.parse(readFileSync(join(inbox.fresh, file!), "utf8"));
     expect(emitted.from).toBe("custom-bridge");
+    const signedInbound = JSON.parse(emitted.body);
+    expect(signedInbound.from).toBe("custom-bridge");
+    expect(signedInbound.trust).toBe("external");
     rmSync(join(inbox.fresh, file!));
     for (const from of [emitted.from, "openclaw-bridge"]) {
       for (const trust of [undefined, "internal", "external", "superuser"]) {
