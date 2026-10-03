@@ -53,7 +53,7 @@ export interface PulseConfig {
   /** Who receives merge-ready and escalation mail. Configured; unset ⇒ the
    *  notification refuses (named error), never a hardcoded person. */
   mergeAuthority?: string;
-  /** The PR author's mail id. Configured; unset ⇒ the transition mail refuses. */
+  /** Configured notification recipient for every PR. */
   author?: string;
   human?: string;
   pollIntervalMs: number;
@@ -412,14 +412,19 @@ export function checkReminders(
   pendingReviews: Record<string, string[]>,
   now: Date = new Date(),
 ): void {
-  for (const [key, instance] of Object.entries(state.instances)) {
-    if (instance.state === "merged") continue;
+  const reminders = Object.entries(state.instances).flatMap(([key, instance]) => {
+    if (instance.state === "merged") return [];
     const pending = pendingReviews[key] ?? [];
-    if (pending.length === 0) continue;
+    if (pending.length === 0) return [];
     const requestedAt = instance.reviewRequestedAt ? Date.parse(instance.reviewRequestedAt) : NaN;
-    if (Number.isNaN(requestedAt)) continue;
+    if (Number.isNaN(requestedAt)) return [];
     const elapsed = now.getTime() - requestedAt;
+    const escalate = elapsed >= (2 * config.remindAfterMs) && !instance.escalatedAt;
+    const escalationRecipient = escalate ? requireMergeAuthority(config) : undefined;
+    return [{ key, instance, pending, elapsed, escalationRecipient }];
+  });
 
+  for (const { key, instance, pending, elapsed, escalationRecipient } of reminders) {
     if (elapsed >= config.remindAfterMs) {
       const lastRemindedAt = instance.lastRemindedAt ? Date.parse(instance.lastRemindedAt) : 0;
       if (!instance.lastRemindedAt || (now.getTime() - lastRemindedAt) >= config.remindAfterMs) {
@@ -436,9 +441,9 @@ export function checkReminders(
       }
     }
 
-    if (elapsed >= (2 * config.remindAfterMs) && !instance.escalatedAt) {
+    if (escalationRecipient) {
       sendMail(
-        requireMergeAuthority(config),
+        escalationRecipient,
         `ESCALATE: PR #${instance.prNumber} has no review after 60 min. Repo: ${instance.repo}. Missing: ${pending.join(", ")}`,
         config,
         sender,
@@ -464,6 +469,8 @@ export function pollOnce(
   const now = new Date().toISOString();
   const pendingReviews: Record<string, string[]> = {};
   const ghAgent = requireGhAgent(config);
+  requireMergeAuthority(config);
+  requireAuthor(config);
 
   for (const repo of config.repos) {
     let prs: GhPr[];
@@ -582,13 +589,15 @@ export function pollOnce(
     for (const [key, inst] of trackedInRepo) {
       if (openNumbers.has(inst.prNumber)) continue;
       // PR is no longer open — check if merged
+      let prData: GhPr;
       try {
-        const prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, ghAgent, runner) as GhPr;
-        if (prData.merged_at) {
-          handleTransition(key, inst, "merged", config, sender, publisher);
-        }
+        prData = ghApi(`repos/${repo}/pulls/${inst.prNumber}`, ghAgent, runner) as GhPr;
       } catch (e: unknown) {
         console.warn(`[pulse] Failed to check closed PR ${key}: ${(e as Error).message}`);
+        continue;
+      }
+      if (prData.merged_at) {
+        handleTransition(key, inst, "merged", config, sender, publisher);
       }
     }
   }

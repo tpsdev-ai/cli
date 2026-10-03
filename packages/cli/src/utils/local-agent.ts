@@ -1,5 +1,5 @@
 /**
- * local-agent.ts — the invoking agent's own id, resolved from configuration.
+ * local-agent.ts — resolve the requested local agent ID.
  *
  * The local agent id comes from an explicit argument or `TPS_AGENT_ID`; a
  * caller that needs it and has neither refuses with a named error instead of

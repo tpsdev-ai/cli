@@ -800,3 +800,109 @@ describe("pulse identity (cli#397)", () => {
     expect(() => pollOnce(config, state, runner, () => {})).toThrow(/gh agent/);
   });
 });
+
+
+describe("polling recipient refusal", () => {
+  for (const path of ["new", "pre-existing", "existing"] as const) {
+    for (const [computed, review, missing, message] of [
+      ["approved", "APPROVED", "mergeAuthority", /merge authority/],
+      ["changes-requested", "CHANGES_REQUESTED", "author", /author/],
+      ["merged", "APPROVED", "author", /author/],
+    ] as const) {
+      test(`${path} ${computed} leaves state unchanged without ${missing}`, () => {
+        const config = makeConfig();
+        delete config[missing];
+        const key = "pr:tpsdev-ai/cli#42";
+        const state = makeState(path === "existing" ? { [key]: makeInstance({ state: "reviewing" }) } : {});
+        const before = structuredClone(state);
+        const { calls, sender } = trackMails();
+        let publishes = 0;
+        const runner: SyncRunner = (_cmd, args) => ({
+          status: 0,
+          stdout: JSON.stringify(args[2].includes("/reviews")
+            ? [{ state: review, user: { login: "tps-sherlock" } }]
+            : [{ number: 42, title: "Changed title", state: "open",
+                merged_at: computed === "merged" ? new Date().toISOString() : null,
+                created_at: new Date(Date.now() + (path === "pre-existing" ? -60000 : 60000)).toISOString() }]),
+          stderr: "",
+        }) as ReturnType<SyncRunner>;
+        expect(() => pollOnce(config, state, runner, sender, async () => { publishes++; })).toThrow(message);
+        expect(state).toEqual(before);
+        expect(calls).toEqual([]);
+        expect(publishes).toBe(0);
+      });
+    }
+  }
+
+  test("tracked closed PR refuses missing author before changing state", () => {
+    const config = makeConfig({ author: undefined });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": makeInstance({ state: "approved" }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    let publishes = 0;
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "",
+      stdout: JSON.stringify(args[2].includes("/pulls?") ? [] : { merged_at: new Date().toISOString() }),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender, async () => { publishes++; })).toThrow(/author/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+    expect(publishes).toBe(0);
+  });
+
+  test("unchanged approved PR refuses missing merge recipient before changing title", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const state = makeState({ "pr:tpsdev-ai/cli#42": makeInstance({ state: "approved" }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "", stdout: JSON.stringify(
+      args[2].includes("/reviews") ? [{ state: "APPROVED", user: { login: "tps-sherlock" } }]
+      : args[2].includes("/status") ? { state: "success" }
+      : [{ number: 42, title: "Changed title", state: "open", merged_at: null, head: { sha: "test" } }]),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender)).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  test("poll reminder escalation refuses before an existing title changes", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const key = "pr:tpsdev-ai/cli#42";
+    const state = makeState({ [key]: makeInstance({ reviewRequestedAt: new Date(0).toISOString() }) });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    const runner: SyncRunner = (_cmd, args) => ({ status: 0, stderr: "", stdout: JSON.stringify(
+      args[2].includes("/reviews") ? [] : [{ number: 42, title: "Changed title", state: "open", merged_at: null }]),
+    }) as ReturnType<SyncRunner>;
+    expect(() => pollOnce(config, state, runner, sender)).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  test("missing escalation recipient prevents reminders for earlier instances", () => {
+    const config = makeConfig({ mergeAuthority: undefined });
+    const state = makeState({
+      first: makeInstance({ reviewRequestedAt: "2026-01-01T00:30:00Z" }),
+      second: makeInstance({ reviewRequestedAt: "2026-01-01T00:00:00Z" }),
+    });
+    const before = structuredClone(state);
+    const { calls, sender } = trackMails();
+    expect(() => checkReminders(state, config, sender, { first: ["sherlock"], second: ["kern"] }, new Date("2026-01-01T01:05:00Z"))).toThrow(/merge authority/);
+    expect(state).toEqual(before);
+    expect(calls).toEqual([]);
+  });
+
+  for (const lastRemindedAt of [undefined, "2026-01-01T00:01:00Z"]) {
+    test(`escalation refuses before reminder mail or state (${lastRemindedAt ?? "first reminder"})`, () => {
+      const config = makeConfig({ mergeAuthority: undefined });
+      const key = "pr:tpsdev-ai/cli#42";
+      const state = makeState({ [key]: makeInstance({
+        reviewRequestedAt: "2026-01-01T00:00:00Z", lastRemindedAt,
+      }) });
+      const before = structuredClone(state);
+      const { calls, sender } = trackMails();
+      expect(() => checkReminders(state, config, sender, { [key]: ["sherlock"] }, new Date("2026-01-01T01:05:00Z"))).toThrow(/merge authority/);
+      expect(state).toEqual(before);
+      expect(calls).toEqual([]);
+    });
+  }
+});
