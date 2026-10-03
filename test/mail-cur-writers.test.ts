@@ -314,7 +314,7 @@ describe("cli#380: no unlisted detected writer of a cur/ directory", () => {
     expect(stale).toEqual([]);
   });
 
-  test("every record updater delegates to the helper", () => {
+  test("listed record updaters delegate to the helper", () => {
     for (const [file, names] of [
       ["packages/cli/src/utils/mail.ts", ["checkMessages", "setBridgeSentAtPath", "ackMessageAtPath", "nackMessage"]],
       ["plugins/openclaw-tps-mail/src/index.ts", ["patchMailFile"]],
