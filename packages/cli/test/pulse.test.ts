@@ -756,16 +756,10 @@ describe("mail send failure resilience", () => {
 });
 
 // ---------------------------------------------------------------------------
-// pulse identity (cli#397)
-//
-// pulse runs under its own principal and never sends mail as another agent.
-// mergeAuthority and ghAgent come from configuration; with neither set, the
-// feature that needs it refuses with a named error rather than falling back
-// to a person's id.
-// ---------------------------------------------------------------------------
+// Pulse notification mail uses its own principal.
 
 describe("pulse identity (cli#397)", () => {
-  test("notification mail is signed as pulse, never as the gh agent", () => {
+  test("notification sender receives pulse rather than the gh agent", () => {
     const config = makeConfig({ ghAgent: "some-gh-agent" });
     const { calls, sender } = trackMails();
     const instance = makeInstance({ state: "reviewing" });
@@ -776,16 +770,25 @@ describe("pulse identity (cli#397)", () => {
     expect(calls[0].agentId).toBe("pulse");
   });
 
-  test("handleTransition refuses a merge-ready mail with no mergeAuthority", () => {
-    const config = makeConfig();
-    delete config.mergeAuthority;
-    const { sender } = trackMails();
-    const instance = makeInstance({ state: "reviewing" });
-
-    expect(() =>
-      handleTransition("pr:tpsdev-ai/cli#42", instance, "approved", config, sender),
-    ).toThrow(/merge authority/);
-  });
+  for (const [newState, missing, message] of [
+    ["approved", "mergeAuthority", /merge authority/],
+    ["changes-requested", "author", /author/],
+    ["merged", "author", /author/],
+  ] as const) {
+    test(`handleTransition refuses ${newState} without ${missing} before state or publish`, () => {
+      const config = makeConfig();
+      delete config[missing];
+      const { calls, sender } = trackMails();
+      const instance = makeInstance({ state: "reviewing" });
+      const before = structuredClone(instance);
+      let publishes = 0;
+      const publisher = async () => { publishes++; };
+      expect(() => handleTransition("pr:tpsdev-ai/cli#42", instance, newState, config, sender, publisher)).toThrow(message);
+      expect(instance).toEqual(before);
+      expect(publishes).toBe(0);
+      expect(calls).toEqual([]);
+    });
+  }
 
   test("pollOnce refuses to poll with no ghAgent", () => {
     const config = makeConfig();

@@ -33,6 +33,7 @@ describe("handleGithubWebhook", () => {
     root = mkdtempSync(join(tmpdir(), "tps-gh-webhook-"));
     process.env.HOME = root;
     process.env.GITHUB_WEBHOOK_TARGET = "host";
+    process.env.GITHUB_WEBHOOK_AGENT_ID = "webhook-agent";
     process.env.GITHUB_WEBHOOK_SECRET = "testsecret";
   });
 

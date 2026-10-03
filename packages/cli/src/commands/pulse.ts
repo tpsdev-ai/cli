@@ -316,6 +316,9 @@ export function handleTransition(
   const oldState = instance.state;
   if (oldState === newState) return;
 
+  if (newState === "approved") requireMergeAuthority(config);
+  if (newState === "changes-requested" || newState === "merged") requireAuthor(config);
+
   const now = new Date().toISOString();
   instance.history.push({ at: now, from: oldState, to: newState });
   instance.state = newState;

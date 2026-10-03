@@ -146,7 +146,7 @@ export function readManifest(): CredentialsManifest | null {
   try {
     const obj = JSON.parse(raw) as CredentialsManifest;
     if (obj.version !== 1) return null;
-    return obj;
+    return { ...obj, agents: agentsOf(obj) };
   } catch {
     return null;
   }
@@ -236,7 +236,12 @@ export function inferOwnerFromName(
 // ---------------------------------------------------------------------------
 
 function agentsOf(manifest: CredentialsManifest | null): ConfiguredAgent[] {
-  return manifest?.agents ?? [];
+  const agents = manifest?.agents;
+  if (!Array.isArray(agents) || !agents.every((a) =>
+    a !== null && typeof a === "object" && typeof a.id === "string" &&
+    /^[a-zA-Z0-9_-]{1,64}$/.test(a.id)
+  )) return [];
+  return agents.map((a) => ({ id: a.id, local: a.local === true, keyringPat: a.keyringPat === true }));
 }
 
 /** Agent ids configured in the manifest. Absent/empty ⇒ [] (no default). */

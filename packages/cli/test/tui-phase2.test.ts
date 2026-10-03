@@ -6,31 +6,13 @@
  * recipient list is configuration (the credentials manifest), not a
  * hardcoded agent list.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { sendMailAction } from "../src/commands/tui.js";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { manifestPath, writeManifest } from "../src/utils/credentials-manifest.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
-
-/** Mirrors the sendMailAction logic for testing purposes. */
-function sendMailAction(
-  _agentId: string,
-  to: string,
-  body: string,
-  execFn: (cmd: string) => void,
-  knownAgents: string[] = [],
-): { ok: boolean; err?: string } {
-  if (!knownAgents.includes(to)) {
-    return { ok: false, err: `Unknown agent: ${to}` };
-  }
-  if (!body.trim()) {
-    return { ok: false, err: "Body cannot be empty" };
-  }
-  try {
-    execFn(`mail send ${to} ${JSON.stringify(body)}`);
-    return { ok: true };
-  } catch (e: unknown) {
-    return { ok: false, err: (e as Error).message?.slice(0, 80) ?? "send failed" };
-  }
-}
 
 /** Mirrors compose state transitions. */
 type ComposeState = "idle" | "composing" | "sending" | "done" | "error";
@@ -62,42 +44,54 @@ function transitionCompose(
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 describe("sendMailAction", () => {
+  let saved: string | undefined;
   const known = ["alice", "bob"];
+  beforeEach(() => {
+    saved = existsSync(manifestPath()) ? readFileSync(manifestPath(), "utf8") : undefined;
+    mkdirSync(dirname(manifestPath()), { recursive: true });
+    writeManifest({ version: 1, credentials: {}, agents: known.map((id) => ({ id })) });
+  });
+  afterEach(() => {
+    if (saved === undefined) rmSync(manifestPath(), { force: true });
+    else writeFileSync(manifestPath(), saved);
+  });
+  const execOk = (() => ({ status: 0, stdout: "", stderr: "" })) as Parameters<typeof sendMailAction>[3];
 
   it("rejects an unknown agent", () => {
-    const result = sendMailAction("carol", "stranger", "hello", () => {}, known);
+    const result = sendMailAction("carol", "stranger", "hello", execOk);
     expect(result.ok).toBe(false);
     expect(result.err).toContain("Unknown agent");
   });
 
   it("rejects an empty recipient list (unconfigured)", () => {
-    const result = sendMailAction("carol", "alice", "hello", () => {});
+    writeManifest({ version: 1, credentials: {}, agents: [] });
+    const result = sendMailAction("carol", "alice", "hello", execOk);
     expect(result.ok).toBe(false);
     expect(result.err).toContain("Unknown agent");
   });
 
   it("rejects empty body", () => {
-    const result = sendMailAction("carol", "alice", "   ", () => {}, known);
+    const result = sendMailAction("carol", "alice", "   ", execOk);
     expect(result.ok).toBe(false);
     expect(result.err).toContain("empty");
   });
 
   it("returns ok on successful exec", () => {
-    const result = sendMailAction("carol", "alice", "hello", () => {}, known);
+    const result = sendMailAction("carol", "alice", "hello", execOk);
     expect(result.ok).toBe(true);
   });
 
   it("returns error on exec failure", () => {
     const result = sendMailAction("carol", "bob", "test", () => {
       throw new Error("mail daemon unavailable");
-    }, known);
+    });
     expect(result.ok).toBe(false);
     expect(result.err).toContain("mail daemon unavailable");
   });
 
   it("accepts every configured agent", () => {
     for (const agent of known) {
-      const result = sendMailAction("carol", agent, "ping", () => {}, known);
+      const result = sendMailAction("carol", agent, "ping", execOk);
       expect(result.ok).toBe(true);
     }
   });

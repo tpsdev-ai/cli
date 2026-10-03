@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
@@ -802,7 +803,7 @@ async function main() {
         const healthInterval = process.argv.find((a: string) => a.startsWith("--interval="))?.split("=")[1];
         await runOfficeHealth({
           flairUrl: process.env.FLAIR_URL,
-          viewerId: process.env.TPS_AGENT_ID ?? "anvil",
+          viewerId: requireLocalAgentId("office health viewer id", cli.flags.agent ?? cli.flags.id ?? rest[1]),
           interval: healthInterval ? Number(healthInterval) : 60,
           json: cli.flags.json as boolean | undefined,
           local: process.argv.includes("--local"),
@@ -1590,13 +1591,13 @@ async function main() {
 
     case "tui":
     case "ui": {
+      const tuiAgentId = requireLocalAgentId("TUI agent id", cli.flags.agent ?? cli.flags.id ?? rest[0]);
       const { TuiApp } = await import("../src/commands/tui.js");
       const { render } = await import("ink");
       const React = (await import("react")).default;
       const { join: tuiJoin } = await import("node:path");
       const { homedir: tuiHomedir } = await import("node:os");
       const tuiMailDir = (cli.flags["mail-dir"] as string | undefined) ?? tuiJoin(tuiHomedir(), ".tps", "mail");
-      const tuiAgentId = (cli.flags.agent as string | undefined) ?? (cli.flags.id as string | undefined) ?? rest[0] ?? "anvil";
       const tuiRepoRaw = (cli.flags.repo as string | undefined) ?? "tpsdev-ai/cli";
       const tuiRepo = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(tuiRepoRaw) ? tuiRepoRaw : "tpsdev-ai/cli";
       if (tuiRepo !== tuiRepoRaw) console.warn(`[tui] Invalid --repo value ignored: ${tuiRepoRaw}`);

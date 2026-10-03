@@ -1,80 +1,50 @@
-/**
- * no-identity-in-src.test.ts — cli#397.
- *
- * No source file under packages/cli/src may name a person as a hardcoded
- * principal or default. A bare string literal equal to a known agent id means
- * the code acts as, or defaults to, that id with nobody configuring it: a TUI
- * that can approve/merge, or a daemon whose mail is signed, as that agent.
- * The fix is configuration (cli#397); this test keeps it that way.
- *
- * Detection: parse each .ts with the TypeScript parser and collect every
- * string literal (and substitution-free template literal) whose text is
- * exactly one of the ids. Comments are excluded by the parser, so a comment
- * that attributes work to a person is not a hit.
- *
- * ALLOWLIST holds the genuine non-identity uses — a `~/.tps/pulse` path
- * segment, a memory tag — and the identity defaults still owned by an open
- * PR, each with a reason. A NEW occurrence anywhere, including these files,
- * still fails: the allowlist is per file+id, not a blanket skip.
- */
+// Scan known agent literals in src/ and bin/; exceptions pin one literal and line.
 import { describe, expect, test } from "bun:test";
 import ts from "typescript";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
+import { load } from "js-yaml";
 
-const SRC = join(import.meta.dir, "..", "src");
-const IDS = ["flint", "kern", "sherlock", "anvil", "heskew", "pulse"];
-
-interface AllowEntry {
-  ids: string[];
-  reason: string;
-}
-
-const ALLOWLIST: Record<string, AllowEntry> = {
-  "commands/office-health.ts": {
-    ids: ["pulse"],
-    reason: "`~/.tps/pulse` state-path segment, not an identity",
-  },
-  "commands/pulse.ts": {
-    ids: ["pulse"],
-    reason: "pulse's own principal, the `~/.tps/pulse` state dir, and a memory tag",
-  },
-  // Identity defaults in files an open PR owns; not touched by cli#397.
-  "bridge/core.ts": {
-    ids: ["anvil"],
-    reason: "identity default in a file owned by open PR cli#484",
-  },
-  "commands/agent.ts": {
-    ids: ["anvil"],
-    reason: "identity default in a file owned by open PR cli#474",
-  },
-  "commands/roster.ts": {
-    ids: ["anvil"],
-    reason: "identity default in a file owned by open PR cli#484",
-  },
+const CLI = join(import.meta.dir, "..");
+const manifest = load(readFileSync(join(CLI, "..", "..", "manifests", "dev-team.yaml"), "utf8")) as {
+  manager: { name: string }; agents: { name: string }[];
 };
+const IDS = new Set([
+  "flint", "kern", "sherlock", "anvil", "heskew", "pulse", "ember", "nathan",
+  "gauge", "canary", "pixel", "quill", "reed", "adjudicator", "smoke-1781024342351-1343f65d", "smoke-test-auth-check",
+  manifest.manager.name.toLowerCase(), ...manifest.agents.map((a) => a.name.toLowerCase()),
+]);
+
+interface AllowEntry { file: string; literal: string; context: string; reason: string }
+const ALLOWLIST: AllowEntry[] = [
+  { file: "src/commands/office-health.ts", literal: '"pulse"', context: 'return join(homeDir(), ".tps", "pulse", "state.json");', reason: "state-path segment" },
+  { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'export const PULSE_AGENT_ID = "pulse";', reason: "notification sender's own principal" },
+  { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'return join(homeDir(), ".tps", "pulse");', reason: "state-path segment" },
+  { file: "src/commands/pulse.ts", literal: '"pulse"', context: 'tags: ["pulse", "pr-lifecycle", to],', reason: "memory tag" },
+  { file: "src/bridge/core.ts", literal: '"anvil"', context: 'this.defaultAgentId = config.defaultAgentId ?? "anvil";', reason: "follow-up: cli#484 merged, but this default remains on the merge base" },
+  { file: "src/commands/agent.ts", literal: '"anvil"', context: 'const scopeAgentId = process.env.TPS_AGENT_ID ?? "anvil";', reason: "identity default owned by open PR cli#474" },
+  { file: "src/commands/roster.ts", literal: '"anvil"', context: 'const viewerId = opts.agentId ?? process.env.TPS_AGENT_ID ?? "anvil";', reason: "follow-up: cli#484 merged, but this default remains on the merge base" },
+  { file: "bin/tps.ts", literal: '"pulse"', context: 'case "pulse": {', reason: "command dispatch" },
+];
 
 function sourceFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const p = join(dir, entry);
-    if (statSync(p).isDirectory()) out.push(...sourceFiles(p));
-    else if (p.endsWith(".ts")) out.push(p);
-  }
-  return out;
+  return readdirSync(dir).flatMap((name) => {
+    const path = join(dir, name);
+    return statSync(path).isDirectory() ? sourceFiles(path) : /\.(?:[cm]?js|tsx?)$/.test(path) ? [path] : [];
+  });
 }
 
-function bareIdLiterals(file: string): { line: number; id: string }[] {
-  const src = readFileSync(file, "utf-8");
-  const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const found: { line: number; id: string }[] = [];
+function offenders(file: string, src: string, allowed = ALLOWLIST): string[] {
+  const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true);
+  const unused = [...allowed];
+  const found: string[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) {
-      const text = node.text.trim();
-      if (IDS.includes(text)) {
-        const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line + 1;
-        found.push({ line, id: text });
-      }
+    if ((ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) && IDS.has(node.text.trim().toLowerCase())) {
+      const line = sf.getLineAndCharacterOfPosition(node.getStart(sf)).line;
+      const context = src.split(/\r?\n/)[line]!.trim();
+      const index = unused.findIndex((a) => a.file === file && a.literal === node.getText(sf) && a.context === context);
+      if (index >= 0) unused.splice(index, 1);
+      else found.push(`${file}:${line + 1}: ${node.text}`);
     }
     ts.forEachChild(node, visit);
   };
@@ -82,21 +52,27 @@ function bareIdLiterals(file: string): { line: number; id: string }[] {
   return found;
 }
 
-describe("no identity in source (cli#397)", () => {
-  test("no known agent id is a hardcoded principal/default under packages/cli/src", () => {
-    const files = sourceFiles(SRC);
+describe("known identity literals (cli#397)", () => {
+  test("src and shipped bin literals have occurrence-pinned exceptions", () => {
+    const files = [join(CLI, "src"), join(CLI, "bin")].flatMap(sourceFiles);
     expect(files.length).toBeGreaterThan(0);
-
-    const offenders: string[] = [];
-    for (const file of files) {
-      const rel = relative(SRC, file);
-      const allowed = ALLOWLIST[rel];
-      for (const hit of bareIdLiterals(file)) {
-        if (allowed?.ids.includes(hit.id)) continue;
-        offenders.push(`${rel}:${hit.line}: ${hit.id}`);
-      }
+    expect(files.flatMap((f) => offenders(relative(CLI, f), readFileSync(f, "utf8")))).toEqual([]);
+  });
+  test("each exception still pins one existing occurrence", () => {
+    for (const entry of ALLOWLIST) {
+      const lines = readFileSync(join(CLI, entry.file), "utf8").split(/\r?\n/).filter((line) => line.trim() === entry.context);
+      expect(lines).toHaveLength(1);
+      expect(offenders(entry.file, lines[0]!, [])).toHaveLength(1);
     }
-
-    expect(offenders).toEqual([]);
+  });
+  test("a new literal in every allowlisted file fails, even with identical context", () => {
+    for (const entry of ALLOWLIST) {
+      expect(entry.reason).not.toBeEmpty();
+      expect(offenders(entry.file, `${entry.context}\n${entry.context}`, [entry])).toHaveLength(1);
+      expect(offenders(entry.file, `${entry.context}\nconst regression = "nathan";`, [entry])).toHaveLength(1);
+    }
+  });
+  test("all known ids, including manifest agents, are detected in bin", () => {
+    for (const id of IDS) expect(offenders("bin/probe.ts", `const regression = ${JSON.stringify(id)};`)).toHaveLength(1);
   });
 });

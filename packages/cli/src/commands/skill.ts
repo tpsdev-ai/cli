@@ -4,6 +4,7 @@
  * Manages skill assignments as Soul records in Flair.
  * Skills are knowledge packages — not executable code.
  */
+import { requireLocalAgentId } from "../utils/local-agent.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -176,8 +177,7 @@ async function scanSkill(args: SkillArgs): Promise<void> {
     process.exit(1);
   }
 
-  // Use a default agent ID for scan-only (read-only operation)
-  const agentId = args.agent ?? process.env.TPS_AGENT_ID ?? "nathan";
+  const agentId = requireLocalAgentId("skill scan agent id", args.agent);
   const flair = createFlairClient(agentId, args.flairUrl, defaultFlairKeyPath(agentId));
   const result = await flair.scanSkill(content);
 

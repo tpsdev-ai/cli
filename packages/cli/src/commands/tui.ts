@@ -147,11 +147,16 @@ function fetchTasks(): string[] {
 
 const AGENT_NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 
-function sendMailAction(agentId: string, to: string, body: string): { ok: boolean; err?: string } {
+export function sendMailAction(
+  agentId: string, to: string, body: string,
+  execFn: typeof spawnSync = spawnSync,
+): { ok: boolean; err?: string } {
+  if (!configuredAgentIds().includes(to)) return { ok: false, err: `Unknown agent: ${to}` };
+  if (!body.trim()) return { ok: false, err: "Body cannot be empty" };
   if (!AGENT_NAME_RE.test(to)) return { ok: false, err: `invalid recipient: ${to}` };
   try {
     const tpsBin = join(homedir(), "ops", "tps", "packages", "cli", "bin", "tps.ts");
-    const r = spawnSync("bun", [tpsBin, "mail", "send", to, body], {
+    const r = execFn("bun", [tpsBin, "mail", "send", to, body], {
       encoding: "utf-8",
       timeout: 8000,
       env: { ...process.env, TPS_AGENT_ID: agentId },
@@ -427,11 +432,6 @@ export function TuiApp({
   // Compose submit
   const handleComposeSubmit = useCallback(() => {
     if (!composeData.to.trim() || !composeData.body.trim()) return;
-    if (!configuredAgentIds().includes(composeData.to.trim())) {
-      setComposeState("error");
-      setComposeError(`Unknown agent: ${composeData.to}`);
-      return;
-    }
     setComposeState("sending");
     const result = sendMailAction(agentId, composeData.to.trim(), composeData.body.trim());
     if (result.ok) {

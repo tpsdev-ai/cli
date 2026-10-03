@@ -31,7 +31,9 @@ function webhookTarget(): string {
 }
 
 function webhookAgentId(): string {
-  return process.env.GITHUB_WEBHOOK_AGENT_ID ?? "ember";
+  const id = process.env.GITHUB_WEBHOOK_AGENT_ID;
+  if (!id) throw new Error("GITHUB_WEBHOOK_AGENT_ID env var required");
+  return id;
 }
 
 function defaultReviewEventPublisher(agentId: string): ReviewRerequestedPublisher {
