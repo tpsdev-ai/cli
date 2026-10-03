@@ -1,3 +1,4 @@
+import { mailboxReplayStore } from "@tpsdev-ai/agent";
 /**
  * reply-obligation.test.ts — slice S2 of the reply-OBLIGATION work (the
  * follow-up to cli#392's S0/S1).
@@ -251,10 +252,14 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       for (const file of readdirSafe(resolve(tempMailDir, agentId, "cur"))) {
         const path = resolve(tempMailDir, agentId, "cur", file);
         const record = JSON.parse(readFileSync(path, "utf8"));
-        if (record.envelope) continue;
+        if (record.envelope) {
+          mailboxReplayStore(resolve(tempMailDir, agentId)).recordConsumed(record.envelope.messageId);
+          continue;
+        }
         const envelope = JSON.parse(record.body);
         writeFileSync(path, JSON.stringify({ ...record, body: envelope.body, timestamp: envelope.timestamp,
           envelopeId: envelope.messageId, envelope, replyToId: envelope.replyToId }));
+        mailboxReplayStore(resolve(tempMailDir, agentId)).recordConsumed(envelope.messageId);
       }
     }
     const startPromise = capturedPlugin.gateway.startAccount(ctx);

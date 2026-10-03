@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { isTopicRecipient, verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
+import { decideEnvelopeForMailbox, parseSignedEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { assertValidBody, sendMessage } from "./mail.js";
 import { signOutboundBody } from "./mail-sign.js";
@@ -288,15 +288,12 @@ export async function catchUpTopics(agentId: string, topics?: string[], config: 
       }
       let envelope: Envelope;
       try {
-        envelope = JSON.parse(entry.envelope);
+        const parsed = parseSignedEnvelope(entry.envelope);
+        if (!parsed.ok) throw new Error(parsed.reason);
+        envelope = parsed.envelope;
         if (!envelope || envelope.from !== entry.from || envelope.body !== entry.body
           || envelope.to !== `topic:${topic}` || entry.topic !== topic
-          || envelope.messageId !== entry.id || envelope.timestamp !== entry.timestamp
-          || typeof envelope.body !== "string" || typeof envelope.from !== "string"
-          || !Array.isArray(envelope.delegationChain) || typeof envelope.signature !== "string"
-          || !envelope.delegationChain.every((hop) => hop && typeof hop.agent === "string"
-            && (hop.kind === "agent" || hop.kind === "human")
-            && (hop.signature === null || typeof hop.signature === "string"))) {
+          || envelope.messageId !== entry.id || envelope.timestamp !== entry.timestamp) {
           throw new Error("topic log/envelope mismatch");
         }
       } catch {
@@ -305,20 +302,19 @@ export async function catchUpTopics(agentId: string, topics?: string[], config: 
         continue;
       }
       try {
-        const verified = await verifyEnvelope(envelope, await createMailVerifyClient(agentId, config));
+        const verified = await decideEnvelopeForMailbox(agentId, envelope, entry.from, await createMailVerifyClient(agentId, config));
         if (!verified.ok) {
-          const reason = /^agent (.+) not found in Flair$/.test(verified.reason)
-            ? "unresolvable-principal" : "invalid-envelope";
+          if (verified.class === "wrong-recipient") {
+            swarn(`topic-catch-up-recipient-policy-unavailable: retry ${topic}/${entry.id}`);
+            return delivered;
+          }
+          const reason = verified.class === "unresolvable-principal" ? "unresolvable-principal" : "invalid-envelope";
           swarn(`topic-catch-up-${reason}: skipping ${topic}/${entry.id}`);
           updateCursor(agentId, topic, `@${entry.id}`);
           continue;
         }
       } catch {
         swarn(`topic-catch-up-verification-unavailable: retry ${topic}/${entry.id}`);
-        return delivered;
-      }
-      if (!isTopicRecipient(envelope.to, agentId, envelope.from)) {
-        swarn(`topic-catch-up-recipient-policy-unavailable: retry ${topic}/${entry.id}`);
         return delivered;
       }
       if (envelope.from === agentId) {

@@ -6,7 +6,8 @@
  */
 
 import crypto from "node:crypto";
-import { readFileSync, existsSync } from "node:fs";
+import { decodeRegistryPublicKey } from "../lib/registry-key.js";
+import { readPrivateKeyAtPath } from "../lib/agent-keys.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { FlairConfig } from "../runtime/types.js";
@@ -30,6 +31,10 @@ export interface FlairSoulEntry {
   value: string;
 }
 
+class FlairHttpError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
+
 export class FlairContextProvider {
   private readonly url: string;
   private readonly agentId: string;
@@ -50,17 +55,14 @@ export class FlairContextProvider {
     const nonce = crypto.randomUUID();
     const payload = `${this.agentId}:${ts}:${nonce}:${method}:${path}`;
 
-    if (!existsSync(this.keyPath)) {
+    const seed = readPrivateKeyAtPath(this.keyPath);
+    if (!seed) {
       throw new Error(`Flair key not found at ${this.keyPath}. Run: tps agent create --id ${this.agentId}`);
     }
-
-    const raw = readFileSync(this.keyPath, "utf-8").trim();
-    let key;
-    if (raw.startsWith("-----")) {
-      key = crypto.createPrivateKey(raw);
-    } else {
-      key = crypto.createPrivateKey({ key: Buffer.from(raw, "base64"), format: "der", type: "pkcs8" });
-    }
+    const key = crypto.createPrivateKey({
+      key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]),
+      format: "der", type: "pkcs8",
+    });
     const sig = crypto.sign(null, Buffer.from(payload), key);
     return `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
   }
@@ -76,7 +78,7 @@ export class FlairContextProvider {
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
-      throw new Error(`Flair ${method} ${path} → ${res.status}: ${txt}`);
+      throw new FlairHttpError(`Flair ${method} ${path} → ${res.status}: ${txt}`, res.status);
     }
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
@@ -93,25 +95,16 @@ export class FlairContextProvider {
     }
   }
 
-  /**
-   * Resolve an agent from Flair.
-   *
-   * Distinguishes "Flair says this principal does not exist" (return null) from
-   * "Flair could not be reached" (THROW). The signature verifier built on this
-   * would otherwise see null for BOTH and dead-letter every message as a
-   * terminal "principal not found" for the duration of a Flair outage. The
-   * shared mail-verify client applies the same null→ping→throw rule; the two
-   * must not diverge.
-   */
+  /** Return null only for a not-found response; other failures throw. */
   async getAgent(name: string): Promise<FlairAgent | null> {
     try {
-      return await this.req<FlairAgent>("GET", `/Agent/${name}`);
-    } catch {
-      // Either the agent is absent (a reachable 404) or Flair is unreachable.
-      if (!(await this.ping())) {
-        throw new Error(`Flair unreachable at ${this.url} while resolving agent "${name}"`);
-      }
-      return null;
+      const agent = await this.req<FlairAgent>("GET", `/Agent/${encodeURIComponent(name)}`);
+      if (!agent || typeof agent.publicKey !== "string") throw new Error("invalid principal record");
+      decodeRegistryPublicKey(agent.publicKey);
+      return agent;
+    } catch (err) {
+      if (err instanceof FlairHttpError && err.status === 404) return null;
+      throw err;
     }
   }
 

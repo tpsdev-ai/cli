@@ -51,18 +51,17 @@
  *     (hook always landed in `main` session, accumulating noise).
  */
 
-import { randomBytes, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, mailRootForRecordPath, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
-import { mailLockPath, tryAcquireMailLock } from "@tpsdev-ai/cli/utils/mail-lock";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
 import {
   TERMINAL_STATES,
@@ -620,98 +619,23 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
 }
 
 /**
- * ONE locked, existing-only writer for a cur/ record — cli#469's rule, applied
- * where it reaches the plugin. Every ack/nack stamp written AFTER a durable
- * terminal transition goes through this, and only this:
- *
- *   - it REUSES the CLI's own mailbox lock (`tryAcquireMailLock` from
- *     `@tpsdev-ai/cli/utils/mail-lock`), so the plugin's stamp coordinates with
- *     the CLI's `promote()` — both lock the same `<mailDir>/<agent>/.mail-lock`;
- *   - it is EXISTING-ONLY: a missing or unreadable record is a NAMED refusal,
- *     never a create;
- *   - it re-reads under the lock and REPLACES atomically (dot-temp + rename),
- *     so a crash can never leave a torn record.
- *
- * It never throws. The caller gets a structured outcome it must ACT on, so a
- * failed write is surfaced (logged by message id, record path and error code)
- * and retried — never silently ignored (cli#492).
+ * Update an existing cur/ record through the CLI's `updateExistingRecord`
+ * (cli#469). Never throws: a missing record is `record-missing`; any other
+ * failure is `write-failed` with its error code, for the caller to log and
+ * retry (cli#492).
  */
 type CurRecordUpdate =
   | { ok: true }
-  | {
-      ok: false;
-      reason: "record-missing" | "record-unreadable" | "lock-busy" | "lock-unverified" | "write-failed";
-      path: string;
-      code: string;
-    };
+  | { ok: false; reason: "record-missing" | "write-failed"; path: string; code: string };
 
-/** Read a cur/ record (existing-only), distinguishing absent from unreadable. */
-function readCurRecord(path: string):
-  | { status: "ok"; record: TpsMailBody }
-  | { status: "missing" }
-  | { status: "unreadable"; code: string } {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>): CurRecordUpdate {
   try {
-    const record = JSON.parse(readFileSync(path, "utf-8")) as TpsMailBody;
-    if (!record || typeof record !== "object" || typeof record.id !== "string") {
-      return { status: "unreadable", code: "INVALID_RECORD" };
-    }
-    return { status: "ok", record };
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code ?? "INVALID_JSON";
-    return code === "ENOENT" ? { status: "missing" } : { status: "unreadable", code };
-  }
-}
-
-function updateExistingCurRecord(path: string, patch: Partial<TpsMailBody>): CurRecordUpdate {
-  // The mailbox root is the record's grandparent: <mailDir>/<agent>/cur/<file>.
-  const root = dirname(dirname(path));
-  // EXISTING-ONLY: refuse by name before taking the lock when there is nothing
-  // to update. A missing record is benign (there is no stamp to diverge from);
-  // an UNREADABLE one is refused, never replaced.
-  let current = readCurRecord(path);
-  if (current.status !== "ok") {
-    return {
-      ok: false,
-      reason: current.status === "missing" ? "record-missing" : "record-unreadable",
-      path,
-      code: current.status === "missing" ? "ENOENT" : current.code,
-    };
-  }
-  let lock: ReturnType<typeof tryAcquireMailLock>;
-  try {
-    lock = tryAcquireMailLock(mailLockPath(root));
+    const r = updateExistingRecord<TpsMailBody>(path, (current) => Object.assign(current, patch));
+    if (r.status === "updated") return { ok: true };
+    if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
+    return { ok: false, reason: "write-failed", path, code: r.status };
   } catch (err: any) {
-    // An unverifiable lock owner is NOT "no lock": fail closed, never write
-    // outside the lock (cli#469's rule and this plugin's unknown-evidence rule).
-    return { ok: false, reason: "lock-unverified", path, code: err?.name ?? "LOCK_ERROR" };
-  }
-  if (!lock) return { ok: false, reason: "lock-busy", path, code: "EEXIST" };
-  try {
-    // Re-read under the lock: lock, re-read, mutate, atomically replace.
-    current = readCurRecord(path);
-    if (current.status !== "ok") {
-      return {
-        ok: false,
-        reason: current.status === "missing" ? "record-missing" : "record-unreadable",
-        path,
-        code: current.status === "missing" ? "ENOENT" : current.code,
-      };
-    }
-    const tmp = resolve(dirname(path), `.${basename(path)}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`);
-    try {
-      writeFileSync(tmp, JSON.stringify({ ...current.record, ...patch }, null, 2), "utf-8");
-      renameSync(tmp, path);
-    } catch (err: any) {
-      try {
-        rmSync(tmp, { force: true });
-      } catch {
-        /* the fault persists — the caller's diagnostic names it */
-      }
-      return { ok: false, reason: "write-failed", path, code: err?.code ?? "WRITE_FAILED" };
-    }
-    return { ok: true };
-  } finally {
-    lock.release();
+    return { ok: false, reason: "write-failed", path, code: err?.code ?? err?.name ?? "WRITE_FAILED" };
   }
 }
 
@@ -731,13 +655,13 @@ function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): v
     const cur = readMailFile(curPath);
     if (!cur) continue;
     if (rec.state === "acked" && !cur.ackedAt) {
-      const r = updateExistingCurRecord(curPath, { ackedAt: new Date().toISOString(), read: true });
+      const r = patchMailFile(curPath, { ackedAt: new Date().toISOString(), read: true });
       if (r.ok) log?.info?.(`tps-mail: reconciled the acked stamp for ${rec.inboundId} at ${curPath}`);
       else if (r.reason !== "record-missing") {
         log?.warn?.(`tps-mail: ack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
       }
     } else if (rec.state === "failed" && !cur.nackedAt) {
-      const r = updateExistingCurRecord(curPath, { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" });
+      const r = patchMailFile(curPath, { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" });
       if (r.ok) log?.info?.(`tps-mail: reconciled the nacked stamp for ${rec.inboundId} at ${curPath}`);
       else if (r.reason !== "record-missing") {
         log?.warn?.(`tps-mail: nack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
@@ -1016,11 +940,8 @@ function stampTerminalCur(
   attempt = 0,
 ): void {
   const key = kind === "ack" ? "ackedAt" : "nackedAt";
-  if (attempt > 0) {
-    const cur = readCurRecord(ctx.curPath);
-    if (cur.status === "ok" && cur.record[key]) return;
-  }
-  const stamped = updateExistingCurRecord(ctx.curPath, patch);
+  if (attempt > 0 && readMailFile(ctx.curPath)?.[key]) return;
+  const stamped = patchMailFile(ctx.curPath, patch);
   if (stamped.ok) {
     if (attempt > 0) ctx.log?.info?.(`tps-mail: ${kind}-stamp-retry-ok: ${ctx.inboundId} at ${ctx.curPath} (retry ${attempt})`);
     return;
