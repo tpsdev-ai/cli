@@ -52,7 +52,10 @@ describe("tps agent commit", () => {
 
     const cleanEnv = Object.fromEntries(
       Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_"))
-    );
+    ) as NodeJS.ProcessEnv;
+    // The scope-expansion guard reads the caller's task mail, so it needs the
+    // acting agent id (cli#486).
+    cleanEnv.TPS_AGENT_ID = "ember";
     const result = spawnSync("bun", [
       TPS_BIN,
       "agent",
@@ -113,6 +116,7 @@ printf '%s\n' "$@" > "${ghLog}"
       encoding: "utf-8",
       env: {
         ...process.env,
+        TPS_AGENT_ID: "ember",
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
       },
     });

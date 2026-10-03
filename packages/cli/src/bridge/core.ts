@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 
 const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
@@ -53,8 +54,8 @@ export class BridgeCore {
     log?: (msg: string) => void,
   ) {
     this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(process.env.HOME ?? homedir(), ".tps", "mail");
+    this.defaultAgentId = requireLocalAgentId("bridge default agent id", config.defaultAgentId);
     this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
-    this.defaultAgentId = config.defaultAgentId ?? "anvil";
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
     this.log = log ?? ((msg) => console.log(`${new Date().toISOString()} ${msg}`));
