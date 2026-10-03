@@ -1,1 +1,1 @@
-- **A redelivered dismissed-review webhook event no longer re-requests the review: the delivery id is recorded once and redeliveries are skipped (Closes #490).**
+- **A redelivered dismissed-review webhook event no longer re-requests the review: redeliveries are skipped once the re-request has succeeded (Closes #490).**

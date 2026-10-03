@@ -259,12 +259,39 @@ describe("handleGithubWebhook", () => {
     const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-record-fails",
       "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
     let ghCalls = 0;
-    const deps = { queueOutboxMessageImpl: (() => { throw new Error("record write refused"); }) as any,
+    const deps = { queueOutboxDeliveryImpl: (() => { throw new Error("record write refused"); }) as any,
       reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
         ghCalls++; return { status: 0, stdout: "", stderr: "" };
       }) as any }, publishReviewRerequestedEvent: async () => {} };
     expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "record write refused" });
     expect(ghCalls).toBe(0);
+  });
+  test("a failed re-request releases the record, so a redelivery retries it once", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
+      pull_request: { number: 150, html_url: "https://github.com/tpsdev-ai/cli/pull/150" }, review: { user: { login: "tps-kern" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-rerequest-fails",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    const id = createHash("sha256").update("delivery-rerequest-fails").digest("hex");
+    const record = join(root, ".tps", "outbox", "new", `github-${id}.json`);
+    const lock = join(root, ".tps", "outbox", "new", `.github-${id}.lock`);
+    let status = 1;
+    let ghCalls = 0;
+    const lockHeld: boolean[] = [];
+    const deps = { reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
+      ghCalls++; lockHeld.push(existsSync(lock)); return { status, stdout: "", stderr: "gh failed" };
+    }) as any }, publishReviewRerequestedEvent: async () => { lockHeld.push(existsSync(lock)); } };
+    expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "GitHub re-request failed" });
+    expect(ghCalls).toBe(1);
+    expect(existsSync(record)).toBe(false);
+    status = 0;
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "ok" });
+    expect(ghCalls).toBe(2);
+    expect(existsSync(record)).toBe(true);
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
+    expect(ghCalls).toBe(2);
+    // Held across each GitHub call; released before the publish's await.
+    expect(lockHeld).toEqual([true, true, false]);
+    expect(existsSync(lock)).toBe(false);
   });
   test("invalid dismissed review does not require an agent id", async () => {
     delete process.env.GITHUB_WEBHOOK_AGENT_ID;

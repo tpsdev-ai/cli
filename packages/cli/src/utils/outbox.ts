@@ -1,8 +1,8 @@
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { tryAcquireMailLock } from "./mail-lock.js";
+import { type MailLock, tryAcquireMailLock } from "./mail-lock.js";
 
 export class OutboxLockError extends Error {
   constructor(lockPath: string, cause: unknown) {
@@ -29,18 +29,49 @@ function outboxDir(kind: "new" | "sent"): string {
 export type QueueOutboxResult = "queued" | "duplicate" | "duplicate in progress";
 
 export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): QueueOutboxResult {
+  return queue(to, body, from, deliveryId, false).result;
+}
+
+/** As queueOutboxMessage, but a "queued" result keeps the per-delivery lock
+ * held until unlock() is called. */
+export function queueOutboxDelivery(to: string, body: string, from: string, deliveryId?: string): { result: QueueOutboxResult; unlock: () => void } {
+  const { result, lock } = queue(to, body, from, deliveryId, true);
+  return {
+    result,
+    unlock: () => {
+      try {
+        lock?.release();
+      } catch (error) {
+        throw new OutboxLockError(outboxLockPath(deliveryId!), error);
+      }
+    },
+  };
+}
+
+/** Removes this delivery's record from new/ and sent/. */
+export function releaseOutboxRecord(deliveryId: string): void {
+  if (!/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
+  rmSync(join(outboxDir("new"), `github-${deliveryId}.json`), { force: true });
+  rmSync(join(outboxDir("sent"), `github-${deliveryId}.json`), { force: true });
+}
+
+function outboxLockPath(deliveryId: string): string {
+  return join(outboxDir("new"), `.github-${deliveryId}.lock`);
+}
+
+function queue(to: string, body: string, from: string, deliveryId: string | undefined, keepLock: boolean): { result: QueueOutboxResult; lock?: MailLock } {
   if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
-  const lockPath = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
-  let lock;
+  const lockPath = deliveryId ? outboxLockPath(deliveryId) : undefined;
+  let lock: MailLock | null | undefined;
   if (lockPath) {
     try {
       lock = tryAcquireMailLock(lockPath);
     } catch (error) {
       throw new OutboxLockError(lockPath, error);
     }
-    if (!lock) return "duplicate in progress";
+    if (!lock) return { result: "duplicate in progress" };
   }
   let alreadyRecorded = false;
   const write = (): void => {
@@ -74,6 +105,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     writeFailed = true;
     writeError = error;
   }
+  if (keepLock && lock && !writeFailed && !alreadyRecorded) return { result: "queued", lock };
   if (lock) {
     try {
       lock.release();
@@ -83,7 +115,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     }
   }
   if (writeFailed) throw writeError;
-  return alreadyRecorded ? "duplicate" : "queued";
+  return { result: alreadyRecorded ? "duplicate" : "queued" };
 }
 
 export function drainOutbox(): OutboxMessage[] {

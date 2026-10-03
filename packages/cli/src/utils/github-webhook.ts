@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
-import { queueOutboxMessage } from "./outbox.js";
+import { queueOutboxDelivery, releaseOutboxRecord } from "./outbox.js";
 import { reRequestReviewer, type ReviewRequestDeps } from "./pr-review-trigger.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
@@ -14,7 +14,7 @@ type ReviewRerequestedPublisher = (event: {
 }) => Promise<void>;
 
 export interface GithubWebhookDeps {
-  queueOutboxMessageImpl?: typeof queueOutboxMessage;
+  queueOutboxDeliveryImpl?: typeof queueOutboxDelivery;
   reviewRequestDeps?: ReviewRequestDeps;
   publishReviewRerequestedEvent?: ReviewRerequestedPublisher;
 }
@@ -133,8 +133,9 @@ export async function processGithubWebhookEvent(
   payload: Record<string, unknown>,
   deps: GithubWebhookDeps = {},
   resolvedAgentId?: string,
-): Promise<void> {
-  if (event !== "pull_request_review" || payload.action !== "dismissed") return;
+  onReRequest?: (reRequested: boolean) => void,
+): Promise<boolean> {
+  if (event !== "pull_request_review" || payload.action !== "dismissed") return true;
   const review = payload.review as Record<string, unknown> | undefined;
   const reviewer = (review?.user as Record<string, unknown> | undefined)?.login;
   const pr = payload.pull_request as Record<string, unknown> | undefined;
@@ -144,12 +145,13 @@ export async function processGithubWebhookEvent(
 
   if (typeof reviewer !== "string" || !reviewer || !prNumber || typeof repo !== "string" || !repo) {
     swarn("[webhook] pull_request_review dismissed missing reviewer, PR number, or repo");
-    return;
+    return true;
   }
 
   const agentId = resolvedAgentId ?? webhookAgentId();
   const reRequested = reRequestReviewer(prNumber, reviewer, { agentId, repo }, deps.reviewRequestDeps);
-  if (!reRequested) return;
+  onReRequest?.(reRequested);
+  if (!reRequested) return false;
 
   const publishEvent = deps.publishReviewRerequestedEvent ?? defaultReviewEventPublisher(agentId);
   const refId = `${repo}#${prNumber}`;
@@ -164,6 +166,7 @@ export async function processGithubWebhookEvent(
   } catch (error) {
     swarn(`[webhook] Failed to publish review.re-requested for PR #${prNumber}: ${(error as Error).message}`);
   }
+  return true;
 }
 
 export async function handleGithubWebhook(
@@ -213,15 +216,14 @@ export async function handleGithubWebhook(
   const delivery = req.headers["x-github-delivery"];
   const deliveryId = typeof delivery === "string" && delivery
     ? createHash("sha256").update(delivery).digest("hex") : undefined;
-  const queueMessage = deps.queueOutboxMessageImpl ?? queueOutboxMessage;
+  const queueDelivery = deps.queueOutboxDeliveryImpl ?? queueOutboxDelivery;
+  let claim: ReturnType<typeof queueOutboxDelivery>;
   try {
-    const result = queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
-    // A delivery that an earlier call recorded (or that another writer is
-    // recording) must not repeat the GitHub action: it runs at most once per
-    // delivery id.
-    if (result === "duplicate" || result === "duplicate in progress") {
+    claim = queueDelivery(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
+    // A recorded or in-progress delivery is not processed again.
+    if (claim.result !== "queued") {
       res.statusCode = 200;
-      res.end(result);
+      res.end(claim.result);
       return;
     }
   } catch (error) {
@@ -229,7 +231,38 @@ export async function handleGithubWebhook(
     res.end((error as Error).message);
     return;
   }
-  await processGithubWebhookEvent(event, payload, deps, agentId);
+  let handled = false;
+  let failure: unknown;
+  let settled = false;
+  // Runs synchronously after the GitHub call, so the lock is not held across an await.
+  const settle = (reRequested: boolean): void => {
+    if (settled) return;
+    settled = true;
+    try {
+      // A failed re-request releases the record, so a redelivery retries it.
+      if (!reRequested && deliveryId) releaseOutboxRecord(deliveryId);
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      claim.unlock();
+    } catch (error) {
+      failure ??= error;
+    }
+  };
+  const pending = processGithubWebhookEvent(event, payload, deps, agentId, settle);
+  // Its GitHub call, if any, ran before its first await; without one, this unlocks.
+  settle(true);
+  try {
+    handled = await pending;
+  } catch (error) {
+    failure ??= error;
+  }
+  if (failure !== undefined || !handled) {
+    res.statusCode = 503;
+    res.end(failure === undefined ? "GitHub re-request failed" : (failure as Error).message);
+    return;
+  }
   res.statusCode = 200;
   res.end("ok");
 }
