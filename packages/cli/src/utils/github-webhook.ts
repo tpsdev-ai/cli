@@ -239,7 +239,7 @@ export async function handleGithubWebhook(
     if (settled) return;
     settled = true;
     try {
-      // A failed re-request releases the record, so a redelivery retries it.
+      // Only a re-request that returns false releases the record (a thrown call keeps it).
       if (!reRequested && deliveryId) releaseOutboxRecord(deliveryId);
     } catch (error) {
       failure = error;

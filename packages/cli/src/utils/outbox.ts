@@ -32,8 +32,8 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
   return queue(to, body, from, deliveryId, false).result;
 }
 
-/** As queueOutboxMessage, but a "queued" result keeps the per-delivery lock
- * held until unlock() is called. */
+/** As queueOutboxMessage, but with a delivery ID a "queued" result keeps the
+ * per-delivery lock held until unlock() is called. */
 export function queueOutboxDelivery(to: string, body: string, from: string, deliveryId?: string): { result: QueueOutboxResult; unlock: () => void } {
   const { result, lock } = queue(to, body, from, deliveryId, true);
   return {
