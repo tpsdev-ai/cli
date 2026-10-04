@@ -182,7 +182,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     );
   }
 
-  test("an existing filename returns replay and keeps the cur record", async () => {
+  test("an unconsumed filename collision dead-letters retryable and keeps the cur record", async () => {
     const inbox = getInbox("kern");
     const file = "collide.json";
     const delivered = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-1" });
@@ -199,11 +199,11 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before);
     expect(jsonFiles(inbox.fresh).length).toBe(0);
     const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
-    expect(reason).toContain("class: replay");
+    expect(reason).toContain("class: storage-unavailable");
   });
 
   for (const reuseId of [false, true]) {
-    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body returns replay and keeps the cur record`, async () => {
+    test(`same filename, ${reuseId ? "consumed" : "unconsumed"} ID, different signed body keeps the cur record`, async () => {
       const inbox = getInbox("kern");
       const file = "clash.json";
       const delivered = buildSignedEnvelope("flint", "kern", "original", { flint: FLINT_SEED }, { messageId: "cli482-id-3" });
@@ -219,7 +219,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
       expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before);
       expect(jsonFiles(inbox.dlq)).toContain(file);
       const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
-      expect(reason).toContain("class: replay");
+      expect(reason).toContain(`class: ${reuseId ? "replay" : "storage-unavailable"}`);
     });
   }
 

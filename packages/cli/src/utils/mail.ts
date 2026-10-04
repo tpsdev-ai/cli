@@ -827,7 +827,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     try {
       consumed = replay.isConsumed(envelope.messageId);
     } catch (err: any) {
-      const reason = `storage failure during replay check: ${err?.message ?? String(err)}`;
+      const reason = `replay history unavailable: ${err?.message ?? String(err)}`;
       rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
       return { ok: false, class: "storage-unavailable", reason };
     }
@@ -870,10 +870,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       scratchCreated = true;
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
-        rmSync(scratchPath, { force: true });
-        const reason = `destination already exists: ${filename}`;
-        rejectToDlq(dirs, filename, filePath, "replay", reason);
-        return { ok: false, class: "replay", reason };
+        throw new Error(`destination already exists: ${filename}`);
       }
       movedToCur = true;
       rmSync(scratchPath, { force: true });

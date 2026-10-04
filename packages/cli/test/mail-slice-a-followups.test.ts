@@ -152,15 +152,20 @@ for (const firstWriter of ["promote", "MailClient"] as const) {
           timestamp: incoming.timestamp,
         };
         writeFileSync(sent.filePath, JSON.stringify(record));
-        const rejection = "replay";
+        const rejection = history === "committed-new-id" ? "storage-unavailable" : "replay";
         if (firstWriter === "MailClient") {
           expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: rejection });
         } else {
           expect(await client.checkNewMail()).toEqual([]);
         }
         expect(readFileSync(destination, "utf8")).toBe(before);
-        expect(readdirSync(inbox.fresh)).toEqual([]);
-        expect(readFileSync(join(inbox.dlq, `${filename}.reason`), "utf8")).toContain(`class: ${rejection}`);
+        if (firstWriter === "promote" && history === "committed-new-id") {
+          expect(readdirSync(inbox.fresh)).toEqual([filename]);
+          expect(readdirSync(inbox.dlq)).toEqual([]);
+        } else {
+          expect(readdirSync(inbox.fresh)).toEqual([]);
+          expect(readFileSync(join(inbox.dlq, `${filename}.reason`), "utf8")).toContain(`class: ${rejection}`);
+        }
         if (history === "uncommitted") expect(readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe("");
       });
     }

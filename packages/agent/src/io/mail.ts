@@ -214,23 +214,24 @@ export class MailClient {
       }
       const placement = placeCurRecord(srcPath, dstPath);
       if (placement.status === "exists") {
-        return { pass: false, class: "replay", reason: `destination already exists: ${file}` };
+        throw new Error(`destination already exists: ${file}`);
+      }
+      try {
+        unlinkSync(srcPath);
+      } catch (err) {
+        unlinkSync(dstPath);
+        throw err;
       }
       try {
         replay.recordConsumed(envelope.messageId);
       } catch (err) {
         try {
-          unlinkSync(dstPath);
+          renameSync(dstPath, srcPath);
         } catch (rollbackErr) {
           throw new AggregateError([err, rollbackErr],
             `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
         }
         throw err;
-      }
-      try {
-        unlinkSync(srcPath);
-      } catch (err) {
-        console.error(`[MailClient] committed ${file}; source cleanup failed: ${sanitizeError(err)}`);
       }
       return null;
     } finally {

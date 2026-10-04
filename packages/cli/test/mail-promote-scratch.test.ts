@@ -53,7 +53,7 @@ test("direct promotion and the scratch sweep preserve a stranded hard-linked cur
   const result = await mail.promote(agent, plant("different"));
   expect(result.ok).toBe(false);
   if (result.ok) throw new Error("collision accepted");
-  expect(result.class).toBe("replay");
+  expect(result.class).toBe("storage-unavailable");
   expect(fs.readFileSync(cur, "utf8")).toBe(before);
   expect(fs.readFileSync(scratch, "utf8")).toBe(before);
   expect(fs.existsSync(join(inbox.dlq, "record.json"))).toBe(true);
@@ -112,5 +112,36 @@ for (const body of ["original", "different"]) {
     expect(fs.readFileSync(cur, "utf8")).toBe(before);
     expect(fs.readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe(ledger);
     expect(fs.readdirSync(inbox.tmp)).toEqual([]);
+  });
+}
+
+for (const kind of ["record", "directory", "symlink"] as const) {
+  test(`an unconsumed ID colliding with a ${kind} is retryable`, async () => {
+    const source = plant("retry", "unconsumed-collision");
+    const original = fs.readFileSync(source);
+    const inbox = mail.getInbox(agent);
+    const cur = join(inbox.cur, "record.json");
+    const existing = JSON.stringify({ envelopeId: "other-consumed-id", body: "existing" });
+    if (kind === "directory") fs.mkdirSync(cur);
+    else if (kind === "symlink") {
+      const target = join(root, "existing.json");
+      fs.writeFileSync(target, existing);
+      fs.symlinkSync(target, cur);
+    } else fs.writeFileSync(cur, existing);
+    const inode = fs.lstatSync(cur).ino;
+    const result = await mail.promote(agent, source);
+    expect(result).toEqual({
+      ok: false, class: "storage-unavailable",
+      reason: "storage failure during promote: destination already exists: record.json",
+    });
+    expect(fs.lstatSync(cur).ino).toBe(inode);
+    if (kind !== "directory") expect(fs.readFileSync(cur, "utf8")).toBe(existing);
+    expect(fs.readFileSync(join(inbox.dlq, "record.json"))).toEqual(original);
+    expect(fs.readFileSync(join(inbox.dlq, "record.json.reason"), "utf8")).toContain("class: storage-unavailable");
+    expect(fs.existsSync(join(inbox.root, "consumed.jsonl"))).toBe(false);
+    fs.rmSync(cur, { recursive: true, force: true });
+    const retried = await mail.redriveRetryable(agent, inbox.dlq);
+    expect(retried).toHaveLength(1);
+    expect(retried[0]!.message.envelopeId).toBe("unconsumed-collision");
   });
 }
