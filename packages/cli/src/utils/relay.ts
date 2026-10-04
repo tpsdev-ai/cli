@@ -15,6 +15,7 @@ import { registerServiceProxyHandler } from "./service-proxy-host.js";
 import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
+import type { ZodError } from "zod";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
 
 
@@ -369,10 +370,14 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
-export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
+export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
   MailDeliverBodySchema.shape.id.parse(body.id);
-  const marker = join(getMailDir(), ".relay-accepted", body.id);
-  if (existsSync(marker)) return false;
+  if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
+  // Acceptance is recorded per branch: a 64-hex id is deterministic, so two branches can send the same one.
+  const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
+  const marker = join(acceptedDir, body.id);
+  // A marker written before acceptance was recorded per branch sits directly in .relay-accepted/.
+  if (existsSync(marker) || existsSync(join(getMailDir(), ".relay-accepted", body.id))) return false;
   let delivered: boolean;
   try {
     sendMessage(body.to, body.content, body.from);
@@ -399,7 +404,7 @@ export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
     delivered = false;
   }
   try {
-    mkdirSync(join(getMailDir(), ".relay-accepted"), { recursive: true });
+    mkdirSync(acceptedDir, { recursive: true });
     writeFileSync(marker, "", "utf-8");
   } catch (e: unknown) {
     console.error(`[relay] could not record message ${body.id} as accepted: ${e instanceof Error ? e.message : String(e)}`);
@@ -407,10 +412,16 @@ export function deliverRelayedToLocal(body: MailDeliverBody): boolean {
   return delivered;
 }
 
-async function acceptRelayedMail(channel: TransportChannel, msg: TpsMessage, body: MailDeliverBody): Promise<boolean> {
-  const delivered = deliverRelayedToLocal(body);
+async function acceptRelayedMail(channel: TransportChannel, branchId: string, msg: TpsMessage, body: MailDeliverBody): Promise<boolean> {
+  const delivered = deliverRelayedToLocal(branchId, body);
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
   return delivered;
+}
+
+/** Logs a MAIL_DELIVER the schema refused, naming the branch and the failing fields, never their values. */
+function logRefusedDelivery(branchId: string, error: ZodError): void {
+  const fields = [...new Set(error.issues.map((issue) => issue.path.map(String).join(".") || "body"))].join(", ");
+  console.error(`[relay] refused a MAIL_DELIVER from branch ${branchId}: invalid ${fields}`);
 }
 
 export function startRelay(agentId: string): () => void {
@@ -634,8 +645,11 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
       const handler = (msg: TpsMessage) => {
         if (msg.type !== MSG_MAIL_DELIVER) return;
         const parsed = MailDeliverBodySchema.safeParse(msg.body);
-        if (!parsed.success) return;
-        void acceptRelayedMail(channel, msg, parsed.data).then((delivered) => {
+        if (!parsed.success) {
+          logRefusedDelivery(branchId, parsed.error);
+          return;
+        }
+        void acceptRelayedMail(channel, branchId, msg, parsed.data).then((delivered) => {
           if (delivered) received++;
         }).catch((error: unknown) => {
           console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
@@ -753,9 +767,11 @@ export async function connectAndKeepAlive(
             state.lastHeartbeatAck = now; // any traffic = alive
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
             if (parsed.success) {
-              void acceptRelayedMail(channel, msg, parsed.data).catch((error: unknown) => {
+              void acceptRelayedMail(channel, branchId, msg, parsed.data).catch((error: unknown) => {
                 console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
               });
+            } else {
+              logRefusedDelivery(branchId, parsed.error);
             }
           } else {
             state.lastHeartbeatAck = now;

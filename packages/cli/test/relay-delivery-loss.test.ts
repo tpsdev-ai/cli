@@ -1,5 +1,6 @@
 import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getInbox, MAX_INBOX_MESSAGES, sendMessage } from "../src/utils/mail.js";
@@ -262,6 +263,80 @@ for (const entry of ["sync", "connect"] as const) {
       await emit();
       expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
       expect(jsonFiles(getInbox("local").dlq)).toEqual([]);
+      expect(acks.length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+    });
+
+    for (const shape of ["uuid", "64-hex"] as const) {
+      test(`a ${shape} delivery id produces one inbox record, one ACK and an empty outbox`, async () => {
+        const env = buildSignedEnvelope("remote", "local", `${shape} delivery`, SEEDS);
+        const id = shape === "64-hex" ? "ab".repeat(32) : queue(JSON.stringify(env)).id;
+        if (shape === "64-hex") queueOutboxMessage("local", JSON.stringify(env), "remote", id);
+        await start();
+        await emit();
+        expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+        expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([id]);
+        expect(drainOutbox(false)).toEqual([]);
+        const replay: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: { id, from: "remote", to: "local", content: JSON.stringify(env), timestamp: new Date().toISOString() } };
+        for (const handler of handlers) handler(replay);
+        await Bun.sleep(0);
+        expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+        expect(acks.length).toBe(2);
+      });
+
+      test(`the same ${shape} delivery id from two branches is delivered for each`, async () => {
+        const kp = generateKeyPair();
+        registerBranch("remote-b", kp.signing.publicKey, undefined, kp.encryption.publicKey);
+        const dirB = join(root, ".tps", "branch-office", "remote-b");
+        fs.mkdirSync(dirB, { recursive: true });
+        fs.writeFileSync(join(dirB, "remote.json"), JSON.stringify({ host: "unused", port: 1, transport: "ws" }));
+        await start();
+        const before = handlers.size;
+        if (entry === "sync") {
+          completion = Promise.all([completion, syncRemoteBranch("remote-b")]);
+        } else {
+          const stopA = stop;
+          const stopB = await connectAndKeepAlive("remote-b");
+          stop = async () => { await stopB(); await stopA?.(); };
+        }
+        for (let i = 0; handlers.size === before && i < 100; i++) await Bun.sleep(10);
+        expect(handlers.size).toBeGreaterThan(before);
+        const id = shape === "64-hex" ? "cd".repeat(32) : randomUUID();
+        const content = JSON.stringify(buildSignedEnvelope("remote", "local", "same id", SEEDS));
+        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: { id, from: "remote", to: "local", content, timestamp: new Date().toISOString() } };
+        for (const handler of handlers) handler(msg);
+        await Bun.sleep(0);
+        expect(jsonFiles(getInbox("local").fresh).length).toBe(2);
+        expect(acks.length).toBe(2);
+      });
+    }
+
+    test("a malformed delivery id is refused and logged without the payload", async () => {
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const malformed = ["not-a-delivery-id", "AB".repeat(32), "ab".repeat(32) + "a"];
+      for (const id of malformed) {
+        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: { id, from: "remote", to: "local", content: "payload-text", timestamp: new Date().toISOString() } };
+        for (const handler of handlers) handler(msg);
+      }
+      await Bun.sleep(0);
+      expect(acks).toEqual([]);
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      const refusals = errors.mock.calls.flat().map(String).filter((line) => line.includes("[relay] refused a MAIL_DELIVER from branch remote: invalid id"));
+      expect(refusals.length).toBe(malformed.length);
+      const logs = errors.mock.calls.flat().map(String).join("\n");
+      expect(logs).not.toContain("payload-text");
+      for (const id of malformed) expect(logs).not.toContain(id);
+    });
+
+    test("a UUID accepted under the earlier unscoped marker layout is acknowledged without a second inbox record", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accepted before upgrade", SEEDS)));
+      const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
+      fs.mkdirSync(legacy, { recursive: true });
+      fs.writeFileSync(join(legacy, body.id), "");
+      await start();
+      await emit();
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
       expect(acks.length).toBe(1);
       expect(drainOutbox(false)).toEqual([]);
     });

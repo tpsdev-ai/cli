@@ -9,8 +9,11 @@ export const MSG_HTTP_RESPONSE = 0x21;
 
 const SAFE_ID = /^[a-zA-Z0-9._-]{1,64}$/;
 
+/** A relayed delivery id: a UUID, or the 64-hex id of a GitHub-webhook outbox record (outbox.ts). */
+const DeliveryIdSchema = z.union([z.string().uuid(), z.string().regex(/^[a-f0-9]{64}$/)]);
+
 export const MailDeliverBodySchema = z.object({
-  id: z.string().uuid(),
+  id: DeliveryIdSchema,
   from: z.string().regex(SAFE_ID, "Invalid sender identifier"),
   to: z.string().regex(SAFE_ID, "Invalid recipient identifier"),
   content: z.string(),
@@ -19,7 +22,7 @@ export const MailDeliverBodySchema = z.object({
 export type MailDeliverBody = z.infer<typeof MailDeliverBodySchema>;
 
 export const MailAckBodySchema = z.object({
-  id: z.string().uuid(),
+  id: DeliveryIdSchema,
   accepted: z.boolean(),
   reason: z.string().optional(),
 });
