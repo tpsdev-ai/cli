@@ -92,6 +92,12 @@ const receipt = (obligationId: string, replyToId: string, ts: string, agent: str
 /** Drive the plugin's startup (which runs the retention sweep) and wait until
  *  `done()` or a deadline, then abort. */
 async function runStartup(pluginConfig: Record<string, unknown>, done: () => boolean): Promise<void> {
+  const curDir = join(mailDir, AGENT, "cur");
+  mkdirSync(curDir, { recursive: true });
+  for (const name of readdirSync(obligationsDir(mailDir, AGENT))) {
+    const id = name.replace(/\.json$/, "");
+    writeFileSync(join(curDir, `timestamp-${id}.json`), JSON.stringify({ id, ackedAt: "done", nackedAt: "done" }));
+  }
   mockApi.pluginConfig = pluginConfig;
   pluginModule.register(mockApi);
   controller = new AbortController();

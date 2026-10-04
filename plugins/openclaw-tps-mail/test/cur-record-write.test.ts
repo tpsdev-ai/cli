@@ -16,9 +16,15 @@ let stampError: Error | undefined;
 let obligationReadFailure: string | undefined;
 let obligationReads = 0;
 let failObligationReads = Infinity;
+let curReadFailure: string | undefined;
+let curReads = 0;
+let curReadsUntilFailure = 1;
 mock.module("node:fs", () => ({
   ...realFs,
   readFileSync: (...args: any[]) => {
+    if (args[0] === curReadFailure && ++curReads >= curReadsUntilFailure) {
+      throw Object.assign(new Error("injected cur read failure"), { code: "EACCES" });
+    }
     if (args[0] === obligationReadFailure && ++obligationReads <= failObligationReads) {
       throw Object.assign(new Error("injected obligation read failure"), { code: "EACCES" });
     }
@@ -87,6 +93,9 @@ afterEach(() => {
   obligationReadFailure = undefined;
   obligationReads = 0;
   failObligationReads = Infinity;
+  curReadFailure = undefined;
+  curReads = 0;
+  curReadsUntilFailure = 1;
   setStampRetryDelaysForTests(prevDelays);
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
@@ -374,7 +383,7 @@ for (const failReads of [Infinity, 1]) {
       expect(realFs.readFileSync(path, "utf8")).toBe(bytes);
       expect(realFs.existsSync(cur.path)).toBe(true);
       expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
-      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("restore readable records and restart the account"))).toBe(true);
+      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("repair the record and restart the account"))).toBe(true);
     } finally {
       await second.stop();
       obligationReadFailure = undefined;
@@ -388,4 +397,53 @@ for (const failReads of [Infinity, 1]) {
       await third.stop();
     }
   }, 15000);
+}
+
+for (const state of ["acked", "failed"] as const) {
+  for (const stage of ["lookup-read", "reread", "locked-read", "recovery-read", "stamp-write"] as const) {
+    it(`startup ${state} ${stage} holds aged obligations across restarts without redispatch`, async () => {
+      const first = await boot(true);
+      try {
+        expect(await pollUntil(() => first.dispatch() !== null)).toBe(true);
+        if (state === "acked") await first.deliver("verdict");
+        else first.skip("empty");
+        first.settle();
+        expect(await pollUntil(() => obligation(first.inboundId)?.state === state)).toBe(true);
+        expect(await pollUntil(() => !!readCur()?.record?.[state === "acked" ? "ackedAt" : "nackedAt"])).toBe(true);
+      } finally { await first.stop(); }
+      const cur = readCur()!;
+      delete cur.record.ackedAt;
+      delete cur.record.nackedAt;
+      realFs.writeFileSync(cur.path, JSON.stringify(cur.record));
+      const path = resolve(mailDir, "anvil", ".obligations", `${first.inboundId}.json`);
+      const terminal = JSON.parse(realFs.readFileSync(path, "utf8"));
+      terminal.lastTransitionAt = new Date(0).toISOString();
+      realFs.writeFileSync(path, JSON.stringify(terminal));
+      const bytes = realFs.readFileSync(path, "utf8");
+      for (let restart = 0; restart < 2; restart++) {
+        if (stage === "stamp-write") stampError = new Error("injected stamp failure");
+        else {
+          curReadFailure = cur.path;
+          curReads = 0;
+          curReadsUntilFailure = stage === "lookup-read" ? 1 : stage === "reread" ? 2 : stage === "recovery-read" ? (restart === 0 ? 4 : 3) : 3;
+        }
+        const next = await boot(false);
+        try {
+          expect(await pollUntil(() => next.logs.some((m) => m.includes(`actor=anvil state=${state}`) && m.includes(first.inboundId)))).toBe(true);
+          await sleep(100);
+          expect(next.dispatch()).toBeNull();
+          expect(next.logs.filter((m) => m.includes("actor=anvil") && m.includes(first.inboundId))).toHaveLength(1);
+          expect(realFs.readFileSync(path, "utf8")).toBe(bytes);
+          if (stage !== "recovery-read") expect(JSON.parse(realFs.readFileSync(cur.path, "utf8"))[state === "acked" ? "ackedAt" : "nackedAt"]).toBeUndefined();
+        } finally { await next.stop(); }
+      }
+      stampError = undefined;
+      curReadFailure = undefined;
+      const repaired = await boot(false);
+      try {
+        expect(await pollUntil(() => !!readCur()?.record?.[state === "acked" ? "ackedAt" : "nackedAt"])).toBe(true);
+        expect(repaired.dispatch()).toBeNull();
+      } finally { await repaired.stop(); }
+    }, 15000);
+  }
 }

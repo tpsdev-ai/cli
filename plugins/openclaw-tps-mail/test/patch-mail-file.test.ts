@@ -11,11 +11,22 @@ let listFailure: string | undefined;
 let stampOnRead: { path: string; count: number } | undefined;
 let readsBeforeRemoval = 1;
 let uncodedWriteFailure = false;
+let deleteFailure: string | undefined;
+let renameFailure: string | undefined;
+let replaceIdentity = false;
 mock.module("node:fs", () => ({
   ...realFs,
   readdirSync: (...args: any[]) => {
     if (args[0] === listFailure) throw Object.assign(new Error("injected list failure"), { code: "EACCES" });
     return (realFs.readdirSync as any)(...args);
+  },
+  unlinkSync: (...args: any[]) => {
+    if (args[0] === deleteFailure) throw Object.assign(new Error("injected delete failure"), { code: "EACCES" });
+    return (realFs.unlinkSync as any)(...args);
+  },
+  renameSync: (...args: any[]) => {
+    if (args[1] === renameFailure) throw Object.assign(new Error("injected rename failure"), { code: "EACCES" });
+    return (realFs.renameSync as any)(...args);
   },
   openSync: (...args: any[]) => {
     if (uncodedWriteFailure && String(args[0]).includes(".ack-")) throw new Error("injected write failure");
@@ -26,6 +37,7 @@ mock.module("node:fs", () => ({
     const result = (realFs.readFileSync as any)(...args);
     if (stampOnRead?.path === args[0] && --stampOnRead.count === 0) {
       const record = JSON.parse(String(result));
+      if (replaceIdentity) record.id = "replacement";
       record.ackedAt = "concurrent-ack";
       record.nackedAt = "concurrent-nack";
       realFs.writeFileSync(stampOnRead.path, JSON.stringify(record));
@@ -40,7 +52,7 @@ mock.module("node:fs", () => ({
 }));
 
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
-const { createObligation, listObligations } = await import("../src/obligations.js");
+const { createObligation, listObligations, sweepTerminalObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
 const path = join(root, "record.json");
 
@@ -49,7 +61,8 @@ afterEach(() => {
   readsBeforeRemoval = readsUntilFailure = 1;
   readFailure = listFailure = undefined;
   stampOnRead = undefined;
-  uncodedWriteFailure = false;
+  uncodedWriteFailure = replaceIdentity = false;
+  deleteFailure = renameFailure = undefined;
   realFs.rmSync(join(root, "anvil"), { recursive: true, force: true });
   realFs.rmSync(path, { force: true });
 });
@@ -85,7 +98,7 @@ function terminalFixture(state: "acked" | "failed") {
   realFs.mkdirSync(curDir, { recursive: true });
   const obligationPath = join(obligationDir, "inbound.json");
   const curPath = join(curDir, "timestamp-inbound.json");
-  realFs.writeFileSync(obligationPath, JSON.stringify({ inboundId: "inbound", state, failure: "empty" }));
+  realFs.writeFileSync(obligationPath, JSON.stringify({ obligationId: "ob-inbound", inboundId: "inbound", state, failure: "empty", lastTransitionAt: new Date(0).toISOString() }));
   realFs.writeFileSync(curPath, JSON.stringify({ id: "inbound", body: "hello" }));
   const logs: string[] = [];
   const reconcile = () => reconcileTerminalCurStamps(root, "anvil", { warn: (message: string) => logs.push(message) });
@@ -210,4 +223,130 @@ test("creation refuses an unreadable existing terminal obligation", () => {
   readFailure = f.obligationPath;
   expect(() => createObligation(root, "anvil", () => ({ inboundId: "inbound", state: "pending" }) as any)).toThrow("state=unknown");
   expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
+});
+
+for (const state of ["acked", "failed"] as const) {
+  for (const stage of ["cur-list", "cur-lookup-read", "cur-reread", "locked-read", "stamp-write", "stamp-rename", "cur-missing", "identity-change"] as const) {
+    test(`${state}: ${stage} holds an aged timestamped inbound and continues healthy records`, () => {
+      const f = terminalFixture(state);
+      if (stage === "cur-list") listFailure = f.curDir;
+      if (stage.endsWith("read")) {
+        readFailure = f.curPath;
+        readsUntilFailure = stage === "cur-reread" ? 2 : stage === "locked-read" ? 3 : 1;
+      }
+      if (stage === "stamp-write") uncodedWriteFailure = true;
+      if (stage === "stamp-rename") renameFailure = f.curPath;
+      if (stage === "cur-missing") realFs.unlinkSync(f.curPath);
+      if (stage === "identity-change") {
+        replaceIdentity = true;
+        stampOnRead = { path: f.curPath, count: 2 };
+      }
+      const bytes = realFs.readFileSync(f.obligationPath, "utf8");
+      const unresolved = f.reconcile();
+      expect(unresolved.has("inbound")).toBe(true);
+      const receiptDir = join(f.obligationDir, "receipts");
+      realFs.mkdirSync(receiptDir);
+      const receiptPath = join(receiptDir, "ob-inbound.json");
+      realFs.writeFileSync(receiptPath, JSON.stringify({ obligationId: "ob-inbound", ts: new Date(0).toISOString() }));
+      realFs.writeFileSync(join(f.obligationDir, "healthy.json"), JSON.stringify({ inboundId: "healthy", obligationId: "ob-healthy", state: "acked", lastTransitionAt: new Date(0).toISOString() }));
+      listFailure = readFailure = renameFailure = undefined;
+      uncodedWriteFailure = false;
+      realFs.writeFileSync(join(f.curDir, "timestamp-healthy.json"), JSON.stringify({ id: "healthy", ackedAt: "done" }));
+      sweepTerminalObligations(root, "anvil", 7, { warn: (m) => f.logs.push(m) }, Date.now(), 28, unresolved, undefined, [{ inboundId: "inbound", obligationId: "ob-inbound" } as any]);
+      expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
+      expect(realFs.existsSync(receiptPath)).toBe(true);
+      expect(realFs.existsSync(join(f.obligationDir, "healthy.json"))).toBe(false);
+      expect(f.logs.filter((m) => m.includes("actor=anvil"))).toHaveLength(1);
+      expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain(`state=${state}`);
+      expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain("restart the account");
+      replaceIdentity = false;
+      if (stage === "cur-missing" || stage === "identity-change") realFs.writeFileSync(f.curPath, JSON.stringify({ id: "inbound" }));
+      expect(f.reconcile().size).toBe(0);
+      expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8"))[state === "acked" ? "ackedAt" : "nackedAt"]).toBeDefined();
+    });
+  }
+}
+
+for (const stage of ["obligation-reread", "cur-retention-read", "cur-retention-list", "obligation-delete", "abandonment-write", "age", "identity", "cur-retention-missing"] as const) {
+  test(`retention ${stage} retains evidence, reports once, and continues`, () => {
+    const f = terminalFixture(stage === "abandonment-write" ? "failed" : "acked");
+    const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
+    if (stage === "abandonment-write") record.nackPending = true;
+    if (stage === "age") record.lastTransitionAt = "invalid";
+    if (stage === "identity") record.inboundId = "other";
+    realFs.writeFileSync(f.obligationPath, JSON.stringify(record));
+    realFs.writeFileSync(f.curPath, JSON.stringify({ id: "inbound", ackedAt: "done" }));
+    const bytes = realFs.readFileSync(f.obligationPath, "utf8");
+    if (stage === "obligation-reread") readFailure = f.obligationPath;
+    if (stage === "cur-retention-read") readFailure = f.curPath;
+    if (stage === "cur-retention-list") listFailure = f.curDir;
+    if (stage === "cur-retention-missing") realFs.unlinkSync(f.curPath);
+    if (stage === "obligation-delete") deleteFailure = f.obligationPath;
+    if (stage === "abandonment-write") renameFailure = f.obligationPath;
+    const unresolved = new Set<string>();
+    sweepTerminalObligations(root, "anvil", 7, { warn: (m) => f.logs.push(m) }, Date.now(), 28, unresolved, (path, code, id, state) => {
+      f.logs.push(`actor=anvil state=${state} path=${path} code=${code}; repair and restart the account`);
+      unresolved.add(id);
+    });
+    expect(unresolved.has("inbound")).toBe(true);
+    expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
+    expect(f.logs.filter((m) => m.includes("actor=anvil"))).toHaveLength(1);
+    expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain("restart the account");
+  });
+}
+
+test("retention holds a timestamped cur record before abandoning its nack debt", () => {
+  const f = terminalFixture("failed");
+  const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
+  record.nackPending = true;
+  realFs.writeFileSync(f.obligationPath, JSON.stringify(record));
+  const bytes = realFs.readFileSync(f.obligationPath, "utf8");
+  const result = sweepTerminalObligations(root, "anvil", 7);
+  expect(result.heldForRecovery).toBe(1);
+  expect(result.abandonedForNack).toBe(0);
+  expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
+});
+
+for (const stage of ["receipt-list", "receipt-read", "receipt-delete", "receipt-age"] as const) {
+  test(`startup retention ${stage} reports an unresolved record and retains evidence`, () => {
+    const f = terminalFixture("acked");
+    realFs.writeFileSync(f.curPath, JSON.stringify({ id: "inbound", ackedAt: "done" }));
+    const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
+    const receiptDir = join(f.obligationDir, "receipts");
+    realFs.mkdirSync(receiptDir);
+    const receiptPath = join(receiptDir, "ob-inbound.json");
+    realFs.writeFileSync(receiptPath, JSON.stringify({ obligationId: "ob-inbound", ts: new Date(0).toISOString() }));
+    if (stage === "receipt-list") listFailure = receiptDir;
+    if (stage === "receipt-read") readFailure = receiptPath;
+    if (stage === "receipt-age") {
+      realFs.unlinkSync(f.obligationPath);
+      realFs.writeFileSync(receiptPath, JSON.stringify({ obligationId: "ob-inbound", ts: "invalid" }));
+    }
+    if (stage === "receipt-delete") {
+      realFs.unlinkSync(f.obligationPath);
+      deleteFailure = receiptPath;
+    }
+    const unresolved = new Set<string>();
+    const onFailure = (path: string, code: string, id: string, state: string) => {
+      f.logs.push(`actor=anvil state=${state} path=${path} code=${code}; repair and restart the account`);
+      unresolved.add(id);
+    };
+    sweepTerminalObligations(root, "anvil", 7, { warn: (m) => f.logs.push(m) }, Date.now(), 28, unresolved, onFailure, [record]);
+    expect(unresolved.size).toBe(1);
+    expect(realFs.existsSync(receiptPath)).toBe(true);
+    if (stage !== "receipt-delete" && stage !== "receipt-age") expect(realFs.existsSync(f.obligationPath)).toBe(true);
+    expect(f.logs.filter((m) => m.includes("actor=anvil"))).toHaveLength(1);
+    expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain(`path=${stage === "receipt-list" ? receiptDir : receiptPath} code=${stage === "receipt-age" ? "INVALID_TIMESTAMP" : "EACCES"}`);
+  });
+}
+
+test("obligation filename and inboundId must agree before startup uses the record", () => {
+  const f = terminalFixture("acked");
+  const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
+  record.inboundId = "other";
+  realFs.writeFileSync(f.obligationPath, JSON.stringify(record));
+  expect(f.reconcile().has("inbound")).toBe(true);
+  expect(f.logs).toHaveLength(1);
+  expect(f.logs[0]).toContain("INVALID_RECORD");
+  expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeUndefined();
 });

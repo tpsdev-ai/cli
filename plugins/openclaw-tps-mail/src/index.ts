@@ -272,7 +272,7 @@ function readMailFile(filePath: string, onReadError?: (path: string, code: strin
     }
     return record as TpsMailBody;
   } catch (err: any) {
-    if (err?.code !== "ENOENT") onReadError?.(filePath, err?.code ?? "INVALID_RECORD");
+    onReadError?.(filePath, err?.code ?? "INVALID_RECORD");
     return null;
   }
 }
@@ -628,10 +628,13 @@ type CurRecordUpdate =
   | { ok: true }
   | { ok: false; reason: "record-missing" | "write-failed"; path: string; code: string };
 
-export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey?: "ackedAt" | "nackedAt"): CurRecordUpdate {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey?: "ackedAt" | "nackedAt", inboundId?: string): CurRecordUpdate {
   try {
     let alreadyStamped = false;
     const r = updateExistingRecord<TpsMailBody>(path, (current) => {
+      if (inboundId !== undefined && current.id !== inboundId) {
+        throw Object.assign(new Error("cur identity changed"), { code: "ID_MISMATCH" });
+      }
       if (stampKey && current[stampKey]) {
         alreadyStamped = true;
         return null;
@@ -647,16 +650,19 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
   }
 }
 
-export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): Set<string> {
-  const unknownInbounds = new Set<string>();
-  const reportReadError = (state: string, id: string) => (path: string, code: string) => log?.warn?.(
-    `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
-  );
-  const onObligationReadError = (path: string, code: string) => {
-    unknownInbounds.add(path.endsWith(".json") ? basename(path, ".json") : "*");
-    reportReadError("unknown", "unknown")(path, code);
+export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any, records?: ObligationRecord[], unknownInbounds = new Set<string>()): Set<string> {
+  const reportReadError = (state: string, id: string) => (path: string, code: string) => {
+    if (unknownInbounds.has(id)) return;
+    unknownInbounds.add(id);
+    log?.warn?.(
+      `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
+    );
   };
-  for (const rec of listObligations(mailDir, agent, onObligationReadError)) {
+  const onObligationReadError = (path: string, code: string) => {
+    reportReadError("unknown", path.endsWith(".json") ? basename(path, ".json") : "*")(path, code);
+  };
+  for (const rec of records ?? listObligations(mailDir, agent, onObligationReadError)) {
+    if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
     if (rec.state !== "acked" && rec.state !== "failed") continue;
     let unreadable = false;
     const onReadError = (path: string, code: string) => {
@@ -666,9 +672,13 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     const kind = rec.state === "acked" ? "ack" : "nack";
     const key = kind === "ack" ? "ackedAt" : "nackedAt";
     const curPath = findCurPath(mailDir, agent, rec.inboundId, onReadError);
-    const missing = (path: string) => log?.warn?.(
-      `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${path} code=ENOENT; inspect the missing cur record; obligation retained`,
-    );
+    const missing = (path: string) => {
+      unknownInbounds.add(rec.inboundId);
+      log?.warn?.(
+      `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${path} code=ENOENT; inspect the missing cur record; obligation retained; repair it and restart the account`,
+      );
+    };
+    if (unreadable) continue;
     if (!curPath) {
       if (!unreadable) missing(resolve(mailDir, agent, "cur"));
       continue;
@@ -682,9 +692,10 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     const patch = kind === "ack"
       ? { ackedAt: new Date().toISOString(), read: true }
       : { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" };
-    const r = patchMailFile(curPath, patch, key);
+    const r = patchMailFile(curPath, patch, key, rec.inboundId);
     if (r.ok) log?.info?.(`tps-mail: reconciled the ${kind} stamp for ${rec.inboundId} at ${curPath}`);
     else {
+      unknownInbounds.add(rec.inboundId);
       log?.warn?.(
         `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${r.path} code=${r.code}; ` +
         (r.reason === "record-missing" ? "inspect the missing cur record; obligation retained" : "restore writable records and restart the account; obligation retained"),
@@ -1642,7 +1653,9 @@ function installYieldSubscription(api: any): boolean {
 function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code: string) => void): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
-    for (const name of readdirSync(curDir)) {
+    const names = readdirSync(curDir);
+    const matching = names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`));
+    for (const name of matching.length ? matching : names) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
       const rec = readMailFile(p, onReadError);
@@ -2372,12 +2385,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           }
         } catch { /* ignore */ }
 
-        // STAMP RECONCILIATION (cli#492): an acked or failed obligation whose
-        // cur/ record never received its stamp — the write failed AFTER the
-        // durable transition — is re-stamped here, under the same lock that
-        // write uses, BEFORE the recovery loop below decides whether to
-        // re-dispatch the record.
-        const unknownInbounds = reconcileTerminalCurStamps(account.mailDir, agentId, log);
+        // Attempt terminal stamps before recovery and retention.
+        const unknownInbounds = new Set<string>();
+        const startupFailure = (path: string, code: string, id = "*", state = "unknown") => {
+          if (unknownInbounds.has(id)) return;
+          unknownInbounds.add(id);
+          log?.warn?.(`tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
+        };
+        const startupRecords = listObligations(account.mailDir, agentId, (path, code) =>
+          startupFailure(path, code, path.endsWith(".json") ? basename(path, ".json") : "*"),
+        );
+        reconcileTerminalCurStamps(account.mailDir, agentId, log, startupRecords, unknownInbounds);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
@@ -2394,13 +2412,15 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               if (!filename.endsWith(".json")) continue;
               const curPath = resolve(curDir, filename);
               if (seenFiles.has(curPath)) continue;
-              const record = readMailFile(curPath);
+              const known = startupRecords.find((rec) => filename === `${rec.inboundId}.json` || filename.endsWith(`-${rec.inboundId}.json`));
+              if (unknownInbounds.has("*") || (known && unknownInbounds.has(known.inboundId))) continue;
+              const record = readMailFile(curPath, (path, code) => startupFailure(path, code, known?.inboundId ?? basename(filename, ".json"), known?.state));
               if (!record || record.ackedAt || record.nackedAt) continue;
               if (unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
               void recoverUnackedCurRecord(agentId, curPath, record);
             }
           }
-        } catch { /* ignore */ }
+        } catch (err: any) { startupFailure(curDir, err?.code ?? "READ_FAILED"); }
 
         // Reap stranded tmp/*.promote scratch from an interrupted promote (the
         // catch only runs on a thrown error, so a kill leaves orphans no other
@@ -2430,9 +2450,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // below HOLDS any record still owing its nack (obligations.ts) while it
         // is inside the bounded hold, so an owed mail survives whether the retry
         // or the sweep runs first.
-        for (const rec of listObligations(account.mailDir, agentId)) {
+        for (const rec of startupRecords) {
           if (!isLive()) break;
-          if (!nackOwed(rec)) continue;
+          if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId) || !nackOwed(rec)) continue;
           retryOwedNackInBackground(
             account.mailDir,
             agentId,
@@ -2459,7 +2479,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // a route cannot pin a record forever.
         try {
           const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
-          if (unknownInbounds.size === 0) {
+          if (!unknownInbounds.has("*")) {
             sweepTerminalObligations(
               account.mailDir,
               agentId,
@@ -2467,6 +2487,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               log,
               Date.now(),
               resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
+              unknownInbounds,
+              startupFailure,
+              startupRecords,
             );
           }
         } catch (err: any) {
@@ -2476,10 +2499,13 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // RESTART RECOVERY (S2): in-memory timers die with the process, so
         // reconcile every durable obligation record against the maildir/outbox
         // and RE-ARM the deadline where work is still outstanding.
-        for (const rec of listObligations(account.mailDir, agentId)) {
+        for (const rec of startupRecords) {
           if (!isLive()) break;
-          if (TERMINAL_STATES.has(rec.state)) continue;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
+          if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId) || TERMINAL_STATES.has(rec.state)) continue;
+          const onFailure = (path: string, code: string) => startupFailure(path, code, rec.inboundId, rec.state);
+          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, onFailure);
+          if (!recCurPath) onFailure(curDir, "ENOENT");
+          if (unknownInbounds.has(rec.inboundId)) continue;
           const ctx = makeYieldCtx(
             account.mailDir,
             agentId,
@@ -2493,7 +2519,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             rec.inboundEnvelopeId,
           );
           yieldContexts.set(rec.obligationId, ctx);
-          await reconcileObligation(ctx, rec);
+          try {
+            await reconcileObligation(ctx, rec);
+          } catch (err: any) {
+            startupFailure(recCurPath!, err?.code ?? "RECONCILE_FAILED", rec.inboundId, rec.state);
+            yieldContexts.delete(rec.obligationId);
+          }
         }
       } catch (err: any) {
         log?.warn?.(

@@ -197,7 +197,7 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   const path = obligationPath(mailDir, agent, inboundId);
   try {
     const record: unknown = JSON.parse(readFileSync(path, "utf-8"));
-    if (!isObligationRecord(record)) {
+    if (!isObligationRecord(record) || record.inboundId !== inboundId) {
       return { status: "unverified", path, code: "INVALID_RECORD" };
     }
     return { status: "found", record };
@@ -227,7 +227,7 @@ export function listObligations(
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
       const record: unknown = JSON.parse(readFileSync(resolve(dir, name), "utf-8"));
-      if (!isObligationRecord(record)) {
+      if (!isObligationRecord(record) || `${record.inboundId}.json` !== name) {
         onReadError(resolve(dir, name), "INVALID_RECORD");
         continue;
       }
@@ -446,18 +446,37 @@ const ALL_STATES: ReadonlySet<string> = new Set([
   "failed",
 ]);
 
-/** True when the agent's cur/ record for this inbound is still UNRESOLVED
- *  (present without ackedAt/nackedAt). Startup recovery may re-dispatch it, so
- *  its obligation must not be swept yet — a crash between ackObligation's
- *  `acked` transition and the cur/ `ackedAt` patch leaves exactly this shape. */
-function curRecordUnresolved(mailDir: string, agent: string, inboundId: string): boolean {
-  const p = resolve(mailDir, agent, "cur", `${inboundId}.json`);
+function curRecordUnresolved(mailDir: string, agent: string, inboundId: string, onFailure: (path: string, code: string) => void, requireCur = false): boolean {
+  const curDirectory = resolve(mailDir, agent, "cur");
+  let names: string[];
   try {
-    const rec = JSON.parse(readFileSync(p, "utf-8"));
-    return !rec?.ackedAt && !rec?.nackedAt;
-  } catch {
-    return false; // absent/unreadable: nothing recovery can re-drive
+    names = readdirSync(curDirectory);
+  } catch (err: any) {
+    if (err?.code === "ENOENT" && !requireCur) return false;
+    onFailure(curDirectory, err?.code ?? "READ_FAILED");
+    return true;
   }
+  const matching = names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`));
+  for (const name of matching.length ? matching : names) {
+    if (!name.endsWith(".json")) continue;
+    const path = resolve(curDirectory, name);
+    try {
+      const rec = JSON.parse(readFileSync(path, "utf-8"));
+      if (!rec || typeof rec !== "object" || typeof rec.id !== "string") {
+        onFailure(path, "INVALID_RECORD");
+        return true;
+      }
+      if (rec.id === inboundId) return !rec.ackedAt && !rec.nackedAt;
+    } catch (err: any) {
+      onFailure(path, err?.code ?? "INVALID_RECORD");
+      return true;
+    }
+  }
+  if (requireCur) {
+    onFailure(curDirectory, "ENOENT");
+    return true;
+  }
+  return false;
 }
 
 /** The record's OWN recorded last-transition time in ms. `lastTransitionAt`
@@ -527,6 +546,9 @@ export function sweepTerminalObligations(
   log?: ObligationLog,
   nowMs: number = Date.now(),
   nackHoldDays: number = retentionDays * DEFAULT_NACK_HOLD_MULTIPLE,
+  unresolved = new Set<string>(),
+  onFailure?: (path: string, code: string, id: string, state: string) => void,
+  heldRecords: ObligationRecord[] = [],
 ): RetentionResult {
   const res: RetentionResult = {
     removed: 0,
@@ -544,6 +566,12 @@ export function sweepTerminalObligations(
     res.disabled = true;
     return res;
   }
+  const fail = (path: string, code: string, id: string, state: string) => {
+    if (unresolved.has(id)) return;
+    if (onFailure) onFailure(path, code, id, state);
+    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
+    unresolved.add(id);
+  };
   const dir = obligationsDir(mailDir, agent);
   let names: string[] = [];
   try {
@@ -556,9 +584,8 @@ export function sweepTerminalObligations(
     // unreadable the agent's own receipts cannot be attributed either.
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
-      log?.warn?.(
-        `tps-mail: obligation retention: could not read ${dir}: ${err instanceof Error ? err.message : String(err)}; sweep skipped`,
-      );
+      fail(dir, code ?? "READ_FAILED", "*", "unknown");
+      if (!onFailure) log?.warn?.(`tps-mail: obligation retention: could not read ${dir}; sweep skipped`);
       return res;
     }
   }
@@ -573,29 +600,66 @@ export function sweepTerminalObligations(
   // unique UUID, and the receipts live in this same store — so every receipt is
   // attributable to an obligation this sweep can see. There is no host-wide dir
   // to be careful of, and no inbound for two obligations to collide on.
+  const failedReceiptIds = new Set<string>();
+  const receiptFailureCodes = new Map<string, string>();
+  const receiptSnapshot = new Map<string, unknown>();
+  if (onFailure) {
+    const root = receiptsDir(mailDir, agent);
+    let receiptNames: string[] = [];
+    try { receiptNames = readdirSync(root); }
+    catch (err: any) {
+      if (err?.code !== "ENOENT") {
+        fail(root, err?.code ?? "READ_FAILED", "*", "unknown");
+        return res;
+      }
+    }
+    for (const name of receiptNames) {
+      if (!name.endsWith(".json") || name.startsWith(".")) continue;
+      try {
+        const receipt = JSON.parse(readFileSync(resolve(root, name), "utf-8"));
+        if (!receipt || typeof receipt.obligationId !== "string") throw new Error("invalid receipt");
+        receiptSnapshot.set(name, receipt);
+      } catch (err: any) {
+        const id = name.replace(/\.json$/, "");
+        failedReceiptIds.add(id);
+        const code = err?.code ?? "INVALID_RECEIPT";
+        receiptFailureCodes.set(id, code);
+        const owner = heldRecords.find((rec) => rec.obligationId === id);
+        fail(resolve(root, name), code, owner?.inboundId ?? `receipt:${name}`, owner?.state ?? "unknown");
+      }
+    }
+  }
   const terminalObligationIds = new Set<string>();
-  const liveObligationIds = new Set<string>();
+  const liveObligationIds = new Set<string>(heldRecords.filter((rec) => unresolved.has(rec.inboundId)).map((rec) => rec.obligationId));
+  if (unresolved.size > 0) res.unreadable++;
   for (const name of names) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     const path = resolve(dir, name);
+    const fileId = name.replace(/\.json$/, "");
+    if (unresolved.has("*") || unresolved.has(fileId)) {
+      res.heldForRecovery++;
+      continue;
+    }
     let record: unknown;
     try {
       record = JSON.parse(readFileSync(path, "utf-8"));
-    } catch {
+    } catch (err: any) {
       res.unreadable++;
       leftUnreadable.push(name);
+      fail(path, err?.code ?? "INVALID_RECORD", fileId, "unknown");
       continue;
     }
     // Shape check: a parseable value that is not an object with a RECOGNIZED
     // state (null, no state, an unknown state) is a malformed record, not a
     // non-terminal one — reported as unreadable, never swept.
-    const state = (record as { state?: unknown } | null)?.state;
-    if (typeof record !== "object" || record === null || Array.isArray(record) || typeof state !== "string" || !ALL_STATES.has(state)) {
+    if (!isObligationRecord(record) || record.inboundId !== fileId) {
       res.unreadable++;
       leftUnreadable.push(name);
+      fail(path, "INVALID_RECORD", fileId, "unknown");
       continue;
     }
-    if (!TERMINAL_STATES.has(state as ObligationState)) {
+    const state = record.state;
+    if (!TERMINAL_STATES.has(state)) {
       const liveObligationId = (record as { obligationId?: unknown }).obligationId;
       if (typeof liveObligationId === "string") liveObligationIds.add(liveObligationId);
       res.left++; // pending / delivering / posted / yielded are never deletable
@@ -603,6 +667,28 @@ export function sweepTerminalObligations(
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
     if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
+    const inboundId = (record as { inboundId?: unknown }).inboundId;
+    const hold = () => {
+      if (typeof snapshotObligationId === "string") liveObligationIds.add(snapshotObligationId);
+      res.heldForRecovery++;
+    };
+    if (typeof snapshotObligationId === "string" && failedReceiptIds.has(snapshotObligationId)) {
+      fail(resolve(receiptsDir(mailDir, agent), `${snapshotObligationId}.json`), receiptFailureCodes.get(snapshotObligationId) ?? "RECEIPT_READ_FAILED", fileId, state);
+      hold();
+      continue;
+    }
+    const transitionMs = obligationLastTransitionMs(record);
+    if (transitionMs === null) {
+      res.unreadable++;
+      leftUnreadable.push(name);
+      fail(path, "INVALID_TIMESTAMP", fileId, state);
+      hold();
+      continue;
+    }
+    if (typeof inboundId === "string" && curRecordUnresolved(mailDir, agent, inboundId, (p, code) => fail(p, code, fileId, state), Boolean(onFailure))) {
+      hold();
+      continue;
+    }
     // cli#389 round 11, item 1: a record still OWING its nack mail is not
     // deletable while it is INSIDE the hold window — startup retries delivery
     // from this exact shape (`nackPending` with no `nackSentAt`), so sweeping it
@@ -618,7 +704,6 @@ export function sweepTerminalObligations(
         res.heldForNack++;
         continue;
       }
-      res.abandonedForNack++;
       // cli#389 round 13, item 2: RELEASE the debt in the same pass that gives up
       // on it — clear `nackPending` and record `nackAbandonedAt`. Without the
       // clear, a record retention then KEEPS would be abandoned and logged
@@ -630,30 +715,23 @@ export function sweepTerminalObligations(
         mailDir,
         agent,
         typeof recInbound === "string" ? recInbound : name.replace(/\.json$/, ""),
-        log,
+        { warn: () => {} },
         new Date(nowMs).toISOString(),
       );
+      if (!released) {
+        fail(path, "WRITE_FAILED", fileId, state);
+        hold();
+        continue;
+      }
+      res.abandonedForNack++;
       log?.warn?.(
         `tps-mail: nack-abandoned: ${name} has owed its nack past the hold window (${nackHoldDays} day(s)); ` +
-          `the debt is released${released ? "" : " (the release could not be recorded, so a later sweep will abandon it again)"} ` +
+          `the debt is released ` +
           `and normal retention applies to the record`,
       );
       // fall through to the normal terminal-retention rules below
     }
-    // A terminal record whose cur/ record is still unresolved is HELD until
-    // startup recovery resolves it (else a re-dispatch would open a fresh
-    // obligation and double-post).
-    const inboundId = (record as { inboundId?: unknown }).inboundId;
-    if (typeof inboundId === "string" && curRecordUnresolved(mailDir, agent, inboundId)) {
-      res.heldForRecovery++;
-      continue;
-    }
-    const t = obligationLastTransitionMs(record);
-    if (t === null) {
-      res.unreadable++;
-      leftUnreadable.push(name);
-      continue;
-    }
+    const t = transitionMs;
     if (t >= cutoff) {
       res.left++;
       continue;
@@ -662,9 +740,8 @@ export function sweepTerminalObligations(
       unlinkSync(path);
       res.removed++;
     } catch (err) {
-      log?.warn?.(
-        `tps-mail: obligation retention: could not delete ${name}: ${err instanceof Error ? err.message : String(err)}; left in place`,
-      );
+      fail(path, (err as NodeJS.ErrnoException).code ?? "DELETE_FAILED", fileId, state);
+      hold();
       res.left++;
     }
   }
@@ -689,7 +766,7 @@ export function sweepTerminalObligations(
   const receiptsRoot = receiptsDir(mailDir, agent);
   let receiptNames: string[];
   try {
-    receiptNames = readdirSync(receiptsRoot);
+    receiptNames = onFailure ? [...receiptSnapshot.keys()] : readdirSync(receiptsRoot);
   } catch {
     // No receipts directory yet (no receipted delivery was ever made): done.
     receiptNames = [];
@@ -697,11 +774,13 @@ export function sweepTerminalObligations(
   for (const name of receiptNames) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     const path = resolve(receiptsRoot, name);
+    if (onFailure && failedReceiptIds.has(name.replace(/\.json$/, ""))) continue;
     let receipt: unknown;
     try {
-      receipt = JSON.parse(readFileSync(path, "utf-8"));
-    } catch {
+      receipt = onFailure ? receiptSnapshot.get(name) : JSON.parse(readFileSync(path, "utf-8"));
+    } catch (err: any) {
       res.receiptsUnreadable++;
+      if (onFailure) fail(path, err?.code ?? "INVALID_RECEIPT", `receipt:${name}`, "unknown");
       continue;
     }
     const obligationId = (receipt as { obligationId?: unknown } | null)?.obligationId;
@@ -710,9 +789,15 @@ export function sweepTerminalObligations(
     // names no obligation id cannot be attributed to one, so it is left in
     // place rather than aged out on a guess.
     if (typeof obligationId !== "string" || obligationId.length === 0) continue;
-    const terminal = terminalObligationIds.has(obligationId);
     const live = liveObligationIds.has(obligationId);
+    if (live) continue;
+    const terminal = terminalObligationIds.has(obligationId);
+    if (onFailure && terminal) continue;
     const t = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
+    if (onFailure && !terminal && !Number.isFinite(t)) {
+      fail(path, "INVALID_TIMESTAMP", `receipt:${name}`, "orphan");
+      continue;
+    }
     const agedOrphan = !live && Number.isFinite(t) && t < cutoff;
     // FAIL SAFE (cli#389 round 6, item 3): an obligation record that could not
     // be read joins neither set, so a receipt for THAT obligation looks
@@ -729,12 +814,16 @@ export function sweepTerminalObligations(
       unlinkSync(path);
       res.receiptsRemoved++;
     } catch (err) {
+      if (onFailure) {
+        fail(path, (err as NodeJS.ErrnoException).code ?? "DELETE_FAILED", `receipt:${name}`, "orphan");
+        continue;
+      }
       log?.warn?.(
         `tps-mail: obligation retention: could not delete receipt ${name}: ${err instanceof Error ? err.message : String(err)}; left in place`,
       );
     }
   }
-  if (res.receiptsUnreadable > 0) {
+  if (res.receiptsUnreadable > 0 && !onFailure) {
     log?.warn?.(
       `tps-mail: obligation retention: left ${res.receiptsUnreadable} unreadable receipt(s) in place (never deleted)`,
     );
@@ -747,7 +836,7 @@ export function sweepTerminalObligations(
   }
 
   // Logged ONCE: a single line for the unreadable/malformed records we left.
-  if (leftUnreadable.length > 0) {
+  if (leftUnreadable.length > 0 && !onFailure) {
     log?.warn?.(
       `tps-mail: obligation retention: left ${leftUnreadable.length} unreadable/malformed record(s) in place (never deleted): ${leftUnreadable.join(", ")}`,
     );
