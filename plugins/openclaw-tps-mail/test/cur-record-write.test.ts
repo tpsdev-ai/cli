@@ -128,7 +128,7 @@ function signedBody(from: string, to: string, body: string, seed: Buffer): strin
   ));
 }
 
-/** The anvil cur/ record (the first .json file in anvil/cur). */
+/** The anvil cur/ record (the first parseable .json file in anvil/cur). */
 function readCur(): { path: string; record: any } | null {
   const dir = resolve(mailDir, "anvil", "cur");
   let names: string[];
@@ -512,4 +512,26 @@ for (const invalidState of [false, true]) {
       expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
     } finally { next.settle(); await next.stop(); }
   }, 15000);
+}
+
+for (const failure of ["directory", "file"] as const) {
+  it(`startup distinguishes a ${failure} read failure from the literal star file`, async () => {
+    const dir = resolve(mailDir, "anvil", ".obligations");
+    realFs.mkdirSync(resolve(mailDir, "anvil"), { recursive: true });
+    const path = failure === "directory" ? dir : resolve(dir, "*.json");
+    if (failure === "file") realFs.mkdirSync(dir);
+    realFs.writeFileSync(path, "{}");
+    if (failure === "file") realFs.chmodSync(path, 0o000);
+    const h = await boot(false);
+    try {
+      expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved") && m.includes(path)))).toBe(true);
+      const diagnostic = h.logs.find((m) => m.includes("startup-unresolved") && m.includes(path))!;
+      expect(diagnostic).toContain(failure === "directory" ? "the directory could not be read" : "repair the record");
+      expect(diagnostic.includes("the directory could not be read")).toBe(failure === "directory");
+      expect(diagnostic).not.toContain("obligation retained");
+    } finally {
+      await h.stop();
+      if (failure === "file") realFs.chmodSync(path, 0o644);
+    }
+  });
 }

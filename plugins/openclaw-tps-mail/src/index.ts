@@ -77,6 +77,7 @@ import {
   scanForReceipt,
   sweepTerminalObligations,
   type ReceiptSignatureCheck,
+  type ReadFailureKind,
   transitionObligation,
   writeReceipt,
   type ObligationRecord,
@@ -655,7 +656,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     if (unknownInbounds.has(id)) return;
     unknownInbounds.add(id);
     log?.warn?.(
-      `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
+      `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account`,
     );
   };
   const onObligationReadError = (path: string, code: string, ids: string[]) => {
@@ -703,7 +704,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
           ? "inspect the missing cur record; obligation retained"
           : r.code === "ID_MISMATCH"
           ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
-          : "restore writable records and restart the account; obligation retained"),
+          : "repair the record and restart the account; obligation retained"),
       );
     }
   }
@@ -986,7 +987,7 @@ function stampTerminalCur(
         : stamped.code === "ID_MISMATCH"
         ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
         : delay === undefined
-        ? "no retries left; restore writable records and restart the account; obligation retained"
+        ? "no retries left; repair the record and restart the account; obligation retained"
         : `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`),
   );
   if (delay === undefined || !isLiveContext(ctx)) return;
@@ -2394,17 +2395,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
         // Attempt terminal stamps before recovery and retention.
         const unknownInbounds = new Set<string>();
-        const startupFailure = (path: string, code: string, id = "*", state = "unknown") => {
+        const startupFailure = (path: string, code: string, id = "*", state = "unknown", kind: ReadFailureKind = "file") => {
           if (unknownInbounds.has(id)) return;
           unknownInbounds.add(id);
           log?.warn?.(
-            id === "*"
+            kind === "directory"
               ? `tps-mail: startup-unresolved: actor=${agentId} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`
-              : `tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`,
+              : `tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account`,
           );
         };
-        const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids) => {
-          startupFailure(path, code, ids[0]);
+        const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids, kind) => {
+          startupFailure(path, code, ids[0], "unknown", kind);
           for (const id of ids) unknownInbounds.add(id);
         });
         reconcileTerminalCurStamps(account.mailDir, agentId, log, startupRecords, unknownInbounds);
@@ -2432,7 +2433,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               void recoverUnackedCurRecord(agentId, curPath, record);
             }
           }
-        } catch (err: any) { startupFailure(curDir, err?.code ?? "READ_FAILED"); }
+        } catch (err: any) { startupFailure(curDir, err?.code ?? "READ_FAILED", "*", "unknown", "directory"); }
 
         // Reap stranded tmp/*.promote scratch from an interrupted promote (the
         // catch only runs on a thrown error, so a kill leaves orphans no other

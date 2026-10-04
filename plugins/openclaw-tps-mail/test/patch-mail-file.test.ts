@@ -128,7 +128,7 @@ describe("terminal stamp reconciliation", () => {
       uncodedWriteFailure = true;
       f.reconcile();
       expect(f.logs[0]).toContain(`actor=anvil state=${state} path=${f.curPath} code=WRITE_FAILED`);
-      expect(f.logs[0]).toContain("restore writable records and restart the account; obligation retained");
+      expect(f.logs[0]).toContain("repair the record and restart the account; obligation retained");
       uncodedWriteFailure = false;
       f.reconcile();
       expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8"))[key]).toBeDefined();
@@ -170,7 +170,7 @@ describe("terminal stamp reconciliation", () => {
       expect(f.logs[0]).toContain("stamp-reconcile-read-failed");
       expect(f.logs[0]).toContain("actor=anvil state=");
       expect(f.logs[0]).toContain(`path=${target} code=EACCES`);
-      expect(f.logs[0]).toContain("restore readable records and restart the account");
+      expect(f.logs[0]).toContain("repair the record and restart the account");
       listFailure = readFailure = undefined;
       f.reconcile();
       expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeDefined();
@@ -203,7 +203,7 @@ for (const invalid of [null, 7, "bad", [], { inboundId: "bad" }]) {
     expect(errors).toEqual([`${badPath}:INVALID_RECORD`]);
     expect(() => f.reconcile()).not.toThrow();
     expect(f.logs[0]).toContain(`actor=anvil state=unknown path=${badPath} code=INVALID_RECORD`);
-    expect(f.logs[0]).toContain("restore readable records and restart the account");
+    expect(f.logs[0]).toContain("repair the record and restart the account");
     expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeDefined();
     expect(realFs.readFileSync(badPath, "utf8")).toBe(JSON.stringify(invalid));
   });
@@ -214,7 +214,7 @@ test("a null cur record is reported as unreadable", () => {
   realFs.writeFileSync(f.curPath, "null");
   f.reconcile();
   expect(f.logs[0]).toContain(`actor=anvil state=acked path=${f.curPath} code=INVALID_RECORD`);
-  expect(f.logs[0]).toContain("restore readable records and restart the account");
+  expect(f.logs[0]).toContain("repair the record and restart the account");
 });
 
 test("creation refuses an unreadable existing terminal obligation", () => {
@@ -350,3 +350,23 @@ test("obligation filename and inboundId must agree before startup uses the recor
   expect(f.logs[0]).toContain("INVALID_RECORD");
   expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeUndefined();
 });
+
+for (const failure of ["directory", "file"] as const) {
+  test(`retention distinguishes a ${failure} read failure from the literal star file`, () => {
+    const dir = join(root, "anvil", ".obligations");
+    realFs.mkdirSync(dir, { recursive: true });
+    const path = failure === "directory" ? dir : join(dir, "*.json");
+    if (failure === "directory") listFailure = path;
+    else {
+      realFs.writeFileSync(path, "{}");
+      readFailure = path;
+    }
+    const logs: string[] = [];
+    sweepTerminalObligations(root, "anvil", 7, { warn: (m) => logs.push(m) });
+    const diagnostic = logs.find((m) => m.includes("retention-unresolved"))!;
+    expect(diagnostic).toContain(`path=${path} code=EACCES`);
+    expect(diagnostic).toContain(failure === "directory" ? "the directory could not be read" : "repair the record");
+    expect(diagnostic.includes("the directory could not be read")).toBe(failure === "directory");
+    expect(diagnostic).not.toContain("obligation retained");
+  });
+}

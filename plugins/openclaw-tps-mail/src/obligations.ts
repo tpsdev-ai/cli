@@ -161,6 +161,8 @@ export interface ObligationRecord {
   nackAbandonedAt?: string;
 }
 
+export type ReadFailureKind = "directory" | "file";
+
 export interface ObligationLog {
   info?: (msg: string) => void;
   warn?: (msg: string) => void;
@@ -210,8 +212,8 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
 export function listObligations(
   mailDir: string,
   agent: string,
-  onReadError: (path: string, code: string, ids: string[]) => void = (path, code) => console.warn(
-    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; restore readable obligations and restart the account`,
+  onReadError: (path: string, code: string, ids: string[], kind: ReadFailureKind) => void = (path, code) => console.warn(
+    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; repair the record and restart the account`,
   ),
 ): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
@@ -219,7 +221,7 @@ export function listObligations(
   try {
     names = readdirSync(dir);
   } catch (err: any) {
-    if (err?.code !== "ENOENT") onReadError(dir, err?.code ?? "READ_FAILED", ["*"]);
+    if (err?.code !== "ENOENT") onReadError(dir, err?.code ?? "READ_FAILED", ["*"], "directory");
     return [];
   }
   const out: ObligationRecord[] = [];
@@ -232,12 +234,12 @@ export function listObligations(
         if (record && typeof record === "object" && "inboundId" in record && typeof record.inboundId === "string") {
           ids.push(record.inboundId);
         }
-        onReadError(resolve(dir, name), "INVALID_RECORD", ids);
+        onReadError(resolve(dir, name), "INVALID_RECORD", ids, "file");
         continue;
       }
       out.push(record);
     } catch (err: any) {
-      onReadError(resolve(dir, name), err?.code ?? "INVALID_RECORD", [name.slice(0, -5)]);
+      onReadError(resolve(dir, name), err?.code ?? "INVALID_RECORD", [name.slice(0, -5)], "file");
     }
   }
   return out;
@@ -267,7 +269,7 @@ export function createObligation(
   const draft = make();
   const result = readObligationResult(mailDir, agent, draft.inboundId);
   if (result.status === "unverified") {
-    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; restore readable records and restart the account; obligation retained`;
+    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; repair the record and restart the account`;
     log?.warn?.(message);
     throw new Error(message);
   }
@@ -551,7 +553,7 @@ export function sweepTerminalObligations(
   nowMs: number = Date.now(),
   nackHoldDays: number = retentionDays * DEFAULT_NACK_HOLD_MULTIPLE,
   unresolved = new Set<string>(),
-  onFailure?: (path: string, code: string, id: string, state: string) => void,
+  onFailure?: (path: string, code: string, id: string, state: string, kind: ReadFailureKind) => void,
   heldRecords: ObligationRecord[] = [],
 ): RetentionResult {
   const res: RetentionResult = {
@@ -570,11 +572,11 @@ export function sweepTerminalObligations(
     res.disabled = true;
     return res;
   }
-  const fail = (path: string, code: string, id: string, state: string) => {
+  const fail = (path: string, code: string, id: string, state: string, kind: ReadFailureKind = "file") => {
     if (unresolved.has(id)) return;
-    if (onFailure) onFailure(path, code, id, state);
-    else if (id === "*") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`);
-    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
+    if (onFailure) onFailure(path, code, id, state, kind);
+    else if (kind === "directory") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`);
+    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account`);
     unresolved.add(id);
   };
   const dir = obligationsDir(mailDir, agent);
@@ -589,7 +591,7 @@ export function sweepTerminalObligations(
     // unreadable the agent's own receipts cannot be attributed either.
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
-      fail(dir, code ?? "READ_FAILED", "*", "unknown");
+      fail(dir, code ?? "READ_FAILED", "*", "unknown", "directory");
       if (!onFailure) log?.warn?.(`tps-mail: obligation retention: could not read ${dir}; sweep skipped`);
       return res;
     }
@@ -614,7 +616,7 @@ export function sweepTerminalObligations(
     try { receiptNames = readdirSync(root); }
     catch (err: any) {
       if (err?.code !== "ENOENT") {
-        fail(root, err?.code ?? "READ_FAILED", "*", "unknown");
+        fail(root, err?.code ?? "READ_FAILED", "*", "unknown", "directory");
         return res;
       }
     }

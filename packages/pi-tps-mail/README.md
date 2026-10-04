@@ -76,16 +76,8 @@ process.on("SIGTERM", () => watcher.stop());
 Every `tps` invocation below runs as the agent (`TPS_AGENT_ID={agent}`,
 `TPS_MAIL_DIR={inboxRoot}/.tps/mail`).
 
-1. Every 5 seconds (`pollIntervalMs`) it first finishes any reply its journal
-   still owes (step 3), then — when `new/` holds anything, or at least every
-   `rescanIntervalMs` — runs **`tps mail check {agent} --json`**. That is the
-   CLI's promotion path: it verifies each inbound's signed envelope (signature,
-   sender, recipient, replay, id shape), moves it to `cur/`, and dead-letters
-   what fails to `dlq/`; it also re-verifies and re-presents a `cur/` record
-   whose processing lease expired without an ack. **The watcher acts only on the
-   records that command returns** — never on a file it reads itself — so an
-   unsigned or forged inbound is never dispatched and never answered, and the
-   sender, the body and the thread all come from the verified envelope.
+1. Runs **`tps mail check {agent} --json`** when `new/` holds anything or
+   `rescanIntervalMs` has elapsed.
 2. For each verified inbound:
    - Spawns the launcher script with the verified message body as its argument,
      with a hard timeout (SIGTERM → 5s grace → SIGKILL).

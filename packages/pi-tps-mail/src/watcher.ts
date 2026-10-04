@@ -5,11 +5,7 @@
 // the agent: the CLI's own promotion path (promote()) verifies every new/
 // record — signature, sender binding, recipient, replay, id shape — moves it to
 // cur/, and dead-letters what fails; it also re-verifies and re-presents a
-// cur/ record whose processing lease expired without an ack. The watcher acts
-// ONLY on the verified records that command prints: the sender, the body the
-// launcher sees and the thread the reply signs (the envelope's messageId) all
-// come from the verified envelope. An unsigned or forged inbound is never
-// dispatched and never answered.
+// cur/ record whose processing lease expired without an ack.
 //
 // THE REPLY JOURNAL. Before a reply is first sent, the watcher writes it to
 // `<mail>/<agent>/.pi-tps-mail/replies/<inbound id>.json` (0600): the verified
