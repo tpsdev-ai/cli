@@ -1,3 +1,3 @@
 - **First delivery never replaces or writes through an existing `cur/` record (Closes #482).**
 
-  A delivery that passes the signature and mailbox checks and carries an already-consumed ID is treated as a replay and the existing `cur/` record is kept; other outcomes are main's, unchanged.
+  A delivery never replaces or writes through an existing `cur/` record: it is created exclusively on a fresh unique scratch path, and a stranded scratch link is removed without writing through it.
