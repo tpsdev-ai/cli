@@ -137,6 +137,19 @@ export class FlairRequestError extends Error {
   }
 }
 
+/**
+ * Flair exposes no operation that promotes or rejects a Memory by id: the
+ * promotion operation `POST /PromoteMemoryCandidate` acts on a `MemoryCandidate`
+ * id. Refuse by name rather than send a write Flair rejects.
+ */
+function promotionUnsupported(action: "approve" | "reject", id: string): Error {
+  return new Error(
+    `tps memory ${action} is unavailable: Flair has no operation that sets a memory's promotion status by id. ` +
+      `Promotion uses Flair's candidate workflow (POST /PromoteMemoryCandidate, on a MemoryCandidate id). ` +
+      `${id} was not changed.`,
+  );
+}
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -332,11 +345,16 @@ export class FlairClient {
     });
   }
 
-  async search(query: string, limit = 5): Promise<SearchResult[]> {
+  /**
+   * Semantic search. The client signs as its own agent; `opts.agentId` names
+   * the reader whose read scope the search resolves (that reader's memories
+   * plus other agents' non-private memories). Defaults to the signing agent.
+   */
+  async search(query: string, limit = 5, opts: { agentId?: string } = {}): Promise<SearchResult[]> {
     const result = await this.request<{ results: SearchResult[] }>(
       "POST",
       "/SemanticSearch",
-      { agentId: this.agentId, q: query, limit },
+      { agentId: opts.agentId ?? this.agentId, q: query, limit },
     );
     return result.results ?? [];
   }
@@ -402,30 +420,51 @@ export class FlairClient {
   }
 
 
-  /** Read-modify-write: GET existing record, merge patch, PUT back. Prevents field loss on partial updates. */
-  private async patchRecord(table: string, id: string, patch: Record<string, unknown>): Promise<void> {
-    const existing = await this.request<Record<string, unknown>>("GET", `/${table}/${encodeURIComponent(id)}`).catch(() => null);
-    const merged = { ...(existing ?? {}), ...patch, id };  // id always present
-    await this.request("PUT", `/${table}/${encodeURIComponent(id)}`, merged);
+  /**
+   * Read the record a governance write will land on. A governance update must
+   * not proceed on unknown state: a failed or incomplete read refuses by name
+   * before any write is sent.
+   */
+  private async readGovernedMemory(id: string): Promise<Memory> {
+    let record: Memory;
+    try {
+      record = await this.request<Memory>("GET", `/Memory/${encodeURIComponent(id)}`);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(`refusing to update memory ${id}: the read failed (${detail})`);
+    }
+    if (
+      !record ||
+      typeof record.id !== "string" ||
+      typeof record.agentId !== "string" ||
+      typeof record.content !== "string"
+    ) {
+      throw new Error(`refusing to update memory ${id}: Flair returned an incomplete record`);
+    }
+    return record;
+  }
+
+  /**
+   * Send a merge-request PATCH carrying only the governance fields. The read
+   * first is the gate above; the PATCH itself merges server-side, so a
+   * full-record PUT cannot rewrite a projected read and drop unprojected
+   * fields.
+   */
+  private async patchGovernedMemory(id: string, patch: Record<string, unknown>): Promise<void> {
+    await this.readGovernedMemory(id);
+    await this.request("PATCH", `/Memory/${encodeURIComponent(id)}`, patch);
   }
 
   async approveMemory(id: string): Promise<void> {
-    await this.patchRecord("Memory", id, {
-      promotionStatus: "approved",
-      promotedBy: this.agentId,
-      promotedAt: new Date().toISOString(),
-      durability: "permanent",
-    });
+    throw promotionUnsupported("approve", id);
   }
 
   async rejectMemory(id: string): Promise<void> {
-    await this.patchRecord("Memory", id, {
-      promotionStatus: "rejected",
-    });
+    throw promotionUnsupported("reject", id);
   }
 
   async archiveMemory(id: string): Promise<void> {
-    await this.patchRecord("Memory", id, {
+    await this.patchGovernedMemory(id, {
       archived: true,
       archivedBy: this.agentId,
       archivedAt: new Date().toISOString(),
@@ -433,7 +472,7 @@ export class FlairClient {
   }
 
   async unarchiveMemory(id: string): Promise<void> {
-    await this.patchRecord("Memory", id, {
+    await this.patchGovernedMemory(id, {
       archived: false,
       archivedBy: null,
       archivedAt: null,

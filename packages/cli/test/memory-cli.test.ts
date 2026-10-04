@@ -74,62 +74,70 @@ describe("ops-31.1: tps memory review", () => {
   });
 });
 
-describe("ops-31.1: tps memory approve", () => {
-  test("sends PUT with promotionStatus=approved", async () => {
-    let captured: any;
-    mockFetch(async (url, opts) => {
-      if (opts?.method === "PUT") captured = JSON.parse(opts.body as string);
-      return new Response("{}", { status: 200 });
-    });
+describe("ops-31.1: tps memory approve / reject are unsupported by Flair", () => {
+  test("approve refuses by name and sends no write", async () => {
+    const calls: Array<string | undefined> = [];
+    mockFetch(async (_url, opts) => { calls.push(opts?.method); return new Response("{}", { status: 200 }); });
 
     const { runMemory } = await import("../src/commands/memory.js");
-    await runMemory({ action: "approve", memoryId: "flint-lesson-042", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-
-    expect(captured.promotionStatus).toBe("approved");
-    expect(captured.id).toBe("flint-lesson-042");
+    await expect(
+      runMemory({ action: "approve", memoryId: "agent-a-mem-1", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH }),
+    ).rejects.toThrow(/no operation that sets a memory's promotion status by id/);
+    expect(calls).toEqual([]);
   });
-});
 
-describe("ops-31.1: tps memory reject", () => {
-  test("sends PUT with promotionStatus=rejected", async () => {
-    let captured: any;
-    mockFetch(async (url, opts) => {
-      if (opts?.method === "PUT") captured = JSON.parse(opts.body as string);
-      return new Response("{}", { status: 200 });
-    });
+  test("reject refuses by name and sends no write", async () => {
+    const calls: Array<string | undefined> = [];
+    mockFetch(async (_url, opts) => { calls.push(opts?.method); return new Response("{}", { status: 200 }); });
 
     const { runMemory } = await import("../src/commands/memory.js");
-    await runMemory({ action: "reject", memoryId: "flint-pattern-018", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-
-    expect(captured.promotionStatus).toBe("rejected");
+    await expect(
+      runMemory({ action: "reject", memoryId: "agent-a-mem-1", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH }),
+    ).rejects.toThrow(/no operation that sets a memory's promotion status by id/);
+    expect(calls).toEqual([]);
   });
 });
 
 describe("ops-31.1: tps memory archive / unarchive", () => {
-  test("archive sends archived=true", async () => {
-    let captured: any;
+  test("archive reads first, then PATCHes only the governance fields", async () => {
+    const writes: Array<{ method?: string; url: string; body: any }> = [];
     mockFetch(async (url, opts) => {
-      if (opts?.method === "PUT") captured = JSON.parse(opts.body as string);
+      if (opts?.method === "GET") {
+        return new Response(JSON.stringify({ id: "agent-a-mem-1", agentId: "agent-a", content: "keep this", durability: "standard" }), { status: 200 });
+      }
+      writes.push({ method: opts?.method, url, body: JSON.parse(opts?.body as string) });
       return new Response("{}", { status: 200 });
     });
 
     const { runMemory } = await import("../src/commands/memory.js");
-    await runMemory({ action: "archive", memoryId: "flint-lesson-042", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
+    await runMemory({ action: "archive", memoryId: "agent-a-mem-1", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
 
-    expect(captured.archived).toBe(true);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].method).toBe("PATCH");
+    expect(writes[0].url).toBe("http://127.0.0.1:19926/Memory/agent-a-mem-1");
+    expect(Object.keys(writes[0].body).sort()).toEqual(["archived", "archivedAt", "archivedBy"]);
+    expect(writes[0].body.archived).toBe(true);
+    expect(writes[0].body.archivedBy).toBe("operator");
   });
 
-  test("unarchive sends archived=false", async () => {
-    let captured: any;
+  test("unarchive reads first, then PATCHes only the governance fields", async () => {
+    const writes: Array<{ method?: string; url: string; body: any }> = [];
     mockFetch(async (url, opts) => {
-      if (opts?.method === "PUT") captured = JSON.parse(opts.body as string);
+      if (opts?.method === "GET") {
+        return new Response(JSON.stringify({ id: "agent-a-mem-1", agentId: "agent-a", content: "keep this", durability: "standard" }), { status: 200 });
+      }
+      writes.push({ method: opts?.method, url, body: JSON.parse(opts?.body as string) });
       return new Response("{}", { status: 200 });
     });
 
     const { runMemory } = await import("../src/commands/memory.js");
-    await runMemory({ action: "unarchive", memoryId: "flint-lesson-042", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
+    await runMemory({ action: "unarchive", memoryId: "agent-a-mem-1", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
 
-    expect(captured.archived).toBe(false);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].method).toBe("PATCH");
+    expect(Object.keys(writes[0].body).sort()).toEqual(["archived", "archivedAt", "archivedBy"]);
+    expect(writes[0].body.archived).toBe(false);
+    expect(writes[0].body.archivedBy).toBeNull();
   });
 });
 
