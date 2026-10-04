@@ -268,7 +268,7 @@ for (const state of ["acked", "failed"] as const) {
 }
 
 for (const stage of ["obligation-reread", "cur-retention-read", "cur-retention-list", "obligation-delete", "abandonment-write", "age", "identity", "cur-retention-missing"] as const) {
-  test(`retention ${stage} retains evidence, reports once, and continues`, () => {
+  test(`retention ${stage} retains evidence and reports once`, () => {
     const f = terminalFixture(stage === "abandonment-write" ? "failed" : "acked");
     const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
     if (stage === "abandonment-write") record.nackPending = true;

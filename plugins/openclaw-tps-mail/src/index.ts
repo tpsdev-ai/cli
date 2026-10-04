@@ -699,7 +699,11 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
       unknownInbounds.add(rec.inboundId);
       log?.warn?.(
         `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${r.path} code=${r.code}; ` +
-        (r.reason === "record-missing" ? "inspect the missing cur record; obligation retained" : "restore writable records and restart the account; obligation retained"),
+        (r.reason === "record-missing"
+          ? "inspect the missing cur record; obligation retained"
+          : r.code === "ID_MISMATCH"
+          ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
+          : "restore writable records and restart the account; obligation retained"),
       );
     }
   }
@@ -979,6 +983,8 @@ function stampTerminalCur(
     `tps-mail: ${kind}-stamp-failed: ${ctx.inboundId} actor=${ctx.agent} state=${kind === "ack" ? "acked" : "failed"} path=${stamped.path} code=${stamped.code}; ` +
       (stamped.reason === "record-missing"
         ? "inspect the missing cur record; obligation retained"
+        : stamped.code === "ID_MISMATCH"
+        ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
         : delay === undefined
         ? "no retries left; restore writable records and restart the account; obligation retained"
         : `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`),
@@ -2391,7 +2397,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         const startupFailure = (path: string, code: string, id = "*", state = "unknown") => {
           if (unknownInbounds.has(id)) return;
           unknownInbounds.add(id);
-          log?.warn?.(`tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
+          log?.warn?.(
+            id === "*"
+              ? `tps-mail: startup-unresolved: actor=${agentId} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`
+              : `tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`,
+          );
         };
         const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids) => {
           startupFailure(path, code, ids[0]);

@@ -573,6 +573,7 @@ export function sweepTerminalObligations(
   const fail = (path: string, code: string, id: string, state: string) => {
     if (unresolved.has(id)) return;
     if (onFailure) onFailure(path, code, id, state);
+    else if (id === "*") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`);
     else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
     unresolved.add(id);
   };

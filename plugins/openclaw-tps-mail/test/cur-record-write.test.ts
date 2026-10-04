@@ -128,7 +128,7 @@ function signedBody(from: string, to: string, body: string, seed: Buffer): strin
   ));
 }
 
-/** The anvil cur/ record (promote() names it for the inbound id). */
+/** The anvil cur/ record (the first .json file in anvil/cur). */
 function readCur(): { path: string; record: any } | null {
   const dir = resolve(mailDir, "anvil", "cur");
   let names: string[];
