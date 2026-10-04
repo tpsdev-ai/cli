@@ -156,6 +156,14 @@ describe("terminal stamp reconciliation", () => {
       expect(JSON.parse(realFs.readFileSync(f.obligationPath, "utf8")).state).toBe(state);
     });
 
+    test(`${kind}: a missing cur record is reported at its expected file path`, () => {
+      const f = terminalFixture(state);
+      realFs.unlinkSync(f.curPath);
+      f.reconcile();
+      expect(f.logs).toHaveLength(1);
+      expect(f.logs[0]).toContain(`state=${state} path=${join(f.curDir, "inbound.json")} code=ENOENT`);
+    });
+
     test(`${kind}: an uncoded write failure is reported and the next run can stamp`, () => {
       const f = terminalFixture(state);
       uncodedWriteFailure = true;

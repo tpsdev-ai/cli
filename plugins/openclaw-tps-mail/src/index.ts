@@ -682,7 +682,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     };
     if (unreadable) continue;
     if (!curPath) {
-      if (!unreadable) missing(resolve(mailDir, agent, "cur"));
+      if (!unreadable) missing(resolve(mailDir, agent, "cur", `${rec.inboundId}.json`));
       continue;
     }
     const cur = readMailFile(curPath, onReadError);
