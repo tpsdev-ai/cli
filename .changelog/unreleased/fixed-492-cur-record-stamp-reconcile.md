@@ -1,0 +1,1 @@
+- **Ack/nack stamps use locked writes**. Stamps use the CLI's existing-only `updateExistingRecord` (#469) (Closes #492).
