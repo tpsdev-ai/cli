@@ -30,7 +30,7 @@ describe("validated delivery content", () => {
   });
 
   for (const field of ["from", "to", "body", "messageId", "timestamp", "signature"]) {
-    for (const value of [undefined, ""]) {
+    for (const value of field === "body" ? [undefined, null, 0, {}] : [undefined, ""]) {
       test(`${field}=${String(value)} is not comparable`, () => {
         const source = plant("new", { ...envelope(), [field]: value });
         const destination = plant("cur", { ...envelope(), [field]: value });
@@ -38,6 +38,20 @@ describe("validated delivery content", () => {
       });
     }
   }
+
+  test("an empty string body is placed and compares as a duplicate", () => {
+    const incoming = { ...envelope(), body: "" };
+    const source = plant("new", incoming);
+    const destination = join(root, "cur");
+    expect(placeCurRecord(source, destination, incoming as Envelope, "promoted-envelope"))
+      .toEqual({ status: "placed" });
+    const before = readFileSync(destination, "utf8");
+    const duplicate = { ...incoming, messageId: "other-id" };
+    const duplicateSource = plant("again", duplicate);
+    expect(placeCurRecord(duplicateSource, destination, duplicate as Envelope, "promoted-envelope"))
+      .toEqual({ status: "duplicate", existingId: incoming.messageId });
+    expect(readFileSync(destination, "utf8")).toBe(before);
+  });
 
   test("same delivery content ignores a different messageId", () => {
     const source = plant("new", envelope());

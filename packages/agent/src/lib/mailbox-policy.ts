@@ -486,20 +486,21 @@ function storedEnvelope(record: Record<string, unknown>, representation: "signed
   return null;
 }
 
-/** Compare from/to/subject/body/replyToId only after envelope validation. */
+/** Compare from/to/subject/body/replyToId after shape checks. */
 function deliveryContent(env: Record<string, unknown> | null): string | null {
   if (!env) return null;
   const parsed = parseSignedEnvelope(JSON.stringify(env));
   if (!parsed.ok || env.v !== 1 || !Array.isArray(env.delegationChain) || env.delegationChain.length === 0
     || typeof env.signature !== "string" || env.signature.trim() === ""
     || !isValidEnvelopeId(env.messageId) || typeof env.timestamp !== "string" || Number.isNaN(Date.parse(env.timestamp))
-    || [env.from, env.to, env.body].some((value) => typeof value !== "string" || value.trim() === "")
+    || [env.from, env.to].some((value) => typeof value !== "string" || value.trim() === "")
+    || typeof env.body !== "string"
     || (env.subject !== undefined && typeof env.subject !== "string")
     || (env.replyToId !== undefined && !isValidEnvelopeId(env.replyToId))) return null;
   return JSON.stringify({ from: env.from, to: env.to, subject: env.subject, body: env.body, replyToId: env.replyToId });
 }
 
-/** Compare the verified incoming envelope with the caller's stored representation. */
+/** Callers must verify the incoming envelope; this helper checks shape. */
 export function placeCurRecord(sourcePath: string, curPath: string, incomingEnvelope: Envelope,
   representation: "signed-body" | "promoted-envelope"): FirstDelivery {
   const incomingContent = deliveryContent(incomingEnvelope as unknown as Record<string, unknown>);

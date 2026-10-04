@@ -27,6 +27,26 @@ function plant() {
   return { envelope, source: sendMessage("kern", JSON.stringify(envelope), "flint").filePath, inbox: getInbox("kern") };
 }
 
+test("an empty-body signed message is delivered and a same-content collision is a duplicate", async () => {
+  const inbox = getInbox("kern");
+  const source = join(inbox.fresh, "empty.json");
+  const first = buildSignedEnvelope("flint", "kern", "", { flint: seed });
+  const record = (envelope: typeof first) => JSON.stringify({ from: "flint", to: "kern", body: JSON.stringify(envelope) });
+  fs.writeFileSync(source, record(first));
+  expect(await promote("kern", source)).toMatchObject({ ok: true, message: { body: "", envelopeId: first.messageId } });
+  const destination = join(inbox.cur, "empty.json");
+  const before = fs.readFileSync(destination, "utf8");
+
+  const again = buildSignedEnvelope("flint", "kern", "", { flint: seed });
+  fs.writeFileSync(source, record(again));
+  expect(await promote("kern", source)).toMatchObject({ ok: false, class: "replay", reason: expect.stringContaining("duplicate delivery") });
+  expect(fs.readFileSync(destination, "utf8")).toBe(before);
+  expect(fs.existsSync(source)).toBe(false);
+  const reason = fs.readFileSync(join(inbox.dlq, "empty.json.reason"), "utf8");
+  expect(reason).toContain("class: replay");
+  expect(reason).toContain(first.messageId);
+});
+
 test("promotion delivers with the public key registered by agent create", async () => {
   verifier.mockRestore();
   const id = "created-promotion-regression";
