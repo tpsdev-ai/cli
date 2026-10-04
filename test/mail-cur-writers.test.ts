@@ -2,9 +2,6 @@
  * For CLI signed-inbox delivery, promote() is the only first-delivery writer of cur/.
  * Updates touch only existing records through updateExistingRecord().
  * MailClient applies the same policy; outbox and internal mail are separate stores.
- * First delivery into cur/ uses placeCurRecord()'s exclusive link, so it never replaces
- * an existing record: an identical same-filename record is a duplicate, a different one
- * is an integrity error.
  * Scans scripts/, package src/ and scripts/, and plugin src/ with text patterns.
  * Unrecognized destinations may be missed.
  * Follow-up: the per-process bridge queue.

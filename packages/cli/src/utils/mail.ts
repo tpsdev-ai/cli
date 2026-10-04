@@ -832,20 +832,21 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
-      // First delivery into cur/ uses an EXCLUSIVE link, so an existing record is
-      // never replaced. On a filename collision the two records are compared by
-      // content: an identical one is a duplicate (dead-lettered like a replay,
-      // the delivered record untouched); a different one is an integrity error.
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
         rmSync(scratchPath, { force: true });
+        if (placement.status === "malformed") {
+          const reason = "malformed delivery record";
+          rejectToDlq(dirs, filename, filePath, "invalid", reason);
+          return { ok: false, class: "invalid", reason };
+        }
         const delivered = placement.existingId ?? "unknown";
         if (placement.status === "duplicate") {
           const reason = `duplicate delivery: ${filename} already delivered as ${delivered}`;
           rejectToDlq(dirs, filename, filePath, "replay", reason);
           return { ok: false, class: "replay", reason };
         }
-        const reason = `filename collision: ${filename} already delivered as ${delivered}; incoming record ${envelope.messageId} differs`;
+        const reason = `filename collision: ${filename} already delivered as ${delivered}; incoming record ${envelope.messageId} has different delivery content`;
         rejectToDlq(dirs, filename, filePath, "invalid", reason);
         return { ok: false, class: "invalid", reason };
       }

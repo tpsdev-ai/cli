@@ -194,14 +194,7 @@ export class MailClient {
     return messages;
   }
 
-  /**
-   * Under the mailbox lock: refuse a consumed messageId, else place the record
-   * in cur/ with an EXCLUSIVE link and record the id. Returns the rejection, or
-   * null once committed. The placement never replaces an existing record: on a
-   * filename collision the two are compared by content — an identical record is
-   * a duplicate (refused like a replay); a different one is an integrity error.
-   * On append failure, move the record back to new/; throw on failure.
-   */
+  /** Commit under the mailbox lock; attempt placement rollback on append failure. */
   private async commitToCur(
     file: string,
     srcPath: string,
@@ -218,33 +211,38 @@ export class MailClient {
       }
       const dstPath = join(this.inboxCur, file);
       const placement = placeCurRecord(srcPath, dstPath);
+      if (placement.status === "malformed") {
+        return { pass: false, class: "invalid", reason: "malformed delivery record" };
+      }
       if (placement.status === "duplicate") {
         return {
           pass: false,
           class: "replay",
-          reason: `duplicate delivery: ${file} already delivered as ${placement.existingId ?? envelope.messageId}`,
+          reason: `duplicate delivery: ${file} already delivered as ${placement.existingId ?? "unknown"}`,
         };
       }
       if (placement.status === "collision") {
         return {
           pass: false,
           class: "invalid",
-          reason: `filename collision: ${file} already delivered as ${placement.existingId ?? "unknown"}; incoming record ${envelope.messageId} differs`,
+          reason: `filename collision: ${file} already delivered as ${placement.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`,
         };
       }
-      // Placed: cur/ and the source are hard links to one inode. Drop the
-      // source link, then commit the consumed id durably.
-      unlinkSync(srcPath);
       try {
         replay.recordConsumed(envelope.messageId);
       } catch (err) {
         try {
-          renameSync(dstPath, srcPath);
+          unlinkSync(dstPath);
         } catch (rollbackErr) {
           throw new AggregateError([err, rollbackErr],
             `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
         }
         throw err;
+      }
+      try {
+        unlinkSync(srcPath);
+      } catch (err) {
+        console.error(`[MailClient] committed ${file}; source cleanup failed: ${sanitizeError(err)}`);
       }
       return null;
     } finally {

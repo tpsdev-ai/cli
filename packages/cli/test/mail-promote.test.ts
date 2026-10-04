@@ -173,9 +173,6 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
 
   // ── First-delivery filename collision (cli#482) ───────────────────────────
   //
-  // A second record under the SAME filename must not replace the delivered
-  // record. Identical content is an idempotent duplicate (replay); different
-  // content is an integrity error. Both leave cur/ untouched.
 
   /** Plant a raw wrapper record at an exact filename in the recipient's new/. */
   function plantRaw(agent: string, filename: string, env: Envelope): void {
@@ -187,7 +184,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     );
   }
 
-  test("a second delivery with the same filename and identical content is dead-lettered as a duplicate (replay)", async () => {
+  test("a second delivery with the same filename and same delivery content is dead-lettered as a duplicate (replay)", async () => {
     const inbox = getInbox("kern");
     const file = "collide.json";
     const delivered = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-1" });
@@ -196,7 +193,6 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const before = readFileSync(join(inbox.cur, file), "utf-8");
     expect(JSON.parse(before).envelopeId).toBe("cli482-id-1");
 
-    // Same filename, same message content, a DIFFERENT envelope id (re-signed).
     const again = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-2" });
     plantRaw("kern", file, again);
     const second = await checkMessages("kern");
@@ -209,7 +205,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(reason).toContain("cli482-id-1");
   });
 
-  test("a second delivery with the same filename and different content is an integrity error", async () => {
+  test("a second delivery with the same filename and different delivery content is an integrity error", async () => {
     const inbox = getInbox("kern");
     const file = "clash.json";
     const delivered = buildSignedEnvelope("flint", "kern", "original", { flint: FLINT_SEED }, { messageId: "cli482-id-3" });
