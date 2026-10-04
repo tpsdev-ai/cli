@@ -1,21 +1,5 @@
-/**
- * cur-record-write.test.ts — cli#492.
- *
- * After a DURABLE terminal transition (acked/failed) the plugin stamps the cur/
- * record (`ackedAt` / `nackedAt`). The old `patchMailFile` swallowed a failed
- * write, so the on-disk record and the plugin's view could diverge with no
- * diagnostic.
- *
- * These tests inject a write failure (the cur/ DIRECTORY is made unwritable, so
- * the atomic stamp's temp file cannot be created) and assert:
- *   (a) a diagnostic naming the message id, the record path and the error code;
- *   (b) a bounded in-process retry fixes a transient failure without a restart;
- *   (c) a persistent failure stops after the bound and the next account start
- *       re-stamps the record;
- *   (d) stopping the account cancels pending retries.
- * A further test pins the successful path as unchanged.
- */
-import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -25,6 +9,27 @@ import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 import { hashes } from "@noble/ed25519";
 hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest());
+
+const realFs = { ...fs };
+let removeOnTerminal: { path: string; state: string } | undefined;
+let stampError: Error | undefined;
+mock.module("node:fs", () => ({
+  ...realFs,
+  openSync: (...args: any[]) => {
+    if (stampError && String(args[0]).includes(".ack-")) throw stampError;
+    return (realFs.openSync as any)(...args);
+  },
+  writeFileSync: (...args: any[]) => {
+    const result = (realFs.writeFileSync as any)(...args);
+    if (removeOnTerminal && String(args[0]).includes(".obligations/") && typeof args[1] === "string") {
+      if (JSON.parse(args[1]).state === removeOnTerminal.state) {
+        realFs.unlinkSync(removeOnTerminal.path);
+        removeOnTerminal = undefined;
+      }
+    }
+    return result;
+  },
+}));
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const ANVIL_SEED = Buffer.alloc(32, 0x02);
@@ -68,6 +73,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  removeOnTerminal = undefined;
+  stampError = undefined;
   setStampRetryDelaysForTests(prevDelays);
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
@@ -242,8 +249,55 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
       await h2.stop();
     }, 20000);
 
+    it(`${kind}: a missing record is reported after the durable transition`, async () => {
+      const h = await boot(true);
+      try {
+        expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
+        const cur = readCur()!;
+        removeOnTerminal = { path: cur.path, state };
+        await finish(h);
+        expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
+        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain(`actor=anvil state=${state} path=${cur.path} code=ENOENT`);
+        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain("inspect the missing cur record; obligation retained");
+        expect(obligation(h.inboundId)?.state).toBe(state);
+        await sleep(400);
+        expect(failedLogs(h, `${kind}-stamp-failed`).length).toBe(1);
+        expect(realFs.existsSync(cur.path)).toBe(false);
+      } finally {
+        await h.stop();
+      }
+    }, 15000);
+
+    it(`${kind}: an exception without a code is reported and remains retryable`, async () => {
+      const h = await boot(true);
+      try {
+        expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
+        stampError = new Error("injected stamp failure");
+        await finish(h);
+        expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
+        const diagnostic = failedLogs(h, `${kind}-stamp-failed`)[0];
+        expect(diagnostic).toContain(`actor=anvil state=${state}`);
+        expect(diagnostic).toContain("code=WRITE_FAILED");
+        expect(diagnostic).toContain("retry 1");
+        stampError = undefined;
+        expect(await pollUntil(() => !!readCur()?.record?.[stampKey])).toBe(true);
+        expect(obligation(h.inboundId)?.state).toBe(state);
+      } finally {
+        stampError = undefined;
+        await h.stop();
+      }
+    }, 15000);
+
     it(`${kind}: stopping the account cancels the pending stamp retries`, async () => {
-      setStampRetryDelaysForTests([300, 300, 300]);
+      setStampRetryDelaysForTests([731, 731, 731]);
+      const realSetTimeout = globalThis.setTimeout;
+      let scheduled = 0;
+      let fired = 0;
+      const timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((fn: any, delay: number, ...args: any[]) => {
+        if (delay !== 731) return realSetTimeout(fn, delay, ...args);
+        scheduled++;
+        return realSetTimeout(() => { fired++; fn(...args); }, delay);
+      }) as typeof setTimeout);
       const h = await boot(true);
       expect(await pollUntil(() => h.dispatch() !== null, 4000), "dispatch started").toBe(true);
       const cur = readCur();
@@ -252,12 +306,18 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
       try {
         await finish(h);
         expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length >= 1, 4000), "first failure logged").toBe(true);
+        expect(scheduled).toBe(1);
         await h.stop();
       } finally {
         restore();
       }
       const before = failedLogs(h, `${kind}-stamp-failed`).length;
-      await sleep(1200);
+      try {
+        await sleep(1200);
+        expect(fired, "the pending timer callback never runs after stop").toBe(0);
+      } finally {
+        timerSpy.mockRestore();
+      }
       expect(failedLogs(h, `${kind}-stamp-failed`).length, "no retry ran after stop").toBe(before);
       expect(readCur()?.record?.[stampKey], "the cancelled retry never stamped").toBeUndefined();
     }, 20000);

@@ -262,11 +262,12 @@ function findBoundAgents(cfg: any, accountId: string): string[] {
 
 // ─── TPS mail envelope helpers ───────────────────────────────────────────────
 
-function readMailFile(filePath: string): TpsMailBody | null {
+function readMailFile(filePath: string, onReadError?: (path: string, code: string) => void): TpsMailBody | null {
   try {
     const raw = readFileSync(filePath, "utf-8");
     return JSON.parse(raw) as TpsMailBody;
-  } catch {
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") onReadError?.(filePath, err?.code ?? "INVALID_RECORD");
     return null;
   }
 }
@@ -618,54 +619,66 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
   return resolveMailRoute({ to, mailDir, localAgents: findBoundAgents(cfg, accountId) });
 }
 
-/**
- * Update an existing cur/ record through the CLI's `updateExistingRecord`
- * (cli#469). Never throws: a missing record is `record-missing`; any other
- * failure is `write-failed` with its error code, for the caller to log and
- * retry (cli#492).
- */
 type CurRecordUpdate =
   | { ok: true }
   | { ok: false; reason: "record-missing" | "write-failed"; path: string; code: string };
 
-export function patchMailFile(path: string, patch: Partial<TpsMailBody>): CurRecordUpdate {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey?: "ackedAt" | "nackedAt"): CurRecordUpdate {
   try {
-    const r = updateExistingRecord<TpsMailBody>(path, (current) => Object.assign(current, patch));
+    let alreadyStamped = false;
+    const r = updateExistingRecord<TpsMailBody>(path, (current) => {
+      if (stampKey && current[stampKey]) {
+        alreadyStamped = true;
+        return null;
+      }
+      return Object.assign(current, patch);
+    });
+    if (r.status === "changed" && alreadyStamped) return { ok: true };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
     return { ok: false, reason: "write-failed", path, code: r.status };
   } catch (err: any) {
-    return { ok: false, reason: "write-failed", path, code: err?.code ?? err?.name ?? "WRITE_FAILED" };
+    return { ok: false, reason: "write-failed", path, code: err?.code ?? "WRITE_FAILED" };
   }
 }
 
-/**
- * Re-stamp an `acked` or `failed` obligation whose cur/ record never received
- * its stamp (the write failed after the durable transition — cli#492). The
- * obligation record is the durable truth, so at account start the record and
- * the maildir are made to agree: an `acked` obligation re-stamps
- * `ackedAt`/`read`, a `failed` one `nackedAt`/`nackReason`. Idempotent; a
- * failure here is logged by name.
- */
-function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): void {
-  for (const rec of listObligations(mailDir, agent)) {
+export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): void {
+  const reportReadError = (state: string, id: string) => (path: string, code: string) => log?.warn?.(
+    `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
+  );
+  for (const rec of listObligations(mailDir, agent, reportReadError("unknown", "unknown"))) {
     if (rec.state !== "acked" && rec.state !== "failed") continue;
-    const curPath = findCurPath(mailDir, agent, rec.inboundId);
-    if (!curPath) continue;
-    const cur = readMailFile(curPath);
-    if (!cur) continue;
-    if (rec.state === "acked" && !cur.ackedAt) {
-      const r = patchMailFile(curPath, { ackedAt: new Date().toISOString(), read: true });
-      if (r.ok) log?.info?.(`tps-mail: reconciled the acked stamp for ${rec.inboundId} at ${curPath}`);
-      else if (r.reason !== "record-missing") {
-        log?.warn?.(`tps-mail: ack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
-      }
-    } else if (rec.state === "failed" && !cur.nackedAt) {
-      const r = patchMailFile(curPath, { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" });
-      if (r.ok) log?.info?.(`tps-mail: reconciled the nacked stamp for ${rec.inboundId} at ${curPath}`);
-      else if (r.reason !== "record-missing") {
-        log?.warn?.(`tps-mail: nack-stamp-reconcile-failed: ${rec.inboundId} at ${r.path} (${r.code})`);
-      }
+    let unreadable = false;
+    const onReadError = (path: string, code: string) => {
+      unreadable = true;
+      reportReadError(rec.state, rec.inboundId)(path, code);
+    };
+    const kind = rec.state === "acked" ? "ack" : "nack";
+    const key = kind === "ack" ? "ackedAt" : "nackedAt";
+    const curPath = findCurPath(mailDir, agent, rec.inboundId, onReadError);
+    const missing = (path: string) => log?.warn?.(
+      `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${path} code=ENOENT; inspect the missing cur record; obligation retained`,
+    );
+    if (!curPath) {
+      if (!unreadable) missing(resolve(mailDir, agent, "cur"));
+      continue;
+    }
+    const cur = readMailFile(curPath, onReadError);
+    if (!cur) {
+      if (!unreadable) missing(curPath);
+      continue;
+    }
+    if (cur[key]) continue;
+    const patch = kind === "ack"
+      ? { ackedAt: new Date().toISOString(), read: true }
+      : { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" };
+    const r = patchMailFile(curPath, patch, key);
+    if (r.ok) log?.info?.(`tps-mail: reconciled the ${kind} stamp for ${rec.inboundId} at ${curPath}`);
+    else {
+      log?.warn?.(
+        `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${r.path} code=${r.code}; ` +
+        (r.reason === "record-missing" ? "inspect the missing cur record; obligation retained" : "restore writable records and restart the account; obligation retained"),
+      );
     }
   }
 }
@@ -926,13 +939,6 @@ export function setStampRetryDelaysForTests(delays: number[]): number[] {
   return prev;
 }
 
-/**
- * Stamp the cur/ record after a durable terminal transition. A failure is
- * logged by id, path and code, then retried under the account's live
- * incarnation after each delay in `stampRetryDelaysMs`; the timers are
- * cancelled when the account stops. After the last retry the stamp is left to
- * `reconcileTerminalCurStamps` at the next account start.
- */
 function stampTerminalCur(
   ctx: YieldContext,
   kind: "ack" | "nack",
@@ -940,18 +946,18 @@ function stampTerminalCur(
   attempt = 0,
 ): void {
   const key = kind === "ack" ? "ackedAt" : "nackedAt";
-  if (attempt > 0 && readMailFile(ctx.curPath)?.[key]) return;
-  const stamped = patchMailFile(ctx.curPath, patch);
+  const stamped = patchMailFile(ctx.curPath, patch, key);
   if (stamped.ok) {
     if (attempt > 0) ctx.log?.info?.(`tps-mail: ${kind}-stamp-retry-ok: ${ctx.inboundId} at ${ctx.curPath} (retry ${attempt})`);
     return;
   }
-  if (stamped.reason === "record-missing") return;
-  const delay = stampRetryDelaysMs[attempt];
+  const delay = stamped.reason === "record-missing" ? undefined : stampRetryDelaysMs[attempt];
   ctx.log?.warn?.(
-    `tps-mail: ${kind}-stamp-failed: could not stamp ${key} on ${ctx.inboundId} at ${stamped.path} (${stamped.code}); ` +
-      (delay === undefined
-        ? `no retries left, the next account start re-stamps it`
+    `tps-mail: ${kind}-stamp-failed: ${ctx.inboundId} actor=${ctx.agent} state=${kind === "ack" ? "acked" : "failed"} path=${stamped.path} code=${stamped.code}; ` +
+      (stamped.reason === "record-missing"
+        ? "inspect the missing cur record; obligation retained"
+        : delay === undefined
+        ? "no retries left; restore writable records and restart the account; obligation retained"
         : `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`),
   );
   if (delay === undefined || !isLiveContext(ctx)) return;
@@ -1622,17 +1628,17 @@ function installYieldSubscription(api: any): boolean {
 }
 
 /** The cur/ path for an inbound id (cur filenames are timestamp-id, not the id). */
-function findCurPath(mailDir: string, agent: string, inboundId: string): string | null {
+function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code: string) => void): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
     for (const name of readdirSync(curDir)) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
-      const rec = readMailFile(p);
+      const rec = readMailFile(p, onReadError);
       if (rec?.id === inboundId) return p;
     }
-  } catch {
-    // no cur dir yet
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") onReadError?.(curDir, err?.code ?? "READ_FAILED");
   }
   return null;
 }

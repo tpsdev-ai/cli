@@ -1,1 +1,1 @@
-- **A failed cur/ stamp write after a terminal transition is logged, retried in-process up to 3 times, then re-stamped at the next account start**. Each failure is logged by message id, record path and error code. Ack/nack stamps use the CLI's locked, existing-only `updateExistingRecord` (#469) (Closes #492).
+- **Ack/nack stamps use locked writes**. Stamps use the CLI's existing-only `updateExistingRecord` (#469) (Closes #492).

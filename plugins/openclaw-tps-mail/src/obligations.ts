@@ -200,12 +200,19 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   }
 }
 
-export function listObligations(mailDir: string, agent: string): ObligationRecord[] {
+export function listObligations(
+  mailDir: string,
+  agent: string,
+  onReadError: (path: string, code: string) => void = (path, code) => console.warn(
+    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; restore readable obligations and restart the account`,
+  ),
+): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
   let names: string[];
   try {
     names = readdirSync(dir);
-  } catch {
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") onReadError(dir, err?.code ?? "READ_FAILED");
     return [];
   }
   const out: ObligationRecord[] = [];
@@ -213,8 +220,8 @@ export function listObligations(mailDir: string, agent: string): ObligationRecor
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
       out.push(JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord);
-    } catch {
-      // A torn record is not readable truth; skip it rather than crash recovery.
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") onReadError(resolve(dir, name), err?.code ?? "INVALID_RECORD");
     }
   }
   return out;
