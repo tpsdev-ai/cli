@@ -587,7 +587,7 @@ export function sweepTerminalObligations(
       continue;
     }
     const heldInboundId = (record as { inboundId?: unknown }).inboundId;
-    if (typeof heldInboundId === "string" && unresolved.has(heldInboundId)) {
+    if (unresolved.has(name.slice(0, -5)) || (typeof heldInboundId === "string" && unresolved.has(heldInboundId))) {
       const obligationId = (record as { obligationId?: unknown }).obligationId;
       if (typeof obligationId === "string") liveObligationIds.add(obligationId);
       res.heldForRecovery++;

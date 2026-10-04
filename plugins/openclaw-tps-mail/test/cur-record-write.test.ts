@@ -458,6 +458,56 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
 });
 
 for (const state of ["acked", "failed"] as const) {
+  for (const malformed of [true, false]) {
+    it(`startup retention ${malformed ? "keeps an aged terminal obligation missing inboundId and its receipt" : "sweeps an aged resolved obligation and its receipt"} (${state})`, async () => {
+      const first = await boot(true, true);
+      try {
+        expect(await pollUntil(() => first.dispatch() !== null)).toBe(true);
+        if (state === "acked") await first.deliver("verdict");
+        else first.skip("empty");
+        first.settle();
+        expect(await pollUntil(() => !!readCur()?.record?.[state === "acked" ? "ackedAt" : "nackedAt"])).toBe(true);
+      } finally { await first.stop(); }
+      const cur = readCur()!;
+      const path = resolve(mailDir, "anvil", ".obligations", `${first.inboundId}.json`);
+      const terminal = JSON.parse(realFs.readFileSync(path, "utf8"));
+      expect(terminal.state).toBe(state);
+      terminal.lastTransitionAt = new Date(0).toISOString();
+      if (malformed) {
+        delete terminal.inboundId;
+        delete cur.record.ackedAt;
+        delete cur.record.nackedAt;
+        realFs.writeFileSync(cur.path, JSON.stringify(cur.record));
+      }
+      realFs.writeFileSync(path, JSON.stringify(terminal));
+      const receiptDir = resolve(mailDir, "anvil", ".obligations", "receipts");
+      realFs.mkdirSync(receiptDir, { recursive: true });
+      const receiptPath = resolve(receiptDir, `${terminal.obligationId}.json`);
+      const receipt = realFs.existsSync(receiptPath)
+        ? JSON.parse(realFs.readFileSync(receiptPath, "utf8"))
+        : { obligationId: terminal.obligationId };
+      receipt.ts = new Date(0).toISOString();
+      realFs.writeFileSync(receiptPath, JSON.stringify(receipt));
+      const obligationBytes = realFs.readFileSync(path, "utf8");
+      const receiptBytes = realFs.readFileSync(receiptPath, "utf8");
+      const curBytes = realFs.readFileSync(cur.path, "utf8");
+      const next = await boot(false);
+      try {
+        expect(await pollUntil(() => next.logs.some((m) => m.includes("obligation retention: removed")))).toBe(true);
+        expect(next.dispatch()).toBeNull();
+        expect(realFs.readFileSync(cur.path, "utf8")).toBe(curBytes);
+        if (malformed) {
+          expect(realFs.readFileSync(path, "utf8")).toBe(obligationBytes);
+          expect(realFs.readFileSync(receiptPath, "utf8")).toBe(receiptBytes);
+          expect(next.logs.some((m) => m.includes("held 1 for unresolved cur/ recovery"))).toBe(true);
+        } else {
+          expect(realFs.existsSync(path)).toBe(false);
+          expect(realFs.existsSync(receiptPath)).toBe(false);
+        }
+      } finally { await next.stop(); }
+    }, 15000);
+  }
+
   for (const stage of ["lookup-read", "reread", "locked-read", "stamp-write"] as const) {
     it(`startup ${state} ${stage} holds aged obligations across restarts without redispatch`, async () => {
       const first = await boot(true);

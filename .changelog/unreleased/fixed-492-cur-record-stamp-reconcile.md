@@ -1,1 +1,1 @@
-- **Report failed cur/ stamps**. Retry failed ack/nack stamp writes. Hold unresolved startup stamps from recovery and retention.
+- **Report failed cur/ stamps**. Retry failed ack/nack stamp writes.
