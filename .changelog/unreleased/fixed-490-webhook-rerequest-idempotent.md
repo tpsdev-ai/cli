@@ -1,1 +1,1 @@
-- **A redelivered dismissed-review webhook event that carries an `X-GitHub-Delivery` header no longer re-requests the review: redeliveries are skipped once the re-request has succeeded (Closes #490).**
+- **Dismissed-review webhook redeliveries with an `X-GitHub-Delivery` header are skipped after successful re-request and completion-record write (Closes #490).** A crash between GitHub success and recording permits one repeated re-request.

@@ -1,4 +1,4 @@
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -23,9 +23,6 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-/** "queued" — this call wrote the record; "duplicate" — a record for this
- * delivery already exists (new/ or sent/), so an earlier call recorded it;
- * "duplicate in progress" — another writer holds the per-delivery lock. */
 export type QueueOutboxResult = "queued" | "duplicate" | "duplicate in progress";
 
 export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): QueueOutboxResult {
@@ -51,12 +48,26 @@ export function claimOutboxDelivery(to: string, body: string, from: string, deli
 /** Removes this delivery's record from new/ and sent/. */
 export function releaseOutboxRecord(deliveryId: string): void {
   if (!/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
-  rmSync(join(outboxDir("new"), `github-${deliveryId}.json`), { force: true });
-  rmSync(join(outboxDir("sent"), `github-${deliveryId}.json`), { force: true });
+  for (const kind of ["new", "sent"] as const) {
+    for (const prefix of ["github", "github-completed"]) {
+      rmSync(join(outboxDir(kind), `${prefix}-${deliveryId}.json`), { force: true });
+    }
+  }
 }
 
 function outboxLockPath(deliveryId: string): string {
   return join(outboxDir("new"), `.github-${deliveryId}.lock`);
+}
+
+function recordExists(path: string): boolean {
+  try {
+    statSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  readFileSync(path);
+  return true;
 }
 
 function queue(to: string, body: string, from: string, deliveryId: string | undefined, deferWrite: boolean): { result: QueueOutboxResult; lock?: MailLock; complete?: () => void } {
@@ -75,8 +86,8 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
   }
   const id = deliveryId ?? randomUUID();
   const timestamp = new Date().toISOString();
-  const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-  const alreadyRecorded = !!deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)));
+  const filename = deliveryId ? `${deferWrite ? "github-completed" : "github"}-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
+  let alreadyRecorded = false;
   const write = (): void => {
     const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
     const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
@@ -93,10 +104,11 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
       renameSync(tmp, join(dir, filename));
     }
   };
-  if (deferWrite && !alreadyRecorded) return { result: "queued", lock: lock ?? undefined, complete: write };
   let writeFailed = false;
   let writeError: unknown;
   try {
+    alreadyRecorded = !!deliveryId && (recordExists(join(dir, filename)) || recordExists(join(outboxDir("sent"), filename)));
+    if (deferWrite && !alreadyRecorded) return { result: "queued", lock: lock ?? undefined, complete: write };
     if (!alreadyRecorded) write();
   } catch (error) {
     writeFailed = true;

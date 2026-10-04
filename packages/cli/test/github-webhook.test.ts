@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { drainOutbox } from "../src/utils/outbox.js";
+import * as mailLock from "../src/utils/mail-lock.js";
 import { handleGithubWebhook, processGithubWebhookEvent } from "../src/utils/github-webhook.js";
 
 async function post(
@@ -207,6 +208,72 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toHaveLength(1);
     expect(agents).toEqual(["webhook-agent", "webhook-agent"]);
   });
+  describe("completion records", () => {
+    const release = mock(() => {});
+    let acquire: { mockRestore(): void };
+    beforeEach(() => {
+      release.mockClear();
+      acquire = spyOn(mailLock, "tryAcquireMailLock").mockReturnValue({ release });
+    });
+    afterEach(() => acquire.mockRestore());
+
+    for (const kind of ["new", "sent"] as const) {
+      test(`a main-format record in ${kind}/ does not prove completion after upgrade`, async () => {
+        const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+          pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+        const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "legacy-record",
+          "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+        const id = createHash("sha256").update(headers["x-github-delivery"]).digest("hex");
+        const dir = join(root, ".tps", "outbox", kind);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, `github-${id}.json`), JSON.stringify({
+          id, to: "host", from: "github-webhook", body: "old pre-call record", timestamp: new Date().toISOString(),
+        }));
+        expect(existsSync(join(root, ".tps", "outbox", kind, `github-${id}.json`))).toBe(true);
+        let calls = 0;
+        const deps = { reviewRequestDeps: { spawnSyncImpl: (() => {
+          calls++; return { status: 0, stdout: "", stderr: "" };
+        }) as any }, publishReviewRerequestedEvent: async () => {} };
+        expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "ok" });
+        expect(calls).toBe(1);
+        expect(existsSync(join(root, ".tps", "outbox", "new", `github-completed-${id}.json`))).toBe(true);
+        expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
+        expect(calls).toBe(1);
+      });
+
+      for (const operation of ["statSync", "readFileSync"] as const) {
+        test(`an unreadable completed ${kind}/ record (${operation}) returns 503 without another GitHub call`, async () => {
+          const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+            pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+          const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "unreadable-record",
+            "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+          const id = createHash("sha256").update(headers["x-github-delivery"]).digest("hex");
+          const record = join(root, ".tps", "outbox", kind, `github-completed-${id}.json`);
+          let calls = 0;
+          const deps = { reviewRequestDeps: { spawnSyncImpl: (() => {
+            calls++; return { status: 0, stdout: "", stderr: "" };
+          }) as any }, publishReviewRerequestedEvent: async () => {} };
+          expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "ok" });
+          if (kind === "sent") drainOutbox();
+          const original = fs[operation];
+          const lookup = spyOn(fs, operation).mockImplementation(((...args: any[]) => {
+            if (String(args[0]) === record) throw Object.assign(new Error("completion record unreadable"), { code: "EACCES" });
+            return (original as any)(...args);
+          }) as any);
+          try {
+            expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "completion record unreadable" });
+            expect(calls).toBe(1);
+            expect(release).toHaveBeenCalledTimes(2);
+          } finally {
+            lookup.mockRestore();
+          }
+          expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
+          expect(calls).toBe(1);
+        });
+      }
+    }
+  });
+
   test("a first delivery re-requests the dismissed reviewer exactly once", async () => {
     const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
       pull_request: { number: 146, html_url: "https://github.com/tpsdev-ai/cli/pull/146" }, review: { user: { login: "tps-kern" } } });
@@ -272,7 +339,7 @@ describe("handleGithubWebhook", () => {
     const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-rerequest-fails",
       "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
     const id = createHash("sha256").update("delivery-rerequest-fails").digest("hex");
-    const record = join(root, ".tps", "outbox", "new", `github-${id}.json`);
+    const record = join(root, ".tps", "outbox", "new", `github-completed-${id}.json`);
     const lock = join(root, ".tps", "outbox", "new", `.github-${id}.lock`);
     let status = 1;
     let ghCalls = 0;

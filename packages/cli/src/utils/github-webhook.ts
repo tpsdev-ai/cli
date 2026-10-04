@@ -231,7 +231,7 @@ export async function handleGithubWebhook(
   let handled = false;
   let failure: unknown;
   try {
-    // Hold the lock through the GitHub call and completion write, including awaits.
+    // When a delivery ID is present, hold the lock through the GitHub call and completion write, including awaits.
     handled = await processGithubWebhookEvent(event, payload, deps, agentId);
     if (handled) claim.complete();
   } catch (error) {
