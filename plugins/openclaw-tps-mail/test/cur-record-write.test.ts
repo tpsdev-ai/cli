@@ -233,7 +233,7 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         expect(readCur()?.record?.[stampKey], "the stamp did NOT land").toBeUndefined();
         expect(
           await pollUntil(
-            () => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes(`path=${resolve(mailDir, "anvil", "cur")}/.ack-`) && m.includes("EACCES")),
+            () => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes(`path=${readCur()!.path}`) && m.includes("EACCES")),
             4000,
           ),
           "the failed write is logged by id, path and code",
@@ -290,8 +290,8 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
           await finish(h);
           expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
           const diagnostic = failedLogs(h, `${kind}-stamp-failed`)[0];
-          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock.claim code=EACCES` : `path=${blocked}/.ack-`);
-          expect(diagnostic).not.toContain(`path=${cur.path}`);
+          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock code=EACCES` : `path=${cur.path} code=EACCES`);
+          if (stage === "lock") expect(diagnostic).not.toContain(`path=${cur.path}`);
           expect(readCur()?.record?.[stampKey]).toBeUndefined();
         } finally {
           await h.stop();
@@ -302,8 +302,8 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         try {
           expect(await pollUntil(() => next.logs.some((m) => m.includes(`${kind}-stamp-reconcile-failed`)))).toBe(true);
           const diagnostic = next.logs.find((m) => m.includes(`${kind}-stamp-reconcile-failed`))!;
-          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock.claim code=EACCES` : `path=${blocked}/.ack-`);
-          expect(diagnostic).not.toContain(`path=${cur.path}`);
+          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock code=EACCES` : `path=${cur.path} code=EACCES`);
+          if (stage === "lock") expect(diagnostic).not.toContain(`path=${cur.path}`);
           expect(diagnostic).toContain("obligation retained");
           expect(readCur()?.record?.[stampKey]).toBeUndefined();
         } finally {
@@ -321,7 +321,7 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         removeOnTerminal = { path: cur.path, state };
         await finish(h);
         expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
-        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain(`actor=anvil state=${state} path=${cur.path} code=ENOENT`);
+        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain(`actor=anvil path=${cur.path} code=ENOENT`);
         expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain("obligation retained; fix the path named above and restart the account");
         expect(obligation(h.inboundId)?.state).toBe(state);
         await sleep(400);
@@ -361,9 +361,10 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         await finish(h);
         expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
         const diagnostic = failedLogs(h, `${kind}-stamp-failed`)[0];
-        expect(diagnostic).toContain(`actor=anvil state=${state}`);
+        expect(diagnostic).toContain(`actor=anvil`);
         expect(diagnostic).toContain("code=WRITE_FAILED");
-        expect(diagnostic).toContain("retry 1");
+        expect(diagnostic).toContain("obligation retained");
+        expect(diagnostic).not.toContain("no retries left");
         stampError = undefined;
         expect(await pollUntil(() => !!readCur()?.record?.[stampKey])).toBe(true);
         expect(obligation(h.inboundId)?.state).toBe(state);
@@ -447,7 +448,7 @@ for (const failReads of [Infinity, 1]) {
       expect(realFs.readFileSync(path, "utf8")).toBe(bytes);
       expect(realFs.existsSync(cur.path)).toBe(true);
       expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
-      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("fix the path named above and restart the account"))).toBe(true);
+      expect(second.logs.some((m) => m.includes("actor=anvil") && m.includes(path) && m.includes("fix the path named above and restart the account"))).toBe(true);
     } finally {
       await second.stop();
       obligationReadFailure = undefined;
@@ -493,7 +494,7 @@ for (const state of ["acked", "failed"] as const) {
         }
         const next = await boot(false);
         try {
-          expect(await pollUntil(() => next.logs.some((m) => m.includes(`actor=anvil state=${state}`) && m.includes(first.inboundId)))).toBe(true);
+          expect(await pollUntil(() => next.logs.some((m) => m.includes(`actor=anvil`) && m.includes(first.inboundId)))).toBe(true);
           await sleep(100);
           expect(next.dispatch()).toBeNull();
           expect(next.logs.filter((m) => m.includes("actor=anvil") && m.includes(first.inboundId))).toHaveLength(1);
@@ -563,10 +564,10 @@ for (const failure of ["directory", "file"] as const) {
       const diagnostic = h.logs.find((m) => m.includes("startup-unresolved") && m.includes(path))!;
       expect(diagnostic).toContain("fix the path named above and restart the account");
       if (failure === "directory") {
-        expect(diagnostic).toContain("startup-unresolved: actor=anvil state=unknown");
+        expect(diagnostic).toContain("startup-unresolved: actor=anvil");
         expect(diagnostic).not.toContain("obligation retained");
       } else {
-        expect(diagnostic).toContain("startup-unresolved: * actor=anvil state=unknown");
+        expect(diagnostic).toContain("startup-unresolved: * actor=anvil");
         expect(diagnostic).toContain("obligation retained");
       }
     } finally {
@@ -575,3 +576,61 @@ for (const failure of ["directory", "file"] as const) {
     }
   });
 }
+
+for (const state of ["pending", "yielded", "delivering", "posted"] as const) {
+  it(`startup reports the missing ${state} record`, async () => {
+    const dir = resolve(mailDir, "anvil", ".obligations");
+    realFs.mkdirSync(dir, { recursive: true });
+    realFs.mkdirSync(resolve(mailDir, "anvil", "cur"));
+    realFs.writeFileSync(resolve(dir, "missing.json"), JSON.stringify({
+      inboundId: "missing", obligationId: "ob-missing", state, from: "flint", to: "anvil" }));
+    const h = await boot(false);
+    try {
+      expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved")))).toBe(true);
+      expect(h.logs.find((m) => m.includes("startup-unresolved"))).toBe(`tps-mail: startup-unresolved: missing actor=anvil path=${resolve(mailDir, "anvil", "cur", "missing.json")} code=ENOENT; obligation retained; fix the path named above and restart the account`);
+    } finally { await h.stop(); }
+  });
+}
+
+it("startup reports the missing unconfirmed record during retention", async () => {
+  const dir = resolve(mailDir, "anvil", ".obligations");
+  realFs.mkdirSync(dir, { recursive: true });
+  realFs.mkdirSync(resolve(mailDir, "anvil", "cur"));
+  realFs.writeFileSync(resolve(dir, "missing.json"), JSON.stringify({ inboundId: "missing",
+    obligationId: "ob-missing", state: "unconfirmed", lastTransitionAt: new Date(0).toISOString() }));
+  const h = await boot(false);
+  try {
+    expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved")))).toBe(true);
+    expect(h.logs.find((m) => m.includes("startup-unresolved"))).toBe(`tps-mail: startup-unresolved: missing actor=anvil path=${resolve(mailDir, "anvil", "cur", "missing.json")} code=ENOENT; obligation retained; fix the path named above and restart the account`);
+  } finally { await h.stop(); }
+});
+
+for (const stage of ["age", "delete"] as const) {
+  it(`startup orphan receipt ${stage} failure`, async () => {
+    const dir = resolve(mailDir, "anvil", ".obligations", "receipts");
+    realFs.mkdirSync(dir, { recursive: true });
+    const path = resolve(dir, "orphan.json");
+    realFs.writeFileSync(path, JSON.stringify({ obligationId: "orphan",
+      ts: stage === "age" ? "invalid" : new Date(0).toISOString() }));
+    if (stage === "delete") realFs.chmodSync(dir, 0o555);
+    const h = await boot(false);
+    try {
+      expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved")))).toBe(true);
+      expect(h.logs.find((m) => m.includes("startup-unresolved"))).toBe(`tps-mail: startup-unresolved: receipt:orphan.json actor=anvil path=${path} code=${stage === "age" ? "INVALID_TIMESTAMP" : "EACCES"}; fix the path named above and restart the account`);
+      expect(realFs.existsSync(path)).toBe(true);
+    } finally { await h.stop(); realFs.chmodSync(dir, 0o755); }
+  });
+}
+
+it("startup orphan receipt with an unreadable obligation", async () => {
+  const dir = resolve(mailDir, "anvil", ".obligations");
+  realFs.mkdirSync(resolve(dir, "receipts"), { recursive: true });
+  realFs.writeFileSync(resolve(dir, "broken.json"), "null");
+  const path = resolve(dir, "receipts", "orphan.json");
+  realFs.writeFileSync(path, JSON.stringify({ obligationId: "orphan", ts: "invalid" }));
+  const h = await boot(false);
+  try {
+    expect(await pollUntil(() => h.logs.some((m) => m.includes("receipt:orphan.json")))).toBe(true);
+    expect(h.logs.find((m) => m.includes("receipt:orphan.json"))).toBe(`tps-mail: startup-unresolved: receipt:orphan.json actor=anvil path=${path} code=INVALID_TIMESTAMP; state unknown; fix the path named above and restart the account`);
+  } finally { await h.stop(); }
+});

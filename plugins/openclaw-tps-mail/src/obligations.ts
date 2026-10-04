@@ -1,3 +1,4 @@
+import { formatStampDiagnostic, type ObligationPresence } from "./diagnostics.js";
 /**
  * obligations.ts — the durable reply-OBLIGATION store for the tps-mail plugin
  * (slice S2 of cli#392's follow-up).
@@ -213,7 +214,7 @@ export function listObligations(
   mailDir: string,
   agent: string,
   onReadError: (path: string, code: string, ids: string[], kind: ReadFailureKind) => void = (path, code) => console.warn(
-    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; fix the path named above and restart the account`,
+    formatStampDiagnostic({ kind: "obligation-list-read-failed", actor: agent, path, code, obligation: "unknown" }),
   ),
 ): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
@@ -269,7 +270,7 @@ export function createObligation(
   const draft = make();
   const result = readObligationResult(mailDir, agent, draft.inboundId);
   if (result.status === "unverified") {
-    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; fix the path named above and restart the account`;
+    const message = formatStampDiagnostic({ kind: "obligation-create-read-failed", actor: agent, id: draft.inboundId, path: result.path, code: result.code, obligation: "unknown" });
     log?.warn?.(message);
     throw new Error(message);
   }
@@ -365,8 +366,7 @@ export function markNackSent(
     return true;
   } catch (err) {
     log?.warn?.(
-      `tps-mail: obligation-write-failed: could not record nackSentAt for ${inboundId} ` +
-        `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later start may send the nack again`,
+      formatStampDiagnostic({ kind: "obligation-write-failed", actor: agent, id: inboundId, path: obligationPath(mailDir, agent, inboundId), code: (err as NodeJS.ErrnoException).code ?? "WRITE_FAILED", obligation: "retained" }),
     );
     return false;
   }
@@ -400,8 +400,7 @@ export function abandonOwedNack(
     return true;
   } catch (err) {
     log?.warn?.(
-      `tps-mail: obligation-write-failed: could not record the nack abandonment for ${inboundId} ` +
-        `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later sweep will abandon it again`,
+      formatStampDiagnostic({ kind: "obligation-write-failed", actor: agent, id: inboundId, path: obligationPath(mailDir, agent, inboundId), code: (err as NodeJS.ErrnoException).code ?? "WRITE_FAILED", obligation: "retained" }),
     );
     return false;
   }
@@ -452,14 +451,14 @@ const ALL_STATES: ReadonlySet<string> = new Set([
   "failed",
 ]);
 
-function curRecordUnresolved(mailDir: string, agent: string, inboundId: string, onFailure: (path: string, code: string) => void, requireCur = false): boolean {
+function curRecordUnresolved(mailDir: string, agent: string, inboundId: string, onFailure: (path: string, code: string, kind?: ReadFailureKind) => void, requireCur = false): boolean {
   const curDirectory = resolve(mailDir, agent, "cur");
   let names: string[];
   try {
     names = readdirSync(curDirectory);
   } catch (err: any) {
     if (err?.code === "ENOENT" && !requireCur) return false;
-    onFailure(curDirectory, err?.code ?? "READ_FAILED");
+    onFailure(curDirectory, err?.code ?? "READ_FAILED", "directory");
     return true;
   }
   const matching = names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`));
@@ -479,7 +478,7 @@ function curRecordUnresolved(mailDir: string, agent: string, inboundId: string, 
     }
   }
   if (requireCur) {
-    onFailure(curDirectory, "ENOENT");
+    onFailure(resolve(curDirectory, `${inboundId}.json`), "ENOENT");
     return true;
   }
   return false;
@@ -517,9 +516,7 @@ export function obligationLastTransitionMs(record: unknown): number | null {
  * reads those.
  *
  * Ages a record by its OWN recorded timestamp (`lastTransitionAt`, else
- * `inboundTimestamp`), never the file mtime. Safe + best-effort: an
- * unreadable/malformed record (or one whose timestamp cannot be parsed) is LEFT
- * and logged ONCE; a deletion failure is logged and never blocks startup.
+ * `inboundTimestamp`), never the file mtime.
  * `retentionDays <= 0` disables the sweep.
  *
  * A terminal record still OWING ITS NACK MAIL (`nackPending` with no
@@ -553,7 +550,7 @@ export function sweepTerminalObligations(
   nowMs: number = Date.now(),
   nackHoldDays: number = retentionDays * DEFAULT_NACK_HOLD_MULTIPLE,
   unresolved = new Set<string>(),
-  onFailure?: (path: string, code: string, id: string, state: string, kind: ReadFailureKind) => void,
+  onFailure?: (path: string, code: string, id: string, state: string, kind: ReadFailureKind, obligation: ObligationPresence) => void,
   heldRecords: ObligationRecord[] = [],
 ): RetentionResult {
   const res: RetentionResult = {
@@ -572,11 +569,11 @@ export function sweepTerminalObligations(
     res.disabled = true;
     return res;
   }
-  const fail = (path: string, code: string, id: string, state: string, kind: ReadFailureKind = "file") => {
+  const fail = (path: string, code: string, id: string, state: string, kind: ReadFailureKind = "file", obligation: ObligationPresence = kind === "directory" ? "unknown" : "retained") => {
     if (unresolved.has(id)) return;
-    if (onFailure) onFailure(path, code, id, state, kind);
-    else if (kind === "directory") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; fix the path named above and restart the account`);
-    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; obligation retained; fix the path named above and restart the account`);
+    if (onFailure) onFailure(path, code, id, state, kind, obligation);
+    else log?.warn?.(formatStampDiagnostic({ kind: "retention-unresolved", actor: agent,
+      id: kind === "directory" ? undefined : id, path, code, obligation }));
     unresolved.add(id);
   };
   const dir = obligationsDir(mailDir, agent);
@@ -592,12 +589,10 @@ export function sweepTerminalObligations(
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code !== "ENOENT") {
       fail(dir, code ?? "READ_FAILED", "*", "unknown", "directory");
-      if (!onFailure) log?.warn?.(`tps-mail: obligation retention: could not read ${dir}; sweep skipped`);
       return res;
     }
   }
   const cutoff = nowMs - retentionDays * 24 * 60 * 60 * 1000;
-  const leftUnreadable: string[] = [];
   // WHICH OBLIGATIONS THE STORE HELD at the START of this sweep, by state. The
   // obligation loop below DELETES aged terminal records, so "is this receipt's
   // obligation live, terminal, or gone?" must be answered from a snapshot taken
@@ -632,7 +627,7 @@ export function sweepTerminalObligations(
         const code = err?.code ?? "INVALID_RECEIPT";
         receiptFailureCodes.set(id, code);
         const owner = heldRecords.find((rec) => rec.obligationId === id);
-        fail(resolve(root, name), code, owner?.inboundId ?? `receipt:${name}`, owner?.state ?? "unknown");
+        fail(resolve(root, name), code, owner?.inboundId ?? `receipt:${name}`, owner?.state ?? "unknown", "file", owner ? "retained" : "unknown");
       }
     }
   }
@@ -652,7 +647,6 @@ export function sweepTerminalObligations(
       record = JSON.parse(readFileSync(path, "utf-8"));
     } catch (err: any) {
       res.unreadable++;
-      leftUnreadable.push(name);
       fail(path, err?.code ?? "INVALID_RECORD", fileId, "unknown");
       continue;
     }
@@ -661,7 +655,6 @@ export function sweepTerminalObligations(
     // non-terminal one — reported as unreadable, never swept.
     if (!isObligationRecord(record) || record.inboundId !== fileId) {
       res.unreadable++;
-      leftUnreadable.push(name);
       fail(path, "INVALID_RECORD", fileId, "unknown");
       continue;
     }
@@ -687,12 +680,11 @@ export function sweepTerminalObligations(
     const transitionMs = obligationLastTransitionMs(record);
     if (transitionMs === null) {
       res.unreadable++;
-      leftUnreadable.push(name);
       fail(path, "INVALID_TIMESTAMP", fileId, state);
       hold();
       continue;
     }
-    if (typeof inboundId === "string" && curRecordUnresolved(mailDir, agent, inboundId, (p, code) => fail(p, code, fileId, state), Boolean(onFailure))) {
+    if (typeof inboundId === "string" && curRecordUnresolved(mailDir, agent, inboundId, (p, code, kind) => fail(p, code, fileId, state, kind), Boolean(onFailure))) {
       hold();
       continue;
     }
@@ -732,9 +724,8 @@ export function sweepTerminalObligations(
       }
       res.abandonedForNack++;
       log?.warn?.(
-        `tps-mail: nack-abandoned: ${name} has owed its nack past the hold window (${nackHoldDays} day(s)); ` +
-          `the debt is released ` +
-          `and normal retention applies to the record`,
+        formatStampDiagnostic({ kind: "nack-abandoned", actor: agent, id: fileId, path,
+          code: "NACK_HOLD_EXPIRED", obligation: "retained" }),
       );
       // fall through to the normal terminal-retention rules below
     }
@@ -787,7 +778,9 @@ export function sweepTerminalObligations(
       receipt = onFailure ? receiptSnapshot.get(name) : JSON.parse(readFileSync(path, "utf-8"));
     } catch (err: any) {
       res.receiptsUnreadable++;
-      if (onFailure) fail(path, err?.code ?? "INVALID_RECEIPT", `receipt:${name}`, "unknown");
+      if (onFailure) fail(path, err?.code ?? "INVALID_RECEIPT", `receipt:${name}`, "unknown", "file", "unknown");
+      else log?.warn?.(formatStampDiagnostic({ kind: "retention-receipt-read-failed", actor: agent, id: `receipt:${name}`,
+        path, code: err?.code ?? "INVALID_RECEIPT", obligation: "unknown" }));
       continue;
     }
     const obligationId = (receipt as { obligationId?: unknown } | null)?.obligationId;
@@ -802,7 +795,7 @@ export function sweepTerminalObligations(
     if (onFailure && terminal) continue;
     const t = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
     if (onFailure && !terminal && !Number.isFinite(t)) {
-      fail(path, "INVALID_TIMESTAMP", `receipt:${name}`, "orphan");
+      fail(path, "INVALID_TIMESTAMP", `receipt:${name}`, "orphan", "file", res.unreadable > 0 ? "unknown" : "none");
       continue;
     }
     const agedOrphan = !live && Number.isFinite(t) && t < cutoff;
@@ -822,31 +815,14 @@ export function sweepTerminalObligations(
       res.receiptsRemoved++;
     } catch (err) {
       if (onFailure) {
-        fail(path, (err as NodeJS.ErrnoException).code ?? "DELETE_FAILED", `receipt:${name}`, "orphan");
+        fail(path, (err as NodeJS.ErrnoException).code ?? "DELETE_FAILED", `receipt:${name}`, "orphan", "file", "none");
         continue;
       }
       log?.warn?.(
-        `tps-mail: obligation retention: could not delete receipt ${name}: ${err instanceof Error ? err.message : String(err)}; left in place`,
+        formatStampDiagnostic({ kind: "retention-receipt-delete-failed", actor: agent, id: `receipt:${name}`, path,
+          code: (err as NodeJS.ErrnoException).code ?? "DELETE_FAILED", obligation: terminal ? "unknown" : "none" }),
       );
     }
-  }
-  if (res.receiptsUnreadable > 0 && !onFailure) {
-    log?.warn?.(
-      `tps-mail: obligation retention: left ${res.receiptsUnreadable} unreadable receipt(s) in place (never deleted)`,
-    );
-  }
-  if (res.orphanReceiptsSkipped > 0) {
-    log?.warn?.(
-      `tps-mail: obligation retention: left ${res.orphanReceiptsSkipped} aged receipt(s) in place — ` +
-        `${res.unreadable} unreadable/malformed record(s) in the store make an orphan unprovable this pass`,
-    );
-  }
-
-  // Logged ONCE: a single line for the unreadable/malformed records we left.
-  if (leftUnreadable.length > 0 && !onFailure) {
-    log?.warn?.(
-      `tps-mail: obligation retention: left ${leftUnreadable.length} unreadable/malformed record(s) in place (never deleted): ${leftUnreadable.join(", ")}`,
-    );
   }
   log?.info?.(
     `tps-mail: obligation retention: removed ${res.removed} terminal record(s) older than ${retentionDays} day(s); kept ${res.left}` +
@@ -982,7 +958,7 @@ const realFs: ReceiptScanFs = {
  * Flair, for one) counts as NOT verified — the candidate is not evidence, and
  * the obligation resolves by a later scan or at its deadline.
  */
-export type ReceiptSignatureCheck = (envelope: Envelope) => Promise<boolean>;
+export type ReceiptSignatureCheck = (envelope: Envelope, path?: string) => Promise<boolean>;
 
 /** True for a value with the shape of a SIGNED v1 envelope (not yet verified). */
 function isSignedEnvelopeShape(x: unknown): x is Envelope {
@@ -1206,8 +1182,8 @@ export async function scanForReceipt(
 ): Promise<ReceiptScan> {
   const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
-  const verified = (envelope: Envelope | null): Promise<boolean> =>
-    isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
+  const verified = (envelope: Envelope | null, path: string): Promise<boolean> =>
+    isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, (candidate) => checkSignature(candidate, path));
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
   //     the agent's receipts root holds a receipt per receipted delivery, so
   //     walking it would parse every retained receipt on every scan (round 4).
@@ -1227,7 +1203,7 @@ export async function scanForReceipt(
       (expectedReplyId === undefined || rec.replyId === expectedReplyId) &&
       rec.obligationId === obligationId &&
       rec.replyToId === replyToId &&
-      (await verified(receiptEnvelope(rec.signedReply)))
+      (await verified(receiptEnvelope(rec.signedReply), direct))
     ) {
       return { status: "found", path: direct };
     }
@@ -1270,7 +1246,7 @@ export async function scanForReceipt(
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
-        if (!(await verified(recordReceiptEnvelope(record)))) continue;
+        if (!(await verified(recordReceiptEnvelope(record), path))) continue;
         return { status: "found", path };
       }
       // (2b) the BRIDGE SANDBOX RECORD (cli#389 round 5, item 2): the reduced
@@ -1286,7 +1262,7 @@ export async function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
-        (await verified(recordReceiptEnvelope(record)))
+        (await verified(recordReceiptEnvelope(record), path))
       ) {
         return { status: "found", path };
       }

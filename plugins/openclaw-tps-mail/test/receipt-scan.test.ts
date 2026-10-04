@@ -574,3 +574,27 @@ describe("receipt scan — cli#429 signed thread mode (real signatures)", () => 
     expect(receiptThread({ inboundId: INBOUND })).toEqual({ threadId: INBOUND, mode: "legacy" });
   });
 });
+
+for (const form of ["metadata", "posted", "bridge"] as const) {
+  it(`signature check receives the ${form} candidate path`, async () => {
+    let path: string;
+    if (form === "metadata") path = writeMetadataReceipt(metadata());
+    else {
+      const record = reply();
+      if (form === "bridge") {
+        delete record.headers;
+        delete record.accountId;
+        record.obligationId = OB_ID;
+        record.replyId = "reply-1";
+      }
+      writeReply(record);
+      path = join(dir, "2026-05-26T00-00-00-reply-1.json");
+    }
+    const paths: (string | undefined)[] = [];
+    const result = await scanForReceipt({ direct: form === "metadata" ? [receiptsRoot()] : [],
+      posted: form === "metadata" ? [] : [dir] }, OB_ID, INBOUND, AGENT, ACCOUNT, RECIPIENT,
+      async (envelope, candidatePath) => { paths.push(candidatePath); return check(envelope); });
+    expect(result).toEqual({ status: "found", path });
+    expect(paths).toEqual([path]);
+  });
+}

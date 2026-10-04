@@ -1217,7 +1217,7 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
       expect(outcome.inboundNackedAt, "the inbound is NOT stamped").toBeNull();
       expect(outcome.nackCount, "and NO nack mail is sent for a failure that was never recorded").toBe(0);
       expect(
-        outcome.warns.some((w) => w.includes("refusing to record the failure")),
+        outcome.warns.some((w) => w.includes("failure-refused")),
         "the refusal is logged by name",
       ).toBe(true);
     } finally {

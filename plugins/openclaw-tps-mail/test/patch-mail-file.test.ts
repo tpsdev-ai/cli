@@ -53,6 +53,7 @@ mock.module("node:fs", () => ({
   },
 }));
 
+const { formatStampDiagnostic } = await import("../src/diagnostics.js");
 const { acquireMailLockSync, mailLockPath } = await import("@tpsdev-ai/agent");
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
 const { createObligation, listObligations, sweepTerminalObligations } = await import("../src/obligations.js");
@@ -92,13 +93,15 @@ describe("patchMailFile", () => {
   });
 
   for (const code of ["EACCES", "ENOENT"]) {
-    test(`a scratch ${code} failure names the scratch path and preserves the record`, () => {
+    test(`a scratch ${code} failure names the target path and preserves the record`, () => {
       const f = terminalFixture("acked");
       scratchErrorCode = code;
       const result = patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound");
       expect(result).toMatchObject({ ok: false, reason: "write-failed", code });
       if (result.ok) throw new Error("expected scratch failure");
-      expect(result.path).toStartWith(join(f.curDir, ".ack-"));
+      expect(result.path).toBe(f.curPath);
+      f.reconcile();
+      expect(f.logs[0]).toBe(`tps-mail: ack-stamp-reconcile-failed: inbound actor=anvil path=${f.curPath} code=${code}; obligation retained; fix the path named above and restart the account`);
       expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeUndefined();
     });
   }
@@ -150,7 +153,7 @@ describe("terminal stamp reconciliation", () => {
       f.reconcile();
       expect(removeAfterRead).toBeUndefined();
       expect(f.logs).toHaveLength(1);
-      expect(f.logs[0]).toContain(`${kind}-stamp-reconcile-failed: inbound actor=anvil state=${state} path=${f.curPath} code=ENOENT`);
+      expect(f.logs[0]).toContain(`${kind}-stamp-reconcile-failed: inbound actor=anvil path=${f.curPath} code=ENOENT`);
       expect(f.logs[0]).toContain("obligation retained; fix the path named above and restart the account");
       expect(realFs.existsSync(f.curPath)).toBe(false);
       expect(JSON.parse(realFs.readFileSync(f.obligationPath, "utf8")).state).toBe(state);
@@ -161,14 +164,14 @@ describe("terminal stamp reconciliation", () => {
       realFs.unlinkSync(f.curPath);
       f.reconcile();
       expect(f.logs).toHaveLength(1);
-      expect(f.logs[0]).toContain(`state=${state} path=${join(f.curDir, "inbound.json")} code=ENOENT`);
+      expect(f.logs[0]).toContain(`path=${join(f.curDir, "inbound.json")} code=ENOENT`);
     });
 
     test(`${kind}: an uncoded write failure is reported and the next run can stamp`, () => {
       const f = terminalFixture(state);
       uncodedWriteFailure = true;
       f.reconcile();
-      expect(f.logs[0]).toContain(`actor=anvil state=${state} path=${f.curPath} code=WRITE_FAILED`);
+      expect(f.logs[0]).toContain(`actor=anvil path=${f.curPath} code=WRITE_FAILED`);
       expect(f.logs[0]).toContain("obligation retained; fix the path named above and restart the account");
       uncodedWriteFailure = false;
       f.reconcile();
@@ -209,7 +212,7 @@ describe("terminal stamp reconciliation", () => {
       }
       f.reconcile();
       expect(f.logs[0]).toContain("stamp-reconcile-read-failed");
-      expect(f.logs[0]).toContain("actor=anvil state=");
+      expect(f.logs[0]).toContain("actor=anvil");
       expect(f.logs[0]).toContain(`path=${target} code=EACCES`);
       expect(f.logs[0]).toContain("fix the path named above and restart the account");
       listFailure = readFailure = undefined;
@@ -243,7 +246,7 @@ for (const invalid of [null, 7, "bad", [], { inboundId: "bad" }]) {
     expect(listObligations(root, "anvil", (path, code) => errors.push(`${path}:${code}`))).toHaveLength(1);
     expect(errors).toEqual([`${badPath}:INVALID_RECORD`]);
     expect(() => f.reconcile()).not.toThrow();
-    expect(f.logs[0]).toContain(`actor=anvil state=unknown path=${badPath} code=INVALID_RECORD`);
+    expect(f.logs[0]).toContain(`actor=anvil path=${badPath} code=INVALID_RECORD`);
     expect(f.logs[0]).toContain("fix the path named above and restart the account");
     expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeDefined();
     expect(realFs.readFileSync(badPath, "utf8")).toBe(JSON.stringify(invalid));
@@ -254,7 +257,7 @@ test("a null cur record is reported as unreadable", () => {
   const f = terminalFixture("acked");
   realFs.writeFileSync(f.curPath, "null");
   f.reconcile();
-  expect(f.logs[0]).toContain(`actor=anvil state=acked path=${f.curPath} code=INVALID_RECORD`);
+  expect(f.logs[0]).toContain(`actor=anvil path=${f.curPath} code=INVALID_RECORD`);
   expect(f.logs[0]).toContain("fix the path named above and restart the account");
 });
 
@@ -262,7 +265,7 @@ test("creation refuses an unreadable existing terminal obligation", () => {
   const f = terminalFixture("acked");
   const bytes = realFs.readFileSync(f.obligationPath, "utf8");
   readFailure = f.obligationPath;
-  expect(() => createObligation(root, "anvil", () => ({ inboundId: "inbound", state: "pending" }) as any)).toThrow("state=unknown");
+  expect(() => createObligation(root, "anvil", () => ({ inboundId: "inbound", state: "pending" }) as any)).toThrow("state unknown");
   expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
 });
 
@@ -298,7 +301,7 @@ for (const state of ["acked", "failed"] as const) {
       expect(realFs.existsSync(receiptPath)).toBe(true);
       expect(realFs.existsSync(join(f.obligationDir, "healthy.json"))).toBe(false);
       expect(f.logs.filter((m) => m.includes("actor=anvil"))).toHaveLength(1);
-      expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain(`state=${state}`);
+      expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain(`actor=anvil`);
       expect(f.logs.find((m) => m.includes("actor=anvil"))).toContain("restart the account");
       replaceIdentity = false;
       if (stage === "cur-missing" || stage === "identity-change") realFs.writeFileSync(f.curPath, JSON.stringify({ id: "inbound" }));
@@ -326,7 +329,7 @@ for (const stage of ["obligation-reread", "cur-retention-read", "cur-retention-l
     if (stage === "abandonment-write") renameFailure = f.obligationPath;
     const unresolved = new Set<string>();
     sweepTerminalObligations(root, "anvil", 7, { warn: (m) => f.logs.push(m) }, Date.now(), 28, unresolved, (path, code, id, state) => {
-      f.logs.push(`actor=anvil state=${state} path=${path} code=${code}; fix the path named above and restart the account`);
+      f.logs.push(`actor=anvil path=${path} code=${code}; fix the path named above and restart the account`);
       unresolved.add(id);
     });
     expect(unresolved.has("inbound")).toBe(true);
@@ -368,12 +371,15 @@ for (const stage of ["receipt-list", "receipt-read", "receipt-delete", "receipt-
       deleteFailure = receiptPath;
     }
     const unresolved = new Set<string>();
-    const onFailure = (path: string, code: string, id: string, state: string) => {
-      f.logs.push(`actor=anvil state=${state} path=${path} code=${code}; fix the path named above and restart the account`);
+    const onFailure = (path: string, code: string, id: string, state: string, kind: "directory" | "file", obligation: "retained" | "none" | "unknown") => {
+      f.logs.push(formatStampDiagnostic({ kind: "startup-unresolved", actor: "anvil", id: kind === "directory" ? undefined : id, path, code, obligation }));
       unresolved.add(id);
     };
     sweepTerminalObligations(root, "anvil", 7, { warn: (m) => f.logs.push(m) }, Date.now(), 28, unresolved, onFailure, [record]);
     expect(unresolved.size).toBe(1);
+    if (stage === "receipt-delete" || stage === "receipt-age") {
+      expect(f.logs[0]).toBe(`tps-mail: startup-unresolved: receipt:ob-inbound.json actor=anvil path=${receiptPath} code=${stage === "receipt-age" ? "INVALID_TIMESTAMP" : "EACCES"}; fix the path named above and restart the account`);
+    }
     expect(realFs.existsSync(receiptPath)).toBe(true);
     if (stage !== "receipt-delete" && stage !== "receipt-age") expect(realFs.existsSync(f.obligationPath)).toBe(true);
     expect(f.logs.filter((m) => m.includes("actor=anvil"))).toHaveLength(1);
@@ -408,11 +414,23 @@ for (const failure of ["directory", "file"] as const) {
     expect(diagnostic).toContain(`path=${path} code=EACCES`);
     expect(diagnostic).toContain("fix the path named above and restart the account");
     if (failure === "directory") {
-      expect(diagnostic).toContain("retention-unresolved: actor=anvil state=unknown");
+      expect(diagnostic).toContain("retention-unresolved: actor=anvil");
       expect(diagnostic).not.toContain("obligation retained");
     } else {
-      expect(diagnostic).toContain("retention-unresolved: * actor=anvil state=unknown");
+      expect(diagnostic).toContain("retention-unresolved: * actor=anvil");
       expect(diagnostic).toContain("obligation retained");
     }
   });
 }
+
+test("retention reports the expected missing unconfirmed record", () => {
+  const f = terminalFixture("acked");
+  const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
+  record.state = "unconfirmed";
+  realFs.writeFileSync(f.obligationPath, JSON.stringify(record));
+  realFs.unlinkSync(f.curPath);
+  sweepTerminalObligations(root, "anvil", 7, undefined, Date.now(), 28, new Set(),
+    (path, code, id, state, kind, obligation) => f.logs.push(formatStampDiagnostic({
+      kind: "startup-unresolved", actor: "anvil", id, path, code, obligation })), [record]);
+  expect(f.logs).toEqual([`tps-mail: startup-unresolved: inbound actor=anvil path=${join(f.curDir, "inbound.json")} code=ENOENT; obligation retained; fix the path named above and restart the account`]);
+});

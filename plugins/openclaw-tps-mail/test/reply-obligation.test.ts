@@ -1125,11 +1125,11 @@ describe("cli#389 round 11 — an owed nack is never swept", () => {
       expect(arrived, "the owed mail is handed over").toBe(true);
 
       const logged = await pollUntil(
-        () => warned.join("\n").includes(`could not record nackSentAt for ${inboundId}`),
+        () => warned.some((m) => m.includes("obligation-write-failed") && m.includes(inboundId) && m.includes("code=")),
         2000,
       );
       expect(logged, "and the failed record write is logged BY NAME").toBe(true);
-      expect(warned.join("\n"), "the line names the consequence for the sender").toContain("later start");
+      expect(warned.join("\n"), "the retained obligation is reported").toContain("obligation retained");
       await h.stop();
     } finally {
       chmodSync(obligationsDir, 0o700); // let the harness remove the tree
