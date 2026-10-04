@@ -373,10 +373,10 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
   MailDeliverBodySchema.shape.id.parse(body.id);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
-  // Acceptance is recorded per branch: a 64-hex id is deterministic, so two branches can send the same one.
+  // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
   const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
   const marker = join(acceptedDir, body.id);
-  // A marker written before acceptance was recorded per branch sits directly in .relay-accepted/.
+  // A marker in the earlier unscoped layout sits directly in .relay-accepted/.
   if (existsSync(marker) || existsSync(join(getMailDir(), ".relay-accepted", body.id))) return false;
   let delivered: boolean;
   try {
