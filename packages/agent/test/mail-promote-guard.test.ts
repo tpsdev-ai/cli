@@ -387,6 +387,44 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(sidecar).toContain("guard482-id-4"); // the incoming record id
   });
 
+  for (const metadata of ["copied", "empty"]) {
+    test(`${metadata} wrapper envelopes cannot hide different signed delivery content`, async () => {
+      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+      const envelope = metadata === "copied" ? first : {};
+      plant({ ...wrapper("flint", first), envelope }, "clash.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect(await client.checkNewMail()).toHaveLength(1);
+      const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+
+      const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT });
+      plant({ ...wrapper("flint", other), envelope }, "clash.json");
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before);
+      const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
+      expect(sidecar).toContain("class: invalid");
+      expect(sidecar).toContain("filename collision");
+      expect(sidecar).toContain(first.messageId);
+      expect(sidecar).not.toContain("class: replay");
+    });
+  }
+
+  test("stored wrapper metadata cannot change a signed-body duplicate or its existing ID", async () => {
+    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+    const forged = signedEnvelope("flint", AGENT, "forged", { flint: FLINT });
+    plant({ ...wrapper("flint", first), envelope: forged, envelopeId: forged.messageId }, "collide.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect(await client.checkNewMail()).toHaveLength(1);
+    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
+    const again = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+    plant(wrapper("flint", again), "collide.json");
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before);
+    const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: replay");
+    expect(sidecar).toContain(first.messageId);
+    expect(sidecar).not.toContain(forged.messageId);
+  });
+
   for (const code of ["EACCES", "EISDIR"]) {
     test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
       const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });

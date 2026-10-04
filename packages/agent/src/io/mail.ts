@@ -210,7 +210,7 @@ export class MailClient {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
       const dstPath = join(this.inboxCur, file);
-      const placement = placeCurRecord(srcPath, dstPath);
+      const placement = placeCurRecord(srcPath, dstPath, envelope, "signed-body");
       if (placement.status === "malformed") {
         return { pass: false, class: "invalid", reason: "malformed delivery record" };
       }

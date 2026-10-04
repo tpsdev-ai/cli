@@ -474,10 +474,11 @@ function readRecordJson(path: string): Record<string, unknown> | null {
   return parsed as Record<string, unknown>;
 }
 
-/** Parse the stored envelope or JSON body. */
-function storedEnvelope(record: Record<string, unknown>): Record<string, unknown> | null {
-  const env = record.envelope;
-  if (env !== null && typeof env === "object" && !Array.isArray(env)) return env as Record<string, unknown>;
+function storedEnvelope(record: Record<string, unknown>, representation: "signed-body" | "promoted-envelope"): Record<string, unknown> | null {
+  if (representation === "promoted-envelope") {
+    const env = record.envelope;
+    return env !== null && typeof env === "object" && !Array.isArray(env) ? env as Record<string, unknown> : null;
+  }
   if (typeof record.body === "string") {
     const parsed = tryParseEnvelope(record.body);
     if (parsed !== "json-parse-error" && parsed !== "missing-fields") return parsed;
@@ -486,8 +487,7 @@ function storedEnvelope(record: Record<string, unknown>): Record<string, unknown
 }
 
 /** Compare from/to/subject/body/replyToId only after envelope validation. */
-function deliveryContent(record: Record<string, unknown>): string | null {
-  const env = storedEnvelope(record);
+function deliveryContent(env: Record<string, unknown> | null): string | null {
   if (!env) return null;
   const parsed = parseSignedEnvelope(JSON.stringify(env));
   if (!parsed.ok || env.v !== 1 || !Array.isArray(env.delegationChain) || env.delegationChain.length === 0
@@ -499,17 +499,10 @@ function deliveryContent(record: Record<string, unknown>): string | null {
   return JSON.stringify({ from: env.from, to: env.to, subject: env.subject, body: env.body, replyToId: env.replyToId });
 }
 
-/** The stored envelope id. */
-function recordEnvelopeId(record: Record<string, unknown>): string | null {
-  if (typeof record.envelopeId === "string") return record.envelopeId;
-  const env = storedEnvelope(record);
-  return env && typeof env.messageId === "string" ? env.messageId : null;
-}
-
-/** Place exclusively; compare validated delivery content on a filename collision. */
-export function placeCurRecord(sourcePath: string, curPath: string): FirstDelivery {
-  const incoming = readRecordJson(sourcePath);
-  const incomingContent = incoming ? deliveryContent(incoming) : null;
+/** Compare the verified incoming envelope with the caller's stored representation. */
+export function placeCurRecord(sourcePath: string, curPath: string, incomingEnvelope: Envelope,
+  representation: "signed-body" | "promoted-envelope"): FirstDelivery {
+  const incomingContent = deliveryContent(incomingEnvelope as unknown as Record<string, unknown>);
   if (incomingContent === null) return { status: "malformed" };
   try {
     linkSync(sourcePath, curPath);
@@ -527,11 +520,12 @@ export function placeCurRecord(sourcePath: string, curPath: string): FirstDelive
     throw new Error(`cannot place ${curPath}: destination exists and is not a regular file`);
   }
   const existing = readRecordJson(curPath);
-  const existingId = existing ? recordEnvelopeId(existing) : null;
-  const existingContent = existing ? deliveryContent(existing) : null;
+  const existingEnvelope = existing ? storedEnvelope(existing, representation) : null;
+  const existingId = existingEnvelope && isValidEnvelopeId(existingEnvelope.messageId) ? existingEnvelope.messageId : undefined;
+  const existingContent = deliveryContent(existingEnvelope);
   if (existingContent === null) throw new Error(`cannot place ${curPath}: destination is not a valid delivery record`);
   if (incomingContent === existingContent) {
-    return { status: "duplicate", existingId: existingId ?? undefined };
+    return { status: "duplicate", existingId };
   }
-  return { status: "collision", existingId: existingId ?? undefined };
+  return { status: "collision", existingId };
 }

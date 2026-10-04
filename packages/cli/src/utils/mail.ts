@@ -832,7 +832,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
-      const placement = placeCurRecord(scratchPath, curPath);
+      const placement = placeCurRecord(scratchPath, curPath, envelope, "promoted-envelope");
       if (placement.status !== "placed") {
         rmSync(scratchPath, { force: true });
         if (placement.status === "malformed") {
@@ -852,10 +852,6 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       }
       movedToCur = true;
       rmSync(scratchPath, { force: true });
-      // Record the consumed id durably as PART OF THE COMMIT. If this throws, the
-      // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
-      // promotion that can't be recorded must not silently succeed (its id would
-      // be replayable with no retry and no quarantine).
       replay.recordConsumed(envelope.messageId);
     } catch (err: any) {
       // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
@@ -867,7 +863,6 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
         /* fault persists — re-drivable */
       }
       if (movedToCur) {
-        // Roll the commit back so the source (still intact) is the single copy.
         try {
           rmSync(curPath, { force: true });
         } catch {
@@ -917,7 +912,7 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
 /**
  * Remove stranded `tmp/<name>.json.promote` scratch files.
  *
- * A crash between composing the scratch and renaming it into cur/ leaves one
+ * A crash between composing the scratch and linking it into cur/ leaves one
  * behind. The promote catch only runs on a THROWN error, not a kill, and
  * `listMessageFiles` filters `.endsWith(".json")`, so `.promote` orphans are
  * invisible to every sweep. They are always safe to remove: the move into cur/
