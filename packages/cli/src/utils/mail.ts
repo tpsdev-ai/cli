@@ -376,7 +376,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   const filename = `${safeTs}-${id}.json`;
   const tmpPath = join(inbox.tmp, filename);
   const newPath = join(inbox.fresh, filename);
-  writeFileSync(tmpPath, JSON.stringify(message, null, 2), "utf-8");
+  writeFileSync(tmpPath, JSON.stringify(message, null, 2), { encoding: "utf-8", flag: "wx" });
   renameSync(tmpPath, newPath);
 
   logEvent({ event: "sent", from: sender, to, messageId: id }, body);
@@ -826,12 +826,14 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
     };
     const curPath = join(dirs.cur, filename);
-    const scratchPath = join(dirs.tmp, `${filename}.promote`);
+    const scratchPath = join(dirs.tmp, `${filename}.${randomUUID()}.promote`);
+    let scratchCreated = false;
     let movedToCur = false;
     try {
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
-      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
+      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
+      scratchCreated = true;
       const placement = placeCurRecord(scratchPath, curPath, envelope, "promoted-envelope");
       if (placement.status !== "placed") {
         rmSync(scratchPath, { force: true });
@@ -858,7 +860,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       // non-file entry at the scratch path) is expected to persist so a later
       // check can re-drive it; a transient one is cleared here and self-heals.
       try {
-        rmSync(scratchPath, { force: true });
+        if (scratchCreated) rmSync(scratchPath, { force: true });
       } catch {
         /* fault persists — re-drivable */
       }
@@ -910,15 +912,9 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
 }
 
 /**
- * Remove stranded `tmp/<name>.json.promote` scratch files.
- *
- * A crash between composing the scratch and linking it into cur/ leaves one
- * behind. The promote catch only runs on a THROWN error, not a kill, and
- * `listMessageFiles` filters `.endsWith(".json")`, so `.promote` orphans are
- * invisible to every sweep. They are always safe to remove: the move into cur/
- * is a link followed by removal of the scratch, so a surviving scratch is
- * incomplete, already linked into cur/, or still has its untouched source,
- * which a later check re-promotes.
+ * Unlink stranded `tmp/*.promote` scratch, including links shared with cur/.
+ * A crash after linking but before the consumed-ID append leaves an uncommitted
+ * cur/ record: presentation withholds it, and retrying its ID is refused as replay.
  */
 export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
   const tmpDir = join(root, "tmp");
