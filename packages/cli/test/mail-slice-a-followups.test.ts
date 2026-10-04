@@ -152,7 +152,7 @@ for (const firstWriter of ["promote", "MailClient"] as const) {
           timestamp: incoming.timestamp,
         };
         writeFileSync(sent.filePath, JSON.stringify(record));
-        const rejection = content === "original" ? "replay" : "invalid";
+        const rejection = "replay";
         if (firstWriter === "MailClient") {
           expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: rejection });
         } else {
@@ -165,59 +165,6 @@ for (const firstWriter of ["promote", "MailClient"] as const) {
       });
     }
   }
-}
-
-for (const content of ["equal", "inner"] as const) {
-  test(`envelope-shaped message content across both writers: ${content}`, async () => {
-    for (const [firstWriter, secondWriter] of [["promote", "MailClient"], ["MailClient", "promote"], ["promote", "promote"]] as const) {
-      const inbox = getInbox("kern");
-      const client = new MailClient(join(home, "mail"), undefined, "kern", {
-        async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
-      });
-      const inner = signOutboundBody("flint", "kern", "inner content", { requireKey: true });
-      const first = JSON.parse(signOutboundBody("flint", "kern", inner, { requireKey: true }));
-      const sent = sendMessage("kern", JSON.stringify(first), "flint");
-      if (firstWriter === "MailClient") expect(await client.checkNewMail()).toHaveLength(1);
-      else expect(await promote("kern", sent.filePath)).toMatchObject({ ok: true });
-      const filename = sent.filePath.split("/").pop()!;
-      const destination = join(inbox.cur, filename);
-      const before = readFileSync(destination, "utf8");
-      const incoming = signEnvelope({ ...first, body: content === "equal" ? inner : "inner content" }, { flint: seed });
-      writeFileSync(sent.filePath, JSON.stringify({
-        id: first.messageId, from: "flint", to: "kern", body: JSON.stringify(incoming), timestamp: incoming.timestamp,
-      }));
-      const rejection = content === "equal" ? "replay" : "invalid";
-      if (secondWriter === "MailClient") expect(await client.checkNewMail()).toEqual([]);
-      else expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: rejection });
-      expect(readFileSync(destination, "utf8")).toBe(before);
-      expect(readdirSync(inbox.fresh)).toEqual([]);
-      expect(readFileSync(join(inbox.dlq, `${filename}.reason`), "utf8")).toContain(`class: ${rejection}`);
-    }
-  });
-}
-
-for (const content of ["original", "different"] as const) {
-  test(`CLI compares MailClient signed content despite wrapper metadata: ${content}`, async () => {
-    const inbox = getInbox("kern");
-    const first = JSON.parse(signOutboundBody("flint", "kern", "original", { requireKey: true }));
-    const forged = signEnvelope({ ...first, body: "different" }, { flint: seed });
-    const sent = sendMessage("kern", JSON.stringify(first), "flint");
-    const record = JSON.parse(readFileSync(sent.filePath, "utf8"));
-    writeFileSync(sent.filePath, JSON.stringify({ ...record, envelope: forged, envelopeId: forged.messageId }));
-    const client = new MailClient(join(home, "mail"), undefined, "kern", {
-      async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
-    });
-    expect(await client.checkNewMail()).toHaveLength(1);
-    const filename = sent.filePath.split("/").pop()!;
-    const destination = join(inbox.cur, filename);
-    const before = readFileSync(destination, "utf8");
-    const incoming = signEnvelope({ ...first, body: content }, { flint: seed });
-    writeFileSync(sent.filePath, JSON.stringify({ ...record, body: JSON.stringify(incoming) }));
-    expect(await promote("kern", sent.filePath)).toMatchObject({
-      ok: false, class: content === "original" ? "replay" : "invalid",
-    });
-    expect(readFileSync(destination, "utf8")).toBe(before);
-  });
 }
 
 for (const field of ["messageId", "replyToId"] as const) {

@@ -5,8 +5,6 @@
  * Flair client unconditionally, so the tests stand up a stub Flair HTTP server
  * and point FLAIR_URL/FLAIR_KEY_PATH at it. No internal mocking.
  *
- * Every acceptance case here FAILS against origin/main (where verification was
- * an optional parameter and the only live caller passed two arguments).
  */
 
 import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
@@ -184,7 +182,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     );
   }
 
-  test("a second delivery with the same filename and same delivery content is dead-lettered as a duplicate (replay)", async () => {
+  test("an existing filename returns replay and keeps the cur record", async () => {
     const inbox = getInbox("kern");
     const file = "collide.json";
     const delivered = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-1" });
@@ -198,15 +196,14 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const second = await checkMessages("kern");
 
     expect(second.length).toBe(0);
-    expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before); // delivered record untouched
-    expect(jsonFiles(inbox.fresh).length).toBe(0); // the duplicate left new/
+    expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before);
+    expect(jsonFiles(inbox.fresh).length).toBe(0);
     const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
     expect(reason).toContain("class: replay");
-    expect(reason).toContain("cli482-id-1");
   });
 
   for (const reuseId of [false, true]) {
-    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body is invalid`, async () => {
+    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body returns replay and keeps the cur record`, async () => {
       const inbox = getInbox("kern");
       const file = "clash.json";
       const delivered = buildSignedEnvelope("flint", "kern", "original", { flint: FLINT_SEED }, { messageId: "cli482-id-3" });
@@ -219,12 +216,10 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
       const second = await checkMessages("kern");
 
       expect(second.length).toBe(0);
-      expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before); // delivered record untouched
+      expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before);
       expect(jsonFiles(inbox.dlq)).toContain(file);
       const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
-      expect(reason).toContain("class: invalid");
-      expect(reason).toContain("cli482-id-3"); // the delivered record id
-      expect(reason).toContain(reuseId ? "cli482-id-3" : "cli482-id-4");
+      expect(reason).toContain("class: replay");
     });
   }
 
@@ -514,7 +509,6 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(reasonFor(process.env.TPS_MAIL_DIR!, "sherlock", "planted.json")).toContain("class: wrong-recipient");
   });
 
-  // ── Lock: bounded, fail-closed, crash-recoverable, no duplicate delivery ──
   test("a held mailbox lock prevents delivery (fail-closed), then clears", async () => {
     const env = buildSignedEnvelope("flint", "kern", "locked", { flint: FLINT_SEED });
     sendMessage("kern", JSON.stringify(env), "flint");

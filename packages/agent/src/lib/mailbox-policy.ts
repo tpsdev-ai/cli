@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, type Dirent, existsSync, linkSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, type Dirent, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.js";
@@ -454,85 +454,14 @@ export function hasCommittedMessageId(root: string, messageId: string): boolean 
 // ─── First delivery into cur/ (cli#482) ──────────────────────────────────────
 //
 /** The result of a first-delivery placement. */
-export type FirstDelivery =
-  | { status: "placed" }
-  | { status: "malformed" }
-  | { status: "duplicate"; existingId?: string }
-  | { status: "collision"; existingId?: string };
+export type FirstDelivery = { status: "placed" } | { status: "exists" };
 
-/** Parse a record file, or null when it is unreadable or not a JSON object. */
-function readRecordJson(path: string): Record<string, unknown> | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf-8"));
-  } catch {
-    return null;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  return parsed as Record<string, unknown>;
-}
-
-function storedEnvelope(record: Record<string, unknown>): Record<string, unknown> | null {
-  if (Object.hasOwn(record, "checkedOutAt")) {
-    const env = record.envelope;
-    return typeof record.checkedOutAt === "string" && env !== null && typeof env === "object" && !Array.isArray(env)
-      ? env as Record<string, unknown> : null;
-  }
-  if (typeof record.from !== "string" || typeof record.to !== "string" || typeof record.body !== "string") return null;
-  const parsed = tryParseEnvelope(record.body);
-  return parsed !== "json-parse-error" && parsed !== "missing-fields" ? parsed : null;
-}
-
-/** Compare from/to/subject/body/replyToId after shape checks. */
-function deliveryContent(env: Record<string, unknown> | null): string | null {
-  if (!env) return null;
-  const parsed = parseSignedEnvelope(JSON.stringify(env));
-  if (!parsed.ok || env.v !== 1 || !Array.isArray(env.delegationChain) || env.delegationChain.length === 0
-    || typeof env.signature !== "string" || env.signature.trim() === ""
-    || !isValidEnvelopeId(env.messageId) || typeof env.timestamp !== "string" || Number.isNaN(Date.parse(env.timestamp))
-    || [env.from, env.to].some((value) => typeof value !== "string" || value.trim() === "")
-    || typeof env.body !== "string"
-    || (env.subject !== undefined && typeof env.subject !== "string")
-    || (env.replyToId !== undefined && !isValidEnvelopeId(env.replyToId))) return null;
-  return JSON.stringify({ from: env.from, to: env.to, subject: env.subject, body: env.body, replyToId: env.replyToId });
-}
-
-/** Callers must verify the incoming envelope; this helper checks shape. */
-export function inspectCurRecord(curPath: string, incomingEnvelope: Envelope,
-  _representation: "signed-body" | "promoted-envelope"): Exclude<FirstDelivery, { status: "placed" }> | null {
-  const incomingContent = deliveryContent(incomingEnvelope as unknown as Record<string, unknown>);
-  if (incomingContent === null) return { status: "malformed" };
-  let entry: ReturnType<typeof lstatSync>;
-  try {
-    entry = lstatSync(curPath);
-  } catch (err) {
-    if (isMissing(err)) return null;
-    throw new Error(`cannot place ${curPath}: destination stat failed (${(err as NodeJS.ErrnoException).code ?? String(err)})`);
-  }
-  if (!entry.isFile()) {
-    throw new Error(`cannot place ${curPath}: destination exists and is not a regular file`);
-  }
-  const existing = readRecordJson(curPath);
-  const existingEnvelope = existing ? storedEnvelope(existing) : null;
-  const existingId = existingEnvelope && isValidEnvelopeId(existingEnvelope.messageId) ? existingEnvelope.messageId : undefined;
-  const existingContent = deliveryContent(existingEnvelope);
-  if (existingContent === null) throw new Error(`cannot place ${curPath}: destination is not a valid delivery record`);
-  if (incomingContent === existingContent) {
-    return { status: "duplicate", existingId };
-  }
-  return { status: "collision", existingId };
-}
-
-export function placeCurRecord(sourcePath: string, curPath: string, incomingEnvelope: Envelope,
-  representation: "signed-body" | "promoted-envelope"): FirstDelivery {
-  if (deliveryContent(incomingEnvelope as unknown as Record<string, unknown>) === null) return { status: "malformed" };
+export function placeCurRecord(sourcePath: string, curPath: string): FirstDelivery {
   try {
     linkSync(sourcePath, curPath);
     return { status: "placed" };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return { status: "exists" };
   }
-  const existing = inspectCurRecord(curPath, incomingEnvelope, representation);
-  if (existing === null) throw new Error(`cannot place ${curPath}: destination disappeared`);
-  return existing;
 }

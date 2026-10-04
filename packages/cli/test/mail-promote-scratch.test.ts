@@ -38,7 +38,7 @@ function plant(body: string, messageId?: string) {
   return path;
 }
 
-test("direct promotion preserves a stranded hard-linked cur record and rejects different content", async () => {
+test("direct promotion and the scratch sweep preserve a stranded hard-linked cur record", async () => {
   expect((await mail.promote(agent, plant("original"))).ok).toBe(true);
   const inbox = mail.getInbox(agent);
   const cur = join(inbox.cur, "record.json");
@@ -53,8 +53,7 @@ test("direct promotion preserves a stranded hard-linked cur record and rejects d
   const result = await mail.promote(agent, plant("different"));
   expect(result.ok).toBe(false);
   if (result.ok) throw new Error("collision accepted");
-  expect(result.class).toBe("invalid");
-  expect(result.reason).toContain("different delivery content");
+  expect(result.class).toBe("replay");
   expect(fs.readFileSync(cur, "utf8")).toBe(before);
   expect(fs.readFileSync(scratch, "utf8")).toBe(before);
   expect(fs.existsSync(join(inbox.dlq, "record.json"))).toBe(true);
@@ -99,7 +98,7 @@ test("exclusive scratch creation refuses an existing hard link without changing 
 });
 
 for (const body of ["original", "different"]) {
-  test(`consumed ID at the same filename with ${body} signed body returns ${body === "original" ? "replay" : "invalid"}`, async () => {
+  test(`consumed ID at the same filename with ${body} signed body returns replay`, async () => {
     const messageId = "consumed-collision";
     expect((await mail.promote(agent, plant("original", messageId))).ok).toBe(true);
     const inbox = mail.getInbox(agent);
@@ -109,28 +108,9 @@ for (const body of ["original", "different"]) {
     const result = await mail.promote(agent, plant(body, messageId));
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("consumed collision accepted");
-    expect(result.class).toBe(body === "original" ? "replay" : "invalid");
+    expect(result.class).toBe("replay");
     expect(fs.readFileSync(cur, "utf8")).toBe(before);
     expect(fs.readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe(ledger);
-    expect(fs.readdirSync(inbox.tmp)).toEqual([]);
-  });
-}
-
-for (const destination of ["directory", "non-record"]) {
-  test(`consumed ID at a ${destination} destination is storage-unavailable`, async () => {
-    const messageId = "consumed-non-record";
-    expect((await mail.promote(agent, plant("original", messageId))).ok).toBe(true);
-    const inbox = mail.getInbox(agent);
-    const cur = join(inbox.cur, "record.json");
-    fs.unlinkSync(cur);
-    if (destination === "directory") fs.mkdirSync(cur);
-    else fs.writeFileSync(cur, "{}");
-    const result = await mail.promote(agent, plant("original", messageId));
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error("non-record accepted");
-    expect(result.class).toBe("storage-unavailable");
-    expect(fs.lstatSync(cur).isDirectory()).toBe(destination === "directory");
-    if (destination === "non-record") expect(fs.readFileSync(cur, "utf8")).toBe("{}");
     expect(fs.readdirSync(inbox.tmp)).toEqual([]);
   });
 }

@@ -12,7 +12,7 @@ import {
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
   parseSignedEnvelope,
-  inspectCurRecord, placeCurRecord,
+  placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 
@@ -210,34 +210,11 @@ export class MailClient {
       const consumed = replay.isConsumed(envelope.messageId);
       const dstPath = join(this.inboxCur, file);
       if (consumed) {
-        const existing = inspectCurRecord(dstPath, envelope, "signed-body");
-        if (existing?.status === "collision" || existing?.status === "malformed") {
-          return {
-            pass: false,
-            class: "invalid",
-            reason: existing.status === "malformed" ? "malformed delivery record"
-              : `filename collision: ${file} already delivered as ${existing.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`,
-          };
-        }
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
-      const placement = placeCurRecord(srcPath, dstPath, envelope, "signed-body");
-      if (placement.status === "malformed") {
-        return { pass: false, class: "invalid", reason: "malformed delivery record" };
-      }
-      if (placement.status === "duplicate") {
-        return {
-          pass: false,
-          class: "replay",
-          reason: `duplicate delivery: ${file} already delivered as ${placement.existingId ?? "unknown"}`,
-        };
-      }
-      if (placement.status === "collision") {
-        return {
-          pass: false,
-          class: "invalid",
-          reason: `filename collision: ${file} already delivered as ${placement.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`,
-        };
+      const placement = placeCurRecord(srcPath, dstPath);
+      if (placement.status === "exists") {
+        return { pass: false, class: "replay", reason: `destination already exists: ${file}` };
       }
       try {
         replay.recordConsumed(envelope.messageId);

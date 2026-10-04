@@ -352,7 +352,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
 
   // ── cli#482: a first-delivery filename collision must not replace ──────────
   //
-  test("a second delivery with the same filename and same delivery content is dead-lettered as a duplicate (replay)", async () => {
+  test("an existing filename returns replay and keeps the cur record", async () => {
     const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-1" });
     plant(wrapper("flint", first), "collide.json");
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
@@ -363,15 +363,30 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     plant(wrapper("flint", again), "collide.json");
     expect((await client.checkNewMail()).length).toBe(0);
 
-    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before); // delivered record untouched
-    expect(files("new").length).toBe(0); // the duplicate left new/
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before);
+    expect(files("new").length).toBe(0);
     const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
     expect(sidecar).toContain("class: replay");
-    expect(sidecar).toContain("guard482-id-1");
   });
 
+  for (const body of ["hello", "different"]) {
+    test(`a consumed ID with ${body} body returns replay and keeps the cur record`, async () => {
+      const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-consumed" });
+      plant(wrapper("flint", first), "consumed.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect(await client.checkNewMail()).toHaveLength(1);
+      const cur = join(inbox("cur"), "consumed.json");
+      const before = readFileSync(cur);
+      const again = signedEnvelope("flint", AGENT, body, { flint: FLINT }, { messageId: first.messageId });
+      plant(wrapper("flint", again), "consumed.json");
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(readFileSync(cur)).toEqual(before);
+      expect(readFileSync(join(inbox("dlq"), "consumed.json.reason"), "utf8")).toContain("class: replay");
+    });
+  }
+
   for (const reuseId of [false, true]) {
-    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body is invalid`, async () => {
+    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body returns replay and keeps the cur record`, async () => {
       const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
       plant(wrapper("flint", first), "clash.json");
       const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
@@ -382,98 +397,12 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
       plant(wrapper("flint", other), "clash.json");
       expect((await client.checkNewMail()).length).toBe(0);
 
-      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before); // delivered record untouched
+      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before);
       expect(files("dlq")).toContain("clash.json");
       const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
-      expect(sidecar).toContain("class: invalid");
-      expect(sidecar).toContain("guard482-id-3"); // the delivered record id
-      expect(sidecar).toContain(reuseId ? "guard482-id-3" : "guard482-id-4");
+      expect(sidecar).toContain("class: replay");
     });
   }
-
-  for (const destination of ["directory", "non-record"]) {
-    test(`consumed ID at a ${destination} destination reports a storage error and stays in new/`, async () => {
-      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard-consumed-non-record" });
-      plant(wrapper("flint", first), "storage.json");
-      const logger = new EventLogger(AGENT, join(tmpDir, "events"));
-      const events = spyOn(logger, "emit");
-      const client = new MailClient(tmpDir, logger, AGENT, flairClient({ flint: pub(FLINT) }));
-      try {
-        expect(await client.checkNewMail()).toHaveLength(1);
-        const cur = join(inbox("cur"), "storage.json");
-        rmSync(cur);
-        if (destination === "directory") mkdirSync(cur);
-        else writeFileSync(cur, "{}");
-        plant(wrapper("flint", first), "storage.json");
-        expect(await client.checkNewMail()).toEqual([]);
-        expect(files("new")).toContain("storage.json");
-        expect(files("dlq")).toEqual([]);
-        const last = events.mock.calls.at(-1)?.[0];
-        expect(last).toMatchObject({ type: "mail.receive", status: "error" });
-        expect(last.error).toContain("destination");
-        if (destination === "non-record") expect(readFileSync(cur, "utf8")).toBe("{}");
-      } finally {
-        events.mockRestore();
-      }
-    });
-  }
-
-  test("an empty-body signed message is delivered and a same-content collision is a duplicate", async () => {
-    const first = signedEnvelope("flint", AGENT, "", { flint: FLINT });
-    plant(wrapper("flint", first), "empty.json");
-    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
-    const delivered = await client.checkNewMail();
-    expect(delivered).toHaveLength(1);
-    expect(delivered[0]!.verifiedEnvelope!.body).toBe("");
-    const before = readFileSync(join(inbox("cur"), "empty.json"), "utf-8");
-
-    const again = signedEnvelope("flint", AGENT, "", { flint: FLINT });
-    plant(wrapper("flint", again), "empty.json");
-    expect(await client.checkNewMail()).toEqual([]);
-    expect(readFileSync(join(inbox("cur"), "empty.json"), "utf-8")).toBe(before);
-    const sidecar = readFileSync(join(inbox("dlq"), "empty.json.reason"), "utf-8");
-    expect(sidecar).toContain("class: replay");
-    expect(sidecar).toContain("duplicate delivery");
-    expect(sidecar).toContain(first.messageId);
-  });
-
-  for (const metadata of ["copied", "empty"]) {
-    test(`${metadata} wrapper envelopes cannot hide different signed delivery content`, async () => {
-      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
-      const envelope = metadata === "copied" ? first : {};
-      plant({ ...wrapper("flint", first), envelope }, "clash.json");
-      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
-      expect(await client.checkNewMail()).toHaveLength(1);
-      const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
-
-      const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT });
-      plant({ ...wrapper("flint", other), envelope }, "clash.json");
-      expect(await client.checkNewMail()).toEqual([]);
-      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before);
-      const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
-      expect(sidecar).toContain("class: invalid");
-      expect(sidecar).toContain("filename collision");
-      expect(sidecar).toContain(first.messageId);
-      expect(sidecar).not.toContain("class: replay");
-    });
-  }
-
-  test("stored wrapper metadata cannot change a signed-body duplicate or its existing ID", async () => {
-    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
-    const forged = signedEnvelope("flint", AGENT, "forged", { flint: FLINT });
-    plant({ ...wrapper("flint", first), envelope: forged, envelopeId: forged.messageId }, "collide.json");
-    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
-    expect(await client.checkNewMail()).toHaveLength(1);
-    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
-    const again = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
-    plant(wrapper("flint", again), "collide.json");
-    expect(await client.checkNewMail()).toEqual([]);
-    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before);
-    const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
-    expect(sidecar).toContain("class: replay");
-    expect(sidecar).toContain(first.messageId);
-    expect(sidecar).not.toContain(forged.messageId);
-  });
 
   for (const code of ["EACCES", "EISDIR"]) {
     test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
@@ -542,27 +471,6 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
       fault.mockRestore();
     }
     expect(await client.checkNewMail()).toHaveLength(1);
-  });
-
-  test("malformed wrapper envelopes cannot hide a signed-body integrity error", async () => {
-    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
-    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
-    const raw = JSON.stringify({ ...wrapper("flint", first), envelope: {}, envelopeId: "wrapper-id" });
-    writeFileSync(join(inbox("cur"), "m1.json"), raw);
-    const incoming = signedEnvelope("flint", AGENT, "different", { flint: FLINT });
-    const incomingRecord = { ...wrapper("flint", incoming), envelope: {}, envelopeId: "wrapper-id" };
-    plant(incomingRecord);
-    expect(await client.checkNewMail()).toEqual([]);
-    expect(readFileSync(join(inbox("cur"), "m1.json"), "utf-8")).toBe(raw);
-    expect(readFileSync(join(inbox("dlq"), "m1.json"), "utf-8")).toBe(JSON.stringify(incomingRecord));
-    expect(files("new")).toEqual([]);
-    const sidecar = readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8");
-    expect(sidecar).toContain("class: invalid");
-    expect(sidecar).toContain("filename collision");
-    expect(sidecar).toContain(first.messageId);
-    expect(sidecar).toContain(incoming.messageId);
-    expect(sidecar).not.toContain("wrapper-id");
-    expect(sidecar).not.toContain("duplicate");
   });
 
   test("a failed ledger append and rollback are both reported without delivery", async () => {

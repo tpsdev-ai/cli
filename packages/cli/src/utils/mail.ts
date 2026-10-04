@@ -8,7 +8,7 @@ import {
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
-  inspectCurRecord, placeCurRecord,
+  placeCurRecord,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -824,22 +824,14 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     const replay = mailboxReplayStore(dirs.root);
     const curPath = join(dirs.cur, filename);
     let consumed: boolean;
-    let existing: ReturnType<typeof inspectCurRecord> = null;
     try {
       consumed = replay.isConsumed(envelope.messageId);
-      if (consumed) existing = inspectCurRecord(curPath, envelope, "promoted-envelope");
     } catch (err: any) {
       const reason = `storage failure during replay check: ${err?.message ?? String(err)}`;
       rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
       return { ok: false, class: "storage-unavailable", reason };
     }
     if (consumed) {
-      if (existing?.status === "collision" || existing?.status === "malformed") {
-        const reason = existing.status === "malformed" ? "malformed delivery record"
-          : `filename collision: ${filename} already delivered as ${existing.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`;
-        rejectToDlq(dirs, filename, filePath, "invalid", reason);
-        return { ok: false, class: "invalid", reason };
-      }
       const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
       rejectToDlq(dirs, filename, filePath, "replay", reason);
       return { ok: false, class: "replay", reason };
@@ -876,23 +868,12 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
       scratchCreated = true;
-      const placement = placeCurRecord(scratchPath, curPath, envelope, "promoted-envelope");
+      const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
         rmSync(scratchPath, { force: true });
-        if (placement.status === "malformed") {
-          const reason = "malformed delivery record";
-          rejectToDlq(dirs, filename, filePath, "invalid", reason);
-          return { ok: false, class: "invalid", reason };
-        }
-        const delivered = placement.existingId ?? "unknown";
-        if (placement.status === "duplicate") {
-          const reason = `duplicate delivery: ${filename} already delivered as ${delivered}`;
-          rejectToDlq(dirs, filename, filePath, "replay", reason);
-          return { ok: false, class: "replay", reason };
-        }
-        const reason = `filename collision: ${filename} already delivered as ${delivered}; incoming record ${envelope.messageId} has different delivery content`;
-        rejectToDlq(dirs, filename, filePath, "invalid", reason);
-        return { ok: false, class: "invalid", reason };
+        const reason = `destination already exists: ${filename}`;
+        rejectToDlq(dirs, filename, filePath, "replay", reason);
+        return { ok: false, class: "replay", reason };
       }
       movedToCur = true;
       rmSync(scratchPath, { force: true });
