@@ -9,6 +9,7 @@ import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, M
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
 import { sendMessage, inboxExists } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
 import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
@@ -33,13 +34,22 @@ export type HandlerRoute =
   | { kind: "refused"; reason: string };
 
 /**
+ * Resolve the branch's configured local agent id, refusing by name when none is
+ * set (cli#499). `TPS_AGENT_ID` wins; otherwise the id persisted by
+ * `tps branch init --agent`. There is no fallback to the hostname.
+ */
+export function branchAgentId(confAgentId?: string): string {
+  return requireLocalAgentId("branch agent id", process.env.TPS_AGENT_ID ?? confAgentId);
+}
+
+/**
  * Route a handler action for a received message.
  */
 export function routeHandlerAction(
   action: HandlerAction,
   incoming: HandlerIncoming,
   queueOutbox: (to: string, body: string, from: string) => void = queueOutboxMessage,
-  localAgentId = process.env.TPS_AGENT_ID || hostname().split(".")[0],
+  localAgentId = requireLocalAgentId("branch agent id"),
 ): HandlerRoute {
   const from = inboxExists(incoming.to) ? incoming.to : localAgentId;
   switch (action.type) {
@@ -256,6 +266,10 @@ async function runInit(args: BranchArgs): Promise<void> {
 }
 
 async function runStart(): Promise<void> {
+  const conf = existsSync(confPath()) ? readBranchConf() : undefined;
+  const localAgentId = branchAgentId(conf?.agentId);
+  if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
+
   if (
     process.env.TPS_BRANCH_DAEMON !== "1" &&
     process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
@@ -282,7 +296,6 @@ async function runStart(): Promise<void> {
     throw new Error("Branch is not joined. Run `tps branch init` first.");
   }
 
-  const conf = readBranchConf();
   const kp = loadKeyPair(identityDir, "branch");
   const host = JSON.parse(readFileSync(hostFile, "utf-8"));
   const hostPub = new Uint8Array(Buffer.from(host.publicKey, "base64url"));
@@ -305,19 +318,6 @@ async function runStart(): Promise<void> {
         : [];
     } catch { return []; }
   }
-
-  // Resolve the local agent identity for incoming mail storage.
-  // Preference order: TPS_AGENT_ID env → conf.agentId → hostname fragment.
-  // This ensures mail is stored under the branch's own identity, not the
-  // logical 'to' name used by the sender (which may be a GAL alias).
-  function getLocalAgentId(): string {
-    if (process.env.TPS_AGENT_ID) return process.env.TPS_AGENT_ID;
-    if ((conf as any).agentId) return String((conf as any).agentId);
-    // Fall back to hostname fragment (e.g. "tps-anvil" from hostname)
-    return hostname().split(".")[0]!;
-  }
-
-  const localAgentId = getLocalAgentId();
 
   let serviceProxies: ServiceProxySet | null = null;
   const outboxSends = new OutboxSendTracker();

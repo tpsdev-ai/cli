@@ -118,7 +118,7 @@ const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
   agent: ["model", "flair-url", "display-name", "soul-file", "repo", "message", "pr-title", "scope-warn-threshold"],
   mail: ["type", "retry-after", "max-age", "pr", "status"],
   facts: ["command", "args"],
-  memory: ["focus", "tag", "older-than", "flair-url"],
+  memory: ["focus", "tag", "older-than", "flair-url", "durability"],
   bridge: ["adapter", "openclaw-url", "discord-token", "discord-token-file", "discord-channel", "webhook-url", "bridge-agent-id", "default-agent", "mail-dir", "bot-user-id", "require-mention", "discord-poll-ms", "discord-prompt"],
   skill: ["flair-url", "include-rules", "rule-name-format", "registry"],
   flair: ["flair-dir", "auth-mode", "auth-path", "flair-url"],
@@ -336,7 +336,10 @@ const USAGE: Record<string, string> = {
   service: "Usage:\n  tps service register <name> <url> [--port <local-port>] [--desc <text>]\n  tps service list [--json]\n  tps service remove <name>",
   memory: "Usage:\n" +
           "  tps memory reflect <agentId> [--scope recent|tagged|all] [--since ISO] [--focus lessons_learned|patterns|decisions|errors] [--limit N]\n" +
-          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]",
+          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]\n" +
+          "  tps memory review|list <agentId> [--limit N] [--json]\n" +
+          "  tps memory search <agentId> <query> [--limit N] [--json]\n" +
+          "  tps memory approve|reject|archive|unarchive|purge|show <memoryId>",
   proxy: "Usage:\n  tps proxy start [--port 6459]\n  tps proxy stop\n  tps proxy status",
   bridge: "Usage:\n" +
           "  tps bridge start [--port 7891] [--openclaw-url <url>] [--bridge-agent-id openclaw-bridge] [--default-agent <id>]\n" +
@@ -1383,24 +1386,36 @@ async function main() {
     }
 
     case "memory": {
-      // ops-31.2: reflect + consolidate (ops-31.1 governance commands come with PR #67)
+      const getFlag = (name: string): string | undefined => {
+        const idx = process.argv.indexOf(`--${name}`);
+        return idx >= 0 ? process.argv[idx + 1] : undefined;
+      };
+      const governanceActions = ["review", "approve", "reject", "archive", "unarchive", "purge", "list", "show", "search"];
+      if (governanceActions.includes(rest[0] ?? "")) {
+        const { runMemory } = await import("../src/commands/memory.js");
+        const action = rest[0] as import("../src/commands/memory.js").MemoryArgs["action"];
+        const targetsAgent = ["review", "list", "search"].includes(action);
+        await runMemory({
+          action,
+          agentId: targetsAgent ? rest[1] : undefined,
+          memoryId: targetsAgent ? undefined : rest[1],
+          query: action === "search" ? rest.slice(2).join(" ") : undefined,
+          durability: getFlag("durability"),
+          limit: getFlag("limit") ? Number(getFlag("limit")) : undefined,
+          includeArchived: process.argv.includes("--include-archived"),
+          flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
+          json: cli.flags.json,
+        });
+        break;
+      }
       const action = rest[0] as "reflect" | "consolidate" | undefined;
       if (!action || !["reflect", "consolidate"].includes(action)) {
-        console.error(
-          "Usage:\n" +
-          "  tps memory reflect <agentId> [--scope recent|tagged|all] [--since ISO] [--focus lessons_learned|patterns|decisions|errors] [--limit N]\n" +
-          "  tps memory consolidate <agentId> [--scope persistent|standard|all] [--older-than 30d] [--limit N]"
-        );
+        console.error(USAGE.memory);
         process.exit(1);
       }
 
       const agentId = rest[1];
       if (!agentId) { console.error(`Usage: tps memory ${action} <agentId>`); process.exit(1); }
-
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
 
       const { runMemoryLearn } = await import("../src/commands/memory-learn.js");
       await runMemoryLearn({
