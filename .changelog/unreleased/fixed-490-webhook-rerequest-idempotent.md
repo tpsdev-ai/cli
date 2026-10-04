@@ -1,1 +1,1 @@
-- **Dismissed-review webhook redeliveries with an `X-GitHub-Delivery` header are skipped after successful re-request and completion-record write (Closes #490).** A crash between GitHub success and recording permits one repeated re-request.
+- **A webhook delivery that finds a completion record for its `X-GitHub-Delivery` ID returns 200 without calling GitHub (Closes #490).** The record is written after the event is handled; until it exists, a redelivery can repeat the re-request.
