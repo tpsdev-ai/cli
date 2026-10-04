@@ -213,7 +213,7 @@ export function listObligations(
   mailDir: string,
   agent: string,
   onReadError: (path: string, code: string, ids: string[], kind: ReadFailureKind) => void = (path, code) => console.warn(
-    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; repair the record and restart the account`,
+    `tps-mail: obligation-list-read-failed: actor=${agent} state=unknown path=${path} code=${code}; fix the path named above and restart the account`,
   ),
 ): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
@@ -269,7 +269,7 @@ export function createObligation(
   const draft = make();
   const result = readObligationResult(mailDir, agent, draft.inboundId);
   if (result.status === "unverified") {
-    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; repair the record and restart the account`;
+    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; fix the path named above and restart the account`;
     log?.warn?.(message);
     throw new Error(message);
   }
@@ -575,8 +575,8 @@ export function sweepTerminalObligations(
   const fail = (path: string, code: string, id: string, state: string, kind: ReadFailureKind = "file") => {
     if (unresolved.has(id)) return;
     if (onFailure) onFailure(path, code, id, state, kind);
-    else if (kind === "directory") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`);
-    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account`);
+    else if (kind === "directory") log?.warn?.(`tps-mail: retention-unresolved: actor=${agent} state=unknown path=${path} code=${code}; fix the path named above and restart the account`);
+    else log?.warn?.(`tps-mail: retention-unresolved: ${id} actor=${agent} state=${state} path=${path} code=${code}; fix the path named above and restart the account`);
     unresolved.add(id);
   };
   const dir = obligationsDir(mailDir, agent);

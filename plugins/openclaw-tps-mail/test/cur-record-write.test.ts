@@ -287,7 +287,7 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         await finish(h);
         expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
         expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain(`actor=anvil state=${state} path=${cur.path} code=ENOENT`);
-        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain("inspect the missing cur record; obligation retained");
+        expect(failedLogs(h, `${kind}-stamp-failed`)[0]).toContain("obligation retained; fix the path named above and restart the account");
         expect(obligation(h.inboundId)?.state).toBe(state);
         await sleep(400);
         expect(failedLogs(h, `${kind}-stamp-failed`).length).toBe(1);
@@ -412,7 +412,7 @@ for (const failReads of [Infinity, 1]) {
       expect(realFs.readFileSync(path, "utf8")).toBe(bytes);
       expect(realFs.existsSync(cur.path)).toBe(true);
       expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
-      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("repair the record and restart the account"))).toBe(true);
+      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("fix the path named above and restart the account"))).toBe(true);
     } finally {
       await second.stop();
       obligationReadFailure = undefined;
@@ -526,9 +526,8 @@ for (const failure of ["directory", "file"] as const) {
     try {
       expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved") && m.includes(path)))).toBe(true);
       const diagnostic = h.logs.find((m) => m.includes("startup-unresolved") && m.includes(path))!;
-      expect(diagnostic).toContain(failure === "directory" ? "the directory could not be read" : "repair the record");
-      expect(diagnostic.includes("the directory could not be read")).toBe(failure === "directory");
-      expect(diagnostic).not.toContain("obligation retained");
+      expect(diagnostic).toContain("fix the path named above and restart the account");
+        expect(diagnostic).not.toContain("obligation retained");
     } finally {
       await h.stop();
       if (failure === "file") realFs.chmodSync(path, 0o644);

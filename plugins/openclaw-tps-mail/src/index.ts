@@ -656,7 +656,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     if (unknownInbounds.has(id)) return;
     unknownInbounds.add(id);
     log?.warn?.(
-      `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; repair the record and restart the account`,
+      `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; fix the path named above and restart the account`,
     );
   };
   const onObligationReadError = (path: string, code: string, ids: string[]) => {
@@ -677,7 +677,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     const missing = (path: string) => {
       unknownInbounds.add(rec.inboundId);
       log?.warn?.(
-      `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${path} code=ENOENT; inspect the missing cur record; obligation retained; repair it and restart the account`,
+      `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${path} code=ENOENT; obligation retained; fix the path named above and restart the account`,
       );
     };
     if (unreadable) continue;
@@ -700,11 +700,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
       unknownInbounds.add(rec.inboundId);
       log?.warn?.(
         `tps-mail: ${kind}-stamp-reconcile-failed: ${rec.inboundId} actor=${agent} state=${rec.state} path=${r.path} code=${r.code}; ` +
-        (r.reason === "record-missing"
-          ? "inspect the missing cur record; obligation retained"
-          : r.code === "ID_MISMATCH"
-          ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
-          : "repair the record and restart the account; obligation retained"),
+        `obligation retained; fix the path named above and restart the account`,
       );
     }
   }
@@ -982,13 +978,9 @@ function stampTerminalCur(
   const delay = stamped.reason === "record-missing" ? undefined : stampRetryDelaysMs[attempt];
   ctx.log?.warn?.(
     `tps-mail: ${kind}-stamp-failed: ${ctx.inboundId} actor=${ctx.agent} state=${kind === "ack" ? "acked" : "failed"} path=${stamped.path} code=${stamped.code}; ` +
-      (stamped.reason === "record-missing"
-        ? "inspect the missing cur record; obligation retained"
-        : stamped.code === "ID_MISMATCH"
-        ? "the cur record has another id; restore the expected record or correct its path and restart the account; obligation retained"
-        : delay === undefined
-        ? "no retries left; repair the record and restart the account; obligation retained"
-        : `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`),
+      (stamped.reason !== "record-missing" && delay !== undefined
+        ? `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`
+        : `obligation retained; fix the path named above and restart the account`),
   );
   if (delay === undefined || !isLiveContext(ctx)) return;
   const timer = accountTimer(ctx, () => stampTerminalCur(ctx, kind, patch, attempt + 1), delay);
@@ -2399,9 +2391,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           if (unknownInbounds.has(id)) return;
           unknownInbounds.add(id);
           log?.warn?.(
-            kind === "directory"
-              ? `tps-mail: startup-unresolved: actor=${agentId} state=unknown path=${path} code=${code}; the directory could not be read; repair it and restart the account`
-              : `tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account`,
+            `tps-mail: startup-unresolved: ${kind === "directory" ? "" : id + " "}actor=${agentId} state=${kind === "directory" ? "unknown" : state} path=${path} code=${code}; fix the path named above and restart the account`,
           );
         };
         const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids, kind) => {
