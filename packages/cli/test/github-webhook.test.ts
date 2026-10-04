@@ -193,7 +193,7 @@ describe("handleGithubWebhook", () => {
       agents.push(args[0]!); return { status: 0, stdout: "", stderr: "" };
     }) as any }, publishReviewRerequestedEvent: async () => {} };
     const results = await Promise.all([post(headers, payload, deps), post(headers, payload, deps)]);
-    expect(results.map(r => r.status)).toEqual([200, 200]);
+    expect(results.map(r => r.status)).toEqual([200, 503]);
     expect(readdirSync(join(root, ".tps", "outbox", "new"))).toHaveLength(1);
     expect(drainOutbox()).toHaveLength(1);
     // The racing pair performed the GitHub re-request exactly once.
@@ -253,20 +253,20 @@ describe("handleGithubWebhook", () => {
     expect((await post(headers, payload, deps)).status).toBe(200);
     expect(ghCalls).toBe(1);
   });
-  test("a failed delivery record makes no GitHub call (fails closed)", async () => {
+  test("a failed delivery claim makes no GitHub call (fails closed)", async () => {
     const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
       pull_request: { number: 149, html_url: "https://github.com/tpsdev-ai/cli/pull/149" }, review: { user: { login: "tps-kern" } } });
     const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-record-fails",
       "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
     let ghCalls = 0;
-    const deps = { queueOutboxDeliveryImpl: (() => { throw new Error("record write refused"); }) as any,
+    const deps = { claimOutboxDeliveryImpl: (() => { throw new Error("claim refused"); }) as any,
       reviewRequestDeps: { spawnSyncImpl: ((_: string, __: string[]) => {
         ghCalls++; return { status: 0, stdout: "", stderr: "" };
       }) as any }, publishReviewRerequestedEvent: async () => {} };
-    expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "record write refused" });
+    expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "claim refused" });
     expect(ghCalls).toBe(0);
   });
-  test("a failed re-request releases the record, so a redelivery retries it once", async () => {
+  test("a failed re-request leaves no completed record, so a redelivery retries it once", async () => {
     const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "tpsdev-ai/cli" },
       pull_request: { number: 150, html_url: "https://github.com/tpsdev-ai/cli/pull/150" }, review: { user: { login: "tps-kern" } } });
     const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "delivery-rerequest-fails",
@@ -289,10 +289,121 @@ describe("handleGithubWebhook", () => {
     expect(existsSync(record)).toBe(true);
     expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
     expect(ghCalls).toBe(2);
-    // Held across each GitHub call; released before the publish's await.
-    expect(lockHeld).toEqual([true, true, false]);
+    expect(lockHeld).toEqual([true, true, true]);
     expect(existsSync(lock)).toBe(false);
   });
+  test("a simulated crash after GitHub success before the record write permits one more re-request", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+      pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "crash-after-success",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    const called = join(root, "github-succeeded");
+    const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
+    const child = Bun.spawn([process.execPath, "-e", `
+      import { spyOn } from "bun:test";
+      import * as fs from "node:fs";
+      import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
+      import { PassThrough } from "node:stream";
+      const write = fs.writeFileSync;
+      spyOn(fs, "writeFileSync").mockImplementation((...args) => {
+        if (String(args[0]).endsWith(".tmp")) process.exit(86);
+        return write(...args);
+      });
+      const req = new PassThrough(); req.headers = ${JSON.stringify(headers)};
+      const res = { statusCode: 200, end() {} };
+      const pending = handleGithubWebhook(req, res, {
+        reviewRequestDeps: { spawnSyncImpl() {
+          write(${JSON.stringify(called)}, "success");
+          return { status: 0, stdout: "", stderr: "" };
+        } }, publishReviewRerequestedEvent: async () => {}
+      });
+      req.end(${JSON.stringify(payload)}); await pending;
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited, await new Response(child.stderr).text()).toBe(86);
+    expect(existsSync(called)).toBe(true);
+    expect(drainOutbox()).toEqual([]);
+    const id = createHash("sha256").update(headers["x-github-delivery"]).digest("hex");
+    const lock = join(root, ".tps", "outbox", "new", `.github-${id}.lock`);
+    expect(existsSync(lock)).toBe(true);
+    let ghCalls = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: (() => {
+      ghCalls++; return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => {} };
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "ok" });
+    expect(ghCalls).toBe(1);
+    expect(existsSync(lock)).toBe(false);
+    expect(drainOutbox()).toHaveLength(1);
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
+    expect(ghCalls).toBe(1);
+  });
+
+  test("a thrown GitHub call returns 503 and a redelivery retries successfully", async () => {
+    const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+      pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+    const headers = { "x-github-event": "pull_request_review", "x-github-delivery": "thrown-call",
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}` };
+    let ghCalls = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: (() => {
+      if (++ghCalls === 1) throw new Error("GitHub call threw");
+      return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => {} };
+    expect(await post(headers, payload, deps)).toEqual({ status: 503, text: "GitHub call threw" });
+    expect(drainOutbox()).toEqual([]);
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "ok" });
+    expect(await post(headers, payload, deps)).toEqual({ status: 200, text: "duplicate" });
+    expect(ghCalls).toBe(2);
+  });
+
+  test("holds the lock until the in-flight GitHub call returns; redelivery gets 503 then retries", async () => {
+    const request = deliveryRequest("in-flight-call");
+    request.body = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
+      pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });
+    request.headers["x-github-event"] = "pull_request_review";
+    request.headers["x-hub-signature-256"] = `sha256=${createHmac("sha256", "testsecret").update(request.body).digest("hex")}`;
+    const release = join(root, "return-from-github");
+    const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
+    const child = Bun.spawn([process.execPath, "-e", `
+      import { existsSync } from "node:fs";
+      import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
+      import { PassThrough } from "node:stream";
+      const req = new PassThrough(); req.headers = ${JSON.stringify(request.headers)};
+      const res = { statusCode: 200, end(text) { console.log(JSON.stringify({status: this.statusCode, text})); } };
+      const pending = handleGithubWebhook(req, res, {
+        reviewRequestDeps: { spawnSyncImpl() {
+          console.log("inside-github-call");
+          while (!existsSync(${JSON.stringify(release)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+          if (!existsSync(${JSON.stringify(request.lock)})) throw new Error("lock released before GitHub returned");
+          return { status: 1, stdout: "", stderr: "first attempt failed" };
+        } }, publishReviewRerequestedEvent: async () => {}
+      });
+      req.end(${JSON.stringify(request.body)}); await pending;
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" });
+    const reader = child.stdout.getReader();
+    let ghCalls = 0;
+    const deps = { reviewRequestDeps: { spawnSyncImpl: (() => {
+      ghCalls++; return { status: 0, stdout: "", stderr: "" };
+    }) as any }, publishReviewRerequestedEvent: async () => {} };
+    try {
+      expect(new TextDecoder().decode((await reader.read()).value)).toContain("inside-github-call");
+      expect(existsSync(request.lock)).toBe(true);
+      expect(await post(request.headers, request.body, deps)).toEqual({ status: 503, text: "duplicate in progress" });
+      expect(ghCalls).toBe(0);
+      expect(drainOutbox()).toEqual([]);
+      writeFileSync(release, "");
+      let output = "";
+      for (;;) { const part = await reader.read(); if (part.done) break; output += new TextDecoder().decode(part.value); }
+      expect(await child.exited, await new Response(child.stderr).text()).toBe(0);
+      expect(JSON.parse(output)).toEqual({ status: 503, text: "GitHub re-request failed" });
+      expect(existsSync(request.lock)).toBe(false);
+    } finally {
+      child.kill();
+      await child.exited;
+    }
+    expect(await post(request.headers, request.body, deps)).toEqual({ status: 200, text: "ok" });
+    expect(await post(request.headers, request.body, deps)).toEqual({ status: 200, text: "duplicate" });
+    expect(ghCalls).toBe(1);
+  });
+
   test("invalid dismissed review does not require an agent id", async () => {
     delete process.env.GITHUB_WEBHOOK_AGENT_ID;
     const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" } });
@@ -338,7 +449,7 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toEqual([]);
   });
 
-  test("cross-process redelivery returns 200 for an old live owner's lock and enqueues once", async () => {
+  test("cross-process redelivery returns 503 for an old live owner's lock and enqueues once", async () => {
     const request = deliveryRequest("cross-process");
     const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
     const child = Bun.spawn([process.execPath, "-e", `
@@ -373,7 +484,7 @@ describe("handleGithubWebhook", () => {
         expect(await contender.exited, error).toBe(0);
         return JSON.parse(output);
       }));
-      expect(results).toEqual(Array.from({ length: 4 }, () => ({ status: 200, text: "duplicate in progress" })));
+      expect(results).toEqual(Array.from({ length: 4 }, () => ({ status: 503, text: "duplicate in progress" })));
       expect(drainOutbox()).toEqual([]);
       writeFileSync(join(request.lock, "release"), "");
       let output = "";
@@ -425,7 +536,8 @@ describe("handleGithubWebhook", () => {
     for (const contender of contenders) {
       const result = JSON.parse(await new Response(contender.stdout).text());
       expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
-      expect(result.status, result.text).toBe(200);
+      expect([200, 503]).toContain(result.status);
+      if (result.status === 503) expect(result.text).toBe("duplicate in progress");
     }
     expect(existsSync(request.lock)).toBe(false);
     expect(drainOutbox()).toHaveLength(1);

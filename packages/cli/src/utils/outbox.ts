@@ -32,12 +32,12 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
   return queue(to, body, from, deliveryId, false).result;
 }
 
-/** As queueOutboxMessage, but with a delivery ID a "queued" result keeps the
- * per-delivery lock held until unlock() is called. */
-export function queueOutboxDelivery(to: string, body: string, from: string, deliveryId?: string): { result: QueueOutboxResult; unlock: () => void } {
-  const { result, lock } = queue(to, body, from, deliveryId, true);
+/** With a delivery ID, pending claims hold the lock until unlock(). */
+export function claimOutboxDelivery(to: string, body: string, from: string, deliveryId?: string): { result: "pending" | "duplicate" | "duplicate in progress"; complete: () => void; unlock: () => void } {
+  const { result, lock, complete } = queue(to, body, from, deliveryId, true);
   return {
-    result,
+    result: result === "queued" ? "pending" : result,
+    complete: complete ?? (() => {}),
     unlock: () => {
       try {
         lock?.release();
@@ -59,7 +59,7 @@ function outboxLockPath(deliveryId: string): string {
   return join(outboxDir("new"), `.github-${deliveryId}.lock`);
 }
 
-function queue(to: string, body: string, from: string, deliveryId: string | undefined, keepLock: boolean): { result: QueueOutboxResult; lock?: MailLock } {
+function queue(to: string, body: string, from: string, deliveryId: string | undefined, deferWrite: boolean): { result: QueueOutboxResult; lock?: MailLock; complete?: () => void } {
   if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
@@ -73,15 +73,11 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
     }
     if (!lock) return { result: "duplicate in progress" };
   }
-  let alreadyRecorded = false;
+  const id = deliveryId ?? randomUUID();
+  const timestamp = new Date().toISOString();
+  const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
+  const alreadyRecorded = !!deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)));
   const write = (): void => {
-    const id = deliveryId ?? randomUUID();
-    const timestamp = new Date().toISOString();
-    const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) {
-      alreadyRecorded = true;
-      return;
-    }
     const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
     const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
     writeFileSync(tmp, content, "utf-8");
@@ -97,15 +93,15 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
       renameSync(tmp, join(dir, filename));
     }
   };
+  if (deferWrite && !alreadyRecorded) return { result: "queued", lock: lock ?? undefined, complete: write };
   let writeFailed = false;
   let writeError: unknown;
   try {
-    write();
+    if (!alreadyRecorded) write();
   } catch (error) {
     writeFailed = true;
     writeError = error;
   }
-  if (keepLock && lock && !writeFailed && !alreadyRecorded) return { result: "queued", lock };
   if (lock) {
     try {
       lock.release();
