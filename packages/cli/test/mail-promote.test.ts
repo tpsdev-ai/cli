@@ -171,6 +171,61 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(reason).toContain("class: replay");
   });
 
+  // ── First-delivery filename collision (cli#482) ───────────────────────────
+  //
+
+  /** Plant a raw wrapper record at an exact filename in the recipient's new/. */
+  function plantRaw(agent: string, filename: string, env: Envelope): void {
+    const inbox = getInbox(agent);
+    writeFileSync(
+      join(inbox.fresh, filename),
+      JSON.stringify({ id: `rec-${env.messageId}`, from: env.from, to: env.to, body: JSON.stringify(env), timestamp: new Date().toISOString() }),
+      "utf-8",
+    );
+  }
+
+  test("a second delivery with the same filename and same delivery content is dead-lettered as a duplicate (replay)", async () => {
+    const inbox = getInbox("kern");
+    const file = "collide.json";
+    const delivered = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-1" });
+    plantRaw("kern", file, delivered);
+    expect((await checkMessages("kern")).length).toBe(1);
+    const before = readFileSync(join(inbox.cur, file), "utf-8");
+    expect(JSON.parse(before).envelopeId).toBe("cli482-id-1");
+
+    const again = buildSignedEnvelope("flint", "kern", "hello", { flint: FLINT_SEED }, { messageId: "cli482-id-2" });
+    plantRaw("kern", file, again);
+    const second = await checkMessages("kern");
+
+    expect(second.length).toBe(0);
+    expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before); // delivered record untouched
+    expect(jsonFiles(inbox.fresh).length).toBe(0); // the duplicate left new/
+    const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
+    expect(reason).toContain("class: replay");
+    expect(reason).toContain("cli482-id-1");
+  });
+
+  test("a second delivery with the same filename and different delivery content is an integrity error", async () => {
+    const inbox = getInbox("kern");
+    const file = "clash.json";
+    const delivered = buildSignedEnvelope("flint", "kern", "original", { flint: FLINT_SEED }, { messageId: "cli482-id-3" });
+    plantRaw("kern", file, delivered);
+    expect((await checkMessages("kern")).length).toBe(1);
+    const before = readFileSync(join(inbox.cur, file), "utf-8");
+
+    const other = buildSignedEnvelope("flint", "kern", "different", { flint: FLINT_SEED }, { messageId: "cli482-id-4" });
+    plantRaw("kern", file, other);
+    const second = await checkMessages("kern");
+
+    expect(second.length).toBe(0);
+    expect(readFileSync(join(inbox.cur, file), "utf-8")).toBe(before); // delivered record untouched
+    expect(jsonFiles(inbox.dlq)).toContain(file);
+    const reason = reasonFor(process.env.TPS_MAIL_DIR!, "kern", file);
+    expect(reason).toContain("class: invalid");
+    expect(reason).toContain("cli482-id-3"); // the delivered record id
+    expect(reason).toContain("cli482-id-4"); // the incoming record id
+  });
+
   // ── Wrapper/envelope from-mismatch ────────────────────────────────────────
   test("a wrapper/envelope from mismatch dead-letters", async () => {
     const env = buildSignedEnvelope("flint", "kern", "signed by flint", { flint: FLINT_SEED });

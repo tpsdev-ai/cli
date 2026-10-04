@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -12,6 +12,7 @@ import {
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
   parseSignedEnvelope,
+  placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 
@@ -194,11 +195,7 @@ export class MailClient {
     return messages;
   }
 
-  /**
-   * Under the mailbox lock: refuse a consumed messageId, else rename into cur/
-   * and record the id. Returns the replay rejection, or null once committed.
-   * On append failure, attempt to move the record back to new/; throw on failure.
-   */
+  /** Commit under the mailbox lock; attempt placement rollback on append failure. */
   private async commitToCur(
     file: string,
     srcPath: string,
@@ -214,17 +211,39 @@ export class MailClient {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
       const dstPath = join(this.inboxCur, file);
-      renameSync(srcPath, dstPath);
+      const placement = placeCurRecord(srcPath, dstPath, envelope, "signed-body");
+      if (placement.status === "malformed") {
+        return { pass: false, class: "invalid", reason: "malformed delivery record" };
+      }
+      if (placement.status === "duplicate") {
+        return {
+          pass: false,
+          class: "replay",
+          reason: `duplicate delivery: ${file} already delivered as ${placement.existingId ?? "unknown"}`,
+        };
+      }
+      if (placement.status === "collision") {
+        return {
+          pass: false,
+          class: "invalid",
+          reason: `filename collision: ${file} already delivered as ${placement.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`,
+        };
+      }
       try {
         replay.recordConsumed(envelope.messageId);
       } catch (err) {
         try {
-          renameSync(dstPath, srcPath);
+          unlinkSync(dstPath);
         } catch (rollbackErr) {
           throw new AggregateError([err, rollbackErr],
             `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
         }
         throw err;
+      }
+      try {
+        unlinkSync(srcPath);
+      } catch (err) {
+        console.error(`[MailClient] committed ${file}; source cleanup failed: ${sanitizeError(err)}`);
       }
       return null;
     } finally {

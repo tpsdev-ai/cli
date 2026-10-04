@@ -349,6 +349,102 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
   });
 
+  // ── cli#482: a first-delivery filename collision must not replace ──────────
+  //
+  test("a second delivery with the same filename and same delivery content is dead-lettered as a duplicate (replay)", async () => {
+    const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-1" });
+    plant(wrapper("flint", first), "collide.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(1);
+    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
+
+    const again = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-2" });
+    plant(wrapper("flint", again), "collide.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before); // delivered record untouched
+    expect(files("new").length).toBe(0); // the duplicate left new/
+    const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: replay");
+    expect(sidecar).toContain("guard482-id-1");
+  });
+
+  test("a second delivery with the same filename and different delivery content is an integrity error", async () => {
+    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
+    plant(wrapper("flint", first), "clash.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(1);
+    const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+
+    const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT }, { messageId: "guard482-id-4" });
+    plant(wrapper("flint", other), "clash.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+
+    expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before); // delivered record untouched
+    expect(files("dlq")).toContain("clash.json");
+    const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: invalid");
+    expect(sidecar).toContain("guard482-id-3"); // the delivered record id
+    expect(sidecar).toContain("guard482-id-4"); // the incoming record id
+  });
+
+  test("an empty-body signed message is delivered and a same-content collision is a duplicate", async () => {
+    const first = signedEnvelope("flint", AGENT, "", { flint: FLINT });
+    plant(wrapper("flint", first), "empty.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const delivered = await client.checkNewMail();
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]!.verifiedEnvelope!.body).toBe("");
+    const before = readFileSync(join(inbox("cur"), "empty.json"), "utf-8");
+
+    const again = signedEnvelope("flint", AGENT, "", { flint: FLINT });
+    plant(wrapper("flint", again), "empty.json");
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readFileSync(join(inbox("cur"), "empty.json"), "utf-8")).toBe(before);
+    const sidecar = readFileSync(join(inbox("dlq"), "empty.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: replay");
+    expect(sidecar).toContain("duplicate delivery");
+    expect(sidecar).toContain(first.messageId);
+  });
+
+  for (const metadata of ["copied", "empty"]) {
+    test(`${metadata} wrapper envelopes cannot hide different signed delivery content`, async () => {
+      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+      const envelope = metadata === "copied" ? first : {};
+      plant({ ...wrapper("flint", first), envelope }, "clash.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect(await client.checkNewMail()).toHaveLength(1);
+      const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+
+      const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT });
+      plant({ ...wrapper("flint", other), envelope }, "clash.json");
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before);
+      const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
+      expect(sidecar).toContain("class: invalid");
+      expect(sidecar).toContain("filename collision");
+      expect(sidecar).toContain(first.messageId);
+      expect(sidecar).not.toContain("class: replay");
+    });
+  }
+
+  test("stored wrapper metadata cannot change a signed-body duplicate or its existing ID", async () => {
+    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+    const forged = signedEnvelope("flint", AGENT, "forged", { flint: FLINT });
+    plant({ ...wrapper("flint", first), envelope: forged, envelopeId: forged.messageId }, "collide.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect(await client.checkNewMail()).toHaveLength(1);
+    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
+    const again = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+    plant(wrapper("flint", again), "collide.json");
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before);
+    const sidecar = readFileSync(join(inbox("dlq"), "collide.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: replay");
+    expect(sidecar).toContain(first.messageId);
+    expect(sidecar).not.toContain(forged.messageId);
+  });
+
   for (const code of ["EACCES", "EISDIR"]) {
     test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
       const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
@@ -375,19 +471,83 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     });
   }
 
+  test("source unlink failure after commit does not cause a second delivery", async () => {
+    const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    plant(wrapper("flint", env));
+    const source = join(inbox("new"), "m1.json");
+    const unlink = fs.unlinkSync;
+    const fault = spyOn(fs, "unlinkSync").mockImplementation((...args: Parameters<typeof unlink>) => {
+      if (args[0] === source) throw new Error("source cleanup fault");
+      return unlink(...args);
+    });
+    try {
+      expect(await client.checkNewMail()).toHaveLength(1);
+      expect(existsSync(source)).toBe(true);
+      expect(JSON.parse(readFileSync(join(tmpDir, AGENT, "consumed.jsonl"), "utf-8").trim()).id).toBe(env.messageId);
+    } finally {
+      fault.mockRestore();
+    }
+    const restarted = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect(await restarted.checkNewMail()).toEqual([]);
+    expect(files("new")).toEqual([]);
+    expect(files("cur")).toEqual(["m1.json"]);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
+  });
+
+  test("failed consumed-ID append removes cur/ while retaining the source", async () => {
+    const env = signedEnvelope("flint", AGENT, "retry", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    plant(wrapper("flint", env));
+    const append = fs.appendFileSync;
+    const fault = spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof append>) => {
+      if (args[0] === join(tmpDir, AGENT, "consumed.jsonl")) throw new Error("append fault");
+      return append(...args);
+    });
+    try {
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(files("cur")).toEqual([]);
+      expect(files("new")).toEqual(["m1.json"]);
+    } finally {
+      fault.mockRestore();
+    }
+    expect(await client.checkNewMail()).toHaveLength(1);
+  });
+
+  test("malformed wrapper envelopes cannot hide a signed-body integrity error", async () => {
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT });
+    const raw = JSON.stringify({ ...wrapper("flint", first), envelope: {}, envelopeId: "wrapper-id" });
+    writeFileSync(join(inbox("cur"), "m1.json"), raw);
+    const incoming = signedEnvelope("flint", AGENT, "different", { flint: FLINT });
+    const incomingRecord = { ...wrapper("flint", incoming), envelope: {}, envelopeId: "wrapper-id" };
+    plant(incomingRecord);
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readFileSync(join(inbox("cur"), "m1.json"), "utf-8")).toBe(raw);
+    expect(readFileSync(join(inbox("dlq"), "m1.json"), "utf-8")).toBe(JSON.stringify(incomingRecord));
+    expect(files("new")).toEqual([]);
+    const sidecar = readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8");
+    expect(sidecar).toContain("class: invalid");
+    expect(sidecar).toContain("filename collision");
+    expect(sidecar).toContain(first.messageId);
+    expect(sidecar).toContain(incoming.messageId);
+    expect(sidecar).not.toContain("wrapper-id");
+    expect(sidecar).not.toContain("duplicate");
+  });
+
   test("a failed ledger append and rollback are both reported without delivery", async () => {
     const env = signedEnvelope("flint", AGENT, "uncommitted", { flint: FLINT });
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
     plant(wrapper("flint", env));
     const append = fs.appendFileSync;
-    const rename = fs.renameSync;
+    const unlink = fs.unlinkSync;
     const appendFault = spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof append>) => {
       if (args[0] === join(tmpDir, AGENT, "consumed.jsonl")) throw new Error("append fault");
       return append(...args);
     });
-    const rollbackFault = spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof rename>) => {
+    const rollbackFault = spyOn(fs, "unlinkSync").mockImplementation((...args: Parameters<typeof unlink>) => {
       if (args[0] === join(inbox("cur"), "m1.json")) throw new Error("rollback fault");
-      return rename(...args);
+      return unlink(...args);
     });
     try {
       await expect(client["commitToCur"]("m1.json", join(inbox("new"), "m1.json"),
