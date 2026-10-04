@@ -7,8 +7,7 @@
  *   - approve / reject are unsupported (Flair has no by-id memory promotion).
  *
  * Flair's own contract is read from its resources (Memory.patch merges;
- * POST /PromoteMemoryCandidate acts on a candidate id; the authority-field guard
- * refuses direct promotionStatus writes for every caller).
+ * POST /PromoteMemoryCandidate acts on a candidate id).
  */
 import { describe, test, expect, beforeEach, afterEach, beforeAll, afterAll } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";

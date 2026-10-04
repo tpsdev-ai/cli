@@ -138,17 +138,15 @@ export class FlairRequestError extends Error {
 }
 
 /**
- * Flair exposes no operation that promotes or rejects a Memory by id: its write
- * paths refuse direct `promotionStatus` changes for every caller
- * (resources/authority-field-guard.ts), and the promotion operation
- * `POST /PromoteMemoryCandidate` acts on a `MemoryCandidate` id. Refuse by name
- * rather than send a write Flair rejects.
+ * Flair exposes no operation that promotes or rejects a Memory by id: the
+ * promotion operation `POST /PromoteMemoryCandidate` acts on a `MemoryCandidate`
+ * id. Refuse by name rather than send a write Flair rejects.
  */
 function promotionUnsupported(action: "approve" | "reject", id: string): Error {
   return new Error(
     `tps memory ${action} is unavailable: Flair has no operation that sets a memory's promotion status by id. ` +
-      `Direct promotionStatus writes are refused for every caller; promotion uses Flair's candidate ` +
-      `workflow (POST /PromoteMemoryCandidate, on a MemoryCandidate id). ${id} was not changed.`,
+      `Promotion uses Flair's candidate workflow (POST /PromoteMemoryCandidate, on a MemoryCandidate id). ` +
+      `${id} was not changed.`,
   );
 }
 
@@ -349,8 +347,8 @@ export class FlairClient {
 
   /**
    * Semantic search. The client signs as its own agent; `opts.agentId` names
-   * the agent whose memories are searched (Flair's read scoping decides what
-   * that caller may see). Defaults to the signing agent.
+   * the reader whose read scope the search resolves (that reader's memories
+   * plus other agents' non-private memories). Defaults to the signing agent.
    */
   async search(query: string, limit = 5, opts: { agentId?: string } = {}): Promise<SearchResult[]> {
     const result = await this.request<{ results: SearchResult[] }>(

@@ -54,4 +54,67 @@ describe("memory CLI entry", () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  test("search propagates a SemanticSearch refusal as a non-zero exit with no results output", () => {
+    const home = mkdtempSync(join(tmpdir(), "memory-entry-"));
+    try {
+      const identity = join(home, ".tps", "identity");
+      mkdirSync(identity, { recursive: true });
+      const { privateKey } = generateKeyPairSync("ed25519", { privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+      writeFileSync(join(identity, "operator.key"), privateKey, { mode: 0o600 });
+      const preload = join(home, "fetch.mjs");
+      // Model SemanticSearch: a non-admin search whose body agentId differs from
+      // the authenticated (signing) principal is refused 403.
+      writeFileSync(preload, `globalThis.fetch = async (url, options) => {
+        const principal = String(options.headers.Authorization || "").split(" ")[1]?.split(":")[0];
+        const target = JSON.parse(options.body).agentId;
+        if (target !== principal) {
+          return new Response(JSON.stringify({ error: "forbidden: agentId must match authenticated agent" }), { status: 403 });
+        }
+        return new Response(JSON.stringify({ results: [] }), { status: 200 });
+      };`);
+      const result = spawnSync(
+        "node",
+        ["--import", preload, bin, "memory", "search", "target-a", "hello", "--flair-url", "http://example.invalid"],
+        { env: { ...process.env, HOME: home, TPS_AGENT_ID: "operator" }, encoding: "utf8", timeout: 10_000 },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("forbidden: agentId must match authenticated agent");
+      expect(result.stdout.trim()).toBe("");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("archive propagates a Memory.patch refusal as a non-zero exit with no success output", () => {
+    const home = mkdtempSync(join(tmpdir(), "memory-entry-"));
+    try {
+      const identity = join(home, ".tps", "identity");
+      mkdirSync(identity, { recursive: true });
+      const { privateKey } = generateKeyPairSync("ed25519", { privateKeyEncoding: { type: "pkcs8", format: "pem" } });
+      writeFileSync(join(identity, "operator.key"), privateKey, { mode: 0o600 });
+      const preload = join(home, "fetch.mjs");
+      // Model Memory.patch's skill-write path rejection: a patch to a row whose
+      // stored tags include `skill` is refused.
+      writeFileSync(preload, `globalThis.fetch = async (url, options) => {
+        if (options.method === "GET") {
+          return new Response(JSON.stringify({ id: "m1", agentId: "operator", content: "a skill", tags: ["skill"] }), { status: 200 });
+        }
+        if (options.method === "PATCH") {
+          return new Response(JSON.stringify({ error: "skill_write_path", message: "skill memories must be written via skill_store (or Memory post/put); this path does not gate skill writes" }), { status: 400 });
+        }
+        return new Response("{}", { status: 200 });
+      };`);
+      const result = spawnSync(
+        "node",
+        ["--import", preload, bin, "memory", "archive", "m1", "--flair-url", "http://example.invalid"],
+        { env: { ...process.env, HOME: home, TPS_AGENT_ID: "operator" }, encoding: "utf8", timeout: 10_000 },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("skill_write_path");
+      expect(result.stdout.trim()).toBe("");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });
