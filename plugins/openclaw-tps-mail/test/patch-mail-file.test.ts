@@ -11,6 +11,7 @@ let listFailure: string | undefined;
 let stampOnRead: { path: string; count: number } | undefined;
 let readsBeforeRemoval = 1;
 let uncodedWriteFailure = false;
+let scratchErrorCode: string | undefined;
 let deleteFailure: string | undefined;
 let renameFailure: string | undefined;
 let replaceIdentity = false;
@@ -30,6 +31,7 @@ mock.module("node:fs", () => ({
   },
   openSync: (...args: any[]) => {
     if (uncodedWriteFailure && String(args[0]).includes(".ack-")) throw new Error("injected write failure");
+    if (scratchErrorCode && String(args[0]).includes(".ack-")) throw Object.assign(new Error("injected scratch failure"), { code: scratchErrorCode, path: args[0] });
     return (realFs.openSync as any)(...args);
   },
   readFileSync: (...args: any[]) => {
@@ -51,6 +53,7 @@ mock.module("node:fs", () => ({
   },
 }));
 
+const { acquireMailLockSync, mailLockPath } = await import("@tpsdev-ai/agent");
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
 const { createObligation, listObligations, sweepTerminalObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
@@ -62,6 +65,7 @@ afterEach(() => {
   readFailure = listFailure = undefined;
   stampOnRead = undefined;
   uncodedWriteFailure = replaceIdentity = false;
+  scratchErrorCode = undefined;
   deleteFailure = renameFailure = undefined;
   realFs.rmSync(join(root, "anvil"), { recursive: true, force: true });
   realFs.rmSync(path, { force: true });
@@ -70,6 +74,35 @@ afterEach(() => {
 afterAll(() => realFs.rmSync(root, { recursive: true, force: true }));
 
 describe("patchMailFile", () => {
+  test("a nested lock failure names the lock path", () => {
+    const f = terminalFixture("acked");
+    const lock = acquireMailLockSync(join(root, "anvil"))!;
+    try {
+      expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "write-failed", path: mailLockPath(join(root, "anvil")) });
+    } finally {
+      lock.release();
+    }
+  });
+
+  test("a lock timeout names the lock path", () => {
+    const f = terminalFixture("acked");
+    const lockPath = mailLockPath(join(root, "anvil"));
+    realFs.mkdirSync(lockPath);
+    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "write-failed", path: lockPath });
+  });
+
+  for (const code of ["EACCES", "ENOENT"]) {
+    test(`a scratch ${code} failure names the scratch path and preserves the record`, () => {
+      const f = terminalFixture("acked");
+      scratchErrorCode = code;
+      const result = patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound");
+      expect(result).toMatchObject({ ok: false, reason: "write-failed", code });
+      if (result.ok) throw new Error("expected scratch failure");
+      expect(result.path).toStartWith(join(f.curDir, ".ack-"));
+      expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeUndefined();
+    });
+  }
+
   test("patches an existing record", () => {
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
     expect(patchMailFile(path, { read: true }, undefined, "inbound")).toEqual({ ok: true });
@@ -366,6 +399,12 @@ for (const failure of ["directory", "file"] as const) {
     const diagnostic = logs.find((m) => m.includes("retention-unresolved"))!;
     expect(diagnostic).toContain(`path=${path} code=EACCES`);
     expect(diagnostic).toContain("fix the path named above and restart the account");
-    expect(diagnostic).not.toContain("obligation retained");
+    if (failure === "directory") {
+      expect(diagnostic).toContain("retention-unresolved: actor=anvil state=unknown");
+      expect(diagnostic).not.toContain("obligation retained");
+    } else {
+      expect(diagnostic).toContain("retention-unresolved: * actor=anvil state=unknown");
+      expect(diagnostic).toContain("obligation retained");
+    }
   });
 }

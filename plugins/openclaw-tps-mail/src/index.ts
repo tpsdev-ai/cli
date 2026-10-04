@@ -647,7 +647,7 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
     return { ok: false, reason: "write-failed", path, code: r.status };
   } catch (err: any) {
-    return { ok: false, reason: "write-failed", path, code: err?.code ?? "WRITE_FAILED" };
+    return { ok: false, reason: "write-failed", path: err?.path ?? path, code: err?.code ?? "WRITE_FAILED" };
   }
 }
 
@@ -2392,7 +2392,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           if (unknownInbounds.has(id)) return;
           unknownInbounds.add(id);
           log?.warn?.(
-            `tps-mail: startup-unresolved: ${kind === "directory" ? "" : id + " "}actor=${agentId} state=${kind === "directory" ? "unknown" : state} path=${path} code=${code}; fix the path named above and restart the account`,
+            `tps-mail: startup-unresolved: ${kind === "directory" ? "" : id + " "}actor=${agentId} state=${kind === "directory" ? "unknown" : state} path=${path} code=${code}; ${kind === "directory" ? "" : "obligation retained; "}fix the path named above and restart the account`,
           );
         };
         const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids, kind) => {

@@ -233,7 +233,7 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         expect(readCur()?.record?.[stampKey], "the stamp did NOT land").toBeUndefined();
         expect(
           await pollUntil(
-            () => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes(cur!.path) && m.includes("EACCES")),
+            () => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes(`path=${resolve(mailDir, "anvil", "cur")}/.ack-`) && m.includes("EACCES")),
             4000,
           ),
           "the failed write is logged by id, path and code",
@@ -277,6 +277,41 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
       expect(obligation(h.inboundId)?.state).toBe(state);
       await h2.stop();
     }, 20000);
+
+    for (const stage of ["lock", "scratch"] as const) {
+      it(`${kind}: ${stage} acquisition reports the failing path in live and startup stamps`, async () => {
+        const h = await boot(true);
+        expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
+        const cur = readCur()!;
+        const blocked = stage === "lock" ? resolve(mailDir, "anvil") : resolve(mailDir, "anvil", "cur");
+        const restore = () => realFs.chmodSync(blocked, 0o755);
+        realFs.chmodSync(blocked, 0o555);
+        try {
+          await finish(h);
+          expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
+          const diagnostic = failedLogs(h, `${kind}-stamp-failed`)[0];
+          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock.claim code=EACCES` : `path=${blocked}/.ack-`);
+          expect(diagnostic).not.toContain(`path=${cur.path}`);
+          expect(readCur()?.record?.[stampKey]).toBeUndefined();
+        } finally {
+          await h.stop();
+          restore();
+        }
+        realFs.chmodSync(blocked, 0o555);
+        const next = await boot(false);
+        try {
+          expect(await pollUntil(() => next.logs.some((m) => m.includes(`${kind}-stamp-reconcile-failed`)))).toBe(true);
+          const diagnostic = next.logs.find((m) => m.includes(`${kind}-stamp-reconcile-failed`))!;
+          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock.claim code=EACCES` : `path=${blocked}/.ack-`);
+          expect(diagnostic).not.toContain(`path=${cur.path}`);
+          expect(diagnostic).toContain("obligation retained");
+          expect(readCur()?.record?.[stampKey]).toBeUndefined();
+        } finally {
+          await next.stop();
+          restore();
+        }
+      });
+    }
 
     it(`${kind}: a missing record is reported after the durable transition`, async () => {
       const h = await boot(true);
@@ -527,7 +562,13 @@ for (const failure of ["directory", "file"] as const) {
       expect(await pollUntil(() => h.logs.some((m) => m.includes("startup-unresolved") && m.includes(path)))).toBe(true);
       const diagnostic = h.logs.find((m) => m.includes("startup-unresolved") && m.includes(path))!;
       expect(diagnostic).toContain("fix the path named above and restart the account");
+      if (failure === "directory") {
+        expect(diagnostic).toContain("startup-unresolved: actor=anvil state=unknown");
         expect(diagnostic).not.toContain("obligation retained");
+      } else {
+        expect(diagnostic).toContain("startup-unresolved: * actor=anvil state=unknown");
+        expect(diagnostic).toContain("obligation retained");
+      }
     } finally {
       await h.stop();
       if (failure === "file") realFs.chmodSync(path, 0o644);
