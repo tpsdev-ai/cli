@@ -1,8 +1,8 @@
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { tryAcquireMailLock } from "./mail-lock.js";
+import { type MailLock, tryAcquireMailLock } from "./mail-lock.js";
 
 export class OutboxLockError extends Error {
   constructor(lockPath: string, cause: unknown) {
@@ -23,25 +23,72 @@ function outboxDir(kind: "new" | "sent"): string {
   return join(process.env.HOME || homedir(), ".tps", "outbox", kind);
 }
 
-export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): "duplicate in progress" | void {
+export type QueueOutboxResult = "queued" | "duplicate" | "duplicate in progress";
+
+export function queueOutboxMessage(to: string, body: string, from: string, deliveryId?: string): QueueOutboxResult {
+  return queue(to, body, from, deliveryId, false).result;
+}
+
+/** With a delivery ID, pending claims hold the lock until unlock(). */
+export function claimOutboxDelivery(to: string, body: string, from: string, deliveryId?: string): { result: "pending" | "duplicate" | "duplicate in progress"; complete: () => void; unlock: () => void } {
+  const { result, lock, complete } = queue(to, body, from, deliveryId, true);
+  return {
+    result: result === "queued" ? "pending" : result,
+    complete: complete ?? (() => {}),
+    unlock: () => {
+      try {
+        lock?.release();
+      } catch (error) {
+        throw new OutboxLockError(outboxLockPath(deliveryId!), error);
+      }
+    },
+  };
+}
+
+/** Removes this delivery's record from new/ and sent/. */
+export function releaseOutboxRecord(deliveryId: string): void {
+  if (!/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
+  for (const kind of ["new", "sent"] as const) {
+    for (const prefix of ["github", "github-completed"]) {
+      rmSync(join(outboxDir(kind), `${prefix}-${deliveryId}.json`), { force: true });
+    }
+  }
+}
+
+function outboxLockPath(deliveryId: string): string {
+  return join(outboxDir("new"), `.github-${deliveryId}.lock`);
+}
+
+function recordExists(path: string): boolean {
+  try {
+    statSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+  readFileSync(path);
+  return true;
+}
+
+function queue(to: string, body: string, from: string, deliveryId: string | undefined, deferWrite: boolean): { result: QueueOutboxResult; lock?: MailLock; complete?: () => void } {
   if (deliveryId !== undefined && !/^[a-f0-9]{64}$/.test(deliveryId)) throw new Error("invalid outbox delivery id");
   const dir = outboxDir("new");
   mkdirSync(dir, { recursive: true });
-  const lockPath = deliveryId ? join(dir, `.github-${deliveryId}.lock`) : undefined;
-  let lock;
+  const lockPath = deliveryId ? outboxLockPath(deliveryId) : undefined;
+  let lock: MailLock | null | undefined;
   if (lockPath) {
     try {
       lock = tryAcquireMailLock(lockPath);
     } catch (error) {
       throw new OutboxLockError(lockPath, error);
     }
-    if (!lock) return "duplicate in progress";
+    if (!lock) return { result: "duplicate in progress" };
   }
+  const id = deliveryId ?? randomUUID();
+  const timestamp = new Date().toISOString();
+  const filename = deliveryId ? `${deferWrite ? "github-completed" : "github"}-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
+  let alreadyRecorded = false;
   const write = (): void => {
-    const id = deliveryId ?? randomUUID();
-    const timestamp = new Date().toISOString();
-    const filename = deliveryId ? `github-${deliveryId}.json` : `${timestamp.replace(/[:.]/g, "-")}-${id}.json`;
-    if (deliveryId && (existsSync(join(dir, filename)) || existsSync(join(outboxDir("sent"), filename)))) return;
     const content = JSON.stringify({ id, to, from, body, timestamp }, null, 2);
     const tmp = join(dir, `.${filename}-${randomUUID()}.tmp`);
     writeFileSync(tmp, content, "utf-8");
@@ -60,7 +107,9 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
   let writeFailed = false;
   let writeError: unknown;
   try {
-    write();
+    alreadyRecorded = !!deliveryId && (recordExists(join(dir, filename)) || recordExists(join(outboxDir("sent"), filename)));
+    if (deferWrite && !alreadyRecorded) return { result: "queued", lock: lock ?? undefined, complete: write };
+    if (!alreadyRecorded) write();
   } catch (error) {
     writeFailed = true;
     writeError = error;
@@ -74,6 +123,7 @@ export function queueOutboxMessage(to: string, body: string, from: string, deliv
     }
   }
   if (writeFailed) throw writeError;
+  return { result: alreadyRecorded ? "duplicate" : "queued" };
 }
 
 export function drainOutbox(archive = true): OutboxMessage[] {

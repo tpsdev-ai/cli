@@ -2,7 +2,7 @@ import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { queueOutboxMessage, drainOutbox, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
+import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
 
 describe("outbox", () => {
   let root: string;
@@ -151,6 +151,22 @@ describe("outbox", () => {
     expect(count + drainOutbox().length).toBe(1);
     queueOutboxMessage("host", "body", "github-webhook", id);
     expect(drainOutbox()).toEqual([]);
+  });
+
+  test("releaseOutboxRecord removes only that delivery's record, from new/ or sent/", () => {
+    const id = "b".repeat(64);
+    const other = "c".repeat(64);
+    expect(queueOutboxMessage("host", "body", "github-webhook", id)).toBe("queued");
+    expect(drainOutbox()).toHaveLength(1);
+    expect(queueOutboxMessage("host", "body", "github-webhook", other)).toBe("queued");
+    releaseOutboxRecord(id);
+    releaseOutboxRecord(other);
+    expect(readdirSync(join(root, ".tps", "outbox", "sent"))).toEqual([]);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toEqual([]);
+    expect(queueOutboxMessage("host", "body", "github-webhook", id)).toBe("queued");
+    expect(queueOutboxMessage("host", "body", "github-webhook", "d".repeat(64))).toBe("queued");
+    releaseOutboxRecord(id);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toEqual([`github-${"d".repeat(64)}.json`]);
   });
 
 });

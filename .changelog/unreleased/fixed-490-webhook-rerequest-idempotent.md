@@ -1,0 +1,1 @@
+- **A webhook delivery that finds a completion record for its `X-GitHub-Delivery` ID returns 200 without calling GitHub (Closes #490).** The record is written after the event is handled; until it exists, a redelivery can repeat the re-request.
