@@ -24,7 +24,7 @@ describe("memory CLI entry", () => {
     });
   }
 
-  test("archive signs as the configured operator and sends the requested memory id", () => {
+  test("archive reads first, then PATCHes the governance fields as the configured operator", () => {
     const home = mkdtempSync(join(tmpdir(), "memory-entry-"));
     try {
       const identity = join(home, ".tps", "identity");
@@ -33,6 +33,9 @@ describe("memory CLI entry", () => {
       writeFileSync(join(identity, "operator.key"), privateKey, { mode: 0o600 });
       const preload = join(home, "fetch.mjs");
       writeFileSync(preload, `globalThis.fetch = async (url, options) => {
+        if (options.method === "GET") {
+          return new Response(JSON.stringify({ id: "m1", agentId: "operator", content: "keep this" }), { status: 200 });
+        }
         console.log(JSON.stringify({ url, method: options.method, body: JSON.parse(options.body), headers: options.headers }));
         return new Response("{}", { status: 200 });
       };`);
@@ -42,8 +45,10 @@ describe("memory CLI entry", () => {
       expect(result.status).toBe(0);
       const request = JSON.parse(result.stdout.split("\n")[0]);
       expect(request.url).toBe("http://example.invalid/Memory/m1");
-      expect(request.method).toBe("PUT");
-      expect(request.body).toMatchObject({ id: "m1", archived: true, archivedBy: "operator" });
+      expect(request.method).toBe("PATCH");
+      expect(Object.keys(request.body).sort()).toEqual(["archived", "archivedAt", "archivedBy"]);
+      expect(request.body.archived).toBe(true);
+      expect(request.body.archivedBy).toBe("operator");
       expect(request.headers.Authorization).toStartWith("TPS-Ed25519 operator:");
     } finally {
       rmSync(home, { recursive: true, force: true });
