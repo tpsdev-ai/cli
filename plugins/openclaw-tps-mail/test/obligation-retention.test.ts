@@ -1,10 +1,8 @@
 /**
  * obligation-retention.test.ts — cli#401: the obligation-record retention policy.
  *
- * (a) a terminal record older than N days → removed at startup; a younger one kept.
  * (b) pending / posted / yielded at ANY age → never removed.
  * (c) a malformed record older than N → kept + logged once.
- * (d) the config key changes N (N=1 removes a 2-day-old terminal record the default would keep).
  * (e) replay after a sweep: a replayed inbound id whose record was swept opens a FRESH obligation.
  *
  * Terminal records only; aged by the record's OWN `lastTransitionAt` (falling
@@ -70,8 +68,13 @@ function writeRecordFor(
   writeFileSync(join(dir, `${inboundId}.json`), JSON.stringify(rec, null, 2), "utf-8");
 }
 
-function writeRecord(id: string, state: string, lastTransitionAt: string | null): void {
+function writeRecord(id: string, state: string, lastTransitionAt: string | null, stampedCur = false): void {
   writeRecordFor(AGENT, id, `ob-${id}`, state, lastTransitionAt);
+  if (stampedCur) {
+    const curDir = join(mailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    writeFileSync(join(curDir, `${id}.json`), JSON.stringify({ id, [state === "acked" ? "ackedAt" : "nackedAt"]: daysAgo(1) }));
+  }
 }
 
 /** The receipts dir for an agent — inside that agent's own obligation store. */
@@ -127,10 +130,10 @@ afterEach(() => {
 });
 
 describe("cli#401 — obligation retention", () => {
-  it("(a) at startup: a terminal record older than N days is REMOVED; a younger one is KEPT", async () => {
-    writeRecord("old-acked", "acked", daysAgo(10));
-    writeRecord("young-acked", "acked", daysAgo(1));
-    writeRecord("old-failed", "failed", daysAgo(10));
+  it("(a) startup sweeps aged terminal obligations with stamped cur records", async () => {
+    writeRecord("old-acked", "acked", daysAgo(10), true);
+    writeRecord("young-acked", "acked", daysAgo(1), true);
+    writeRecord("old-failed", "failed", daysAgo(10), true);
     await runStartup({}, () =>
       !existsSync(obligationPath(mailDir, AGENT, "old-acked")) &&
       !existsSync(obligationPath(mailDir, AGENT, "old-failed")));
@@ -175,7 +178,7 @@ describe("cli#401 — obligation retention", () => {
     expect(existsSync(p)).toBe(true);
   });
 
-  it("(d) the config key changes N — a 2-day-old terminal record the default keeps is removed at N=1", async () => {
+  it("(d) startup uses the configured retention for a stamped terminal record", async () => {
     // resolution: the plugin config key wins; unset/invalid falls back to 7
     expect(resolveObligationRetentionDays({ obligationRetentionDays: 1 }, undefined)).toBe(1);
     expect(resolveObligationRetentionDays({ obligationRetentionDays: "3" }, undefined)).toBe(3);
@@ -183,7 +186,7 @@ describe("cli#401 — obligation retention", () => {
     expect(resolveObligationRetentionDays({}, undefined)).toBe(7);
     expect(resolveObligationRetentionDays({ obligationRetentionDays: "nope" }, undefined)).toBe(7);
 
-    writeRecord("two-days", "acked", daysAgo(2));
+    writeRecord("two-days", "acked", daysAgo(2), true);
     // default (7): kept
     sweepTerminalObligations(mailDir, AGENT, 7, { info: () => {}, warn: () => {} });
     expect(existsSync(obligationPath(mailDir, AGENT, "two-days")), "default keeps a 2-day-old record").toBe(true);
@@ -227,7 +230,7 @@ describe("cli#401 — obligation retention", () => {
     // OpenClaw passes exactly `plugins.entries[id].config` to the plugin as api.pluginConfig:
     const receivedPluginConfig = openclawConfig.plugins.entries["openclaw-tps-mail"].config;
     expect(resolveObligationRetentionDays(receivedPluginConfig, undefined)).toBe(1);
-    writeRecord("doc-two-days", "acked", daysAgo(2));
+    writeRecord("doc-two-days", "acked", daysAgo(2), true);
     await runStartup(receivedPluginConfig, () => !existsSync(obligationPath(mailDir, AGENT, "doc-two-days")));
     expect(existsSync(obligationPath(mailDir, AGENT, "doc-two-days")), "the documented path must drive the sweep").toBe(false);
   });

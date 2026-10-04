@@ -1,1 +1,1 @@
-- **Report and reconcile failed cur/ stamps**. Retry failed ack/nack stamp writes while the account runs, and reconcile terminal stamps at startup. Hold failed reconciliation from recovery and retention.
+- **Report failed cur/ stamps**. Retry failed ack/nack stamp writes. Hold unresolved startup stamps from recovery and retention.

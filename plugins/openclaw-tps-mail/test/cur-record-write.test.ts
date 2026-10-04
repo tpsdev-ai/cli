@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { FileSystemTransport } from "../../../packages/cli/src/utils/transport.js";
 
 import { hashes } from "@noble/ed25519";
 hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest());
@@ -155,11 +156,19 @@ interface Boot {
 }
 
 /** Start one account. `withInbound` writes a new inbound so a turn is dispatched. */
-async function boot(withInbound: boolean): Promise<Boot> {
+async function boot(withInbound: boolean, useTransport = false): Promise<Boot> {
   mkdirSync(resolve(mailDir, "flint", "new"), { recursive: true });
   mkdirSync(resolve(mailDir, "anvil", "new"), { recursive: true });
   const inboundId = `msg-${Math.random().toString(36).slice(2, 10)}`;
-  if (withInbound) {
+  if (withInbound && useTransport) {
+    const result = await new FileSystemTransport(() => resolve(mailDir, "anvil")).deliver({
+      from: "flint", to: "anvil",
+      body: Buffer.from(signedBody("flint", "anvil", "inbound", FLINT_SEED)),
+      headers: { "x-tps-id": inboundId },
+    });
+    expect(result.delivered).toBe(true);
+    expect(result.path?.endsWith(`-${inboundId}.json`)).toBe(false);
+  } else if (withInbound) {
     writeFileSync(resolve(mailDir, "anvil", "new", `2026-05-26T00-00-00-${inboundId}.json`), JSON.stringify({
       id: inboundId, from: "flint", to: "anvil", body: signedBody("flint", "anvil", "inbound", FLINT_SEED),
       timestamp: new Date().toISOString(), headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" }, deliveryAttempts: 0,
@@ -219,6 +228,33 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
       h.settle();
       return Promise.resolve();
     };
+
+    it(`${kind}: startup stamps a promoted FileSystemTransport record after a failed live stamp`, async () => {
+      const h = await boot(true, true);
+      try {
+        expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
+        const cur = readCur()!;
+        expect(cur.record.id).toBe(h.inboundId);
+        expect(cur.path.endsWith(`-${h.inboundId}.json`)).toBe(false);
+        expect(cur.record.envelopeId).toBeDefined();
+        stampError = Object.assign(new Error("injected stamp failure"), { code: "EACCES" });
+        await finish(h);
+        expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
+        expect(obligation(h.inboundId)?.state).toBe(state);
+        expect(readCur()?.record?.[stampKey]).toBeUndefined();
+      } finally {
+        await h.stop();
+        stampError = undefined;
+      }
+      const next = await boot(false);
+      try {
+        expect(await pollUntil(() => !!readCur()?.record?.[stampKey])).toBe(true);
+        expect(next.logs.some((m) => m.includes(`reconciled the ${kind} stamp for ${h.inboundId}`))).toBe(true);
+        expect(obligation(h.inboundId)?.state).toBe(state);
+      } finally {
+        await next.stop();
+      }
+    });
 
     it(`${kind}: a transient failed ${stampKey} write is logged by id/path/code and fixed by the in-process retry, no restart`, async () => {
       const h = await boot(true);

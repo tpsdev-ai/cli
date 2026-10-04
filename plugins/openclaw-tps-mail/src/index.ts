@@ -674,8 +674,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     let unreadable = false;
     const onReadError = (path: string, code?: string) => {
       unreadable = true;
-      if (path === resolve(mailDir, agent, "cur")) unknownInbounds.add(rec.inboundId);
-      else reportReadError(stampObligationPresence(mailDir, agent, rec.inboundId), rec.inboundId)(path, code);
+      reportReadError(stampObligationPresence(mailDir, agent, rec.inboundId), rec.inboundId)(path, code);
     };
     const kind = rec.state === "acked" ? "ack" : "nack";
     const key = kind === "ack" ? "ackedAt" : "nackedAt";
@@ -1641,20 +1640,31 @@ function installYieldSubscription(api: any): boolean {
   return true;
 }
 
-/** The cur/ path for an inbound id (cur filenames are timestamp-id, not the id). */
 function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code?: string) => void): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
     const names = readdirSync(curDir);
-    const matching = onReadError ? names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`)) : [];
-    for (const name of onReadError ? matching : names) {
+    if (onReadError && names.length > 4096) {
+      onReadError(curDir, "SCAN_LIMIT");
+      return null;
+    }
+    let match: string | null = null;
+    for (const name of names) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
       const rec = readMailFile(p, onReadError);
-      if (rec?.id === inboundId) return p;
+      if (rec?.id !== inboundId) continue;
+      if (!onReadError) return p;
+      if (match) {
+        onReadError(curDir, "AMBIGUOUS_ID");
+        return null;
+      }
+      match = p;
     }
+    if (!match) onReadError?.(curDir, "ENOENT");
+    return match;
   } catch (err: any) {
-    if (err?.code !== "ENOENT") onReadError?.(curDir, err?.code);
+    onReadError?.(curDir, err?.code);
   }
   return null;
 }

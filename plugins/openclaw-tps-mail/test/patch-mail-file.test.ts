@@ -264,12 +264,32 @@ for (const presence of ["missing", "unreadable"] as const) {
   });
 }
 
-test("stamp reconciliation ignores an unrelated filename", () => {
+test("stamp reconciliation holds an obligation when an unreadable record cannot be attributed", () => {
   const f = terminalFixture("acked");
   realFs.unlinkSync(f.curPath);
   const unrelated = join(f.curDir, "timestamp-other.json");
   realFs.writeFileSync(unrelated, JSON.stringify({ id: "other" }));
   readFailure = unrelated;
-  f.reconcile();
-  expect(f.logs).toEqual([]);
+  expect(f.reconcile().has("inbound")).toBe(true);
+  expect(f.logs[0]).toContain(`path=${unrelated} code=EACCES`);
+  expect(f.logs[0]).toContain("obligation retained");
 });
+
+for (const state of ["acked", "failed"] as const) {
+  for (const lookup of ["missing", "ambiguous", "bounded"] as const) {
+    test(`${state}: ${lookup} cur lookup holds the obligation`, () => {
+      const f = terminalFixture(state);
+      if (lookup === "missing") realFs.unlinkSync(f.curPath);
+      if (lookup === "ambiguous") realFs.writeFileSync(join(f.curDir, "independent.json"), JSON.stringify({ id: "inbound" }));
+      if (lookup === "bounded") {
+        for (let i = 0; i < 4096; i++) realFs.writeFileSync(join(f.curDir, `${i}.json`), JSON.stringify({ id: `other-${i}` }));
+      }
+      expect(f.reconcile().has("inbound")).toBe(true);
+      const code = lookup === "missing" ? "ENOENT" : lookup === "ambiguous" ? "AMBIGUOUS_ID" : "SCAN_LIMIT";
+      expect(f.logs[0]).toContain(`path=${f.curDir} code=${code}`);
+      expect(f.logs[0]).toContain("obligation retained");
+      expect(realFs.existsSync(f.obligationPath)).toBe(true);
+      if (lookup !== "missing") expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8"))[state === "acked" ? "ackedAt" : "nackedAt"]).toBeUndefined();
+    });
+  }
+}
