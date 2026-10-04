@@ -3,14 +3,14 @@
  *
  * Subcommands:
  *   review <agentId>        List memories pending promotion (promotionStatus=pending)
- *   approve <memoryId>      Promote to permanent (admin only — enforced server-side)
- *   reject <memoryId>       Reject promotion (stays standard)
+ *   approve <memoryId>      Unsupported: Flair has no promotion operation for a memory id
+ *   reject <memoryId>       Unsupported: Flair has no promotion operation for a memory id
  *   archive <memoryId>      Soft-delete (hidden from search, recoverable)
  *   unarchive <memoryId>    Restore archived memory
  *   purge <memoryId>        Hard-delete (admin only — enforced server-side)
  *   list <agentId>          List memories with optional filters
  *   show <memoryId>         Show full memory record
- *   search <agentId> <q>    Semantic search (excludes archived)
+ *   search <agentId> <q>    Semantic search (excludes archived), signed by the operator
  */
 
 import { createFlairClient, defaultFlairKeyPath, type Memory } from "../utils/flair-client.js";
@@ -72,14 +72,12 @@ export async function runMemory(args: MemoryArgs): Promise<void> {
     case "approve": {
       if (!args.memoryId) { console.error("Usage: tps memory approve <memoryId>"); process.exit(1); }
       await flair.approveMemory(args.memoryId);
-      console.log(`✓ Memory ${args.memoryId} promoted to permanent.`);
       break;
     }
 
     case "reject": {
       if (!args.memoryId) { console.error("Usage: tps memory reject <memoryId>"); process.exit(1); }
       await flair.rejectMemory(args.memoryId);
-      console.log(`✗ Memory ${args.memoryId} rejected. Stays standard.`);
       break;
     }
 
@@ -142,8 +140,11 @@ export async function runMemory(args: MemoryArgs): Promise<void> {
         console.error("Usage: tps memory search <agentId> <query>");
         process.exit(1);
       }
-      const agentFlair = createFlairClient(args.agentId, flairUrl, args.keyPath ?? defaultFlairKeyPath(args.agentId));
-      const results = await agentFlair.search(args.query, args.limit ?? 10);
+      // The operator signs; the target agent rides as the search's agentId
+      // parameter. Flair's read scoping decides what the operator may see.
+      const signer = requireLocalAgentId("memory operator id", process.env.TPS_AGENT_ID);
+      const searchClient = createFlairClient(signer, flairUrl, args.keyPath ?? defaultFlairKeyPath(signer));
+      const results = await searchClient.search(args.query, args.limit ?? 10, { agentId: args.agentId });
       if (args.json) { console.log(JSON.stringify(results, null, 2)); break; }
       if (results.length === 0) { console.log("No results."); break; }
       for (const r of results) {
