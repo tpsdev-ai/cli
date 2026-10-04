@@ -1,8 +1,8 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { queueOutboxMessage, drainOutbox } from "../src/utils/outbox.js";
+import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
 
 describe("outbox", () => {
   let root: string;
@@ -70,6 +70,64 @@ describe("outbox", () => {
     expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
   });
 
+  test("drainOutbox leaves a source it cannot read in place", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    queueOutboxMessage("host", "good", "austin");
+    mkdirSync(join(newDir, "unreadable.json"));
+    const rows = drainOutbox(false);
+    expect(rows.length).toBe(1);
+    expect(existsSync(join(newDir, "unreadable.json"))).toBe(true);
+    expect(existsSync(join(root, ".tps", "outbox", "sent", ".malformed-unreadable.json"))).toBe(false);
+  });
+
+  test("acknowledgeOutbox skips an unreadable or corrupt entry and still archives the acknowledged record", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    queueOutboxMessage("host", "good", "austin");
+    const [record] = drainOutbox(false);
+    mkdirSync(join(newDir, "unreadable.json"));
+    writeFileSync(join(newDir, "corrupt.json"), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      acknowledgeOutbox(record!.id);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(readdirSync(newDir).sort()).toEqual(["corrupt.json", "unreadable.json"]);
+    expect(readdirSync(join(root, ".tps", "outbox", "sent")).length).toBe(1);
+  });
+
+  test("OutboxSendTracker sends a pending record once until its resend time, and stops after the max", () => {
+    queueOutboxMessage("host", "once", "austin");
+    const tracker = new OutboxSendTracker();
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let now = 1_000_000;
+      expect(tracker.due(now).length).toBe(1);
+      expect(tracker.due(now)).toEqual([]);
+      expect(tracker.due(now + OUTBOX_RESEND_BASE_MS - 1)).toEqual([]);
+      let sends = 1;
+      for (let i = 0; i < 20; i++) {
+        now += OUTBOX_RESEND_BASE_MS * 2 ** 10;
+        sends += tracker.due(now).length;
+      }
+      expect(sends).toBe(OUTBOX_MAX_SENDS);
+      expect(drainOutbox(false).length).toBe(1);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test("OutboxSendTracker resends after a failed send and forgets an acknowledged record", () => {
+    queueOutboxMessage("host", "retry", "austin");
+    const tracker = new OutboxSendTracker();
+    const [item] = tracker.due(0);
+    tracker.sendFailed(item!.id);
+    expect(tracker.due(0).map((m) => m.id)).toEqual([item!.id]);
+    tracker.acknowledge(item!.id);
+    expect(drainOutbox(false)).toEqual([]);
+    expect(tracker.due(OUTBOX_RESEND_BASE_MS * 100)).toEqual([]);
+  });
+
   test("concurrent redelivery and drain enqueue a delivery only once", async () => {
     const modulePath = new URL("../src/utils/outbox.ts", import.meta.url).pathname;
     const id = "a".repeat(64);
@@ -93,6 +151,22 @@ describe("outbox", () => {
     expect(count + drainOutbox().length).toBe(1);
     queueOutboxMessage("host", "body", "github-webhook", id);
     expect(drainOutbox()).toEqual([]);
+  });
+
+  test("releaseOutboxRecord removes only that delivery's record, from new/ or sent/", () => {
+    const id = "b".repeat(64);
+    const other = "c".repeat(64);
+    expect(queueOutboxMessage("host", "body", "github-webhook", id)).toBe("queued");
+    expect(drainOutbox()).toHaveLength(1);
+    expect(queueOutboxMessage("host", "body", "github-webhook", other)).toBe("queued");
+    releaseOutboxRecord(id);
+    releaseOutboxRecord(other);
+    expect(readdirSync(join(root, ".tps", "outbox", "sent"))).toEqual([]);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toEqual([]);
+    expect(queueOutboxMessage("host", "body", "github-webhook", id)).toBe("queued");
+    expect(queueOutboxMessage("host", "body", "github-webhook", "d".repeat(64))).toBe("queued");
+    releaseOutboxRecord(id);
+    expect(readdirSync(join(root, ".tps", "outbox", "new"))).toEqual([`github-${"d".repeat(64)}.json`]);
   });
 
 });

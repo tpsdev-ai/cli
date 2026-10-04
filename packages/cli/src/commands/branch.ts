@@ -5,11 +5,12 @@ import { spawn } from "node:child_process";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
-import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema } from "../utils/wire-mail.js";
+import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema, MailAckBodySchema } from "../utils/wire-mail.js";
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
 import { sendMessage, inboxExists } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
-import { drainOutbox, queueOutboxMessage } from "../utils/outbox.js";
+import { requireLocalAgentId } from "../utils/local-agent.js";
+import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
 import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
@@ -33,13 +34,22 @@ export type HandlerRoute =
   | { kind: "refused"; reason: string };
 
 /**
+ * Resolve the branch's configured local agent id, refusing by name when none is
+ * set (cli#499). `TPS_AGENT_ID` wins; otherwise the id persisted by
+ * `tps branch init --agent`. There is no fallback to the hostname.
+ */
+export function branchAgentId(confAgentId?: string): string {
+  return requireLocalAgentId("branch agent id", process.env.TPS_AGENT_ID ?? confAgentId);
+}
+
+/**
  * Route a handler action for a received message.
  */
 export function routeHandlerAction(
   action: HandlerAction,
   incoming: HandlerIncoming,
   queueOutbox: (to: string, body: string, from: string) => void = queueOutboxMessage,
-  localAgentId = process.env.TPS_AGENT_ID || hostname().split(".")[0],
+  localAgentId = requireLocalAgentId("branch agent id"),
 ): HandlerRoute {
   const from = inboxExists(incoming.to) ? incoming.to : localAgentId;
   switch (action.type) {
@@ -256,6 +266,10 @@ async function runInit(args: BranchArgs): Promise<void> {
 }
 
 async function runStart(): Promise<void> {
+  const conf = existsSync(confPath()) ? readBranchConf() : undefined;
+  const localAgentId = branchAgentId(conf?.agentId);
+  if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
+
   if (
     process.env.TPS_BRANCH_DAEMON !== "1" &&
     process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
@@ -282,7 +296,6 @@ async function runStart(): Promise<void> {
     throw new Error("Branch is not joined. Run `tps branch init` first.");
   }
 
-  const conf = readBranchConf();
   const kp = loadKeyPair(identityDir, "branch");
   const host = JSON.parse(readFileSync(hostFile, "utf-8"));
   const hostPub = new Uint8Array(Buffer.from(host.publicKey, "base64url"));
@@ -306,20 +319,8 @@ async function runStart(): Promise<void> {
     } catch { return []; }
   }
 
-  // Resolve the local agent identity for incoming mail storage.
-  // Preference order: TPS_AGENT_ID env → conf.agentId → hostname fragment.
-  // This ensures mail is stored under the branch's own identity, not the
-  // logical 'to' name used by the sender (which may be a GAL alias).
-  function getLocalAgentId(): string {
-    if (process.env.TPS_AGENT_ID) return process.env.TPS_AGENT_ID;
-    if ((conf as any).agentId) return String((conf as any).agentId);
-    // Fall back to hostname fragment (e.g. "tps-anvil" from hostname)
-    return hostname().split(".")[0]!;
-  }
-
-  const localAgentId = getLocalAgentId();
-
   let serviceProxies: ServiceProxySet | null = null;
+  const outboxSends = new OutboxSendTracker();
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {
@@ -334,13 +335,13 @@ async function runStart(): Promise<void> {
     if (msg.type === MSG_HEARTBEAT) {
       // Echo heartbeat back so host can track bidirectional liveness
       await channel.send({ type: MSG_HEARTBEAT, seq: msg.seq, ts: new Date().toISOString(), body: {} }).catch(() => {});
-      for (const item of drainOutbox()) {
+      for (const item of outboxSends.due()) {
         await channel.send({
           type: MSG_MAIL_DELIVER,
           seq: msg.seq + 1,
           ts: new Date().toISOString(),
           body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-        }).catch(() => {});
+        }).catch(() => outboxSends.sendFailed(item.id));
       }
       logLine("SYNC", "Heartbeat received — drained outbox");
       return;
@@ -360,6 +361,11 @@ async function runStart(): Promise<void> {
       return;
     }
 
+    if (msg.type === MSG_MAIL_ACK) {
+      const ack = MailAckBodySchema.safeParse(msg.body);
+      if (ack.success && ack.data.accepted) outboxSends.acknowledge(ack.data.id);
+      return;
+    }
     if (msg.type !== MSG_MAIL_DELIVER) return;
     const parsed = MailDeliverBodySchema.safeParse(msg.body);
     if (!parsed.success) {
@@ -431,13 +437,13 @@ async function runStart(): Promise<void> {
         : { id: body.id, accepted: false, error: deliveryError },
     }).catch(() => {});
 
-    for (const item of drainOutbox()) {
+    for (const item of outboxSends.due()) {
       await channel.send({
         type: MSG_MAIL_DELIVER,
         seq: msg.seq + 1,
         ts: new Date().toISOString(),
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => {});
+      }).catch(() => outboxSends.sendFailed(item.id));
     }
 
     logLine("MAIL", `Received message for ${body.to} (id: ${body.id})`);
@@ -463,13 +469,13 @@ async function runStart(): Promise<void> {
   mkdirSync(outboxNewDir, { recursive: true });
   const outboxWatcher = watch(outboxNewDir, async () => {
     if (!activeHostChannel || !activeHostChannel.isAlive()) return;
-    for (const item of drainOutbox()) {
+    for (const item of outboxSends.due()) {
       await activeHostChannel.send({
         type: MSG_MAIL_DELIVER,
         seq: 0,
         ts: new Date().toISOString(),
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => {});
+      }).catch(() => outboxSends.sendFailed(item.id));
     }
   });
 

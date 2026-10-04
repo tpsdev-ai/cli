@@ -14,7 +14,7 @@ let root: string;
 let fault: ReturnType<typeof spyOn>;
 afterEach(() => { fault?.mockRestore(); if (root) rmSync(root, { recursive: true, force: true }); });
 
-for (const response of [401, 403, 500, null, {}, { publicKey: "bad-key" }]) {
+for (const response of [401, 403, 500, null, {}]) {
   test(`healthy Health with indeterminate Agent response ${JSON.stringify(response)} stays retryable`, async () => {
     root = mkdtempSync(join(tmpdir(), "partial-flair-"));
     const keyPath = join(root, "reader.key");

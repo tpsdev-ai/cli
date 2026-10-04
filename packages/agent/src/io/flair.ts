@@ -6,7 +6,7 @@
  */
 
 import crypto from "node:crypto";
-import { decodeRegistryPublicKey } from "../lib/registry-key.js";
+import { parseFlairPublicKey } from "../lib/public-key.js";
 import { readPrivateKeyAtPath } from "../lib/agent-keys.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -100,7 +100,9 @@ export class FlairContextProvider {
     try {
       const agent = await this.req<FlairAgent>("GET", `/Agent/${encodeURIComponent(name)}`);
       if (!agent || typeof agent.publicKey !== "string") throw new Error("invalid principal record");
-      decodeRegistryPublicKey(agent.publicKey);
+      // Flair's placeholder until the principal's key is registered: retryable, not malformed.
+      if (agent.publicKey === "pending") throw new Error(`Flair has no registered public key for ${name} yet (pending)`);
+      parseFlairPublicKey(agent.publicKey);
       return agent;
     } catch (err) {
       if (err instanceof FlairHttpError && err.status === 404) return null;

@@ -386,7 +386,7 @@ describe("test-home-guard: destinations and suite names", () => {
   });
 
   test("a suite name is a plain file-name token", () => {
-    for (const ok of ["cli", "agent", "pi-tps-mail", "root-test", "attested", "a.b_c-1"]) {
+    for (const ok of ["cli", "agent", "root-test", "attested", "a.b_c-1"]) {
       expect(() => assertSuiteName(ok), ok).not.toThrow();
     }
     for (const bad of ["../../../.tps/identity/key", "a/b", "a\\b", "..", ".", "a..b", "x y", "", "x;y", "é"]) {
@@ -548,7 +548,6 @@ const BARE_RUN_LOCATIONS = [
   { name: "the repo root", cwd: REPO },
   { name: "packages/agent", cwd: join(REPO, "packages/agent") },
   { name: "packages/cli", cwd: join(REPO, "packages/cli") },
-  { name: "packages/pi-tps-mail", cwd: join(REPO, "packages/pi-tps-mail") },
   { name: "plugins/openclaw-tps-mail", cwd: PLUGIN_DIR },
   { name: "plugins/openclaw-github-review", cwd: REVIEW_DIR },
 ];

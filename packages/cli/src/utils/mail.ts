@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   decideEnvelopeForMailbox as decideEnvelope,
-  type Envelope, verifiedMailTier, bridgePrincipalIds,
+  type Envelope, PublicKeyFormatError, verifiedMailTier, bridgePrincipalIds,
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
@@ -415,7 +415,8 @@ export type PromoteRejectClass =
   | "verify-unavailable"
   | "storage-unavailable"
   | "unverified"
-  | "busy";
+  | "busy"
+  | "inbox-full";
 
 /**
  * Reject classes a later check will re-drive. `verify-unavailable` (a Flair
@@ -432,6 +433,7 @@ export const RETRYABLE_REJECT_CLASSES: ReadonlySet<PromoteRejectClass> = new Set
   "verify-unavailable",
   "storage-unavailable",
   "busy",
+  "inbox-full",
 ]);
 
 export interface PromoteOk {
@@ -470,6 +472,32 @@ function readReasonSidecar(dlqDir: string, filename: string): { cls: PromoteReje
   } catch {
     return null;
   }
+}
+
+export function deadLetterUndelivered(
+  agent: string,
+  record: { id: string; from: string; to: string; body: string; timestamp: string },
+  cls: PromoteRejectClass,
+  reason: string,
+): string {
+  validateMessageId(record.id);
+  let inbox: { tmp: string; dlq: string };
+  try {
+    assertValidAgentId(agent);
+    inbox = getInbox(agent);
+  } catch (error) {
+    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
+    inbox = { tmp: join(getMailDir(), ".undeliverable", "tmp"), dlq: join(getMailDir(), ".undeliverable", "dlq") };
+    mkdirSync(inbox.tmp, { recursive: true });
+    mkdirSync(inbox.dlq, { recursive: true });
+  }
+  const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
+  const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
+  const tmpPath = join(inbox.tmp, filename);
+  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false }, null, 2), "utf-8");
+  writeReasonSidecar(inbox.dlq, filename, cls, reason);
+  renameSync(tmpPath, join(inbox.dlq, filename));
+  return join(inbox.dlq, filename);
 }
 
 /**
@@ -659,7 +687,13 @@ async function decideEnvelopeForMailbox(
   mailRoot: string,
   verify: MailVerifyConfig = {},
 ): Promise<EnvelopePolicyResult> {
-  const decision = await decideEnvelope(agent, envelope, wrapperFrom, await createMailVerifyClient(agent, verify));
+  const decision = await decideEnvelope(agent, envelope, wrapperFrom, await createMailVerifyClient(agent, verify))
+    .catch((err: unknown) => {
+      if (err instanceof PublicKeyFormatError) {
+        return { ok: false as const, class: "invalid" as const, reason: `signature verification failed: ${err.message}` };
+      }
+      throw err;
+    });
   if (!decision.ok) return decision;
   return trustCeilingReject(decision.envelope, mailRoot, verify) ?? decision;
 }

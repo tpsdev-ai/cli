@@ -1,7 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { FlairClient, defaultFlairKeyPath } from "./flair-client.js";
-import { queueOutboxMessage } from "./outbox.js";
+import { claimOutboxDelivery } from "./outbox.js";
 import { reRequestReviewer, type ReviewRequestDeps } from "./pr-review-trigger.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
@@ -14,7 +14,7 @@ type ReviewRerequestedPublisher = (event: {
 }) => Promise<void>;
 
 export interface GithubWebhookDeps {
-  queueOutboxMessageImpl?: typeof queueOutboxMessage;
+  claimOutboxDeliveryImpl?: typeof claimOutboxDelivery;
   reviewRequestDeps?: ReviewRequestDeps;
   publishReviewRerequestedEvent?: ReviewRerequestedPublisher;
 }
@@ -133,8 +133,8 @@ export async function processGithubWebhookEvent(
   payload: Record<string, unknown>,
   deps: GithubWebhookDeps = {},
   resolvedAgentId?: string,
-): Promise<void> {
-  if (event !== "pull_request_review" || payload.action !== "dismissed") return;
+): Promise<boolean> {
+  if (event !== "pull_request_review" || payload.action !== "dismissed") return true;
   const review = payload.review as Record<string, unknown> | undefined;
   const reviewer = (review?.user as Record<string, unknown> | undefined)?.login;
   const pr = payload.pull_request as Record<string, unknown> | undefined;
@@ -144,12 +144,12 @@ export async function processGithubWebhookEvent(
 
   if (typeof reviewer !== "string" || !reviewer || !prNumber || typeof repo !== "string" || !repo) {
     swarn("[webhook] pull_request_review dismissed missing reviewer, PR number, or repo");
-    return;
+    return true;
   }
 
   const agentId = resolvedAgentId ?? webhookAgentId();
   const reRequested = reRequestReviewer(prNumber, reviewer, { agentId, repo }, deps.reviewRequestDeps);
-  if (!reRequested) return;
+  if (!reRequested) return false;
 
   const publishEvent = deps.publishReviewRerequestedEvent ?? defaultReviewEventPublisher(agentId);
   const refId = `${repo}#${prNumber}`;
@@ -164,6 +164,7 @@ export async function processGithubWebhookEvent(
   } catch (error) {
     swarn(`[webhook] Failed to publish review.re-requested for PR #${prNumber}: ${(error as Error).message}`);
   }
+  return true;
 }
 
 export async function handleGithubWebhook(
@@ -213,12 +214,13 @@ export async function handleGithubWebhook(
   const delivery = req.headers["x-github-delivery"];
   const deliveryId = typeof delivery === "string" && delivery
     ? createHash("sha256").update(delivery).digest("hex") : undefined;
-  const queueMessage = deps.queueOutboxMessageImpl ?? queueOutboxMessage;
+  const claimDelivery = deps.claimOutboxDeliveryImpl ?? claimOutboxDelivery;
+  let claim: ReturnType<typeof claimOutboxDelivery>;
   try {
-    const result = queueMessage(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
-    if (result === "duplicate in progress") {
-      res.statusCode = 200;
-      res.end(result);
+    claim = claimDelivery(webhookTarget(), formatEvent(event, payload), "github-webhook", deliveryId);
+    if (claim.result !== "pending") {
+      res.statusCode = claim.result === "duplicate" ? 200 : 503;
+      res.end(claim.result);
       return;
     }
   } catch (error) {
@@ -226,7 +228,26 @@ export async function handleGithubWebhook(
     res.end((error as Error).message);
     return;
   }
-  await processGithubWebhookEvent(event, payload, deps, agentId);
+  let handled = false;
+  let failure: unknown;
+  try {
+    // When a delivery ID is present, hold the lock through the GitHub call and completion write, including awaits.
+    handled = await processGithubWebhookEvent(event, payload, deps, agentId);
+    if (handled) claim.complete();
+  } catch (error) {
+    failure = error;
+  } finally {
+    try {
+      claim.unlock();
+    } catch (error) {
+      failure ??= error;
+    }
+  }
+  if (failure !== undefined || !handled) {
+    res.statusCode = 503;
+    res.end(failure === undefined ? "GitHub re-request failed" : (failure as Error).message);
+    return;
+  }
   res.statusCode = 200;
   res.end("ok");
 }
