@@ -200,20 +200,29 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   }
 }
 
-export function listObligations(mailDir: string, agent: string): ObligationRecord[] {
+export function listObligations(mailDir: string, agent: string, onReadError?: (path: string, code: string | undefined, ids: string[], kind: "directory" | "file") => void): ObligationRecord[] {
   const dir = obligationsDir(mailDir, agent);
   let names: string[];
   try {
     names = readdirSync(dir);
-  } catch {
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") onReadError?.(dir, err?.code, ["*"], "directory");
     return [];
   }
   const out: ObligationRecord[] = [];
   for (const name of names) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
-      out.push(JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord);
-    } catch {
+      const record = JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord;
+      if (onReadError && (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state))) {
+        const ids = [name.slice(0, -5)];
+        if (typeof record?.inboundId === "string") ids.push(record.inboundId);
+        onReadError(resolve(dir, name), undefined, ids, "file");
+        continue;
+      }
+      out.push(record);
+    } catch (err: any) {
+      onReadError?.(resolve(dir, name), err?.code, [name.slice(0, -5)], "file");
       // A torn record is not readable truth; skip it rather than crash recovery.
     }
   }
@@ -502,6 +511,7 @@ export function sweepTerminalObligations(
   log?: ObligationLog,
   nowMs: number = Date.now(),
   nackHoldDays: number = retentionDays * DEFAULT_NACK_HOLD_MULTIPLE,
+  unresolved = new Set<string>(),
 ): RetentionResult {
   const res: RetentionResult = {
     removed: 0,
@@ -574,6 +584,13 @@ export function sweepTerminalObligations(
       const liveObligationId = (record as { obligationId?: unknown }).obligationId;
       if (typeof liveObligationId === "string") liveObligationIds.add(liveObligationId);
       res.left++; // pending / delivering / posted / yielded are never deletable
+      continue;
+    }
+    const heldInboundId = (record as { inboundId?: unknown }).inboundId;
+    if (unresolved.has(name.slice(0, -5)) || (typeof heldInboundId === "string" && unresolved.has(heldInboundId))) {
+      const obligationId = (record as { obligationId?: unknown }).obligationId;
+      if (typeof obligationId === "string") liveObligationIds.add(obligationId);
+      res.heldForRecovery++;
       continue;
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;

@@ -11,7 +11,7 @@ import {
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
-import { acquireMailLock, acquireMailLockSync, type MailLock } from "./mail-lock.js";
+import { acquireMailLock, acquireMailLockSync, mailLockPath, type MailLock } from "./mail-lock.js";
 import { createMailVerifyClient, type MailVerifyConfig } from "./mail-verify.js";
 
 // cli#429: the ONE id shape rule, re-exported so the openclaw-tps-mail plugin
@@ -189,10 +189,16 @@ export function updateExistingRecord<T extends object>(
   mutate: (record: T) => T | null,
   options: { snapshot?: T; afterWrite?: (record: T) => void; nonBlocking?: boolean } = {},
 ): UpdateExistingResult<T> {
-  const lock = acquireMailLockSync(dirname(dirname(path)), options.nonBlocking ? { timeoutMs: 0 } : {});
+  const root = dirname(dirname(path));
+  let lock: MailLock | null;
+  try {
+    lock = acquireMailLockSync(root, options.nonBlocking ? { timeoutMs: 0 } : {});
+  } catch (err: any) {
+    throw Object.assign(err, { path: err?.path ?? mailLockPath(root) });
+  }
   if (!lock) {
     if (options.nonBlocking) return { status: "busy" };
-    throw new Error(`mail lock contention timeout for ${path}`);
+    throw Object.assign(new Error(`mail lock contention timeout for ${path}`), { path: mailLockPath(root) });
   }
   const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
@@ -215,7 +221,7 @@ export function updateExistingRecord<T extends object>(
     options.afterWrite?.(updated);
     return { status: "updated", record: updated };
   } catch (err: any) {
-    if (!replaced && err?.code === "ENOENT") return { status: "gone" };
+    if (!replaced && err?.code === "ENOENT" && err?.path === path) return { status: "gone" };
     throw err;
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch {} }
