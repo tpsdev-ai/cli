@@ -125,6 +125,72 @@ test("topic replay stays consumed across MailClient and promote after cur remova
   expect(readdirSync(inbox.cur)).toEqual([]);
 });
 
+for (const firstWriter of ["promote", "MailClient"] as const) {
+  for (const history of ["committed-same-id", "committed-new-id", "uncommitted"] as const) {
+    for (const content of ["original", "different"] as const) {
+      test(`${firstWriter} then the other writer: ${history}, ${content} content`, async () => {
+        const inbox = getInbox("kern");
+        const client = new MailClient(join(home, "mail"), undefined, "kern", {
+          async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+        });
+        const first = JSON.parse(signOutboundBody("flint", "kern", "original", { requireKey: true }));
+        const incoming = history === "committed-new-id"
+          ? JSON.parse(signOutboundBody("flint", "kern", content, { requireKey: true }))
+          : signEnvelope({ ...first, body: content }, { flint: seed });
+        const sent = sendMessage("kern", JSON.stringify(first), "flint");
+        const filename = sent.filePath.split("/").pop()!;
+        if (firstWriter === "MailClient") {
+          expect(await client.checkNewMail()).toHaveLength(1);
+        } else {
+          expect(await promote("kern", sent.filePath)).toMatchObject({ ok: true });
+        }
+        const destination = join(inbox.cur, filename);
+        const before = readFileSync(destination, "utf8");
+        if (history === "uncommitted") writeFileSync(join(inbox.root, "consumed.jsonl"), "");
+        const record = {
+          id: first.messageId, from: "flint", to: "kern", body: JSON.stringify(incoming),
+          timestamp: incoming.timestamp,
+        };
+        writeFileSync(sent.filePath, JSON.stringify(record));
+        const rejection = content === "original" ? "replay" : "invalid";
+        if (firstWriter === "MailClient") {
+          expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: rejection });
+        } else {
+          expect(await client.checkNewMail()).toEqual([]);
+        }
+        expect(readFileSync(destination, "utf8")).toBe(before);
+        expect(readdirSync(inbox.fresh)).toEqual([]);
+        expect(readFileSync(join(inbox.dlq, `${filename}.reason`), "utf8")).toContain(`class: ${rejection}`);
+        if (history === "uncommitted") expect(readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe("");
+      });
+    }
+  }
+}
+
+for (const content of ["original", "different"] as const) {
+  test(`CLI compares MailClient signed content despite wrapper metadata: ${content}`, async () => {
+    const inbox = getInbox("kern");
+    const first = JSON.parse(signOutboundBody("flint", "kern", "original", { requireKey: true }));
+    const forged = signEnvelope({ ...first, body: "different" }, { flint: seed });
+    const sent = sendMessage("kern", JSON.stringify(first), "flint");
+    const record = JSON.parse(readFileSync(sent.filePath, "utf8"));
+    writeFileSync(sent.filePath, JSON.stringify({ ...record, envelope: forged, envelopeId: forged.messageId }));
+    const client = new MailClient(join(home, "mail"), undefined, "kern", {
+      async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+    });
+    expect(await client.checkNewMail()).toHaveLength(1);
+    const filename = sent.filePath.split("/").pop()!;
+    const destination = join(inbox.cur, filename);
+    const before = readFileSync(destination, "utf8");
+    const incoming = signEnvelope({ ...first, body: content }, { flint: seed });
+    writeFileSync(sent.filePath, JSON.stringify({ ...record, body: JSON.stringify(incoming) }));
+    expect(await promote("kern", sent.filePath)).toMatchObject({
+      ok: false, class: content === "original" ? "replay" : "invalid",
+    });
+    expect(readFileSync(destination, "utf8")).toBe(before);
+  });
+}
+
 for (const field of ["messageId", "replyToId"] as const) {
   test(`catch-up skips an invalid signed ${field} and delivers the following publication`, async () => {
     createTopic("alerts");

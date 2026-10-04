@@ -474,16 +474,13 @@ function readRecordJson(path: string): Record<string, unknown> | null {
   return parsed as Record<string, unknown>;
 }
 
-function storedEnvelope(record: Record<string, unknown>, representation: "signed-body" | "promoted-envelope"): Record<string, unknown> | null {
-  if (representation === "promoted-envelope") {
-    const env = record.envelope;
-    return env !== null && typeof env === "object" && !Array.isArray(env) ? env as Record<string, unknown> : null;
-  }
+function storedEnvelope(record: Record<string, unknown>): Record<string, unknown> | null {
   if (typeof record.body === "string") {
     const parsed = tryParseEnvelope(record.body);
-    if (parsed !== "json-parse-error" && parsed !== "missing-fields") return parsed;
+    if (parsed !== "json-parse-error" && parsed !== "missing-fields" && deliveryContent(parsed) !== null) return parsed;
   }
-  return null;
+  const env = record.envelope;
+  return env !== null && typeof env === "object" && !Array.isArray(env) ? env as Record<string, unknown> : null;
 }
 
 /** Compare from/to/subject/body/replyToId after shape checks. */
@@ -502,7 +499,7 @@ function deliveryContent(env: Record<string, unknown> | null): string | null {
 
 /** Callers must verify the incoming envelope; this helper checks shape. */
 export function inspectCurRecord(curPath: string, incomingEnvelope: Envelope,
-  representation: "signed-body" | "promoted-envelope"): Exclude<FirstDelivery, { status: "placed" }> | null {
+  _representation: "signed-body" | "promoted-envelope"): Exclude<FirstDelivery, { status: "placed" }> | null {
   const incomingContent = deliveryContent(incomingEnvelope as unknown as Record<string, unknown>);
   if (incomingContent === null) return { status: "malformed" };
   let entry: ReturnType<typeof lstatSync>;
@@ -516,7 +513,7 @@ export function inspectCurRecord(curPath: string, incomingEnvelope: Envelope,
     throw new Error(`cannot place ${curPath}: destination exists and is not a regular file`);
   }
   const existing = readRecordJson(curPath);
-  const existingEnvelope = existing ? storedEnvelope(existing, representation) : null;
+  const existingEnvelope = existing ? storedEnvelope(existing) : null;
   const existingId = existingEnvelope && isValidEnvelopeId(existingEnvelope.messageId) ? existingEnvelope.messageId : undefined;
   const existingContent = deliveryContent(existingEnvelope);
   if (existingContent === null) throw new Error(`cannot place ${curPath}: destination is not a valid delivery record`);

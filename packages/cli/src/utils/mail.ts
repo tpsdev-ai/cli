@@ -955,8 +955,6 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
 
 /**
  * Unlink stranded `tmp/*.promote` scratch, including links shared with cur/.
- * A crash after linking but before the consumed-ID append leaves an uncommitted
- * cur/ record: presentation withholds it, and retrying its ID is refused as replay.
  */
 export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
   const tmpDir = join(root, "tmp");

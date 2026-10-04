@@ -65,7 +65,7 @@ describe("validated delivery content", () => {
     expect(() => placeCurRecord(source, destination, JSON.parse(readFileSync(source, "utf8")).envelope as Envelope, "promoted-envelope")).toThrow("destination is not a valid delivery record");
   });
 
-  test("a promoted record compares its envelope even when its display body is envelope-shaped JSON", () => {
+  test("a valid signed body takes precedence over wrapper envelope metadata", () => {
     const incoming = envelope();
     const source = plant("new", incoming);
     const destination = plant("cur", { ...incoming, messageId: "other-id" });
@@ -74,7 +74,7 @@ describe("validated delivery content", () => {
       body: JSON.stringify({ ...incoming, body: "display-only", messageId: "decoy-id" }),
     }));
     expect(placeCurRecord(source, destination, incoming as Envelope, "promoted-envelope"))
-      .toEqual({ status: "duplicate", existingId: "other-id" });
+      .toEqual({ status: "collision", existingId: "decoy-id" });
   });
 
   for (const overrides of [{ subject: {} }, { replyToId: {} }, { replyToId: "" }, { delegationChain: [] }]) {
