@@ -1,1 +1,1 @@
-- **Mail from a sender whose Flair public key is still `pending` is retried, not dead-lettered as invalid (Closes #507).** A later check re-verifies it once the key is registered. Other malformed keys stay invalid.
+- **A Flair public key of exactly `pending` now fails mail verification retryably instead of being rejected as malformed (Closes #507).**
