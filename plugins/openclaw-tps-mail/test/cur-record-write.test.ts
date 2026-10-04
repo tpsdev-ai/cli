@@ -12,6 +12,7 @@ hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m)
 
 const realFs = { ...fs };
 let removeOnTerminal: { path: string; state: string } | undefined;
+let replaceOnTerminal: { path: string; state: string; bytes: string } | undefined;
 let stampError: Error | undefined;
 let obligationReadFailure: string | undefined;
 let obligationReads = 0;
@@ -40,6 +41,12 @@ mock.module("node:fs", () => ({
       if (JSON.parse(args[1]).state === removeOnTerminal.state) {
         realFs.unlinkSync(removeOnTerminal.path);
         removeOnTerminal = undefined;
+      }
+    }
+    if (replaceOnTerminal && String(args[0]).includes(".obligations/") && typeof args[1] === "string") {
+      if (JSON.parse(args[1]).state === replaceOnTerminal.state) {
+        realFs.writeFileSync(replaceOnTerminal.path, replaceOnTerminal.bytes);
+        replaceOnTerminal = undefined;
       }
     }
     return result;
@@ -89,6 +96,7 @@ beforeEach(() => {
 
 afterEach(() => {
   removeOnTerminal = undefined;
+  replaceOnTerminal = undefined;
   stampError = undefined;
   obligationReadFailure = undefined;
   obligationReads = 0;
@@ -289,6 +297,27 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
       }
     }, 15000);
 
+    for (const alreadyStamped of [false, true]) {
+      it(`${kind}: a replacement identity is refused on the live stamp path (already stamped: ${alreadyStamped})`, async () => {
+        const h = await boot(true);
+        try {
+          expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
+          const cur = readCur()!;
+          const replacement = { ...cur.record, id: "replacement", ...(alreadyStamped ? { ackedAt: "existing-ack", nackedAt: "existing-nack" } : {}) };
+          const bytes = JSON.stringify(replacement);
+          replaceOnTerminal = { path: cur.path, state, bytes };
+          await finish(h);
+          expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).some((m) => m.includes("code=ID_MISMATCH")))).toBe(true);
+          expect(obligation(h.inboundId)?.state).toBe(state);
+          await sleep(500);
+          expect(realFs.readFileSync(cur.path, "utf8")).toBe(bytes);
+          expect(failedLogs(h, `${kind}-stamp-failed`)).toHaveLength(4);
+          expect(h.logs.some((m) => m.includes(`${kind}-stamp-retry-ok`))).toBe(false);
+        } finally { await h.stop(); }
+      }, 15000);
+
+    }
+
     it(`${kind}: an exception without a code is reported and remains retryable`, async () => {
       const h = await boot(true);
       try {
@@ -446,4 +475,41 @@ for (const state of ["acked", "failed"] as const) {
       } finally { await repaired.stop(); }
     }, 15000);
   }
+}
+
+for (const invalidState of [false, true]) {
+  it(`startup holds both identities of a mismatched obligation (invalid state: ${invalidState})`, async () => {
+    const first = await boot(true);
+    try {
+      expect(await pollUntil(() => first.dispatch() !== null)).toBe(true);
+      await first.deliver("verdict");
+      first.settle();
+      expect(await pollUntil(() => !!readCur()?.record?.ackedAt)).toBe(true);
+    } finally { await first.stop(); }
+    const cur = readCur()!;
+    delete cur.record.ackedAt;
+    realFs.writeFileSync(cur.path, JSON.stringify(cur.record));
+    const dir = resolve(mailDir, "anvil", ".obligations");
+    const original = resolve(dir, `${first.inboundId}.json`);
+    const record = JSON.parse(realFs.readFileSync(original, "utf8"));
+    record.lastTransitionAt = new Date(0).toISOString();
+    if (invalidState) record.state = "invalid";
+    const mismatched = resolve(dir, "filename-id.json");
+    const bytes = JSON.stringify(record);
+    realFs.renameSync(original, mismatched);
+    realFs.writeFileSync(mismatched, bytes);
+    const filenameCur = resolve(mailDir, "anvil", "cur", "filename-id.json");
+    realFs.writeFileSync(filenameCur, JSON.stringify({ ...cur.record, id: "filename-id" }));
+    const next = await boot(false);
+    try {
+      expect(await pollUntil(() => next.logs.some((m) => m.includes(mismatched) && m.includes("code=INVALID_RECORD")))).toBe(true);
+      await sleep(500);
+      expect(next.dispatch()).toBeNull();
+      expect(next.logs.some((m) => m.includes(`delivering ${first.inboundId} `) || m.includes("delivering filename-id "))).toBe(false);
+      expect(realFs.readFileSync(mismatched, "utf8")).toBe(bytes);
+      expect(realFs.existsSync(cur.path)).toBe(true);
+      expect(realFs.existsSync(filenameCur)).toBe(true);
+      expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
+    } finally { next.settle(); await next.stop(); }
+  }, 15000);
 }

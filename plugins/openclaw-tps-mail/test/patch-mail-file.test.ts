@@ -72,19 +72,19 @@ afterAll(() => realFs.rmSync(root, { recursive: true, force: true }));
 describe("patchMailFile", () => {
   test("patches an existing record", () => {
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
-    expect(patchMailFile(path, { read: true })).toEqual({ ok: true });
+    expect(patchMailFile(path, { read: true }, undefined, "inbound")).toEqual({ ok: true });
     expect(JSON.parse(realFs.readFileSync(path, "utf-8"))).toEqual({ id: "inbound", body: "hello", read: true });
   });
 
   test("reports a missing record without creating it", () => {
-    expect(patchMailFile(path, { read: true })).toMatchObject({ ok: false, reason: "record-missing" });
+    expect(patchMailFile(path, { read: true }, undefined, "inbound")).toMatchObject({ ok: false, reason: "record-missing" });
     expect(realFs.existsSync(path)).toBe(false);
   });
 
   test("reports a record removed after the read without recreating it", () => {
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
     removeAfterRead = path;
-    expect(patchMailFile(path, { ackedAt: "receipt", read: true })).toMatchObject({ ok: false, reason: "record-missing" });
+    expect(patchMailFile(path, { ackedAt: "receipt", read: true }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "record-missing" });
     expect(removeAfterRead).toBeUndefined();
     expect(realFs.existsSync(path)).toBe(false);
   });
@@ -345,7 +345,7 @@ test("obligation filename and inboundId must agree before startup uses the recor
   const record = JSON.parse(realFs.readFileSync(f.obligationPath, "utf8"));
   record.inboundId = "other";
   realFs.writeFileSync(f.obligationPath, JSON.stringify(record));
-  expect(f.reconcile().has("inbound")).toBe(true);
+  expect([...f.reconcile()].sort()).toEqual(["inbound", "other"]);
   expect(f.logs).toHaveLength(1);
   expect(f.logs[0]).toContain("INVALID_RECORD");
   expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeUndefined();

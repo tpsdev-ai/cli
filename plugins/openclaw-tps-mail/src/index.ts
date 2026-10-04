@@ -628,11 +628,11 @@ type CurRecordUpdate =
   | { ok: true }
   | { ok: false; reason: "record-missing" | "write-failed"; path: string; code: string };
 
-export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey?: "ackedAt" | "nackedAt", inboundId?: string): CurRecordUpdate {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey: "ackedAt" | "nackedAt" | undefined, inboundId: string): CurRecordUpdate {
   try {
     let alreadyStamped = false;
     const r = updateExistingRecord<TpsMailBody>(path, (current) => {
-      if (inboundId !== undefined && current.id !== inboundId) {
+      if (current.id !== inboundId) {
         throw Object.assign(new Error("cur identity changed"), { code: "ID_MISMATCH" });
       }
       if (stampKey && current[stampKey]) {
@@ -658,8 +658,9 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
       `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
     );
   };
-  const onObligationReadError = (path: string, code: string) => {
-    reportReadError("unknown", path.endsWith(".json") ? basename(path, ".json") : "*")(path, code);
+  const onObligationReadError = (path: string, code: string, ids: string[]) => {
+    reportReadError("unknown", ids[0])(path, code);
+    for (const id of ids) unknownInbounds.add(id);
   };
   for (const rec of records ?? listObligations(mailDir, agent, onObligationReadError)) {
     if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
@@ -968,7 +969,7 @@ function stampTerminalCur(
   attempt = 0,
 ): void {
   const key = kind === "ack" ? "ackedAt" : "nackedAt";
-  const stamped = patchMailFile(ctx.curPath, patch, key);
+  const stamped = patchMailFile(ctx.curPath, patch, key, ctx.inboundId);
   if (stamped.ok) {
     if (attempt > 0) ctx.log?.info?.(`tps-mail: ${kind}-stamp-retry-ok: ${ctx.inboundId} at ${ctx.curPath} (retry ${attempt})`);
     return;
@@ -2392,9 +2393,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           unknownInbounds.add(id);
           log?.warn?.(`tps-mail: startup-unresolved: ${id} actor=${agentId} state=${state} path=${path} code=${code}; repair the record and restart the account; obligation retained`);
         };
-        const startupRecords = listObligations(account.mailDir, agentId, (path, code) =>
-          startupFailure(path, code, path.endsWith(".json") ? basename(path, ".json") : "*"),
-        );
+        const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids) => {
+          startupFailure(path, code, ids[0]);
+          for (const id of ids) unknownInbounds.add(id);
+        });
         reconcileTerminalCurStamps(account.mailDir, agentId, log, startupRecords, unknownInbounds);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
