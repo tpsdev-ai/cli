@@ -13,8 +13,17 @@ hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m)
 const realFs = { ...fs };
 let removeOnTerminal: { path: string; state: string } | undefined;
 let stampError: Error | undefined;
+let obligationReadFailure: string | undefined;
+let obligationReads = 0;
+let failObligationReads = Infinity;
 mock.module("node:fs", () => ({
   ...realFs,
+  readFileSync: (...args: any[]) => {
+    if (args[0] === obligationReadFailure && ++obligationReads <= failObligationReads) {
+      throw Object.assign(new Error("injected obligation read failure"), { code: "EACCES" });
+    }
+    return (realFs.readFileSync as any)(...args);
+  },
   openSync: (...args: any[]) => {
     if (stampError && String(args[0]).includes(".ack-")) throw stampError;
     return (realFs.openSync as any)(...args);
@@ -75,6 +84,9 @@ beforeEach(() => {
 afterEach(() => {
   removeOnTerminal = undefined;
   stampError = undefined;
+  obligationReadFailure = undefined;
+  obligationReads = 0;
+  failObligationReads = Infinity;
   setStampRetryDelaysForTests(prevDelays);
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
@@ -334,3 +346,46 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
     await h.stop();
   }, 15000);
 });
+
+for (const failReads of [Infinity, 1]) {
+  it(`startup retains an unreadable terminal obligation without redispatch (failed reads: ${failReads})`, async () => {
+    const first = await boot(true);
+    expect(await pollUntil(() => first.dispatch() !== null)).toBe(true);
+    await first.deliver("verdict");
+    first.settle();
+    expect(await pollUntil(() => !!readCur()?.record?.ackedAt)).toBe(true);
+    await first.stop();
+    const cur = readCur()!;
+    delete cur.record.ackedAt;
+    realFs.writeFileSync(cur.path, JSON.stringify(cur.record));
+    const path = resolve(mailDir, "anvil", ".obligations", `${first.inboundId}.json`);
+    const terminal = JSON.parse(realFs.readFileSync(path, "utf8"));
+    terminal.lastTransitionAt = new Date(0).toISOString();
+    realFs.writeFileSync(path, JSON.stringify(terminal));
+    const bytes = realFs.readFileSync(path, "utf8");
+    obligationReadFailure = path;
+    failObligationReads = failReads;
+    const second = await boot(false);
+    try {
+      expect(await pollUntil(() => second.logs.some((m) => m.includes(path) && m.includes("code=EACCES")))).toBe(true);
+      await sleep(300);
+      expect(second.dispatch()).toBeNull();
+      expect(second.logs.some((m) => m.includes(`delivering ${first.inboundId} `))).toBe(false);
+      expect(realFs.readFileSync(path, "utf8")).toBe(bytes);
+      expect(realFs.existsSync(cur.path)).toBe(true);
+      expect(JSON.parse(realFs.readFileSync(cur.path, "utf8")).ackedAt).toBeUndefined();
+      expect(second.logs.some((m) => m.includes("actor=anvil state=unknown") && m.includes(path) && m.includes("restore readable records and restart the account"))).toBe(true);
+    } finally {
+      await second.stop();
+      obligationReadFailure = undefined;
+    }
+    const third = await boot(false);
+    try {
+      expect(await pollUntil(() => !!readCur()?.record?.ackedAt)).toBe(true);
+      expect(third.dispatch()).toBeNull();
+
+    } finally {
+      await third.stop();
+    }
+  }, 15000);
+}

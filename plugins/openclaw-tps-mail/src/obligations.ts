@@ -174,6 +174,13 @@ export function obligationPath(mailDir: string, agent: string, inboundId: string
   return resolve(obligationsDir(mailDir, agent), `${inboundId}.json`);
 }
 
+function isObligationRecord(record: unknown): record is ObligationRecord {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  const value = record as Partial<ObligationRecord>;
+  return typeof value.inboundId === "string" && typeof value.state === "string" &&
+    ALL_STATES.has(value.state);
+}
+
 export function readObligation(mailDir: string, agent: string, inboundId: string): ObligationRecord | null {
   const p = obligationPath(mailDir, agent, inboundId);
   try {
@@ -189,8 +196,8 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   | { status: "unverified"; path: string; code: string } {
   const path = obligationPath(mailDir, agent, inboundId);
   try {
-    const record = JSON.parse(readFileSync(path, "utf-8")) as ObligationRecord;
-    if (!record || typeof record.state !== "string") {
+    const record: unknown = JSON.parse(readFileSync(path, "utf-8"));
+    if (!isObligationRecord(record)) {
       return { status: "unverified", path, code: "INVALID_RECORD" };
     }
     return { status: "found", record };
@@ -219,9 +226,14 @@ export function listObligations(
   for (const name of names) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
-      out.push(JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord);
+      const record: unknown = JSON.parse(readFileSync(resolve(dir, name), "utf-8"));
+      if (!isObligationRecord(record)) {
+        onReadError(resolve(dir, name), "INVALID_RECORD");
+        continue;
+      }
+      out.push(record);
     } catch (err: any) {
-      if (err?.code !== "ENOENT") onReadError(resolve(dir, name), err?.code ?? "INVALID_RECORD");
+      onReadError(resolve(dir, name), err?.code ?? "INVALID_RECORD");
     }
   }
   return out;
@@ -249,8 +261,14 @@ export function createObligation(
   log?: ObligationLog,
 ): { created: boolean; record: ObligationRecord } {
   const draft = make();
-  const existing = readObligation(mailDir, agent, draft.inboundId);
-  if (existing) {
+  const result = readObligationResult(mailDir, agent, draft.inboundId);
+  if (result.status === "unverified") {
+    const message = `tps-mail: obligation-create-read-failed: ${draft.inboundId} actor=${agent} state=unknown path=${result.path} code=${result.code}; restore readable records and restart the account; obligation retained`;
+    log?.warn?.(message);
+    throw new Error(message);
+  }
+  if (result.status === "found") {
+    const existing = result.record;
     log?.info?.(
       `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.obligationId}); not creating a second`,
     );

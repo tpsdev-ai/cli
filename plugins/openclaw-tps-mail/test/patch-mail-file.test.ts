@@ -40,6 +40,7 @@ mock.module("node:fs", () => ({
 }));
 
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
+const { createObligation, listObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
 const path = join(root, "record.json");
 
@@ -177,4 +178,36 @@ describe("terminal stamp reconciliation", () => {
     expect(f.logs[0]).toContain("obligation retained");
     expect(realFs.existsSync(f.obligationPath)).toBe(true);
   });
+});
+
+for (const invalid of [null, 7, "bad", [], { inboundId: "bad" }]) {
+  test(`invalid obligation ${JSON.stringify(invalid)} is reported and a later terminal record is reconciled`, () => {
+    const f = terminalFixture("acked");
+    const badPath = join(f.obligationDir, "000-bad.json");
+    realFs.writeFileSync(badPath, JSON.stringify(invalid));
+    const errors: string[] = [];
+    expect(listObligations(root, "anvil", (path, code) => errors.push(`${path}:${code}`))).toHaveLength(1);
+    expect(errors).toEqual([`${badPath}:INVALID_RECORD`]);
+    expect(() => f.reconcile()).not.toThrow();
+    expect(f.logs[0]).toContain(`actor=anvil state=unknown path=${badPath} code=INVALID_RECORD`);
+    expect(f.logs[0]).toContain("restore readable records and restart the account");
+    expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8")).ackedAt).toBeDefined();
+    expect(realFs.readFileSync(badPath, "utf8")).toBe(JSON.stringify(invalid));
+  });
+}
+
+test("a null cur record is reported as unreadable", () => {
+  const f = terminalFixture("acked");
+  realFs.writeFileSync(f.curPath, "null");
+  f.reconcile();
+  expect(f.logs[0]).toContain(`actor=anvil state=acked path=${f.curPath} code=INVALID_RECORD`);
+  expect(f.logs[0]).toContain("restore readable records and restart the account");
+});
+
+test("creation refuses an unreadable existing terminal obligation", () => {
+  const f = terminalFixture("acked");
+  const bytes = realFs.readFileSync(f.obligationPath, "utf8");
+  readFailure = f.obligationPath;
+  expect(() => createObligation(root, "anvil", () => ({ inboundId: "inbound", state: "pending" }) as any)).toThrow("state=unknown");
+  expect(realFs.readFileSync(f.obligationPath, "utf8")).toBe(bytes);
 });

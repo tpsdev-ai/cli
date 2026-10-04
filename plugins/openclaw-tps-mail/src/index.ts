@@ -265,7 +265,12 @@ function findBoundAgents(cfg: any, accountId: string): string[] {
 function readMailFile(filePath: string, onReadError?: (path: string, code: string) => void): TpsMailBody | null {
   try {
     const raw = readFileSync(filePath, "utf-8");
-    return JSON.parse(raw) as TpsMailBody;
+    const record: unknown = JSON.parse(raw);
+    if (!record || typeof record !== "object" || Array.isArray(record) || typeof (record as TpsMailBody).id !== "string") {
+      onReadError?.(filePath, "INVALID_RECORD");
+      return null;
+    }
+    return record as TpsMailBody;
   } catch (err: any) {
     if (err?.code !== "ENOENT") onReadError?.(filePath, err?.code ?? "INVALID_RECORD");
     return null;
@@ -642,11 +647,16 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
   }
 }
 
-export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): void {
+export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any): Set<string> {
+  const unknownInbounds = new Set<string>();
   const reportReadError = (state: string, id: string) => (path: string, code: string) => log?.warn?.(
     `tps-mail: stamp-reconcile-read-failed: ${id} actor=${agent} state=${state} path=${path} code=${code}; restore readable records and restart the account`,
   );
-  for (const rec of listObligations(mailDir, agent, reportReadError("unknown", "unknown"))) {
+  const onObligationReadError = (path: string, code: string) => {
+    unknownInbounds.add(path.endsWith(".json") ? basename(path, ".json") : "*");
+    reportReadError("unknown", "unknown")(path, code);
+  };
+  for (const rec of listObligations(mailDir, agent, onObligationReadError)) {
     if (rec.state !== "acked" && rec.state !== "failed") continue;
     let unreadable = false;
     const onReadError = (path: string, code: string) => {
@@ -681,6 +691,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
       );
     }
   }
+  return unknownInbounds;
 }
 
 /**
@@ -1951,25 +1962,31 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // The obligation record is created HERE, keyed on the inbound id — a
       // replayed inbound finds its record and opens NO second obligation.
       const obligationId = randomUUID();
-      const created = createObligation(
-        account.mailDir,
-        recipient,
-        () => ({
-          obligationId,
-          inboundId: msg.id,
-          // cli#429: the durable thread id — the inbound's SIGNED envelope id
-          // (promote()/recoverPromoted() stamp it, and the id rule holds there).
-          ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
-          inboundTimestamp: msg.timestamp,
-          from: msg.from,
-          to: recipient,
-          accountId: account.accountId,
-          state: "pending",
-          deadlineAt: null,
-          attempts: 1,
-        }),
-        log,
-      );
+      let created: ReturnType<typeof createObligation>;
+      try {
+        created = createObligation(
+          account.mailDir,
+          recipient,
+          () => ({
+            obligationId,
+            inboundId: msg.id,
+            // cli#429: the durable thread id — the inbound's SIGNED envelope id
+            // (promote()/recoverPromoted() stamp it, and the id rule holds there).
+            ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
+            inboundTimestamp: msg.timestamp,
+            from: msg.from,
+            to: recipient,
+            accountId: account.accountId,
+            state: "pending",
+            deadlineAt: null,
+            attempts: 1,
+          }),
+          log,
+        );
+      } catch (err: any) {
+        log?.warn?.(`tps-mail: obligation creation deferred for ${msg.id}: ${err?.message ?? err}`);
+        return;
+      }
       const obId = created.record.obligationId;
       const yieldCtx = makeYieldCtx(
         account.mailDir,
@@ -2359,8 +2376,8 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // cur/ record never received its stamp — the write failed AFTER the
         // durable transition — is re-stamped here, under the same lock that
         // write uses, BEFORE the recovery loop below decides whether to
-        // re-dispatch the record. Idempotent; a failure here is logged by name.
-        reconcileTerminalCurStamps(account.mailDir, agentId, log);
+        // re-dispatch the record.
+        const unknownInbounds = reconcileTerminalCurStamps(account.mailDir, agentId, log);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
@@ -2379,6 +2396,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               if (seenFiles.has(curPath)) continue;
               const record = readMailFile(curPath);
               if (!record || record.ackedAt || record.nackedAt) continue;
+              if (unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
               void recoverUnackedCurRecord(agentId, curPath, record);
             }
           }
@@ -2441,14 +2459,16 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // a route cannot pin a record forever.
         try {
           const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
-          sweepTerminalObligations(
-            account.mailDir,
-            agentId,
-            retentionDays,
-            log,
-            Date.now(),
-            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
-          );
+          if (unknownInbounds.size === 0) {
+            sweepTerminalObligations(
+              account.mailDir,
+              agentId,
+              retentionDays,
+              log,
+              Date.now(),
+              resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
+            );
+          }
         } catch (err: any) {
           log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);
         }
