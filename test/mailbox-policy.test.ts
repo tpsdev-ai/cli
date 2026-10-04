@@ -17,7 +17,7 @@ describe("validated delivery content", () => {
   });
   const plant = (name: string, env: unknown) => {
     const path = join(root, name);
-    writeFileSync(path, JSON.stringify({ envelope: env }));
+    writeFileSync(path, JSON.stringify({ envelope: env, checkedOutAt: "2026-10-03T00:00:00Z" }));
     return path;
   };
 
@@ -25,8 +25,8 @@ describe("validated delivery content", () => {
     const source = plant("new", {});
     const destination = plant("cur", {});
     expect(placeCurRecord(source, destination, JSON.parse(readFileSync(source, "utf8")).envelope as Envelope, "promoted-envelope")).toEqual({ status: "malformed" });
-    expect(readFileSync(destination, "utf8")).toBe('{"envelope":{}}');
-    expect(readFileSync(source, "utf8")).toBe('{"envelope":{}}');
+    expect(readFileSync(destination, "utf8")).toBe('{"envelope":{},"checkedOutAt":"2026-10-03T00:00:00Z"}');
+    expect(readFileSync(source, "utf8")).toBe('{"envelope":{},"checkedOutAt":"2026-10-03T00:00:00Z"}');
   });
 
   for (const field of ["from", "to", "body", "messageId", "timestamp", "signature"]) {
@@ -65,16 +65,26 @@ describe("validated delivery content", () => {
     expect(() => placeCurRecord(source, destination, JSON.parse(readFileSync(source, "utf8")).envelope as Envelope, "promoted-envelope")).toThrow("destination is not a valid delivery record");
   });
 
-  test("a valid signed body takes precedence over wrapper envelope metadata", () => {
+  test("a transport record compares its body despite wrapper envelope metadata", () => {
     const incoming = envelope();
     const source = plant("new", incoming);
     const destination = plant("cur", { ...incoming, messageId: "other-id" });
     writeFileSync(destination, JSON.stringify({
+      from: incoming.from, to: incoming.to,
       envelope: { ...incoming, messageId: "other-id" },
       body: JSON.stringify({ ...incoming, body: "display-only", messageId: "decoy-id" }),
     }));
     expect(placeCurRecord(source, destination, incoming as Envelope, "promoted-envelope"))
       .toEqual({ status: "collision", existingId: "decoy-id" });
+  });
+
+  test("an envelope-shaped body without a transport record shape is a storage failure", () => {
+    const incoming = envelope();
+    const source = plant("new", incoming);
+    const destination = join(root, "cur");
+    writeFileSync(destination, JSON.stringify({ body: JSON.stringify(incoming) }));
+    expect(() => placeCurRecord(source, destination, incoming as Envelope, "promoted-envelope"))
+      .toThrow("destination is not a valid delivery record");
   });
 
   for (const overrides of [{ subject: {} }, { replyToId: {} }, { replyToId: "" }, { delegationChain: [] }]) {

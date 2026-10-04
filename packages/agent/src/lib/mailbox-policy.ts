@@ -457,9 +457,7 @@ export function hasCommittedMessageId(root: string, messageId: string): boolean 
 export type FirstDelivery =
   | { status: "placed" }
   | { status: "malformed" }
-  /** Same delivery content. */
   | { status: "duplicate"; existingId?: string }
-  /** Different delivery content. */
   | { status: "collision"; existingId?: string };
 
 /** Parse a record file, or null when it is unreadable or not a JSON object. */
@@ -475,12 +473,14 @@ function readRecordJson(path: string): Record<string, unknown> | null {
 }
 
 function storedEnvelope(record: Record<string, unknown>): Record<string, unknown> | null {
-  if (typeof record.body === "string") {
-    const parsed = tryParseEnvelope(record.body);
-    if (parsed !== "json-parse-error" && parsed !== "missing-fields" && deliveryContent(parsed) !== null) return parsed;
+  if (Object.hasOwn(record, "checkedOutAt")) {
+    const env = record.envelope;
+    return typeof record.checkedOutAt === "string" && env !== null && typeof env === "object" && !Array.isArray(env)
+      ? env as Record<string, unknown> : null;
   }
-  const env = record.envelope;
-  return env !== null && typeof env === "object" && !Array.isArray(env) ? env as Record<string, unknown> : null;
+  if (typeof record.from !== "string" || typeof record.to !== "string" || typeof record.body !== "string") return null;
+  const parsed = tryParseEnvelope(record.body);
+  return parsed !== "json-parse-error" && parsed !== "missing-fields" ? parsed : null;
 }
 
 /** Compare from/to/subject/body/replyToId after shape checks. */
