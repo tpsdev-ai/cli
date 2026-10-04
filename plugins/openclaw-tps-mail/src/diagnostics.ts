@@ -5,7 +5,7 @@ export interface StampDiagnosticFacts {
   actor: string;
   id?: string;
   path: string;
-  code: string;
+  code?: string;
   obligation: ObligationPresence;
   retriesExhausted?: boolean;
 }
@@ -16,7 +16,7 @@ export function formatStampDiagnostic(facts: StampDiagnosticFacts): string {
     ...(facts.id === undefined ? [] : [facts.id]),
     `actor=${facts.actor}`,
     `path=${facts.path}`,
-    `code=${facts.code}`,
+    ...(facts.code === undefined ? [] : [`code=${facts.code}`]),
   ];
   const state = facts.obligation === "retained" ? "obligation retained"
     : facts.obligation === "unknown" ? "state unknown" : undefined;
@@ -24,6 +24,6 @@ export function formatStampDiagnostic(facts: StampDiagnosticFacts): string {
     fields.join(" "),
     ...(state ? [state] : []),
     ...(facts.retriesExhausted ? ["no retries left"] : []),
-    "fix the path named above and restart the account",
+    "resolve the failure and restart the account",
   ].join("; ");
 }

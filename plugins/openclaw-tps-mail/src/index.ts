@@ -69,8 +69,6 @@ import {
   listObligations,
   markNackSent,
   nackOwed,
-  obligationPath,
-  obligationsDir,
   newestSessionTranscript,
   readObligation,
   readObligationResult,
@@ -79,7 +77,6 @@ import {
   scanForReceipt,
   sweepTerminalObligations,
   type ReceiptSignatureCheck,
-  type ReadFailureKind,
   transitionObligation,
   writeReceipt,
   type ObligationRecord,
@@ -88,7 +85,7 @@ import {
   type ReceiptScanDirs,
 } from "./obligations.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { formatStampDiagnostic, type ObligationPresence, type StampDiagnosticFacts } from "./diagnostics.js";
+import { formatStampDiagnostic, type ObligationPresence } from "./diagnostics.js";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
 import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
 import type {
@@ -266,17 +263,17 @@ function findBoundAgents(cfg: any, accountId: string): string[] {
 
 // ─── TPS mail envelope helpers ───────────────────────────────────────────────
 
-function readMailFile(filePath: string, onReadError?: (path: string, code: string) => void): TpsMailBody | null {
+function readMailFile(filePath: string, onReadError?: (path: string, code?: string) => void): TpsMailBody | null {
   try {
     const raw = readFileSync(filePath, "utf-8");
     const record: unknown = JSON.parse(raw);
-    if (!record || typeof record !== "object" || Array.isArray(record) || typeof (record as TpsMailBody).id !== "string") {
-      onReadError?.(filePath, "INVALID_RECORD");
+    if (onReadError && (!record || typeof record !== "object" || Array.isArray(record) || typeof (record as TpsMailBody).id !== "string")) {
+      onReadError?.(filePath);
       return null;
     }
     return record as TpsMailBody;
   } catch (err: any) {
-    onReadError?.(filePath, err?.code ?? "INVALID_RECORD");
+    onReadError?.(filePath, err?.code);
     return null;
   }
 }
@@ -412,9 +409,8 @@ function persistReceiptAfterCommit(
     persistReceipt(mailDir, agent, message, route, branchId);
   } catch (err: any) {
     log?.warn?.(
-      formatStampDiagnostic({ kind: "receipt-write-failed", actor: agent, id: message.headers?.["X-TPS-InReplyTo"],
-        path: resolve(receiptsDir(mailDir, agent), `${message.headers?.["X-TPS-Obligation"]}.json`),
-        code: err?.code ?? "WRITE_FAILED", obligation: "unknown" }),
+      `tps-mail: receipt-write-failed: the ${route} delivery committed, but its receipt was not written ` +
+        `(${err?.message ?? err}); the obligation resolves at its deadline`,
     );
   }
 }
@@ -426,14 +422,13 @@ function persistReceiptAfterCommit(
  * never reported as failed and its inbound is never nacked. The logger itself is
  * guarded too: a throwing logger cannot fail a committed send either.
  */
-function postCommit(log: any, name: string, context: string, step: () => void, facts?: Omit<StampDiagnosticFacts, "kind" | "code">): void {
+function postCommit(log: any, name: string, context: string, step: () => void): void {
   try {
     step();
   } catch (err: any) {
     try {
       log?.warn?.(
-        facts ? formatStampDiagnostic({ ...facts, kind: name, code: err?.code ?? "WRITE_FAILED" })
-          : `tps-mail: ${name}: ${context} (${err?.message ?? err}); the delivery committed, so this is not a send failure`,
+        `tps-mail: ${name}: ${context} (${err?.message ?? err}); the delivery committed, so this is not a send failure`,
       );
     } catch {
       /* a logger must never fail a committed send */
@@ -632,7 +627,7 @@ function routeFor(mailDir: string, cfg: any, accountId: string, to: string): Mai
 
 type CurRecordUpdate =
   | { ok: true }
-  | { ok: false; reason: "record-missing" | "write-failed"; path: string; code: string };
+  | { ok: false; reason: "record-missing" | "write-failed"; path: string; code?: string };
 
 export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey: "ackedAt" | "nackedAt" | undefined, inboundId: string): CurRecordUpdate {
   try {
@@ -650,54 +645,44 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
     if (r.status === "changed" && alreadyStamped) return { ok: true };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
-    return { ok: false, reason: "write-failed", path, code: r.status };
+    return { ok: false, reason: "write-failed", path, code: undefined };
   } catch (err: any) {
-    return { ok: false, reason: "write-failed", path: typeof err?.path === "string"
-      ? basename(err.path).startsWith(".ack-") ? path
-        : err.path.startsWith(`${mailLockPath(dirname(dirname(path)))}.`) ? mailLockPath(dirname(dirname(path))) : err.path
-      : path, code: err?.code ?? "WRITE_FAILED" };
+    return { ok: false, reason: "write-failed", path: typeof err?.path === "string" && (err.path === mailLockPath(dirname(dirname(path))) || err.path.startsWith(`${mailLockPath(dirname(dirname(path)))}.`))
+      ? mailLockPath(dirname(dirname(path))) : path, code: typeof err?.code === "string" ? err.code : undefined };
   }
 }
 
+function stampObligationPresence(mailDir: string, agent: string, inboundId: string): ObligationPresence {
+  const result = readObligationResult(mailDir, agent, inboundId);
+  return result.status === "found" ? "retained" : result.status === "missing" ? "none" : "unknown";
+}
+
 export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: any, records?: ObligationRecord[], unknownInbounds = new Set<string>()): Set<string> {
-  const reportReadError = (obligation: ObligationPresence, id: string) => (path: string, code: string) => {
+  const reportReadError = (obligation: ObligationPresence, id: string) => (path: string, code?: string) => {
     if (unknownInbounds.has(id)) return;
     unknownInbounds.add(id);
     log?.warn?.(
       formatStampDiagnostic({ kind: "stamp-reconcile-read-failed", actor: agent, id, path, code, obligation }),
     );
   };
-  const onObligationReadError = (path: string, code: string, ids: string[], kind: ReadFailureKind) => {
-    reportReadError(kind === "directory" ? "unknown" : "retained", ids[0])(path, code);
+  const onObligationReadError = (_path: string, _code: string | undefined, ids: string[]) => {
     for (const id of ids) unknownInbounds.add(id);
   };
   for (const rec of records ?? listObligations(mailDir, agent, onObligationReadError)) {
     if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
     if (rec.state !== "acked" && rec.state !== "failed") continue;
     let unreadable = false;
-    const onReadError = (path: string, code: string) => {
+    const onReadError = (path: string, code?: string) => {
       unreadable = true;
-      reportReadError(path === resolve(mailDir, agent, "cur") ? "unknown" : "retained", rec.inboundId)(path, code);
+      if (path === resolve(mailDir, agent, "cur")) unknownInbounds.add(rec.inboundId);
+      else reportReadError(stampObligationPresence(mailDir, agent, rec.inboundId), rec.inboundId)(path, code);
     };
     const kind = rec.state === "acked" ? "ack" : "nack";
     const key = kind === "ack" ? "ackedAt" : "nackedAt";
     const curPath = findCurPath(mailDir, agent, rec.inboundId, onReadError);
-    const missing = (path: string) => {
-      unknownInbounds.add(rec.inboundId);
-      log?.warn?.(
-      formatStampDiagnostic({ kind: `${kind}-stamp-reconcile-failed`, actor: agent, id: rec.inboundId, path, code: "ENOENT", obligation: "retained" }),
-      );
-    };
-    if (unreadable) continue;
-    if (!curPath) {
-      if (!unreadable) missing(resolve(mailDir, agent, "cur", `${rec.inboundId}.json`));
-      continue;
-    }
+    if (unreadable || !curPath) continue;
     const cur = readMailFile(curPath, onReadError);
-    if (!cur) {
-      if (!unreadable) missing(curPath);
-      continue;
-    }
+    if (!cur) continue;
     if (cur[key]) continue;
     const patch = kind === "ack"
       ? { ackedAt: new Date().toISOString(), read: true }
@@ -707,7 +692,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     else {
       unknownInbounds.add(rec.inboundId);
       log?.warn?.(
-        formatStampDiagnostic({ kind: `${kind}-stamp-reconcile-failed`, actor: agent, id: rec.inboundId, path: r.path, code: r.code, obligation: "retained" }),
+        formatStampDiagnostic({ kind: `${kind}-stamp-reconcile-failed`, actor: agent, id: rec.inboundId, path: r.path, code: r.code, obligation: stampObligationPresence(mailDir, agent, rec.inboundId) }),
       );
     }
   }
@@ -953,7 +938,7 @@ function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
   const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
   if (result.status === "unverified") {
     retryObligationRead(ctx, obligationId);
-    ctx.log?.warn?.(formatStampDiagnostic({ kind: "obligation-read-unverified", actor: ctx.agent, id: ctx.inboundId, path: result.path, code: result.code, obligation: "unknown" }));
+    ctx.log?.warn?.(`tps-mail: obligation-read-unverified: ${ctx.inboundId} path=${result.path} code=${result.code}`);
   } else if (result.status === "missing" || TERMINAL_STATES.has(result.record.state)) {
     releaseObligationState(obligationId);
   }
@@ -985,13 +970,14 @@ function stampTerminalCur(
   const delay = stamped.reason === "record-missing" ? undefined : stampRetryDelaysMs[attempt];
   ctx.log?.warn?.(
     formatStampDiagnostic({ kind: `${kind}-stamp-failed`, actor: ctx.agent, id: ctx.inboundId,
-      path: stamped.path, code: stamped.code, obligation: "retained",
+      path: stamped.path, code: stamped.code, obligation: stampObligationPresence(ctx.mailDir, ctx.agent, ctx.inboundId),
       retriesExhausted: stamped.reason !== "record-missing" && delay === undefined }),
   );
   if (delay === undefined || !isLiveContext(ctx)) return;
   const timer = accountTimer(ctx, () => stampTerminalCur(ctx, kind, patch, attempt + 1), delay);
   if (typeof (timer as any).unref === "function") (timer as any).unref();
 }
+
 
 function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
   if (!isLiveContext(ctx)) return;
@@ -1006,7 +992,7 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     if (result.status === "unverified") return;
     const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
-      formatStampDiagnostic({ kind: "ack-refused", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: cur?.state ?? "OBLIGATION_MISSING", obligation: cur ? "retained" : "none" }),
+      `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
     return;
   }
@@ -1120,19 +1106,21 @@ async function settleObligation(
         if (result.status === "unverified") return "none";
         const cur = result.status === "found" ? result.record : null;
         ctx.log?.warn?.(
-          formatStampDiagnostic({ kind: "unconfirmed-refused", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: cur?.state ?? "OBLIGATION_MISSING", obligation: cur ? "retained" : "none" }),
+          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
         );
         return "none";
       }
     } catch (err: any) {
       ctx.log?.warn?.(
-        formatStampDiagnostic({ kind: "obligation-write-failed", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: err?.code ?? "WRITE_FAILED", obligation: "retained" }),
+        `tps-mail: obligation-write-failed: could not record the unconfirmed outcome for ${ctx.inboundId} ` +
+          `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
       );
       return "none";
     }
     releaseObligationState(obligationId);
     ctx.log?.warn?.(
-      formatStampDiagnostic({ kind: "obligation-unconfirmed", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: s.reason, obligation: "retained" }),
+      `tps-mail: obligation for ${ctx.inboundId} UNCONFIRMED: ${s.reason} — the reply was committed (${rec.state}) ` +
+        `and no receipt evidence was found by its deadline; NOT failed, no nack sent`,
     );
     return "unconfirmed";
   }
@@ -1160,7 +1148,8 @@ async function settleObligation(
     );
   } catch (err: any) {
     ctx.log?.warn?.(
-      formatStampDiagnostic({ kind: "obligation-write-failed", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: err?.code ?? "WRITE_FAILED", obligation: "retained" }),
+      `tps-mail: obligation-write-failed: could not record the failure for ${ctx.inboundId} ` +
+        `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
     );
     return "none";
   }
@@ -1169,7 +1158,8 @@ async function settleObligation(
     if (result.status === "unverified") return "none";
     const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
-      formatStampDiagnostic({ kind: "failure-refused", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: cur?.state ?? "OBLIGATION_MISSING", obligation: cur ? "retained" : "none" }),
+      `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
+        `the inbound keeps no nack stamp and no nack mail is sent`,
     );
     return "none";
   }
@@ -1181,10 +1171,13 @@ async function settleObligation(
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
-  await deliverNack(ctx, failedOn);
+  const nackHandedOff = await deliverNack(ctx, failedOn);
   if (!isLiveContext(ctx)) return "none";
   ctx.log?.warn?.(
-    formatStampDiagnostic({ kind: "obligation-failed", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: failedOn, obligation: "retained" }),
+    `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
+      (s.alreadyStamped ? ", the inbound already carried its nack" : "") +
+      (nackHandedOff ? ", sender notified" : ", the nack mail is still OWED (nackPending) — the next start retries delivery") +
+      ", never acked",
   );
   return "failed";
 }
@@ -1227,12 +1220,14 @@ async function deliverNack(ctx: YieldContext, reason: string, opts: { timeoutMs?
     // over again. The line here says which of the two happened.
     const recorded = markNackSent(ctx.mailDir, ctx.agent, ctx.inboundId, ctx.log);
     ctx.log?.warn?.(
-      formatStampDiagnostic({ kind: "nack-delivered", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: recorded ? "DELIVERED" : "NACK_SENT_WRITE_FAILED", obligation: "retained" }),
+      `tps-mail: nack delivered to ${ctx.sender} for ${ctx.inboundId}` +
+        (recorded ? "" : " — the record could not be updated: it still owes the nack and a later start may send it again"),
     );
     return true;
   }
   ctx.log?.warn?.(
-    formatStampDiagnostic({ kind: "nack-pending", actor: ctx.agent, id: ctx.inboundId, path: obligationPath(ctx.mailDir, ctx.agent, ctx.inboundId), code: reason, obligation: "retained" }),
+    `tps-mail: nack-pending: the sender was NOT told about the failure of ${ctx.inboundId} (${reason}); ` +
+      `the obligation record keeps nackPending and the next start retries delivery`,
   );
   return false;
 }
@@ -1299,13 +1294,14 @@ function retryOwedNackInBackground(
       if (!isLiveContext(ctx)) return;
       if (outcome === "expired") {
         log?.warn?.(
-          formatStampDiagnostic({ kind: "nack-retry-timeout", actor: agentId, id: inboundId, path: obligationPath(mailDir, agentId, inboundId), code: "TIMEOUT", obligation: "retained" }),
+          `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not complete within ${backstopMs}ms ` +
+            `(connect + ack); the transport was closed and the record keeps nackPending`,
         );
       }
     })
     .catch((err: any) => {
       if (!isLiveContext(ctx)) return;
-      log?.warn?.(formatStampDiagnostic({ kind: "nack-retry-failed", actor: agentId, id: inboundId, path: obligationPath(mailDir, agentId, inboundId), code: err?.code ?? "NACK_RETRY_FAILED", obligation: "retained" }));
+      log?.warn?.(`tps-mail: nack-retry-failed: the owed nack for ${inboundId} to ${sender} threw: ${err?.message ?? err}`);
     })
     .finally(() => {
       if (timer) clearAccountTimer(accountId, timer);
@@ -1335,13 +1331,15 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
     const current = readObligation(mailDir, agent, inboundId);
     if (current && TERMINAL_STATES.has(current.state)) {
       log?.warn?.(
-        formatStampDiagnostic({ kind: "late-final-refused", actor: agent, id: inboundId, path: obligationPath(mailDir, agent, inboundId), code: current.state, obligation: "retained" }),
+        `tps-mail: late-final-refused: obligation ${current.obligationId} for ${inboundId} is ${current.state}; ` +
+          `the late final is NOT delivered`,
       );
     }
     return false;
   } catch (err: any) {
     log?.warn?.(
-      formatStampDiagnostic({ kind: "obligation-write-failed", actor: agent, id: inboundId, path: obligationPath(mailDir, agent, inboundId), code: err?.code ?? "WRITE_FAILED", obligation: "retained" }),
+      `tps-mail: obligation-write-failed: could not mark ${inboundId} delivering (${err?.message ?? err}); ` +
+        `nothing was sent`,
     );
     return false;
   }
@@ -1427,7 +1425,7 @@ function makeYieldCtx(
  */
 function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
   let client: ReturnType<typeof createMailVerifyClient> | null = null;
-  return async (envelope, path) => {
+  return async (envelope) => {
     if (!isLiveContext(ctx)) return false;
     try {
       client ??= createMailVerifyClient(ctx.agent);
@@ -1439,7 +1437,8 @@ function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
     } catch (err: any) {
       if (!isLiveContext(ctx)) return false;
       ctx.log?.warn?.(
-        formatStampDiagnostic({ kind: "receipt-verify-unavailable", actor: ctx.agent, id: ctx.inboundId, path: path!, code: err?.code ?? "VERIFY_FAILED", obligation: "unknown" }),
+        `tps-mail: receipt-verify-unavailable: the reply carried by a receipt for ${ctx.inboundId} could not be verified ` +
+          `(${err?.message ?? err}); it is not evidence until a later scan verifies it`,
       );
       return false;
     }
@@ -1643,19 +1642,19 @@ function installYieldSubscription(api: any): boolean {
 }
 
 /** The cur/ path for an inbound id (cur filenames are timestamp-id, not the id). */
-function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code: string) => void): string | null {
+function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code?: string) => void): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
     const names = readdirSync(curDir);
-    const matching = names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`));
-    for (const name of matching.length ? matching : names) {
+    const matching = onReadError ? names.filter((name) => name === `${inboundId}.json` || name.endsWith(`-${inboundId}.json`)) : [];
+    for (const name of onReadError ? matching : names) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
       const rec = readMailFile(p, onReadError);
       if (rec?.id === inboundId) return p;
     }
   } catch (err: any) {
-    if (err?.code !== "ENOENT") onReadError?.(curDir, err?.code ?? "READ_FAILED");
+    if (err?.code !== "ENOENT") onReadError?.(curDir, err?.code);
   }
   return null;
 }
@@ -1783,7 +1782,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     }
 
     if (!existsSync(account.mailDir)) {
-      log?.warn?.(formatStampDiagnostic({ kind: "startup-mail-directory-missing", actor: account.accountId, path: account.mailDir, code: "ENOENT", obligation: "unknown" }));
+      log?.warn?.(`tps-mail: mail directory does not exist: ${account.mailDir}`);
       return;
     }
 
@@ -1875,15 +1874,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         const recovered = await recoverPromoted(recipient, curPath);
         if (!isLive()) return;
         if (!recovered.ok) {
-          const rejectedPath = resolve(account.mailDir, recipient, "dlq", basename(curPath));
           log?.warn?.(
-            formatStampDiagnostic({ kind: "cur-recovery-refused", actor: recipient, id: record.id, path: !existsSync(curPath) && existsSync(rejectedPath) ? rejectedPath : curPath, code: recovered.class, obligation: "unknown" }),
+            `tps-mail: cur/ recovery refused ${record.id} (${recovered.class}): ${recovered.reason}`,
           );
           return;
         }
         await deliverPromoted(recipient, recovered.message, curPath);
       } catch (err: any) {
-        log?.warn?.(formatStampDiagnostic({ kind: "cur-recovery-deferred", actor: recipient, id: record.id, path: curPath, code: err?.code ?? "RECOVERY_FAILED", obligation: "unknown" }));
+        log?.warn?.(`tps-mail: cur/ recovery deferred for ${record.id}: ${err?.message ?? err}`);
       }
     }
 
@@ -1969,31 +1967,25 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // The obligation record is created HERE, keyed on the inbound id — a
       // replayed inbound finds its record and opens NO second obligation.
       const obligationId = randomUUID();
-      let created: ReturnType<typeof createObligation>;
-      try {
-        created = createObligation(
-          account.mailDir,
-          recipient,
-          () => ({
-            obligationId,
-            inboundId: msg.id,
-            // cli#429: the durable thread id — the inbound's SIGNED envelope id
-            // (promote()/recoverPromoted() stamp it, and the id rule holds there).
-            ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
-            inboundTimestamp: msg.timestamp,
-            from: msg.from,
-            to: recipient,
-            accountId: account.accountId,
-            state: "pending",
-            deadlineAt: null,
-            attempts: 1,
-          }),
-          log,
-        );
-      } catch (err: any) {
-        log?.warn?.(formatStampDiagnostic({ kind: "obligation-create-failed", actor: recipient, id: msg.id, path: obligationPath(account.mailDir, recipient, msg.id), code: err?.code ?? "CREATE_FAILED", obligation: "unknown" }));
-        return;
-      }
+      const created = createObligation(
+        account.mailDir,
+        recipient,
+        () => ({
+          obligationId,
+          inboundId: msg.id,
+          // cli#429: the durable thread id — the inbound's SIGNED envelope id
+          // (promote()/recoverPromoted() stamp it, and the id rule holds there).
+          ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
+          inboundTimestamp: msg.timestamp,
+          from: msg.from,
+          to: recipient,
+          accountId: account.accountId,
+          state: "pending",
+          deadlineAt: null,
+          attempts: 1,
+        }),
+        log,
+      );
       const obId = created.record.obligationId;
       const yieldCtx = makeYieldCtx(
         account.mailDir,
@@ -2138,7 +2130,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                 "obligation-posted-transition-failed",
                 `the ${route!.kind} reply ${reply.id} committed to ${msg.from} but the obligation for ${msg.id} was not marked posted`,
                 () => transitionObligation(account.mailDir, recipient, msg.id, "posted", { replyId: reply.id }, log),
-                { actor: recipient, id: msg.id, path: obligationPath(account.mailDir, recipient, msg.id), obligation: "retained" },
               );
             };
             try {
@@ -2255,7 +2246,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
                       r.kind === "local" ? undefined : r.branchId,
                       log,
                     ),
-                  { actor: recipient, id: msg.id, path: resolve(receiptsDir(account.mailDir, recipient), `${obId}.json`), obligation: "unknown" },
                 );
               }
             }
@@ -2317,7 +2307,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           const live = readObligation(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
           if (live && !TERMINAL_STATES.has(live.state)) {
             log?.warn?.(
-              formatStampDiagnostic({ kind: "obligation-unresolved", actor: recipient, id: msg.id, path: obligationPath(account.mailDir, recipient, msg.id), code: "NO_RECEIPT", obligation: "retained" }),
+              `tps-mail: obligation for ${msg.id} is unresolved (no receipt evidence yet); deadline armed`,
             );
           }
         }
@@ -2339,7 +2329,8 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         const rec = readObligation(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
         if (rec && (rec.state === "delivering" || rec.state === "posted")) {
           log?.warn?.(
-            formatStampDiagnostic({ kind: `post-commit-error:${yieldCtx.step ?? "unnamed-step"}`, actor: recipient, id: msg.id, path: obligationPath(account.mailDir, recipient, msg.id), code: err?.code ?? "POST_COMMIT_FAILED", obligation: "retained" }),
+            `tps-mail: post-commit-error:${yieldCtx.step ?? "unnamed-step"}: ${reason} — the delivery for ${msg.id} ` +
+              `committed (${rec.state}), so it is NOT failed and its inbound is NOT nacked; it resolves at its deadline`,
           );
           armDeadline(yieldCtx, obId);
         } else {
@@ -2380,21 +2371,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           }
         } catch { /* ignore */ }
 
-        // Attempt terminal stamps before recovery and retention.
-        const unknownInbounds = new Set<string>();
-        const startupFailure = (path: string, code: string, id = "*", state = "unknown", kind: ReadFailureKind = "file", obligation: ObligationPresence = kind === "directory" ? "unknown" : "retained") => {
-          if (unknownInbounds.has(id)) return;
-          unknownInbounds.add(id);
-          log?.warn?.(
-            formatStampDiagnostic({ kind: "startup-unresolved", actor: agentId,
-              id: kind === "directory" ? undefined : id, path, code, obligation }),
-          );
-        };
-        const startupRecords = listObligations(account.mailDir, agentId, (path, code, ids, kind) => {
-          startupFailure(path, code, ids[0], "unknown", kind);
-          for (const id of ids) unknownInbounds.add(id);
-        });
-        reconcileTerminalCurStamps(account.mailDir, agentId, log, startupRecords, unknownInbounds);
+        const unknownInbounds = reconcileTerminalCurStamps(account.mailDir, agentId, log);
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
@@ -2411,15 +2388,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               if (!filename.endsWith(".json")) continue;
               const curPath = resolve(curDir, filename);
               if (seenFiles.has(curPath)) continue;
-              const known = startupRecords.find((rec) => filename === `${rec.inboundId}.json` || filename.endsWith(`-${rec.inboundId}.json`));
-              if (unknownInbounds.has("*") || (known && unknownInbounds.has(known.inboundId))) continue;
-              const record = readMailFile(curPath, (path, code) => startupFailure(path, code, known?.inboundId ?? basename(filename, ".json"), known?.state, "file", known ? "retained" : "unknown"));
-              if (!record || record.ackedAt || record.nackedAt) continue;
-              if (unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
+              const record = readMailFile(curPath);
+              if (!record || record.ackedAt || record.nackedAt || unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
               void recoverUnackedCurRecord(agentId, curPath, record);
             }
           }
-        } catch (err: any) { startupFailure(curDir, err?.code ?? "READ_FAILED", "*", "unknown", "directory"); }
+        } catch { /* ignore */ }
 
         // Reap stranded tmp/*.promote scratch from an interrupted promote (the
         // catch only runs on a thrown error, so a kill leaves orphans no other
@@ -2449,9 +2423,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // below HOLDS any record still owing its nack (obligations.ts) while it
         // is inside the bounded hold, so an owed mail survives whether the retry
         // or the sweep runs first.
-        for (const rec of startupRecords) {
+        for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
-          if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId) || !nackOwed(rec)) continue;
+          if (!nackOwed(rec)) continue;
           retryOwedNackInBackground(
             account.mailDir,
             agentId,
@@ -2478,33 +2452,26 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // a route cannot pin a record forever.
         try {
           const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
-          if (!unknownInbounds.has("*")) {
-            sweepTerminalObligations(
-              account.mailDir,
-              agentId,
-              retentionDays,
-              log,
-              Date.now(),
-              resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
-              unknownInbounds,
-              startupFailure,
-              startupRecords,
-            );
-          }
+          if (!unknownInbounds.has("*")) sweepTerminalObligations(
+            account.mailDir,
+            agentId,
+            retentionDays,
+            log,
+            Date.now(),
+            resolveObligationNackHoldDays(retentionDays, pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID], log),
+            unknownInbounds,
+          );
         } catch (err: any) {
-          log?.warn?.(formatStampDiagnostic({ kind: "retention-sweep-failed", actor: agentId, path: err?.path ?? obligationsDir(account.mailDir, agentId), code: err?.code ?? "SWEEP_FAILED", obligation: "unknown" }));
+          log?.warn?.(`tps-mail: obligation retention sweep failed (ignored): ${err?.message ?? String(err)}`);
         }
 
         // RESTART RECOVERY (S2): in-memory timers die with the process, so
         // reconcile every durable obligation record against the maildir/outbox
         // and RE-ARM the deadline where work is still outstanding.
-        for (const rec of startupRecords) {
+        for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
-          if (unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId) || TERMINAL_STATES.has(rec.state)) continue;
-          const onFailure = (path: string, code: string) => startupFailure(path, code, rec.inboundId, rec.state, path === curDir ? "directory" : "file");
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, onFailure);
-          if (!recCurPath) onFailure(resolve(curDir, `${rec.inboundId}.json`), "ENOENT");
-          if (unknownInbounds.has(rec.inboundId)) continue;
+          if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
+          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
           const ctx = makeYieldCtx(
             account.mailDir,
             agentId,
@@ -2518,16 +2485,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             rec.inboundEnvelopeId,
           );
           yieldContexts.set(rec.obligationId, ctx);
-          try {
-            await reconcileObligation(ctx, rec);
-          } catch (err: any) {
-            startupFailure(recCurPath!, err?.code ?? "RECONCILE_FAILED", rec.inboundId, rec.state);
-            yieldContexts.delete(rec.obligationId);
-          }
+          await reconcileObligation(ctx, rec);
         }
       } catch (err: any) {
         log?.warn?.(
-          formatStampDiagnostic({ kind: "startup-watch-failed", actor: agentId, path: newDir, code: err?.code ?? "WATCH_FAILED", obligation: "unknown" }),
+          `tps-mail: failed to watch ${newDir}: ${err?.message ?? String(err)}`,
         );
       }
     }

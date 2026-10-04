@@ -1,1 +1,1 @@
-- **Ack/nack stamps use locked writes**. Stamps use the CLI's existing-only `updateExistingRecord` (#469) (Closes #492).
+- **Report and reconcile failed cur/ stamps**. Retry failed ack/nack stamp writes while the account runs, and reconcile terminal stamps at startup. Hold failed reconciliation from recovery and retention.

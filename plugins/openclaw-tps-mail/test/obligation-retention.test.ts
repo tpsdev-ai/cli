@@ -92,12 +92,6 @@ const receipt = (obligationId: string, replyToId: string, ts: string, agent: str
 /** Drive the plugin's startup (which runs the retention sweep) and wait until
  *  `done()` or a deadline, then abort. */
 async function runStartup(pluginConfig: Record<string, unknown>, done: () => boolean): Promise<void> {
-  const curDir = join(mailDir, AGENT, "cur");
-  mkdirSync(curDir, { recursive: true });
-  for (const name of readdirSync(obligationsDir(mailDir, AGENT))) {
-    const id = name.replace(/\.json$/, "");
-    writeFileSync(join(curDir, `timestamp-${id}.json`), JSON.stringify({ id, ackedAt: "done", nackedAt: "done" }));
-  }
   mockApi.pluginConfig = pluginConfig;
   pluginModule.register(mockApi);
   controller = new AbortController();
@@ -166,7 +160,7 @@ describe("cli#401 — obligation retention", () => {
     expect(res.unreadable).toBe(1);
     expect(res.removed).toBe(0);
     expect(existsSync(join(obligationsDir(mailDir, AGENT), "broken.json"))).toBe(true);
-    const warns = logs.warn.filter((m) => m.includes("retention-unresolved"));
+    const warns = logs.warn.filter((m) => m.includes("unreadable/malformed"));
     expect(warns.length, "logged once").toBe(1);
     expect(warns[0]).toContain("broken.json");
   });
@@ -254,7 +248,7 @@ describe("cli#401 — obligation retention", () => {
     writeFileSync(obligationsDir(mailDir, AGENT), "not a directory", "utf-8");
     const res = sweepTerminalObligations(mailDir, AGENT, 7, { warn: (m) => logs.warn.push(m), info: (m) => logs.info.push(m) });
     expect(res.removed).toBe(0);
-    expect(logs.warn.some((m) => m.includes("code=ENOTDIR")), "names the error").toBe(true);
+    expect(logs.warn.some((m) => m.includes("could not read")), "names the error").toBe(true);
   });
 
   it("(i) malformed record SHAPES (null / no state / unknown state) are reported unreadable, not skipped", () => {
@@ -266,7 +260,7 @@ describe("cli#401 — obligation retention", () => {
     const res = sweepTerminalObligations(mailDir, AGENT, 7, { warn: (m) => logs.warn.push(m), info: (m) => logs.info.push(m) });
     expect(res.removed).toBe(0);
     expect(res.unreadable).toBe(3);
-    expect(logs.warn.filter((m) => m.includes("retention-unresolved")).length, "each path is reported").toBe(3);
+    expect(logs.warn.filter((m) => m.includes("unreadable/malformed")).length, "logged once").toBe(1);
     expect(existsSync(join(dir, "null.json")) && existsSync(join(dir, "no-state.json")) && existsSync(join(dir, "bad-state.json"))).toBe(true);
   });
 

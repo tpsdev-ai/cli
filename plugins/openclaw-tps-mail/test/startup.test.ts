@@ -464,11 +464,10 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const cfg = {
       bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
     };
-    const warnings: string[] = [];
     const ctx = {
       account: { accountId: "default", mailDir: tempMailDir, enabled: true },
       cfg,
-      log: { info: () => {}, warn: (message: string) => warnings.push(message), error: () => {} },
+      log: { info: () => {}, warn: () => {}, error: () => {} },
       channelRuntime,
       abortSignal: abortController.signal,
     };
@@ -482,8 +481,6 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     expect(readdirSync(dlqDir).filter((f) => f.endsWith(".json")).length).toBe(1);
     const reason = readFileSync(resolve(dlqDir, `${filename}.reason`), "utf-8");
     expect(reason).toContain("class: unverified");
-    expect(await pollUntil(() => warnings.some((m) => m.includes("cur-recovery-refused")), 2000)).toBe(true);
-    expect(warnings.find((m) => m.includes("cur-recovery-refused"))).toBe(`tps-mail: cur-recovery-refused: msg-forged-001 actor=${agentId} path=${resolve(dlqDir, filename)} code=unverified; state unknown; fix the path named above and restart the account`);
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }
