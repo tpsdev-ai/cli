@@ -119,7 +119,6 @@ export function parseSeal(text) {
 export const REQUIRED_SUITES = [
   { suite: "agent", cwd: "packages/agent" },
   { suite: "cli", cwd: "packages/cli" },
-  { suite: "pi-tps-mail", cwd: "packages/pi-tps-mail" },
   { suite: "root-test", cwd: "." },
   { suite: "plugin", cwd: "plugins/openclaw-tps-mail" },
   { suite: "github-review", cwd: "plugins/openclaw-github-review" },

@@ -23,8 +23,13 @@ afterAll(() => {
   if (existsSync(TEST_KEY_PATH)) unlinkSync(TEST_KEY_PATH);
 });
 let _savedFetch: typeof globalThis.fetch;
-beforeEach(() => { _savedFetch = globalThis.fetch; });
-afterEach(() => { globalThis.fetch = _savedFetch; });
+const _savedAgentId = process.env.TPS_AGENT_ID;
+beforeEach(() => { _savedFetch = globalThis.fetch; process.env.TPS_AGENT_ID = "operator"; });
+afterEach(() => {
+  globalThis.fetch = _savedFetch;
+  if (_savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
+  else process.env.TPS_AGENT_ID = _savedAgentId;
+});
 
 const PENDING_MEMORIES = [
   { id: "flint-lesson-042", agentId: "flint", content: "Never run bare gh commands", promotionStatus: "pending", durability: "standard", createdAt: "2026-03-01T10:00:00Z", archived: false },

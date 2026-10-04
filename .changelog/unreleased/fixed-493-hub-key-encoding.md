@@ -1,0 +1,1 @@
+- **Mail verification decodes uniform-case hex and canonical base64/base64url public keys to exactly 32 bytes (Closes #493).**

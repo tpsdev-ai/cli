@@ -95,7 +95,6 @@ jobs:
         run: |
           cd packages/agent && bun run build
           cd ../cli && bun run build
-          (cd ../pi-tps-mail && bun run build) || true
       - name: Build ${TARGET}
         env:
           TARGET: ${{ matrix.target }}
@@ -157,7 +156,6 @@ jobs:
         run: |
           cd packages/agent && bun run build
           cd ../cli && bun run build
-          (cd ../pi-tps-mail && bun run build) || true
       - name: Build linux-x64 release binary
         run: |
           bun run --filter @tpsdev-ai/cli build:binary:linux-x64
