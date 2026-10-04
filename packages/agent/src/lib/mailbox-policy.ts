@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, type Dirent, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, type Dirent, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.js";
@@ -449,4 +449,19 @@ export function hasCommittedMessageId(root: string, messageId: string): boolean 
   const ids = peekConsumedLedger(root);
   if (ids === null) return false;
   return ids.has(messageId);
+}
+
+// ─── First delivery into cur/ (cli#482) ──────────────────────────────────────
+//
+/** The result of a first-delivery placement. */
+export type FirstDelivery = { status: "placed" } | { status: "exists" };
+
+export function placeCurRecord(sourcePath: string, curPath: string): FirstDelivery {
+  try {
+    linkSync(sourcePath, curPath);
+    return { status: "placed" };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return { status: "exists" };
+  }
 }

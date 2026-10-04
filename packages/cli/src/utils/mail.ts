@@ -8,6 +8,7 @@ import {
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
+  placeCurRecord,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -381,7 +382,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   const filename = `${safeTs}-${id}.json`;
   const tmpPath = join(inbox.tmp, filename);
   const newPath = join(inbox.fresh, filename);
-  writeFileSync(tmpPath, JSON.stringify(message, null, 2), "utf-8");
+  writeFileSync(tmpPath, JSON.stringify(message, null, 2), { encoding: "utf-8", flag: "wx" });
   renameSync(tmpPath, newPath);
 
   logEvent({ event: "sent", from: sender, to, messageId: id }, body);
@@ -827,6 +828,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     // dead-letter. Consulted against the DURABLE ledger (and the maildir
     // fallback), not cur/ alone. The ledger prune runs here, under the lock.
     const replay = mailboxReplayStore(dirs.root);
+    const curPath = join(dirs.cur, filename);
     let consumed: boolean;
     try {
       consumed = replay.isConsumed(envelope.messageId);
@@ -864,32 +866,31 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       checkedOutBy: msg.checkedOutBy ?? agent,
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
     };
-    const curPath = join(dirs.cur, filename);
-    const scratchPath = join(dirs.tmp, `${filename}.promote`);
+    const scratchPath = join(dirs.tmp, `${filename}.${randomUUID()}.promote`);
+    let scratchCreated = false;
     let movedToCur = false;
     try {
       mkdirSync(dirs.tmp, { recursive: true });
       mkdirSync(dirs.cur, { recursive: true });
-      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), "utf-8");
-      // Atomic into cur/.
-      renameSync(scratchPath, curPath);
+      writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
+      scratchCreated = true;
+      const placement = placeCurRecord(scratchPath, curPath);
+      if (placement.status !== "placed") {
+        throw new Error(`destination already exists: ${filename}`);
+      }
       movedToCur = true;
-      // Record the consumed id durably as PART OF THE COMMIT. If this throws, the
-      // move is rolled back below and the ORIGINAL is dead-lettered retryable — a
-      // promotion that can't be recorded must not silently succeed (its id would
-      // be replayable with no retry and no quarantine).
+      rmSync(scratchPath, { force: true });
       replay.recordConsumed(envelope.messageId);
     } catch (err: any) {
       // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
       // non-file entry at the scratch path) is expected to persist so a later
       // check can re-drive it; a transient one is cleared here and self-heals.
       try {
-        rmSync(scratchPath, { force: true });
+        if (scratchCreated) rmSync(scratchPath, { force: true });
       } catch {
         /* fault persists — re-drivable */
       }
       if (movedToCur) {
-        // Roll the commit back so the source (still intact) is the single copy.
         try {
           rmSync(curPath, { force: true });
         } catch {
@@ -937,14 +938,7 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
 }
 
 /**
- * Remove stranded `tmp/<name>.json.promote` scratch files.
- *
- * A crash between composing the scratch and renaming it into cur/ leaves one
- * behind. The promote catch only runs on a THROWN error, not a kill, and
- * `listMessageFiles` filters `.endsWith(".json")`, so `.promote` orphans are
- * invisible to every sweep. They are always safe to remove: the rename into
- * cur/ deletes the scratch, so any surviving scratch is either incomplete or
- * still has its untouched source, which a later check re-promotes.
+ * Unlink stranded `tmp/*.promote` scratch, including links shared with cur/.
  */
 export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
   const tmpDir = join(root, "tmp");

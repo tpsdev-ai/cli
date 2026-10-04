@@ -125,6 +125,53 @@ test("topic replay stays consumed across MailClient and promote after cur remova
   expect(readdirSync(inbox.cur)).toEqual([]);
 });
 
+for (const firstWriter of ["promote", "MailClient"] as const) {
+  for (const history of ["committed-same-id", "committed-new-id", "uncommitted"] as const) {
+    for (const content of ["original", "different"] as const) {
+      test(`${firstWriter} then the other writer: ${history}, ${content} content`, async () => {
+        const inbox = getInbox("kern");
+        const client = new MailClient(join(home, "mail"), undefined, "kern", {
+          async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
+        });
+        const first = JSON.parse(signOutboundBody("flint", "kern", "original", { requireKey: true }));
+        const incoming = history === "committed-new-id"
+          ? JSON.parse(signOutboundBody("flint", "kern", content, { requireKey: true }))
+          : signEnvelope({ ...first, body: content }, { flint: seed });
+        const sent = sendMessage("kern", JSON.stringify(first), "flint");
+        const filename = sent.filePath.split("/").pop()!;
+        if (firstWriter === "MailClient") {
+          expect(await client.checkNewMail()).toHaveLength(1);
+        } else {
+          expect(await promote("kern", sent.filePath)).toMatchObject({ ok: true });
+        }
+        const destination = join(inbox.cur, filename);
+        const before = readFileSync(destination, "utf8");
+        if (history === "uncommitted") writeFileSync(join(inbox.root, "consumed.jsonl"), "");
+        const record = {
+          id: first.messageId, from: "flint", to: "kern", body: JSON.stringify(incoming),
+          timestamp: incoming.timestamp,
+        };
+        writeFileSync(sent.filePath, JSON.stringify(record));
+        const rejection = history === "committed-new-id" ? "storage-unavailable" : "replay";
+        if (firstWriter === "MailClient") {
+          expect(await promote("kern", sent.filePath)).toMatchObject({ ok: false, class: rejection });
+        } else {
+          expect(await client.checkNewMail()).toEqual([]);
+        }
+        expect(readFileSync(destination, "utf8")).toBe(before);
+        if (firstWriter === "promote" && history === "committed-new-id") {
+          expect(readdirSync(inbox.fresh)).toEqual([filename]);
+          expect(readdirSync(inbox.dlq)).toEqual([]);
+        } else {
+          expect(readdirSync(inbox.fresh)).toEqual([]);
+          expect(readFileSync(join(inbox.dlq, `${filename}.reason`), "utf8")).toContain(`class: ${rejection}`);
+        }
+        if (history === "uncommitted") expect(readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe("");
+      });
+    }
+  }
+}
+
 for (const field of ["messageId", "replyToId"] as const) {
   test(`catch-up skips an invalid signed ${field} and delivers the following publication`, async () => {
     createTopic("alerts");

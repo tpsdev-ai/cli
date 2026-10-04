@@ -349,6 +349,63 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
   });
 
+  // ── cli#482: a first-delivery filename collision must not replace ──────────
+  //
+  test("an unconsumed filename collision stays in new and keeps the cur record", async () => {
+    const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-1" });
+    plant(wrapper("flint", first), "collide.json");
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect((await client.checkNewMail()).length).toBe(1);
+    const before = readFileSync(join(inbox("cur"), "collide.json"), "utf-8");
+
+    const again = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-id-2" });
+    plant(wrapper("flint", again), "collide.json");
+    expect((await client.checkNewMail()).length).toBe(0);
+
+    expect(readFileSync(join(inbox("cur"), "collide.json"), "utf-8")).toBe(before);
+    expect(files("new")).toEqual(["collide.json"]);
+    expect(files("dlq")).toEqual([]);
+  });
+
+  for (const body of ["hello", "different"]) {
+    test(`a consumed ID with ${body} body returns replay and keeps the cur record`, async () => {
+      const first = signedEnvelope("flint", AGENT, "hello", { flint: FLINT }, { messageId: "guard482-consumed" });
+      plant(wrapper("flint", first), "consumed.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect(await client.checkNewMail()).toHaveLength(1);
+      const cur = join(inbox("cur"), "consumed.json");
+      const before = readFileSync(cur);
+      const again = signedEnvelope("flint", AGENT, body, { flint: FLINT }, { messageId: first.messageId });
+      plant(wrapper("flint", again), "consumed.json");
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(readFileSync(cur)).toEqual(before);
+      expect(readFileSync(join(inbox("dlq"), "consumed.json.reason"), "utf8")).toContain("class: replay");
+    });
+  }
+
+  for (const reuseId of [false, true]) {
+    test(`same filename, ${reuseId ? "consumed" : "unconsumed"} ID, different signed body keeps the cur record`, async () => {
+      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
+      plant(wrapper("flint", first), "clash.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect((await client.checkNewMail()).length).toBe(1);
+      const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+
+      const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT }, { messageId: reuseId ? "guard482-id-3" : "guard482-id-4" });
+      plant(wrapper("flint", other), "clash.json");
+      expect((await client.checkNewMail()).length).toBe(0);
+
+      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before);
+      if (reuseId) {
+        expect(files("dlq")).toContain("clash.json");
+        expect(readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8")).toContain("class: replay");
+      } else {
+        expect(files("new")).toEqual(["clash.json"]);
+        expect(files("dlq")).toEqual([]);
+      }
+    });
+  }
+
   for (const code of ["EACCES", "EISDIR"]) {
     test(`an unreadable ledger (${code}) with no cur/ copy withholds delivery`, async () => {
       const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
@@ -374,6 +431,50 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
       expect(readFileSync(join(inbox("dlq"), "again.json.reason"), "utf-8")).toContain("class: replay");
     });
   }
+
+  test("source unlink failure withholds delivery and retries", async () => {
+    const env = signedEnvelope("flint", AGENT, "once only", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    plant(wrapper("flint", env));
+    const source = join(inbox("new"), "m1.json");
+    const unlink = fs.unlinkSync;
+    const fault = spyOn(fs, "unlinkSync").mockImplementation((...args: Parameters<typeof unlink>) => {
+      if (args[0] === source) throw new Error("source cleanup fault");
+      return unlink(...args);
+    });
+    try {
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(existsSync(source)).toBe(true);
+      expect(files("cur")).toEqual([]);
+      expect(existsSync(join(tmpDir, AGENT, "consumed.jsonl"))).toBe(false);
+    } finally {
+      fault.mockRestore();
+    }
+    const restarted = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect(await restarted.checkNewMail()).toHaveLength(1);
+    expect(await restarted.checkNewMail()).toEqual([]);
+    expect(files("new")).toEqual([]);
+    expect(files("cur")).toEqual(["m1.json"]);
+  });
+
+  test("failed consumed-ID append removes cur/ while retaining the source", async () => {
+    const env = signedEnvelope("flint", AGENT, "retry", { flint: FLINT });
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    plant(wrapper("flint", env));
+    const append = fs.appendFileSync;
+    const fault = spyOn(fs, "appendFileSync").mockImplementation((...args: Parameters<typeof append>) => {
+      if (args[0] === join(tmpDir, AGENT, "consumed.jsonl")) throw new Error("append fault");
+      return append(...args);
+    });
+    try {
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(files("cur")).toEqual([]);
+      expect(files("new")).toEqual(["m1.json"]);
+    } finally {
+      fault.mockRestore();
+    }
+    expect(await client.checkNewMail()).toHaveLength(1);
+  });
 
   test("a failed ledger append and rollback are both reported without delivery", async () => {
     const env = signedEnvelope("flint", AGENT, "uncommitted", { flint: FLINT });
