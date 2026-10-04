@@ -57,6 +57,8 @@ export async function createMailVerifyClient(
     async getAgent(name: string) {
       const info = await cliClient.getAgentForVerification(name);
       if (!info) return null;
+      // Flair's placeholder until the principal's key is registered: retryable, not malformed.
+      if (info.publicKey === "pending") throw new Error(`Flair has no registered public key for ${name} yet (pending)`);
       let publicKey: Buffer;
       try {
         publicKey = parseFlairPublicKey(info.publicKey);
