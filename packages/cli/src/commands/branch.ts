@@ -266,6 +266,10 @@ async function runInit(args: BranchArgs): Promise<void> {
 }
 
 async function runStart(): Promise<void> {
+  const conf = existsSync(confPath()) ? readBranchConf() : undefined;
+  const localAgentId = branchAgentId(conf?.agentId);
+  if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
+
   if (
     process.env.TPS_BRANCH_DAEMON !== "1" &&
     process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
@@ -292,7 +296,6 @@ async function runStart(): Promise<void> {
     throw new Error("Branch is not joined. Run `tps branch init` first.");
   }
 
-  const conf = readBranchConf();
   const kp = loadKeyPair(identityDir, "branch");
   const host = JSON.parse(readFileSync(hostFile, "utf-8"));
   const hostPub = new Uint8Array(Buffer.from(host.publicKey, "base64url"));
@@ -315,17 +318,6 @@ async function runStart(): Promise<void> {
         : [];
     } catch { return []; }
   }
-
-  // Resolve the local agent identity for incoming mail storage: `TPS_AGENT_ID`,
-  // then the id persisted by `tps branch init --agent`. With neither, refuse by
-  // name instead of falling back to the host (cli#499). This keeps mail stored
-  // under the branch's own identity, not the logical 'to' name the sender used
-  // (which may be a GAL alias).
-  function getLocalAgentId(): string {
-    return branchAgentId(conf.agentId);
-  }
-
-  const localAgentId = getLocalAgentId();
 
   let serviceProxies: ServiceProxySet | null = null;
   const outboxSends = new OutboxSendTracker();
