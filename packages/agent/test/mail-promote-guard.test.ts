@@ -26,6 +26,7 @@ import * as ed from "@noble/ed25519";
 import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "../src/lib/signEnvelope.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
+import { EventLogger } from "../src/telemetry/events.js";
 
 const AGENT = "mailbox";
 
@@ -368,24 +369,53 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(sidecar).toContain("guard482-id-1");
   });
 
-  test("a second delivery with the same filename and different delivery content is an integrity error", async () => {
-    const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
-    plant(wrapper("flint", first), "clash.json");
-    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
-    expect((await client.checkNewMail()).length).toBe(1);
-    const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
+  for (const reuseId of [false, true]) {
+    test(`same filename, ${reuseId ? "same" : "different"} ID, different signed body is invalid`, async () => {
+      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard482-id-3" });
+      plant(wrapper("flint", first), "clash.json");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+      expect((await client.checkNewMail()).length).toBe(1);
+      const before = readFileSync(join(inbox("cur"), "clash.json"), "utf-8");
 
-    const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT }, { messageId: "guard482-id-4" });
-    plant(wrapper("flint", other), "clash.json");
-    expect((await client.checkNewMail()).length).toBe(0);
+      const other = signedEnvelope("flint", AGENT, "different", { flint: FLINT }, { messageId: reuseId ? "guard482-id-3" : "guard482-id-4" });
+      plant(wrapper("flint", other), "clash.json");
+      expect((await client.checkNewMail()).length).toBe(0);
 
-    expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before); // delivered record untouched
-    expect(files("dlq")).toContain("clash.json");
-    const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
-    expect(sidecar).toContain("class: invalid");
-    expect(sidecar).toContain("guard482-id-3"); // the delivered record id
-    expect(sidecar).toContain("guard482-id-4"); // the incoming record id
-  });
+      expect(readFileSync(join(inbox("cur"), "clash.json"), "utf-8")).toBe(before); // delivered record untouched
+      expect(files("dlq")).toContain("clash.json");
+      const sidecar = readFileSync(join(inbox("dlq"), "clash.json.reason"), "utf-8");
+      expect(sidecar).toContain("class: invalid");
+      expect(sidecar).toContain("guard482-id-3"); // the delivered record id
+      expect(sidecar).toContain(reuseId ? "guard482-id-3" : "guard482-id-4");
+    });
+  }
+
+  for (const destination of ["directory", "non-record"]) {
+    test(`consumed ID at a ${destination} destination reports a storage error and stays in new/`, async () => {
+      const first = signedEnvelope("flint", AGENT, "original", { flint: FLINT }, { messageId: "guard-consumed-non-record" });
+      plant(wrapper("flint", first), "storage.json");
+      const logger = new EventLogger(AGENT, join(tmpDir, "events"));
+      const events = spyOn(logger, "emit");
+      const client = new MailClient(tmpDir, logger, AGENT, flairClient({ flint: pub(FLINT) }));
+      try {
+        expect(await client.checkNewMail()).toHaveLength(1);
+        const cur = join(inbox("cur"), "storage.json");
+        rmSync(cur);
+        if (destination === "directory") mkdirSync(cur);
+        else writeFileSync(cur, "{}");
+        plant(wrapper("flint", first), "storage.json");
+        expect(await client.checkNewMail()).toEqual([]);
+        expect(files("new")).toContain("storage.json");
+        expect(files("dlq")).toEqual([]);
+        const last = events.mock.calls.at(-1)?.[0];
+        expect(last).toMatchObject({ type: "mail.receive", status: "error" });
+        expect(last.error).toContain("destination");
+        if (destination === "non-record") expect(readFileSync(cur, "utf8")).toBe("{}");
+      } finally {
+        events.mockRestore();
+      }
+    });
+  }
 
   test("an empty-body signed message is delivered and a same-content collision is a duplicate", async () => {
     const first = signedEnvelope("flint", AGENT, "", { flint: FLINT });

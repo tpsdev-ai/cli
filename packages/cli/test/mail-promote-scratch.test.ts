@@ -30,9 +30,9 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function plant(body: string) {
+function plant(body: string, messageId?: string) {
   const inbox = mail.getInbox(agent);
-  const envelope = buildSignedEnvelope("kern", agent, body, { kern: seed });
+  const envelope = buildSignedEnvelope("kern", agent, body, { kern: seed }, { messageId });
   const path = join(inbox.fresh, "record.json");
   fs.writeFileSync(path, JSON.stringify({ id: envelope.messageId, from: "kern", to: agent, body: JSON.stringify(envelope) }));
   return path;
@@ -97,3 +97,40 @@ test("exclusive scratch creation refuses an existing hard link without changing 
   expect(await mail.sweepStrandedPromoteScratch(inbox.root)).toBe(1);
   expect(fs.readFileSync(cur, "utf8")).toBe(before);
 });
+
+for (const body of ["original", "different"]) {
+  test(`consumed ID at the same filename with ${body} signed body returns ${body === "original" ? "replay" : "invalid"}`, async () => {
+    const messageId = "consumed-collision";
+    expect((await mail.promote(agent, plant("original", messageId))).ok).toBe(true);
+    const inbox = mail.getInbox(agent);
+    const cur = join(inbox.cur, "record.json");
+    const before = fs.readFileSync(cur, "utf8");
+    const ledger = fs.readFileSync(join(inbox.root, "consumed.jsonl"), "utf8");
+    const result = await mail.promote(agent, plant(body, messageId));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("consumed collision accepted");
+    expect(result.class).toBe(body === "original" ? "replay" : "invalid");
+    expect(fs.readFileSync(cur, "utf8")).toBe(before);
+    expect(fs.readFileSync(join(inbox.root, "consumed.jsonl"), "utf8")).toBe(ledger);
+    expect(fs.readdirSync(inbox.tmp)).toEqual([]);
+  });
+}
+
+for (const destination of ["directory", "non-record"]) {
+  test(`consumed ID at a ${destination} destination is storage-unavailable`, async () => {
+    const messageId = "consumed-non-record";
+    expect((await mail.promote(agent, plant("original", messageId))).ok).toBe(true);
+    const inbox = mail.getInbox(agent);
+    const cur = join(inbox.cur, "record.json");
+    fs.unlinkSync(cur);
+    if (destination === "directory") fs.mkdirSync(cur);
+    else fs.writeFileSync(cur, "{}");
+    const result = await mail.promote(agent, plant("original", messageId));
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("non-record accepted");
+    expect(result.class).toBe("storage-unavailable");
+    expect(fs.lstatSync(cur).isDirectory()).toBe(destination === "directory");
+    if (destination === "non-record") expect(fs.readFileSync(cur, "utf8")).toBe("{}");
+    expect(fs.readdirSync(inbox.tmp)).toEqual([]);
+  });
+}

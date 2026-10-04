@@ -501,20 +501,15 @@ function deliveryContent(env: Record<string, unknown> | null): string | null {
 }
 
 /** Callers must verify the incoming envelope; this helper checks shape. */
-export function placeCurRecord(sourcePath: string, curPath: string, incomingEnvelope: Envelope,
-  representation: "signed-body" | "promoted-envelope"): FirstDelivery {
+export function inspectCurRecord(curPath: string, incomingEnvelope: Envelope,
+  representation: "signed-body" | "promoted-envelope"): Exclude<FirstDelivery, { status: "placed" }> | null {
   const incomingContent = deliveryContent(incomingEnvelope as unknown as Record<string, unknown>);
   if (incomingContent === null) return { status: "malformed" };
-  try {
-    linkSync(sourcePath, curPath);
-    return { status: "placed" };
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-  }
   let entry: ReturnType<typeof lstatSync>;
   try {
     entry = lstatSync(curPath);
   } catch (err) {
+    if (isMissing(err)) return null;
     throw new Error(`cannot place ${curPath}: destination stat failed (${(err as NodeJS.ErrnoException).code ?? String(err)})`);
   }
   if (!entry.isFile()) {
@@ -529,4 +524,18 @@ export function placeCurRecord(sourcePath: string, curPath: string, incomingEnve
     return { status: "duplicate", existingId };
   }
   return { status: "collision", existingId };
+}
+
+export function placeCurRecord(sourcePath: string, curPath: string, incomingEnvelope: Envelope,
+  representation: "signed-body" | "promoted-envelope"): FirstDelivery {
+  if (deliveryContent(incomingEnvelope as unknown as Record<string, unknown>) === null) return { status: "malformed" };
+  try {
+    linkSync(sourcePath, curPath);
+    return { status: "placed" };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+  }
+  const existing = inspectCurRecord(curPath, incomingEnvelope, representation);
+  if (existing === null) throw new Error(`cannot place ${curPath}: destination disappeared`);
+  return existing;
 }

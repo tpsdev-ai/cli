@@ -11,7 +11,7 @@ import {
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
   parseSignedEnvelope,
-  placeCurRecord,
+  inspectCurRecord, placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 
@@ -206,10 +206,20 @@ export class MailClient {
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
-      if (replay.isConsumed(envelope.messageId)) {
+      const consumed = replay.isConsumed(envelope.messageId);
+      const dstPath = join(this.inboxCur, file);
+      if (consumed) {
+        const existing = inspectCurRecord(dstPath, envelope, "signed-body");
+        if (existing?.status === "collision" || existing?.status === "malformed") {
+          return {
+            pass: false,
+            class: "invalid",
+            reason: existing.status === "malformed" ? "malformed delivery record"
+              : `filename collision: ${file} already delivered as ${existing.existingId ?? "unknown"}; incoming record ${envelope.messageId} has different delivery content`,
+          };
+        }
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
-      const dstPath = join(this.inboxCur, file);
       const placement = placeCurRecord(srcPath, dstPath, envelope, "signed-body");
       if (placement.status === "malformed") {
         return { pass: false, class: "invalid", reason: "malformed delivery record" };
