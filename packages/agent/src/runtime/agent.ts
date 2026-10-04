@@ -33,6 +33,8 @@ export class AgentRuntime {
         try {
           const a = await verifyProvider.getAgent(name);
           if (!a) return null;
+          // Flair's placeholder until the principal's key is registered: retryable, not malformed.
+          if (a.publicKey === "pending") throw new Error(`Flair has no registered public key for ${name} yet (pending)`);
           return { publicKey: parseFlairPublicKey(a.publicKey) };
         } catch (err) {
           if (err instanceof PublicKeyFormatError) {

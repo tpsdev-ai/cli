@@ -100,6 +100,8 @@ export class FlairContextProvider {
     try {
       const agent = await this.req<FlairAgent>("GET", `/Agent/${encodeURIComponent(name)}`);
       if (!agent || typeof agent.publicKey !== "string") throw new Error("invalid principal record");
+      // Flair's placeholder until the principal's key is registered: retryable, not malformed.
+      if (agent.publicKey === "pending") throw new Error(`Flair has no registered public key for ${name} yet (pending)`);
       parseFlairPublicKey(agent.publicKey);
       return agent;
     } catch (err) {
