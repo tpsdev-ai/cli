@@ -980,7 +980,8 @@ function stampTerminalCur(
     `tps-mail: ${kind}-stamp-failed: ${ctx.inboundId} actor=${ctx.agent} state=${kind === "ack" ? "acked" : "failed"} path=${stamped.path} code=${stamped.code}; ` +
       (stamped.reason !== "record-missing" && delay !== undefined
         ? `retry ${attempt + 1} of ${stampRetryDelaysMs.length} in ${delay}ms`
-        : `obligation retained; fix the path named above and restart the account`),
+        : (stamped.reason === "record-missing" ? "" : "no retries left; ") +
+          `obligation retained; fix the path named above and restart the account`),
   );
   if (delay === undefined || !isLiveContext(ctx)) return;
   const timer = accountTimer(ctx, () => stampTerminalCur(ctx, kind, patch, attempt + 1), delay);
