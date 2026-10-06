@@ -1,11 +1,5 @@
-/**
- * Startup reconciliation (cli#500): the unresolved-record hold and the
- * owed-nack age bound. These cases compose the two calls in the order startup
- * uses them (reconcileTerminalCurStamps → sweepTerminalObligations with the
- * returned set).
- */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -45,23 +39,52 @@ afterEach(() => { rmSync(mailDir, { recursive: true, force: true }); });
 const quiet = { info: () => {}, warn: () => {} };
 
 describe("startup reconciliation: the unresolved hold and the owed-nack age bound", () => {
- it("an aged owed nack is abandoned even when its inbound is in the unresolved set", () => {
+ it("successful aged nack release clears the debt for an unresolved inbound", () => {
  terminalRecord("owed-unresolved", "failed", 40, true);
  const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), 28, new Set(["owed-unresolved"]));
- expect(res.abandonedForNack, "past the 28-day hold the debt is abandoned").toBe(1);
- expect(nackOwed(readObligation(mailDir, AGENT, "owed-unresolved")), "so the startup retry stops").toBe(false);
+ expect(res.abandonedForNack).toBe(1);
+ expect(nackOwed(readObligation(mailDir, AGENT, "owed-unresolved"))).toBe(false);
  });
 
- it("startup composition: an aged owed nack whose cur/ record is gone is abandoned", () => {
+ for (const held of [false, true]) {
+ it(`failed nack release retains the owed record (unresolved=${held})`, () => {
+ const id = "owed-write-failed";
+ const p = terminalRecord(id, "failed", 40, true);
+ const staging = join(obligationsDir(mailDir, AGENT), `.${id}.json.tmp`);
+ writeFileSync(staging, "");
+ chmodSync(staging, 0o400);
+ const seen: string[] = [];
+ const log = { info: () => {}, warn: (m: string) => seen.push(m) };
+ const unresolved = new Set(held ? [id] : []);
+ try {
+ const res = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 28, unresolved);
+ expect(existsSync(p)).toBe(true);
+ expect(nackOwed(readObligation(mailDir, AGENT, id))).toBe(true);
+ expect(res.removed).toBe(0);
+ expect(res.abandonedForNack).toBe(0);
+ expect(seen.some((m) => m.includes("obligation-write-failed") && /EACCES|EPERM/.test(m))).toBe(true);
+ expect(seen.some((m) => m.includes("nack-release-failed") && m.includes(`ob-${id}`))).toBe(true);
+ expect(seen.some((m) => m.includes("nack-abandoned") || m.includes("the debt is released"))).toBe(false);
+ } finally {
+ chmodSync(staging, 0o600);
+ }
+ const retry = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 28, unresolved);
+ expect(retry.abandonedForNack).toBe(1);
+ expect(nackOwed(readObligation(mailDir, AGENT, id))).toBe(false);
+ expect(existsSync(p)).toBe(held);
+ });
+ }
+
+ it("missing cur/ record: aged owed-nack release succeeds", () => {
  terminalRecord("owed-archived", "failed", 40, true);
- mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true }); // cur/ exists; the record was archived
+ mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true });
  const unresolved = reconcileTerminalCurStamps(mailDir, AGENT, quiet);
  const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), 28, unresolved);
  expect(res.abandonedForNack).toBe(1);
  expect(nackOwed(readObligation(mailDir, AGENT, "owed-archived"))).toBe(false);
  });
 
- it("control (passes on main): with its stamped cur/ record present, the aged acked record is removed", () => {
+ it("with its stamped cur/ record present, the aged acked record is removed", () => {
  const p = terminalRecord("acked-present", "acked", 40, false);
  mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true });
  writeFileSync(join(mailDir, AGENT, "cur", "2026-01-01T00-00-00-000Z-acked-present.json"),
@@ -72,10 +95,7 @@ describe("startup reconciliation: the unresolved hold and the owed-nack age boun
  expect(existsSync(p)).toBe(false);
  });
 
- // Adjacent to the audit finding (not raised by the auditor): an aged acked
- // record whose cur/ record is gone must still be removed by retention rather
- // than held as unresolved.
- it("adjacent: startup retention removes an aged acked obligation whose cur/ record is gone", () => {
+ it("startup retention removes an aged acked obligation whose cur/ record is gone", () => {
  const p = terminalRecord("acked-archived", "acked", 40, false);
  mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true });
  const unresolved = reconcileTerminalCurStamps(mailDir, AGENT, quiet);
@@ -84,9 +104,6 @@ describe("startup reconciliation: the unresolved hold and the owed-nack age boun
  expect(existsSync(p)).toBe(false);
  });
 
- // cli#526: a gone cur/ record must not produce a read-failure warning on every
- // restart. The record survives both starts (so a per-start warning would fire
- // on both) and the warning count stays zero.
  it("no repeated restart warning for a gone cur/ record across two startup compositions", () => {
  const p = terminalRecord("acked-gone-warn", "acked", 40, false);
  mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true });

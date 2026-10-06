@@ -294,10 +294,7 @@ for (const state of ["acked", "failed"] as const) {
 }
 
 for (const state of ["acked", "failed"] as const) {
-  // cli#526: the cur/ record is gone (archived or garbage-collected) — nothing
-  // is left to stamp, so the obligation is RESOLVED for retention, not held, and
-  // no read-failure warning is logged for it.
-  test(`${state}: a missing cur/ record resolves the obligation without a warning`, () => {
+  test(`${state}: a missing cur/ record is omitted from the unresolved set without a warning`, () => {
     const f = terminalFixture(state);
     realFs.unlinkSync(f.curPath);
     expect(f.reconcile().has("inbound")).toBe(false);

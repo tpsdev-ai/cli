@@ -351,17 +351,8 @@ export function markNackSent(
 }
 
 /**
- * cli#389 round 13, item 2: GIVE UP an owed nack — the record sat past the hold
- * window and the sender still had no route. Clears `nackPending` and records
- * `nackAbandonedAt` in the same write, so the debt is RELEASED: `nackOwed`
- * becomes false, the sweep no longer abandons (and logs) it on every pass, and
- * the startup retry stops for that record. Unlike `markNackSent` this is not a
- * hand-off — nothing was delivered — so the record keeps its OWN
- * `lastTransitionAt` and ages out by normal retention from there.
- *
- * Best-effort by design: a store that cannot be written leaves `nackPending`
- * set, so a later sweep abandons it again (logged by name). Returns true when
- * the write landed.
+ * Clearing the debt prevents later scheduling; it does not stop an in-flight retry.
+ * Returns true when the write landed.
  */
 export function abandonOwedNack(
   mailDir: string,
@@ -379,7 +370,7 @@ export function abandonOwedNack(
   } catch (err) {
     log?.warn?.(
       `tps-mail: obligation-write-failed: could not record the nack abandonment for ${inboundId} ` +
-        `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later sweep will abandon it again`,
+        `(${err instanceof Error ? err.message : String(err)}); release failed`,
     );
     return false;
   }
@@ -489,12 +480,6 @@ export function obligationLastTransitionMs(record: unknown): number | null {
  * (`nackSentAt` recorded, flag cleared) the record is ordinary and ages out
  * normally.
  *
- * cli#389 round 12, item 2: that hold is BOUNDED by AGE — `nackHoldDays`, a
- * configurable multiple of `retentionDays` (default `DEFAULT_NACK_HOLD_MULTIPLE`)
- * — so a sender that never gets a route cannot pin one record per affected
- * inbound forever. Past the bound the debt is ABANDONED: logged `nack-abandoned`,
- * ONCE, by name (the record's file name), and normal retention then applies.
- *
  * The same sweep owns the agent's metadata RECEIPTS (cli#389 round 3), which
  * live in this store as `receipts/<obligationId>.json` (round 5): a live
  * obligation keeps its receipt, a terminal obligation's receipt goes, and an
@@ -586,23 +571,11 @@ export function sweepTerminalObligations(
       res.left++; // pending / delivering / posted / yielded are never deletable
       continue;
     }
-    // cli#525: the owed-nack AGE BOUND decides BEFORE the unresolved hold. An
-    // owed nack past its hold window is abandoned — and the debt released — even
-    // when its inbound is in the unresolved set; otherwise the unresolved hold
-    // below would keep the record, and its startup retry, alive forever (the age
-    // bound the round-12 hold relies on would never be reached).
     let nackAbandoned = false;
     if (nackOwed(record)) {
       const owedSince = obligationLastTransitionMs(record);
       const nackCutoff = nowMs - nackHoldDays * 24 * 60 * 60 * 1000;
       if (owedSince !== null && owedSince < nackCutoff) {
-        res.abandonedForNack++;
-        // cli#389 round 13, item 2: RELEASE the debt in the same pass that gives
-        // up on it — clear `nackPending` and record `nackAbandonedAt`. Without
-        // the clear, a record retention then KEEPS would be abandoned and logged
-        // again on every sweep, and the startup retry would keep firing for a
-        // debt nobody is going to pay. Best-effort: an unwritable store keeps
-        // `nackPending`, so a later sweep abandons it again.
         const recInbound = (record as { inboundId?: unknown }).inboundId;
         const released = abandonOwedNack(
           mailDir,
@@ -611,10 +584,15 @@ export function sweepTerminalObligations(
           log,
           new Date(nowMs).toISOString(),
         );
-        log?.warn?.(
-          `tps-mail: nack-abandoned: ${name} has owed its nack past the hold window (${nackHoldDays} day(s)); ` +
-            `the debt is released${released ? "" : " (the release could not be recorded, so a later sweep will abandon it again)"}`,
-        );
+        if (!released) {
+          const obligationId = (record as { obligationId?: unknown }).obligationId;
+          log?.warn?.(`tps-mail: nack-release-failed: ${name} (${typeof obligationId === "string" ? obligationId : name}); release failed`);
+          if (typeof obligationId === "string") liveObligationIds.add(obligationId);
+          res.heldForNack++;
+          continue;
+        }
+        res.abandonedForNack++;
+        log?.warn?.(`tps-mail: nack-abandoned: ${name}; the debt is released`);
         nackAbandoned = true;
       }
     }
@@ -628,15 +606,7 @@ export function sweepTerminalObligations(
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
     if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
-    // cli#389 round 11, item 1: a record still OWING its nack mail is not
-    // deletable while it is INSIDE the hold window — startup retries delivery
-    // from this exact shape (`nackPending` with no `nackSentAt`), so sweeping it
-    // would erase the only durable evidence that the sender is still owed a
-    // mail. (An owed nack already past the window was abandoned above, and falls
-    // through to the normal terminal-retention rules.)
     if (!nackAbandoned && nackOwed(record)) {
-      // Unknown age, or still inside the hold: keep it. (An unageable record is
-      // retained on principle elsewhere too, never aged by a guess.)
       res.heldForNack++;
       continue;
     }
