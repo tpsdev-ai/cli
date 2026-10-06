@@ -1,0 +1,1 @@
+- **MailClient requires a pending placement intent to recover linked new/→cur/ records (Closes #527).** An interrupted placement left by an earlier version has no intent, so it is not delivered on recovery; after verification and the replay-history check succeed, its new/ link is removed and the record stays in cur/, and if either fails the link stays in new/ for a later retry.

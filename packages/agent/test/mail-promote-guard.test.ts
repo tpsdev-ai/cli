@@ -27,6 +27,8 @@ import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "
 import { parseFlairPublicKey } from "../src/lib/public-key.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
+import { acquireMailLockSync } from "../src/lib/mail-lock.js";
+import { mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 
 const AGENT = "mailbox";
 
@@ -118,6 +120,59 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
   // ── F1 defect 1: verification was optional (no client ⇒ unverified promote) ─
   test("NO verifier: construction throws", () => {
     expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);
+  });
+
+  test("a pending placement with matching new/ and cur/ links is delivered", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    const lock = acquireMailLockSync(join(tmpDir, AGENT));
+    if (!lock) throw new Error("lock unavailable");
+    try {
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    } finally { lock.release(); }
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const first = await client.checkNewMail();
+    const second = await client.checkNewMail();
+
+    expect(first.length + second.length).toBe(1);
+    expect(files("new")).toEqual([]);
+  });
+
+  test("a cur/ entry that is a different file with the same name is refused, not completed", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    writeFileSync(join(inbox("cur"), "m1.json"), readFileSync(join(inbox("new"), "m1.json")));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("cur")).toEqual(["m1.json"]);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
+  });
+
+  test("a pending linked placement is completed across two checks", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    const lock = acquireMailLockSync(join(tmpDir, AGENT));
+    if (!lock) throw new Error("lock unavailable");
+    try {
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    } finally { lock.release(); }
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const first = await client.checkNewMail();
+    const second = await client.checkNewMail();
+
+    expect(first.length + second.length).toBe(1);
+    expect(files("new")).toEqual([]);
+    expect(files("cur")).toEqual(["m1.json"]);
   });
 
   // ── F1 defect 2: the verifier throw was swallowed and treated as a pass ────

@@ -2,7 +2,8 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, type Dirent, existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { type Envelope, type FlairClient, verifyEnvelope } from "./signEnvelope.js";
@@ -219,12 +220,14 @@ const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
 /**
- * The replay gate for one mailbox. Both methods must be called while holding
+ * The replay gate and placement intents for one mailbox. Call while holding
  * that mailbox's lock (acquireMailLock on the same root).
  */
 export interface ReplayStore {
-  /** Has this envelope messageId already been consumed? */
-  isConsumed(messageId: string): boolean;
+  isConsumed(messageId: string, pendingFile?: string): boolean;
+  beginPlacement(messageId: string, file: string): void;
+  hasPendingPlacement(messageId: string, file: string): boolean;
+  finishPlacement(messageId: string, file: string): void;
   /**
    * Record a consumed messageId. Call ONLY after the record is in cur/; THROWS
    * on failure, and the caller must then roll the move back.
@@ -235,9 +238,53 @@ export interface ReplayStore {
 /** The durable ReplayStore for the mailbox rooted at `root` (`<mailDir>/<agent>`). */
 export function mailboxReplayStore(root: string): ReplayStore {
   return {
-    isConsumed: (messageId) => isConsumedMessageId(root, messageId),
+    isConsumed: (messageId, pendingFile) => isConsumedMessageId(root, messageId, pendingFile),
+    beginPlacement: (messageId, file) => writePlacementIntent(root, messageId, file),
+    hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
+    finishPlacement: (messageId, file) => {
+      if (readPlacementIntent(root, file)?.messageId !== messageId) return;
+      unlinkSync(placementIntentPath(root, file));
+      syncDirectory(root);
+    },
     recordConsumed: (messageId) => recordConsumedMessageId(root, messageId),
   };
+}
+
+function placementIntentPath(root: string, file: string): string {
+  return join(root, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
+}
+
+function readPlacementIntent(root: string, file: string): { messageId: string } | null {
+  let raw: string;
+  try { raw = readFileSync(placementIntentPath(root, file), "utf8"); } catch (err) {
+    if (isMissing(err)) return null;
+    throw err;
+  }
+  const intent = JSON.parse(raw);
+  if (intent?.file !== file || !isValidEnvelopeId(intent?.messageId)) throw new Error("invalid placement intent");
+  return intent;
+}
+
+function syncDirectory(root: string): void {
+  const fd = openSync(root, "r");
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function writePlacementIntent(root: string, messageId: string, file: string): void {
+  if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
+  const path = placementIntentPath(root, file);
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify({ messageId, file }));
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+    syncDirectory(root);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
 }
 
 function consumedLedgerPath(root: string): string {
@@ -382,13 +429,13 @@ function recordCarriesMessageId(msg: { envelopeId?: unknown; body?: unknown }, m
  * It reads the ledger through readConsumedLedger, which may rewrite the ledger:
  * call it only while holding the mailbox lock.
  */
-function isConsumedMessageId(root: string, messageId: string): boolean {
+function isConsumedMessageId(root: string, messageId: string, pendingFile?: string): boolean {
   if (readConsumedLedger(root).has(messageId)) return true;
 
-  return maildirHistoryHasMessageId(root, messageId);
+  return maildirHistoryHasMessageId(root, messageId, pendingFile === undefined ? undefined : join(root, "cur", pendingFile));
 }
 
-function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
+function maildirHistoryHasMessageId(root: string, messageId: string, pendingPath?: string): boolean {
   const stack = [join(root, "cur"), join(root, "archive")];
   for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
     let entries: Dirent[];
@@ -400,6 +447,7 @@ function maildirHistoryHasMessageId(root: string, messageId: string): boolean {
     }
     for (const entry of entries) {
       const full = join(dir, entry.name);
+      if (full === pendingPath) continue;
       if (entry.isDirectory()) {
         stack.push(full);
         continue;
