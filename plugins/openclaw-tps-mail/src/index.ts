@@ -673,6 +673,11 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     if (rec.state !== "acked" && rec.state !== "failed") continue;
     let unreadable = false;
     const onReadError = (path: string, code?: string) => {
+      // cli#526: a cur/ record that no longer exists (archived or
+      // garbage-collected) is RESOLVED for retention — there is nothing left to
+      // stamp, so it must not be held as unresolved, nor warned about on every
+      // start. Any other lookup problem still keeps the inbound unresolved.
+      if (code === "ENOENT") return;
       unreadable = true;
       reportReadError(stampObligationPresence(mailDir, agent, rec.inboundId), rec.inboundId)(path, code);
     };
