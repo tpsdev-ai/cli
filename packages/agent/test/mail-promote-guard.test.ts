@@ -120,6 +120,57 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);
   });
 
+  // An interrupted placement — the cur/ link made, the new/ entry not yet
+  // removed — is MailClient's own unfinished commit: the next check completes
+  // it rather than refusing the record (cli#527).
+  test("a record linked into cur/ but still in new/ (interrupted placement) is delivered on the next check", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const first = await client.checkNewMail();
+    const second = await client.checkNewMail();
+
+    expect(first.length + second.length).toBe(1);
+    expect(files("new")).toEqual([]);
+  });
+
+  // The same name is not enough: a DIFFERENT file (a separate write with
+  // identical bytes) is another record, so the cli#503 refusal stands and the
+  // record is dead-lettered as a replay rather than completed as our own.
+  test("a cur/ entry that is a different file with the same name is refused, not completed", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    writeFileSync(join(inbox("cur"), "m1.json"), readFileSync(join(inbox("new"), "m1.json")));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const msgs = await client.checkNewMail();
+
+    expect(msgs.length).toBe(0);
+    expect(files("cur")).toEqual(["m1.json"]);
+    expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
+  });
+
+  // Completing the placement delivers the record once and leaves one copy in
+  // cur/, not two and not zero.
+  test("an interrupted placement is delivered exactly once across two checks", async () => {
+    const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(inbox("cur"), { recursive: true });
+    fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    const first = await client.checkNewMail();
+    const second = await client.checkNewMail();
+
+    expect(first.length + second.length).toBe(1);
+    expect(files("new")).toEqual([]);
+    expect(files("cur")).toEqual(["m1.json"]);
+  });
+
   // ── F1 defect 2: the verifier throw was swallowed and treated as a pass ────
   test("THROWING verifier: refuses to promote — a throw must not mean pass", async () => {
     const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -61,6 +61,31 @@ function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxReject
     `class: ${cls}\nPromote rejected at ${new Date().toISOString()}\nReason: ${reason}\n`,
     "utf-8",
   );
+}
+
+/**
+ * Whether two paths name the SAME FILE — one inode reachable through two
+ * directory entries — compared by device and inode from lstat. Equal names and
+ * equal bytes are not the same file.
+ *
+ * A stat that fails with ENOENT reports the path as absent, which is not the
+ * same file; a stat that fails any other way is re-thrown, so an unreadable
+ * path is never taken for the same file (nor for an absent one).
+ */
+function sameFileByDeviceInode(a: string, b: string): boolean {
+  const sa = lstatOrAbsent(a);
+  const sb = lstatOrAbsent(b);
+  return sa !== null && sb !== null && sa.dev === sb.dev && sa.ino === sb.ino;
+}
+
+function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
+  try {
+    const st = lstatSync(path);
+    return { dev: st.dev, ino: st.ino };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
 }
 
 /**
@@ -207,13 +232,27 @@ export class MailClient {
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
-      const consumed = replay.isConsumed(envelope.messageId);
       const dstPath = join(this.inboxCur, file);
+      // cli#527: cur/<file> may be THIS client's own interrupted placement — the
+      // link into cur/ was made and the new/ entry was not yet removed. That is
+      // one inode with two links, not merely a file with the same name or the
+      // same bytes. Recognise it by device and inode before the replay gate,
+      // whose maildir fallback would otherwise read our own cur/ link as
+      // consumed history, and finish the placement by recording the id and
+      // removing the new/ entry.
+      if (sameFileByDeviceInode(srcPath, dstPath)) {
+        replay.recordConsumed(envelope.messageId);
+        unlinkSync(srcPath);
+        return null;
+      }
+      const consumed = replay.isConsumed(envelope.messageId);
       if (consumed) {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
       const placement = placeCurRecord(srcPath, dstPath);
       if (placement.status === "exists") {
+        // A DIFFERENT file under this name is a different record: refuse it
+        // (cli#503).
         throw new Error(`destination already exists: ${file}`);
       }
       try {
