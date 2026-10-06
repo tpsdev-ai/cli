@@ -63,15 +63,6 @@ function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxReject
   );
 }
 
-/**
- * Whether two paths name the SAME FILE — one inode reachable through two
- * directory entries — compared by device and inode from lstat. Equal names and
- * equal bytes are not the same file.
- *
- * A stat that fails with ENOENT reports the path as absent, which is not the
- * same file; a stat that fails any other way is re-thrown, so an unreadable
- * path is never taken for the same file (nor for an absent one).
- */
 function sameFileByDeviceInode(a: string, b: string): boolean {
   const sa = lstatOrAbsent(a);
   const sb = lstatOrAbsent(b);
@@ -127,15 +118,6 @@ export class MailClient {
     }
   }
 
-  /**
-   * A record is promoted ONLY after the shared mailbox policy
-   * (decideEnvelopeForMailbox) passes and, under the mailbox lock, the shared
-   * replay store has not seen its messageId:
-   *   - the verifier THROWS (Flair unreachable) → refuse; the record stays in
-   *     new/ for a later check (a throw must never mean "pass");
-   *   - the policy or the replay gate REJECTS → attempt dead-lettering and a
-   *     `.reason` sidecar.
-   */
   async checkNewMail(): Promise<MailMessage[]> {
     if (!existsSync(this.inboxNew)) return [];
 
@@ -185,9 +167,9 @@ export class MailClient {
         continue;
       }
 
-      // Promote to cur/ under the mailbox lock, behind the replay gate.
       try {
         const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope);
+        if (committed === "already-delivered") continue;
         if (committed) {
           this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
           continue;
@@ -226,39 +208,41 @@ export class MailClient {
     srcPath: string,
     body: string,
     envelope: Envelope,
-  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | null> {
+  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
     const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
       const dstPath = join(this.inboxCur, file);
-      // cli#527: cur/<file> may be THIS client's own interrupted placement — the
-      // link into cur/ was made and the new/ entry was not yet removed. That is
-      // one inode with two links, not merely a file with the same name or the
-      // same bytes. Recognise it by device and inode before the replay gate,
-      // whose maildir fallback would otherwise read our own cur/ link as
-      // consumed history, and finish the placement by recording the id and
-      // removing the new/ entry.
       if (sameFileByDeviceInode(srcPath, dstPath)) {
+        const pending = replay.hasPendingPlacement(envelope.messageId, file);
+        const consumed = replay.isConsumed(envelope.messageId, pending ? file : undefined);
+        if (!pending || consumed) {
+          unlinkSync(srcPath);
+          replay.finishPlacement(envelope.messageId, file);
+          return "already-delivered";
+        }
         replay.recordConsumed(envelope.messageId);
         unlinkSync(srcPath);
+        replay.finishPlacement(envelope.messageId, file);
         return null;
       }
       const consumed = replay.isConsumed(envelope.messageId);
       if (consumed) {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
+      replay.beginPlacement(envelope.messageId, file);
       const placement = placeCurRecord(srcPath, dstPath);
       if (placement.status === "exists") {
-        // A DIFFERENT file under this name is a different record: refuse it
-        // (cli#503).
+        replay.finishPlacement(envelope.messageId, file);
         throw new Error(`destination already exists: ${file}`);
       }
       try {
         unlinkSync(srcPath);
       } catch (err) {
         unlinkSync(dstPath);
+        replay.finishPlacement(envelope.messageId, file);
         throw err;
       }
       try {
@@ -266,12 +250,14 @@ export class MailClient {
       } catch (err) {
         try {
           renameSync(dstPath, srcPath);
+          replay.finishPlacement(envelope.messageId, file);
         } catch (rollbackErr) {
           throw new AggregateError([err, rollbackErr],
             `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
         }
         throw err;
       }
+      replay.finishPlacement(envelope.messageId, file);
       return null;
     } finally {
       lock.release();

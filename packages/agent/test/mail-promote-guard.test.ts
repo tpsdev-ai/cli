@@ -27,6 +27,8 @@ import { signEnvelope, type Envelope, type ChainEntry, type FlairClient } from "
 import { parseFlairPublicKey } from "../src/lib/public-key.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
+import { acquireMailLockSync } from "../src/lib/mail-lock.js";
+import { mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 
 const AGENT = "mailbox";
 
@@ -120,14 +122,16 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);
   });
 
-  // An interrupted placement — the cur/ link made, the new/ entry not yet
-  // removed — is MailClient's own unfinished commit: the next check completes
-  // it rather than refusing the record (cli#527).
-  test("a record linked into cur/ but still in new/ (interrupted placement) is delivered on the next check", async () => {
+  test("a pending placement with matching new/ and cur/ links is delivered", async () => {
     const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
     plant(wrapper("flint", env));
     mkdirSync(inbox("cur"), { recursive: true });
-    fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    const lock = acquireMailLockSync(join(tmpDir, AGENT));
+    if (!lock) throw new Error("lock unavailable");
+    try {
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    } finally { lock.release(); }
 
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
     const first = await client.checkNewMail();
@@ -137,9 +141,6 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(files("new")).toEqual([]);
   });
 
-  // The same name is not enough: a DIFFERENT file (a separate write with
-  // identical bytes) is another record, so the cli#503 refusal stands and the
-  // record is dead-lettered as a replay rather than completed as our own.
   test("a cur/ entry that is a different file with the same name is refused, not completed", async () => {
     const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
     plant(wrapper("flint", env));
@@ -154,13 +155,16 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: replay");
   });
 
-  // Completing the placement delivers the record once and leaves one copy in
-  // cur/, not two and not zero.
-  test("an interrupted placement is delivered exactly once across two checks", async () => {
+  test("a pending linked placement is completed across two checks", async () => {
     const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
     plant(wrapper("flint", env));
     mkdirSync(inbox("cur"), { recursive: true });
-    fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    const lock = acquireMailLockSync(join(tmpDir, AGENT));
+    if (!lock) throw new Error("lock unavailable");
+    try {
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
+    } finally { lock.release(); }
 
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
     const first = await client.checkNewMail();
