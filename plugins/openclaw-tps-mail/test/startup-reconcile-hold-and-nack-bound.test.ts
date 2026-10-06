@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -51,8 +51,8 @@ describe("startup reconciliation: the unresolved hold and the owed-nack age boun
  const id = "owed-write-failed";
  const p = terminalRecord(id, "failed", 40, true);
  const staging = join(obligationsDir(mailDir, AGENT), `.${id}.json.tmp`);
- writeFileSync(staging, "");
- chmodSync(staging, 0o400);
+ // A directory at the staging path makes the release write fail for any user, root included.
+ mkdirSync(staging);
  const seen: string[] = [];
  const log = { info: () => {}, warn: (m: string) => seen.push(m) };
  const unresolved = new Set(held ? [id] : []);
@@ -62,11 +62,11 @@ describe("startup reconciliation: the unresolved hold and the owed-nack age boun
  expect(nackOwed(readObligation(mailDir, AGENT, id))).toBe(true);
  expect(res.removed).toBe(0);
  expect(res.abandonedForNack).toBe(0);
- expect(seen.some((m) => m.includes("obligation-write-failed") && /EACCES|EPERM/.test(m))).toBe(true);
+ expect(seen.some((m) => m.includes("obligation-write-failed") && /EISDIR/.test(m))).toBe(true);
  expect(seen.some((m) => m.includes("nack-release-failed") && m.includes(`ob-${id}`))).toBe(true);
  expect(seen.some((m) => m.includes("nack-abandoned") || m.includes("the debt is released"))).toBe(false);
  } finally {
- chmodSync(staging, 0o600);
+ rmSync(staging, { recursive: true, force: true });
  }
  const retry = sweepTerminalObligations(mailDir, AGENT, 7, log, Date.now(), 28, unresolved);
  expect(retry.abandonedForNack).toBe(1);
