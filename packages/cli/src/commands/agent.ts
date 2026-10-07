@@ -29,6 +29,7 @@ import {
   runtimeNonoOptions,
   runtimeNonoProfile,
   approveRuntimeNonoOptions,
+  sandboxProfileGrantRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
 } from "../utils/nono.js";
@@ -910,18 +911,22 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
               allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
             };
-            const approval = selectedRuntime
-              ? approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId)
-              : null;
-            if (approval?.refusal) {
-              console.error(`❌ refusing to launch runtime '${selectedRuntime}': ${approval.refusal}`);
+            const profile = runtimeNonoProfile(selectedRuntime);
+            const approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
+            if (approval.refusal) {
+              console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+            }
+            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime);
+            if (profileRefusal) {
+              console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             const exitCode = await launchAttested(
-              runtimeNonoProfile(selectedRuntime),
-              approval?.options ?? launchOptions,
+              profile,
+              approval.options,
               relaunch,
-              { runtimeDirectories: approval?.runtimeDirectories },
+              { runtimeDirectories: approval.runtimeDirectories },
             );
             process.exit(exitCode);
           }

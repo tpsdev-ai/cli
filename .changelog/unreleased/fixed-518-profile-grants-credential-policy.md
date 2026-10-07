@@ -1,2 +1,1 @@
-- **A sandbox profile's filesystem grants are checked against the credential policy, and a runtime directory inside the profile directory is refused.**
-  A profile that grants a TPS credential root, or that covers another runtime's credential file, stops the launch naming the offending path and the policy it violates. The profile and the profiles it extends are read; one that is present but unreadable is refused. Paths resolve symlinks before the check.
+- **The nono agent launch path checks declared profile grants and refuses writable launch directories overlapping nono profile directories.**

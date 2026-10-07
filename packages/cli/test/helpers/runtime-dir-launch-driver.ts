@@ -38,4 +38,4 @@ mock.module(attestationPath, () => ({
 }));
 
 const { runAgent } = await import("../../src/commands/agent.js");
-await runAgent({ action: "start", id: "probe", runtime: "claude-code", sandboxRequired: true });
+await runAgent({ action: "start", id: "probe", runtime: process.env.TPS_TEST_DEFAULT_RUNTIME ? undefined : "claude-code", sandboxRequired: true });

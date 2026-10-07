@@ -342,18 +342,13 @@ function tpsCredentialRoots(
   }));
 }
 
-/**
- * The directories a sandbox profile is resolved from, in `resolveProfilePath`
- * order: the per-user profile directory, then the bundled profiles. A writable
- * runtime directory that resolves into one of these could rewrite the profile
- * this launch — or the next — loads, so the launcher refuses it (cli#518).
- */
 function sandboxProfileDirectories(
   env: NodeJS.ProcessEnv = process.env,
 ): Array<{ label: string; path: string }> {
   const home = env.HOME || homedir() || "/tmp";
   const dirs = [
     { label: "~/.config/nono/profiles", path: join(home, ".config", "nono", "profiles") },
+    { label: "the XDG nono profile directory", path: join(env.XDG_CONFIG_HOME || join(home, ".config"), "nono", "profiles") },
     { label: "the bundled nono-profiles directory", path: findBundledProfilesDir() },
   ];
   const seen = new Set<string>();
@@ -372,37 +367,29 @@ function expandHome(p: string, env: NodeJS.ProcessEnv): string {
   return p;
 }
 
-/** One filesystem grant a sandbox profile declares. */
 interface ProfileGrant {
-  /** The profile key it came from: read, allow, read_file or allow_file. */
   kind: string;
-  /** The path as written, with a leading `~` expanded against HOME. */
   path: string;
 }
 
-/**
- * Read a sandbox profile and the profiles it extends, and return the
- * filesystem grants they declare (cli#518). A profile that is present but
- * cannot be read or parsed THROWS — the caller refuses rather than treating an
- * unreadable profile as granting nothing. An `extends` name that resolves to no
- * file here contributes no grant (nono's `default` is one such built-in name).
- */
 function sandboxProfileGrants(profile: string, env: NodeJS.ProcessEnv): ProfileGrant[] {
   const grants: ProfileGrant[] = [];
   const seen = new Set<string>();
   const visit = (name: string, from: string | null, depth: number): void => {
     if (depth > 16) throw new Error(`the profile chain from '${profile}' extends more than 16 deep`);
-    const path =
-      from && (name.includes("/") || name.endsWith(".json"))
-        ? resolve(dirname(from), name)
-        : resolveProfilePath(name, env);
-    if (!path) return; // nono's own built-in profile, not a TPS file
-    let canon: string;
-    try {
-      canon = canonicalPath(path);
-    } catch (err) {
-      throw new Error(`cannot resolve sandbox profile ${path}: ${(err as Error).message}`);
+    if (from && env.XDG_CONFIG_HOME &&
+      canonicalPath(env.XDG_CONFIG_HOME) !== canonicalPath(join(env.HOME || homedir(), ".config"))) {
+      throw new Error(`unsupported extends '${name}' with a different XDG_CONFIG_HOME`);
     }
+    if (from && (name.includes("/") || name.endsWith(".json"))) {
+      throw new Error(`unsupported extends path '${name}' in sandbox profile ${from}`);
+    }
+    const path = resolveProfilePath(name, env);
+    if (!path) {
+      if (from && name === "default") return;
+      throw new Error(`cannot resolve sandbox profile '${name}'${from ? ` in extends of ${from}` : ""}`);
+    }
+    const canon = canonicalPath(path);
     if (seen.has(canon)) return;
     seen.add(canon);
     let doc: unknown;
@@ -412,50 +399,65 @@ function sandboxProfileGrants(profile: string, env: NodeJS.ProcessEnv): ProfileG
       throw new Error(`cannot read sandbox profile ${path}: ${(err as Error).message}`);
     }
     grants.push(...declaredGrants(doc, path, env));
-    if (typeof (doc as Record<string, unknown>).extends === "string") {
-      visit((doc as Record<string, string>).extends, path, depth + 1);
+    const parents = (doc as Record<string, unknown>).extends;
+    if (parents === undefined || parents === null) return;
+    const names = typeof parents === "string" ? [parents] : parents;
+    if (!Array.isArray(names) || !names.length || names.some((name) => typeof name !== "string")) {
+      throw new Error(`unsupported extends in sandbox profile ${path}`);
     }
+    for (const parent of names) visit(parent, path, depth + 1);
   };
   visit(profile, null, 0);
   return grants;
 }
 
-/** The filesystem grants one parsed sandbox profile declares, or a throw when
- * the shape is not the JSON object nono's schema requires. */
 function declaredGrants(doc: unknown, path: string, env: NodeJS.ProcessEnv): ProfileGrant[] {
-  if (typeof doc !== "object" || doc === null) {
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
     throw new Error(`sandbox profile ${path} is not a JSON object`);
   }
-  const filesystem = (doc as Record<string, unknown>).filesystem;
+  const record = doc as Record<string, unknown>;
+  for (const key of ["platform_overrides", "unsafe_macos_seatbelt_rules", "packs", "command_policies"]) {
+    if (record[key] !== undefined && record[key] !== null) {
+      throw new Error(`unsupported ${key} in sandbox profile ${path}`);
+    }
+  }
+  const filesystem = record.filesystem;
   if (filesystem === undefined) return [];
-  if (typeof filesystem !== "object" || filesystem === null) {
+  if (typeof filesystem !== "object" || filesystem === null || Array.isArray(filesystem)) {
     throw new Error(`sandbox profile ${path} has a non-object filesystem section`);
   }
   const grants: ProfileGrant[] = [];
-  for (const key of ["read", "allow", "read_file", "allow_file"] as const) {
-    const entries = (filesystem as Record<string, unknown>)[key];
-    if (entries === undefined) continue;
+  for (const [key, entries] of Object.entries(filesystem)) {
+    if (["deny", "bypass_protection", "suppress_save_prompt", "ignore"].includes(key)) continue;
+    if (!["read", "allow", "write", "read_file", "allow_file", "write_file"].includes(key)) {
+      throw new Error(`unsupported filesystem.${key} in sandbox profile ${path}`);
+    }
     if (!Array.isArray(entries)) {
       throw new Error(`sandbox profile ${path} has a non-list filesystem.${key}`);
     }
     for (const entry of entries) {
-      if (typeof entry !== "string") {
-        throw new Error(`sandbox profile ${path} has a non-string filesystem.${key} entry`);
+      let value: unknown = entry;
+      if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+        if (Object.keys(entry).some((key) => key !== "path" && key !== "when")) {
+          throw new Error(`unsupported conditional-path filesystem.${key} entry in ${path}`);
+        }
+        value = entry.path;
       }
-      grants.push({ kind: key, path: expandHome(entry, env) });
+      if (typeof value !== "string") {
+        throw new Error(`unsupported filesystem.${key} path in sandbox profile ${path}`);
+      }
+      if (/[*?\[\]{}]/.test(value)) {
+        throw new Error(`unsupported filesystem.${key} glob '${value}' in sandbox profile ${path}`);
+      }
+      if (value.includes("$") || (!isAbsolute(value) && value !== "~" && !value.startsWith("~/"))) {
+        throw new Error(`unsupported filesystem.${key} path expansion '${value}' in sandbox profile ${path}`);
+      }
+      grants.push({ kind: key, path: expandHome(value, env) });
     }
   }
   return grants;
 }
 
-/**
- * Check a sandbox profile's own filesystem grants against the same credential
- * policy the launcher applies to the launch's other grants (cli#518): a
- * profile that grants a TPS credential root, or covers another runtime's
- * credential file, is refused before the launch. Returns the refusal, or null
- * when the profile grants nothing protected — a profile that is not found
- * yields null, since the launch's own profile check refuses a missing profile.
- */
 export function sandboxProfileGrantRefusal(
   profile: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -473,6 +475,9 @@ export function sandboxProfileGrantRefusal(
       ...r,
       comparison: asComparison(canonicalPath(r.path)),
     }));
+    const profileDirs = sandboxProfileDirectories(env).map((d) => ({
+      ...d, comparison: asComparison(canonicalPath(d.path)),
+    }));
     const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
     const foreignFiles = runtimes
       .filter((rt) => rt !== runtime)
@@ -480,6 +485,11 @@ export function sandboxProfileGrantRefusal(
       .map((f) => ({ path: f, comparison: asComparison(canonicalPath(f)) }));
     for (const grant of grants) {
       const comparison = asComparison(canonicalPath(grant.path));
+      const writable = ["allow", "write", "allow_file", "write_file"].includes(grant.kind);
+      const profileDir = writable && profileDirs.find((d) => pathsOverlap(comparison, d.comparison));
+      if (profileDir) {
+        return `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', which overlaps the sandbox profile directory ${profileDir.path}`;
+      }
       const root = roots.find((r) => pathsOverlap(comparison, r.comparison));
       if (root) {
         return (
@@ -648,11 +658,11 @@ export function approveRuntimeNonoOptions(
       }
     }
 
-    const dirGrants: Array<{ label: string; path: string }> = [];
-    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir });
-    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd });
+    const dirGrants: Array<{ label: string; path: string; writable?: boolean }> = [];
+    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir, writable: true });
+    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd, writable: true });
     for (const p of grants.read ?? []) dirGrants.push({ label: `the read grant '${p}'`, path: p });
-    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p });
+    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p, writable: true });
     for (const p of runtimeNonoOptions(runtime, env).allow ?? []) {
       const profileDir = profileDirs.find((d) => overlaps(canonical(p), d.canon));
       if (profileDir) {
@@ -662,7 +672,7 @@ export function approveRuntimeNonoOptions(
         );
       }
       runtimeDirectories.push(canonical(p));
-      dirGrants.push({ label: `the runtime directory '${p}'`, path: p });
+      dirGrants.push({ label: `the runtime directory '${p}'`, path: p, writable: true });
     }
 
     const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
@@ -683,6 +693,10 @@ export function approveRuntimeNonoOptions(
               ? `set the workspace to a directory outside the credential roots`
               : `remove or narrow this grant to a directory outside the credential roots`)
         );
+      }
+      const profileHit = grant.writable && profileDirs.find((d) => overlaps(canon, d.canon));
+      if (profileHit) {
+        return result(`${grant.label} (${grant.path}) overlaps the sandbox profile directory ${profileHit.label} (${profileHit.path})`);
       }
       const foreign = foreignFiles.find((f) => contains(canon, f.canon));
       if (foreign) {
@@ -725,10 +739,6 @@ export function approveRuntimeNonoOptions(
     }
     for (const key of ["read", "allow", "readFiles", "allowFiles"] as const) {
       options[key] = (grants[key] ?? []).map(canonical);
-    }
-    if (runtimes.includes(runtime as CredentialRuntime)) {
-      const profileRefusal = sandboxProfileGrantRefusal(runtimeNonoProfile(runtime), env, runtime);
-      if (profileRefusal) return result(profileRefusal);
     }
     return result(null);
   } catch (err) {

@@ -40,7 +40,7 @@ afterEach(() => {
   while (homes.length > 0) rmSync(homes.pop()!, { recursive: true, force: true });
 });
 
-describe("cli#518 — a sandbox profile's filesystem grants are checked against the credential policy", () => {
+describe("cli#518 profile grants", () => {
   test.skipIf(!profileGrantRefusal)("a profile granting the credential store names the grant and the root", () => {
     const home = makeHome();
     writeProfile(home, { filesystem: { allow: ["~/.tps/secrets"] } });
@@ -74,17 +74,106 @@ describe("cli#518 — a sandbox profile's filesystem grants are checked against 
     expect(reason).toContain("~/.tps/identity");
   });
 
-  test.skipIf(!profileGrantRefusal)("a profile that cannot be read is refused, not treated as granting nothing", () => {
+  test.skipIf(!profileGrantRefusal)("malformed JSON is refused", () => {
     const home = makeHome();
     writeProfile(home, "{ this is not json");
     const reason = profileGrantRefusal!("tps-agent-run-claude-code", envFor(home), "claude-code");
     expect(reason).toContain("cannot read the sandbox profile");
   });
 
-  test.skipIf(!profileGrantRefusal)("a profile that is not found yields no refusal here", () => {
+  test.skipIf(!profileGrantRefusal)("a missing profile is refused", () => {
     const home = makeHome();
-    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home), "claude-code")).toBeNull();
+    expect(profileGrantRefusal!("missing-fixture", envFor(home), "claude-code")).toContain("cannot resolve");
   });
+
+  for (const key of ["read", "allow", "write", "read_file", "allow_file", "write_file"]) {
+    for (const conditional of [false, true]) {
+      test(`${key} ${conditional ? "conditional-path" : "string"} protected grant is refused`, () => {
+        const home = makeHome();
+        const path = join(home, ".tps", "secrets", "fixture");
+        writeProfile(home, { filesystem: { [key]: [conditional ? { path, when: ["linux", "macos"] } : path] } });
+        const reason = profileGrantRefusal!("tps-agent-run-claude-code", envFor(home), "claude-code");
+        expect(reason).toContain(`filesystem.${key}`);
+        expect(reason).toContain("~/.tps/secrets");
+      });
+    }
+    test(`${key} glob is refused by name`, () => {
+      const home = makeHome();
+      writeProfile(home, { filesystem: { [key]: [join(home, ".tps", "*", "**")] } });
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain(`filesystem.${key} glob`);
+    });
+  }
+
+  test("a writable profile grant at the profile directory is refused", () => {
+    const home = makeHome();
+    writeProfile(home, { filesystem: { write: [join(home, ".config", "nono", "profiles")] } });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("sandbox profile directory");
+  });
+
+  test("inheritance with a different XDG_CONFIG_HOME is refused by name", () => {
+    const home = makeHome();
+    writeProfile(home, { extends: "default" });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { XDG_CONFIG_HOME: join(home, "xdg") }))).toContain("XDG_CONFIG_HOME");
+  });
+
+  test("inheritance by path is refused by name", () => {
+    const home = makeHome();
+    writeProfile(home, { filesystem: { read: ["~/.tps/secrets"] } }, "protected-parent");
+    writeProfile(home, { extends: "./protected-parent.json" });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("unsupported extends path");
+  });
+
+  test("array inheritance checks a later parent", () => {
+    const home = makeHome();
+    writeProfile(home, { filesystem: { read: ["/usr"] } }, "safe-parent");
+    writeProfile(home, { filesystem: { write: [join(home, ".tps", "auth")] } }, "protected-parent");
+    writeProfile(home, { extends: ["safe-parent", "protected-parent"] });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("filesystem.write");
+  });
+
+  for (const platform of ["macos", "linux", "windows"]) {
+    test(`${platform} platform override is refused by name`, () => {
+      const home = makeHome();
+      writeProfile(home, { platform_overrides: { [platform]: { filesystem: { allow: ["~/.tps/secrets"] } } } });
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("unsupported platform_overrides");
+    });
+  }
+
+  test("a harmless conditional read is accepted", () => {
+    const home = makeHome();
+    writeProfile(home, { filesystem: { read: [{ path: "/usr", when: "linux" }] } });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toBeNull();
+  });
+
+  test("a protected conditional read is checked even when inactive", () => {
+    const home = makeHome();
+    writeProfile(home, { filesystem: { read: [{ path: "~/.tps/auth", when: "windows" }] } });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("~/.tps/auth");
+  });
+
+  test("an unresolved built-in parent is refused by name", () => {
+    const home = makeHome();
+    writeProfile(home, { extends: "claude-code" });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("extends");
+  });
+
+  for (const path of ["$HOME/.tps/secrets", "$WORKDIR", "./secrets"]) {
+    test(`path expansion ${path} is refused by name`, () => {
+      const home = makeHome();
+      writeProfile(home, { filesystem: { read: [path] } });
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("path expansion");
+    });
+  }
+
+  test("profile identity reads and agent-bound launch identity reads differ", () => {
+    const home = makeHome();
+    const key = join(home, ".tps", "identity", "probe.key");
+    writeFileSync(key, "fixture");
+    writeProfile(home, { filesystem: { read_file: [key] } });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home))).toContain("~/.tps/identity");
+    expect(nono.approveRuntimeNonoOptions(undefined, { readFiles: [key] }, envFor(home), "probe").refusal).toBeNull();
+  });
+
 });
 
 describe("cli#518 — a runtime directory inside the sandbox profile directory is refused", () => {
@@ -122,9 +211,21 @@ describe("cli#518 — a runtime directory inside the sandbox profile directory i
     ).refusal;
     expect(reason).toBeNull();
   });
+
+  for (const kind of ["allow", "workdir", "cwd"] as const) {
+    for (const ancestor of [false, true]) {
+      test(`${kind} ${ancestor ? "ancestor" : "direct"} profile-directory grant is refused`, () => {
+        const home = makeHome();
+        const path = ancestor ? join(home, ".config") : profileDir(home);
+        const grants = kind === "allow" ? { allow: [path] } : { [kind]: path };
+        expect(nono.approveRuntimeNonoOptions(undefined, grants, envFor(home)).refusal).toContain("sandbox profile directory");
+      });
+    }
+  }
+
 });
 
-describe("cli#518 — the launch refuses a profile or runtime directory that reaches the credential policy", () => {
+describe("cli#518 launch checks", () => {
   const runLaunch = (sb: ReturnType<typeof makeSandbox>, extra: Record<string, string> = {}) =>
     spawnSync(process.execPath, [join(import.meta.dir, "helpers/runtime-dir-launch-driver.ts")], {
       cwd: sb.ws,
@@ -143,6 +244,31 @@ describe("cli#518 — the launch refuses a profile or runtime directory that rea
       expect(text).toContain(join(sb.home, ".tps", "secrets"));
       expect(text).toContain("~/.tps/secrets");
       expect(text).not.toContain("HANDOFF ");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("the default AgentRuntime launch checks its profile", () => {
+    const sb = makeSandbox();
+    try {
+      writeProfile(sb.home, { filesystem: { read: [join(sb.home, ".tps", "auth")] } }, "tps-agent-run");
+      const r = runLaunch(sb, { TPS_TEST_DEFAULT_RUNTIME: "1" });
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(78);
+      expect(`${r.stdout}${r.stderr}`).toContain("filesystem.read");
+      expect(`${r.stdout}${r.stderr}`).not.toContain("HANDOFF ");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a launch with TMPDIR at the profile directory is refused", () => {
+    const sb = makeSandbox();
+    try {
+      const r = runLaunch(sb, { TMPDIR: join(sb.home, ".config", "nono", "profiles"), TPS_TEST_DEFAULT_RUNTIME: "1" });
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(78);
+      expect(`${r.stdout}${r.stderr}`).toContain("sandbox profile directory");
+      expect(`${r.stdout}${r.stderr}`).not.toContain("HANDOFF ");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -171,6 +297,18 @@ describe("cli#518 — the launch refuses a profile or runtime directory that rea
       expect(r.status, text).toBe(78);
       expect(text).toContain("CLAUDE_CONFIG_DIR");
       expect(text).not.toContain("HANDOFF ");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a default AgentRuntime launch proceeds with the fixture profile", () => {
+    const sb = makeSandbox();
+    try {
+      const r = runLaunch(sb, { TPS_TEST_DEFAULT_RUNTIME: "1" });
+      expect(r.status, `${r.stdout}${r.stderr}`).toBe(0);
+      expect(`${r.stdout}${r.stderr}`).toContain('"profile":"tps-agent-run"');
+      expect(`${r.stdout}${r.stderr}`).toContain("HANDOFF ");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
