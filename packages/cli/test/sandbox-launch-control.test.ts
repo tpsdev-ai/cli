@@ -169,6 +169,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       chmodSync(shimPath, 0o755);
 
       spawnSync("bun", [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
+        cwd: ws,
         encoding: "utf-8",
         timeout: 8000,
         killSignal: "SIGKILL",

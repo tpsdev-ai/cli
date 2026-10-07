@@ -581,12 +581,10 @@ describe("4e fixtures — the launcher refuses (fake nono, pinned absolute path)
     }
   });
 
-  test("the private dir inside the granted tmpdir → refused BEFORE spawning (overlap assert)", () => {
+  test("HOME inside the granted tmpdir → credential root overlap refused BEFORE spawning", () => {
     const sb = makeSandbox("priv-in-tmp");
     try {
       const bin = writeFakeNono(sb, FAKE_NONO);
-      // A full HOME inside the granted tmpdir: the private dir then lands inside
-      // the TMPDIR grant (a naive mkdtemp under TMPDIR).
       seedHome(sb.tmp, sb.ws);
       const r = runLauncher(sb, ["agent", "start", "--id", "probe", SANDBOX_REQUIRED_FLAG], {
         [NONO_BIN_ENV]: bin,
@@ -594,8 +592,8 @@ describe("4e fixtures — the launcher refuses (fake nono, pinned absolute path)
         TMPDIR: sb.tmp,
       });
       const text = out(r);
-      expect(text).toContain("OUTSIDE canary");
-      expect(text).toContain("inside the grant");
+      expect(text).toContain(`the writable grant '${sb.tmp}'`);
+      expect(text).toContain("overlaps the TPS credential root ~/.tps/auth");
       expect(r.status).toBe(78);
       expect(fakeNonoRuns(sb)).toEqual([]); // refused BEFORE spawning
       expect(launchDirs({ home: sb.tmp } as Sandbox)).toEqual([]);
