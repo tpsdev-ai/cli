@@ -1,0 +1,1 @@
+- **The mailbox lock's default retry interval is 2 ms instead of 25 ms (Closes #538).**

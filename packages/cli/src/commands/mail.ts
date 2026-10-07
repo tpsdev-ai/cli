@@ -417,7 +417,7 @@ export async function runMail(args: MailArgs): Promise<void> {
     case "list": {
       const agent = await resolveAgentId(args.agent);
       let messages = (await listMessages(agent))
-        .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+        .sort((a, b) => Date.parse(b.receivedAt ?? b.timestamp) - Date.parse(a.receivedAt ?? a.timestamp));
       if (args.status && args.status !== "all") {
         messages = messages.filter((m) => {
           if (args.status === "new") return !m.read && !m.checkedOutAt && !m.nackedAt;

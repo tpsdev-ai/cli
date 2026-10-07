@@ -1,9 +1,9 @@
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, getMailDir, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -370,19 +370,41 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
+function recordAcceptance(acceptedDir: string, marker: string): void {
+  mkdirMailDirectory(acceptedDir);
+  const tmp = `${marker}.tmp`;
+  writeFileSync(tmp, "", { mode: 0o600 });
+  syncMailFile(tmp);
+  renameSync(tmp, marker);
+  syncMailDirectory(acceptedDir);
+}
+
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
   MailDeliverBodySchema.shape.id.parse(body.id);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
   // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
   const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
   const marker = join(acceptedDir, body.id);
-  // A marker in the earlier unscoped layout sits directly in .relay-accepted/.
-  if (existsSync(marker) || existsSync(join(getMailDir(), ".relay-accepted", body.id))) return false;
+  const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
+  const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
+  const delivery = { branchId, id: body.id };
+  const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp });
+  if (existingMarker && existingRecord) {
+    syncMailFile(existingMarker);
+    syncMailDirectory(dirname(existingMarker));
+    return false;
+  }
+  if (!existingMarker && existingRecord) {
+    recordAcceptance(acceptedDir, marker);
+    return false;
+  }
+
   let delivered: boolean;
   try {
-    sendMessage(body.to, body.content, body.from);
+    sendMessage(body.to, body.content, body.from, delivery, body.timestamp);
     delivered = true;
   } catch (e: unknown) {
+    if (e instanceof MailSyncError) throw e;
     const reason = e instanceof Error ? e.message : String(e);
     const cls: PromoteRejectClass = /inbox full/i.test(reason)
       ? "inbox-full"
@@ -394,6 +416,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
         { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
         cls,
         reason,
+        delivery,
       );
     } catch (dlqErr: unknown) {
       console.error(
@@ -403,12 +426,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     }
     delivered = false;
   }
-  try {
-    mkdirSync(acceptedDir, { recursive: true });
-    writeFileSync(marker, "", "utf-8");
-  } catch (e: unknown) {
-    console.error(`[relay] could not record message ${body.id} as accepted: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  recordAcceptance(acceptedDir, marker);
   return delivered;
 }
 
