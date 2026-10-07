@@ -76,12 +76,16 @@ describe("startup reconciliation: the unresolved hold and the owed-nack age boun
  }
 
  it("missing cur/ record: aged owed-nack release succeeds", () => {
- terminalRecord("owed-archived", "failed", 40, true);
+ const p = terminalRecord("owed-archived", "failed", 40, true);
  mkdirSync(join(mailDir, AGENT, "cur"), { recursive: true });
  const unresolved = reconcileTerminalCurStamps(mailDir, AGENT, quiet);
+ expect(unresolved.has("owed-archived")).toBe(false);
  const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet, Date.now(), 28, unresolved);
  expect(res.abandonedForNack).toBe(1);
  expect(nackOwed(readObligation(mailDir, AGENT, "owed-archived"))).toBe(false);
+ expect(res.removed).toBe(1);
+ expect(existsSync(p)).toBe(false);
+ expect(res.heldForRecovery).toBe(0);
  });
 
  it("with its stamped cur/ record present, the aged acked record is removed", () => {
