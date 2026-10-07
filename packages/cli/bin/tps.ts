@@ -428,6 +428,26 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
   return { requested, argv: parsed };
 }
 
+/**
+ * secrets-guard's own mode flags, read only up to the start of the wrapped
+ * command. parseHelpArgs closes that region with `--` before the first
+ * non-flag argument, so this scan never reads a flag-shaped word out of the
+ * wrapped command's arguments. Called with the parsed argv, so `--no-guard`
+ * survives as written (meow's own parser treats it as a negation).
+ */
+function parseGuardMode(argv: readonly string[]): { check: boolean; noGuard: boolean } {
+  const start = argv.indexOf("secrets-guard");
+  let check = false;
+  let noGuard = false;
+  for (let i = Math.max(start, 0) + 1; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--") break;
+    if (arg === "--check") check = true;
+    else if (arg === "--no-guard") noGuard = true;
+  }
+  return { check, noGuard };
+}
+
 async function main() {
   if (process.argv.includes("--version") || process.argv.includes("-v")) {
     // Version is injected at build time to avoid runtime package.json reads,
@@ -1029,8 +1049,12 @@ async function main() {
     case "secrets-guard": {
       const { runSecretsGuard } = await import("../src/commands/secrets-guard.js");
 
+      // Flags are read only up to the start of the wrapped command; a
+      // flag-shaped word in the wrapped command's arguments is data.
+      const mode = parseGuardMode(helpArgs.argv);
+
       // --check mode: read stdin, print match count
-      if (process.argv.includes("--check")) {
+      if (mode.check) {
         // Collect stdin
         let data = "";
         process.stdin.setEncoding("utf-8");
@@ -1056,7 +1080,7 @@ async function main() {
         action: "guard",
         cmd,
         args: rest.slice(1),
-        noGuard: process.argv.includes("--no-guard"),
+        noGuard: mode.noGuard,
       });
       break;
     }
