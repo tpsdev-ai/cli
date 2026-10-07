@@ -353,6 +353,14 @@ export function markNackSent(
 /**
  * Clearing the debt prevents later scheduling; it does not stop an in-flight retry.
  * Returns true when the write landed.
+ *
+ * cli#533: the record is re-read here and re-checked before the release write.
+ * The sweep decided from ITS read; between that read and this write the record
+ * can be rewritten to a FRESH debt. With the window the sweep passes
+ * (`nackCutoffMs`), the release proceeds only while the re-read record is STILL
+ * an owed nack (`nackPending`, no `nackSentAt`) whose last transition is still
+ * OLDER than that window. A record that now carries a newer debt — a fresh
+ * `nackPending`, or a transition inside the window — is left untouched.
  */
 export function abandonOwedNack(
   mailDir: string,
@@ -360,9 +368,14 @@ export function abandonOwedNack(
   inboundId: string,
   log?: ObligationLog,
   when?: string,
+  nackCutoffMs?: number,
 ): boolean {
   const current = readObligation(mailDir, agent, inboundId);
-  if (!current || current.state !== "failed") return false;
+  if (!current || !nackOwed(current)) return false;
+  if (typeof nackCutoffMs === "number") {
+    const owedSince = obligationLastTransitionMs(current);
+    if (owedSince === null || owedSince >= nackCutoffMs) return false;
+  }
   const { nackPending: _cleared, ...rest } = current;
   try {
     writeObligation(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
@@ -480,6 +493,12 @@ export function obligationLastTransitionMs(record: unknown): number | null {
  * (`nackSentAt` recorded, flag cleared) the record is ordinary and ages out
  * normally.
  *
+ * cli#389 round 12, item 2: that hold is BOUNDED by AGE — `nackHoldDays`, a
+ * configurable multiple of `retentionDays` (default `DEFAULT_NACK_HOLD_MULTIPLE`).
+ * An owed nack held as unresolved is released once it is older than the window,
+ * and not before: past the bound the debt is ABANDONED, logged once by name
+ * (`nack-abandoned`), and normal retention then applies.
+ *
  * The same sweep owns the agent's metadata RECEIPTS (cli#389 round 3), which
  * live in this store as `receipts/<obligationId>.json` (round 5): a live
  * obligation keeps its receipt, a terminal obligation's receipt goes, and an
@@ -583,6 +602,7 @@ export function sweepTerminalObligations(
           typeof recInbound === "string" ? recInbound : name.replace(/\.json$/, ""),
           log,
           new Date(nowMs).toISOString(),
+          nackCutoff,
         );
         if (!released) {
           const obligationId = (record as { obligationId?: unknown }).obligationId;
@@ -605,11 +625,16 @@ export function sweepTerminalObligations(
       continue;
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
-    if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
     if (!nackAbandoned && nackOwed(record)) {
+      // cli#533: a record HELD for its owed nack is still RETAINED, so its
+      // metadata receipt is retained with it — mark it LIVE for the receipt
+      // sweep. Adding it to terminalObligationIds here would delete the receipt
+      // while the obligation stays.
+      if (typeof snapshotObligationId === "string") liveObligationIds.add(snapshotObligationId);
       res.heldForNack++;
       continue;
     }
+    if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
     // A terminal record whose cur/ record is still unresolved is HELD until
     // startup recovery resolves it (else a re-dispatch would open a fresh
     // obligation and double-post).
