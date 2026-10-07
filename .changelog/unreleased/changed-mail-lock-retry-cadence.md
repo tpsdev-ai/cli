@@ -1,1 +1,1 @@
-- **The mailbox lock retries a missed acquisition every 2 ms instead of every 25 ms (Closes #538).**
+- **The mailbox lock's default retry interval is 2 ms instead of 25 ms (Closes #538).**
