@@ -10,7 +10,7 @@ import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
 import { parseOfficeManifest } from "../schema/manifest.js";
 import { connectAndKeepAlive, startRelay, syncRemoteBranch } from "../utils/relay.js";
-import { MSG_JOIN_COMPLETE, MSG_MAIL_DELIVER } from "../utils/wire-mail.js";
+import { MSG_JOIN_COMPLETE } from "../utils/wire-mail.js";
 import { ensureDefaultServices, listServices } from "../utils/service-registry.js";
 import { WsNoiseTransport } from "../utils/ws-noise-transport.js";
 import { branchRoot as sharedBranchRoot, resolveTeamId, workspacePath as sharedWorkspacePath } from "../utils/workspace.js";
@@ -876,10 +876,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
       const hostKp = await loadHostIdentity();
       const stop = await connectAndKeepAlive(args.agent, {
-        onMessage: (msg) => {
-          if (msg.type === MSG_MAIL_DELIVER) {
-            console.log(`\n[${new Date().toLocaleTimeString()}] ✉️ Mail received`);
-          }
+        onAccepted: () => {
+          console.log(`\n[${new Date().toLocaleTimeString()}] ✉️ Mail received`);
         }
       });
 

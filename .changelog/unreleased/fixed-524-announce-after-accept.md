@@ -1,0 +1,1 @@
+- **`tps office connect` announces a relayed message after the local acceptance path has recorded it (Closes #524).** Previously the received line fired on the raw `MAIL_DELIVER` frame, so a refused delivery (payload conflict, quarantine or write failure) announced mail the inbox did not receive.
