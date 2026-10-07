@@ -63,12 +63,15 @@ function privateDirectory(path) {
   }
 }
 
-export function createMailboxStore(root, path) {
+export function benchmarkPaths(mailDir) {
+  return { mailDir, store: resolve(mailDir, AGENT) };
+}
+
+export function createMailboxStore(root) {
   privateDirectory(root);
-  if (path !== join(root, "mailbox")) throw new Error("refused mailbox directory");
-  mkdirSync(path, { mode: 0o700 });
-  privateDirectory(path);
-  mkdirSync(join(path, AGENT), { mode: 0o700 });
+  const { store } = benchmarkPaths(root);
+  mkdirSync(store, { mode: 0o700 });
+  privateDirectory(store);
 }
 
 function verifyRole() {
@@ -79,7 +82,7 @@ function verifyRole() {
     throw new Error("invalid benchmark root");
   }
   privateDirectory(root);
-  if (F.dir !== join(root, "mailbox")) throw new Error("refused mailbox directory");
+  if (F.dir !== root) throw new Error("refused mailbox directory");
   privateDirectory(F.dir);
   const marker = join(root, ".bench-parent.json");
   if (!lstatSync(marker).isFile()) throw new Error("invalid parent marker");
@@ -92,12 +95,12 @@ function verifyRole() {
     if (resolve(F[name]) !== join(root, name)) throw new Error(`invalid ${name} path`);
     F[name] = confinedPath(root, F[name]);
   }
-  privateDirectory(join(F.dir, AGENT));
-  const entries = readdirSync(F.dir);
-  if (entries.length !== 1 || entries[0] !== AGENT || readdirSync(join(F.dir, AGENT)).length) {
+  const paths = benchmarkPaths(F.dir);
+  privateDirectory(paths.store);
+  if (readdirSync(paths.store).length) {
     throw new Error("refused populated mailbox");
   }
-  return F.dir;
+  return paths;
 }
 
 async function loadMeasuredComponents() {
@@ -159,12 +162,12 @@ function seedAgedBatch(mailDir, n, tag) {
 }
 
 async function roleMain() {
-  const root = verifyRole();
+  const { mailDir, store } = verifyRole();
   if (F.role !== "watch") await loadMeasuredComponents();
   writeFileSync(F.ready, "ready", { flag: "wx" });
   while (!existsSync(F.go)) await pause(1);
   if (F.role === "watch") {
-    const ownerPath = join(root, AGENT, ".mail-lock", "owner.json");
+    const ownerPath = join(store, ".mail-lock", "owner.json");
     const spans = [];
     let current = null;
     let start = 0;
@@ -192,9 +195,9 @@ async function roleMain() {
       const obligationId = `ob-${inboundId}`;
       const iso = new Date().toISOString();
       for (const call of [
-        () => createObligation(root, AGENT, () => makeRecord(obligationId, inboundId, "pending", iso), QUIET),
-        () => transitionObligation(root, AGENT, inboundId, "delivering", {}, QUIET),
-        () => writeObligation(root, AGENT, makeRecord(obligationId, inboundId, "posted", iso)),
+        () => createObligation(mailDir, AGENT, () => makeRecord(obligationId, inboundId, "pending", iso), QUIET),
+        () => transitionObligation(mailDir, AGENT, inboundId, "delivering", {}, QUIET),
+        () => writeObligation(mailDir, AGENT, makeRecord(obligationId, inboundId, "posted", iso)),
       ]) {
         const start = nowMs();
         call();
@@ -206,16 +209,16 @@ async function roleMain() {
     const holder = F.holder === undefined ? null : Number(F.holder);
     if (holder !== null && (!Number.isFinite(holder) || holder < 0)) throw new Error("invalid holder");
     for (let j = 0; j < positive("sweeps", 8); j++) {
-      seedAgedBatch(root, seed, j);
+      seedAgedBatch(mailDir, seed, j);
       const start = nowMs();
       if (holder !== null) {
-        const lock = acquireMailLockSync(join(root, AGENT), { timeoutMs: 0 });
+        const lock = acquireMailLockSync(store, { timeoutMs: 0 });
         if (!lock) throw new Error("holder acquisition failed");
         try {
           if (holder > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holder);
         } finally { lock.release(); }
       } else {
-        const res = sweepTerminalObligations(root, AGENT, RETENTION_DAYS, QUIET);
+        const res = sweepTerminalObligations(mailDir, AGENT, RETENTION_DAYS, QUIET);
         removals.push(res.removed);
         if (res.removed !== seed || res.receiptsRemoved !== seed || res.unreadable || res.receiptsUnreadable) {
           throw new Error(`incomplete sweep: ${JSON.stringify(res)}`);
@@ -254,12 +257,12 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
   for (let round = 0; round < rounds; round++) {
     const base = safeTempBase();
     const root = realpathSync(mkdtempSync(join(base, "bench-lock-")));
-    const dir = join(root, "mailbox");
+    const { mailDir: dir } = benchmarkPaths(root);
     const token = randomUUID();
     const jobs = [];
     try {
       privateDirectory(root);
-      createMailboxStore(root, dir);
+      createMailboxStore(root);
       writeFileSync(join(root, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 0o600 });
       for (const sub of ["home", "tmp"]) mkdirSync(join(root, sub), { mode: 0o700 });
       const env = { PATH: process.env.PATH, HOME: join(root, "home"), TMPDIR: join(root, "tmp"),
