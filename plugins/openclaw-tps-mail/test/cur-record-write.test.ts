@@ -15,6 +15,8 @@ const realFs = { ...fs };
 let removeOnTerminal: { path: string; state: string } | undefined;
 let replaceOnTerminal: { path: string; state: string; bytes: string } | undefined;
 let stampError: Error | undefined;
+let stampFault: { stage: "lock" | "scratch"; path: string } | undefined;
+let faultOnTerminal: { state: string; stage: "lock" | "scratch"; path: string } | undefined;
 let obligationReadFailure: string | undefined;
 let obligationReads = 0;
 let failObligationReads = Infinity;
@@ -32,12 +34,26 @@ mock.module("node:fs", () => ({
     }
     return (realFs.readFileSync as any)(...args);
   },
+  mkdirSync: (...args: any[]) => {
+    if (stampFault?.stage === "lock" && String(args[0]).endsWith(".mail-lock.claim")) {
+      return realFs.writeFileSync(stampFault.path, "");
+    }
+    return (realFs.mkdirSync as any)(...args);
+  },
   openSync: (...args: any[]) => {
+    if (stampFault?.stage === "scratch" && String(args[0]).includes(".ack-")) {
+      return realFs.writeFileSync(stampFault.path, "");
+    }
     if (stampError && String(args[0]).includes(".ack-")) throw stampError;
     return (realFs.openSync as any)(...args);
   },
   writeFileSync: (...args: any[]) => {
     const result = (realFs.writeFileSync as any)(...args);
+    if (faultOnTerminal && String(args[0]).includes(".obligations/") && typeof args[1] === "string" &&
+        JSON.parse(args[1]).state === faultOnTerminal.state) {
+      stampFault = faultOnTerminal;
+      faultOnTerminal = undefined;
+    }
     if (removeOnTerminal && String(args[0]).includes(".obligations/") && typeof args[1] === "string") {
       if (JSON.parse(args[1]).state === removeOnTerminal.state) {
         realFs.unlinkSync(removeOnTerminal.path);
@@ -99,6 +115,7 @@ afterEach(() => {
   removeOnTerminal = undefined;
   replaceOnTerminal = undefined;
   stampError = undefined;
+  stampFault = faultOnTerminal = undefined;
   obligationReadFailure = undefined;
   obligationReads = 0;
   failObligationReads = Infinity;
@@ -319,32 +336,32 @@ describe("cli#492 — a failed cur/ stamp write is surfaced and retried", () => 
         const h = await boot(true);
         expect(await pollUntil(() => h.dispatch() !== null)).toBe(true);
         const cur = readCur()!;
-        const blocked = stage === "lock" ? resolve(mailDir, "anvil") : resolve(mailDir, "anvil", "cur");
-        const restore = () => realFs.chmodSync(blocked, 0o755);
-        realFs.chmodSync(blocked, 0o555);
+        const blocked = stage === "lock" ? resolve(mailDir, "anvil", ".mail-lock.fault") : resolve(mailDir, "anvil", "cur", ".stamp-fault");
+        realFs.mkdirSync(blocked);
+        faultOnTerminal = { state, stage, path: blocked };
         try {
           await finish(h);
           expect(await pollUntil(() => failedLogs(h, `${kind}-stamp-failed`).length > 0)).toBe(true);
           const diagnostic = failedLogs(h, `${kind}-stamp-failed`)[0];
-          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock code=EACCES` : `path=${cur.path} code=EACCES`);
+          expect(diagnostic).toContain(stage === "lock" ? `path=${resolve(mailDir, "anvil", ".mail-lock")} code=EISDIR` : `path=${cur.path} code=EISDIR`);
           if (stage === "lock") expect(diagnostic).not.toContain(`path=${cur.path}`);
           expect(readCur()?.record?.[stampKey]).toBeUndefined();
         } finally {
           await h.stop();
-          restore();
+          stampFault = faultOnTerminal = undefined;
         }
-        realFs.chmodSync(blocked, 0o555);
+        stampFault = { stage, path: blocked };
         const next = await boot(false);
         try {
           expect(await pollUntil(() => next.logs.some((m) => m.includes(`${kind}-stamp-reconcile-failed`)))).toBe(true);
           const diagnostic = next.logs.find((m) => m.includes(`${kind}-stamp-reconcile-failed`))!;
-          expect(diagnostic).toContain(stage === "lock" ? `path=${blocked}/.mail-lock code=EACCES` : `path=${cur.path} code=EACCES`);
+          expect(diagnostic).toContain(stage === "lock" ? `path=${resolve(mailDir, "anvil", ".mail-lock")} code=EISDIR` : `path=${cur.path} code=EISDIR`);
           if (stage === "lock") expect(diagnostic).not.toContain(`path=${cur.path}`);
           expect(diagnostic).toContain("obligation retained");
           expect(readCur()?.record?.[stampKey]).toBeUndefined();
         } finally {
           await next.stop();
-          restore();
+          stampFault = undefined;
         }
       });
     }
@@ -499,7 +516,7 @@ for (const state of ["acked", "failed"] as const) {
         if (malformed) {
           expect(realFs.readFileSync(path, "utf8")).toBe(obligationBytes);
           expect(realFs.readFileSync(receiptPath, "utf8")).toBe(receiptBytes);
-          expect(next.logs.some((m) => m.includes("held 1 for unresolved cur/ recovery"))).toBe(true);
+          expect(next.logs.some((m) => m.includes("left 1 unreadable/malformed record(s)"))).toBe(true);
         } else {
           expect(realFs.existsSync(path)).toBe(false);
           expect(realFs.existsSync(receiptPath)).toBe(false);

@@ -1,0 +1,1 @@
+- **openclaw-tps-mail: lock obligation writes and retention; keep receipts for held or ambiguous obligations.**

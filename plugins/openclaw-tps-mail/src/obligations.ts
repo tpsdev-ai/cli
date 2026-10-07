@@ -85,7 +85,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
-import type { Envelope } from "@tpsdev-ai/agent";
+import { acquireMailLockSync, type Envelope, type MailLock } from "@tpsdev-ai/agent";
 
 export type ObligationState =
   | "pending"
@@ -229,8 +229,18 @@ export function listObligations(mailDir: string, agent: string, onReadError?: (p
   return out;
 }
 
+function withObligationLock<T>(mailDir: string, agent: string, run: () => T): T {
+  const lock = acquireMailLockSync(resolve(mailDir, agent));
+  if (!lock) throw new Error("obligation store is busy");
+  try { return run(); } finally { lock.release(); }
+}
+
 /** Atomic write: stage to a dot temp in the same dir, then rename into place. */
 export function writeObligation(mailDir: string, agent: string, record: ObligationRecord): void {
+  withObligationLock(mailDir, agent, () => writeObligationLocked(mailDir, agent, record));
+}
+
+function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord): void {
   const dir = obligationsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const target = resolve(dir, `${record.inboundId}.json`);
@@ -250,17 +260,19 @@ export function createObligation(
   make: () => ObligationRecord,
   log?: ObligationLog,
 ): { created: boolean; record: ObligationRecord } {
-  const draft = make();
-  const existing = readObligation(mailDir, agent, draft.inboundId);
-  if (existing) {
-    log?.info?.(
-      `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.obligationId}); not creating a second`,
-    );
-    return { created: false, record: existing };
-  }
-  draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
-  writeObligation(mailDir, agent, draft);
-  return { created: true, record: draft };
+  return withObligationLock(mailDir, agent, () => {
+    const draft = make();
+    const existing = readObligation(mailDir, agent, draft.inboundId);
+    if (existing) {
+      log?.info?.(
+        `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.obligationId}); not creating a second`,
+      );
+      return { created: false, record: existing };
+    }
+    draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
+    writeObligationLocked(mailDir, agent, draft);
+    return { created: true, record: draft };
+  });
 }
 
 /**
@@ -284,17 +296,19 @@ export function transitionObligation(
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
 ): ObligationRecord | null {
-  const current = readObligation(mailDir, agent, inboundId);
-  if (!current) return null;
-  if (TERMINAL_STATES.has(current.state)) {
-    log?.info?.(
-      `tps-mail: obligation ${current.obligationId} is ${current.state}; refusing the late transition to ${next}`,
-    );
-    return null;
-  }
-  const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
-  writeObligation(mailDir, agent, updated);
-  return updated;
+  return withObligationLock(mailDir, agent, () => {
+    const current = readObligation(mailDir, agent, inboundId);
+    if (!current) return null;
+    if (TERMINAL_STATES.has(current.state)) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} is ${current.state}; refusing the late transition to ${next}`,
+      );
+      return null;
+    }
+    const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
+    writeObligationLocked(mailDir, agent, updated);
+    return updated;
+  });
 }
 
 /**
@@ -335,17 +349,24 @@ export function markNackSent(
   log?: ObligationLog,
   when?: string,
 ): boolean {
-  const current = readObligation(mailDir, agent, inboundId);
-  if (!current || current.state !== "failed") return false;
-  const { nackPending: _clear, ...rest } = current;
   try {
-    writeObligation(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() });
-    return true;
+    return withObligationLock(mailDir, agent, () => {
+      const current = readObligation(mailDir, agent, inboundId);
+      if (!current || current.state !== "failed") return false;
+      const { nackPending: _clear, ...rest } = current;
+      try {
+        writeObligationLocked(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() });
+        return true;
+      } catch (err) {
+        log?.warn?.(
+          `tps-mail: obligation-write-failed: could not record nackSentAt for ${inboundId} ` +
+            `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later start may send the nack again`,
+        );
+        return false;
+      }
+    });
   } catch (err) {
-    log?.warn?.(
-      `tps-mail: obligation-write-failed: could not record nackSentAt for ${inboundId} ` +
-        `(${err instanceof Error ? err.message : String(err)}); the record keeps nackPending, so a later start may send the nack again`,
-    );
+    log?.warn?.(`tps-mail: obligation-write-failed: ${inboundId}: ${err instanceof Error ? err.message : String(err)}`);
     return false;
   }
 }
@@ -360,12 +381,33 @@ export function abandonOwedNack(
   inboundId: string,
   log?: ObligationLog,
   when?: string,
+  nackCutoffMs?: number,
+): boolean {
+  try {
+    return withObligationLock(mailDir, agent, () => abandonOwedNackLocked(mailDir, agent, inboundId, log, when, nackCutoffMs));
+  } catch (err) {
+    log?.warn?.(`tps-mail: obligation-write-failed: ${inboundId}: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+function abandonOwedNackLocked(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  log?: ObligationLog,
+  when?: string,
+  nackCutoffMs?: number,
 ): boolean {
   const current = readObligation(mailDir, agent, inboundId);
-  if (!current || current.state !== "failed") return false;
+  if (!current || !nackOwed(current)) return false;
+  if (typeof nackCutoffMs === "number") {
+    const owedSince = obligationLastTransitionMs(current);
+    if (owedSince === null || owedSince >= nackCutoffMs) return false;
+  }
   const { nackPending: _cleared, ...rest } = current;
   try {
-    writeObligation(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
+    writeObligationLocked(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
     return true;
   } catch (err) {
     log?.warn?.(
@@ -444,7 +486,7 @@ function curRecordUnresolved(mailDir: string, agent: string, inboundId: string):
 export function obligationLastTransitionMs(record: unknown): number | null {
   const r = record as Record<string, unknown> | null;
   const raw = r?.lastTransitionAt;
-  if (raw !== undefined && raw !== null) {
+  if (r !== null && r !== undefined && Object.hasOwn(r, "lastTransitionAt")) {
     if (typeof raw === "string") {
       const t = Date.parse(raw);
       return Number.isFinite(t) ? t : null; // present but unparseable → unageable
@@ -480,6 +522,8 @@ export function obligationLastTransitionMs(record: unknown): number | null {
  * (`nackSentAt` recorded, flag cleared) the record is ordinary and ages out
  * normally.
  *
+ * Unparseable timestamps and failed release writes keep the debt.
+ *
  * The same sweep owns the agent's metadata RECEIPTS (cli#389 round 3), which
  * live in this store as `receipts/<obligationId>.json` (round 5): a live
  * obligation keeps its receipt, a terminal obligation's receipt goes, and an
@@ -514,6 +558,34 @@ export function sweepTerminalObligations(
     res.disabled = true;
     return res;
   }
+  let lock: MailLock | null;
+  try {
+    lock = acquireMailLockSync(resolve(mailDir, agent), { timeoutMs: 0 });
+  } catch (err) {
+    log?.warn?.(`tps-mail: obligation retention: ${err instanceof Error ? err.message : String(err)}; sweep skipped`);
+    return res;
+  }
+  if (!lock) {
+    log?.warn?.("tps-mail: obligation retention: store is busy; sweep skipped");
+    return res;
+  }
+  try {
+    return sweepTerminalObligationsLocked(mailDir, agent, retentionDays, log, nowMs, nackHoldDays, unresolved, res);
+  } finally {
+    lock.release();
+  }
+}
+
+function sweepTerminalObligationsLocked(
+  mailDir: string,
+  agent: string,
+  retentionDays: number,
+  log: ObligationLog | undefined,
+  nowMs: number,
+  nackHoldDays: number,
+  unresolved: Set<string>,
+  res: RetentionResult,
+): RetentionResult {
   const dir = obligationsDir(mailDir, agent);
   let names: string[] = [];
   try {
@@ -534,17 +606,10 @@ export function sweepTerminalObligations(
   }
   const cutoff = nowMs - retentionDays * 24 * 60 * 60 * 1000;
   const leftUnreadable: string[] = [];
-  // WHICH OBLIGATIONS THE STORE HELD at the START of this sweep, by state. The
-  // obligation loop below DELETES aged terminal records, so "is this receipt's
-  // obligation live, terminal, or gone?" must be answered from a snapshot taken
-  // first — else the receipt of the very record just swept looks orphaned.
-  //
-  // cli#389 round 5: the snapshot is keyed by the OBLIGATION ID, which is a
-  // unique UUID, and the receipts live in this same store — so every receipt is
-  // attributable to an obligation this sweep can see. There is no host-wide dir
-  // to be careful of, and no inbound for two obligations to collide on.
   const terminalObligationIds = new Set<string>();
   const liveObligationIds = new Set<string>();
+  const claimedObligationIds = new Set<string>();
+  const ambiguousObligationIds = new Set<string>();
   for (const name of names) {
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     const path = resolve(dir, name);
@@ -556,11 +621,18 @@ export function sweepTerminalObligations(
       leftUnreadable.push(name);
       continue;
     }
-    // Shape check: a parseable value that is not an object with a RECOGNIZED
-    // state (null, no state, an unknown state) is a malformed record, not a
-    // non-terminal one — reported as unreadable, never swept.
+    const id = (record as { obligationId?: unknown } | null)?.obligationId;
+    if (typeof id === "string") {
+      if (claimedObligationIds.has(id)) ambiguousObligationIds.add(id);
+      claimedObligationIds.add(id);
+    }
     const state = (record as { state?: unknown } | null)?.state;
-    if (typeof record !== "object" || record === null || Array.isArray(record) || typeof state !== "string" || !ALL_STATES.has(state)) {
+    const inbound = (record as { inboundId?: unknown } | null)?.inboundId;
+    if (typeof record !== "object" || record === null || Array.isArray(record) ||
+        typeof state !== "string" || !ALL_STATES.has(state) ||
+        typeof inbound !== "string" || `${inbound}.json` !== name ||
+        typeof id !== "string" || id.length === 0) {
+      if (typeof id === "string") liveObligationIds.add(id);
       res.unreadable++;
       leftUnreadable.push(name);
       continue;
@@ -577,12 +649,13 @@ export function sweepTerminalObligations(
       const nackCutoff = nowMs - nackHoldDays * 24 * 60 * 60 * 1000;
       if (owedSince !== null && owedSince < nackCutoff) {
         const recInbound = (record as { inboundId?: unknown }).inboundId;
-        const released = abandonOwedNack(
+        const released = abandonOwedNackLocked(
           mailDir,
           agent,
           typeof recInbound === "string" ? recInbound : name.replace(/\.json$/, ""),
           log,
           new Date(nowMs).toISOString(),
+          nackCutoff,
         );
         if (!released) {
           const obligationId = (record as { obligationId?: unknown }).obligationId;
@@ -605,8 +678,8 @@ export function sweepTerminalObligations(
       continue;
     }
     const snapshotObligationId = (record as { obligationId?: unknown }).obligationId;
-    if (typeof snapshotObligationId === "string") terminalObligationIds.add(snapshotObligationId);
     if (!nackAbandoned && nackOwed(record)) {
+      if (typeof snapshotObligationId === "string") liveObligationIds.add(snapshotObligationId);
       res.heldForNack++;
       continue;
     }
@@ -615,15 +688,18 @@ export function sweepTerminalObligations(
     // obligation and double-post).
     const inboundId = (record as { inboundId?: unknown }).inboundId;
     if (typeof inboundId === "string" && curRecordUnresolved(mailDir, agent, inboundId)) {
+      liveObligationIds.add(id);
       res.heldForRecovery++;
       continue;
     }
     const t = obligationLastTransitionMs(record);
     if (t === null) {
+      liveObligationIds.add(id);
       res.unreadable++;
       leftUnreadable.push(name);
       continue;
     }
+    terminalObligationIds.add(id);
     if (t >= cutoff) {
       res.left++;
       continue;
@@ -639,23 +715,6 @@ export function sweepTerminalObligations(
     }
   }
   // ── the metadata receipts (cli#389 round 3; per-agent since round 5) ───────
-  // Nothing else ever removes a receipt, so this sweep owns them. They live in
-  // THIS agent's own store, so each one names an obligation this sweep can look
-  // up, and three rules cover every case:
-  //   - its obligation is LIVE here → keep (an unfinished obligation has not
-  //     finished with the evidence its ack depends on);
-  //   - its obligation is TERMINAL here → delete (it has served its purpose;
-  //     decided from the snapshot above, so the receipt of the record deleted
-  //     moments ago is still attributed);
-  //   - NO obligation here at all → an orphan: delete once it has aged past the
-  //     window, and never before. A receipt with no readable timestamp is never
-  //     aged by a missing value, exactly like an obligation record.
-  //   - EXCEPT when an obligation record in the store could not be read: such a
-  //     record contributes no id to either set, so its own receipt would look
-  //     orphaned and be deleted, and repairing the record later would find its
-  //     evidence gone. With ANY unreadable record, NO orphan is deleted this
-  //     pass (the terminal rule above still applies — that evidence is not in
-  //     doubt) and the skip is counted (cli#389 round 6, item 3).
   const receiptsRoot = receiptsDir(mailDir, agent);
   let receiptNames: string[];
   try {
@@ -682,14 +741,9 @@ export function sweepTerminalObligations(
     if (typeof obligationId !== "string" || obligationId.length === 0) continue;
     const terminal = terminalObligationIds.has(obligationId);
     const live = liveObligationIds.has(obligationId);
+    if (live || ambiguousObligationIds.has(obligationId)) continue;
     const t = typeof ts === "string" ? Date.parse(ts) : Number.NaN;
     const agedOrphan = !live && Number.isFinite(t) && t < cutoff;
-    // FAIL SAFE (cli#389 round 6, item 3): an obligation record that could not
-    // be read joins neither set, so a receipt for THAT obligation looks
-    // orphaned. Deleting it would destroy evidence a later repair needs, and
-    // "no obligation here" is not proof while part of the store is unreadable.
-    // The TERMINAL rule is unaffected: it is decided from a record this sweep
-    // did read, so that evidence is not in doubt.
     if (agedOrphan && !terminal && res.unreadable > 0) {
       res.orphanReceiptsSkipped++;
       continue;
@@ -786,13 +840,15 @@ export function receiptPath(mailDir: string, agent: string, obligationId: string
  * world/group-readable.
  */
 export function writeReceipt(mailDir: string, agent: string, record: ReceiptRecord): string {
-  const dir = receiptsDir(mailDir, agent);
-  mkdirSync(dir, { recursive: true });
-  const target = resolve(dir, `${record.obligationId}.json`);
-  const tmp = resolve(dir, `.${record.obligationId}.json.tmp`);
-  writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", mode: 0o600 });
-  renameSync(tmp, target);
-  return target;
+  return withObligationLock(mailDir, agent, () => {
+    const dir = receiptsDir(mailDir, agent);
+    mkdirSync(dir, { recursive: true });
+    const target = resolve(dir, `${record.obligationId}.json`);
+    const tmp = resolve(dir, `.${record.obligationId}.json.tmp`);
+    writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", mode: 0o600 });
+    renameSync(tmp, target);
+    return target;
+  });
 }
 
 // ── receipt scan ─────────────────────────────────────────────────────────────

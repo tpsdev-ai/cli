@@ -41,6 +41,10 @@
       "mailDir": {
         "type": "string"
       },
+      "obligationNackHoldMultiple": {
+        "type": "number",
+        "minimum": 1
+      },
       "obligationRetentionDays": {
         "type": "number",
         "description": "Days a TERMINAL obligation record (acked/failed) is kept after its last transition before startup recovery deletes it. Default 7; <= 0 disables the sweep."
