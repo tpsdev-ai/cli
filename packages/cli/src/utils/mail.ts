@@ -982,11 +982,52 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       return { ok: false, class: "busy", reason: "source changed during promotion; retry" };
     }
 
+    const replay = mailboxReplayStore(dirs.root);
+    const curPath = join(dirs.cur, filename);
+
+    // Step 3.5: reconcile a first delivery a prior process left unfinished. A
+    // promote() that linked cur/ and then died before its ledger commit leaves a
+    // placement intent behind (written in Step 5 below). Finish it here — record
+    // the consumed id and drop this source — because the replay gate below scans
+    // cur/ as a migration fallback and would otherwise read the orphaned copy as
+    // consumed and dead-letter this verified mail as a replay. An intent whose
+    // link never landed is undone, and this delivery proceeds normally. Runs
+    // under the same lock as the replay gate and the placement below.
+    let pendingPlacement: boolean;
+    try {
+      pendingPlacement = replay.hasPendingPlacement(envelope.messageId, filename);
+    } catch (err) {
+      const reason = `placement history unavailable: ${err instanceof Error ? err.message : String(err)}`;
+      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+      return { ok: false, class: "storage-unavailable", reason };
+    }
+    if (pendingPlacement) {
+      if (existsSync(curPath)) {
+        let interrupted: MailMessage;
+        try {
+          interrupted = readMessageFile(curPath);
+        } catch (err) {
+          return { ok: false, class: "storage-unavailable", reason: `unfinished promotion copy unreadable: ${err instanceof Error ? err.message : String(err)}` };
+        }
+        try {
+          if (!hasCommittedMessageId(dirs.root, envelope.messageId)) replay.recordConsumed(envelope.messageId);
+          rmSync(filePath, { force: true });
+          replay.finishPlacement(envelope.messageId, filename);
+        } catch (err) {
+          const reason = `storage failure finishing an interrupted promotion: ${err instanceof Error ? err.message : String(err)}`;
+          rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+          return { ok: false, class: "storage-unavailable", reason };
+        }
+        logEvent({ event: "read", from: interrupted.from, to: agent, messageId: interrupted.id, replyToId: interrupted.replyToId }, interrupted.body);
+        return { ok: true, message: interrupted, path: curPath };
+      }
+      // The link never landed: undo the intent and take the ordinary path below.
+      replay.finishPlacement(envelope.messageId, filename);
+    }
+
     // Step 4 (first-delivery only): replay — a re-planted consumed envelope must
     // dead-letter. Consulted against the DURABLE ledger (and the maildir
     // fallback), not cur/ alone. The ledger prune runs here, under the lock.
-    const replay = mailboxReplayStore(dirs.root);
-    const curPath = join(dirs.cur, filename);
     let consumed: boolean;
     try {
       consumed = replay.isConsumed(envelope.messageId);
@@ -1032,6 +1073,9 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
       scratchCreated = true;
+      // The placement intent precedes the link, so a crash between the link and
+      // the ledger commit is recoverable by the next promote() (Step 3.5).
+      replay.beginPlacement(envelope.messageId, filename);
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
         throw new Error(`destination already exists: ${filename}`);
@@ -1055,6 +1099,14 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
           /* best effort */
         }
       }
+      // Undo the placement intent: this promote() is not leaving a cur/ copy
+      // behind. The intent is dropped after the copy, so a crash here is undone
+      // by the next promote() (Step 3.5).
+      try {
+        replay.finishPlacement(envelope.messageId, filename);
+      } catch {
+        /* best effort — reconciled on a later check */
+      }
       const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
       rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
       return { ok: false, class: "storage-unavailable", reason };
@@ -1063,6 +1115,15 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     try {
       rmSync(filePath, { force: true });
     } catch {}
+
+    // The delivery is complete — cur/ holds the record and the ledger holds its
+    // id — so drop the placement intent. Last, so an interruption at any earlier
+    // point is still recoverable (Step 3.5).
+    try {
+      replay.finishPlacement(envelope.messageId, filename);
+    } catch {
+      /* best effort: the next promote() finishes it */
+    }
 
     // Success: clear any stale sidecar from a prior quarantine (best-effort
     // cleanup; cannot undo the promotion above).
