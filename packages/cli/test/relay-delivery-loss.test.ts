@@ -274,7 +274,7 @@ for (const entry of ["sync", "connect"] as const) {
       }
     });
 
-    test("invalid required record fields are quarantined before ACK", async () => {
+    test("invalid record field values are quarantined before ACK", async () => {
       const inbox = getInbox("local");
       spyOn(console, "error").mockImplementation(() => {});
       await start();
