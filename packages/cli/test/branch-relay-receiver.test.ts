@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { MailClient } from "@tpsdev-ai/agent";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
 import { gcMessages, getInbox } from "../src/utils/mail.js";
+import { drainOutbox } from "../src/utils/outbox.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 import { generateKeyPair, initHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
@@ -21,7 +22,7 @@ const HOST_FP = "a".repeat(64);
  * drive the real receiver — captured from the mocked `listenForHostWs` — against
  * real mailbox files, and read back what it published and whether it ACKed.
  */
-describe("branch relay receiver records the delivery before the ACK", () => {
+describe("branch relay receiver inbox acceptance and handler routing", () => {
   let root: string;
   let savedEnv: Record<string, string | undefined>;
   let branchReceive: (msg: TpsMessage, channel: TransportChannel) => void | Promise<void>;
@@ -45,6 +46,7 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     process.env.TPS_VAULT_KEY = "branch-recv-test";
     process.env.FLAIR_URL = "http://flair.invalid";
     process.env.FLAIR_KEY_PATH = writeKeyFile(join(root, "keys"), "local", SEEDS.local);
+    writeKeyFile(join(root, ".tps", "identity"), "local", SEEDS.local);
     spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const name = new URL(String(input)).pathname.match(/^\/Agent\/(.+)$/)?.[1];
       const seed = name && SEEDS[name as keyof typeof SEEDS];
@@ -63,7 +65,26 @@ describe("branch relay receiver records the delivery before the ACK", () => {
       join(process.env.TPS_IDENTITY_DIR!, "host.json"),
       JSON.stringify({ publicKey: Buffer.from(kp.encryption.publicKey).toString("base64url") }),
     );
-    writeBranchConf(1, "unused", "ws", undefined, "remote");
+    const agents = join(root, "agents");
+    const handlerDir = join(agents, "handler");
+    fs.mkdirSync(handlerDir, { recursive: true });
+    fs.writeFileSync(join(handlerDir, "tps.yaml"), `name: handler
+capabilities:
+  mail_handler:
+    exec: ./handle.sh
+    match:
+      bodyPattern: '^handler '
+`);
+    fs.writeFileSync(join(handlerDir, "handle.sh"), `#!/bin/sh
+read action
+printf '%s\\n' "$action" >> calls
+case "$action" in
+  'handler reply') printf '%s' '{"action":"reply","body":"handled"}' ;;
+  'handler forward') printf '%s' '{"action":"forward","to":"remote","body":"handled"}' ;;
+  'handler drop') printf '%s' '{"action":"drop"}' ;;
+esac
+`, { mode: 0o700 });
+    writeBranchConf(1, "unused", "ws", agents, "remote");
 
     sent = [];
     channel = {
@@ -139,7 +160,7 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     return fs.readFileSync(join(dir, names[0]!), "utf-8");
   }
 
-  test("a delivery whose ACK fails is published once and reused on resend", async () => {
+  test("an inbox delivery whose ACK send fails is reused on resend", async () => {
     const body = delivery();
     const send = channel.send;
     channel.send = async (msg) => {
@@ -159,7 +180,7 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     expect(counts().fresh).toBe(1);
   });
 
-  test("a resend after GC removed the unread record republishes it, then reuses it", async () => {
+  test("an inbox resend after GC removal republishes, then reuses the record", async () => {
     const body = delivery();
     await deliver(body);
     expect(acks().map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
@@ -184,7 +205,7 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     expect(acks()).toHaveLength(3);
   });
 
-  test("a resend reusing a consumed envelope id republishes and the replay gate holds", async () => {
+  test("a new inbox delivery reusing a signed-envelope messageId is published, reused on resend and rejected on promotion", async () => {
     const envelope = buildSignedEnvelope("remote", "local", "original delivery", SEEDS);
     const first = delivery({ content: JSON.stringify(envelope) });
     await deliver(first);
@@ -206,14 +227,14 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     expect(counts().cur).toBe(1);
     expect(acks().map((ack) => (ack.body as { id: string }).id)).toEqual([first.id, second.id, second.id]);
 
-    // Exactly-once to the agent: the replay gate refuses the reused id.
+    // Promotion rejects the repeated signed-envelope messageId.
     expect(await client.checkNewMail()).toEqual([]);
     const dlq = getInbox("local").dlq;
     const [rejected] = dirFiles(dlq);
     expect(fs.readFileSync(join(dlq, `${rejected!}.reason`), "utf-8")).toContain("class: replay");
   });
 
-  test("a resend of the same delivery id with a different payload is refused without an ACK", async () => {
+  test("an inbox resend with a changed body is refused without an ACK", async () => {
     const body = delivery({ content: "original payload" });
     await deliver(body);
     expect(acks().map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
@@ -228,4 +249,57 @@ describe("branch relay receiver records the delivery before the ACK", () => {
     expect(fs.readFileSync(source, "utf-8")).toBe(before);
     expect(counts().fresh).toBe(1);
   });
+
+  test("an inbox resend with a changed wire alias is refused without an ACK", async () => {
+    const body = delivery({ to: "alias-one" });
+    await deliver(body);
+    const fresh = getInbox("remote").fresh;
+    const [file] = dirFiles(fresh);
+    const source = join(fresh, file!);
+    const before = fs.readFileSync(source, "utf8");
+    await deliver(body);
+    expect(acks().map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }, { id: body.id, accepted: true }]);
+    const reused = fs.readFileSync(source, "utf8");
+    await deliver({ ...body, to: "alias-two" });
+    expect(acks()).toHaveLength(2);
+    expect(fs.readFileSync(source, "utf8")).toBe(reused);
+    expect(dirFiles(fresh)).toHaveLength(1);
+    const record = JSON.parse(before);
+    expect(record.to).toBe("remote");
+    expect(record.relayWireTo).toBe("alias-one");
+  });
+
+  for (const dir of ["new", "cur", "dlq"] as const) {
+    test(`an unreadable matching ${dir} record refuses an inbox resend without an ACK`, async () => {
+      const body = delivery();
+      await deliver(body);
+      const inbox = getInbox("local");
+      const [file] = dirFiles(inbox.fresh);
+      const source = join(inbox.root, dir, file!);
+      if (dir !== "new") fs.renameSync(join(inbox.fresh, file!), source);
+      const before = fs.readFileSync(source, "utf8");
+      const read = fs.readFileSync;
+      const fault = spyOn(fs, "readFileSync").mockImplementation((path, options) => {
+        if (String(path) === source) throw Object.assign(new Error("injected read denied"), { code: "EACCES" });
+        return read(path, options as BufferEncoding);
+      });
+      try { await deliver(body); } finally { fault.mockRestore(); }
+      expect(acks()).toHaveLength(1);
+      expect(fs.readFileSync(source, "utf8")).toBe(before);
+      expect(counts()).toEqual({ fresh: dir === "new" ? 1 : 0, cur: dir === "cur" ? 1 : 0, dlq: dir === "dlq" ? 1 : 0 });
+      expect(fs.readFileSync(join(root, "branch.log"), "utf8")).toContain(`relayed record read failed: ${source}`);
+    });
+  }
+
+  for (const action of ["reply", "forward", "drop"] as const) {
+    test(`a configured ${action} handler runs again on resend without an inbox acceptance record`, async () => {
+      const body = delivery({ content: `handler ${action}` });
+      await deliver(body);
+      await deliver(body);
+      expect(acks().map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }, { id: body.id, accepted: true }]);
+      expect(counts()).toEqual({ fresh: 0, cur: 0, dlq: 0 });
+      expect(fs.readFileSync(join(root, "agents", "handler", "calls"), "utf8").trim().split("\n")).toEqual([`handler ${action}`, `handler ${action}`]);
+      expect(drainOutbox(false)).toHaveLength(action === "drop" ? 0 : 2);
+    });
+  }
 });

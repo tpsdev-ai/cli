@@ -128,7 +128,7 @@ describe("relay review regressions", () => {
     });
   }
 
-  test("a record read failure is reported and preserved while unrelated relay mail is stored", () => {
+  test("a record read failure refuses relay acceptance and preserves the record", () => {
     const inbox = getInbox("local");
     const source = join(inbox.fresh, "unreadable.json");
     const raw = "{truncated";
@@ -140,13 +140,13 @@ describe("relay review regressions", () => {
       return read(path, options as BufferEncoding);
     });
     const message = body();
-    try { expect(deliverRelayedToLocal("remote", message)).toBe(true); }
+    try { expect(() => deliverRelayedToLocal("remote", message)).toThrow(`relayed record read failed: ${source}`); }
     finally { fault.mockRestore(); }
     expect(fs.readFileSync(source, "utf8")).toBe(raw);
     expect(errors.mock.calls.flat().join("\n")).toContain(source);
     const records = fs.readdirSync(inbox.fresh).filter((file) => file !== "unreadable.json" && file.endsWith(".json"));
-    expect(records).toHaveLength(1);
-    expect(JSON.parse(fs.readFileSync(join(inbox.fresh, records[0]!), "utf8")).relayDelivery).toEqual({ branchId: "remote", id: message.id });
+    expect(records).toHaveLength(0);
+    expect(fs.existsSync(join(mail, ".relay-accepted", "by-branch", "remote", message.id))).toBe(false);
   });
 
   test("mail list and CLI list use receipt time with a timestamp fallback", async () => {

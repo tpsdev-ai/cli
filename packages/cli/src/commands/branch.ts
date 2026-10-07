@@ -379,9 +379,6 @@ async function runStart(): Promise<void> {
     // into accepted=true and the host's deliverToRemoteBranch would log
     // "Mail delivered" while the message was actually dropped.
     let deliveryError: string | null = null;
-    // A resend that conflicts with a recorded delivery, or a check that fails,
-    // is refused without an ACK: the host must not count it accepted, and the
-    // branch must not overwrite the recorded delivery.
     let refused = false;
 
     const action = await runHandlerPipeline(
@@ -414,12 +411,6 @@ async function runStart(): Promise<void> {
         // preserves the original behavior for the GAL-alias case where
         // body.to is a logical name that doesn't match any local agent dir.
         const recipient = inboxExists(body.to) ? body.to : localAgentId;
-        // Publish the record durably before the ACK and reuse it on a resend:
-        // the record is the delivery's acceptance, keyed by the peer host's
-        // fingerprint and the delivery id. A resend whose record is missing is
-        // published again; a same-id record with a different payload is refused
-        // without an ACK. Exactly-once delivery to the agent stays with
-        // MailClient's replay gate on promotion, as on the host side (cli#532).
         const delivery = { branchId: channel.peerFingerprint(), id: body.id };
         let recorded: string | undefined;
         let recordError: unknown;
@@ -429,7 +420,7 @@ async function runStart(): Promise<void> {
             to: recipient,
             body: body.content,
             timestamp: body.timestamp,
-          });
+          }, body.to);
         } catch (e) {
           recordError = e;
         }
@@ -438,7 +429,7 @@ async function runStart(): Promise<void> {
           refused = true;
         } else if (!recorded) {
           try {
-            sendMessage(recipient, body.content, body.from, delivery, body.timestamp);
+            sendMessage(recipient, body.content, body.from, delivery, body.timestamp, body.to);
           } catch (e: any) {
             // Honest NACK: an "Inbox full" or other write failure must NOT be
             // ACKed as accepted=true. Silent drops here strand entire dispatches

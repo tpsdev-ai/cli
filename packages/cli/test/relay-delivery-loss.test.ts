@@ -609,6 +609,37 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
+    for (const dir of ["new", "cur", "dlq"] as const) {
+      test(`an unreadable matching ${dir} record refuses host acceptance without an ACK`, async () => {
+        const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "read retry", SEEDS)));
+        const inbox = getInbox("local");
+        const record = sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
+        const source = join(inbox.root, dir, record.filePath.split("/").at(-1)!);
+        if (dir !== "new") fs.renameSync(record.filePath, source);
+        const before = fs.readFileSync(source, "utf8");
+        const errors = spyOn(console, "error").mockImplementation(() => {});
+        await start();
+        const read = fs.readFileSync;
+        const fault = spyOn(fs, "readFileSync").mockImplementation((path, options) => {
+          if (String(path) === source) throw Object.assign(new Error("injected read denied"), { code: "EACCES" });
+          return read(path, options as BufferEncoding);
+        });
+        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+        try { await deliverDirect(msg); } finally { fault.mockRestore(); }
+        expect(acks).toEqual([]);
+        expect(fs.readFileSync(source, "utf8")).toBe(before);
+        expect(jsonFiles(inbox.fresh).length + jsonFiles(inbox.cur).length + jsonFiles(inbox.dlq).length).toBe(1);
+        expect(fs.existsSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id))).toBe(false);
+        expect(errors.mock.calls.flat().join("\n")).toContain(`relayed record read failed: ${source}`);
+        expect(drainOutbox(false).map((item) => item.id)).toContain(body.id);
+        if (dir === "dlq") fs.writeFileSync(`${source}.reason`, "class: inbox-full\n");
+        await deliverDirect(msg);
+        expect(acks).toHaveLength(1);
+        expect(drainOutbox(false)).toEqual([]);
+        expect(jsonFiles(inbox.fresh).length + jsonFiles(inbox.cur).length + jsonFiles(inbox.dlq).length).toBe(1);
+      });
+    }
+
     test("inbox and DLQ write failures leave no marker or ACK, then retry writes one record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "write retry", SEEDS)));
       const inbox = getInbox("local");
