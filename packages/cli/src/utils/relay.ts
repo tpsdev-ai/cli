@@ -388,12 +388,13 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
   const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
   const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
   const delivery = { branchId, id: body.id };
-  if (existingMarker && findRelayedRecord(body.to, delivery)) {
+  const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp });
+  if (existingMarker && existingRecord) {
     syncMailFile(existingMarker);
     syncMailDirectory(dirname(existingMarker));
     return false;
   }
-  if (!existingMarker && findRelayedRecord(body.to, delivery)) {
+  if (!existingMarker && existingRecord) {
     recordAcceptance(acceptedDir, marker);
     return false;
   }

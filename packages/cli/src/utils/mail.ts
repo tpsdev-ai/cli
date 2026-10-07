@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import { isDeepStrictEqual } from "node:util";
+import { MailDeliverBodySchema } from "./wire-mail.js";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -43,6 +46,7 @@ export interface MailMessage {
   /** The verified envelope's messageId, persisted so replay is detectable. */
   envelopeId?: string;
   relayDelivery?: { branchId: string; id: string };
+  relayPayload?: { from: string; to: string; body: string; timestamp: string };
   /**
    * The full SIGNED envelope, persisted at promotion so a later cur/ re-read
    * (crash recovery / lease sweep) can re-verify it. Binds "verified at
@@ -387,55 +391,106 @@ function publishRelayedRecord(tmp: string, target: string): void {
   if (dirname(tmp) !== dirname(target)) syncMailDirectory(dirname(tmp));
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }): string | undefined {
+const RelayPayloadSchema = z.object({ from: MailDeliverBodySchema.shape.from, to: MailDeliverBodySchema.shape.to, body: z.string(), timestamp: MailDeliverBodySchema.shape.timestamp });
+const MailRecordSchema = RelayPayloadSchema.extend({
+  id: z.string().min(1).regex(VALID_ID),
+  read: z.boolean(),
+  receivedAt: z.string().optional(),
+  ackedAt: z.string().optional(),
+  bridgeSentAt: z.string().optional(),
+  nackedAt: z.string().optional(),
+  nackReason: z.string().optional(),
+  nackType: z.enum(["transient", "agent", "permanent"]).optional(),
+  checkedOutAt: z.string().optional(),
+  checkedOutBy: z.string().optional(),
+  deliveryAttempts: z.number().int().nonnegative().optional(),
+  retryAfter: z.string().optional(),
+  prNumber: z.number().int().positive().optional(),
+  headers: z.record(z.string()).optional(),
+  location: z.enum(["new", "cur", "dlq"]).optional(),
+  envelopeId: z.string().optional(),
+  envelope: z.custom<Envelope>((value) => parseSignedEnvelope(JSON.stringify(value)).ok).optional(),
+  trustTier: z.enum(["user", "internal", "external"]).optional(),
+  replyToId: z.string().optional(),
+  rejectClass: z.string().optional(),
+  rejectReason: z.string().optional(),
+  relayDelivery: z.object({ branchId: z.string().regex(/^[a-zA-Z0-9_-]+$/), id: MailDeliverBodySchema.shape.id }).optional(),
+  relayPayload: RelayPayloadSchema.optional(),
+}).passthrough();
+
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>): string | undefined {
   let root: string;
   try { root = mailboxRoot(agent); } catch (error) {
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
     root = join(mailDirPath(), ".undeliverable");
   }
-  mkdirMailDirectory(root);
-  const lock = acquireMailLockSync(root);
-  if (!lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
-  try {
-    for (const dir of ["new", "cur", "dlq"]) {
-      const path = join(root, dir);
-      for (const file of listMessageFiles(path)) {
-        const source = join(path, file);
-        let record: MailMessage;
-        try {
-          record = readMessageFile(source);
-          if (!record || typeof record !== "object") throw new Error(`invalid message record ${source}`);
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          console.error(`[mail] unreadable record ${source}: ${reason}`);
-          if ((error as NodeJS.ErrnoException)?.code) continue;
-          const quarantine = join(root, "quarantine");
-          mkdirMailDirectory(quarantine);
-          const target = join(quarantine, `${dir}-${randomUUID()}-${file}`);
-          writeFileSync(`${target}.reason`, `class: invalid\nSource: ${source}\nReason: ${reason}\n`, { flag: "wx" });
-          syncMailFile(`${target}.reason`);
-          syncMailFile(source);
-          renameSync(source, target);
-          syncMailDirectory(quarantine);
-          syncMailDirectory(path);
-          continue;
-        }
-        if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
-          const target = join(path, file);
-          record.receivedAt = new Date().toISOString();
-          const tmpDir = join(root, "tmp");
-          mkdirMailDirectory(tmpDir);
-          const tmp = join(tmpDir, `${randomUUID()}.json`);
-          writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
-          publishRelayedRecord(tmp, target);
-          if (dir === "dlq") syncMailFile(`${target}.reason`);
-          syncMailDirectory(path);
-          return target;
-        }
+  const roots = new Set([root]);
+  for (const parent of [mailDirPath(), join(process.env.HOME || homedir(), ".tps", "branch-office")]) {
+    if (!existsSync(parent)) continue;
+    for (const entry of readdirSync(parent, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (parent === mailDirPath() && entry.name === ".undeliverable") roots.add(join(parent, entry.name));
+      else if (/^[a-zA-Z0-9_-]+$/.test(entry.name)) {
+        const candidate = parent === mailDirPath() ? join(parent, entry.name) : join(parent, entry.name, "mail");
+        if (existsSync(candidate)) roots.add(candidate);
       }
     }
-    return undefined;
-  } finally { lock.release(); }
+  }
+  for (const root of roots) {
+    mkdirMailDirectory(root);
+    const lock = acquireMailLockSync(root);
+    if (!lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    try {
+      for (const dir of ["new", "cur", "dlq"]) {
+        const path = join(root, dir);
+        for (const file of listMessageFiles(path)) {
+          const source = join(path, file);
+          let record: MailMessage;
+          try {
+            record = readMessageFile(source);
+            MailRecordSchema.parse(record);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            console.error(`[mail] unreadable record ${source}: ${reason}`);
+            if ((error as NodeJS.ErrnoException)?.code) continue;
+            const quarantine = join(root, "quarantine");
+            mkdirMailDirectory(quarantine);
+            const target = join(quarantine, `${dir}-${randomUUID()}-${file}`);
+            writeFileSync(`${target}.reason`, `class: invalid\nSource: ${source}\nReason: ${reason}\n`, { flag: "wx" });
+            syncMailFile(`${target}.reason`);
+            syncMailFile(source);
+            renameSync(source, target);
+            syncMailDirectory(quarantine);
+            syncMailDirectory(path);
+            continue;
+          }
+          if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
+            const stored = record.envelope ? record.relayPayload ?? record : record;
+            const originalEnvelope = record.envelope && record.relayPayload ? parseSignedEnvelope(record.relayPayload.body) : undefined;
+            const projectionChanged = record.envelope && record.relayPayload && (
+              record.from !== record.envelope.from || record.to !== record.envelope.to ||
+              record.body !== record.envelope.body || record.timestamp !== record.envelope.timestamp ||
+              !originalEnvelope?.ok || !isDeepStrictEqual(originalEnvelope.envelope, record.envelope)
+            );
+            if (projectionChanged || stored.from !== payload.from || stored.to !== payload.to || stored.body !== payload.body || stored.timestamp !== payload.timestamp) {
+              throw new Error(`relayed delivery conflict for branch ${delivery.branchId} message ${delivery.id}`);
+            }
+            const target = join(path, file);
+            record.receivedAt = new Date().toISOString();
+            const tmpDir = join(root, "tmp");
+            mkdirMailDirectory(tmpDir);
+            const tmp = join(tmpDir, `${randomUUID()}.json`);
+            writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
+            publishRelayedRecord(tmp, target);
+            if (dir === "dlq") syncMailFile(`${target}.reason`);
+            syncMailDirectory(path);
+            return target;
+          }
+        }
+      }
+    } finally { lock.release(); }
+  }
+  return undefined;
 }
 
 export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string): MailMessage & { filePath: string } {
@@ -472,7 +527,7 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
     timestamp: senderTimestamp ?? timestamp,
     read: false,
     headers: { "X-TPS-Trust": "user", "X-TPS-Sender": sender },
-    ...(relayDelivery ? { relayDelivery, receivedAt: timestamp } : {}),
+    ...(relayDelivery ? { relayDelivery, relayPayload: { from: sender, to, body, timestamp: senderTimestamp ?? timestamp }, receivedAt: timestamp } : {}),
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
@@ -599,7 +654,7 @@ export function deadLetterUndelivered(
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
-  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery, receivedAt: new Date().toISOString() } : {}) }, null, 2), "utf-8");
+  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery, relayPayload: { from: record.from, to: record.to, body: record.body, timestamp: record.timestamp }, receivedAt: new Date().toISOString() } : {}) }, null, 2), "utf-8");
   writeReasonSidecar(inbox.dlq, filename, cls, reason);
   if (relayDelivery) {
     syncMailFile(join(inbox.dlq, `${filename}.reason`));
