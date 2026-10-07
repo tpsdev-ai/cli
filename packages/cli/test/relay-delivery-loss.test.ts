@@ -243,6 +243,46 @@ for (const entry of ["sync", "connect"] as const) {
       expect(acks.length).toBe(2);
     });
 
+    /** Hands a delivery to the relay handler and lets the async acceptance settle. */
+    async function deliverDirect(msg: TpsMessage): Promise<void> {
+      for (const handler of handlers) handler(msg);
+      await Bun.sleep(50);
+    }
+
+    test("an acceptance write that fails writes no inbox record and sends no ACK, and the redelivery delivers once", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accept once", SEEDS)));
+      // A real DIRECTORY at the marker's temp path fails the acceptance write
+      // itself (EISDIR) even as root, where a chmod would not.
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      fs.mkdirSync(`${marker}.tmp`, { recursive: true });
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+      await deliverDirect(msg);
+      expect(acks).toEqual([]);
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
+      // Clear the obstruction: the redelivery records acceptance and delivers once.
+      fs.rmSync(`${marker}.tmp`, { recursive: true, force: true });
+      await deliverDirect(msg);
+      expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([body.id]);
+      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+      expect(errors.mock.calls.flat().join("\n")).toContain(body.id);
+    });
+
+    test("a delivery whose acceptance is already recorded is acknowledged without a second inbox record", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "recorded", SEEDS)));
+      const acceptedDir = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
+      fs.mkdirSync(acceptedDir, { recursive: true });
+      fs.writeFileSync(join(acceptedDir, body.id), "", "utf-8");
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([body.id]);
+      expect(drainOutbox(false)).toEqual([]);
+    });
+
     test("an invalid recipient is dead-lettered to the host-level dlq and acknowledged", async () => {
       queueOutboxMessage("bad.recipient", "nowhere", "remote");
       spyOn(console, "error").mockImplementation(() => {});
