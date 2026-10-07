@@ -1,9 +1,9 @@
-import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, getMailDir, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -370,25 +370,13 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
-/**
- * Records a delivery id as accepted with an atomic, durable write: create an
- * empty temp file beside the marker, fsync it, then rename it onto the marker.
- * rename(2) is atomic, so the marker is either fully present or absent, and the
- * fsync makes it durable before the caller proceeds. The temp path is
- * `<marker>.tmp`. Throws when the write fails; the caller then delivers nothing
- * and sends no ACK.
- */
 function recordAcceptance(acceptedDir: string, marker: string): void {
   mkdirSync(acceptedDir, { recursive: true });
   const tmp = `${marker}.tmp`;
-  let fd: number | undefined;
-  try {
-    fd = openSync(tmp, "w", 0o600);
-    fsyncSync(fd);
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
+  writeFileSync(tmp, "", { mode: 0o600 });
+  syncMailFile(tmp);
   renameSync(tmp, marker);
+  syncMailDirectory(acceptedDir);
 }
 
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
@@ -397,20 +385,25 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
   // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
   const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
   const marker = join(acceptedDir, body.id);
-  // A marker in the earlier unscoped layout sits directly in .relay-accepted/.
-  if (existsSync(marker) || existsSync(join(getMailDir(), ".relay-accepted", body.id))) return false;
-
-  // Record acceptance BEFORE the inbox write and before the ACK. A failure here
-  // throws, so the inbox stays untouched and the caller sends no ACK; writing
-  // the marker first is what the inbox record's acceptance depends on, and the
-  // dedup check above skips a redelivery that finds it.
-  recordAcceptance(acceptedDir, marker);
+  const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
+  const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
+  if (existingMarker) {
+    syncMailFile(existingMarker);
+    syncMailDirectory(dirname(existingMarker));
+    return false;
+  }
+  const delivery = { branchId, id: body.id };
+  if (findRelayedRecord(body.to, delivery)) {
+    recordAcceptance(acceptedDir, marker);
+    return false;
+  }
 
   let delivered: boolean;
   try {
-    sendMessage(body.to, body.content, body.from);
+    sendMessage(body.to, body.content, body.from, delivery);
     delivered = true;
   } catch (e: unknown) {
+    if (e instanceof MailSyncError) throw e;
     const reason = e instanceof Error ? e.message : String(e);
     const cls: PromoteRejectClass = /inbox full/i.test(reason)
       ? "inbox-full"
@@ -422,11 +415,9 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
         { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
         cls,
         reason,
+        delivery,
       );
     } catch (dlqErr: unknown) {
-      // The attempt was not accepted after all: drop the marker so a later
-      // attempt retries the delivery, then propagate (the caller sends no ACK).
-      try { rmSync(marker, { force: true }); } catch {}
       console.error(
         `[relay] dead-letter failed for message ${body.id} to ${body.to}: ${dlqErr instanceof Error ? dlqErr.message : String(dlqErr)}`,
       );
@@ -434,6 +425,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     }
     delivered = false;
   }
+  recordAcceptance(acceptedDir, marker);
   return delivered;
 }
 

@@ -41,6 +41,7 @@ export interface MailMessage {
   location?: "new" | "cur" | "dlq";
   /** The verified envelope's messageId, persisted so replay is detectable. */
   envelopeId?: string;
+  relayDelivery?: { branchId: string; id: string };
   /**
    * The full SIGNED envelope, persisted at promotion so a later cur/ re-read
    * (crash recovery / lease sweep) can re-verify it. Binds "verified at
@@ -342,7 +343,56 @@ export function archiveOldCur(agent: string, maxAgeDays = 30): number {
   } finally { lock.release(); }
 }
 
-export function sendMessage(to: string, body: string, from?: string): MailMessage & { filePath: string } {
+export class MailSyncError extends Error {
+  constructor(cause: unknown) {
+    super("mail fsync failed", { cause });
+  }
+}
+
+export function syncMailFile(path: string): void {
+  try {
+    const fd = openSync(path, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  } catch (cause) { throw new MailSyncError(cause); }
+}
+
+export function syncMailDirectory(path: string): void {
+  for (let dir = path; ; dir = dirname(dir)) {
+    syncMailFile(dir);
+    if (dirname(dir) === dir) break;
+  }
+}
+
+function publishRelayedRecord(tmp: string, target: string): void {
+  syncMailFile(tmp);
+  renameSync(tmp, target);
+  syncMailDirectory(dirname(target));
+  if (dirname(tmp) !== dirname(target)) syncMailDirectory(dirname(tmp));
+}
+
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }): string | undefined {
+  let root: string;
+  try { root = mailboxRoot(agent); } catch (error) {
+    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
+    root = join(mailDirPath(), ".undeliverable");
+  }
+  for (const dir of ["new", "cur", "dlq"]) {
+    const path = join(root, dir);
+    for (const file of listMessageFiles(path)) {
+      const record = readMessageFile(join(path, file));
+      if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
+        const target = join(path, file);
+        syncMailFile(target);
+        if (dir === "dlq") syncMailFile(`${target}.reason`);
+        syncMailDirectory(path);
+        return target;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }): MailMessage & { filePath: string } {
   assertValidAgentId(to);
   const sender = from || "unknown";
   assertValidAgentId(sender);
@@ -376,6 +426,7 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
     timestamp,
     read: false,
     headers: { "X-TPS-Trust": "user", "X-TPS-Sender": sender },
+    ...(relayDelivery ? { relayDelivery } : {}),
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
@@ -383,7 +434,8 @@ export function sendMessage(to: string, body: string, from?: string): MailMessag
   const tmpPath = join(inbox.tmp, filename);
   const newPath = join(inbox.fresh, filename);
   writeFileSync(tmpPath, JSON.stringify(message, null, 2), { encoding: "utf-8", flag: "wx" });
-  renameSync(tmpPath, newPath);
+  if (relayDelivery) publishRelayedRecord(tmpPath, newPath);
+  else renameSync(tmpPath, newPath);
 
   logEvent({ event: "sent", from: sender, to, messageId: id }, body);
 
@@ -485,6 +537,7 @@ export function deadLetterUndelivered(
   record: { id: string; from: string; to: string; body: string; timestamp: string },
   cls: PromoteRejectClass,
   reason: string,
+  relayDelivery?: { branchId: string; id: string },
 ): string {
   validateMessageId(record.id);
   let inbox: { tmp: string; dlq: string };
@@ -500,9 +553,12 @@ export function deadLetterUndelivered(
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
-  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false }, null, 2), "utf-8");
+  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery } : {}) }, null, 2), "utf-8");
   writeReasonSidecar(inbox.dlq, filename, cls, reason);
-  renameSync(tmpPath, join(inbox.dlq, filename));
+  if (relayDelivery) {
+    syncMailFile(join(inbox.dlq, `${filename}.reason`));
+    publishRelayedRecord(tmpPath, join(inbox.dlq, filename));
+  } else renameSync(tmpPath, join(inbox.dlq, filename));
   return join(inbox.dlq, filename);
 }
 

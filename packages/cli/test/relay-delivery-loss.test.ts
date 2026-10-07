@@ -246,40 +246,136 @@ for (const entry of ["sync", "connect"] as const) {
     /** Hands a delivery to the relay handler and lets the async acceptance settle. */
     async function deliverDirect(msg: TpsMessage): Promise<void> {
       for (const handler of handlers) handler(msg);
-      await Bun.sleep(50);
+      await Bun.sleep(0);
     }
 
-    test("an acceptance write that fails writes no inbox record and sends no ACK, and the redelivery delivers once", async () => {
-      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accept once", SEEDS)));
-      // A real DIRECTORY at the marker's temp path fails the acceptance write
-      // itself (EISDIR) even as root, where a chmod would not.
+    for (const consumed of [false, true]) {
+      test(`marker failure then redelivery keeps one record in ${consumed ? "cur" : "new"}`, async () => {
+        const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accept once", SEEDS)));
+        const inbox = getInbox("local");
+        const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+        fs.mkdirSync(`${marker}.tmp`, { recursive: true });
+        spyOn(console, "error").mockImplementation(() => {});
+        await start();
+        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+        await deliverDirect(msg);
+        expect(acks).toEqual([]);
+        expect(jsonFiles(inbox.fresh).length).toBe(1);
+        expect(fs.existsSync(marker)).toBe(false);
+        expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
+        if (consumed) {
+          const output = spyOn(console, "log").mockImplementation(() => {});
+          await runMail({ action: "check", agent: "local", json: true });
+          expect(JSON.parse(String(output.mock.calls.at(-1)![0])).length).toBe(1);
+          expect(jsonFiles(inbox.fresh)).toEqual([]);
+          expect(jsonFiles(inbox.cur).length).toBe(1);
+        }
+        fs.rmSync(`${marker}.tmp`, { recursive: true, force: true });
+        await deliverDirect(msg);
+        expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([body.id]);
+        expect(jsonFiles(inbox.fresh).length + jsonFiles(inbox.cur).length).toBe(1);
+        expect(drainOutbox(false)).toEqual([]);
+      });
+    }
+
+    test("ACK failure then redelivery keeps one inbox record", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "ACK retry", SEEDS)));
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+      const send = channel.send;
+      channel.send = async (ack) => {
+        if (ack.type === MSG_MAIL_ACK) throw new Error("injected ACK failure");
+        return send(ack);
+      };
+      await deliverDirect(msg);
+      expect(fs.existsSync(marker)).toBe(true);
+      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+      expect(acks).toEqual([]);
+      channel.send = send;
+      await deliverDirect(msg);
+      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+      expect(acks.length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+    });
+
+    test("inbox and DLQ write failures leave no marker or ACK, then retry writes one record", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "write retry", SEEDS)));
+      const inbox = getInbox("local");
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+      const write = fs.writeFileSync;
+      const fault = spyOn(fs, "writeFileSync").mockImplementation((path, data, opts) => {
+        if (String(path).startsWith(inbox.tmp) && String(path).endsWith(".json")) fs.mkdirSync(String(path));
+        return write(path, data, opts);
+      });
+      try { await deliverDirect(msg); } finally { fault.mockRestore(); }
+      expect(acks).toEqual([]);
+      expect(fs.existsSync(marker)).toBe(false);
+      expect(jsonFiles(inbox.fresh)).toEqual([]);
+      expect(jsonFiles(inbox.dlq)).toEqual([]);
+      for (const dir of fs.readdirSync(inbox.tmp)) fs.rmSync(join(inbox.tmp, dir), { recursive: true });
+      await deliverDirect(msg);
+      expect(jsonFiles(inbox.fresh).length).toBe(1);
+      expect(acks.length).toBe(1);
+      expect(drainOutbox(false)).toEqual([]);
+    });
+
+    for (const destination of ["inbox", "DLQ"] as const) {
+      test(`${destination} and marker fsync failures send no ACK at each sync call`, async () => {
+        if (destination === "DLQ") fillInbox();
+        const inbox = getInbox("local");
+        spyOn(console, "error").mockImplementation(() => {});
+        await start();
+        const sync = fs.fsyncSync;
+        const trace: number[] = [];
+        const capture = spyOn(fs, "fsyncSync").mockImplementation((fd) => { trace.push(fd); return sync(fd); });
+        const initial = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "sync trace", SEEDS)));
+        try { await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: initial }); }
+        finally { capture.mockRestore(); }
+        expect(acks.length).toBe(1);
+        expect(trace.length).toBeGreaterThanOrEqual(destination === "inbox" ? 4 : 5);
+        for (let step = 1; step <= trace.length; step++) {
+          const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", `sync fault ${step}`, SEEDS)));
+          const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: step + 1, ts: new Date().toISOString(), body };
+          const beforeAcks = acks.length;
+          const beforeRecords = jsonFiles(inbox.fresh).length + jsonFiles(inbox.dlq).length;
+          let calls = 0;
+          const fault = spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+            if (++calls === step) throw new Error(`injected fsync failure ${step}`);
+            return sync(fd);
+          });
+          try { await deliverDirect(msg); } finally { fault.mockRestore(); }
+          expect(calls).toBe(step);
+          expect(acks.length).toBe(beforeAcks);
+          expect(drainOutbox(false).map((m) => m.id)).toContain(body.id);
+          await deliverDirect(msg);
+          expect(acks.length).toBe(beforeAcks + 1);
+          expect(jsonFiles(inbox.fresh).length + jsonFiles(inbox.dlq).length).toBe(beforeRecords + 1);
+          expect(drainOutbox(false)).toEqual([]);
+        }
+      });
+    }
+
+    test("DLQ record before marker failure is reused on redelivery", async () => {
+      fillInbox();
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "DLQ retry", SEEDS)));
+      const inbox = getInbox("local");
       const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
       fs.mkdirSync(`${marker}.tmp`, { recursive: true });
-      const errors = spyOn(console, "error").mockImplementation(() => {});
+      spyOn(console, "error").mockImplementation(() => {});
       await start();
       const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
       await deliverDirect(msg);
       expect(acks).toEqual([]);
-      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
-      expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
-      // Clear the obstruction: the redelivery records acceptance and delivers once.
-      fs.rmSync(`${marker}.tmp`, { recursive: true, force: true });
+      expect(jsonFiles(inbox.dlq).length).toBe(1);
+      fs.rmSync(`${marker}.tmp`, { recursive: true });
       await deliverDirect(msg);
-      expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([body.id]);
-      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
-      expect(drainOutbox(false)).toEqual([]);
-      expect(errors.mock.calls.flat().join("\n")).toContain(body.id);
-    });
-
-    test("a delivery whose acceptance is already recorded is acknowledged without a second inbox record", async () => {
-      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "recorded", SEEDS)));
-      const acceptedDir = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
-      fs.mkdirSync(acceptedDir, { recursive: true });
-      fs.writeFileSync(join(acceptedDir, body.id), "", "utf-8");
-      await start();
-      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
-      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
-      expect(acks.map((ack) => (ack.body as { id: string }).id)).toEqual([body.id]);
+      expect(acks.length).toBe(1);
+      expect(jsonFiles(inbox.dlq).length).toBe(1);
       expect(drainOutbox(false)).toEqual([]);
     });
 
@@ -369,14 +465,15 @@ for (const entry of ["sync", "connect"] as const) {
       for (const id of malformed) expect(logs).not.toContain(id);
     });
 
-    test("a UUID accepted under the earlier unscoped marker layout is acknowledged without a second inbox record", async () => {
+    test("a UUID with a record and an earlier unscoped marker is acknowledged without a second record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accepted before upgrade", SEEDS)));
+      sendMessage(body.to, body.content, body.from);
       const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
       fs.mkdirSync(legacy, { recursive: true });
       fs.writeFileSync(join(legacy, body.id), "");
       await start();
       await emit();
-      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
       expect(acks.length).toBe(1);
       expect(drainOutbox(false)).toEqual([]);
     });
