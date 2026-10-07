@@ -2457,11 +2457,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // Best-effort — a failure never blocks startup. A replayed id whose
         // record was swept opens a FRESH obligation: accepted, since relay
         // retries arrive within minutes/hours, never the window later.
-        //
-        // cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age —
-        // `nackHoldDays`, a configurable multiple of `retentionDays`. An owed
-        // nack held as unresolved is released once it is older than the window,
-        // and not before; past the bound the debt is abandoned (`nack-abandoned`).
         try {
           const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
           if (!unknownInbounds.has("*")) sweepTerminalObligations(

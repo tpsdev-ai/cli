@@ -1,1 +1,1 @@
-- **openclaw-tps-mail: an aged nack release re-checks the record it re-read; a record held for its owed nack keeps its metadata receipt.**
+- **openclaw-tps-mail: lock obligation writes and retention; keep receipts for held or ambiguous obligations.**
