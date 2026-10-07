@@ -45,23 +45,54 @@ function confinedPath(root, path) {
   return p;
 }
 
+function safeTempBase(path = tmpdir()) {
+  const base = realpathSync(path);
+  const st = lstatSync(base);
+  const uid = process.getuid();
+  if (!st.isDirectory() || (st.uid !== uid && st.uid !== 0) ||
+      ((st.mode & 0o022) && !(st.uid === 0 && (st.mode & 0o1000)))) {
+    throw new Error("unsafe temporary base");
+  }
+  return base;
+}
+
+function privateDirectory(path) {
+  const st = lstatSync(path);
+  if (!st.isDirectory() || st.uid !== process.getuid() || (st.mode & 0o077) || realpathSync(path) !== path) {
+    throw new Error("invalid private directory");
+  }
+}
+
+export function createMailboxStore(root, path) {
+  privateDirectory(root);
+  if (path !== join(root, "mailbox")) throw new Error("refused mailbox directory");
+  mkdirSync(path, { mode: 0o700 });
+  privateDirectory(path);
+  mkdirSync(join(path, AGENT), { mode: 0o700 });
+}
+
 function verifyRole() {
   if (!["writer", "sweeper", "watch"].includes(F.role)) throw new Error("unknown role");
-  const root = realpathSync(F.dir);
-  if (resolve(F.dir) !== root) throw new Error("noncanonical role directory");
+  const root = process.env.TPS_BENCH_ROOT;
+  const base = safeTempBase(process.env.TPS_BENCH_BASE);
+  if (!root || dirname(root) !== base || !/^bench-lock-[A-Za-z0-9]+$/.test(root.slice(base.length + 1))) {
+    throw new Error("invalid benchmark root");
+  }
+  privateDirectory(root);
+  if (F.dir !== join(root, "mailbox")) throw new Error("refused mailbox directory");
+  privateDirectory(F.dir);
   const marker = join(root, ".bench-parent.json");
   if (!lstatSync(marker).isFile()) throw new Error("invalid parent marker");
   const m = JSON.parse(readFileSync(marker, "utf8"));
   if (m.token !== process.env.TPS_BENCH_TOKEN || !m.token || m.pid !== process.ppid) {
-    throw new Error("role requires its creating parent");
+    throw new Error("invalid parent marker");
   }
   for (const name of ["out", "ready"]) F[name] = confinedPath(root, F[name]);
   for (const name of ["go", ...(F.role === "watch" ? ["stop"] : [])]) {
     if (resolve(F[name]) !== join(root, name)) throw new Error(`invalid ${name} path`);
   }
-  const mailbox = join(root, AGENT);
-  if (!lstatSync(mailbox).isDirectory() || realpathSync(mailbox) !== mailbox) throw new Error("invalid mailbox");
-  return root;
+  privateDirectory(join(F.dir, AGENT));
+  return F.dir;
 }
 
 async function loadMeasuredComponents() {
@@ -216,24 +247,29 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
   const result = { writerWaits: [], writerCalls: [], sweepCalls: [], sweepHolds: [],
     writerAcquisitions: 0, writerCollisions: 0, sweepAcquisitions: 0, sweepCollisions: 0 };
   for (let round = 0; round < rounds; round++) {
-    const dir = realpathSync(mkdtempSync(join(tmpdir(), "bench-lock-")));
+    const base = safeTempBase();
+    const root = realpathSync(mkdtempSync(join(base, "bench-lock-")));
+    const dir = join(root, "mailbox");
     const token = randomUUID();
     const jobs = [];
     try {
-      writeFileSync(join(dir, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 0o600 });
-      for (const sub of [AGENT, "home", "tmp"]) mkdirSync(join(dir, sub));
-      const env = { PATH: process.env.PATH, HOME: join(dir, "home"), TMPDIR: join(dir, "tmp"),
-        TMP: join(dir, "tmp"), TEMP: join(dir, "tmp"), TPS_BENCH_TOKEN: token };
+      privateDirectory(root);
+      createMailboxStore(root, dir);
+      writeFileSync(join(root, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 0o600 });
+      for (const sub of ["home", "tmp"]) mkdirSync(join(root, sub), { mode: 0o700 });
+      const env = { PATH: process.env.PATH, HOME: join(root, "home"), TMPDIR: join(root, "tmp"),
+        TMP: join(root, "tmp"), TEMP: join(root, "tmp"), TPS_BENCH_TOKEN: token,
+        TPS_BENCH_ROOT: root, TPS_BENCH_BASE: base };
       const add = (role, id, extra = {}) => {
-        const out = join(dir, `${id}.json`);
-        const ready = join(dir, `${id}.ready`);
-        const job = launch(role, { env, flags: { dir, out, ready, go: join(dir, "go"), ...extra } }, timeoutMs);
+        const out = join(root, `${id}.json`);
+        const ready = join(root, `${id}.ready`);
+        const job = launch(role, { env, flags: { dir, out, ready, go: join(root, "go"), ...extra } }, timeoutMs);
         Object.assign(job, { role, out, ready });
         job.done.then((status) => { job.status = status; });
         jobs.push(job);
         return job;
       };
-      const watcher = add("watch", "watch", { stop: join(dir, "stop") });
+      const watcher = add("watch", "watch", { stop: join(root, "stop") });
       const writers = Array.from({ length: n }, (_, i) => add("writer", `writer-${i}`, { writes }));
       const sweeper = add("sweeper", "sweeper", { sweeps, seed, ...(holder === undefined ? {} : { holder }) });
       const deadline = Date.now() + timeoutMs;
@@ -241,9 +277,9 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
         if (jobs.some((j) => j.status) || Date.now() >= deadline) throw new Error("barrier failed");
         await pause(1);
       }
-      writeFileSync(join(dir, "go"), "go", { flag: "wx" });
+      writeFileSync(join(root, "go"), "go", { flag: "wx" });
       const statuses = await Promise.all([...writers, sweeper].map((j) => j.done));
-      writeFileSync(join(dir, "stop"), "stop", { flag: "wx" });
+      writeFileSync(join(root, "stop"), "stop", { flag: "wx" });
       statuses.push(await watcher.done);
       for (const s of statuses) if (s.code !== 0 || s.timedOut) throw new Error(`child failed: ${JSON.stringify(s)}`);
       for (const job of [...writers, sweeper]) {
@@ -278,7 +314,7 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
     } finally {
       for (const j of jobs) if (!j.status) j.child.kill("SIGKILL");
       await Promise.all(jobs.map((j) => j.done));
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   }
   return result;
@@ -295,6 +331,7 @@ function stats(values) {
 }
 
 async function main() {
+  if (F.dir !== undefined) throw new Error("refused mailbox directory");
   if (F.nowatch !== undefined) throw new Error("watcher required");
   const ns = (F.n ?? "1,4,16").split(",").map(Number);
   if (!ns.length || ns.some((n) => !Number.isSafeInteger(n) || n <= 0)) throw new Error("invalid --n");
@@ -306,9 +343,14 @@ async function main() {
     const rounds = positive("rounds", Math.max(Math.ceil(target / (n * 3 * writes)), Math.ceil(120 / sweeps)));
     const r = await measure(n, rounds, writes, sweeps, seed, timeoutMs, F.holder);
     results[n] = { rounds, writerLockWaitMs: stats(r.writerWaits), wholeWriteLatencyMs: stats(r.writerCalls),
-      sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls),
       writerAcquisitions: r.writerAcquisitions, writerCollisions: r.writerCollisions,
-      sweepAcquisitions: r.sweepAcquisitions, sweepCollisions: r.sweepCollisions };
+      ...(F.holder === undefined ? {
+        sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls),
+        sweepAcquisitions: r.sweepAcquisitions, sweepCollisions: r.sweepCollisions,
+      } : {
+        sampledHolderOwnerSpanMs: stats(r.sweepHolds), holderCallLatencyMs: stats(r.sweepCalls),
+        holderAcquisitions: r.sweepAcquisitions, holderCollisions: r.sweepCollisions,
+      }) };
   }
   for (const [n, r] of Object.entries(results)) console.log(`N=${n} ${JSON.stringify(r)}`);
   if (F.json) console.log(`JSON ${JSON.stringify(results)}`);
