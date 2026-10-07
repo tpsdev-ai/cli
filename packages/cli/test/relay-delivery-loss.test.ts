@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
 import { runMail } from "../src/commands/mail.js";
-import { syncRemoteBranch, connectAndKeepAlive } from "../src/utils/relay.js";
+import { syncRemoteBranch, connectAndKeepAlive, deliverRelayedToLocal } from "../src/utils/relay.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 import { generateKeyPair, initHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
 import { drainOutbox, OUTBOX_RESEND_BASE_MS, queueOutboxMessage } from "../src/utils/outbox.js";
@@ -247,6 +247,59 @@ for (const entry of ["sync", "connect"] as const) {
     async function deliverDirect(msg: TpsMessage): Promise<void> {
       for (const handler of handlers) handler(msg);
       await Bun.sleep(0);
+    }
+
+    for (const destination of ["inbox", "DLQ", "cur"] as const) {
+      for (const prior of ["none", "marker", "no-marker"] as const) {
+        test(`${destination} ${prior} receipt survives GC at ACK with an old sender timestamp`, async () => {
+          if (destination === "DLQ") fillInbox();
+          const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "old timestamp", SEEDS)));
+          body.timestamp = new Date(0).toISOString();
+          const inbox = getInbox("local");
+          const dir = destination === "DLQ" ? inbox.dlq : destination === "cur" ? inbox.cur : inbox.fresh;
+          spyOn(console, "error").mockImplementation(() => {});
+          if (prior !== "none") {
+            deliverRelayedToLocal("remote", body);
+            const initialDir = destination === "DLQ" ? inbox.dlq : inbox.fresh;
+            const [file] = jsonFiles(initialDir).filter((file) => JSON.parse(fs.readFileSync(join(initialDir, file), "utf8")).relayDelivery?.id === body.id);
+            const record = JSON.parse(fs.readFileSync(join(initialDir, file), "utf8"));
+            record.receivedAt = body.timestamp;
+            if (destination === "cur") { record.read = true; record.ackedAt = body.timestamp; }
+            fs.writeFileSync(join(initialDir, file), JSON.stringify(record));
+            if (destination === "cur") fs.renameSync(join(initialDir, file), join(inbox.cur, file));
+            if (prior === "no-marker") fs.rmSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id));
+          }
+          fs.writeFileSync(join(inbox.dlq, "expired-canary.json"), JSON.stringify({ id: "expired", from: "remote", to: "local", body: "expired", timestamp: body.timestamp, read: false }));
+          await start();
+          const client = new MailClient(process.env.TPS_MAIL_DIR!, undefined, "local", {
+            async getAgent(id) {
+              const seed = SEEDS[id as keyof typeof SEEDS];
+              return seed ? { publicKey: pubkeyFromSeed(seed) } : null;
+            },
+          });
+          const send = channel.send;
+          let gcAtAck: number | undefined;
+          let recordAtAck: { timestamp: string; receivedAt: string } | undefined;
+          channel.send = async (ack) => {
+            if (ack.type === MSG_MAIL_ACK) {
+              if (destination === "cur" && prior === "none") expect(await client.checkNewMail()).toHaveLength(1);
+              gcAtAck = gcMessages("local");
+              recordAtAck = jsonFiles(dir).map((file) => JSON.parse(fs.readFileSync(join(dir, file), "utf8"))).find((record) => record.relayDelivery?.id === body.id);
+            }
+            return send(ack);
+          };
+          await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+          for (let i = 0; acks.length === 0 && i < 100; i++) await Bun.sleep(10);
+          expect(gcAtAck).toBe(1);
+          expect(recordAtAck).toBeDefined();
+          if (destination !== "cur" || prior !== "none") expect(recordAtAck!.timestamp).toBe(body.timestamp);
+          expect(Date.parse(recordAtAck!.receivedAt)).toBeGreaterThan(Date.now() - 10_000);
+          expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+          expect(gcMessages("local")).toBe(0);
+          expect(jsonFiles(dir)).toHaveLength(1);
+          expect(drainOutbox(false)).toEqual([]);
+        });
+      }
     }
 
     for (const consumed of [false, true]) {

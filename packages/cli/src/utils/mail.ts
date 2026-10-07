@@ -25,6 +25,7 @@ export interface MailMessage {
   to: string;
   body: string;
   timestamp: string;
+  receivedAt?: string;
   read: boolean;
   ackedAt?: string;
   bridgeSentAt?: string;
@@ -376,23 +377,32 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
     root = join(mailDirPath(), ".undeliverable");
   }
-  for (const dir of ["new", "cur", "dlq"]) {
-    const path = join(root, dir);
-    for (const file of listMessageFiles(path)) {
-      const record = readMessageFile(join(path, file));
-      if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
-        const target = join(path, file);
-        syncMailFile(target);
-        if (dir === "dlq") syncMailFile(`${target}.reason`);
-        syncMailDirectory(path);
-        return target;
+  const lock = acquireMailLockSync(root);
+  if (!lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+  try {
+    for (const dir of ["new", "cur", "dlq"]) {
+      const path = join(root, dir);
+      for (const file of listMessageFiles(path)) {
+        const record = readMessageFile(join(path, file));
+        if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
+          const target = join(path, file);
+          record.receivedAt = new Date().toISOString();
+          const tmpDir = join(root, "tmp");
+          mkdirSync(tmpDir, { recursive: true });
+          const tmp = join(tmpDir, `${randomUUID()}.json`);
+          writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
+          publishRelayedRecord(tmp, target);
+          if (dir === "dlq") syncMailFile(`${target}.reason`);
+          syncMailDirectory(path);
+          return target;
+        }
       }
     }
-  }
-  return undefined;
+    return undefined;
+  } finally { lock.release(); }
 }
 
-export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }): MailMessage & { filePath: string } {
+export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string): MailMessage & { filePath: string } {
   assertValidAgentId(to);
   const sender = from || "unknown";
   assertValidAgentId(sender);
@@ -423,10 +433,10 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
     from: sender,
     to,
     body,
-    timestamp,
+    timestamp: senderTimestamp ?? timestamp,
     read: false,
     headers: { "X-TPS-Trust": "user", "X-TPS-Sender": sender },
-    ...(relayDelivery ? { relayDelivery } : {}),
+    ...(relayDelivery ? { relayDelivery, receivedAt: timestamp } : {}),
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
@@ -553,7 +563,7 @@ export function deadLetterUndelivered(
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
-  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery } : {}) }, null, 2), "utf-8");
+  writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery, receivedAt: new Date().toISOString() } : {}) }, null, 2), "utf-8");
   writeReasonSidecar(inbox.dlq, filename, cls, reason);
   if (relayDelivery) {
     syncMailFile(join(inbox.dlq, `${filename}.reason`));
@@ -1346,8 +1356,8 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
         for (const file of listMessageFiles(dir)) {
           const full = join(dir, file);
           const msg = readMessageFile(full);
-          const ts = Date.parse(msg.ackedAt ?? msg.timestamp);
-          const hardTs = Date.parse(msg.timestamp);
+          const hardTs = Date.parse(msg.receivedAt ?? msg.timestamp);
+          const ts = Math.max(hardTs, Date.parse(msg.ackedAt ?? msg.receivedAt ?? msg.timestamp));
           const done = msg.read && !!msg.ackedAt;
           const prMatch = prNumber == null || msg.prNumber === prNumber || msg.body.includes(`#${prNumber}`) || msg.body.includes(`PR #${prNumber}`);
           if (!prMatch) continue;

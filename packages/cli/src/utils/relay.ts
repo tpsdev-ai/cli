@@ -400,7 +400,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
 
   let delivered: boolean;
   try {
-    sendMessage(body.to, body.content, body.from, delivery);
+    sendMessage(body.to, body.content, body.from, delivery, body.timestamp);
     delivered = true;
   } catch (e: unknown) {
     if (e instanceof MailSyncError) throw e;
