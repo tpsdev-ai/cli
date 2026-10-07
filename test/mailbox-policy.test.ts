@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { placeCurRecord } from "../packages/agent/src/lib/mailbox-policy.js";
@@ -9,12 +9,29 @@ describe("exclusive cur placement", () => {
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), "mailbox-policy-")); });
   afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
-  test("a fresh destination is linked to the source", () => {
+  test("a fresh destination is the same file as the source", () => {
     const source = join(root, "new");
     const destination = join(root, "cur");
     writeFileSync(source, "incoming");
     expect(placeCurRecord(source, destination)).toEqual({ status: "placed" });
-    expect(readFileSync(destination, "utf8")).toBe("incoming");
+
+    // Same FILE, not merely the same bytes: placing the record adds a second
+    // name for one inode. Read each name's identity and content through its own
+    // open descriptor, so no path is stat'd and then read (CodeQL file-system-race).
+    const sourceFd = openSync(source, "r");
+    const destinationFd = openSync(destination, "r");
+    try {
+      const sourceInfo = fstatSync(sourceFd);
+      const destinationInfo = fstatSync(destinationFd);
+      expect(destinationInfo.dev).toBe(sourceInfo.dev);
+      expect(destinationInfo.ino).toBe(sourceInfo.ino);
+      expect(sourceInfo.nlink).toBe(2);
+      expect(destinationInfo.nlink).toBe(2);
+      expect(readFileSync(destinationFd, "utf8")).toBe("incoming");
+    } finally {
+      closeSync(sourceFd);
+      closeSync(destinationFd);
+    }
   });
 
   for (const symlink of [false, true]) {
