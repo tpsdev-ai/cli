@@ -204,7 +204,8 @@ function* mailLockAttempts(
   root: string,
   opts: { timeoutMs?: number; pollMs?: number },
 ): Generator<number, MailLock | null, void> {
-  const { timeoutMs = 2000, pollMs = 25 } = opts;
+  // `pollMs` overrides the default retry interval of 2 ms.
+  const { timeoutMs = 2000, pollMs = 2 } = opts;
   const lockDir = mailLockPath(root);
 
   if (heldByThisProcess.has(lockDir)) {
