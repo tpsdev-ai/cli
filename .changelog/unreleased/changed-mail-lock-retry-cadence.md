@@ -1,0 +1,1 @@
+- **The mailbox lock retries a missed acquisition every 2 ms instead of every 25 ms (Closes #538).**

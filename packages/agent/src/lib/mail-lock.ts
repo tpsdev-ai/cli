@@ -204,7 +204,10 @@ function* mailLockAttempts(
   root: string,
   opts: { timeoutMs?: number; pollMs?: number },
 ): Generator<number, MailLock | null, void> {
-  const { timeoutMs = 2000, pollMs = 25 } = opts;
+  // `pollMs` is the retry interval. 2 ms keeps a writer that collides once
+  // from waiting a whole poll interval; each attempt still sleeps, it does
+  // not spin.
+  const { timeoutMs = 2000, pollMs = 2 } = opts;
   const lockDir = mailLockPath(root);
 
   if (heldByThisProcess.has(lockDir)) {
