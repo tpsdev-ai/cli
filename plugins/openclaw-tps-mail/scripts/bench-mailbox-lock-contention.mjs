@@ -1,101 +1,112 @@
 #!/usr/bin/env bun
 /**
- * bench-mailbox-lock-contention.mjs
- *
- * Measures contention on the per-mailbox lock (packages/agent/src/lib/mail-lock.ts)
- * between the aged-nack retention sweep (`sweepTerminalObligations`, cli#534) and
- * concurrent obligation writers in this plugin.
- *
- * It is a REAL-FILE benchmark, not a unit test: it builds a real mailbox
- * directory on disk (obligation records + metadata receipts), runs the REAL
- * sweep and the REAL obligation writers in SEPARATE OS PROCESSES against that
- * one directory (the lock is inter-process), and records:
- *   - each writer's lock wait  — the wall time of one real obligation write call
- *     (write/create/transition), which is dominated by the lock wait because the
- *     critical-section work is a single small file rewrite;
- *   - each sweep's hold         — the wall time of one real sweep call.
- *
- * It prints p50 / p95 / p99 / max for N = 1, 4, 16 concurrent writers.
- *
- * This script is not part of the unit lane (that lane runs test/ through
- * scripts/run-tests.mjs); run it by hand:
- *
- *   bun plugins/openclaw-tps-mail/scripts/bench-mailbox-lock-contention.mjs
- *
- * Flags (all optional):
- *   --n=1,4,16      writer counts to measure              (default 1,4,16)
- *   --writes=10     obligation-write iterations per writer per round
- *   --sweeps=8      sweep calls per sweeper per round
- *   --rounds=       rounds per writer count (default: auto to target samples)
- *   --seed=200      aged terminal records (+ receipts) seeded before each sweep
- *   --target=1500   target writer samples per writer count (auto rounds)
- *   --timeout=120   per-round wall-clock budget, seconds
- *   --json          also print the raw result object as JSON
+ * Run: bun plugins/openclaw-tps-mail/scripts/bench-mailbox-lock-contention.mjs
+ * Flags: --n=1,4,16 --writes=10 --sweeps=8 --seed=200 --rounds= --target=1500
+ *        --timeout=120 --holder=<ms> --json
+ * Acquisition time includes only acquireMailLock[Sync]. Whole-write latency
+ * includes each separate create, transition or write call. Sweep hold estimates
+ * are sampled owner-file spans; sampling may miss acquisitions or split spans.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const obligations = await import(resolve(HERE, "../src/obligations.js"));
-const { obligationsDir, receiptsDir, sweepTerminalObligations, writeObligation, createObligation, transitionObligation } = obligations;
-const { acquireMailLockSync } = await import("@tpsdev-ai/agent");
-
+const SCRIPT = fileURLToPath(import.meta.url);
+const HERE = dirname(SCRIPT);
+const ENTRY = process.argv[1] && realpathSync(process.argv[1]) === realpathSync(SCRIPT);
+const F = Object.fromEntries((ENTRY ? process.argv.slice(2) : []).map((a) => {
+  const m = /^--([^=]+)(?:=(.*))?$/.exec(a);
+  if (!m) throw new Error(`invalid argument: ${a}`);
+  return [m[1], m[2] ?? "true"];
+}));
+const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+const metrics = { waits: [], acquisitions: 0, collisions: 0, failed: 0, errors: 0 };
+const AGENT = "agent-a";
 const DAY_MS = 24 * 60 * 60 * 1000;
-const RETENTION_DAYS = 30; // records seeded ~200 days old are well past this
-const AGENT = "agent-a"; // neutral fixture name (no real fleet host/agent)
-const QUIET = { info: () => {}, warn: () => {} };
+const RETENTION_DAYS = 30;
+const QUIET = { info() {}, warn() {} };
+let obligationsDir, receiptsDir, sweepTerminalObligations, writeObligation, createObligation, transitionObligation, acquireMailLockSync;
 
-// ── argument parsing ─────────────────────────────────────────────────────────
-
-function flags(argv) {
-  const out = {};
-  for (const a of argv) {
-    const m = /^--([^=]+)(?:=(.*))?$/.exec(a);
-    if (m) out[m[1]] = m[2] === undefined ? "true" : m[2];
-  }
-  return out;
+function positive(name, fallback) {
+  const v = Number(F[name] ?? fallback);
+  if (!Number.isSafeInteger(v) || v <= 0) throw new Error(`invalid --${name}`);
+  return v;
 }
 
-const F = flags(process.argv.slice(2));
-const ROLE = F.role;
-const num = (name, dflt) => (F[name] !== undefined ? Number(F[name]) : dflt);
+function confinedPath(root, path) {
+  const p = resolve(path);
+  if (dirname(p) !== root || realpathSync(dirname(p)) !== root || existsSync(p)) {
+    throw new Error(`refused path: ${path}`);
+  }
+  return p;
+}
 
-// ── shared fixture helpers ───────────────────────────────────────────────────
+function verifyRole() {
+  if (!["writer", "sweeper", "watch"].includes(F.role)) throw new Error("unknown role");
+  const root = realpathSync(F.dir);
+  if (resolve(F.dir) !== root) throw new Error("noncanonical role directory");
+  const marker = join(root, ".bench-parent.json");
+  if (!lstatSync(marker).isFile()) throw new Error("invalid parent marker");
+  const m = JSON.parse(readFileSync(marker, "utf8"));
+  if (m.token !== process.env.TPS_BENCH_TOKEN || !m.token || m.pid !== process.ppid) {
+    throw new Error("role requires its creating parent");
+  }
+  for (const name of ["out", "ready"]) F[name] = confinedPath(root, F[name]);
+  for (const name of ["go", ...(F.role === "watch" ? ["stop"] : [])]) {
+    if (resolve(F[name]) !== join(root, name)) throw new Error(`invalid ${name} path`);
+  }
+  const mailbox = join(root, AGENT);
+  if (!lstatSync(mailbox).isDirectory() || realpathSync(mailbox) !== mailbox) throw new Error("invalid mailbox");
+  return root;
+}
 
-const nowMs = () => Number(process.hrtime.bigint()) / 1e6;
+async function loadMeasuredComponents() {
+  globalThis.__mailBench = (kind, value, lock) => {
+    if (kind === "collision") metrics.collisions++;
+    else {
+      metrics.waits.push(value);
+      if (lock) metrics.acquisitions++;
+      else metrics.failed++;
+    }
+  };
+  Bun.plugin({
+    name: "mail-acquisition-timer",
+    setup(build) {
+      build.onLoad({ filter: /[/\\]lib[/\\]mail-lock\.js$/ }, ({ path }) => {
+        let source = readFileSync(path, "utf8");
+        const start = "const attempt = mailLockAttempts(root, opts);";
+        const finish = /if \(step\.done\)\s*return step\.value;/g;
+        const collision = "if (Date.now() >= deadline)";
+        if (source.split(start).length !== 3 || [...source.matchAll(finish)].length !== 2 || !source.includes(collision)) {
+          throw new Error("mail-lock instrumentation contract changed");
+        }
+        source = source.replaceAll(start, `const benchStart = performance.now(); ${start}`)
+          .replace(finish, "if (step.done) { globalThis.__mailBench('acquired', performance.now() - benchStart, step.value); return step.value; }")
+          .replace(collision, `globalThis.__mailBench('collision'); ${collision}`);
+        return { contents: source, loader: "js" };
+      });
+    },
+  });
+  ({ obligationsDir, receiptsDir, sweepTerminalObligations, writeObligation, createObligation, transitionObligation } =
+    await import(resolve(HERE, "../src/obligations.js")));
+  ({ acquireMailLockSync } = await import("@tpsdev-ai/agent"));
+}
 
-/** Write a file atomically (dot-free temp + rename) so a concurrent reader
- *  never parses a half-written record. */
 function atomicWrite(path, data) {
-  const tmp = `${path}.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`;
-  writeFileSync(tmp, data, "utf-8");
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, data, { flag: "wx" });
   renameSync(tmp, path);
 }
 
 function makeRecord(obligationId, inboundId, state, iso) {
-  return {
-    obligationId,
-    inboundId,
-    inboundTimestamp: iso,
-    from: "sender-a",
-    to: AGENT,
-    accountId: "default",
-    state,
-    deadlineAt: null,
-    attempts: state === "pending" ? 0 : 1,
-    lastTransitionAt: iso,
-  };
+  return { obligationId, inboundId, inboundTimestamp: iso, from: "sender-a", to: AGENT,
+    accountId: "default", state, deadlineAt: null, attempts: state === "pending" ? 0 : 1, lastTransitionAt: iso };
 }
 
-/**
- * Seed `n` aged terminal obligations and their metadata receipts, so a sweep
- * has real work to do (parse, unlink, receipt unlink). Written directly and
- * atomically: this is fixture setup, outside any measured call. Receipt files
- * carry the fields the sweep reads (`obligationId`, `ts`).
- */
 function seedAgedBatch(mailDir, n, tag) {
   const od = obligationsDir(mailDir, AGENT);
   const rd = receiptsDir(mailDir, AGENT);
@@ -105,258 +116,210 @@ function seedAgedBatch(mailDir, n, tag) {
   for (let i = 0; i < n; i++) {
     const inboundId = `seed-${tag}-${i}`;
     const obligationId = `ob-${inboundId}`;
-    atomicWrite(join(od, `${inboundId}.json`), JSON.stringify(makeRecord(obligationId, inboundId, "failed", old), null, 2));
-    atomicWrite(
-      join(rd, `${obligationId}.json`),
-      JSON.stringify({ replyId: `reply-${obligationId}`, obligationId, replyToId: `thread-${inboundId}`, route: "local", ts: old, signedReply: "{}" }, null, 2),
-    );
+    atomicWrite(join(od, `${inboundId}.json`), JSON.stringify(makeRecord(obligationId, inboundId, "failed", old)));
+    atomicWrite(join(rd, `${obligationId}.json`), JSON.stringify({ replyId: `reply-${obligationId}`,
+      obligationId, replyToId: `thread-${inboundId}`, route: "local", ts: old, signedReply: "{}" }));
   }
 }
 
-// ── child roles ──────────────────────────────────────────────────────────────
-
-async function roleWriter() {
-  const mailDir = F.dir;
-  const writes = num("writes", 10);
-  const out = F.out;
-  const waits = [];
-  let busy = 0;
-  let errors = 0;
-  for (let j = 0; j < writes; j++) {
-    const inboundId = `w-${process.pid}-${F.round}-${j}`;
-    const obligationId = `ob-${inboundId}`;
-    const iso = new Date().toISOString();
-    let t0 = nowMs();
-    try {
-      createObligation(mailDir, AGENT, () => makeRecord(obligationId, inboundId, "pending", iso), QUIET);
-      waits.push(nowMs() - t0);
-    } catch (err) {
-      if (String(err?.message ?? err).includes("busy")) busy++;
-      else errors++;
-    }
-    t0 = nowMs();
-    try {
-      transitionObligation(mailDir, AGENT, inboundId, "delivering", {}, QUIET);
-      waits.push(nowMs() - t0);
-    } catch (err) {
-      if (String(err?.message ?? err).includes("busy")) busy++;
-      else errors++;
-    }
-    t0 = nowMs();
-    try {
-      writeObligation(mailDir, AGENT, makeRecord(obligationId, inboundId, "posted", iso));
-      waits.push(nowMs() - t0);
-    } catch (err) {
-      if (String(err?.message ?? err).includes("busy")) busy++;
-      else errors++;
-    }
-  }
-  writeFileSync(out, JSON.stringify({ waits, busy, errors }), "utf-8");
-}
-
-async function roleSweeper() {
-  const mailDir = F.dir;
-  const sweeps = num("sweeps", 8);
-  const seed = num("seed", 200);
-  const out = F.out;
-  const calls = [];
-  let removed = 0;
-  // --holder=<ms> runs a bare lock HOLDER (acquire, hold ms, release) instead of
-  // the real sweep: it isolates how long the sweep HOLDS the lock from the
-  // writers' wait, to show what the wait floor is (the lock's poll interval).
-  const holderMs = F.holder !== undefined ? Number(F.holder) : null;
-  for (let j = 0; j < sweeps; j++) {
-    if (holderMs !== null) {
-      const t0 = nowMs();
-      const lock = acquireMailLockSync(resolve(mailDir, AGENT), { timeoutMs: 0 });
-      if (lock) {
-        if (holderMs > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holderMs);
-        lock.release();
+async function roleMain() {
+  const root = verifyRole();
+  if (F.role !== "watch") await loadMeasuredComponents();
+  writeFileSync(F.ready, "ready", { flag: "wx" });
+  while (!existsSync(F.go)) await pause(1);
+  if (F.role === "watch") {
+    const ownerPath = join(root, AGENT, ".mail-lock", "owner.json");
+    const spans = [];
+    let current = null;
+    let start = 0;
+    while (!existsSync(F.stop)) {
+      let owner = null;
+      try {
+        const o = JSON.parse(readFileSync(ownerPath, "utf8"));
+        if (Number.isInteger(o.pid) && typeof o.nonce === "string") owner = o;
+      } catch {}
+      if (owner?.nonce !== current?.nonce) {
+        if (current) spans.push({ pid: current.pid, ms: nowMs() - start });
+        current = owner;
+        start = nowMs();
       }
-      calls.push(nowMs() - t0);
-      continue;
     }
-    // Re-arm a full batch of aged debt so every timed sweep has real work.
-    seedAgedBatch(mailDir, seed, `${F.round}-${j}`);
-    const t0 = nowMs();
-    const res = sweepTerminalObligations(mailDir, AGENT, RETENTION_DAYS, QUIET);
-    calls.push(nowMs() - t0);
-    removed += res.removed;
+    if (current) spans.push({ pid: current.pid, ms: nowMs() - start });
+    writeFileSync(F.out, JSON.stringify(spans), { flag: "wx" });
+    return;
   }
-  writeFileSync(out, JSON.stringify({ calls, removed }), "utf-8");
-}
-
-/**
- * Sample the mailbox lock's owner and record how long each holder holds it,
- * attributed by the owner pid. This measures the sweep's LOCK HOLD directly
- * (the sweeper's pid), independent of how much work runs outside the lock.
- * Sampled in a busy loop, so it is a benchmark-only observer (not production).
- */
-async function roleWatch() {
-  const dir = F.dir;
-  const out = F.out;
-  const stop = F.stop;
-  const ownerPath = join(dir, AGENT, ".mail-lock", "owner.json");
-  const spans = [];
-  let cur = null;
-  let start = 0;
-  while (!existsSync(stop)) {
-    let pid = null;
-    try {
-      const o = JSON.parse(readFileSync(ownerPath, "utf-8"));
-      if (typeof o.pid === "number") pid = o.pid;
-    } catch {
-      // lock absent or owner unreadable
+  const calls = [];
+  const removals = [];
+  if (F.role === "writer") {
+    for (let j = 0; j < positive("writes", 10); j++) {
+      const inboundId = `w-${process.pid}-${j}`;
+      const obligationId = `ob-${inboundId}`;
+      const iso = new Date().toISOString();
+      for (const call of [
+        () => createObligation(root, AGENT, () => makeRecord(obligationId, inboundId, "pending", iso), QUIET),
+        () => transitionObligation(root, AGENT, inboundId, "delivering", {}, QUIET),
+        () => writeObligation(root, AGENT, makeRecord(obligationId, inboundId, "posted", iso)),
+      ]) {
+        const start = nowMs();
+        call();
+        calls.push(nowMs() - start);
+      }
     }
-    if (pid !== cur) {
-      if (cur !== null) spans.push({ pid: cur, ms: nowMs() - start });
-      cur = pid;
-      start = nowMs();
+  } else {
+    const seed = positive("seed", 200);
+    const holder = F.holder === undefined ? null : Number(F.holder);
+    if (holder !== null && (!Number.isFinite(holder) || holder < 0)) throw new Error("invalid holder");
+    for (let j = 0; j < positive("sweeps", 8); j++) {
+      seedAgedBatch(root, seed, j);
+      const start = nowMs();
+      if (holder !== null) {
+        const lock = acquireMailLockSync(join(root, AGENT), { timeoutMs: 0 });
+        if (!lock) throw new Error("holder acquisition failed");
+        try {
+          if (holder > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holder);
+        } finally { lock.release(); }
+      } else {
+        const res = sweepTerminalObligations(root, AGENT, RETENTION_DAYS, QUIET);
+        removals.push(res.removed);
+        if (res.removed !== seed || res.receiptsRemoved !== seed || res.unreadable || res.receiptsUnreadable) {
+          throw new Error(`incomplete sweep: ${JSON.stringify(res)}`);
+        }
+      }
+      calls.push(nowMs() - start);
     }
   }
-  if (cur !== null) spans.push({ pid: cur, ms: nowMs() - start });
-  writeFileSync(out, JSON.stringify(spans), "utf-8");
+  writeFileSync(F.out, JSON.stringify({ ...metrics, calls, removals }), { flag: "wx" });
 }
 
-// ── orchestrator ─────────────────────────────────────────────────────────────
-
-function percentile(sorted, p) {
-  if (sorted.length === 0) return Number.NaN;
-  const idx = (p / 100) * (sorted.length - 1);
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  if (lo === hi) return sorted[lo];
-  return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
-}
-
-function stats(samples) {
-  const s = [...samples].sort((a, b) => a - b);
-  return {
-    n: s.length,
-    p50: percentile(s, 50),
-    p95: percentile(s, 95),
-    p99: percentile(s, 99),
-    max: s.length ? s[s.length - 1] : Number.NaN,
-    mean: s.length ? s.reduce((a, b) => a + b, 0) / s.length : Number.NaN,
-  };
-}
-
-const fmt = (v) => (Number.isFinite(v) ? v.toFixed(3) : "n/a");
-
-/** Spawn one child (`bun <this> --role=…`); returns the child, its pid and a
- *  completion promise. */
-function startChild(role, opts, timeoutMs) {
-  const args = [fileURLToPath(import.meta.url), `--role=${role}`, `--dir=${opts.dir}`, `--out=${opts.out}`, `--round=${opts.round}`];
-  if (role === "writer") args.push(`--writes=${opts.writes}`);
-  if (role === "sweeper") {
-    args.push(`--sweeps=${opts.sweeps}`, `--seed=${opts.seed}`);
-    if (opts.holder !== undefined) args.push(`--holder=${opts.holder}`);
-  }
-  if (role === "watch") args.push(`--stop=${opts.stop}`);
-  const env = { ...process.env, HOME: opts.home, TMPDIR: opts.tmp };
-  const child = spawn(process.execPath, args, { env, stdio: ["ignore", "ignore", "pipe"] });
+export function startChild(role, opts, timeoutMs) {
+  const args = [SCRIPT, `--role=${role}`];
+  for (const [key, value] of Object.entries(opts.flags)) args.push(`--${key}=${value}`);
+  const child = spawn(process.execPath, args, { env: opts.env, stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
-  child.stderr.on("data", (d) => { stderr += d; });
+  let timedOut = false;
   const done = new Promise((res) => {
-    const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      res({ timedOut: true, stderr });
-    }, timeoutMs);
-    child.on("exit", (code) => {
-      clearTimeout(timer);
-      res({ code, timedOut: false, stderr });
-    });
+    const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+    child.stderr.on("data", (d) => { stderr += d; });
+    child.once("error", (err) => { clearTimeout(timer); res({ code: null, stderr: String(err), timedOut }); });
+    child.once("close", (code) => { clearTimeout(timer); res({ code, stderr, timedOut }); });
   });
   return { child, pid: child.pid, done };
 }
 
-async function measure(nWriters, rounds, writes, sweeps, seed, perRoundTimeoutMs, useWatcher) {
-  const writerWaits = [];
-  const sweepCalls = [];
-  const sweepHolds = [];
-  let busy = 0;
-  let errors = 0;
-  let timeouts = 0;
-  const home = mkdtempSync(join(tmpdir(), "bench-lock-home-"));
-  for (let round = 0; round < rounds; round++) {
-    const dir = mkdtempSync(join(tmpdir(), "bench-lock-mail-"));
-    const tmp = join(dir, "tmp");
-    mkdirSync(tmp, { recursive: true });
-    const outputs = [];
-    const jobs = [];
-    for (let w = 0; w < nWriters; w++) {
-      const out = join(dir, `writer-${w}.json`);
-      outputs.push({ role: "writer", out });
-      jobs.push(startChild("writer", { dir, out, round, writes, home, tmp }, perRoundTimeoutMs));
-    }
-    const sweepOut = join(dir, "sweeper.json");
-    outputs.push({ role: "sweeper", out: sweepOut });
-    const sweeper = startChild("sweeper", { dir, out: sweepOut, round, sweeps, seed, holder: F.holder, home, tmp }, perRoundTimeoutMs);
-    jobs.push(sweeper);
-
-    const stop = join(dir, "watch.stop");
-    const watchOut = join(dir, "watch.json");
-    const watcher = useWatcher ? startChild("watch", { dir, out: watchOut, round, stop, home, tmp }, perRoundTimeoutMs) : null;
-
-    const done = await Promise.all(jobs.map((j) => j.done));
-    for (const d of done) if (d.timedOut) timeouts++;
-    if (watcher) {
-      writeFileSync(stop, "stop");
-      await watcher.done;
-    }
-
-    for (const { role, out } of outputs) {
-      let parsed;
-      try { parsed = JSON.parse(readFileSync(out, "utf-8")); } catch { continue; }
-      if (role === "writer") { writerWaits.push(...parsed.waits); busy += parsed.busy ?? 0; errors += parsed.errors ?? 0; }
-      else sweepCalls.push(...parsed.calls);
-    }
-    if (watcher) {
-      try {
-        const spans = JSON.parse(readFileSync(watchOut, "utf-8"));
-        for (const s of spans) if (s.pid === sweeper.pid) sweepHolds.push(s.ms);
-      } catch { /* watcher produced nothing */ }
-    }
-    rmSync(dir, { recursive: true, force: true });
+function samples(values, count, label) {
+  if (!Array.isArray(values) || values.length !== count || values.some((v) => !Number.isFinite(v) || v < 0)) {
+    throw new Error(`invalid ${label} samples`);
   }
-  rmSync(home, { recursive: true, force: true });
-  return { writerWaits, sweepCalls, sweepHolds, busy, errors, timeouts };
+}
+
+export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder, launch = startChild) {
+  const result = { writerWaits: [], writerCalls: [], sweepCalls: [], sweepHolds: [],
+    writerAcquisitions: 0, writerCollisions: 0, sweepAcquisitions: 0, sweepCollisions: 0 };
+  for (let round = 0; round < rounds; round++) {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "bench-lock-")));
+    const token = randomUUID();
+    const jobs = [];
+    try {
+      writeFileSync(join(dir, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 0o600 });
+      for (const sub of [AGENT, "home", "tmp"]) mkdirSync(join(dir, sub));
+      const env = { PATH: process.env.PATH, HOME: join(dir, "home"), TMPDIR: join(dir, "tmp"),
+        TMP: join(dir, "tmp"), TEMP: join(dir, "tmp"), TPS_BENCH_TOKEN: token };
+      const add = (role, id, extra = {}) => {
+        const out = join(dir, `${id}.json`);
+        const ready = join(dir, `${id}.ready`);
+        const job = launch(role, { env, flags: { dir, out, ready, go: join(dir, "go"), ...extra } }, timeoutMs);
+        Object.assign(job, { role, out, ready });
+        job.done.then((status) => { job.status = status; });
+        jobs.push(job);
+        return job;
+      };
+      const watcher = add("watch", "watch", { stop: join(dir, "stop") });
+      const writers = Array.from({ length: n }, (_, i) => add("writer", `writer-${i}`, { writes }));
+      const sweeper = add("sweeper", "sweeper", { sweeps, seed, ...(holder === undefined ? {} : { holder }) });
+      const deadline = Date.now() + timeoutMs;
+      while (!jobs.every((j) => existsSync(j.ready))) {
+        if (jobs.some((j) => j.status) || Date.now() >= deadline) throw new Error("barrier failed");
+        await pause(1);
+      }
+      writeFileSync(join(dir, "go"), "go", { flag: "wx" });
+      const statuses = await Promise.all([...writers, sweeper].map((j) => j.done));
+      writeFileSync(join(dir, "stop"), "stop", { flag: "wx" });
+      statuses.push(await watcher.done);
+      for (const s of statuses) if (s.code !== 0 || s.timedOut) throw new Error(`child failed: ${JSON.stringify(s)}`);
+      for (const job of [...writers, sweeper]) {
+        const r = JSON.parse(readFileSync(job.out, "utf8"));
+        const count = job.role === "writer" ? writes * 3 : sweeps;
+        samples(r.waits, count, "acquisition");
+        samples(r.calls, count, "call");
+        if (r.errors !== 0 || r.failed !== 0 || r.acquisitions !== count || !Number.isSafeInteger(r.collisions) || r.collisions < 0) {
+          throw new Error("invalid acquisition counts");
+        }
+        if (job.role === "writer") {
+          result.writerWaits.push(...r.waits);
+          result.writerCalls.push(...r.calls);
+          result.writerAcquisitions += r.acquisitions;
+          result.writerCollisions += r.collisions;
+        } else {
+          if (holder === undefined && (!Array.isArray(r.removals) || r.removals.length !== sweeps || r.removals.some((v) => v !== seed))) {
+            throw new Error("invalid sweep removals");
+          }
+          result.sweepCalls.push(...r.calls);
+          result.sweepAcquisitions += r.acquisitions;
+          result.sweepCollisions += r.collisions;
+        }
+      }
+      const spans = JSON.parse(readFileSync(watcher.out, "utf8"));
+      if (!Array.isArray(spans) || spans.some((s) => !Number.isSafeInteger(s.pid) || !Number.isFinite(s.ms) || s.ms < 0)) {
+        throw new Error("invalid watcher data");
+      }
+      const holds = spans.filter((s) => s.pid === sweeper.pid).map((s) => s.ms);
+      if (!holds.length) throw new Error("missing sweep hold observations");
+      result.sweepHolds.push(...holds);
+    } finally {
+      for (const j of jobs) if (!j.status) j.child.kill("SIGKILL");
+      await Promise.all(jobs.map((j) => j.done));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  return result;
+}
+
+function stats(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const percentile = (p) => {
+    const index = p / 100 * (sorted.length - 1);
+    const lo = Math.floor(index), hi = Math.ceil(index);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (index - lo);
+  };
+  return { n: sorted.length, p50: percentile(50), p95: percentile(95), p99: percentile(99), max: sorted.at(-1) };
 }
 
 async function main() {
-  const ns = (F.n ?? "1,4,16").split(",").map((x) => Number(x.trim())).filter((x) => Number.isFinite(x) && x > 0);
-  const writes = num("writes", 10);
-  const sweeps = num("sweeps", 8);
-  const seed = num("seed", 200);
-  const target = num("target", 1500);
-  const perRoundTimeoutMs = num("timeout", 120) * 1000;
-
-  console.log(`bench-mailbox-lock-contention: writes=${writes}/writer/round, sweeps=${sweeps}/sweeper/round, seed=${seed}${F.holder !== undefined ? `, holder=${F.holder}ms` : ""}`);
-  console.log("lock wait = wall time of one real obligation write call; hold = wall time of one real sweep call\n");
-
-  const useWatcher = F.nowatch === undefined;
+  if (F.nowatch !== undefined) throw new Error("watcher required");
+  const ns = (F.n ?? "1,4,16").split(",").map(Number);
+  if (!ns.length || ns.some((n) => !Number.isSafeInteger(n) || n <= 0)) throw new Error("invalid --n");
+  const writes = positive("writes", 10), sweeps = positive("sweeps", 8), seed = positive("seed", 200);
+  const target = positive("target", 1500), timeoutMs = Number(F.timeout ?? 120) * 1000;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid timeout");
   const results = {};
   for (const n of ns) {
-    const rounds = num("rounds", Math.max(Math.ceil(target / (n * 3 * writes)), Math.ceil(120 / sweeps)));
-    const r = await measure(n, rounds, writes, sweeps, seed, perRoundTimeoutMs, useWatcher);
-    const w = stats(r.writerWaits);
-    const s = stats(r.sweepHolds);
-    const c = stats(r.sweepCalls);
-    results[n] = { rounds, writers: n, wait: w, hold: s, call: c, busy: r.busy, errors: r.errors, timeouts: r.timeouts };
-    console.log(
-      `N=${n}  (${rounds} rounds)  writer lock wait ms: n=${w.n} p50=${fmt(w.p50)} p95=${fmt(w.p95)} p99=${fmt(w.p99)} max=${fmt(w.max)} mean=${fmt(w.mean)}` +
-        `   |   sweep LOCK HOLD ms: n=${s.n} p50=${fmt(s.p50)} p95=${fmt(s.p95)} p99=${fmt(s.p99)} max=${fmt(s.max)}` +
-        `   |   sweep call ms: p50=${fmt(c.p50)} p99=${fmt(c.p99)}` +
-        (r.busy || r.errors || r.timeouts ? `   | busy=${r.busy} errors=${r.errors} roundTimeouts=${r.timeouts}` : ""),
-    );
+    const rounds = positive("rounds", Math.max(Math.ceil(target / (n * 3 * writes)), Math.ceil(120 / sweeps)));
+    const r = await measure(n, rounds, writes, sweeps, seed, timeoutMs, F.holder);
+    results[n] = { rounds, writerLockWaitMs: stats(r.writerWaits), wholeWriteLatencyMs: stats(r.writerCalls),
+      sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls),
+      writerAcquisitions: r.writerAcquisitions, writerCollisions: r.writerCollisions,
+      sweepAcquisitions: r.sweepAcquisitions, sweepCollisions: r.sweepCollisions };
   }
-
-  if (F.json) console.log(`\nJSON ${JSON.stringify(results)}`);
+  for (const [n, r] of Object.entries(results)) console.log(`N=${n} ${JSON.stringify(r)}`);
+  if (F.json) console.log(`JSON ${JSON.stringify(results)}`);
 }
 
-// ── dispatch ─────────────────────────────────────────────────────────────────
-
-if (ROLE === "writer") await roleWriter();
-else if (ROLE === "sweeper") await roleSweeper();
-else if (ROLE === "watch") await roleWatch();
-else await main();
+if (ENTRY) {
+  try {
+    if (F.role) await roleMain();
+    else await main();
+  } catch (err) {
+    console.error(String(err));
+    process.exitCode = 1;
+  }
+}
