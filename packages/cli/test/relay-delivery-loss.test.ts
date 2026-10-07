@@ -1,4 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import { MailClient, hasCommittedMessageId } from "@tpsdev-ai/agent";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -300,6 +301,60 @@ for (const entry of ["sync", "connect"] as const) {
       expect(drainOutbox(false)).toEqual([]);
     });
 
+    for (const state of ["removed-unread", "consumed", "legacy"] as const) {
+      test(`existing ${state} marker ACK requires a record or consumed ledger entry`, async () => {
+        const envelope = buildSignedEnvelope("remote", "local", state, SEEDS);
+        const body = queue(JSON.stringify(envelope));
+        const inbox = getInbox("local");
+        const marker = state === "legacy"
+          ? join(process.env.TPS_MAIL_DIR!, ".relay-accepted", body.id)
+          : join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+        spyOn(console, "error").mockImplementation(() => {});
+        await start();
+        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
+        if (state === "legacy") {
+          fs.mkdirSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted"), { recursive: true });
+          fs.writeFileSync(marker, "");
+        } else {
+          const send = channel.send;
+          channel.send = async () => { throw new Error("injected lost ACK"); };
+          await deliverDirect(msg);
+          channel.send = send;
+          expect(acks).toEqual([]);
+          expect(fs.readFileSync(marker, "utf8")).toBe("");
+          expect(jsonFiles(inbox.fresh)).toHaveLength(1);
+          if (state === "consumed") {
+            const client = new MailClient(process.env.TPS_MAIL_DIR!, undefined, "local", {
+              async getAgent(id) {
+                const seed = SEEDS[id as keyof typeof SEEDS];
+                return seed ? { publicKey: pubkeyFromSeed(seed) } : null;
+              },
+            });
+            expect(await client.checkNewMail()).toHaveLength(1);
+            expect(hasCommittedMessageId(join(process.env.TPS_MAIL_DIR!, "local"), envelope.messageId)).toBe(true);
+            expect(envelope.messageId).not.toBe(body.id);
+            for (const file of jsonFiles(inbox.cur)) fs.unlinkSync(join(inbox.cur, file));
+          } else {
+            for (const file of jsonFiles(inbox.fresh)) fs.unlinkSync(join(inbox.fresh, file));
+            expect(hasCommittedMessageId(join(process.env.TPS_MAIL_DIR!, "local"), envelope.messageId)).toBe(false);
+          }
+        }
+        const recordsAtAck: number[] = [];
+        const send = channel.send;
+        channel.send = async (ack) => {
+          if (ack.type === MSG_MAIL_ACK) recordsAtAck.push(jsonFiles(inbox.fresh).length);
+          return send(ack);
+        };
+        await deliverDirect(msg);
+        expect(recordsAtAck).toEqual([state === "consumed" ? 0 : 1]);
+        expect(jsonFiles(inbox.fresh)).toHaveLength(state === "consumed" ? 0 : 1);
+        expect(jsonFiles(inbox.cur)).toEqual([]);
+        expect(jsonFiles(inbox.dlq)).toEqual([]);
+        expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+        expect(drainOutbox(false)).toEqual([]);
+      });
+    }
+
     test("inbox and DLQ write failures leave no marker or ACK, then retry writes one record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "write retry", SEEDS)));
       const inbox = getInbox("local");
@@ -465,9 +520,9 @@ for (const entry of ["sync", "connect"] as const) {
       for (const id of malformed) expect(logs).not.toContain(id);
     });
 
-    test("a UUID with a record and an earlier unscoped marker is acknowledged without a second record", async () => {
+    test("a UUID with a matching record and an unscoped marker reuses the record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accepted before upgrade", SEEDS)));
-      sendMessage(body.to, body.content, body.from);
+      sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id });
       const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
       fs.mkdirSync(legacy, { recursive: true });
       fs.writeFileSync(join(legacy, body.id), "");

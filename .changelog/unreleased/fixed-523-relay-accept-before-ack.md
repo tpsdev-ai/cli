@@ -1,1 +1,1 @@
-- **Relay ACKs follow inbox or DLQ publication and acceptance marker publication.**
+- **Relay ACKs require a synced marker plus either a synced matching new/cur/DLQ record or a synced recipient replay ledger containing the consumed envelope ID.**
