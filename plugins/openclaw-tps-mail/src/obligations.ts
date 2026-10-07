@@ -486,7 +486,7 @@ function curRecordUnresolved(mailDir: string, agent: string, inboundId: string):
 export function obligationLastTransitionMs(record: unknown): number | null {
   const r = record as Record<string, unknown> | null;
   const raw = r?.lastTransitionAt;
-  if (raw !== undefined && raw !== null) {
+  if (r !== null && r !== undefined && Object.hasOwn(r, "lastTransitionAt")) {
     if (typeof raw === "string") {
       const t = Date.parse(raw);
       return Number.isFinite(t) ? t : null; // present but unparseable → unageable

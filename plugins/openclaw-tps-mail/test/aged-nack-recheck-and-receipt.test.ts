@@ -186,7 +186,7 @@ describe("owed-nack retention", () => {
     expect(existsSync(receipt)).toBe(true);
   });
 
-  it("accepts the hold setting through the shipped manifest schema", async () => {
+  it("validates the hold setting with Ajv against the shipped manifest", async () => {
     const require = createRequire(import.meta.url);
     const Ajv = createRequire(require.resolve("openclaw/package.json"))("ajv");
     const manifest = JSON.parse(realFs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
@@ -202,6 +202,40 @@ describe("owed-nack retention", () => {
     expect(res.abandonedForNack).toBe(0);
     expect(existsSync(path)).toBe(true);
   });
+
+  it("ages debt from inboundTimestamp when lastTransitionAt is absent", () => {
+    const path = writeRecord("legacy", { obligationId: "ob-legacy", ageDays: 40, owesNack: true });
+    const receipt = writeReceiptFor("ob-legacy", 40);
+    const record = JSON.parse(realFs.readFileSync(path, "utf8"));
+    delete record.lastTransitionAt;
+    realFs.writeFileSync(path, JSON.stringify(record));
+    const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+    expect(res.abandonedForNack).toBe(1);
+    expect(res.removed).toBe(1);
+    expect(res.receiptsRemoved).toBe(1);
+    expect(() => realFs.readFileSync(path)).toThrow();
+    expect(() => realFs.readFileSync(receipt)).toThrow();
+  });
+
+  for (const timestamp of [null, 123, false, {}, []]) {
+    it(`keeps debt and receipt with lastTransitionAt ${JSON.stringify(timestamp)}`, () => {
+      const id = "unageable";
+      const path = writeRecord(id, { obligationId: "ob-unageable", ageDays: 40, owesNack: true });
+      const receipt = writeReceiptFor("ob-unageable", 40);
+      const record = JSON.parse(realFs.readFileSync(path, "utf8"));
+      record.lastTransitionAt = timestamp;
+      realFs.writeFileSync(path, JSON.stringify(record));
+      const res = sweepTerminalObligations(mailDir, AGENT, 7, quiet);
+      expect(res.abandonedForNack).toBe(0);
+      expect(res.removed).toBe(0);
+      expect(res.receiptsRemoved).toBe(0);
+      const kept = JSON.parse(realFs.readFileSync(path, "utf8"));
+      expect(kept.lastTransitionAt).toEqual(timestamp);
+      expect(kept.nackAbandonedAt).toBeUndefined();
+      expect(nackOwed(kept)).toBe(true);
+      expect(JSON.parse(realFs.readFileSync(receipt, "utf8")).obligationId).toBe("ob-unageable");
+    });
+  }
 
   it("keeps debt and receipt after an unparseable transition or a failed release write", () => {
     for (const fault of ["timestamp", "write"]) {
