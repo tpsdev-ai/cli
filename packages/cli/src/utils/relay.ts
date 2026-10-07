@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -371,7 +371,7 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
 }
 
 function recordAcceptance(acceptedDir: string, marker: string): void {
-  mkdirSync(acceptedDir, { recursive: true });
+  mkdirMailDirectory(acceptedDir);
   const tmp = `${marker}.tmp`;
   writeFileSync(tmp, "", { mode: 0o600 });
   syncMailFile(tmp);

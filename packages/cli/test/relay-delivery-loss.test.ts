@@ -492,6 +492,7 @@ for (const entry of ["sync", "connect"] as const) {
         const inbox = getInbox("local");
         spyOn(console, "error").mockImplementation(() => {});
         await start();
+        fs.mkdirSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote"), { recursive: true });
         const sync = fs.fsyncSync;
         const trace: number[] = [];
         const capture = spyOn(fs, "fsyncSync").mockImplementation((fd) => { trace.push(fd); return sync(fd); });

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import {
   decideEnvelopeForMailbox as decideEnvelope,
   type Envelope, PublicKeyFormatError, verifiedMailTier, bridgePrincipalIds,
@@ -97,7 +97,7 @@ function mailDirPath(): string {
 
 export function getMailDir(): string {
   const dir = mailDirPath();
-  mkdirSync(dir, { recursive: true });
+  mkdirMailDirectory(dir);
   return dir;
 }
 
@@ -135,10 +135,10 @@ export function getInbox(agent: string): { root: string; tmp: string; fresh: str
   const fresh = join(root, "new");
   const cur = join(root, "cur");
   const dlq = join(root, "dlq");
-  mkdirSync(tmp, { recursive: true });
-  mkdirSync(fresh, { recursive: true });
-  mkdirSync(cur, { recursive: true });
-  mkdirSync(dlq, { recursive: true });
+  mkdirMailDirectory(tmp);
+  mkdirMailDirectory(fresh);
+  mkdirMailDirectory(cur);
+  mkdirMailDirectory(dlq);
   return { root, tmp, fresh, cur, dlq };
 }
 
@@ -165,7 +165,7 @@ function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur"
       console.error(`[mail] skipping corrupt message ${f}: ${err.message}`);
     }
   }
-  return messages.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+  return messages.sort((a, b) => ((a.receivedAt ?? a.timestamp) < (b.receivedAt ?? b.timestamp) ? 1 : -1));
 }
 
 function listMessageFiles(dir: string): string[] {
@@ -358,9 +358,25 @@ export function syncMailFile(path: string): void {
 }
 
 export function syncMailDirectory(path: string): void {
-  for (let dir = path; ; dir = dirname(dir)) {
-    syncMailFile(dir);
-    if (dirname(dir) === dir) break;
+  syncMailFile(path);
+}
+
+const pendingDirectorySyncs = new Set<string>();
+
+export function mkdirMailDirectory(path: string): void {
+  const target = resolve(path);
+  const created = mkdirSync(target, { recursive: true });
+  if (created) {
+    const stop = dirname(resolve(created));
+    for (let dir = dirname(target); ; dir = dirname(dir)) {
+      pendingDirectorySyncs.add(dir);
+      if (dir === stop) break;
+    }
+  }
+  for (const dir of pendingDirectorySyncs) {
+    if (target !== dir && !target.startsWith(dir.endsWith(sep) ? dir : dir + sep)) continue;
+    syncMailDirectory(dir);
+    pendingDirectorySyncs.delete(dir);
   }
 }
 
@@ -377,18 +393,38 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
     root = join(mailDirPath(), ".undeliverable");
   }
+  mkdirMailDirectory(root);
   const lock = acquireMailLockSync(root);
   if (!lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
   try {
     for (const dir of ["new", "cur", "dlq"]) {
       const path = join(root, dir);
       for (const file of listMessageFiles(path)) {
-        const record = readMessageFile(join(path, file));
+        const source = join(path, file);
+        let record: MailMessage;
+        try {
+          record = readMessageFile(source);
+          if (!record || typeof record !== "object") throw new Error(`invalid message record ${source}`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          console.error(`[mail] unreadable record ${source}: ${reason}`);
+          if ((error as NodeJS.ErrnoException)?.code) continue;
+          const quarantine = join(root, "quarantine");
+          mkdirMailDirectory(quarantine);
+          const target = join(quarantine, `${dir}-${randomUUID()}-${file}`);
+          writeFileSync(`${target}.reason`, `class: invalid\nSource: ${source}\nReason: ${reason}\n`, { flag: "wx" });
+          syncMailFile(`${target}.reason`);
+          syncMailFile(source);
+          renameSync(source, target);
+          syncMailDirectory(quarantine);
+          syncMailDirectory(path);
+          continue;
+        }
         if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
           const target = join(path, file);
           record.receivedAt = new Date().toISOString();
           const tmpDir = join(root, "tmp");
-          mkdirSync(tmpDir, { recursive: true });
+          mkdirMailDirectory(tmpDir);
           const tmp = join(tmpDir, `${randomUUID()}.json`);
           writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
           publishRelayedRecord(tmp, target);
@@ -557,8 +593,8 @@ export function deadLetterUndelivered(
   } catch (error) {
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
     inbox = { tmp: join(getMailDir(), ".undeliverable", "tmp"), dlq: join(getMailDir(), ".undeliverable", "dlq") };
-    mkdirSync(inbox.tmp, { recursive: true });
-    mkdirSync(inbox.dlq, { recursive: true });
+    mkdirMailDirectory(inbox.tmp);
+    mkdirMailDirectory(inbox.dlq);
   }
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
@@ -681,6 +717,7 @@ const UNVERIFIED_PRESENTABLE_FIELDS = [
   "from",
   "to",
   "timestamp",
+  "receivedAt",
   "read",
   "location",
   "rejectClass",
@@ -1234,7 +1271,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   // Best-effort GC: purge acked/expired messages older than 24h on every check
   try { gcMessages(agent); } catch { /* never block delivery */ }
 
-  return messages.sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+  return messages.sort((a, b) => ((a.receivedAt ?? a.timestamp) < (b.receivedAt ?? b.timestamp) ? 1 : -1));
 }
 
 export async function listMessages(agent: string): Promise<MailMessage[]> {
@@ -1260,7 +1297,7 @@ export async function listMessages(agent: string): Promise<MailMessage[]> {
       console.error(`[mail] skipping corrupt message ${file}: ${err.message}`);
     }
   }
-  return [...unread, ...cur, ...dlq].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+  return [...unread, ...cur, ...dlq].sort((a, b) => ((a.receivedAt ?? a.timestamp) < (b.receivedAt ?? b.timestamp) ? 1 : -1));
 }
 
 export async function verifyMailAction(agent: string, id: string): Promise<MailMessage | null> {
