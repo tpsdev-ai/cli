@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createMailboxStore, measure, startChild } from "../scripts/bench-mailbox-lock-contention.mjs";
@@ -15,7 +15,7 @@ const run = (...args: string[]) => runWithEnv(process.env, ...args);
 const snapshot = (dir: string): unknown[] => readdirSync(dir).sort().map((name) => {
   const path = join(dir, name);
   const st = lstatSync(path);
-  return [name, st.mode, st.isDirectory() ? snapshot(path) : readFileSync(path).toString("hex")];
+  return [name, st.mode, st.isDirectory() ? snapshot(path) : st.isSymbolicLink() ? readlinkSync(path) : readFileSync(path).toString("hex")];
 });
 
 test("benchmark runs real writers, sweep and watcher", async () => {
@@ -82,25 +82,66 @@ test("benchmark rejects a completed child timeout after readiness", async () => 
   expect(injected).toBe(true);
 }, 15000);
 
-test("direct roles refuse an existing mailbox with a forged marker", () => {
-  const base = realpathSync(tmpdir());
-  const dir = realpathSync(mkdtempSync(join(base, "bench-lock-")));
-  const out = join(dir, "result.json");
-  const token = "forged-token";
-  try {
-    mkdirSync(join(dir, "agent-a"));
-    writeFileSync(join(dir, "agent-a", "message.json"), '{"body":"keep"}');
-    writeFileSync(join(dir, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }));
-    const before = snapshot(dir);
-    for (const role of ["writer", "sweeper", "watch"]) {
-      const result = runWithEnv({ ...process.env, TPS_BENCH_TOKEN: token, TPS_BENCH_ROOT: dir, TPS_BENCH_BASE: base },
-        `--role=${role}`, `--dir=${dir}`, `--out=${out}`, `--ready=${join(dir, "ready")}`, `--go=${join(dir, "go")}`);
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr.toString()).toContain("refused mailbox directory");
-      expect(snapshot(dir)).toEqual(before);
+for (const role of ["writer", "sweeper", "watch"]) {
+  test(`direct ${role} refuses a populated mailbox with a forged marker`, async () => {
+    const base = realpathSync(tmpdir());
+    const root = realpathSync(mkdtempSync(join(base, "bench-lock-")));
+    const dir = join(root, "mailbox");
+    const token = "forged-token";
+    try {
+      createMailboxStore(root, dir);
+      const od = join(dir, "agent-a", ".obligations");
+      mkdirSync(od, { mode: 0o700 });
+      writeFileSync(join(od, "existing.json"), JSON.stringify({
+        obligationId: "ob-existing", inboundId: "existing", inboundTimestamp: "2020-01-01T00:00:00.000Z",
+        from: "sender-a", to: "agent-a", accountId: "default", state: "failed", deadlineAt: null,
+        attempts: 1, lastTransitionAt: "2020-01-01T00:00:00.000Z",
+      }), { mode: 0o600 });
+      writeFileSync(join(root, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { mode: 0o600 });
+      const before = snapshot(root);
+      const job = startChild(role, {
+        env: { ...process.env, TPS_BENCH_TOKEN: token, TPS_BENCH_ROOT: root, TPS_BENCH_BASE: base },
+        flags: { dir, out: join(root, "result.json"), ready: join(root, "ready"),
+          go: join(root, "go"), ...(role === "watch" ? { stop: join(root, "stop") } : {}) },
+      }, 1000);
+      const result = await job.done;
+      expect(snapshot(root)).toEqual(before);
+      expect(result.timedOut).toBe(false);
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("refused populated mailbox");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 5000);
+}
+
+for (const role of ["writer", "sweeper", "watch"]) {
+  for (const path of ["out", "ready", "go", ...(role === "watch" ? ["stop"] : [])]) {
+    for (const kind of ["file", "dangling-symlink"]) {
+      test(`direct ${role} refuses ${kind} at ${path} before readiness`, async () => {
+        const base = realpathSync(tmpdir());
+        const root = realpathSync(mkdtempSync(join(base, "bench-lock-")));
+        const dir = join(root, "mailbox");
+        const token = "forged-token";
+        try {
+          createMailboxStore(root, dir);
+          writeFileSync(join(root, ".bench-parent.json"), JSON.stringify({ pid: process.pid, token }), { mode: 0o600 });
+          if (kind === "file") writeFileSync(join(root, path), "keep", { mode: 0o600 });
+          else symlinkSync(join(root, "absent"), join(root, path));
+          const before = snapshot(root);
+          const job = startChild(role, {
+            env: { ...process.env, TPS_BENCH_TOKEN: token, TPS_BENCH_ROOT: root, TPS_BENCH_BASE: base },
+            flags: { dir, out: join(root, "out"), ready: join(root, "ready"),
+              go: join(root, "go"), ...(role === "watch" ? { stop: join(root, "stop") } : {}) },
+          }, 1000);
+          const result = await job.done;
+          expect(snapshot(root)).toEqual(before);
+          expect(result.timedOut).toBe(false);
+          expect(result.code).toBe(1);
+          expect(result.stderr).toContain("refused path:");
+        } finally { rmSync(root, { recursive: true, force: true }); }
+      }, 5000);
     }
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+  }
+}
 
 for (const kind of ["existing", "symlink"]) {
   test(`mailbox creation refuses ${kind} store`, () => {

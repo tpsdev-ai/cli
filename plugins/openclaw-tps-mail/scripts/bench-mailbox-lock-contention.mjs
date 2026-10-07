@@ -9,7 +9,7 @@
  */
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,7 +39,7 @@ function positive(name, fallback) {
 
 function confinedPath(root, path) {
   const p = resolve(path);
-  if (dirname(p) !== root || realpathSync(dirname(p)) !== root || existsSync(p)) {
+  if (dirname(p) !== root || realpathSync(dirname(p)) !== root || lstatSync(p, { throwIfNoEntry: false })) {
     throw new Error(`refused path: ${path}`);
   }
   return p;
@@ -90,8 +90,13 @@ function verifyRole() {
   for (const name of ["out", "ready"]) F[name] = confinedPath(root, F[name]);
   for (const name of ["go", ...(F.role === "watch" ? ["stop"] : [])]) {
     if (resolve(F[name]) !== join(root, name)) throw new Error(`invalid ${name} path`);
+    F[name] = confinedPath(root, F[name]);
   }
   privateDirectory(join(F.dir, AGENT));
+  const entries = readdirSync(F.dir);
+  if (entries.length !== 1 || entries[0] !== AGENT || readdirSync(join(F.dir, AGENT)).length) {
+    throw new Error("refused populated mailbox");
+  }
   return F.dir;
 }
 
