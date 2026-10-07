@@ -1,0 +1,1 @@
+- **Host-side relay acceptance validates stored records and refuses payload conflicts without ACK.** MailClient retains its signature-verified replay gate. The branch receiver is follow-up work.
