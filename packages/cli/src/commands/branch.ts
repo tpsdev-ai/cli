@@ -7,7 +7,7 @@ import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
 import { MailDeliverBodySchema, MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MSG_JOIN_COMPLETE, JoinCompleteBodySchema, MailAckBodySchema } from "../utils/wire-mail.js";
 import { startServiceProxies, type ServiceProxySet } from "../utils/service-proxy-branch.js";
-import { sendMessage, inboxExists } from "../utils/mail.js";
+import { sendMessage, inboxExists, findRelayedRecord } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
@@ -379,6 +379,10 @@ async function runStart(): Promise<void> {
     // into accepted=true and the host's deliverToRemoteBranch would log
     // "Mail delivered" while the message was actually dropped.
     let deliveryError: string | null = null;
+    // A resend that conflicts with a recorded delivery, or a check that fails,
+    // is refused without an ACK: the host must not count it accepted, and the
+    // branch must not overwrite the recorded delivery.
+    let refused = false;
 
     const action = await runHandlerPipeline(
       { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
@@ -410,32 +414,59 @@ async function runStart(): Promise<void> {
         // preserves the original behavior for the GAL-alias case where
         // body.to is a logical name that doesn't match any local agent dir.
         const recipient = inboxExists(body.to) ? body.to : localAgentId;
+        // Publish the record durably before the ACK and reuse it on a resend:
+        // the record is the delivery's acceptance, keyed by the peer host's
+        // fingerprint and the delivery id. A resend whose record is missing is
+        // published again; a same-id record with a different payload is refused
+        // without an ACK. Exactly-once delivery to the agent stays with
+        // MailClient's replay gate on promotion, as on the host side (cli#532).
+        const delivery = { branchId: channel.peerFingerprint(), id: body.id };
+        let recorded: string | undefined;
+        let recordError: unknown;
         try {
-          sendMessage(recipient, body.content, body.from);
-        } catch (e: any) {
-          // Honest NACK: an "Inbox full" or other write failure must NOT be
-          // ACKed as accepted=true. Silent drops here strand entire dispatches
-          // because the host's deliverToRemoteBranch only checks the ACK.
-          // Log the raw error locally, but send only a sanitized category
-          // to the host (Sherlock #294: raw error messages can include
-          // filesystem paths or internal state — leak surface to remote).
-          const rawError = e?.message || "Mail write failed";
-          logLine("WARN", `Mail write failed: ${rawError}`);
-          deliveryError = sanitizeDeliveryError(rawError);
+          recorded = findRelayedRecord(recipient, delivery, {
+            from: body.from,
+            to: recipient,
+            body: body.content,
+            timestamp: body.timestamp,
+          });
+        } catch (e) {
+          recordError = e;
+        }
+        if (recordError) {
+          logLine("WARN", `Relayed delivery refused: ${recordError instanceof Error ? recordError.message : String(recordError)}`);
+          refused = true;
+        } else if (!recorded) {
+          try {
+            sendMessage(recipient, body.content, body.from, delivery, body.timestamp);
+          } catch (e: any) {
+            // Honest NACK: an "Inbox full" or other write failure must NOT be
+            // ACKed as accepted=true. Silent drops here strand entire dispatches
+            // because the host's deliverToRemoteBranch only checks the ACK.
+            // Log the raw error locally, but send only a sanitized category
+            // to the host (Sherlock #294: raw error messages can include
+            // filesystem paths or internal state — leak surface to remote).
+            const rawError = e?.message || "Mail write failed";
+            logLine("WARN", `Mail write failed: ${rawError}`);
+            deliveryError = sanitizeDeliveryError(rawError);
+          }
         }
         break;
       }
     }
 
-    const ackAccepted = deliveryError === null;
-    await channel.send({
-      type: MSG_MAIL_ACK,
-      seq: msg.seq,
-      ts: new Date().toISOString(),
-      body: ackAccepted
-        ? { id: body.id, accepted: true }
-        : { id: body.id, accepted: false, error: deliveryError },
-    }).catch(() => {});
+    if (!refused) {
+      const ackAccepted = deliveryError === null;
+      await channel.send({
+        type: MSG_MAIL_ACK,
+        seq: msg.seq,
+        ts: new Date().toISOString(),
+        body: ackAccepted
+          ? { id: body.id, accepted: true }
+          : { id: body.id, accepted: false, error: deliveryError },
+      }).catch(() => {});
+      logLine("MAIL", `Received message for ${body.to} (id: ${body.id})`);
+    }
 
     for (const item of outboxSends.due()) {
       await channel.send({
@@ -445,8 +476,6 @@ async function runStart(): Promise<void> {
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
       }).catch(() => outboxSends.sendFailed(item.id));
     }
-
-    logLine("MAIL", `Received message for ${body.to} (id: ${body.id})`);
   };
 
   logLine("STARTED", `Listening on 0.0.0.0:${conf.port} (${conf.transport})`);

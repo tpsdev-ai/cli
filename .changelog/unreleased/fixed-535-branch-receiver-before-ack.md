@@ -1,0 +1,1 @@
+- **The branch relay receiver records a delivery before its ACK and reuses or republishes it on a resend.** A same-id record with a different payload is refused without an ACK; exactly-once delivery to the agent stays with the replay gate on promotion.
