@@ -276,20 +276,29 @@ test("stamp reconciliation holds an obligation when an unreadable record cannot 
 });
 
 for (const state of ["acked", "failed"] as const) {
-  for (const lookup of ["missing", "ambiguous", "bounded"] as const) {
+  for (const lookup of ["ambiguous", "bounded"] as const) {
     test(`${state}: ${lookup} cur lookup holds the obligation`, () => {
       const f = terminalFixture(state);
-      if (lookup === "missing") realFs.unlinkSync(f.curPath);
       if (lookup === "ambiguous") realFs.writeFileSync(join(f.curDir, "independent.json"), JSON.stringify({ id: "inbound" }));
       if (lookup === "bounded") {
         for (let i = 0; i < 4096; i++) realFs.writeFileSync(join(f.curDir, `${i}.json`), JSON.stringify({ id: `other-${i}` }));
       }
       expect(f.reconcile().has("inbound")).toBe(true);
-      const code = lookup === "missing" ? "ENOENT" : lookup === "ambiguous" ? "AMBIGUOUS_ID" : "SCAN_LIMIT";
+      const code = lookup === "ambiguous" ? "AMBIGUOUS_ID" : "SCAN_LIMIT";
       expect(f.logs[0]).toContain(`path=${f.curDir} code=${code}`);
       expect(f.logs[0]).toContain("obligation retained");
       expect(realFs.existsSync(f.obligationPath)).toBe(true);
-      if (lookup !== "missing") expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8"))[state === "acked" ? "ackedAt" : "nackedAt"]).toBeUndefined();
+      expect(JSON.parse(realFs.readFileSync(f.curPath, "utf8"))[state === "acked" ? "ackedAt" : "nackedAt"]).toBeUndefined();
     });
   }
+}
+
+for (const state of ["acked", "failed"] as const) {
+  test(`${state}: a missing cur/ record is omitted from the unresolved set without a warning`, () => {
+    const f = terminalFixture(state);
+    realFs.unlinkSync(f.curPath);
+    expect(f.reconcile().has("inbound")).toBe(false);
+    expect(f.logs).toEqual([]);
+    expect(realFs.existsSync(f.obligationPath)).toBe(true);
+  });
 }

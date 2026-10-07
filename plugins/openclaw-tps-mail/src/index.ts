@@ -673,6 +673,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     if (rec.state !== "acked" && rec.state !== "failed") continue;
     let unreadable = false;
     const onReadError = (path: string, code?: string) => {
+      if (code === "ENOENT") return;
       unreadable = true;
       reportReadError(stampObligationPresence(mailDir, agent, rec.inboundId), rec.inboundId)(path, code);
     };
@@ -2456,10 +2457,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // Best-effort — a failure never blocks startup. A replayed id whose
         // record was swept opens a FRESH obligation: accepted, since relay
         // retries arrive within minutes/hours, never the window later.
-        //
-        // cli#389 round 12, item 2: the owed-nack hold is BOUNDED by age — a
-        // configurable multiple of `retentionDays` — so a sender that NEVER gets
-        // a route cannot pin a record forever.
         try {
           const retentionDays = resolveObligationRetentionDays(pluginConfig, (cfg as any)?.channels?.[CHANNEL_ID]);
           if (!unknownInbounds.has("*")) sweepTerminalObligations(
