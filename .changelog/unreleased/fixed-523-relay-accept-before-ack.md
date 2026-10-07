@@ -1,1 +1,1 @@
-- **Relay ACKs require a synced marker plus either a synced matching new/cur/DLQ record or a synced recipient replay ledger containing the consumed envelope ID.**
+- **Host-side relay acceptance republishes missing records before ACK.** MailClient retains its signature-verified replay gate. The branch receiver is follow-up work.

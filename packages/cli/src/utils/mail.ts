@@ -9,7 +9,6 @@ import {
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
   placeCurRecord,
-  isValidEnvelopeId,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -391,16 +390,6 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     }
   }
   return undefined;
-}
-
-export function hasConsumedRelayedMessage(agent: string, content: string): boolean {
-  const parsed = parseSignedEnvelope(content);
-  if (!parsed.ok || !isValidEnvelopeId(parsed.envelope.messageId) || !agent || sanitizeIdentifier(agent) !== agent) return false;
-  const root = mailboxRoot(agent);
-  if (!hasCommittedMessageId(root, parsed.envelope.messageId)) return false;
-  syncMailFile(join(root, "consumed.jsonl"));
-  syncMailDirectory(root);
-  return true;
 }
 
 export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }): MailMessage & { filePath: string } {

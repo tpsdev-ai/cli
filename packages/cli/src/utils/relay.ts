@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, hasConsumedRelayedMessage, getMailDir, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, MailSyncError, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
@@ -388,7 +388,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
   const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
   const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
   const delivery = { branchId, id: body.id };
-  if (existingMarker && (findRelayedRecord(body.to, delivery) || hasConsumedRelayedMessage(body.to, body.content))) {
+  if (existingMarker && findRelayedRecord(body.to, delivery)) {
     syncMailFile(existingMarker);
     syncMailDirectory(dirname(existingMarker));
     return false;
