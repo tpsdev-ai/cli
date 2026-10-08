@@ -1350,6 +1350,15 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   //    replay) are NOT retried.
   for (const result of await redriveRetryable(agent, inbox.dlq, verify)) messages.push(result.message);
 
+  try {
+    archiveOldCur(agent);
+  } catch (e: any) {
+    // Non-fatal: archive failure must never block mail processing. Log so
+    // operators can see ENOSPC, permissions, or other persistent issues
+    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
+    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
+  }
+
   // 3. Lease sweep over cur/ — re-present un-acked records past their lease.
   //    cur/ is a DESTINATION, so this is LIVE delivery and goes through the same
   //    bar as promotion: require proof of promotion (envelopeId) AND re-verify
@@ -1378,15 +1387,6 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
     }, { snapshot: recovered.snapshot, nonBlocking: true });
     if (result.status === "updated") messages.push(result.record);
-  }
-
-  try {
-    archiveOldCur(agent);
-  } catch (e: any) {
-    // Non-fatal: archive failure must never block mail processing. Log so
-    // operators can see ENOSPC, permissions, or other persistent issues
-    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
-    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check

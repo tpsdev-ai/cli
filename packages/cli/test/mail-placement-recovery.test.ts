@@ -128,14 +128,30 @@ test("mail gc preserves pending placement files", async () => {
   expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
 });
 
-test("archival preserves pending placement files", () => {
-  const fixture = pending();
-  age(fixture);
-  expect(mail.archiveOldCur(agent)).toBe(0);
-  expect(fs.existsSync(fixture.cur)).toBe(true);
-  expect(fs.existsSync(fixture.source)).toBe(true);
-  expect(intents(fixture.inbox)).toHaveLength(1);
-});
+for (const action of ["archiveOldCur", "checkMessages"] as const) {
+  test(`${action} archives unrelated aged cur files and preserves pending placement files`, async () => {
+    const fixture = pending();
+    age(fixture);
+    const copy = JSON.parse(fs.readFileSync(fixture.cur, "utf8"));
+    copy.id = "other-record";
+    fs.writeFileSync(fixture.cur, JSON.stringify(copy));
+    const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(fixture.cur, old, old);
+    const unrelated = join(fixture.inbox.cur, "ancient.json");
+    const bytes = JSON.stringify({ id: "ancient", from: "kern", to: agent, body: "old", timestamp: old.toISOString() });
+    fs.writeFileSync(unrelated, bytes);
+    fs.utimesSync(unrelated, old, old);
+    if (action === "archiveOldCur") expect(mail.archiveOldCur(agent)).toBe(1);
+    else expect(await mail.checkMessages(agent)).toEqual([]);
+    const month = `${old.getUTCFullYear()}-${String(old.getUTCMonth() + 1).padStart(2, "0")}`;
+    expect(fs.readFileSync(join(fixture.inbox.root, "archive", month, "ancient.json"), "utf8")).toBe(bytes);
+    expect(fs.existsSync(unrelated)).toBe(false);
+    expect(fs.existsSync(fixture.cur)).toBe(true);
+    expect(fs.existsSync(fixture.source)).toBe(true);
+    expect(intents(fixture.inbox)).toHaveLength(1);
+    expect(hasCommittedMessageId(fixture.inbox.root, fixture.envelope.messageId)).toBe(false);
+  });
+}
 
 test("checkMessages reconciles pending placement before archival", async () => {
   const fixture = pending();
