@@ -50,7 +50,7 @@ describe("env leak preload (cli#555)", () => {
     ["env-late-snapshot", "added TPS_FIXTURE_VALUE"],
     ["env-whole-snapshot", "added TPS_FIXTURE_VALUE"],
   ] as const) {
-    test(`fails ${name} naming the name it leaves behind (red fixture)`, () => {
+    test(`fails ${name} and reports "${verdict}" (red fixture)`, () => {
       const run = runFixture(name);
       expect(run.status, run.output).not.toBe(0);
       expect(run.output).toContain(`left process.env different from when it loaded: ${verdict}`);

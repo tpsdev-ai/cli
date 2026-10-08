@@ -1,17 +1,17 @@
 /**
- * env-leak-preload.ts — cli#555: fail a cli test file that leaves process.env
- * changed. Listed in packages/cli/bunfig.toml as a test preload.
+ * env-leak-preload.ts — cli#555: appends a process.env check to each cli test
+ * file. Listed in packages/cli/bunfig.toml as a test preload.
  *
  * Every cli test file runs in ONE bun process, so an env name a file sets and
- * does not put back is still set when later files run. Measured on bun 1.3.10,
+ * does not put back is still set when later files run. Measured on bun 1.3.10:
  * a preload's own beforeAll/afterAll run once for the whole run, not per file,
- * so this preload registers a runtime plugin instead: bun calls its onLoad for
- * each `.test`/`.spec` file it loads, after the previous file has finished.
- * onLoad copies process.env and appends one line to the file's source. That
- * line registers an afterAll at the end of the file's top-level code, so it
- * runs after the top-level afterAll hooks the file registered before it; it
- * fails the file when process.env differs from the copy, naming the names
- * added, removed or changed (never their values).
+ * and a runtime plugin's onLoad runs for each test file as bun loads it, after
+ * the previous file has finished. So this preload registers a plugin whose
+ * onLoad, for each `.test`/`.spec` file, copies process.env and appends one
+ * line to the file's source. That line registers an afterAll at the end of the
+ * file's top-level code, so it runs after the top-level afterAll hooks the file
+ * registered before it; it fails the file when process.env differs from the
+ * copy, naming the names added, removed or changed (never their values).
  */
 import { plugin } from "bun";
 import { afterAll } from "bun:test";

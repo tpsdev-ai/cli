@@ -10,14 +10,14 @@
  * This guard parses each discovered cli test file (see
  * helpers/mock-restore-guard-scan.ts) and fails when a file
  *   - calls `mock.module(...)`, or
- *   - contains the identifier `spyOn`, or `mock`, `jest` or `vi` outside a
- *     property name, without the top-level teardown
- *     `afterEach(() => { mock.restore(); })` or `afterEach(() => mock.restore())`
- *     (`afterEach` and `mock` imported from "bun:test").
+ *   - contains `spyOn`, `mock`, `jest` or `vi` as an identifier, without the
+ *     top-level teardown `afterEach(() => { mock.restore(); })` or
+ *     `afterEach(() => mock.restore())` (`afterEach` and `mock` imported by
+ *     name from "bun:test").
  *
  * Fixture files under fixtures/mock-restore-guard/ pin the verdicts: each red
- * fixture must be reported, each green fixture must be clean. Env changes are
- * checked at run time instead (env-leak-guard.test.ts).
+ * fixture must be reported, each green fixture must be clean. process.env is
+ * checked at run time by helpers/env-leak-preload.ts (env-leak-guard.test.ts).
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";

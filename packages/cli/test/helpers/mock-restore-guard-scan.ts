@@ -14,11 +14,11 @@
  *     child-process isolation.
  *   - `missing-mock-restore-teardown`: the file contains `spyOn`, `mock`,
  *     `jest` or `vi` as an identifier, and none of its top-level statements is
- *     one of
+ *     one of these two (spacing, comments and semicolons aside)
  *         afterEach(() => { mock.restore(); });
  *         afterEach(() => mock.restore());
- *     with `afterEach` and `mock` imported under those names from "bun:test".
- *     No other cleanup form is credited.
+ *     with `afterEach` and `mock` imported by name, without an alias, from
+ *     "bun:test". No other cleanup form is credited.
  */
 
 import { readdirSync } from "node:fs";
