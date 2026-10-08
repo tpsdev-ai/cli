@@ -9,11 +9,7 @@
  *
  * This guard parses each discovered cli test file (see
  * helpers/mock-restore-guard-scan.ts) and fails when a file
- *   - calls `mock.module(...)`, or
- *   - contains `spyOn`, `mock`, `jest` or `vi` as an identifier, without the
- *     top-level teardown `afterEach(() => { mock.restore(); })` or
- *     `afterEach(() => mock.restore())` (`afterEach` and `mock` imported by
- *     name from "bun:test").
+ *   - calls `mock.module(...)`.
  *
  * Fixture files under fixtures/mock-restore-guard/ pin the verdicts: each red
  * fixture must be reported, each green fixture must be clean. process.env is
@@ -55,13 +51,19 @@ describe("mock restore guard (cli#555)", () => {
     "spy-unreachable-restore.fixture.ts",
     "spy-foreign-afterEach.fixture.ts",
     "mock-fn-leaked.fixture.ts",
+    "spy-aliased-leaked.fixture.ts",
   ]) {
     test(`reports ${name} (red fixture)`, () => {
       expect(kindsFor(name)).toContain("missing-mock-restore-teardown");
     });
   }
 
-  for (const name of ["prototype-spy-restored.fixture.ts", "spy-restored-expression.fixture.ts"]) {
+  for (const name of [
+    "prototype-spy-restored.fixture.ts",
+    "spy-restored-expression.fixture.ts",
+    "spy-aliased-restored.fixture.ts",
+    "spy-namespace-restored.fixture.ts",
+  ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);
     });
@@ -70,6 +72,38 @@ describe("mock restore guard (cli#555)", () => {
   test("rejects a shared-process file that calls mock.module() (red fixture)", () => {
     expect(kindsFor("module-mock.fixture.ts")).toContain("module-mock-needs-child-process");
   });
+
+  for (const name of ["module-mock-aliased.fixture.ts", "module-mock-namespace.fixture.ts"]) {
+    test(`reports ${name} (red fixture)`, () => {
+      expect(kindsFor(name)).toContain("module-mock-needs-child-process");
+    });
+  }
+
+  for (const api of ["mock", "spyOn", "jest", "vi"]) {
+    test(`reports aliased ${api} usage without teardown`, () => {
+      expect(analyzeSource(`import { ${api} as local } from "bun:test"; local;`).map((finding) => finding.kind))
+        .toContain("missing-mock-restore-teardown");
+      expect(analyzeSource(`import * as bt from "bun:test"; bt.${api};`).map((finding) => finding.kind))
+        .toContain("missing-mock-restore-teardown");
+    });
+  }
+
+  for (const source of [
+    'import bt from "bun:test"; bt.mock();',
+    'import * as bt from "bun:test"; bt["mock"]();',
+    'import * as bt from "bun:test"; const { mock: m } = bt; m();',
+    'const bt = await import("bun:test"); bt.mock();',
+    'const bt = require("bun:test"); bt.mock();',
+    'import bt = require("bun:test"); bt.mock();',
+    'import { mock as m } from "bun:test"; m["module"]("target", () => ({}));',
+    'import { mock as m } from "bun:test"; const alias = m; alias.module("target", () => ({}));',
+    'import { mock as m } from "bun:test"; const register = m.module; register("target", () => ({}));',
+  ]) {
+    test(`reports unresolved bun:test access: ${source}`, () => {
+      expect(analyzeSource(`import { afterEach, mock } from "bun:test"; afterEach(() => mock.restore()); ${source}`)
+        .map((finding) => finding.kind)).toContain("missing-mock-restore-teardown");
+    });
+  }
 
   test("mock.restore() does not undo mock.module(): a later consumer still receives the replacement", () => {
     const probe = spawnSync(process.execPath, ["test", "./module-mock-probe.ts"], {

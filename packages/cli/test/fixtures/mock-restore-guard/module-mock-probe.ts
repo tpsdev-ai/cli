@@ -4,16 +4,16 @@
 // is why the scanner rejects mock.module() in a shared-process test file.
 // Run with `bun test ./module-mock-probe.ts` from this directory; the file is
 // not named *.test.ts, so bun does not discover it automatically.
-import { afterEach, mock, test } from "bun:test";
+import { afterEach, mock as m, test } from "bun:test";
 
 const target = new URL("./module-mock-probe-target.ts", import.meta.url).href;
 
 afterEach(() => {
-  mock.restore();
+  m.restore();
 });
 
 test("registers a module mock", async () => {
-  mock.module(target, () => ({ marker: "MOCKED" }));
+  m.module(target, () => ({ marker: "MOCKED" }));
   const mod = await import(target);
   console.log("FIRST=" + mod.marker);
 });
