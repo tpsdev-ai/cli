@@ -84,7 +84,9 @@ describe("promotion at the listed pause points (cli#515)", () => {
   function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promise<KillRun> {
     const inbox = getInbox(AGENT);
     const marker = join(root, `paused.${killAt}`);
-    const child = spawn("node", [CHILD, AGENT, source], {
+    // The runtime running this suite (bun): the child imports the TypeScript Flair stub, which a
+    // bare `node` cannot load on every CI image (Node 20 in the Docker job has no type stripping).
+    const child = spawn(process.execPath, [CHILD, AGENT, source], {
       env: {
         HOME: root,
         PATH: process.env.PATH,
