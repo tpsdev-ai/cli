@@ -1,13 +1,9 @@
 /**
  * test/check-dep-ages.test.ts — the dependency release-age gate (cli#529).
  *
- * Pure-function cases run against literal inputs. The CLI cases spawn
- * `node scripts/check-dep-ages.mjs` with an explicit env, pointed at a fixture
- * repo and (where the gate gets past parsing) a fixture registry served from
- * this process, so no case touches the real npm registry. The script path is
- * derived from this file's location, never the working directory, and a broken
- * setup throws before the CLI runs — it can never pass as the exit a case
- * expects.
+ * Pure-function cases use literal inputs. CLI cases spawn
+ * `node scripts/check-dep-ages.mjs` with an explicit env. Missing script or lock
+ * files and an unbound fixture registry throw before the CLI runs.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -15,6 +11,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { load } from "js-yaml";
 import {
   collectResolvedDeps,
   evaluateAges,
@@ -26,7 +23,6 @@ import {
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const CLI_SCRIPT = join(REPO, "scripts", "check-dep-ages.mjs");
 
-/** A broken test setup fails as itself, never as the CLI exit a case expects. */
 function setupFailure(what: string): never {
   throw new Error(`test setup failed before the gate ran: ${what}`);
 }
@@ -525,27 +521,53 @@ describe("exception version syntax", () => {
   );
 });
 
-it("documents missing publish-time precedence for an uncovered young version", () => {
-  const source = readFileSync(CLI_SCRIPT, "utf8");
-  expect(source).toContain("1 — all required publish times are available and an uncovered version is too fresh");
-  expect(source).toContain("2 — a required publish time is missing");
-  const result = evaluateAges({
-    deps: [{ name: "young", version: "1.0.0" }, { name: "missing", version: "1.0.0" }],
-    publishTimes: new Map([["young@1.0.0", NOW]]),
-    gateSeconds: 604800, nowMs: NOW, exceptionEntries: new Map(),
+it("exits 2 for a missing publish time alongside an uncovered young version", async () => {
+  const root = writeFixtureRepo(join(scratch, "mixed-publish-times"), {
+    lock: '{"packages":{"young":["young@1.0.0"],"missing":["missing@2.0.0"]}}',
+    exceptions: "## Exceptions\n",
   });
-  expect(result.uncovered.map((dep) => dep.name)).toEqual(["young"]);
-  expect(result.missing.map((dep) => dep.name)).toEqual(["missing"]);
+  const timeMap = encodeURIComponent(JSON.stringify({ time: { "1.0.0": ISO_NOW } }));
+  const { exitCode, output } = await runGate({
+    TPS_DEP_AGES_ROOT: root,
+    TPS_DEP_AGES_REGISTRY: `data:application/json,${timeMap}#`,
+  });
+  expect(exitCode).toBe(2);
+  expect(output).toContain("missing@2.0.0: no publish time");
+}, 30_000);
+
+function assertInstallGates(source: string) {
+  const workflow = load(source) as {
+    jobs: Record<string, { steps: { run?: string; uses?: string }[] }>;
+  };
+  let installs = 0;
+  for (const job of Object.values(workflow.jobs)) {
+    const checkout = job.steps.findIndex((step) => step.uses?.startsWith("actions/checkout@"));
+    const gate = job.steps.findIndex((step) =>
+      step.run?.split("\n").some((line) => line.trim() === "node scripts/check-dep-ages.mjs --ci"),
+    );
+    for (const [index, step] of job.steps.entries()) {
+      if (!step.run?.split("\n").some((line) =>
+        !line.trimStart().startsWith("#") && /\b(?:bun install|npm (?:ci|install))\b/.test(line),
+      )) continue;
+      installs++;
+      expect(checkout).toBeGreaterThanOrEqual(0);
+      expect(gate).toBeGreaterThan(checkout);
+      expect(gate).toBeLessThan(index);
+    }
+  }
+  expect(installs).toBeGreaterThan(0);
+}
+
+it("runs the lock gate before every install step in the CI workflow", () => {
+  assertInstallGates(readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8"));
 });
 
-it("runs the lock gate before each frozen install in the CI workflow", () => {
+it("rejects a workflow gate whose run line is only a YAML comment", () => {
   const workflow = readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8");
-  const jobs = workflow.split(/^  [\w-]+:\n/gm).slice(1);
-  const installingJobs = jobs.filter((job) => job.includes("sfw bun install --frozen-lockfile"));
-  expect(installingJobs.length).toBeGreaterThan(0);
-  for (const job of installingJobs) {
-    const gate = job.indexOf("node scripts/check-dep-ages.mjs --ci");
-    expect(gate).toBeGreaterThan(job.indexOf("actions/checkout@"));
-    expect(gate).toBeLessThan(job.indexOf("sfw bun install --frozen-lockfile"));
-  }
+  const commented = workflow.replace(
+    "        run: node scripts/check-dep-ages.mjs --ci",
+    "        # run: node scripts/check-dep-ages.mjs --ci",
+  );
+  expect(commented).not.toBe(workflow);
+  expect(() => assertInstallGates(commented)).toThrow();
 });

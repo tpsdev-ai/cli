@@ -10,10 +10,9 @@
  *   0 — every external resolved version is at least the gate old (or a valid
  *       exception covers it)
  *   1 — all required publish times are available and an uncovered version is too fresh
- *   2 — a required publish time is missing, cannot read/parse a required file,
- *       no `[install] minimumReleaseAge` in
- *       bunfig.toml, an invalid exception entry, a REFUSED CI run, an
- *       unexpected argument, or a registry fetch failure (fail closed)
+ *   2 — missing publish times, unreadable or unparseable required files,
+ *       missing or invalid threshold, invalid or unused exceptions, no external
+ *       resolutions, refused CI overrides, unexpected arguments, or registry fetch failures
  *
  */
 
