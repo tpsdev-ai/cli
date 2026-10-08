@@ -917,7 +917,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime);
+            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
             if (profileRefusal) {
               console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);

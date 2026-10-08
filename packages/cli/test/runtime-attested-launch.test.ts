@@ -34,6 +34,7 @@ set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 if [ "\${1:-}" = "ps" ]; then
   if [ -n "\${FAKE_NONO_PS_JSON:-}" ] && [ -f "\${FAKE_NONO_PS_JSON}" ]; then cat "\${FAKE_NONO_PS_JSON}"; else echo "[]"; fi
   exit 0

@@ -462,6 +462,7 @@ export function sandboxProfileGrantRefusal(
   profile: string,
   env: NodeJS.ProcessEnv = process.env,
   runtime?: string,
+  bin: string | undefined = env.NONO_BIN,
 ): string | null {
   let grants: ProfileGrant[];
   try {
@@ -507,6 +508,40 @@ export function sandboxProfileGrantRefusal(
     }
   } catch (err) {
     return `cannot resolve sandbox profile '${profile}' file grants: ${(err as Error).message}`;
+  }
+  if (!bin || !isAbsolute(bin)) return `cannot query sandbox profile '${profile}': nono must be an absolute path`;
+  const path = resolveProfilePath(profile, env);
+  if (!path) return `cannot query sandbox profile '${profile}': profile not found`;
+  const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
+  const protectedPaths = [
+    ...runtimes.filter((rt) => rt !== runtime).flatMap((rt) => runtimeCredentialFiles(rt, env)),
+    ...runtimes.map((rt) => providerAuthPath(runtimeProviders[rt], env)),
+    ...tpsCredentialRoots(env).map((root) => root.path),
+  ];
+  const queries = [
+    ...[...new Set(protectedPaths)].flatMap((path) => [
+      { path, op: "read" }, { path, op: "write" },
+    ]),
+    ...sandboxProfileDirectories(env).map((dir) => ({ path: dir.path, op: "write" })),
+  ];
+  for (const query of queries) {
+    try {
+      const result = spawnSync(bin, ["why", "--json", "--profile", path, "--path", query.path, "--op", query.op], {
+        env, encoding: "utf8", timeout: 5_000,
+      });
+      if (result.error || result.status !== 0) throw new Error("nono why failed");
+      const answer: unknown = JSON.parse(result.stdout);
+      if (typeof answer !== "object" || answer === null || Array.isArray(answer)) throw new Error("invalid nono why output");
+      const record = answer as Record<string, unknown>;
+      if (record.status === "allowed") {
+        return `the sandbox profile '${profile}': nono reports ${query.op} access to ${query.path}`;
+      }
+      if (record.status !== "denied" || typeof record.reason !== "string" || !["path_not_granted", "insufficient_access", "filesystem_deny"].includes(record.reason)) {
+        throw new Error("invalid nono why denial");
+      }
+    } catch (err) {
+      return `cannot query sandbox profile '${profile}' ${query.op} access to ${query.path}: ${(err as Error).message}`;
+    }
   }
   return null;
 }

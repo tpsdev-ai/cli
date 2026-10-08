@@ -140,7 +140,7 @@ function makeSandbox(name: string, seedProfiles = true): Sandbox {
   // OUTSIDE /tmp: the launch grants /tmp unconditionally (cli#350 r4g), so a
   // HOME under /tmp would put the private dir inside that grant and the overlap
   // assert would (correctly) refuse. /var/tmp keeps HOME and every grant disjoint.
-  const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+  const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
   const root = mkdtempSync(join(base, `tps-attest-${name}-`));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
@@ -180,6 +180,7 @@ const FAKE_NONO = `#!/usr/bin/env bash
 # bind to).
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then
@@ -663,6 +664,7 @@ async function runLauncherInProcess(opts: {
   const script = `#!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then
@@ -1003,6 +1005,7 @@ function runLauncherTty(
 const CONFINING_FAKE_NONO = `#!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then

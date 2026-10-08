@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -26,7 +26,7 @@ function makeHome(): string {
 }
 
 function envFor(home: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  return { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), ...extra };
+  return { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config"), NONO_BIN: join(import.meta.dir, "fakes/nono/bin/nono"), NONO_FAKE_LOG: join(home, "nono.log"), ...extra };
 }
 
 /** Write the profile the claude-code launch resolves, in the fixture HOME. */
@@ -38,6 +38,63 @@ function writeProfile(home: string, body: unknown, name = "tps-agent-run-claude-
 
 afterEach(() => {
   while (homes.length > 0) rmSync(homes.pop()!, { recursive: true, force: true });
+});
+
+describe("effective profile access query", () => {
+  test("queries the relocated foreign credential with the selected binary and resolved profile", () => {
+    const home = makeHome();
+    const path = writeProfile(home, { extends: "default" });
+    const env = envFor(home, { CODEX_HOME: join(home, ".local", "bin"), NONO_FAKE_WHY_OUTPUT: '{"status":"allowed","reason":"granted_path"}' });
+    const refusal = profileGrantRefusal!("tps-agent-run-claude-code", env, "claude-code");
+    expect(refusal).toContain("nono reports read access");
+    expect(refusal).toContain(join(env.CODEX_HOME!, "auth.json"));
+    expect(readFileSync(join(home, "nono.log"), "utf8")).toContain(`--profile ${path}`);
+  });
+
+  test("queries foreign credentials and profile directories", () => {
+    const home = makeHome();
+    writeProfile(home, { extends: "default" });
+    const env = envFor(home, { CODEX_HOME: join(home, ".local", "bin") });
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", env, "claude-code")).toBeNull();
+    const log = readFileSync(join(home, "nono.log"), "utf8");
+    expect(log).toContain(`--path ${join(env.CODEX_HOME!, "auth.json")} --op read`);
+    expect(log).toContain(`--path ${join(env.CODEX_HOME!, "auth.json")} --op write`);
+    expect(log).toContain(`--path ${join(home, ".config", "nono", "profiles")} --op write`);
+    expect(log).toContain(`--path ${join(home, ".tps", "auth", "anthropic.json")}`);
+    expect(log).not.toContain(`--path ${join(home, ".claude", ".credentials.json")}`);
+  });
+
+  for (const output of ['not json', '{}', '{"status":"unknown"}', '{"status":"denied"}', '[]', '{"status":false}', '{"status":"denied"} trailing', '{"status":"denied","reason":"invalid_query"}', '{"status":"denied","reason":["path_not_granted"]}']) {
+    test(`refuses query output ${output}`, () => {
+      const home = makeHome();
+      writeProfile(home, { extends: "default" });
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_FAKE_WHY_OUTPUT: output }), "claude-code")).toContain("cannot query");
+    });
+  }
+
+  test("refuses a query subprocess failure", () => {
+    const home = makeHome();
+    writeProfile(home, {});
+    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_FAKE_WHY_FAIL: "1" }))).toContain("cannot query");
+  });
+
+  for (const [name, script] of [["signal", "kill -TERM $$"], ["timeout", "exec sleep 10"]]) {
+    test(`refuses query ${name}`, () => {
+      const home = makeHome();
+      writeProfile(home, {});
+      const bin = join(home, "query-nono");
+      writeFileSync(bin, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_BIN: bin }))).toContain("cannot query");
+    }, 7_000);
+  }
+
+  for (const bin of ["", "nono", "/missing/nono"]) {
+    test(`refuses unavailable query binary ${JSON.stringify(bin)}`, () => {
+      const home = makeHome();
+      writeProfile(home, {});
+      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_BIN: bin }))).toContain("cannot query");
+    });
+  }
 });
 
 describe("cli#518 profile grants", () => {

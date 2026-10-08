@@ -28,7 +28,7 @@ import {
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { evaluateLaunchControl } from "../src/utils/nono.js";
 import meow from "meow";
@@ -119,7 +119,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
     // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
     // sit inside that grant and the overlap assert would refuse before spawning.
-    const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+    const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
     const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");
@@ -160,6 +160,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
         "#!/usr/bin/env bash",
         'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
         'if [ "${1:-}" = "profile" ]; then exit 0; fi',
+        `if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi`,
         'echo "NONO-ARGV $*" >> "${NONO_ARGV_LOG:?}"',
         "exit 0",
         "",
