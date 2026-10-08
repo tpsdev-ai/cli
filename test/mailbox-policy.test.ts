@@ -19,18 +19,22 @@ describe("exclusive cur placement", () => {
     // name for one inode. Read each name's identity and content through its own
     // open descriptor, so no path is stat'd and then read (CodeQL file-system-race).
     const sourceFd = openSync(source, "r");
-    const destinationFd = openSync(destination, "r");
     try {
-      const sourceInfo = fstatSync(sourceFd);
-      const destinationInfo = fstatSync(destinationFd);
-      expect(destinationInfo.dev).toBe(sourceInfo.dev);
-      expect(destinationInfo.ino).toBe(sourceInfo.ino);
-      expect(sourceInfo.nlink).toBe(2);
-      expect(destinationInfo.nlink).toBe(2);
-      expect(readFileSync(destinationFd, "utf8")).toBe("incoming");
+      const destinationFd = openSync(destination, "r");
+      try {
+        const sourceInfo = fstatSync(sourceFd);
+        const destinationInfo = fstatSync(destinationFd);
+        expect(destinationInfo.dev).toBe(sourceInfo.dev);
+        expect(destinationInfo.ino).toBe(sourceInfo.ino);
+        expect(sourceInfo.nlink).toBe(2);
+        expect(destinationInfo.nlink).toBe(2);
+        expect(readFileSync(sourceFd, "utf8")).toBe("incoming");
+        expect(readFileSync(destinationFd, "utf8")).toBe("incoming");
+      } finally {
+        closeSync(destinationFd);
+      }
     } finally {
       closeSync(sourceFd);
-      closeSync(destinationFd);
     }
   });
 
