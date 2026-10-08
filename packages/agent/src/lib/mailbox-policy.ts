@@ -321,6 +321,8 @@ function syncDirectory(root: string): void {
 function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
   const path = placementIntentPath(root, file);
+  const existing = readPlacementIntent(root, file);
+  if (existing && existing.messageId !== messageId) throw new Error(`placement intent for ${file} names another message`);
   let identity: PlacementIntent["identity"];
   if (sourcePath !== undefined) {
     const stat = lstatSync(sourcePath, { bigint: true });

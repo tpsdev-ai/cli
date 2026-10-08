@@ -186,6 +186,29 @@ describe("promotion at the listed pause points (cli#515)", () => {
     });
   }
 
+  test("after intent-finish, a source re-planted with another record ID leaves the committed copy deliverable", async () => {
+    const messageId = "kill-replant";
+    const source = plant(messageId);
+    const planted = JSON.parse(readFileSync(source, "utf-8"));
+    const run = await runAndKillAt("intent-finish", source);
+    expect(run.reached, `child never reached intent-finish; stderr=${run.stderr}`).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    const inbox = getInbox(AGENT);
+    const cur = join(inbox.cur, "record.json");
+    const copy = readFileSync(cur, "utf-8");
+    writeFileSync(source, JSON.stringify({ ...planted, id: "replanted-record" }));
+    expect(await checkMessages(AGENT)).toEqual([]);
+    expect(readFileSync(cur, "utf-8")).toBe(copy);
+    expect(existsSync(source)).toBe(false);
+    expect(jsonFiles(inbox.dlq)).toEqual([]);
+    const record = JSON.parse(copy);
+    record.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    writeFileSync(cur, JSON.stringify(record));
+    expect((await checkMessages(AGENT)).map((m) => m.body)).toEqual(["kill-safety"]);
+    expect(await checkMessages(AGENT)).toEqual([]);
+    expect(hasCommittedMessageId(inbox.root, messageId)).toBe(true);
+  });
+
   test("a consumed envelope re-planted after a clean promotion still dead-letters replay", async () => {
     const first = await checkMessages(AGENT);
     expect(first).toEqual([]);

@@ -130,6 +130,25 @@ for (const binding of ["different inode", "legacy intent"] as const) {
   });
 }
 
+for (const read of [false, true]) {
+  test(`pending recovery keeps a same-envelope cur record at another inode retryable (read: ${read})`, async () => {
+    const { source, cur, inbox, envelope } = pending();
+    const bytes = JSON.stringify({ ...JSON.parse(fs.readFileSync(cur, "utf8")), read });
+    fs.rmSync(cur);
+    fs.writeFileSync(cur, bytes);
+    for (const path of [source, join(inbox.dlq, "record.json")]) {
+      const result = await mail.promote(agent, path);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected refusal");
+      expect(result.class).toBe("storage-unavailable");
+      expect(fs.readFileSync(cur, "utf8")).toBe(bytes);
+      expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+      expect(fs.readFileSync(join(inbox.dlq, "record.json.reason"), "utf8")).toContain("class: storage-unavailable");
+      expect(intents(inbox)).toHaveLength(1);
+    }
+  });
+}
+
 test("committed pending recovery uses the cur lease", async () => {
   const { source, cur, inbox, record } = plant();
   const unlink = fs.unlinkSync;
@@ -186,6 +205,26 @@ test("pending recovery rejects an archived ID with a missing ledger entry", asyn
   expect(fs.existsSync(source)).toBe(false);
   expect(fs.existsSync(cur)).toBe(false);
   expect(await mail.checkMessages(agent)).toEqual([]);
+});
+
+test("pending recovery does not commit a cur copy whose ID an archived record holds", async () => {
+  const { source, cur, inbox, envelope } = pending();
+  mailboxReplayStore(inbox.root).recordConsumed(envelope.messageId);
+  fs.writeFileSync(join(inbox.root, "consumed.jsonl"), "");
+  const archived = fs.readFileSync(cur, "utf8");
+  const archive = join(inbox.root, "archive", "old");
+  fs.mkdirSync(archive, { recursive: true });
+  fs.writeFileSync(join(archive, "earlier.json"), archived);
+  const result = await mail.promote(agent, source);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("expected refusal");
+  expect(result.class).toBe("replay");
+  expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+  expect(fs.existsSync(cur)).toBe(false);
+  expect(fs.existsSync(source)).toBe(false);
+  expect(intents(inbox)).toEqual([]);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+  expect(fs.readFileSync(join(archive, "earlier.json"), "utf8")).toBe(archived);
 });
 
 test("ledger pruning retains IDs named by pending intents", () => {
@@ -304,6 +343,32 @@ for (const committed of [true, false]) {
     expect(intents(inbox)).toHaveLength(committed ? 0 : 1);
   });
 }
+
+test("a different message at an orphaned committed copy's filename leaves its intent intact", async () => {
+  const { source, cur, inbox, envelope } = pending();
+  mailboxReplayStore(inbox.root).recordConsumed(envelope.messageId);
+  fs.rmSync(source);
+  const [intent] = intents(inbox);
+  const intentBytes = fs.readFileSync(join(inbox.root, intent!), "utf8");
+  const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
+  copy.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(cur, JSON.stringify(copy));
+  const other = buildSignedEnvelope("kern", agent, "different", { kern: seed }, { messageId: "other-id" });
+  fs.writeFileSync(source, JSON.stringify({
+    id: "other-record", from: "kern", to: agent, body: JSON.stringify(other), timestamp: other.timestamp,
+  }));
+  const result = await mail.promote(agent, source);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("expected refusal");
+  expect(result.class).toBe("storage-unavailable");
+  expect(fs.readFileSync(join(inbox.root, intent!), "utf8")).toBe(intentBytes);
+  expect(fs.readFileSync(cur, "utf8")).toBe(JSON.stringify(copy));
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+  expect(intents(inbox)).toEqual([]);
+  expect(fs.readFileSync(join(inbox.dlq, "record.json.reason"), "utf8")).toContain("class: storage-unavailable");
+  expect(hasCommittedMessageId(inbox.root, other.messageId)).toBe(false);
+});
 
 for (const malformed of ["file", "json", "unknown ID", "invalid escape"] as const) {
   test(`malformed placement ${malformed} retains replay history and permits unrelated mail`, async () => {

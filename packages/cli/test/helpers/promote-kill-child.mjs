@@ -9,7 +9,7 @@
 // the wrappers.
 //
 // argv:  <agent> <sourcePath>
-// env:   TPS_PROMOTE_MODULE  file:// URL of the built mail module
+// env:   TPS_PROMOTE_MODULE  file:// URL of the mail module
 //        TPS_KILL_AT         symbolic step boundary (see the table below)
 //        TPS_KILL_MARKER     marker file written just before blocking
 //        TPS_MAIL_ROOT       the mailbox root (<maildir>/<agent>)

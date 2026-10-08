@@ -186,6 +186,16 @@ function isConfirmedAbsent(path: string): boolean {
   return false;
 }
 
+/** True unless the record at `path` is confirmed absent or its envelope names another messageId. */
+function holdsMessageSource(path: string, messageId: string): boolean {
+  let record: MailMessage;
+  try { record = readMessageFile(path); } catch (err) {
+    return (err as NodeJS.ErrnoException | undefined)?.code !== "ENOENT" || !isConfirmedAbsent(path);
+  }
+  const parsed = typeof record?.body === "string" ? parseSignedEnvelope(record.body) : undefined;
+  return !parsed?.ok || parsed.envelope.messageId === messageId;
+}
+
 function readMessageFile(path: string): MailMessage {
   try {
     return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
@@ -1021,12 +1031,14 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     }
     if (pendingPlacement) {
       let interrupted: MailMessage | undefined;
+      const replayReason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+      const refuseCollision = (): PromoteReject => {
+        const reason = `destination already exists: ${filename}`;
+        rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+        return { ok: false, class: "storage-unavailable", reason };
+      };
       const rejectMismatch = (): PromoteReject => {
-        if (!replay.ownsPendingPlacement(envelope.messageId, filename)) {
-          const reason = `destination already exists: ${filename}`;
-          rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
-          return { ok: false, class: "storage-unavailable", reason };
-        }
+        if (!replay.ownsPendingPlacement(envelope.messageId, filename)) return refuseCollision();
         mkdirSync(dirs.dlq, { recursive: true });
         writeReasonSidecar(dirs.dlq, filename, "unverified", "placement-copy-mismatch");
         syncMailFile(join(dirs.dlq, `${filename}.reason`));
@@ -1049,30 +1061,39 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
         }
         if (interrupted) {
           const decision = await checkPromotedRecord(agent, interrupted, mailRoot, verify, dirs.root, false);
+          if (decision.ok && interrupted.envelopeId === envelope.messageId
+            && isDeepStrictEqual(readMessageFile(curPath), interrupted)
+            && replay.ownsPendingPlacement(envelope.messageId, filename)
+            && hasCommittedMessageId(dirs.root, envelope.messageId)) {
+            rmSync(filePath, { force: true });
+            try { replay.finishPlacement(envelope.messageId, filename); } catch {}
+            return { ok: false, class: "replay", reason: replayReason };
+          }
           if (!decision.ok || interrupted.id !== msg.id || !isDeepStrictEqual(interrupted.envelope, envelope)) {
             return rejectMismatch();
           }
           if (!isDeepStrictEqual(readMessageFile(curPath), interrupted)) {
             return rejectMismatch();
           }
-          const consumed = replay.isConsumed(envelope.messageId);
-          if (consumed && hasCommittedMessageId(dirs.root, envelope.messageId)) {
-            const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+          if (!replay.ownsPendingPlacement(envelope.messageId, filename)) return refuseCollision();
+          if (replay.isConsumed(envelope.messageId, filename)) {
+            rmSync(curPath, { force: true });
+            if (!isConfirmedAbsent(curPath)) throw new Error("placement copy removal unavailable");
             rmSync(filePath, { force: true });
             try { replay.finishPlacement(envelope.messageId, filename); } catch {}
-            return { ok: false, class: "replay", reason };
+            return { ok: false, class: "replay", reason: replayReason };
           }
           const now = new Date();
           utimesSync(curPath, now, now);
           replay.recordConsumed(envelope.messageId);
           rmSync(filePath, { force: true });
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
-          return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
+          return { ok: false, class: "replay", reason: replayReason };
         }
         if (replay.isConsumed(envelope.messageId)) {
           rmSync(filePath, { force: true });
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
-          return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
+          return { ok: false, class: "replay", reason: replayReason };
         }
         replay.finishPlacement(envelope.messageId, filename);
       } catch (err) {
@@ -1109,6 +1130,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       replay.beginPlacement(envelope.messageId, filename, scratchPath);
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
+        replay.finishPlacement(envelope.messageId, filename);
         throw new Error(`destination already exists: ${filename}`);
       }
       movedToCur = true;
@@ -1390,7 +1412,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       if (replay.hasPendingFile(f) && (
         !msg.envelopeId || !replay.hasPendingPlacement(msg.envelopeId, f) ||
         !hasCommittedMessageId(inbox.root, msg.envelopeId) ||
-        !isConfirmedAbsent(join(inbox.fresh, f)) || !isConfirmedAbsent(join(inbox.dlq, f))
+        holdsMessageSource(join(inbox.fresh, f), msg.envelopeId) || holdsMessageSource(join(inbox.dlq, f), msg.envelopeId)
       )) continue;
     } catch { continue; }
     if (msg.read || msg.nackedAt) continue;
@@ -1413,7 +1435,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
         if (replay.hasPendingFile(f)) {
           if (!fresh.envelopeId || !replay.hasPendingPlacement(fresh.envelopeId, f) ||
             !hasCommittedMessageId(inbox.root, fresh.envelopeId) ||
-            !isConfirmedAbsent(join(inbox.fresh, f)) || !isConfirmedAbsent(join(inbox.dlq, f))) return null;
+            holdsMessageSource(join(inbox.fresh, f), fresh.envelopeId) || holdsMessageSource(join(inbox.dlq, f), fresh.envelopeId)) return null;
           replay.finishPlacement(fresh.envelopeId, f);
         }
         return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
