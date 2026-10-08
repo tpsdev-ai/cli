@@ -29,6 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildArgsFor, loadTable } from "../../../../scripts/reviewer/build-reviewer-image.mjs";
 import {
+  bashStep,
   checkFreshClone,
   checkStepEnv,
   containedDirectory,
@@ -840,11 +841,25 @@ describe("A2/A3 — the review build", () => {
       ["      - run: sleep 5", "      - run: touch second", "      - run: touch always-ran\n        if: always()"].join("\n") + "\n",
       { jobExtra: "    timeout-minutes: 0.01\n" },
     );
+    const started: number[] = [];
     const t0 = Date.now();
-    const r = await build();
+    const r = await build({
+      // Control time instead of racing it: the launcher hands each step the
+      // smaller of its own and the job's remaining time, so the sleep (no
+      // timeout-minutes of its own) is killed at the job deadline. The test
+      // then waits a fixed margin before the launcher considers the next step,
+      // so the order it asserts never depends on how fast the kill is reaped.
+      runStep: async (args: Parameters<typeof bashStep>[0]) => {
+        started.push(args.step.index);
+        const result = await bashStep(args);
+        if (args.step.index === 3) await new Promise((done) => setTimeout(done, 50));
+        return result;
+      },
+    });
     expect(Date.now() - t0).toBeLessThan(4000);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal.message).toContain("timed out");
+    expect(started).toEqual([3]); // the always() step is never started
     expect(existsSync(join(workspace, "second"))).toBe(false);
     expect(existsSync(join(workspace, "always-ran"))).toBe(false);
   });
