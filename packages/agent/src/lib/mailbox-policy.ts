@@ -238,7 +238,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
   return {
     isConsumed: (messageId, pendingFile) => isConsumedMessageId(root, messageId, pendingFile),
     beginPlacement: (messageId, file) => writePlacementIntent(root, messageId, file),
-    hasPendingFile: (file) => readPlacementIntent(root, file) !== null,
+    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || readPlacementIntent(root, file) !== null,
     hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
     finishPlacement: (messageId, file) => {
       if (readPlacementIntent(root, file)?.messageId !== messageId) return;
@@ -253,14 +253,42 @@ function placementIntentPath(root: string, file: string): string {
   return join(root, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
 }
 
+function malformedPlacement(path: string): Error {
+  const err = new Error(`malformed placement intent at ${path}`);
+  err.name = "MalformedPlacementIntentError";
+  return err;
+}
+
+function quarantinePlacement(path: string): void {
+  const err = malformedPlacement(path);
+  writeFileSync(`${path}.quarantined.reason`, `${err.name}: ${err.message}\n`, { mode: 0o600 });
+  renameSync(path, `${path}.quarantined`);
+  syncDirectory(join(path, ".."));
+  console.warn(`${err.name}: ${err.message}`);
+}
+
+function parsePlacement(raw: string, path: string): { messageId: string; file: string } | null {
+  try {
+    const intent = JSON.parse(raw);
+    if (typeof intent?.file === "string" && placementIntentPath(join(path, ".."), intent.file) === path
+      && isValidEnvelopeId(intent?.messageId)) return intent;
+  } catch {}
+  return null;
+}
+
 function readPlacementIntent(root: string, file: string): { messageId: string } | null {
+  const path = placementIntentPath(root, file);
+  if (existsSync(`${path}.quarantined`)) throw malformedPlacement(path);
   let raw: string;
-  try { raw = readFileSync(placementIntentPath(root, file), "utf8"); } catch (err) {
+  try { raw = readFileSync(path, "utf8"); } catch (err) {
     if (isMissing(err)) return null;
     throw err;
   }
-  const intent = JSON.parse(raw);
-  if (intent?.file !== file || !isValidEnvelopeId(intent?.messageId)) throw new Error("invalid placement intent");
+  const intent = parsePlacement(raw, path);
+  if (!intent) {
+    quarantinePlacement(path);
+    throw malformedPlacement(path);
+  }
   return intent;
 }
 
@@ -286,16 +314,31 @@ function writePlacementIntent(root: string, messageId: string, file: string): vo
   }
 }
 
-function pendingPlacementIds(root: string): Set<string> {
+function pendingPlacementIds(root: string, quarantine = false): { ids: Set<string>; blocked: Set<string>; retainAll: boolean } {
   const ids = new Set<string>();
+  const blocked = new Set<string>();
+  let retainAll = false;
   for (const name of readdirSync(root)) {
-    if (!/^\.placement-[a-f0-9]{64}\.json$/.test(name)) continue;
-    const intent = JSON.parse(readFileSync(join(root, name), "utf8"));
-    if (typeof intent?.file !== "string" || placementIntentPath(root, intent.file) !== join(root, name)
-      || !isValidEnvelopeId(intent?.messageId)) throw new Error("invalid placement intent");
-    ids.add(intent.messageId);
+    if (!/^\.placement-[a-f0-9]{64}\.json(?:\.quarantined)?$/.test(name)) continue;
+    const path = join(root, name.replace(/\.quarantined$/, ""));
+    const raw = readFileSync(join(root, name), "utf8");
+    const intent = name.endsWith(".quarantined") ? null : parsePlacement(raw, path);
+    if (intent) {
+      ids.add(intent.messageId);
+      continue;
+    }
+    const matches = [...raw.matchAll(/"messageId"\s*:\s*("(?:[^"\\]|\\.)*")/g)];
+    if (matches.length === 0 || matches.length !== [...raw.matchAll(/"messageId"\s*:/g)].length) retainAll = true;
+    for (const match of matches) {
+      try {
+        const id = JSON.parse(match[1]!);
+        if (isValidEnvelopeId(id)) { ids.add(id); blocked.add(id); }
+        else retainAll = true;
+      } catch { retainAll = true; }
+    }
+    if (quarantine && !name.endsWith(".quarantined")) quarantinePlacement(path);
   }
-  return ids;
+  return { ids, blocked, retainAll };
 }
 
 function consumedLedgerPath(root: string): string {
@@ -318,7 +361,7 @@ function recordConsumedMessageId(root: string, messageId: string): void {
   appendFileSync(path, `${raw !== null && raw !== "" && !raw.endsWith("\n") ? "\n" : ""}${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`, "utf-8");
 }
 
-function parseConsumedLedger(raw: string, cutoff: number, pendingIds: Set<string>): { ids: Set<string>; kept: string[]; pruned: number } {
+function parseConsumedLedger(raw: string, cutoff: number, pendingIds: Set<string>, retainAll = false): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
   const kept: string[] = [];
   let pruned = 0;
@@ -349,7 +392,7 @@ function parseConsumedLedger(raw: string, cutoff: number, pendingIds: Set<string
       kept.push(line);
       continue;
     }
-    if (at < cutoff && !pendingIds.has(id)) {
+    if (at < cutoff && !retainAll && !pendingIds.has(id)) {
       pruned++;
       continue;
     }
@@ -368,9 +411,10 @@ function readConsumedLedger(root: string): Set<string> {
   const path = consumedLedgerPath(root);
 
   const raw = readLedgerText(root);
-  if (raw === null) return new Set<string>();
+  const pending = pendingPlacementIds(root, true);
+  if (raw === null) return pending.blocked;
 
-  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pendingPlacementIds(root));
+  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pending.ids, pending.retainAll);
   if (pruned > 0) {
     try {
       const tmp = `${path}.tmp`;
@@ -380,6 +424,7 @@ function readConsumedLedger(root: string): Set<string> {
       // Pruning is housekeeping — non-fatal, retried on the next read.
     }
   }
+  for (const id of pending.blocked) ids.add(id);
   return ids;
 }
 
@@ -402,7 +447,8 @@ function isMissing(err: unknown): boolean {
 function peekConsumedLedger(root: string): Set<string> | null {
   const raw = readLedgerText(root);
   if (raw === null) return null;
-  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pendingPlacementIds(root)).ids;
+  const pending = pendingPlacementIds(root);
+  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pending.ids, pending.retainAll).ids;
 }
 
 /**

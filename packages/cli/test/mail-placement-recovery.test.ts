@@ -58,8 +58,8 @@ function intents(inbox: ReturnType<typeof mail.getInbox>) {
   return fs.readdirSync(inbox.root).filter((name) => name.startsWith(".placement-") && name.endsWith(".json"));
 }
 
-for (const check of ["signature", "binding", "source equality", "record identity"] as const) {
-  test(`pending recovery requires cur ${check}`, async () => {
+for (const check of ["signature", "binding", "source equality", "record identity", "null", "json"] as const) {
+  test(`pending recovery quarantines cur with invalid ${check}`, async () => {
     const { source, cur, inbox, envelope } = pending();
     const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
     if (check === "signature") copy.envelope.signature = "00".repeat(64);
@@ -70,16 +70,26 @@ for (const check of ["signature", "binding", "source equality", "record identity
       copy.timestamp = copy.envelope.timestamp;
     }
     if (check === "record identity") copy.id = "other-record";
-    fs.writeFileSync(cur, JSON.stringify(copy));
-    const before = fs.readFileSync(cur, "utf8");
+    fs.writeFileSync(cur, check === "null" ? "null" : check === "json" ? "{" : JSON.stringify(copy));
     const result = await mail.promote(agent, source);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected refusal");
     expect(result.class).toBe("unverified");
     expect(result.reason).toContain("placement-copy-mismatch");
     expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
-    expect(fs.readFileSync(cur, "utf8")).toBe(before);
+    expect(fs.existsSync(cur)).toBe(false);
+    expect(fs.existsSync(source)).toBe(false);
+    expect(intents(inbox)).toEqual([]);
+    const dlq = join(inbox.dlq, "record.json");
+    expect(fs.existsSync(dlq)).toBe(true);
+    const reason = fs.readFileSync(`${dlq}.reason`, "utf8");
+    expect(reason).toContain("placement-copy-mismatch");
+    expect(reason).toContain("class: unverified");
+    const before = fs.statSync(dlq).mtimeMs;
     expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(fs.statSync(dlq).mtimeMs).toBe(before);
+    expect(fs.readdirSync(inbox.dlq).filter((name) => name.endsWith(".json"))).toEqual(["record.json"]);
   });
 }
 
@@ -175,7 +185,7 @@ test("mail gc preserves pending placement files", async () => {
 });
 
 for (const action of ["archiveOldCur", "checkMessages"] as const) {
-  test(`${action} archives unrelated aged cur files and preserves pending placement files`, async () => {
+  test(`${action} handles unrelated aged cur files and pending placement files`, async () => {
     const fixture = pending();
     age(fixture);
     const copy = JSON.parse(fs.readFileSync(fixture.cur, "utf8"));
@@ -192,9 +202,9 @@ for (const action of ["archiveOldCur", "checkMessages"] as const) {
     const month = `${old.getUTCFullYear()}-${String(old.getUTCMonth() + 1).padStart(2, "0")}`;
     expect(fs.readFileSync(join(fixture.inbox.root, "archive", month, "ancient.json"), "utf8")).toBe(bytes);
     expect(fs.existsSync(unrelated)).toBe(false);
-    expect(fs.existsSync(fixture.cur)).toBe(true);
-    expect(fs.existsSync(fixture.source)).toBe(true);
-    expect(intents(fixture.inbox)).toHaveLength(1);
+    expect(fs.existsSync(fixture.cur)).toBe(action === "archiveOldCur");
+    expect(fs.existsSync(fixture.source)).toBe(action === "archiveOldCur");
+    expect(intents(fixture.inbox)).toHaveLength(action === "archiveOldCur" ? 1 : 0);
     expect(hasCommittedMessageId(fixture.inbox.root, fixture.envelope.messageId)).toBe(false);
   });
 }
@@ -255,5 +265,38 @@ for (const committed of [true, false]) {
     expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(committed ? ["hello"] : []);
     expect(await mail.checkMessages(agent)).toEqual([]);
     expect(intents(inbox)).toHaveLength(committed ? 0 : 1);
+  });
+}
+
+for (const malformed of ["file", "json", "unknown ID", "invalid escape"] as const) {
+  test(`malformed placement ${malformed} retains replay history and permits unrelated mail`, async () => {
+    const { inbox, envelope, source, cur } = pending();
+    const intent = join(inbox.root, intents(inbox)[0]!);
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString();
+    fs.writeFileSync(join(inbox.root, "consumed.jsonl"), JSON.stringify({ id: envelope.messageId, at: old }) + "\n");
+    const raw = malformed === "file" ? JSON.stringify({ messageId: envelope.messageId, file: "other.json" })
+      : malformed === "json" ? `{"messageId":"${envelope.messageId}",`
+        : malformed === "invalid escape" ? '{"messageId":"\\q",' : "{";
+    fs.writeFileSync(intent, raw);
+    const unrelated = buildSignedEnvelope("kern", agent, "unrelated", { kern: seed }, { messageId: "unrelated" });
+    fs.writeFileSync(join(inbox.fresh, "unrelated.json"), JSON.stringify({
+      id: "unrelated-record", from: "kern", to: agent, body: JSON.stringify(unrelated), timestamp: unrelated.timestamp,
+    }));
+    expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["unrelated"]);
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(true);
+    expect(fs.existsSync(cur)).toBe(true);
+    expect(fs.existsSync(intent)).toBe(false);
+    expect(fs.readFileSync(`${intent}.quarantined`, "utf8")).toBe(raw);
+    expect(fs.readFileSync(`${intent}.quarantined.reason`, "utf8")).toContain(intent);
+    expect(fs.readFileSync(`${intent}.quarantined.reason`, "utf8")).toContain("MalformedPlacementIntentError");
+    expect(fs.existsSync(join(inbox.dlq, "unrelated.json"))).toBe(false);
+    expect(fs.existsSync(source)).toBe(false);
+    fs.rmSync(cur);
+    fs.writeFileSync(join(inbox.fresh, "duplicate.json"), JSON.stringify({
+      id: "duplicate-record", from: "kern", to: agent, body: JSON.stringify(envelope), timestamp: envelope.timestamp,
+    }));
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(fs.readFileSync(join(inbox.dlq, "duplicate.json.reason"), "utf8")).toContain("class: replay");
   });
 }

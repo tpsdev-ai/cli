@@ -22,7 +22,7 @@ const FROM = "agent-b";
 const FROM_SEED = Buffer.alloc(32, 0x41);
 const AGENT_SEED = Buffer.alloc(32, 0x42);
 const CHILD = fileURLToPath(new URL("./helpers/promote-kill-child.mjs", import.meta.url));
-const DIST_MAIL = new URL("../dist/src/utils/mail.js", import.meta.url).href;
+const SOURCE_MAIL = new URL("../src/utils/mail.ts", import.meta.url).href;
 
 const jsonFiles = (dir: string): string[] =>
   existsSync(dir)
@@ -94,7 +94,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
         FLAIR_URL: process.env.FLAIR_URL,
         TPS_FLAIR_TEST_SEEDS: JSON.stringify({ [FROM]: FROM_SEED.toString("base64"), [AGENT]: AGENT_SEED.toString("base64") }),
         FLAIR_KEY_PATH: process.env.FLAIR_KEY_PATH,
-        TPS_PROMOTE_MODULE: DIST_MAIL,
+        TPS_PROMOTE_MODULE: SOURCE_MAIL,
         TPS_KILL_AT: killAt,
         TPS_KILL_MARKER: marker,
         TPS_MAIL_ROOT: inbox.root,

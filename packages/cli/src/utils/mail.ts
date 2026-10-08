@@ -1015,34 +1015,47 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       pendingPlacement = replay.hasPendingPlacement(envelope.messageId, filename);
     } catch (err) {
       const reason = `placement history unavailable: ${err instanceof Error ? err.message : String(err)}`;
-      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
-      return { ok: false, class: "storage-unavailable", reason };
+      const cls = err instanceof Error && err.name === "MalformedPlacementIntentError" ? "unverified" : "storage-unavailable";
+      rejectToDlq(dirs, filename, filePath, cls, reason);
+      return { ok: false, class: cls, reason };
     }
     if (pendingPlacement) {
       let interrupted: MailMessage | undefined;
+      const rejectMismatch = (): PromoteReject => {
+        mkdirSync(dirs.dlq, { recursive: true });
+        writeReasonSidecar(dirs.dlq, filename, "unverified", "placement-copy-mismatch");
+        syncMailFile(join(dirs.dlq, `${filename}.reason`));
+        const target = join(dirs.dlq, filename);
+        if (filePath !== target) renameSync(filePath, target);
+        rmSync(curPath, { force: true });
+        if (!isConfirmedAbsent(curPath)) throw new Error("placement copy removal unavailable");
+        replay.finishPlacement(envelope.messageId, filename);
+        return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+      };
       try {
-        const consumed = replay.isConsumed(envelope.messageId);
-        if (consumed && hasCommittedMessageId(dirs.root, envelope.messageId)) {
-          const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
-          rmSync(filePath, { force: true });
-          try { replay.finishPlacement(envelope.messageId, filename); } catch {}
-          return { ok: false, class: "replay", reason };
-        }
         try {
-          interrupted = readMessageFile(curPath);
+          interrupted = JSON.parse(readFileSync(curPath, "utf8")) as MailMessage;
           if (!interrupted || typeof interrupted !== "object") {
-            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+            return rejectMismatch();
           }
         } catch (err: any) {
+          if (err instanceof SyntaxError) return rejectMismatch();
           if (err?.code !== "ENOENT" || !isConfirmedAbsent(curPath)) throw err;
         }
         if (interrupted) {
           const decision = await checkPromotedRecord(agent, interrupted, mailRoot, verify, dirs.root, false);
           if (!decision.ok || interrupted.id !== msg.id || !isDeepStrictEqual(interrupted.envelope, envelope)) {
-            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+            return rejectMismatch();
           }
           if (!isDeepStrictEqual(readMessageFile(curPath), interrupted)) {
-            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+            return rejectMismatch();
+          }
+          const consumed = replay.isConsumed(envelope.messageId);
+          if (consumed && hasCommittedMessageId(dirs.root, envelope.messageId)) {
+            const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+            rmSync(filePath, { force: true });
+            try { replay.finishPlacement(envelope.messageId, filename); } catch {}
+            return { ok: false, class: "replay", reason };
           }
           const now = new Date();
           utimesSync(curPath, now, now);
@@ -1051,7 +1064,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
           return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
         }
-        if (consumed) {
+        if (replay.isConsumed(envelope.messageId)) {
           rmSync(filePath, { force: true });
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
           return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
