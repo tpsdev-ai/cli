@@ -7,7 +7,7 @@
  *
  */
 
-import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -48,6 +48,9 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
 
   afterEach(() => {
     stub.stop();
+    // Restore every spy this file registered, so nothing leaks to a later file
+    // in the same bun process (cli#555).
+    mock.restore();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

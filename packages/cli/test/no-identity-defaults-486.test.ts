@@ -1,7 +1,7 @@
 // cli#486 — the last three `?? "anvil"` identity defaults are gone: the bridge
 // core, the roster dashboard and `tps agent commit` take a configured identity
 // and refuse by name when none is set.
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -46,6 +46,9 @@ describe("cli#486 — configured identity, no anvil default", () => {
   });
 
   afterEach(() => {
+    // Restore every spy this file registered, so nothing leaks to a later file
+    // in the same bun process (cli#555).
+    mock.restore();
     if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
     else process.env.TPS_AGENT_ID = savedAgentId;
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });

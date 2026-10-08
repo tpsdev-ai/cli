@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -13,6 +13,9 @@ describe("outbox", () => {
   });
 
   afterEach(() => {
+    // Restore every spy this file registered, so nothing leaks to a later file
+    // in the same bun process (cli#555).
+    mock.restore();
     rmSync(root, { recursive: true, force: true });
     delete process.env.HOME;
   });

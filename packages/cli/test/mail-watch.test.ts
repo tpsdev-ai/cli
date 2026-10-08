@@ -20,7 +20,7 @@
  * tests stand up a stub Flair and point FLAIR_URL/FLAIR_KEY_PATH at it.
  */
 
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -180,6 +180,9 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   afterEach(() => {
     stub.stop();
+    // Restore every spy this file registered, so nothing leaks to a later file
+    // in the same bun process (cli#555).
+    mock.restore();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

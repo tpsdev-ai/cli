@@ -1,0 +1,1 @@
+- **cli tests restore every spy and module mock they register.** A guard fails a test file that registers a `spyOn` or `mock.module` without a teardown restore, or that sets `process.env` in a `before*` hook and never undoes it.
