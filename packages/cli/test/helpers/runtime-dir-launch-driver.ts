@@ -25,11 +25,13 @@ if (insensitiveRoot) {
   }));
 }
 
+process.env.NONO_FAKE_LOG = process.env.FAKE_NONO_LOG || join(process.env.TMPDIR!, "nono-query.log");
+
 const attestationPath = resolve(import.meta.dir, "../../src/utils/launch-attestation.ts");
 const attestation = await import(attestationPath);
 mock.module(attestationPath, () => ({
   ...attestation,
-  resolveNonoBinary: () => ({ bin: "/fixture/nono" }),
+  resolveNonoBinary: () => ({ bin: process.env.NONO_BIN || join(import.meta.dir, "../fakes/nono/bin/nono") }),
   launchAttested: async (profile: string, options: import("../../src/utils/nono.js").NonoOptions, cmd: string[], opts: unknown) => {
     const { buildNonoArgs } = await import("../../src/utils/nono.js");
     console.log("HANDOFF " + JSON.stringify({ profile, options, cmd, opts, args: buildNonoArgs(profile, options, cmd), cwd: process.cwd() }));
@@ -38,4 +40,4 @@ mock.module(attestationPath, () => ({
 }));
 
 const { runAgent } = await import("../../src/commands/agent.js");
-await runAgent({ action: "start", id: "probe", runtime: "claude-code", sandboxRequired: true });
+await runAgent({ action: "start", id: "probe", runtime: process.env.TPS_TEST_DEFAULT_RUNTIME ? undefined : "claude-code", sandboxRequired: true });

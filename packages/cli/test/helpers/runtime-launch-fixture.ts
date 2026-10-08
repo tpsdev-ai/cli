@@ -58,7 +58,7 @@ export function makeSandbox(): Sandbox {
 export function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Record<string, string> {
   const base: Record<string, string> = {
     ...(process.env as Record<string, string>),
-    HOME: "../home",
+    HOME: sb.home,
     SNOOPLOGG: "tps:agent*",
     TMPDIR: sb.tmp,
     FAKE_NONO_LOG: sb.nonoLog,

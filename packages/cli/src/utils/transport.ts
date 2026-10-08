@@ -53,6 +53,47 @@ export interface TransportServer {
   close(): Promise<void>;
 }
 
+/**
+ * Settle a listener's `close()` with or without a live peer, and resolve at
+ * once when the listener is already stopped (idempotent).
+ *
+ * `net.Server.close()` and a graceful `httpServer.close()` wait for their
+ * accepted sockets to end, so with a peer still connected they never settle and
+ * the branch daemon's SIGTERM handler never reaches process.exit. Destroy the
+ * accepted sockets first, force-stop the server, and treat an already-stopped
+ * server as closed. `terminate` is the caller's socket teardown; `server` is the
+ * `net.Server` or `http.Server` behind the transport.
+ */
+export function closeListener({
+  terminate,
+  server,
+}: {
+  terminate: () => void;
+  server: { listening: boolean; close: (cb: (err?: Error) => void) => void; closeAllConnections?: () => void };
+}): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    try {
+      terminate();
+    } catch {
+      /* tearing down sockets must never throw */
+    }
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+    try {
+      server.closeAllConnections?.();
+    } catch {
+      /* best effort — a missing/older method falls through to close() */
+    }
+    server.close((err) => {
+      // ERR_SERVER_NOT_RUNNING here means the server is already stopped.
+      if (err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(err);
+      else resolve();
+    });
+  });
+}
+
 export interface WireTransport {
   connect(target: BranchTarget): Promise<TransportChannel>;
   listen(port: number): Promise<TransportServer>;

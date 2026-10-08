@@ -26,6 +26,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -48,6 +50,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -103,6 +107,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -182,6 +188,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -232,6 +240,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -319,6 +329,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -442,6 +454,8 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: 1.3.10
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
@@ -515,6 +529,8 @@ jobs:
           cp target/release/nono "$HOME/.local/nono-pin/nono"
       - name: Run the profile gate against the pinned nono
         run: NONO_BIN="$HOME/.local/nono-pin/nono" ./scripts/check-nono-profiles.sh
+      - name: Custom profile access and launch-policy checks
+        run: NONO_BIN="$HOME/.local/nono-pin/nono" bun run scripts/check-custom-nono-profile.ts
 
   # SAST (Static Application Security Testing) using Semgrep.
   # Semgrep scans the codebase for security vulnerabilities, hardcoded secrets, and bad practices
