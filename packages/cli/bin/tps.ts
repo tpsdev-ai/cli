@@ -1,118 +1,14 @@
 #!/usr/bin/env node
 import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
-import { enforceLaunchControl, launchFlagDefinitions, readLaunchFlags } from "../src/utils/nono.js";
+import { cliFlagDefinitions, cliOptionConsumesValue, cliOptionTypes } from "../src/utils/cli-flags.js";
+import { parseGuardMode } from "../src/utils/secrets-guard-args.js";
+import { enforceLaunchControl, readLaunchFlags } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
 
-const FLAGS = {
-  reason: { type: "string" },
-  expiresIn: { type: "string" },
-  trust: { type: "string" },
-  pubkey: { type: "string" },
-  encPubkey: { type: "string" },
-  name: { type: "string" },
-  workspace: { type: "string" },
-  dryRun: { type: "boolean", default: false },
-  json: { type: "boolean", default: false },
-  config: { type: "string" },
-  deep: { type: "boolean", default: false },
-  summary: { type: "string" },
-  channel: { type: "string" },
-  branch: { type: "boolean", default: false },
-  manifest: { type: "string" },
-  soundstage: { type: "boolean", default: false },
-  // --quiet-nono-check: skips only the loud availability check; it is NOT a
-  // sandbox bypass. Renamed from --nonono (kept as a hidden deprecated alias).
-  quietNonoCheck: { type: "boolean", default: false },
-  nonono: { type: "boolean", default: false },
-  ...launchFlagDefinitions,
-  inject: { type: "boolean", default: true },
-  runtime: { type: "string", default: "openclaw" },
-  baseModel: { type: "string" },
-  since: { type: "string" },
-  limit: { type: "number" },
-  interval: { type: "number" },
-  daemon: { type: "string" },
-  from: { type: "string" },
-  clone: { type: "boolean", default: false },
-  overwrite: { type: "boolean", default: false },
-  schedule: { type: "string" },
-  keep: { type: "number" },
-  sanitize: { type: "boolean", default: true },
-  listen: { type: "number" },
-  host: { type: "string" },
-  force: { type: "boolean", default: false },
-  follow: { type: "boolean", default: false },
-  lines: { type: "number" },
-  transport: { type: "string" },
-  port: { type: "number" },
-  autoPrune: { type: "boolean", default: false },
-  prune: { type: "boolean", default: false },
-  staleMinutes: { type: "number" },
-  offlineHours: { type: "number" },
-  shared: { type: "boolean", default: false },
-  cost: { type: "boolean", default: false },
-  costs: { type: "boolean", default: false },
-  today: { type: "boolean", default: false },
-  agent: { type: "string" },
-  statusOverride: { type: "string" },
-  desc: { type: "string" },
-  id: { type: "string" },
-  fromBeginning: { type: "boolean", default: false },
-  count: { type: "boolean", default: false },
-  priority: { type: "string" },
-  version: { type: "string" },
-  verbose: { type: "boolean", default: false },
-  // ops-7x9y: office join supervision flags (--force is already declared above)
-  tunnelVia: { type: "string" },
-  keepUnits: { type: "boolean", default: false },
-  // ops-209a: Flair spoke provisioning flags
-  noFlair: { type: "boolean", default: false },
-  forceReinstallFlair: { type: "boolean", default: false },
-  purgeFlair: { type: "boolean", default: false },
-  // ops-568p: Cred substrate S1+S2 (credentials manifest)
-  apply: { type: "boolean", default: false },
-  expires: { type: "string" },
-  expiresWithin: { type: "string" },
-  fix: { type: "boolean", default: false },
-  flairKeysDir: { type: "string" },
-  identityDir: { type: "string" },
-  keysDir: { type: "string" },
-  nonInteractive: { type: "boolean", default: false },
-  owner: { type: "string" },
-  path: { type: "string" },
-  scope: { type: "string" },
-  secretsDir: { type: "string" },
-  sensitivity: { type: "string" },
-  credType: { type: "string" },
-  check: { type: "boolean", default: false },
-  noGuard: { type: "boolean", default: false },
-  staleOnly: { type: "boolean", default: false },
-  root: { type: "string" },
-  // Facts substrate flags
-  failOnDrift: { type: "boolean", default: false },
-  noVerify: { type: "boolean", default: false },
-  verifyPreview: { type: "boolean", default: false },
-  // Task envelope flags (mail send --task)
-  task: { type: "string" },
-  taskId: { type: "string" },
-  title: { type: "string" },
-  spec: { type: "string" },
-  output: { type: "string" },
-  taskContext: { type: "string" },
-  // cli#429: mail send --stdin / --reply-to. `--unsigned` is parsed only so
-  // that `mail send` can REFUSE it by name (there is no unsigned send).
-  stdin: { type: "boolean", default: false },
-  unsigned: { type: "boolean", default: false },
-  replyTo: { type: "string" },
-  // mail send --message-id: sign with a caller-chosen envelope messageId,
-  // so a re-send after an unknown outcome is the same message.
-  messageId: { type: "string" },
-} as const;
 
-// Value-taking options read directly from process.argv rather than FLAGS.
 const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
   init: ["model", "flair-url"],
   agent: ["model", "flair-url", "display-name", "soul-file", "repo", "message", "pr-title", "scope-warn-threshold"],
@@ -124,6 +20,14 @@ const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
   flair: ["flair-dir", "auth-mode", "auth-path", "flair-url"],
   secrets: ["window"],
 };
+
+let guardMode: { check: boolean; noGuard: boolean } | undefined;
+try {
+  if (process.argv[2] === "secrets-guard") guardMode = parseGuardMode(process.argv.slice(2));
+} catch (err) {
+  console.error((err as Error).message);
+  process.exit(1);
+}
 
 const helpArgs = parseHelpArgs(process.argv.slice(2));
 
@@ -201,7 +105,7 @@ const cli = meow(
 `,
   {
     importMeta: import.meta,
-    flags: FLAGS,
+    flags: cliFlagDefinitions,
     argv: helpArgs.argv,
   }
 );
@@ -373,12 +277,6 @@ const USAGE: Record<string, string> = {
 /** `--` ends TPS help detection; option values and command tails are data. */
 function parseHelpArgs(argv: readonly string[]): { requested: boolean; versionRequested: boolean; argv: string[] } {
   const parsed: string[] = [];
-  const values = new Set(Object.entries(FLAGS)
-    .filter(([, flag]) => flag.type !== "boolean")
-    .map(([name]) => `--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`));
-  const booleans = new Set(Object.entries(FLAGS)
-    .filter(([, flag]) => flag.type === "boolean")
-    .map(([name]) => `--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`));
   const positionals: string[] = [];
   let requested = false;
   let versionRequested = false;
@@ -413,7 +311,7 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; versionRe
     const rawValue = RAW_VALUE_FLAGS[cmd ?? ""]?.some((name) => arg === `--${name}`);
     const author = cmd === "agent" && action === "commit" && arg === "--author";
     const branch = cmd === "agent" && action === "commit" && arg === "--branch";
-    if (values.has(arg) || rawValue || author || branch || (cmd === "secrets" && arg === "-n")) {
+    if (cliOptionConsumesValue(arg, argv[i + 1]) || rawValue || author || branch || (cmd === "secrets" && arg === "-n")) {
       if (argv[i + 1] === "--") {
         parsed.push(...argv.slice(i + 1));
         break;
@@ -424,9 +322,9 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; versionRe
         parsed.push(...argv.slice(i + 1, i + (author ? 3 : 2)));
       }
       i += author ? 2 : 1;
-    } else if (booleans.has(arg)) {
+    } else if (cliOptionTypes.get(arg) === "boolean") {
       if (argv[i + 1] === "true" || argv[i + 1] === "false") parsed.push(argv[++i]);
-    } else if (arg.startsWith("-") && !arg.startsWith("--no-") && !arg.includes("=") &&
+    } else if (cmd !== "secrets-guard" && arg.startsWith("-") && !arg.startsWith("--no-") && !arg.includes("=") &&
                argv[i + 1] && !argv[i + 1].startsWith("-")) {
       parsed.push(argv[++i]);
     } else if (!arg.startsWith("-")) {
@@ -1037,8 +935,10 @@ async function main() {
     case "secrets-guard": {
       const { runSecretsGuard } = await import("../src/commands/secrets-guard.js");
 
+      const mode = guardMode ?? parseGuardMode(helpArgs.argv.slice(helpArgs.argv.indexOf("secrets-guard")));
+
       // --check mode: read stdin, print match count
-      if (process.argv.includes("--check")) {
+      if (mode.check) {
         // Collect stdin
         let data = "";
         process.stdin.setEncoding("utf-8");
@@ -1064,7 +964,7 @@ async function main() {
         action: "guard",
         cmd,
         args: rest.slice(1),
-        noGuard: process.argv.includes("--no-guard"),
+        noGuard: mode.noGuard,
       });
       break;
     }
