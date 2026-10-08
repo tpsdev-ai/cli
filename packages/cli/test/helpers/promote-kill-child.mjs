@@ -6,9 +6,7 @@
 //
 // The pause point is injected by wrapping node:fs BEFORE the mail module is
 // loaded, so the mail module's `import { … } from "node:fs"` bindings resolve to
-// the wrappers. When the wrapped call at the named boundary fires, the child
-// writes a marker file and then spins until the parent SIGKILLs it — the paused
-// operation never runs, so the on-disk state is exactly "everything before it".
+// the wrappers.
 //
 // argv:  <agent> <sourcePath>
 // env:   TPS_PROMOTE_MODULE  file:// URL of the built mail module
@@ -58,9 +56,6 @@ for (const name of ["writeFileSync", "openSync", "linkSync", "appendFileSync", "
     if (!paused && matches(name, args)) {
       paused = true;
       if (MARKER) origWrite.call(fs, MARKER, "paused");
-      // Hard upper bound: spin no longer than 60s, then fail loudly. The parent
-      // SIGKILLs within a few tens of ms; a timeout means the boundary was never
-      // reached, which the parent reports as a test failure.
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         /* spin until killed */

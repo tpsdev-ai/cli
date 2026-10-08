@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import {
@@ -181,6 +181,11 @@ function listMessageFiles(dir: string): string[] {
     .map((e) => e.name);
 }
 
+function isConfirmedAbsent(path: string): boolean {
+  try { lstatSync(path); } catch (err: any) { return err?.code === "ENOENT"; }
+  return false;
+}
+
 function readMessageFile(path: string): MailMessage {
   try {
     return JSON.parse(readFileSync(path, "utf-8")) as MailMessage;
@@ -328,6 +333,7 @@ export function archiveOldCur(agent: string, maxAgeDays = 30): number {
     const archiveRoot = join(inbox.root, "archive");
     let moved = 0;
     for (const file of readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))) {
+      if (mailboxReplayStore(inbox.root).hasPendingFile(file)) continue;
       const src = join(inbox.cur, file);
       try {
         const st = statSync(src);
@@ -912,8 +918,6 @@ export async function verifyRecordForMailbox(
  *
  * Accepts a source path in new/, tmp/ or dlq/ (so a quarantined
  * verify-unavailable entry can be re-driven through the same function).
- *
- * Deliberately does NOT retro-verify cur/ or the archive.
  */
 export async function promote(agent: string, filePath: string, verify: MailVerifyConfig = {}): Promise<PromoteResult> {
   assertValidAgentId(agent);
@@ -978,21 +982,34 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     } catch {
       return { ok: false, class: "busy", reason: "source became unreadable during promotion; retry" };
     }
-    if (current.body !== msg.body || current.from !== msg.from || current.timestamp !== msg.timestamp) {
+    if (!isDeepStrictEqual(current, msg)) {
       return { ok: false, class: "busy", reason: "source changed during promotion; retry" };
     }
 
     const replay = mailboxReplayStore(dirs.root);
     const curPath = join(dirs.cur, filename);
 
-    // Step 3.5: reconcile a first delivery a prior process left unfinished. A
-    // promote() that linked cur/ and then died before its ledger commit leaves a
-    // placement intent behind (written in Step 5 below). Finish it here — record
-    // the consumed id and drop this source — because the replay gate below scans
-    // cur/ as a migration fallback and would otherwise read the orphaned copy as
-    // consumed and dead-letter this verified mail as a replay. An intent whose
-    // link never landed is undone, and this delivery proceeds normally. Runs
-    // under the same lock as the replay gate and the placement below.
+    const promoted: MailMessage = {
+      ...msg,
+      from: envelope.from,
+      to: envelope.to,
+      body: envelope.body,
+      timestamp: envelope.timestamp,
+      read: false,
+      ackedAt: undefined,
+      bridgeSentAt: undefined,
+      envelopeId: envelope.messageId,
+      envelope,
+      trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
+      // Stamp the verified reply-to (or clear it): the binding table checks
+      // record.replyToId against envelope.replyToId, so presentation cannot
+      // show a reply-to that is not the one that was signed.
+      replyToId: envelope.replyToId,
+      checkedOutAt: new Date().toISOString(),
+      checkedOutBy: msg.checkedOutBy ?? agent,
+      deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
+    };
+
     let pendingPlacement: boolean;
     try {
       pendingPlacement = replay.hasPendingPlacement(envelope.messageId, filename);
@@ -1002,27 +1019,47 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       return { ok: false, class: "storage-unavailable", reason };
     }
     if (pendingPlacement) {
-      if (existsSync(curPath)) {
-        let interrupted: MailMessage;
+      let interrupted: MailMessage | undefined;
+      try {
+        if (hasCommittedMessageId(dirs.root, envelope.messageId)) {
+          const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
+          rmSync(filePath, { force: true });
+          try { replay.finishPlacement(envelope.messageId, filename); } catch {}
+          return { ok: false, class: "replay", reason };
+        }
         try {
           interrupted = readMessageFile(curPath);
-        } catch (err) {
-          return { ok: false, class: "storage-unavailable", reason: `unfinished promotion copy unreadable: ${err instanceof Error ? err.message : String(err)}` };
+          if (!interrupted || typeof interrupted !== "object") {
+            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+          }
+        } catch (err: any) {
+          if (err?.code !== "ENOENT" || !isConfirmedAbsent(curPath)) throw err;
         }
-        try {
-          if (!hasCommittedMessageId(dirs.root, envelope.messageId)) replay.recordConsumed(envelope.messageId);
+        if (interrupted) {
+          const decision = await checkPromotedRecord(agent, interrupted, mailRoot, verify, dirs.root, false);
+          if (!decision.ok || interrupted.id !== msg.id || !isDeepStrictEqual(interrupted.envelope, envelope)) {
+            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+          }
+          if (!isDeepStrictEqual(readMessageFile(curPath), interrupted)) {
+            return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
+          }
+          const scratch = join(dirs.tmp, `${filename}.${randomUUID()}.promote`);
+          try {
+            writeFileSync(scratch, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
+            renameSync(scratch, curPath);
+          } finally {
+            try { rmSync(scratch, { force: true }); } catch {}
+          }
+          replay.recordConsumed(envelope.messageId);
           rmSync(filePath, { force: true });
-          replay.finishPlacement(envelope.messageId, filename);
-        } catch (err) {
-          const reason = `storage failure finishing an interrupted promotion: ${err instanceof Error ? err.message : String(err)}`;
-          rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
-          return { ok: false, class: "storage-unavailable", reason };
+          try { replay.finishPlacement(envelope.messageId, filename); } catch {}
+          logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id, replyToId: promoted.replyToId }, promoted.body);
+          return { ok: true, message: promoted, path: curPath };
         }
-        logEvent({ event: "read", from: interrupted.from, to: agent, messageId: interrupted.id, replyToId: interrupted.replyToId }, interrupted.body);
-        return { ok: true, message: interrupted, path: curPath };
+        replay.finishPlacement(envelope.messageId, filename);
+      } catch (err) {
+        return { ok: false, class: "storage-unavailable", reason: `unfinished promotion unavailable: ${err instanceof Error ? err.message : String(err)}` };
       }
-      // The link never landed: undo the intent and take the ordinary path below.
-      replay.finishPlacement(envelope.messageId, filename);
     }
 
     // Step 4 (first-delivery only): replay — a re-planted consumed envelope must
@@ -1045,26 +1082,6 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     // Step 5: atomic → cur/ with verified metadata.
     //
     // Append commits the cur/ copy; source removal is subsequent cleanup.
-    const promoted: MailMessage = {
-      ...msg,
-      from: envelope.from,
-      to: envelope.to,
-      body: envelope.body,
-      timestamp: envelope.timestamp,
-      read: false,
-      ackedAt: undefined,
-      bridgeSentAt: undefined,
-      envelopeId: envelope.messageId,
-      envelope,
-      trustTier: verifiedMailTier(envelope, mailRoot, verify.bridgeAgentId),
-      // Stamp the verified reply-to (or clear it): the binding table checks
-      // record.replyToId against envelope.replyToId, so presentation cannot
-      // show a reply-to that is not the one that was signed.
-      replyToId: envelope.replyToId,
-      checkedOutAt: new Date().toISOString(),
-      checkedOutBy: msg.checkedOutBy ?? agent,
-      deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
-    };
     const scratchPath = join(dirs.tmp, `${filename}.${randomUUID()}.promote`);
     let scratchCreated = false;
     let movedToCur = false;
@@ -1073,8 +1090,6 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
       scratchCreated = true;
-      // The placement intent precedes the link, so a crash between the link and
-      // the ledger commit is recoverable by the next promote() (Step 3.5).
       replay.beginPlacement(envelope.messageId, filename);
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
@@ -1099,13 +1114,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
           /* best effort */
         }
       }
-      // Undo the placement intent: this promote() is not leaving a cur/ copy
-      // behind. The intent is dropped after the copy, so a crash here is undone
-      // by the next promote() (Step 3.5).
-      try {
-        replay.finishPlacement(envelope.messageId, filename);
-      } catch {
-        /* best effort — reconciled on a later check */
+      if (isConfirmedAbsent(curPath)) {
+        try { replay.finishPlacement(envelope.messageId, filename); } catch {}
       }
       const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
       rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
@@ -1116,14 +1126,9 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       rmSync(filePath, { force: true });
     } catch {}
 
-    // The delivery is complete — cur/ holds the record and the ledger holds its
-    // id — so drop the placement intent. Last, so an interruption at any earlier
-    // point is still recoverable (Step 3.5).
     try {
       replay.finishPlacement(envelope.messageId, filename);
-    } catch {
-      /* best effort: the next promote() finishes it */
-    }
+    } catch {}
 
     // Success: clear any stale sidecar from a prior quarantine (best-effort
     // cleanup; cannot undo the promotion above).
@@ -1201,7 +1206,7 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
  * (signature, wrapper->envelope from, recipient, messageId, timestamp).
  *
  */
-async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}, root = mailboxRoot(agent)): Promise<EnvelopePolicyResult> {
+async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot: string, verify: MailVerifyConfig = {}, root = mailboxRoot(agent), requireCommit = true): Promise<EnvelopePolicyResult> {
   // Provenance: only promote() stamps envelopeId + the signed envelope.
   if (typeof record.envelopeId !== "string" || record.envelopeId.trim() === "") {
     return { ok: false, class: "unverified", reason: "record has no envelopeId (did not come through promotion)" };
@@ -1216,7 +1221,7 @@ async function checkPromotedRecord(agent: string, record: MailMessage, mailRoot:
   }
   const decision = await decideEnvelopeForMailbox(agent, env, record.from, mailRoot, verify);
   if (!decision.ok) return decision;
-  if (!hasCommittedMessageId(root, env.messageId)) {
+  if (requireCommit && !hasCommittedMessageId(root, env.messageId)) {
     throw new Error("promotion has no consumed ledger commit; not presented");
   }
   return decision;
@@ -1321,15 +1326,6 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   assertValidAgentId(checkedOutBy);
   const inbox = getInbox(agent);
 
-  try {
-    archiveOldCur(agent);
-  } catch (e: any) {
-    // Non-fatal: archive failure must never block mail processing. Log so
-    // operators can see ENOSPC, permissions, or other persistent issues
-    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
-    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
-  }
-
   // Reap stranded `tmp/*.promote` scratch from an interrupted promote — the
   // catch only runs on a thrown error, so a kill leaves orphans no other sweep
   // can see.
@@ -1382,6 +1378,15 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
     }, { snapshot: recovered.snapshot, nonBlocking: true });
     if (result.status === "updated") messages.push(result.record);
+  }
+
+  try {
+    archiveOldCur(agent);
+  } catch (e: any) {
+    // Non-fatal: archive failure must never block mail processing. Log so
+    // operators can see ENOSPC, permissions, or other persistent issues
+    // rather than silently letting cur/ grow forever. (K&S #295 follow-up.)
+    console.warn(`[mail] archiveOldCur(${agent}) failed: ${e?.message ?? e}`);
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check
@@ -1507,6 +1512,7 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
     try {
       for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
         for (const file of listMessageFiles(dir)) {
+          if (mailboxReplayStore(inbox.root).hasPendingFile(file)) continue;
           const full = join(dir, file);
           const msg = readMessageFile(full);
           const hardTs = Date.parse(msg.receivedAt ?? msg.timestamp);

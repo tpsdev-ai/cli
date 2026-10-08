@@ -1,0 +1,179 @@
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { hasCommittedMessageId, mailboxReplayStore } from "@tpsdev-ai/agent";
+import { runMail } from "../src/commands/mail.js";
+import * as mail from "../src/utils/mail.js";
+import { FlairClient } from "../src/utils/flair-client.js";
+import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+const agent = "placement-test";
+const seed = Buffer.alloc(32, 0x22);
+let root: string;
+let savedMailDir: string | undefined;
+let verifier: ReturnType<typeof spyOn>;
+const faults: Array<ReturnType<typeof spyOn>> = [];
+
+beforeEach(() => {
+  root = fs.mkdtempSync(join(tmpdir(), "placement-recovery-"));
+  savedMailDir = process.env.TPS_MAIL_DIR;
+  process.env.TPS_MAIL_DIR = root;
+  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
+    id: "kern", name: "kern", publicKey: pubkeyFromSeed(seed).toString("base64"),
+  });
+});
+
+afterEach(() => {
+  for (const fault of faults.splice(0)) fault.mockRestore();
+  verifier.mockRestore();
+  if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+  else process.env.TPS_MAIL_DIR = savedMailDir;
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+function plant(messageId = "pending-delivery") {
+  const inbox = mail.getInbox(agent);
+  const envelope = buildSignedEnvelope("kern", agent, "hello", { kern: seed }, { messageId });
+  const record = { id: "record-id", from: "kern", to: agent, body: JSON.stringify(envelope), timestamp: envelope.timestamp, read: false };
+  const source = join(inbox.fresh, "record.json");
+  fs.writeFileSync(source, JSON.stringify(record));
+  return { inbox, envelope, record, source, cur: join(inbox.cur, "record.json") };
+}
+
+function pending() {
+  const fixture = plant();
+  const { inbox, envelope, record, cur } = fixture;
+  const scratch = join(inbox.tmp, "record.json.promote");
+  fs.writeFileSync(scratch, JSON.stringify({
+    ...record, body: envelope.body, envelopeId: envelope.messageId, envelope,
+    checkedOutAt: new Date().toISOString(), checkedOutBy: agent, deliveryAttempts: 1,
+  }));
+  mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json");
+  fs.linkSync(scratch, cur);
+  return fixture;
+}
+
+function intents(inbox: ReturnType<typeof mail.getInbox>) {
+  return fs.readdirSync(inbox.root).filter((name) => name.startsWith(".placement-") && name.endsWith(".json"));
+}
+
+for (const check of ["signature", "binding", "source equality", "record identity"] as const) {
+  test(`pending recovery requires cur ${check}`, async () => {
+    const { source, cur, inbox, envelope } = pending();
+    const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
+    if (check === "signature") copy.envelope.signature = "00".repeat(64);
+    if (check === "binding") copy.body = "other";
+    if (check === "source equality") {
+      copy.envelope = buildSignedEnvelope("kern", agent, "other", { kern: seed }, { messageId: envelope.messageId });
+      copy.body = copy.envelope.body;
+      copy.timestamp = copy.envelope.timestamp;
+    }
+    if (check === "record identity") copy.id = "other-record";
+    fs.writeFileSync(cur, JSON.stringify(copy));
+    const before = fs.readFileSync(cur, "utf8");
+    const result = await mail.promote(agent, source);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected refusal");
+    expect(result.class).toBe("unverified");
+    expect(result.reason).toContain("placement-copy-mismatch");
+    expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+    expect(fs.readFileSync(cur, "utf8")).toBe(before);
+    expect(await mail.checkMessages(agent)).toEqual([]);
+  });
+}
+
+test("committed pending recovery uses the cur lease", async () => {
+  const { source, cur, inbox, record } = plant();
+  const unlink = fs.unlinkSync;
+  const fault = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+    if (String(path).includes(".placement-")) throw new Error("intent cleanup unavailable");
+    return unlink(path);
+  });
+  faults.push(fault);
+  expect((await mail.promote(agent, source)).ok).toBe(true);
+  expect(intents(inbox)).toHaveLength(1);
+  fault.mockRestore();
+  fs.writeFileSync(source, JSON.stringify(record));
+  const result = await mail.promote(agent, source);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("expected refusal");
+  expect(result.class).toBe("replay");
+  expect(await mail.checkMessages(agent)).toEqual([]);
+  const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
+  copy.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(cur, JSON.stringify(copy));
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+});
+
+function age(fixture: ReturnType<typeof pending>) {
+  const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+  for (const path of [fixture.source, fixture.cur]) {
+    const record = JSON.parse(fs.readFileSync(path, "utf8"));
+    record.receivedAt = old.toISOString();
+    record.checkedOutAt = old.toISOString();
+    fs.writeFileSync(path, JSON.stringify(record));
+    fs.utimesSync(path, old, old);
+  }
+}
+
+test("mail gc preserves pending placement files", async () => {
+  const fixture = pending();
+  age(fixture);
+  await runMail({ action: "gc", agent });
+  expect(fs.existsSync(fixture.source)).toBe(true);
+  expect(fs.existsSync(fixture.cur)).toBe(true);
+  expect(intents(fixture.inbox)).toHaveLength(1);
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+});
+
+test("archival preserves pending placement files", () => {
+  const fixture = pending();
+  age(fixture);
+  expect(mail.archiveOldCur(agent)).toBe(0);
+  expect(fs.existsSync(fixture.cur)).toBe(true);
+  expect(fs.existsSync(fixture.source)).toBe(true);
+  expect(intents(fixture.inbox)).toHaveLength(1);
+});
+
+test("checkMessages reconciles pending placement before archival", async () => {
+  const fixture = pending();
+  age(fixture);
+  const archiveOldCur = mail.archiveOldCur;
+  let committedAtArchive = false;
+  let pendingAtArchive: string[] = [];
+  const archive = spyOn(mail, "archiveOldCur");
+  faults.push(archive);
+  archive.mockImplementation((...args) => {
+    committedAtArchive = hasCommittedMessageId(fixture.inbox.root, fixture.envelope.messageId);
+    pendingAtArchive = intents(fixture.inbox);
+    return archiveOldCur(...args);
+  });
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+  expect(archive).toHaveBeenCalled();
+  expect(committedAtArchive).toBe(true);
+  expect(pendingAtArchive).toEqual([]);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+});
+
+test("rollback retains the intent until cur absence is confirmed", async () => {
+  const { source, cur, inbox, envelope } = plant();
+  const append = fs.appendFileSync;
+  faults.push(spyOn(fs, "appendFileSync").mockImplementation(((...args: Parameters<typeof append>) => {
+    if (args[0] === join(inbox.root, "consumed.jsonl")) throw new Error("ledger unavailable");
+    return append(...args);
+  }) as typeof append));
+  const remove = fs.rmSync;
+  faults.push(spyOn(fs, "rmSync").mockImplementation((path, options) => {
+    if (path === cur) throw new Error("cur removal unavailable");
+    return remove(path, options);
+  }));
+  expect((await mail.promote(agent, source)).ok).toBe(false);
+  expect(fs.existsSync(cur)).toBe(true);
+  expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+  expect(intents(inbox)).toHaveLength(1);
+  for (const fault of faults.splice(0)) fault.mockRestore();
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+});

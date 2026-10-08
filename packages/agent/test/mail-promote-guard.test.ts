@@ -567,27 +567,18 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
   });
 
-  // ── cli#515: the sender's trust tier is resolved BEFORE the move to cur/ ────
-  //
-  // verifiedMailTier reads the mailbox's bridge-principal config, which a real
-  // read can fail on. It used to be resolved AFTER commitToCur had already moved
-  // the record into cur/ (which MailClient never re-reads), so a failure there
-  // stranded a verified record in cur/ with no tier and no delivery. It must now
-  // be a refusal that leaves the record in new/ for the next check.
-  test("an unresolvable trust tier leaves the record in new/, not in cur/", async () => {
+  test("MailClient retains new mail while trust tier is unresolved", async () => {
     const env = signedEnvelope("flint", AGENT, "tier", { flint: FLINT });
     plant(wrapper("flint", env));
-    // A malformed bridge-principal record makes the tier resolution throw.
     mkdirSync(join(tmpDir, ".bridge-principals"), { recursive: true });
     writeFileSync(join(tmpDir, ".bridge-principals", "broken.json"), "not json", "utf-8");
 
     const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
     expect(await client.checkNewMail()).toEqual([]);
-    expect(files("new")).toEqual(["m1.json"]); // left for the next check
-    expect(files("cur")).toEqual([]); // never moved to cur/
-    expect(files("dlq")).toEqual([]); // not a verdict
+    expect(files("new")).toEqual(["m1.json"]);
+    expect(files("cur")).toEqual([]);
+    expect(files("dlq")).toEqual([]);
 
-    // Repaired: the same record is delivered on the next check.
     rmSync(join(tmpDir, ".bridge-principals"), { recursive: true, force: true });
     expect((await client.checkNewMail()).length).toBe(1);
     expect(files("new")).toEqual([]);

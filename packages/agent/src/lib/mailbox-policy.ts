@@ -227,6 +227,7 @@ export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
   beginPlacement(messageId: string, file: string): void;
   hasPendingPlacement(messageId: string, file: string): boolean;
+  hasPendingFile(file: string): boolean;
   finishPlacement(messageId: string, file: string): void;
   /**
    * Record a consumed messageId. Call ONLY after the record is in cur/; THROWS
@@ -240,6 +241,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
   return {
     isConsumed: (messageId, pendingFile) => isConsumedMessageId(root, messageId, pendingFile),
     beginPlacement: (messageId, file) => writePlacementIntent(root, messageId, file),
+    hasPendingFile: (file) => readPlacementIntent(root, file) !== null,
     hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
     finishPlacement: (messageId, file) => {
       if (readPlacementIntent(root, file)?.messageId !== messageId) return;

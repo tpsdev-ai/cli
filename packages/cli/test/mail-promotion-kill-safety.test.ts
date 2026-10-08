@@ -1,16 +1,10 @@
 /**
  * mail-promotion-kill-safety.test.ts — cli#515.
  *
- * A verified message must survive promote() being interrupted at a step of its
- * first-delivery sequence and then still be delivered exactly once: never
- * dead-lettered as a replay, so never exposed to the 48h hard-TTL GC
- * (gcMessages) that drops a quarantined record.
- *
  * Each case runs a REAL promote() in a child process and SIGKILLs it at an
  * injected pause point BEFORE a named filesystem operation — a killed process,
  * never an injected error — then runs a fresh in-process restart and checks the
- * end state. Every spawned process has a deadline; roots are mkdtemp'd and
- * ~/.tps is never touched.
+ * end state. Every spawned process has a deadline; roots are mkdtemp'd.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -44,7 +38,7 @@ interface KillRun {
   stderr: string;
 }
 
-describe("an interrupted promotion loses no verified mail (cli#515)", () => {
+describe("promotion at the listed pause points (cli#515)", () => {
   let root: string;
   let keysDir: string;
   let stub: StubFlair;
@@ -147,16 +141,13 @@ describe("an interrupted promotion loses no verified mail (cli#515)", () => {
     const second = await checkMessages(AGENT);
 
     expect(first.map((m) => m.body)).toEqual(["kill-safety"]);
-    expect(second).toEqual([]); // exactly once
-    expect(jsonFiles(inbox.dlq)).toEqual([]); // nothing dead-lettered ⇒ nothing for the 48h GC to drop
+    expect(second).toEqual([]);
+    expect(jsonFiles(inbox.dlq)).toEqual([]);
     expect(jsonFiles(inbox.cur)).toEqual(["record.json"]);
     expect(existsSync(join(inbox.fresh, "record.json"))).toBe(false);
     expect(hasCommittedMessageId(inbox.root, messageId)).toBe(true);
   }
 
-  // The steps of promote()'s first-delivery sequence, each killed just before
-  // its operation, so the on-disk state is exactly "every earlier step done,
-  // this one not".
   const CASES: Array<{ at: string }> = [
     { at: "scratch-write" }, // before the scratch copy is written
     { at: "link-to-cur" }, // before the record is linked into cur/
@@ -166,13 +157,20 @@ describe("an interrupted promotion loses no verified mail (cli#515)", () => {
   ];
 
   for (const { at } of CASES) {
-    test(`a SIGKILL before ${at} still delivers the message exactly once`, async () => {
+    test(`restart checks return one delivery after ${at}`, async () => {
       const messageId = `kill-${at}`;
       const source = plant(messageId);
       const run = await runAndKillAt(at, source);
       expect(run.reached, `child never reached ${at}; stderr=${run.stderr}`).toBe(true);
       expect(run.signal).toBe("SIGKILL");
 
+      if (at === "source-removal") {
+        expect(await checkMessages(AGENT)).toEqual([]);
+        const cur = join(getInbox(AGENT).cur, "record.json");
+        const record = JSON.parse(readFileSync(cur, "utf-8"));
+        record.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        writeFileSync(cur, JSON.stringify(record));
+      }
       await assertDeliveredExactlyOnce(messageId);
     });
   }
@@ -191,9 +189,6 @@ describe("an interrupted promotion loses no verified mail (cli#515)", () => {
     expect(readFileSync(join(inbox.dlq, "record.json.reason"), "utf-8")).toContain("class: replay");
   });
 
-  // A cur/ copy with no ledger commit but NO placement intent is not an
-  // unfinished first delivery of ours — the reconcile must leave it to the
-  // replay gate (which reads it through the maildir fallback), not finish it.
   test("a cur/ copy with no ledger commit and no placement intent is still replay", async () => {
     const messageId = "kill-foreign-cur";
     const source = plant(messageId);
