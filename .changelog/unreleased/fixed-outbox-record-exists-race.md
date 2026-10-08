@@ -1,0 +1,1 @@
+- **Outbox queueing treats a record moved by a concurrent drain as absent.** The existence check reads the record once instead of checking and then reading it.
