@@ -53,6 +53,15 @@ try {
   for (const file of readdirSync(bundled).filter((file) => file.endsWith(".json"))) {
     copyFileSync(join(bundled, file), join(profiles, file));
   }
+  for (const [profile, runtime] of [
+    ["tps-agent-run", undefined],
+    ["tps-agent-run-claude-code", "claude-code"],
+    ["tps-agent-run-codex", "codex"],
+    ["tps-agent-run-gemini", "gemini"],
+  ] as const) {
+    assert.equal(sandboxProfileGrantRefusal(profile, env, runtime, bin), null, profile);
+    checks++;
+  }
   const relocated = { ...env, CODEX_HOME: join(home, ".local", "bin"), NONO_BIN: bin };
   mkdirSync(relocated.CODEX_HOME, { recursive: true });
   const credential = join(relocated.CODEX_HOME, "auth.json");

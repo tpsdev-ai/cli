@@ -140,7 +140,7 @@ function makeSandbox(name: string, seedProfiles = true): Sandbox {
   // OUTSIDE /tmp: the launch grants /tmp unconditionally (cli#350 r4g), so a
   // HOME under /tmp would put the private dir inside that grant and the overlap
   // assert would (correctly) refuse. /var/tmp keeps HOME and every grant disjoint.
-  const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
+  const base = "/var/tmp";
   const root = mkdtempSync(join(base, `tps-attest-${name}-`));
   const home = join(root, "home");
   const tmp = join(root, "tmp");

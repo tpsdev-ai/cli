@@ -379,7 +379,7 @@ function sandboxProfileGrants(profile: string, env: NodeJS.ProcessEnv): ProfileG
     if (depth > 16) throw new Error(`the profile chain from '${profile}' extends more than 16 deep`);
     if (from && env.XDG_CONFIG_HOME &&
       canonicalPath(env.XDG_CONFIG_HOME) !== canonicalPath(join(env.HOME || homedir(), ".config"))) {
-      throw new Error(`unsupported extends '${name}' with a different XDG_CONFIG_HOME`);
+      throw new Error(`unsupported extends '${name}' with a different XDG_CONFIG_HOME — unset XDG_CONFIG_HOME for launches or set it to HOME/.config`);
     }
     if (from && (name.includes("/") || name.endsWith(".json"))) {
       throw new Error(`unsupported extends path '${name}' in sandbox profile ${from}`);
@@ -509,7 +509,7 @@ export function sandboxProfileGrantRefusal(
   } catch (err) {
     return `cannot resolve sandbox profile '${profile}' file grants: ${(err as Error).message}`;
   }
-  if (!bin || !isAbsolute(bin)) return `cannot query sandbox profile '${profile}': nono must be an absolute path`;
+  if (!bin || !isAbsolute(bin)) return `cannot query sandbox profile '${profile}': nono must be an absolute path — Install nono >= 0.70 or set NONO_BIN`;
   const path = resolveProfilePath(profile, env);
   if (!path) return `cannot query sandbox profile '${profile}': profile not found`;
   const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
@@ -534,7 +534,10 @@ export function sandboxProfileGrantRefusal(
       if (typeof answer !== "object" || answer === null || Array.isArray(answer)) throw new Error("invalid nono why output");
       const record = answer as Record<string, unknown>;
       if (record.status === "allowed") {
-        return `the sandbox profile '${profile}': nono reports ${query.op} access to ${query.path}`;
+        const details = ["reason", "granted_path", "access", "source"]
+          .filter((key) => record[key] !== undefined && record[key] !== null)
+          .map((key) => `${key}=${JSON.stringify(record[key])}`);
+        return `the sandbox profile '${profile}': nono reports ${query.op} access to ${query.path}${details.length ? ` (${details.join(", ")})` : ""}`;
       }
       if (record.status !== "denied" || typeof record.reason !== "string" || !["path_not_granted", "insufficient_access", "filesystem_deny"].includes(record.reason)) {
         throw new Error("invalid nono why denial");

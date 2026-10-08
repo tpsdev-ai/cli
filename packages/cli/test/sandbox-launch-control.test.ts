@@ -25,10 +25,10 @@ import {
   mkdirSync,
   chmodSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { evaluateLaunchControl } from "../src/utils/nono.js";
 import meow from "meow";
@@ -119,7 +119,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
     // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
     // sit inside that grant and the overlap assert would refuse before spawning.
-    const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
+    const base = "/var/tmp";
     const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");
@@ -192,7 +192,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       // cli#350 r4g — /tmp is granted IN ADDITION to the configured TMPDIR
       // (bun's temp dir is /tmp regardless of TMPDIR).
       expect(log).toContain(`--allow ${join(home, "tmp")}`);
-      expect(log).toContain("--allow /tmp");
+      expect(log).toContain(`--allow ${realpathSync("/tmp")}`);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

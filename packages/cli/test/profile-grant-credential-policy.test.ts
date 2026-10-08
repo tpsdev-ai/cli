@@ -44,9 +44,13 @@ describe("effective profile access query", () => {
   test("queries the relocated foreign credential with the selected binary and resolved profile", () => {
     const home = makeHome();
     const path = writeProfile(home, { extends: "default" });
-    const env = envFor(home, { CODEX_HOME: join(home, ".local", "bin"), NONO_FAKE_WHY_OUTPUT: '{"status":"allowed","reason":"granted_path"}' });
+    const env = envFor(home, { CODEX_HOME: join(home, ".local", "bin"), NONO_FAKE_WHY_OUTPUT: JSON.stringify({ status: "allowed", reason: "granted_path", granted_path: join(home, ".local", "bin"), access: "readwrite", source: "user_tools" }) });
     const refusal = profileGrantRefusal!("tps-agent-run-claude-code", env, "claude-code");
     expect(refusal).toContain("nono reports read access");
+    expect(refusal).toContain('reason="granted_path"');
+    expect(refusal).toContain(`granted_path=${JSON.stringify(join(home, ".local", "bin"))}`);
+    expect(refusal).toContain('access="readwrite"');
+    expect(refusal).toContain('source="user_tools"');
     expect(refusal).toContain(join(env.CODEX_HOME!, "auth.json"));
     expect(readFileSync(join(home, "nono.log"), "utf8")).toContain(`--profile ${path}`);
   });
@@ -92,7 +96,9 @@ describe("effective profile access query", () => {
     test(`refuses unavailable query binary ${JSON.stringify(bin)}`, () => {
       const home = makeHome();
       writeProfile(home, {});
-      expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_BIN: bin }))).toContain("cannot query");
+      const refusal = profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { NONO_BIN: bin }));
+      expect(refusal).toContain("cannot query");
+      if (!bin || bin === "nono") expect(refusal).toContain("Install nono >= 0.70 or set NONO_BIN");
     });
   }
 });
@@ -170,7 +176,9 @@ describe("cli#518 profile grants", () => {
   test("inheritance with a different XDG_CONFIG_HOME is refused by name", () => {
     const home = makeHome();
     writeProfile(home, { extends: "default" });
-    expect(profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { XDG_CONFIG_HOME: join(home, "xdg") }))).toContain("XDG_CONFIG_HOME");
+    const refusal = profileGrantRefusal!("tps-agent-run-claude-code", envFor(home, { XDG_CONFIG_HOME: join(home, "xdg") }));
+    expect(refusal).toContain("XDG_CONFIG_HOME");
+    expect(refusal).toContain("unset XDG_CONFIG_HOME for launches or set it to HOME/.config");
   });
 
   test("inheritance by path is refused by name", () => {
