@@ -15,6 +15,7 @@ import {
   writeFileSync,
   mkdirSync,
   readFileSync,
+  existsSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -603,7 +604,7 @@ describe("audit log append", () => {
 });
 
 // ---------------------------------------------------------------------------
-// cli#517 — the guard's own mode flags end at the wrapped command
+// cli#517
 // ---------------------------------------------------------------------------
 
 describe("wrapped guard mode flags are data (cli#517)", () => {
@@ -640,13 +641,7 @@ describe("wrapped guard mode flags are data (cli#517)", () => {
           }
         );
 
-        // Read the child's argv first; do not stat the path before reading it.
-        let argvRaw = "";
-        try {
-          argvRaw = readFileSync(argvFile, "utf-8");
-        } catch {
-          // child never ran
-        }
+        const argvRaw = readFileSync(argvFile, "utf-8");
         const out = `${r.stdout ?? ""}${r.stderr ?? ""}`;
 
         // Guard mode is unchanged: the child runs and its output is redacted.
@@ -662,13 +657,15 @@ describe("wrapped guard mode flags are data (cli#517)", () => {
     }, 20_000);
   }
 
-  test("bare guard mode flags before the wrapped command set the mode", () => {
+  test("bare guard modes", () => {
     const root = mkdtempSync(join(tmpdir(), "tps-guard-mode-"));
     try {
       const home = join(root, "home");
       mkdirSync(home);
       const child = join(root, "child.mjs");
-      writeFileSync(child, 'console.log("CHILD_RAN ghp_abcdefghijklmnopqrstuvwxyz1234567890");\n');
+      const sentinel = join(root, "child-ran");
+      writeFileSync(child, 'import { writeFileSync } from \"node:fs\";\n' +
+        'writeFileSync(process.env.CHILD_SENTINEL, \"ran\");\n' + 'console.log("CHILD_RAN ghp_abcdefghijklmnopqrstuvwxyz1234567890");\n');
 
       // --check before the command: check mode reads stdin and runs no child.
       const check = spawnSync(
@@ -680,10 +677,11 @@ describe("wrapped guard mode flags are data (cli#517)", () => {
           timeout: 15_000,
           killSignal: "SIGKILL",
           cwd: root,
-          env: { ...process.env, HOME: home, TPS_HOME: home },
+          env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_SENTINEL: sentinel },
         }
       );
       expect(check.status).toBe(0);
+      expect(existsSync(sentinel)).toBe(false);
       expect(`${check.stdout ?? ""}${check.stderr ?? ""}`).toMatch(/^matches: \d+/);
 
       // --no-guard before the command: bypass, no redaction.
@@ -696,11 +694,12 @@ describe("wrapped guard mode flags are data (cli#517)", () => {
           timeout: 15_000,
           killSignal: "SIGKILL",
           cwd: root,
-          env: { ...process.env, HOME: home, TPS_HOME: home },
+          env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_SENTINEL: sentinel },
         }
       );
       const bypassOut = `${bypass.stdout ?? ""}${bypass.stderr ?? ""}`;
       expect(bypass.status).toBe(0);
+      expect(readFileSync(sentinel, "utf-8")).toBe("ran");
       expect(bypassOut).toContain("CHILD_RAN");
       expect(bypassOut).toContain("ghp_abcdefghijklmnopqrstuvwxyz1234567890");
       expect(bypassOut).not.toContain("[REDACTED-shape]");
@@ -748,9 +747,11 @@ describe("guard mode flag validation", () => {
         const home = join(root, "home");
         mkdirSync(home);
         const argvFile = join(root, "child-argv.jsonl");
+        const sentinel = join(root, "child-ran");
         const child = join(root, "child.mjs");
         writeFileSync(child,
           'import { writeFileSync } from "node:fs";\n' +
+          'writeFileSync(process.env.CHILD_SENTINEL, \"ran\");\n' +
           'writeFileSync(process.env.CHILD_ARGV_FILE, JSON.stringify(process.argv.slice(2)));\n' +
           'console.log("CHILD_RAN ghp_abcdefghijklmnopqrstuvwxyz1234567890");\n'
         );
@@ -762,13 +763,13 @@ describe("guard mode flag validation", () => {
           [BIN, "secrets-guard", ...scenario.flags, ...childCommand, ...scenario.childFlags],
           {
             encoding: "utf-8", input: "", timeout: 15_000, killSignal: "SIGKILL", cwd: root,
-            env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_ARGV_FILE: argvFile, PATH: `${root}:${process.env.PATH}` },
+            env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_ARGV_FILE: argvFile, CHILD_SENTINEL: sentinel, PATH: `${root}:${process.env.PATH}` },
           }
         );
         const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
         expect(result.error).toBeUndefined();
         if (scenario.mode === "refuse" || scenario.mode === "check") {
-          expect(() => readFileSync(argvFile)).toThrow();
+          expect(existsSync(sentinel)).toBe(false);
           expect(output).not.toContain("CHILD_RAN");
           if (scenario.mode === "refuse") {
             expect(result.status).toBe(1);
@@ -780,6 +781,7 @@ describe("guard mode flag validation", () => {
           }
         } else {
           expect(result.status).toBe(0);
+          expect(readFileSync(sentinel, "utf-8")).toBe("ran");
           expect(JSON.parse(readFileSync(argvFile, "utf-8"))).toEqual(scenario.childFlags);
           expect(output).toContain("CHILD_RAN");
           if (scenario.mode === "guard") {
