@@ -164,7 +164,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
       expect(run.reached, `child never reached ${at}; stderr=${run.stderr}`).toBe(true);
       expect(run.signal).toBe("SIGKILL");
 
-      if (at === "source-removal") {
+      if (["scratch-removal", "ledger-commit", "source-removal"].includes(at)) {
         expect(await checkMessages(AGENT)).toEqual([]);
         const cur = join(getInbox(AGENT).cur, "record.json");
         const record = JSON.parse(readFileSync(cur, "utf-8"));
@@ -175,8 +175,6 @@ describe("promotion at the listed pause points (cli#515)", () => {
     });
   }
 
-  // A consumed envelope re-planted after a clean promotion still dead-letters
-  // replay: the reconcile must not weaken the replay gate for delivered mail.
   test("a consumed envelope re-planted after a clean promotion still dead-letters replay", async () => {
     const first = await checkMessages(AGENT);
     expect(first).toEqual([]);

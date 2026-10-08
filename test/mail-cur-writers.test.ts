@@ -43,12 +43,6 @@ const ALLOWED: Array<{ file: string; contains: string; followedBy?: string; scop
     why: "updateExistingRecord — locked fresh read and fsynced existing-only replacement",
   },
   {
-    file: "packages/cli/src/utils/mail.ts",
-    contains: "renameSync(scratch, curPath)",
-    scope: "promote",
-    why: "promote — verified pending placement replacement under the mailbox lock",
-  },
-  {
     file: "packages/agent/src/lib/mailbox-policy.ts",
     contains: "linkSync(sourcePath, curPath)",
     why: "placeCurRecord — the shared exclusive first-delivery into cur/ (never replaces)",

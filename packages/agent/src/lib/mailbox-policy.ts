@@ -213,9 +213,6 @@ export async function decideEnvelopeForMailbox(
 }
 
 // ─── Durable consumed-id ledger (replay gate that survives maildir GC) ───────
-//
-// The ledger is appended on consumption and pruned by age, independently of
-// maildir cleanup.
 const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
@@ -289,6 +286,18 @@ function writePlacementIntent(root: string, messageId: string, file: string): vo
   }
 }
 
+function pendingPlacementIds(root: string): Set<string> {
+  const ids = new Set<string>();
+  for (const name of readdirSync(root)) {
+    if (!/^\.placement-[a-f0-9]{64}\.json$/.test(name)) continue;
+    const intent = JSON.parse(readFileSync(join(root, name), "utf8"));
+    if (typeof intent?.file !== "string" || placementIntentPath(root, intent.file) !== join(root, name)
+      || !isValidEnvelopeId(intent?.messageId)) throw new Error("invalid placement intent");
+    ids.add(intent.messageId);
+  }
+  return ids;
+}
+
 function consumedLedgerPath(root: string): string {
   return join(root, CONSUMED_LEDGER_FILE);
 }
@@ -309,11 +318,7 @@ function recordConsumedMessageId(root: string, messageId: string): void {
   appendFileSync(path, `${raw !== null && raw !== "" && !raw.endsWith("\n") ? "\n" : ""}${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`, "utf-8");
 }
 
-/**
- * Parse ledger text, pruning entries with parseable stored timestamps before `cutoff`.
- * Both ledger readers use it, so they agree on which ids are live.
- */
-function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
+function parseConsumedLedger(raw: string, cutoff: number, pendingIds: Set<string>): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
   const kept: string[] = [];
   let pruned = 0;
@@ -344,7 +349,7 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
       kept.push(line);
       continue;
     }
-    if (at < cutoff) {
+    if (at < cutoff && !pendingIds.has(id)) {
       pruned++;
       continue;
     }
@@ -365,7 +370,7 @@ function readConsumedLedger(root: string): Set<string> {
   const raw = readLedgerText(root);
   if (raw === null) return new Set<string>();
 
-  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
+  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pendingPlacementIds(root));
   if (pruned > 0) {
     try {
       const tmp = `${path}.tmp`;
@@ -397,7 +402,7 @@ function isMissing(err: unknown): boolean {
 function peekConsumedLedger(root: string): Set<string> | null {
   const raw = readLedgerText(root);
   if (raw === null) return null;
-  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
+  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pendingPlacementIds(root)).ids;
 }
 
 /**

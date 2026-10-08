@@ -107,6 +107,52 @@ test("committed pending recovery uses the cur lease", async () => {
   expect(await mail.checkMessages(agent)).toEqual([]);
 });
 
+test("pending recovery rejects a replanted source after ledger pruning", async () => {
+  const { source, cur, inbox, record, envelope } = pending();
+  const replay = mailboxReplayStore(inbox.root);
+  replay.recordConsumed(envelope.messageId);
+  fs.writeFileSync(join(inbox.root, "consumed.jsonl"), "");
+  expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+  expect(intents(inbox)).toHaveLength(1);
+  const before = fs.readFileSync(cur, "utf8");
+  fs.writeFileSync(source, JSON.stringify(record));
+  const result = await mail.promote(agent, source);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("expected refusal");
+  expect(result.class).toBe("replay");
+  expect(fs.readFileSync(cur, "utf8")).toBe(before);
+  expect(fs.existsSync(source)).toBe(false);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+});
+
+test("pending recovery rejects an archived ID after ledger pruning", async () => {
+  const { source, cur, inbox, envelope } = pending();
+  mailboxReplayStore(inbox.root).recordConsumed(envelope.messageId);
+  fs.writeFileSync(join(inbox.root, "consumed.jsonl"), "");
+  const archive = join(inbox.root, "archive", "old");
+  fs.mkdirSync(archive, { recursive: true });
+  fs.renameSync(cur, join(archive, "record.json"));
+  const result = await mail.promote(agent, source);
+  expect(result.ok).toBe(false);
+  if (result.ok) throw new Error("expected refusal");
+  expect(result.class).toBe("replay");
+  expect(fs.existsSync(source)).toBe(false);
+  expect(fs.existsSync(cur)).toBe(false);
+  expect(await mail.checkMessages(agent)).toEqual([]);
+});
+
+test("ledger pruning retains IDs named by pending intents", () => {
+  const { inbox, envelope } = pending();
+  const replay = mailboxReplayStore(inbox.root);
+  replay.recordConsumed(envelope.messageId);
+  const ledger = join(inbox.root, "consumed.jsonl");
+  const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(ledger, [envelope.messageId, "unrelated"].map((id) => JSON.stringify({ id, at: old })).join("\n") + "\n");
+  expect(replay.isConsumed("absent")).toBe(false);
+  expect(fs.readFileSync(ledger, "utf8")).toBe(JSON.stringify({ id: envelope.messageId, at: old }) + "\n");
+  expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(true);
+});
+
 function age(fixture: ReturnType<typeof pending>) {
   const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
   for (const path of [fixture.source, fixture.cur]) {
@@ -190,6 +236,10 @@ test("rollback retains the intent until cur absence is confirmed", async () => {
   expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
   expect(intents(inbox)).toHaveLength(1);
   for (const fault of faults.splice(0)) fault.mockRestore();
+  expect(await mail.checkMessages(agent)).toEqual([]);
+  const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
+  copy.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(cur, JSON.stringify(copy));
   expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
   expect(await mail.checkMessages(agent)).toEqual([]);
 });

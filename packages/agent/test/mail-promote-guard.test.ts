@@ -567,7 +567,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
   });
 
-  test("MailClient retains new mail while trust tier is unresolved", async () => {
+  test("MailClient retains new mail on trust-tier resolution errors", async () => {
     const env = signedEnvelope("flint", AGENT, "tier", { flint: FLINT });
     plant(wrapper("flint", env));
     mkdirSync(join(tmpDir, ".bridge-principals"), { recursive: true });

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import {
@@ -1021,7 +1021,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     if (pendingPlacement) {
       let interrupted: MailMessage | undefined;
       try {
-        if (hasCommittedMessageId(dirs.root, envelope.messageId)) {
+        const consumed = replay.isConsumed(envelope.messageId);
+        if (consumed && hasCommittedMessageId(dirs.root, envelope.messageId)) {
           const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
           rmSync(filePath, { force: true });
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
@@ -1043,18 +1044,17 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
           if (!isDeepStrictEqual(readMessageFile(curPath), interrupted)) {
             return { ok: false, class: "unverified", reason: "placement-copy-mismatch" };
           }
-          const scratch = join(dirs.tmp, `${filename}.${randomUUID()}.promote`);
-          try {
-            writeFileSync(scratch, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
-            renameSync(scratch, curPath);
-          } finally {
-            try { rmSync(scratch, { force: true }); } catch {}
-          }
+          const now = new Date();
+          utimesSync(curPath, now, now);
           replay.recordConsumed(envelope.messageId);
           rmSync(filePath, { force: true });
           try { replay.finishPlacement(envelope.messageId, filename); } catch {}
-          logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id, replyToId: promoted.replyToId }, promoted.body);
-          return { ok: true, message: promoted, path: curPath };
+          return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
+        }
+        if (consumed) {
+          rmSync(filePath, { force: true });
+          try { replay.finishPlacement(envelope.messageId, filename); } catch {}
+          return { ok: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
         }
         replay.finishPlacement(envelope.messageId, filename);
       } catch (err) {
@@ -1062,9 +1062,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       }
     }
 
-    // Step 4 (first-delivery only): replay — a re-planted consumed envelope must
-    // dead-letter. Consulted against the DURABLE ledger (and the maildir
-    // fallback), not cur/ alone. The ledger prune runs here, under the lock.
+    // Pending replay removes the source; ordinary replay attempts dead-lettering.
     let consumed: boolean;
     try {
       consumed = replay.isConsumed(envelope.messageId);
@@ -1366,6 +1364,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   //    re-verification, is quarantined, not shown. Acked history never reaches
   //    this branch.
   for (const f of listMessageFiles(inbox.cur)) {
+    try { if (mailboxReplayStore(inbox.root).hasPendingFile(f)) continue; } catch { continue; }
     const full = join(inbox.cur, f);
     let msg: MailMessage;
     try { msg = readMessageFile(full); } catch { continue; }
