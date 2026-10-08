@@ -253,6 +253,63 @@ describe("TPS help requests and argument passthrough (cli#342)", () => {
 	}
 });
 
+// cli#550 — a --version/-v meant for a wrapped command reaches the child
+// unchanged; only one before the wrapped command asks for tps's own version.
+describe("TPS --version after a wrapped command is data (cli#550)", () => {
+	for (const flag of ["-v", "--version"]) {
+		test(`tps ${flag} prints the version and exits 0`, () => {
+			const r = runHelp([flag]);
+			try {
+				expect(r.signal).toBeNull();
+				expect(r.status).toBe(0);
+				expect(r.out.trim()).toBe("dev");
+				expect(r.out).not.toContain("Usage");
+				expect(r.files).toEqual([]);
+				expect(r.nonoRuns).toBe("");
+			} finally { r.cleanup(); }
+		});
+
+		test(`secrets-guard ${flag} before the wrapped command prints the version`, () => {
+			const r = runHelp(["secrets-guard", flag]);
+			try {
+				expect(r.signal).toBeNull();
+				expect(r.status).toBe(0);
+				expect(r.out.trim()).toBe("dev");
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		test(`agent run receives ${flag} as message data`, () => {
+			const r = runHelp(["agent", "run", "--id", "demo", "--message", flag], true);
+			try {
+				expect(r.status).toBe(0);
+				expect(r.out).toContain(JSON.stringify({ message: flag }));
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		for (const separator of [false, true]) {
+			test(`office exec child receives ${flag} ${separator ? "after --" : "without a separator"}`, () => {
+				expectChildData(["office", "exec", "demo", ...(separator ? ["--"] : [])], flag);
+			});
+		}
+		for (const options of [["--json", "false"], ["--unknown-option", "data"]]) {
+			test(`office exec child receives ${flag} with ${options[0]} before the command`, () => {
+				expectChildData([...options, "office", "exec", "demo"], flag);
+			});
+		}
+		test(`mail watch hook receives ${flag}`, () => {
+			expectChildData(["mail", "watch", "demo", "--sandbox-required", "--exec"], flag);
+		});
+		test(`secrets-guard child receives ${flag}`, () => {
+			expectChildData(["secrets-guard"], flag);
+		});
+		test(`secrets-guard --no-guard child receives ${flag}`, () => {
+			expectChildData(["secrets-guard", "--no-guard"], flag);
+		});
+	}
+});
+
 function expectChildData(prefix: string[], flag: string): void {
 	const root = mkdtempSync(join(tmpdir(), "tps-help-child-"));
 	const child = join(root, "child.mjs");

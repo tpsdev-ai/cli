@@ -371,7 +371,7 @@ const USAGE: Record<string, string> = {
 };
 
 /** `--` ends TPS help detection; option values and command tails are data. */
-function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: string[] } {
+function parseHelpArgs(argv: readonly string[]): { requested: boolean; versionRequested: boolean; argv: string[] } {
   const parsed: string[] = [];
   const values = new Set(Object.entries(FLAGS)
     .filter(([, flag]) => flag.type !== "boolean")
@@ -381,6 +381,7 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
     .map(([name]) => `--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`));
   const positionals: string[] = [];
   let requested = false;
+  let versionRequested = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const [cmd, action] = positionals;
@@ -400,6 +401,13 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
     parsed.push(arg);
     if (arg === "--help" || arg === "-h") {
       requested = true;
+      continue;
+    }
+    // cli#550: like --help, a --version/-v meant for a wrapped command is data.
+    // This scan stops at the wrapped command (above), so only a --version/-v
+    // before it requests tps's own version.
+    if (arg === "--version" || arg === "-v") {
+      versionRequested = true;
       continue;
     }
     const rawValue = RAW_VALUE_FLAGS[cmd ?? ""]?.some((name) => arg === `--${name}`);
@@ -425,11 +433,11 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
       positionals.push(arg);
     }
   }
-  return { requested, argv: parsed };
+  return { requested, versionRequested, argv: parsed };
 }
 
 async function main() {
-  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  if (helpArgs.versionRequested) {
     // Version is injected at build time to avoid runtime package.json reads,
     // which fail in compiled Bun binaries (the $bunfs path is inaccessible).
     // See: https://bun.sh/docs/bundler/executables#embed-a-file
