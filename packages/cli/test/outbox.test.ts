@@ -10,6 +10,7 @@ afterEach(() => {
 
 describe("outbox", () => {
   let root: string;
+  const originalHome = process.env.HOME;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-outbox-"));
@@ -18,7 +19,8 @@ describe("outbox", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
   });
 
   test("queueOutboxMessage writes to ~/.tps/outbox/new", () => {

@@ -36,6 +36,7 @@ async function post(
 
 describe("handleGithubWebhook", () => {
   let root: string;
+  const originalHome = process.env.HOME;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-gh-webhook-"));
     process.env.HOME = root;
@@ -46,7 +47,8 @@ describe("handleGithubWebhook", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
     delete process.env.GITHUB_WEBHOOK_AGENT_ID;
     delete process.env.GITHUB_WEBHOOK_TARGET;
     delete process.env.GITHUB_WEBHOOK_SECRET;
