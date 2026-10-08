@@ -32,15 +32,12 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
-/**
- * Newly published inbox records are announced; resends and dead-lettered
- * write failures are ACKed without a line.
- */
+/** Prefix for successful announcements of newly published inbox records. */
 const ANNOUNCEMENT = "Mail received";
 
 const ENV_KEYS = ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"];
 
-/** Point every TPS path at `root`; returns the values it replaced. */
+/** Set HOME and TPS_ROOT to `root`, and TPS_MAIL_DIR, TPS_IDENTITY_DIR, TPS_REGISTRY_DIR below it. */
 function isolateEnv(root: string, vaultKey: string): Record<string, string | undefined> {
   const saved: Record<string, string | undefined> = {};
   for (const k of ENV_KEYS) saved[k] = process.env[k];
