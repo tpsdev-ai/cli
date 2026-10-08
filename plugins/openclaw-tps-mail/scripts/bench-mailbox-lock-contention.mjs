@@ -28,7 +28,11 @@ const metrics = { waits: [], acquisitions: 0, collisions: 0, failed: 0, errors: 
 const AGENT = "agent-a";
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETENTION_DAYS = 30;
+const RETRY_MS = 2;
 const QUIET = { info() {}, warn() {} };
+const SWEEP_LOG = { info() {}, warn(message) {
+  if (message !== "tps-mail: obligation retention: store is busy; sweep skipped") throw new Error(message);
+} };
 let obligationsDir, receiptsDir, sweepTerminalObligations, writeObligation, createObligation, transitionObligation, acquireMailLockSync;
 
 function positive(name, fallback) {
@@ -211,17 +215,27 @@ async function roleMain() {
     for (let j = 0; j < positive("sweeps", 8); j++) {
       seedAgedBatch(mailDir, seed, j);
       const start = nowMs();
-      if (holder !== null) {
-        const lock = acquireMailLockSync(store, { timeoutMs: 0 });
-        if (!lock) throw new Error("holder acquisition failed");
+      for (;;) {
         try {
-          if (holder > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holder);
-        } finally { lock.release(); }
-      } else {
-        const res = sweepTerminalObligations(mailDir, AGENT, RETENTION_DAYS, QUIET);
-        removals.push(res.removed);
-        if (res.removed !== seed || res.receiptsRemoved !== seed || res.unreadable || res.receiptsUnreadable) {
-          throw new Error(`incomplete sweep: ${JSON.stringify(res)}`);
+          if (holder !== null) {
+            const lock = acquireMailLockSync(store, { timeoutMs: 0 });
+            if (!lock) { await pause(RETRY_MS); continue; }
+            try {
+              if (holder > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holder);
+            } finally { lock.release(); }
+          } else {
+            const failed = metrics.failed;
+            const res = sweepTerminalObligations(mailDir, AGENT, RETENTION_DAYS, SWEEP_LOG);
+            if (metrics.failed > failed) { await pause(RETRY_MS); continue; }
+            removals.push(res.removed);
+            if (res.removed !== seed || res.receiptsRemoved !== seed || res.unreadable || res.receiptsUnreadable) {
+              throw new Error(`incomplete sweep: ${JSON.stringify(res)}`);
+            }
+          }
+          break;
+        } catch (err) {
+          metrics.errors++;
+          throw new Error(`${holder !== null ? "holder" : "sweep"} iteration failed: ${String(err)}`, { cause: err });
         }
       }
       calls.push(nowMs() - start);
@@ -252,8 +266,8 @@ function samples(values, count, label) {
 }
 
 export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder, launch = startChild) {
-  const result = { writerWaits: [], writerCalls: [], sweepCalls: [], sweepHolds: [],
-    writerAcquisitions: 0, writerCollisions: 0, sweepAcquisitions: 0, sweepCollisions: 0 };
+  const result = { writerWaits: [], writerCalls: [], sweepWaits: [], sweepCalls: [], sweepHolds: [],
+    writerAcquisitions: 0, writerCollisions: 0, sweepAcquisitions: 0, sweepCollisions: 0, sweepContendedAttempts: 0 };
   for (let round = 0; round < rounds; round++) {
     const base = safeTempBase();
     const root = realpathSync(mkdtempSync(join(base, "bench-lock-")));
@@ -293,9 +307,12 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
       for (const job of [...writers, sweeper]) {
         const r = JSON.parse(readFileSync(job.out, "utf8"));
         const count = job.role === "writer" ? writes * 3 : sweeps;
-        samples(r.waits, count, "acquisition");
+        if (!Number.isSafeInteger(r.failed) || r.failed < 0 || (job.role === "writer" && r.failed !== 0)) {
+          throw new Error("invalid contended attempt count");
+        }
+        samples(r.waits, count + r.failed, "acquisition");
         samples(r.calls, count, "call");
-        if (r.errors !== 0 || r.failed !== 0 || r.acquisitions !== count || !Number.isSafeInteger(r.collisions) || r.collisions < 0) {
+        if (r.errors !== 0 || r.acquisitions !== count || !Number.isSafeInteger(r.collisions) || r.collisions < r.failed) {
           throw new Error("invalid acquisition counts");
         }
         if (job.role === "writer") {
@@ -308,8 +325,10 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
             throw new Error("invalid sweep removals");
           }
           result.sweepCalls.push(...r.calls);
+          result.sweepWaits.push(...r.waits);
           result.sweepAcquisitions += r.acquisitions;
           result.sweepCollisions += r.collisions;
+          result.sweepContendedAttempts += r.failed;
         }
       }
       const spans = JSON.parse(readFileSync(watcher.out, "utf8"));
@@ -353,11 +372,13 @@ async function main() {
     results[n] = { rounds, writerLockWaitMs: stats(r.writerWaits), wholeWriteLatencyMs: stats(r.writerCalls),
       writerAcquisitions: r.writerAcquisitions, writerCollisions: r.writerCollisions,
       ...(F.holder === undefined ? {
-        sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls),
+        sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls), sweepLockWaitMs: stats(r.sweepWaits),
         sweepAcquisitions: r.sweepAcquisitions, sweepCollisions: r.sweepCollisions,
+        sweepContendedAttempts: r.sweepContendedAttempts,
       } : {
-        sampledHolderOwnerSpanMs: stats(r.sweepHolds), holderCallLatencyMs: stats(r.sweepCalls),
+        sampledHolderOwnerSpanMs: stats(r.sweepHolds), holderCallLatencyMs: stats(r.sweepCalls), holderLockWaitMs: stats(r.sweepWaits),
         holderAcquisitions: r.sweepAcquisitions, holderCollisions: r.sweepCollisions,
+        holderContendedAttempts: r.sweepContendedAttempts,
       }) };
   }
   for (const [n, r] of Object.entries(results)) console.log(`N=${n} ${JSON.stringify(r)}`);

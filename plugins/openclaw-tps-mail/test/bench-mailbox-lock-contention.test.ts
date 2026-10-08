@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { acquireMailLockSync } from "../../../packages/agent/src/lib/mail-lock.js";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,6 +39,51 @@ test("benchmark runs real writers, sweep and watcher", async () => {
   expect(result.sweepHolds.length).toBeGreaterThan(0);
   for (let i = 0; i < 3; i++) expect(result.writerWaits[i]).toBeLessThanOrEqual(result.writerCalls[i]);
 }, 15000);
+
+for (const holder of [undefined, 10]) {
+  test(`${holder === undefined ? "sweep" : "holder"} retries and counts a busy lock`, async () => {
+    let release: (() => void) | undefined;
+    const launch = (role: string, opts: any, timeout: number) => {
+      if (role !== "sweeper") return startChild(role, opts, timeout);
+      const ready = `${opts.flags.ready}.child`;
+      const job = startChild(role, { ...opts, flags: { ...opts.flags, ready } }, timeout);
+      const gate = (async () => {
+        const deadline = Date.now() + timeout;
+        while (!existsSync(ready)) {
+          if (Date.now() >= deadline) throw new Error("sweeper readiness timeout");
+          await new Promise((r) => setTimeout(r, 1));
+        }
+        const lock = acquireMailLockSync(benchmarkPaths(opts.env.TPS_BENCH_ROOT).store, { timeoutMs: 0 });
+        expect(lock).not.toBeNull();
+        release = () => lock!.release();
+        writeFileSync(opts.flags.ready, "ready", { flag: "wx" });
+        while (!existsSync(opts.flags.go)) {
+          if (Date.now() >= deadline) throw new Error("sweeper barrier timeout");
+          await new Promise((r) => setTimeout(r, 1));
+        }
+        await new Promise((r) => setTimeout(r, 100));
+        release();
+      })();
+      return { ...job, done: Promise.all([job.done, gate]).then(([status]) => {
+        expect(status.code).toBe(0);
+        const data = JSON.parse(readFileSync(opts.flags.out, "utf8"));
+        expect(data.errors).toBe(0);
+        expect(data.failed).toBeGreaterThan(0);
+        expect(data.collisions).toBe(data.failed);
+        expect(data.waits).toHaveLength(data.acquisitions + data.failed);
+        return status;
+      }) };
+    };
+    try {
+      const result = await measure(1, 1, 1, 1, 200, 10000, holder, launch);
+      expect(result.sweepAcquisitions).toBe(1);
+      expect(result.sweepContendedAttempts).toBeGreaterThan(0);
+      expect(result.sweepCollisions).toBe(result.sweepContendedAttempts);
+      expect(result.sweepWaits).toHaveLength(1 + result.sweepContendedAttempts);
+      expect(result.sweepWaits.every((wait: number) => Number.isFinite(wait) && wait >= 0)).toBe(true);
+    } finally { release?.(); }
+  }, 15000);
+}
 
 test("holder JSON uses holder keys", () => {
   const result = run("--n=1", "--rounds=1", "--writes=1", "--sweeps=1", "--seed=200", "--holder=10", "--timeout=10", "--json");
