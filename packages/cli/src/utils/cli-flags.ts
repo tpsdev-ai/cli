@@ -105,5 +105,5 @@ export const cliOptionTypes = new Map<string, (typeof cliFlagDefinitions)[keyof 
 export function cliOptionConsumesValue(arg: string, next: string | undefined): boolean {
   const type = cliOptionTypes.get(arg);
   return type !== undefined && type !== "boolean" && next !== undefined &&
-    (!next.startsWith("-") || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(next) || next === "--help" || next === "-h");
+    (!next.startsWith("-") || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(next) || next === "--help" || next === "-h" || next === "--version" || next === "-v");
 }
