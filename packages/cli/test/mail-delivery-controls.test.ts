@@ -1,10 +1,14 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { MailLock } from "@tpsdev-ai/agent";
 import { FlairClient } from "../src/utils/flair-client.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const lockModuleUrl = new URL("../../agent/dist/lib/mail-lock.js", import.meta.url);
 for (const path of [new URL("../../agent/dist/index.js", import.meta.url), lockModuleUrl]) {

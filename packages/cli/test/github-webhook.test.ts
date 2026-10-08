@@ -9,6 +9,10 @@ import { drainOutbox } from "../src/utils/outbox.js";
 import * as mailLock from "../src/utils/mail-lock.js";
 import { handleGithubWebhook, processGithubWebhookEvent } from "../src/utils/github-webhook.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 async function post(
   headers: Record<string, string>,
   body: string,

@@ -3,6 +3,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("tps agent logs", () => {
   let tempHome: string;
   let originalHome: string | undefined;

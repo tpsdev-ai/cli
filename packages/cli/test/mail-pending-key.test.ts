@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,6 +7,10 @@ import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { promote, redriveRetryable, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 

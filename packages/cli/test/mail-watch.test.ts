@@ -36,6 +36,10 @@ import {
   type StubFlair,
 } from "./helpers/stub-flair.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 const AGENT = "kern";
 const FLINT_SEED = Buffer.alloc(32, 0x11);
 const KERN_SEED = Buffer.alloc(32, 0x22);
@@ -180,9 +184,6 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   afterEach(() => {
     stub.stop();
-    // Restore every spy this file registered, so nothing leaks to a later file
-    // in the same bun process (cli#555).
-    mock.restore();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

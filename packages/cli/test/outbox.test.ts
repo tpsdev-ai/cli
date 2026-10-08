@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("outbox", () => {
   let root: string;
 
@@ -13,9 +17,6 @@ describe("outbox", () => {
   });
 
   afterEach(() => {
-    // Restore every spy this file registered, so nothing leaks to a later file
-    // in the same bun process (cli#555).
-    mock.restore();
     rmSync(root, { recursive: true, force: true });
     delete process.env.HOME;
   });

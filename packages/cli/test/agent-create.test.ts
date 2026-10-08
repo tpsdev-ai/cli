@@ -6,6 +6,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
+afterEach(() => {
+  mock.restore();
+});
+
 // We test the flair client and agent command logic in isolation.
 // The agent runtime (start/run/health) is tested in packages/agent.
 
@@ -66,7 +70,8 @@ describe("ops-36: tps agent create — file system side effects", () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
-    process.env.TPS_HOME = originalTpsHome;
+    if (originalTpsHome === undefined) delete process.env.TPS_HOME;
+    else process.env.TPS_HOME = originalTpsHome;
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

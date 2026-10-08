@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +7,10 @@ import { FlairClient } from "../src/utils/flair-client.js";
 import { checkMessages, getInbox, promote, recoverPromoted, sendMessage } from "../src/utils/mail.js";
 import { processStartToken } from "../src/utils/mail-lock.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const seed = Buffer.alloc(32, 0x11);
 let root: string;

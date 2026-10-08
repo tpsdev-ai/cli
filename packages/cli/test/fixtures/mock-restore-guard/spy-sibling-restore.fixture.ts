@@ -1,6 +1,6 @@
 // cli#555 red fixture: the spy's restore sits in a sibling describe, so it does
 // not run for the describe that registered the spy. The guard must report this
-// file (spy-not-restored-in-teardown). Not named *.test.ts, so it is not
+// file (missing-mock-restore-teardown). Not named *.test.ts, so it is not
 // automatically discovered.
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 

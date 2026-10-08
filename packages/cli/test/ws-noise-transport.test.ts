@@ -21,6 +21,7 @@ async function freePort(): Promise<number> {
 
 describe("WsNoiseTransport", () => {
   let root: string;
+  const originalHome = process.env.HOME;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-ws-noise-"));
@@ -32,7 +33,8 @@ describe("WsNoiseTransport", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
     delete process.env.TPS_VAULT_KEY;
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;

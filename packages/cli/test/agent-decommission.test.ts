@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("tps agent decommission", () => {
   let agentId: string;
   let originalFetch: typeof globalThis.fetch;

@@ -1,6 +1,6 @@
-// cli#555 red fixture: two spies, only one restored in the teardown. The other
-// leaks, so the guard must report this file (spy-not-restored-in-teardown). Not
-// named *.test.ts, so it is not automatically discovered.
+// cli#555 red fixture: two spies, only one restored in the teardown. The guard
+// must report this file (missing-mock-restore-teardown). Not named *.test.ts,
+// so it is not automatically discovered.
 import { afterEach, expect, spyOn, test } from "bun:test";
 
 class Transport {

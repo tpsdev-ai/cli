@@ -14,5 +14,8 @@
 # (a launch-time check, not an OS boundary: a forged marker and token, or code
 # that ignores HOME, can still reach the real home — cli#434).
 
+# The second preload fails a test file that leaves process.env different from
+# when bun loaded it (cli#555; see test/helpers/env-leak-preload.ts).
+
 [test]
-preload = ["../../scripts/home-isolation-preload.ts"]
+preload = ["../../scripts/home-isolation-preload.ts", "./test/helpers/env-leak-preload.ts"]
