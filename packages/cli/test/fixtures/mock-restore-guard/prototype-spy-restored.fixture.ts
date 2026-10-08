@@ -1,6 +1,6 @@
 // cli#555 green fixture: the same prototype spy, with a teardown that restores
-// it. The guard must report nothing for this file. Not named *.test.ts, so bun
-// never discovers or runs it.
+// it. The guard must report nothing for this file. Not named *.test.ts, so it is
+// not automatically discovered.
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 
 class Transport {

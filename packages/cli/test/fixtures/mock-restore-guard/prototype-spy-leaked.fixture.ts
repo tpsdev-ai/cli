@@ -1,6 +1,6 @@
 // cli#555 red fixture: a spy on a shared prototype that no teardown restores.
 // The guard must report this file (spy-not-restored-in-teardown). The name ends
-// in .fixture.ts, not .test.ts, so bun never discovers or runs it.
+// in .fixture.ts, not .test.ts, so it is not automatically discovered.
 import { expect, spyOn, test } from "bun:test";
 
 class Transport {

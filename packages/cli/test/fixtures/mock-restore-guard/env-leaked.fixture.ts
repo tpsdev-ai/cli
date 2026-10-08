@@ -1,6 +1,7 @@
 // cli#555 red fixture: process-wide state set in a before* hook and never undone
 // by a teardown. The guard must report this file
-// (env-not-restored-in-teardown). Not named *.test.ts, so bun never runs it.
+// (env-not-restored-in-teardown). Not named *.test.ts, so it is not
+// automatically discovered.
 import { beforeEach, expect, test } from "bun:test";
 
 beforeEach(() => {
