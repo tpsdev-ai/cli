@@ -7,7 +7,7 @@ import { sandboxProfileGrantRefusal } from "../packages/cli/src/utils/nono.js";
 
 const bin = process.env.NONO_BIN;
 assert(bin && isAbsolute(bin), "NONO_BIN must name the real nono binary by absolute path");
-// The bundled profiles grant /tmp writable, so a HOME under /tmp is itself refused
+// The agent launcher grants /tmp writable, so a HOME under /tmp is itself refused
 // (its credential roots overlap that grant) before the case under test is reached.
 // CI's RUNNER_TEMP sits outside /tmp; locally the platform temp dir is used.
 const root = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "tps-custom-profile-"));
