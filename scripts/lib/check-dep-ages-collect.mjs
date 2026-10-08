@@ -140,6 +140,12 @@ export function parseExceptions(text, nowMs = Date.now()) {
       continue;
     }
     const [, key, date, reason] = m;
+    const version = key.slice(key.lastIndexOf("@") + 1);
+    const semver = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+    if (!semver.test(version)) {
+      errors.push({ line, text: t, message: `invalid semver: ${key}` });
+      continue;
+    }
     // `Date.parse` accepts rollovers (2026-02-30 → 2026-03-02), so round-trip
     // the date to reject one that is not a real calendar day.
     const parsed = Date.parse(`${date}T00:00:00Z`);

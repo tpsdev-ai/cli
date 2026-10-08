@@ -488,3 +488,64 @@ describe("CLI — refusals and fail-closed", () => {
     expect(exitCode).toBe(2);
   }, 30_000);
 });
+
+
+describe("CLI — exception resolutions", () => {
+  it.each([
+    ["nonexistent@1.0.0", "unused exception: nonexistent@1.0.0"],
+    ["dep-a@not-a-version", "invalid semver: dep-a@not-a-version"],
+    ["dep-a@2.0.0", "unused exception: dep-a@2.0.0"],
+  ])("rejects %s before fetching", async (key, diagnostic) => {
+    for (const lock of [FIXTURE_LOCK, '{"packages":{"local":["local@workspace:packages/local"]}}']) {
+      const root = writeFixtureRepo(join(scratch, key.replaceAll("@", "-")), {
+        lock,
+        exceptions: `## Exceptions\n- ${key} | expires:${FUTURE} | reason: urgent\n`,
+      });
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+      });
+      expect(exitCode).toBe(2);
+      expect(output).toContain(diagnostic);
+      expect(output).not.toContain("Checking");
+    }
+  }, 30_000);
+});
+
+describe("exception version syntax", () => {
+  it.each(["not-a-version", "1.0", "01.0.0", "1.0.0-01", "v1.0.0", "1.0.0+"])(
+    "rejects invalid semver %s",
+    (version) => {
+      const { entries, errors } = parseExceptions(
+        exceptionsDoc(`- dep-a@${version} | expires:2026-12-01 | reason: urgent`), NOW,
+      );
+      expect(entries.size).toBe(0);
+      expect(errors[0]?.message).toContain(`invalid semver: dep-a@${version}`);
+    },
+  );
+});
+
+it("documents missing publish-time precedence for an uncovered young version", () => {
+  const source = readFileSync(CLI_SCRIPT, "utf8");
+  expect(source).toContain("1 — all required publish times are available and an uncovered version is too fresh");
+  expect(source).toContain("2 — a required publish time is missing");
+  const result = evaluateAges({
+    deps: [{ name: "young", version: "1.0.0" }, { name: "missing", version: "1.0.0" }],
+    publishTimes: new Map([["young@1.0.0", NOW]]),
+    gateSeconds: 604800, nowMs: NOW, exceptionEntries: new Map(),
+  });
+  expect(result.uncovered.map((dep) => dep.name)).toEqual(["young"]);
+  expect(result.missing.map((dep) => dep.name)).toEqual(["missing"]);
+});
+
+it("runs the lock gate before each frozen install in the CI workflow", () => {
+  const workflow = readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8");
+  const jobs = workflow.split(/^  [\w-]+:\n/gm).slice(1);
+  const installingJobs = jobs.filter((job) => job.includes("sfw bun install --frozen-lockfile"));
+  expect(installingJobs.length).toBeGreaterThan(0);
+  for (const job of installingJobs) {
+    const gate = job.indexOf("node scripts/check-dep-ages.mjs --ci");
+    expect(gate).toBeGreaterThan(job.indexOf("actions/checkout@"));
+    expect(gate).toBeLessThan(job.indexOf("sfw bun install --frozen-lockfile"));
+  }
+});

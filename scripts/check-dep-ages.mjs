@@ -9,8 +9,9 @@
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
  *       exception covers it)
- *   1 — at least one resolved version is too fresh and no valid exception covers it
- *   2 — cannot read/parse a required file, no `[install] minimumReleaseAge` in
+ *   1 — all required publish times are available and an uncovered version is too fresh
+ *   2 — a required publish time is missing, cannot read/parse a required file,
+ *       no `[install] minimumReleaseAge` in
  *       bunfig.toml, an invalid exception entry, a REFUSED CI run, an
  *       unexpected argument, or a registry fetch failure (fail closed)
  *
@@ -84,7 +85,7 @@ if (gateSeconds === null || !Number.isFinite(gateSeconds) || gateSeconds < 0) {
 }
 const gateDays = gateSeconds / (24 * 60 * 60);
 
-// ── Exceptions, validated BEFORE any scan or fetch ──────────────────────────
+// ── Exceptions ─────────────────────────────────────────────────────────────
 const { entries: exceptionEntries, errors: exceptionErrors } = parseExceptions(
   readOrExit(EXCEPTIONS_PATH, "docs/dep-age-exceptions.md"),
 );
@@ -109,6 +110,15 @@ try {
   process.exit(2);
 }
 const deps = collectResolvedDeps(lock);
+const resolutions = new Set(deps.map(({ name, version }) => `${name}@${version}`));
+const unusedExceptions = [...exceptionEntries].filter(([key]) => !resolutions.has(key));
+if (unusedExceptions.length > 0) {
+  for (const [key, entry] of unusedExceptions) {
+    console.error(`check-dep-ages: line ${entry.line}: unused exception: ${key} — no resolution in bun.lock`);
+  }
+  process.exit(2);
+}
+
 if (deps.length === 0) {
   console.error("check-dep-ages: bun.lock resolves no external packages — refusing (a broken read must not read as a pass).");
   process.exit(2);
