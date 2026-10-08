@@ -438,9 +438,12 @@ async function acceptRelayedMail(
   onAccepted?: () => void,
 ): Promise<boolean> {
   const delivered = deliverRelayedToLocal(branchId, body);
-  // Fire the caller's accepted-delivery hook after this call has published an
-  // inbox record: `delivered` is false for a duplicate or a quarantine, and a
-  // conflict or a write failure throws before this point.
+  // Fire the caller's accepted-delivery hook only when this call published a
+  // new inbox record. `delivered` is false for a resend whose record already
+  // exists, and for an inbox write failure that deliverRelayedToLocal handled
+  // by dead-lettering the message; both are still ACKed below. A same-id
+  // conflict throws before this point, as does a sync failure or a failed
+  // dead-letter, so none of those is announced or ACKed.
   if (delivered) onAccepted?.();
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
   return delivered;

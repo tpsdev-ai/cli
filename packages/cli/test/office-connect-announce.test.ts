@@ -1,23 +1,234 @@
 /**
  * cli#524: `office connect` announces a relayed message after the local
- * acceptance path (#532) has published its inbox record. These cases drive
- * `connectAndKeepAlive` — the acceptance path `office connect` wires its
- * announcement to — against REAL inbox files under a mkdtemp root.
+ * acceptance path (#532) has published its inbox record.
  *
- * The announcement is observed through the `onAccepted` callback `office
- * connect` now passes; this PR leaves `onMessage` unchanged.
+ * Two layers, both against REAL inbox files under a mkdtemp root:
+ *
+ * - The command: `tps office connect` runs as its own process, from this tree's
+ *   source, against a local relay built on the branch-side WebSocket/Noise
+ *   listener (`listenForHostWs`). The test reads the command's stdout and
+ *   counts its "Mail received" lines, so removing the command's announcement
+ *   wiring fails it.
+ * - The acceptance path: `connectAndKeepAlive` with its transport replaced by
+ *   an in-memory channel, observed through the `onAccepted` callback: the
+ *   callback runs after the inbox record is published, a resend is ACKed
+ *   without it, and the refusals (a same-id conflict, an injected inbox write
+ *   failure) never reach it.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { connectAndKeepAlive } from "../src/utils/relay.js";
 import { getInbox } from "../src/utils/mail.js";
+import { SANDBOX_REQUIRED_FLAG } from "../src/utils/nono.js";
 import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/identity.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
-import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
+import type { TransportChannel, TransportServer, TpsMessage } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
+
+/** The CLI entry point, run from source so the test exercises this tree's command. */
+const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
+/** The line `office connect` prints for each accepted delivery. */
+const ANNOUNCEMENT = "Mail received";
+
+const ENV_KEYS = ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"];
+
+/** Point every TPS path at `root`; returns the values it replaced. */
+function isolateEnv(root: string, vaultKey: string): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const k of ENV_KEYS) saved[k] = process.env[k];
+  process.env.HOME = root;
+  process.env.TPS_ROOT = root;
+  process.env.TPS_BRANCH_NO_DAEMON = "1";
+  process.env.TPS_MAIL_DIR = join(root, "mail");
+  process.env.TPS_IDENTITY_DIR = join(root, "identity");
+  process.env.TPS_REGISTRY_DIR = join(root, "registry");
+  process.env.TPS_VAULT_KEY = vaultKey;
+  return saved;
+}
+
+function restoreEnv(saved: Record<string, string | undefined>): void {
+  for (const [k, v] of Object.entries(saved)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+}
+
+function jsonFiles(dir: string): string[] {
+  return fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
+}
+
+function body(content: string): MailDeliverBody {
+  return { id: randomUUID(), from: "remote", to: "local", content, timestamp: new Date().toISOString() };
+}
+
+/** Register branch `remote` (whose keys the relay holds) and point its remote.json at `port`. */
+function registerRemote(root: string, port: number) {
+  const kp = generateKeyPair();
+  registerBranch("remote", kp.signing.publicKey, undefined, kp.encryption.publicKey);
+  const branchDir = join(root, ".tps", "branch-office", "remote");
+  fs.mkdirSync(branchDir, { recursive: true });
+  fs.writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "127.0.0.1", port, transport: "ws" }));
+  return kp;
+}
+
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("no address")));
+        return;
+      }
+      server.close(() => resolve(address.port));
+    });
+  });
+}
+
+/** Poll (bounded) until `ready()` holds; the failure names what was awaited. */
+async function waitFor(what: string, ready: () => boolean, ms = 10_000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!ready()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+    await Bun.sleep(10);
+  }
+}
+
+describe("tps office connect, run as a process against a local relay", () => {
+  let root: string | undefined;
+  let savedEnv: Record<string, string | undefined> = {};
+  let relay: TransportServer | undefined;
+  let child: ChildProcess | undefined;
+  let childClosed: Promise<void> | undefined;
+  let stdout = "";
+  let stderr = "";
+  /** The message id of every MAIL_ACK the relay received, in arrival order. */
+  let acks: string[] = [];
+  let seq = 0;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(join(tmpdir(), "tps-connect-command-"));
+    savedEnv = isolateEnv(root, "connect-command-test");
+    stdout = "";
+    stderr = "";
+    acks = [];
+    seq = 0;
+  });
+
+  /**
+   * Stop the command with SIGINT, which runs its own handler (stop the
+   * keep-alive loop, then exit); SIGKILL if it has not closed within 5 s.
+   * Resolves once the process has closed, so all of its output has been read.
+   */
+  async function stopCommand(): Promise<void> {
+    const running = child;
+    const closed = childClosed;
+    child = undefined;
+    childClosed = undefined;
+    if (!running || !closed) return;
+    if (running.exitCode === null && running.signalCode === null) running.kill("SIGINT");
+    const exited = await Promise.race([closed.then(() => true), Bun.sleep(5000).then(() => false)]);
+    if (!exited) {
+      running.kill("SIGKILL");
+      await closed;
+    }
+  }
+
+  afterEach(async () => {
+    // Each step runs in its own `finally`, so one that throws cannot skip the
+    // steps after it.
+    try {
+      await stopCommand();
+    } finally {
+      try {
+        const server = relay;
+        relay = undefined;
+        await server?.close();
+      } finally {
+        try {
+          restoreEnv(savedEnv);
+          savedEnv = {};
+        } finally {
+          const dir = root;
+          root = undefined;
+          if (dir) fs.rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    }
+  });
+
+  /** Start the relay, then `tps office connect remote`; resolves with the relay's end of the channel. */
+  async function startCommand(): Promise<TransportChannel> {
+    const port = await freePort();
+    const branch = registerRemote(root!, port);
+    const host = await initHostIdentity();
+    const server = await ws.listenForHostWs(branch, host.encryption.publicKey, port, (msg) => {
+      if (msg.type === MSG_MAIL_ACK) acks.push((msg.body as { id: string }).id);
+    });
+    relay = server;
+    let channel: TransportChannel | undefined;
+    server.onConnection((connected) => { channel = connected; });
+
+    // The argv the office supervisor's launchd unit runs (office-supervision.ts):
+    // a non-interactive `office connect` is refused without the launcher's flag.
+    const proc = spawn(process.execPath, [TPS_BIN, "office", "connect", "remote", SANDBOX_REQUIRED_FLAG], {
+      env: { ...process.env },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child = proc;
+    childClosed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
+    proc.stdout!.setEncoding("utf8");
+    proc.stderr!.setEncoding("utf8");
+    proc.stdout!.on("data", (data: string) => { stdout += data; });
+    proc.stderr!.on("data", (data: string) => { stderr += data; });
+
+    await waitFor("office connect to reach the relay", () => channel !== undefined || proc.exitCode !== null, 20_000);
+    if (!channel) throw new Error(`office connect exited before connecting:\n${stderr}`);
+    return channel;
+  }
+
+  /** Send one MAIL_DELIVER and wait (bounded) for the command to ACK it. */
+  async function deliver(channel: TransportChannel, delivery: MailDeliverBody): Promise<void> {
+    const before = acks.filter((id) => id === delivery.id).length;
+    await channel.send({ type: MSG_MAIL_DELIVER, seq: ++seq, ts: new Date().toISOString(), body: delivery });
+    await waitFor(`the ACK for ${delivery.id}`, () => acks.filter((id) => id === delivery.id).length > before);
+  }
+
+  function announcements(): number {
+    return stdout.split("\n").filter((line) => line.includes(ANNOUNCEMENT)).length;
+  }
+
+  test("prints \"Mail received\" once per newly recorded delivery; a resend is ACKed without another", async () => {
+    const channel = await startCommand();
+
+    const first = body("first");
+    await deliver(channel, first);
+    await waitFor("the first announcement", () => announcements() >= 1);
+    expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+
+    // A resend of the recorded delivery: same id, same payload.
+    await deliver(channel, first);
+
+    const second = body("second");
+    await deliver(channel, second);
+    await waitFor("the second announcement", () => announcements() >= 2);
+
+    // The command prints a delivery's announcement before it sends that
+    // delivery's ACK, so every line for these three deliveries was written
+    // before the last ACK arrived. Once the process has closed, all of them
+    // have been read: the count is exact.
+    await stopCommand();
+    expect(announcements(), `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(2);
+    expect(jsonFiles(getInbox("local").fresh).length).toBe(2);
+    expect(acks).toEqual([first.id, first.id, second.id]);
+  }, 30_000);
+});
 
 describe("office connect announcement follows local acceptance", () => {
   let root: string | undefined;
@@ -38,21 +249,9 @@ describe("office connect announcement follows local acceptance", () => {
 
   beforeEach(async () => {
     root = fs.mkdtempSync(join(tmpdir(), "tps-connect-announce-"));
-    savedEnv = {};
-    for (const k of ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"]) savedEnv[k] = process.env[k];
-    process.env.HOME = root;
-    process.env.TPS_ROOT = root;
-    process.env.TPS_BRANCH_NO_DAEMON = "1";
-    process.env.TPS_MAIL_DIR = join(root, "mail");
-    process.env.TPS_IDENTITY_DIR = join(root, "identity");
-    process.env.TPS_REGISTRY_DIR = join(root, "registry");
-    process.env.TPS_VAULT_KEY = "connect-announce-test";
+    savedEnv = isolateEnv(root, "connect-announce-test");
     await initHostIdentity();
-    const kp = generateKeyPair();
-    registerBranch("remote", kp.signing.publicKey, undefined, kp.encryption.publicKey);
-    const branchDir = join(root, ".tps", "branch-office", "remote");
-    fs.mkdirSync(branchDir, { recursive: true });
-    fs.writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "unused", port: 1, transport: "ws" }));
+    registerRemote(root, 1);
 
     handlers = new Set();
     loopDetached = false;
@@ -90,33 +289,30 @@ describe("office connect announcement follows local acceptance", () => {
         detached = loopDetached;
       }
     } finally {
-      // Every step runs even when an earlier one threw, and each clears what it
-      // undid, so a second pass is a no-op. The spy is process-wide: left in
-      // place, every later WsNoiseTransport.connect in this bun process would
-      // return this file's fake channel instead of opening a socket.
+      // Each cleanup step runs in its own `finally`, so one that throws cannot
+      // skip the steps after it. The spy is process-wide: left in place, every
+      // later WsNoiseTransport.connect in this bun process would return this
+      // file's fake channel instead of opening a socket.
       stop = undefined;
       handlers = new Set();
       loopDetached = false;
-      connectSpy?.mockRestore();
-      connectSpy = undefined;
-      for (const [k, v] of Object.entries(savedEnv)) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
+      try {
+        const spy = connectSpy;
+        connectSpy = undefined;
+        spy?.mockRestore();
+      } finally {
+        try {
+          restoreEnv(savedEnv);
+          savedEnv = {};
+        } finally {
+          const dir = root;
+          root = undefined;
+          if (dir) fs.rmSync(dir, { recursive: true, force: true });
+        }
       }
-      savedEnv = {};
-      if (root) fs.rmSync(root, { recursive: true, force: true });
-      root = undefined;
     }
     expect(detached).toBe(true);
   });
-
-  function jsonFiles(dir: string): string[] {
-    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith(".json")) : [];
-  }
-
-  function body(content: string): MailDeliverBody {
-    return { id: randomUUID(), from: "remote", to: "local", content, timestamp: new Date().toISOString() };
-  }
 
   function deliver(delivery: MailDeliverBody): void {
     const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: delivery };
@@ -131,6 +327,22 @@ describe("office connect announcement follows local acceptance", () => {
   test("an accepted delivery is announced after its inbox record is published", async () => {
     deliver(body("hello"));
     await settled();
+    expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
+    expect(announced).toEqual([1]);
+  });
+
+  test("a resend of a recorded delivery is ACKed again and is not announced again", async () => {
+    const accepted = body("recorded once");
+    deliver(accepted);
+    await settled();
+    expect(announced).toEqual([1]);
+    acks.length = 0;
+
+    deliver(accepted);
+    await settled();
+
+    // The ACK is sent after the announcement decision, so it settles both.
+    expect(acks.length).toBe(1);
     expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
     expect(announced).toEqual([1]);
   });
