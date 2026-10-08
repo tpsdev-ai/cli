@@ -45,7 +45,7 @@ import meow from "meow";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname, basename, isAbsolute, resolve } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
@@ -446,6 +446,9 @@ function declaredGrants(doc: unknown, path: string, env: NodeJS.ProcessEnv): Pro
       if (typeof value !== "string") {
         throw new Error(`unsupported filesystem.${key} path in sandbox profile ${path}`);
       }
+      const refusal = parentDirectoryRefusal(value, `filesystem.${key}`)
+        ?? parentDirectoryRefusal(expandHome(value, env), `filesystem.${key}`);
+      if (refusal) throw new Error(refusal);
       if (/[*?\[\]{}]/.test(value)) {
         throw new Error(`unsupported filesystem.${key} glob '${value}' in sandbox profile ${path}`);
       }
@@ -456,6 +459,12 @@ function declaredGrants(doc: unknown, path: string, env: NodeJS.ProcessEnv): Pro
     }
   }
   return grants;
+}
+
+function parentDirectoryRefusal(path: string, label: string): string | null {
+  return path.split(sep === "\\" ? /[\\/]/ : sep).includes("..")
+    ? `unsupported parent-directory segment '..' in ${label} '${path}' — give the resolved absolute path`
+    : null;
 }
 
 export function sandboxProfileGrantRefusal(
@@ -595,30 +604,35 @@ function appendUnresolved(ancestor: string, tail: string[]): string {
 
 function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
   if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
-  let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
-  const tail: string[] = [];
-  for (;;) {
+  const inputRoot = parse(p).root;
+  const base = sep === "\\" && inputRoot ? resolve(cwd, inputRoot) : cwd;
+  const absolute = isAbsolute(p) ? p : `${base}${sep}${p.slice(inputRoot.length)}`;
+  const root = parse(absolute).root;
+  let cur = root;
+  for (const part of absolute.slice(root.length).split(sep === "\\" ? /[\\/]/ : sep)) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      cur = dirname(cur);
+      continue;
+    }
+    const next = join(cur, part);
     try {
-      const real = realpathSync(cur);
-      return appendUnresolved(real, tail.reverse());
+      cur = realpathSync(next);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
       try {
-        if (lstatSync(cur).isSymbolicLink()) {
-          const target = canonicalPath(readlinkSync(cur), dirname(cur), links + 1);
-          return appendUnresolved(target, tail.reverse());
-        }
+        cur = lstatSync(next).isSymbolicLink()
+          ? canonicalPath(readlinkSync(next), cur, links + 1)
+          : appendUnresolved(cur, [part]);
       } catch (linkErr) {
         const linkCode = (linkErr as NodeJS.ErrnoException).code;
         if (linkCode !== "ENOENT" && linkCode !== "ENOTDIR") throw linkErr;
+        cur = appendUnresolved(cur, [part]);
       }
-      const parent = dirname(cur);
-      if (parent === cur) throw err;
-      tail.push(basename(cur));
-      cur = parent;
     }
   }
+  return cur;
 }
 
 function pathContainsOrEquals(dir: string, p: string): boolean {
@@ -639,6 +653,21 @@ export function approveRuntimeNonoOptions(
   const options: NonoOptions = {};
   const runtimeDirectories: string[] = [];
   const result = (refusal: string | null) => ({ options, runtimeDirectories, refusal });
+  const runtimeOptions = runtimeNonoOptions(runtime, env);
+  for (const source of [grants, runtimeOptions]) {
+    for (const key of ["workdir", "cwd", "read", "allow", "readFiles", "allowFiles"] as const) {
+      const value = source[key];
+      const paths = typeof value === "string" ? [value] : value ?? [];
+      for (const path of paths) {
+        const refusal = parentDirectoryRefusal(path, `launch option ${key}`);
+        if (refusal) return result(refusal);
+      }
+    }
+  }
+  for (const { variable, path } of runtimeDirVariables(runtime, env)) {
+    const refusal = parentDirectoryRefusal(path, variable);
+    if (refusal) return result(refusal);
+  }
   const resolved = new Map<string, string>();
   const canonical = (p: string): string => {
     if (!resolved.has(p)) resolved.set(p, canonicalPath(p));

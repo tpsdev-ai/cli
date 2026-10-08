@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, symlinkSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { sandboxProfileGrantRefusal } from "../packages/cli/src/utils/nono.js";
+import { approveRuntimeNonoOptions, sandboxProfileGrantRefusal } from "../packages/cli/src/utils/nono.js";
 
 const bin = process.env.NONO_BIN;
 assert(bin && isAbsolute(bin), "NONO_BIN must name the real nono binary by absolute path");
@@ -49,6 +49,40 @@ try {
   });
   assert.equal(sandboxProfileGrantRefusal("safe", env, undefined, bin), null);
 
+  if (process.platform === "darwin") {
+    const before = checks;
+    const target = join(root, "actual", "inner");
+    const leaf = join(root, "actual", "leaf");
+    const component = join(root, "component");
+    const link = join(root, "grant-link");
+    mkdirSync(target, { recursive: true });
+    mkdirSync(leaf);
+    symlinkSync(target, component);
+    symlinkSync("component/../leaf", link);
+    const approved = approveRuntimeNonoOptions(undefined, { read: [link] }, env);
+    assert.equal(approved.refusal, null);
+    const approvedPath = approved.options.read![0];
+    assert.equal(approvedPath, realpathSync(link));
+    const profile = write("symlink-component", { extends: ["parent"], filesystem: { read: [link] } });
+    assert.equal(sandboxProfileGrantRefusal("symlink-component", env, undefined, bin), null);
+    for (const args of [
+      ["--profile", profile],
+      ["--profile", safe, "--read", link],
+    ]) {
+      const queried = run(["why", "--json", ...args, "--path", leaf, "--op", "read"]);
+      assert.equal(queried.status, 0, `${queried.stdout}${queried.stderr}`);
+      const answer = JSON.parse(queried.stdout);
+      assert.equal(answer.status, "allowed");
+      assert.equal(answer.granted_path, approvedPath);
+      checks++;
+    }
+    rmSync(leaf, { recursive: true });
+    const missing = approveRuntimeNonoOptions(undefined, { read: [link] }, env);
+    assert.equal(missing.refusal, null);
+    assert.equal(missing.options.read![0], approvedPath);
+    checks++;
+    console.log(`Darwin symlink path checks: ${checks - before} pass, 0 fail`);
+  }
   const bundled = join(import.meta.dir, "../packages/cli/nono-profiles");
   for (const file of readdirSync(bundled).filter((file) => file.endsWith(".json"))) {
     copyFileSync(join(bundled, file), join(profiles, file));

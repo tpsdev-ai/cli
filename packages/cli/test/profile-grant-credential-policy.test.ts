@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -101,6 +101,47 @@ describe("effective profile access query", () => {
       if (!bin || bin === "nono") expect(refusal).toContain("Install nono >= 0.70 or set NONO_BIN");
     });
   }
+});
+
+describe("parent-directory path policy", () => {
+  for (const separator of process.platform === "win32" ? ["/", "\\"] : ["/"]) {
+    for (const key of ["read", "allow", "write", "read_file", "allow_file", "write_file"]) {
+      test(`${key} parent-directory grant with ${JSON.stringify(separator)} is refused before querying nono`, () => {
+        const home = makeHome();
+        const path = `${home}${separator}workspace${separator}..${separator}other`;
+        writeProfile(home, { filesystem: { [key]: [path] } });
+        const reason = profileGrantRefusal!("tps-agent-run-claude-code", envFor(home));
+        expect(reason).toContain("parent-directory segment '..'");
+        expect(reason).toContain(`filesystem.${key}`);
+        expect(reason).toContain("give the resolved absolute path");
+        expect(existsSync(join(home, "nono.log"))).toBe(false);
+      });
+    }
+
+    for (const key of ["cwd", "workdir", "read", "allow", "readFiles", "allowFiles"] as const) {
+      test(`${key} parent-directory launch option with ${JSON.stringify(separator)} is refused`, () => {
+        const home = makeHome();
+        const path = `${home}${separator}workspace${separator}..${separator}other`;
+        const grants = key === "cwd" || key === "workdir" ? { [key]: path } : { [key]: [path] };
+        const approved = nono.approveRuntimeNonoOptions(undefined, grants, envFor(home));
+        expect(approved.refusal).toContain("parent-directory segment '..'");
+        expect(approved.refusal).toContain(key);
+        expect(approved.refusal).toContain("give the resolved absolute path");
+        expect(approved.options).toEqual({});
+        expect(existsSync(join(home, "nono.log"))).toBe(false);
+      });
+    }
+  }
+
+  test("symlink targets resolve components in filesystem order", () => {
+    const home = makeHome();
+    mkdirSync(join(home, "actual", "inner"), { recursive: true });
+    symlinkSync(join(home, "actual", "inner"), join(home, "component"));
+    symlinkSync("component/../leaf", join(home, "grant"));
+    const approved = nono.approveRuntimeNonoOptions(undefined, { read: [join(home, "grant")] }, envFor(home));
+    expect(approved.refusal).toBeNull();
+    expect(approved.options.read).toEqual([join(home, "actual", "leaf")]);
+  });
 });
 
 describe("cli#518 profile grants", () => {
@@ -298,6 +339,24 @@ describe("cli#518 launch checks", () => {
       encoding: "utf8",
       timeout: 10_000,
     });
+
+  for (const form of ["profile", "launch option"]) {
+    test(`a parent-directory ${form} refuses launch before handoff`, () => {
+      const sb = makeSandbox();
+      try {
+        const path = `${sb.ws}/../other`;
+        if (form === "profile") writeProfile(sb.home, { filesystem: { read: [path] } });
+        const r = runLaunch(sb, form === "launch option" ? { TMPDIR: path } : {});
+        const text = `${r.stdout}${r.stderr}`;
+        expect(r.status, text).toBe(78);
+        expect(text).toContain("parent-directory segment '..'");
+        expect(text).toContain("give the resolved absolute path");
+        expect(text).not.toContain("HANDOFF ");
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
 
   test("a launch whose sandbox profile grants the credential store is refused", () => {
     const sb = makeSandbox();
