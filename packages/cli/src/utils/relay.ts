@@ -445,10 +445,16 @@ async function acceptRelayedMail(
   // conflict throws before this point, as does a sync failure or a failed
   // dead-letter, so none of those is announced or ACKed.
   if (delivered) {
-    try {
-      onAccepted?.();
-    } catch {
+    const reportError = () => {
       console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);
+    };
+    try {
+      const result: unknown = onAccepted?.();
+      if (result != null && typeof (result as { then?: unknown }).then === "function") {
+        void Promise.resolve(result).catch(reportError);
+      }
+    } catch {
+      reportError();
     }
   }
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });

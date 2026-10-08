@@ -1,1 +1,1 @@
-- **Relay ACKs accepted deliveries even if the announcement callback throws.**
+- **Relay ACKs accepted deliveries even if the announcement callback throws or rejects.**

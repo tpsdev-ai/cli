@@ -244,6 +244,7 @@ describe("office connect announcement follows local acceptance", () => {
   /** The inbox record count observed at each announcement. */
   let announced: number[];
   let onAcceptedError: Error | undefined;
+  let onAcceptedHook: (() => void) | undefined;
 
   beforeEach(async () => {
     root = fs.mkdtempSync(join(tmpdir(), "tps-connect-announce-"));
@@ -256,6 +257,7 @@ describe("office connect announcement follows local acceptance", () => {
     acks = [];
     announced = [];
     onAcceptedError = undefined;
+    onAcceptedHook = undefined;
     let alive = true;
     const channel: TransportChannel = {
       async send(msg) { if (msg.type === MSG_MAIL_ACK) acks.push(msg); },
@@ -270,6 +272,7 @@ describe("office connect announcement follows local acceptance", () => {
       onAccepted: () => {
         announced.push(jsonFiles(getInbox("local").fresh).length);
         if (onAcceptedError) throw onAcceptedError;
+        return onAcceptedHook?.();
       },
     });
     for (let i = 0; handlers.size === 0 && i < 200; i++) await Bun.sleep(5);
@@ -378,6 +381,50 @@ describe("office connect announcement follows local acceptance", () => {
       errors.mockRestore();
     }
   });
+
+  for (const kind of ["async", "thenable"] as const) {
+    test(`a rejecting ${kind} onAccepted is reported after ACK without an unhandled rejection`, async () => {
+      const accepted = body("private async message content");
+      let reject: (reason: Error) => void = () => {};
+      const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
+      onAcceptedHook = kind === "async"
+        ? async () => { await pending; }
+        : () => ({ then: pending.then.bind(pending) });
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+      process.on("unhandledRejection", onUnhandled);
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        deliver(accepted);
+        await settled();
+        expect(acks).toEqual([{
+          type: MSG_MAIL_ACK, seq: 1, ts: expect.any(String), body: { id: accepted.id, accepted: true },
+        }]);
+        expect(errors.mock.calls).toEqual([]);
+        const inbox = getInbox("local").fresh;
+        const records = jsonFiles(inbox);
+        expect(records.length).toBe(1);
+        expect(JSON.parse(fs.readFileSync(join(inbox, records[0]!), "utf8")).body).toBe(accepted.content);
+        reject(new Error(`announcement failed: ${accepted.content}`));
+        await Bun.sleep(20);
+        expect(unhandled).toEqual([]);
+        expect(errors.mock.calls).toEqual([[`[relay] onAccepted failed for message ${accepted.id} to ${accepted.to}`]]);
+        expect(errors.mock.calls.flat().join("\n")).not.toContain(accepted.content);
+
+        acks.length = 0;
+        deliver(accepted);
+        await settled();
+        expect(acks.length).toBe(1);
+        expect(jsonFiles(inbox)).toEqual(records);
+        expect(announced).toEqual([1]);
+        expect(errors.mock.calls.length).toBe(1);
+        expect(unhandled).toEqual([]);
+      } finally {
+        process.removeListener("unhandledRejection", onUnhandled);
+        errors.mockRestore();
+      }
+    });
+  }
 
   test("a same-id conflict is not acknowledged and is not announced", async () => {
     const accepted = body("original payload");
