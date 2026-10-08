@@ -23,8 +23,8 @@ const keys = ${JSON.stringify(keys)};
 const nonces = new Set();
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input));
-  if (url.hostname === "provider.test" && url.pathname === "/proxy/openai/v1/chat/completions") {
-    writeFileSync(${JSON.stringify(request)}, init.body);
+  if (url.href === "https://api.openai.com/v1/chat/completions") {
+    writeFileSync(${JSON.stringify(request)}, JSON.stringify({ url: url.href, method: init.method, authorization: new Headers(init.headers).get("Authorization"), body: JSON.parse(init.body) }));
     return Response.json({ choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1 } });
   }
   if (url.hostname === "flair.test") {
@@ -99,11 +99,14 @@ for (const flag of ["--version", "-v", "--help", "-h"]) {
     const f = fixture();
     try {
       const config = join(f.root, "agent.yaml");
-      writeFileSync(config, JSON.stringify({ agentId: "demo", workspace: f.root, mailDir: join(f.root, "mail"), tools: [], llm: { provider: "openai", model: "fixture-model", baseUrl: "http://provider.test" } }));
+      writeFileSync(config, JSON.stringify({ agentId: "demo", workspace: f.root, mailDir: join(f.root, "mail"), tools: [], llm: { provider: "openai", model: "fixture-model", apiKey: "fixture-api-key" } }));
       const r = run(f, ["agent", "run", "--id", "demo", "--config", config, "--message", flag]);
       expect(r.error).toBeUndefined();
       expect(r.status).toBe(0);
-      const body = JSON.parse(readFileSync(f.request, "utf-8"));
+      const { url, method, authorization, body } = JSON.parse(readFileSync(f.request, "utf-8"));
+      expect(url).toBe("https://api.openai.com/v1/chat/completions");
+      expect(method).toBe("POST");
+      expect(authorization).toBe("Bearer fixture-api-key");
       expect(body.model).toBe("fixture-model");
       expect(body.messages.filter((m: { role: string }) => m.role === "user")).toEqual([{ role: "user", content: flag }]);
     } finally { f.cleanup(); }
