@@ -191,7 +191,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       expect(log).toContain("agent start --id probe");
       // cli#350 r4g — /tmp is granted IN ADDITION to the configured TMPDIR
       // (bun's temp dir is /tmp regardless of TMPDIR).
-      expect(log).toContain(`--allow ${join(home, "tmp")}`);
+      expect(log).toContain(`--allow ${realpathSync(join(home, "tmp"))}`);
       expect(log).toContain(`--allow ${realpathSync("/tmp")}`);
     } finally {
       rmSync(home, { recursive: true, force: true });
