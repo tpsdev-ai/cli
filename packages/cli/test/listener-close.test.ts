@@ -46,7 +46,7 @@ async function within<T>(promise: Promise<T>, ms: number, label: string): Promis
   }
 }
 
-/** A best-effort teardown that never hangs the test process. */
+/** Bound how long cleanup is awaited. */
 async function settle(promise: Promise<unknown>): Promise<void> {
   try {
     await within(promise, REPEAT_BOUND_MS, "cleanup");
