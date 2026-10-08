@@ -3,8 +3,10 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const SOURCE_LAUNCHER = resolve(import.meta.dir, "../bin/tps.cjs");
+const BUILT_CLI = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TMP_PREFIX = "tps-launcher-test-";
 const PLATFORM_PKG = `@tpsdev-ai/cli-${process.platform}-${process.arch}`;
 // The launcher is documented to run under node (`#!/usr/bin/env node`). Run it
@@ -21,6 +23,7 @@ function makeIsolatedLauncher(): string {
   const binDir = join(dir, "bin");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(binDir, "tps.cjs"), readFileSync(SOURCE_LAUNCHER));
+  writeFileSync(join(binDir, "cli-args.cjs"), readFileSync(resolve(SOURCE_LAUNCHER, "../cli-args.cjs")));
   return join(binDir, "tps.cjs");
 }
 
@@ -38,6 +41,7 @@ function makeLauncherHarness(fakeBinary: string | null): LauncherHarness {
   const binDir = join(dir, "bin");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(binDir, "tps.cjs"), readFileSync(SOURCE_LAUNCHER));
+  writeFileSync(join(binDir, "cli-args.cjs"), readFileSync(resolve(SOURCE_LAUNCHER, "../cli-args.cjs")));
 
   const fallbackMarker = join(dir, "fallback-ran.marker");
   const fallbackDir = join(dir, "dist", "bin");
@@ -89,6 +93,34 @@ describe("tps launcher version fallback", () => {
     expect(result.stderr.trim()).toBe("");
   });
 });
+
+for (const flag of ["--version", "-v"]) {
+  for (const prefix of [[], ["--no-guard", "--base-model", "fixture"], ["--config", flag], ["--"]]) {
+    test(`launcher secrets-guard ${prefix.join(" ")} child receives ${flag}`, () => {
+      const harness = makeLauncherHarness(null);
+      const root = resolve(harness.launcher, "../..");
+      writeFileSync(join(root, "dist", "bin", "tps.js"), `import(${JSON.stringify(pathToFileURL(BUILT_CLI).href)});\n`);
+      const child = join(root, "child.mjs");
+      writeFileSync(child, 'console.log("CHILD_ARGV=" + JSON.stringify(process.argv.slice(2)));\n');
+      const result = runLauncher(harness, ["secrets-guard", ...prefix, NODE, child, flag]);
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`CHILD_ARGV=${JSON.stringify([flag])}`);
+    });
+  }
+
+  for (const prefix of [[], ["secrets-guard"]]) {
+    test(`launcher ${prefix.join(" ")} ${flag} prints the version before a wrapped command`, () => {
+      const harness = makeLauncherHarness(null);
+      const result = runLauncher(harness, [...prefix, flag, NODE, "child.mjs"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe(process.env.TPS_CLI_VERSION || process.env.npm_package_version || "dev");
+      expect(existsSync(harness.fallbackMarker)).toBe(false);
+    });
+  }
+}
 
 describe("tps launcher exit status", () => {
   test("propagates the platform binary's non-zero exit and does not run the fallback", () => {

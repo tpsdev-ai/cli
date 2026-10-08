@@ -2,6 +2,7 @@
 
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
+const { parseCliArgs } = require('./cli-args.cjs');
 const { existsSync } = require('node:fs');
 const { constants: { signals } } = require('node:os');
 
@@ -19,7 +20,7 @@ function getCliVersion() {
   }
 }
 
-if (process.argv.includes('--version') || process.argv.includes('-v')) {
+if (parseCliArgs(process.argv.slice(2)).versionRequested) {
   // Fast-path version output even when native binary package is missing.
   console.log(getCliVersion());
   process.exit(0);
