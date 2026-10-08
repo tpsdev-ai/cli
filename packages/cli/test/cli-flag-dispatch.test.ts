@@ -8,16 +8,19 @@ import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stu
 const BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const SEEDS = { sender: Buffer.alloc(32, 0x61), demo: Buffer.alloc(32, 0x62) };
 
-function fixture() {
+function fixture(auth?: "missing" | "invalid" | "unknown") {
   const root = mkdtempSync(join(tmpdir(), "tps-flag-dispatch-"));
   const preload = join(root, "transport.mjs");
   const request = join(root, "request.json");
   const keys = Object.fromEntries(Object.entries(SEEDS).map(([name, seed]) => [name, pubkeyFromSeed(seed).toString("base64")]));
+  if (auth === "unknown") delete keys.demo;
   writeFileSync(preload, `import fs, { writeFileSync } from "node:fs";
+import { createPublicKey, verify } from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 fs.watch = () => ({ close() {} });
 syncBuiltinESMExports();
 const keys = ${JSON.stringify(keys)};
+const nonces = new Set();
 globalThis.fetch = async (input, init) => {
   const url = new URL(String(input));
   if (url.hostname === "provider.test" && url.pathname === "/proxy/openai/v1/chat/completions") {
@@ -26,13 +29,35 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.hostname === "flair.test") {
     if (url.pathname === "/Health") return new Response("ok");
-    const name = decodeURIComponent(url.pathname.slice("/Agent/".length));
-    if (url.pathname.startsWith("/Agent/") && keys[name]) return Response.json({ id: name, publicKey: keys[name] });
+    if (url.pathname.startsWith("/Agent/") && init?.method === "GET") {
+      const headers = new Headers(init.headers);
+      if (${JSON.stringify(auth)} === "missing") headers.delete("Authorization");
+      const header = headers.get("Authorization") ?? "";
+      const parsed = header.length <= 4096 && /^TPS-Ed25519\\s+([^:\\s]+):(\\d+):([^:\\s]+):(.+)$/.exec(header);
+      if (!parsed) return Response.json({ type: "error:AccessViolation", error: "forbidden", instance: url.pathname }, { status: 403 });
+      const [, caller, ts, nonce, signature] = parsed;
+      const refuse = (error) => Response.json({ error }, { status: 401 });
+      if (!Number.isFinite(Number(ts)) || Math.abs(Date.now() - Number(ts)) > 30_000) return refuse("timestamp_out_of_window");
+      const replayKey = caller + ":" + nonce;
+      if (nonces.has(replayKey)) return refuse("nonce_replay_detected");
+      if (!Object.hasOwn(keys, caller)) return refuse("unknown_agent");
+      try {
+        const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(keys[caller], "base64")]), format: "der", type: "spki" });
+        const payload = caller + ":" + ts + ":" + nonce + ":" + init.method + ":" + url.pathname + url.search;
+        if (!verify(null, Buffer.from(payload), publicKey, Buffer.from(signature, "base64"))) return refuse("invalid_signature");
+      } catch (err) {
+        return Response.json({ error: "signature_verification_failed", detail: err.message }, { status: 401 });
+      }
+      nonces.add(replayKey);
+      const name = decodeURIComponent(url.pathname.slice("/Agent/".length));
+      if (!Object.hasOwn(keys, name)) return new Response("not found", { status: 404 });
+      return Response.json({ id: name, publicKey: keys[name] });
+    }
   }
   throw new Error("Unexpected transport request: " + url);
 };
 `);
-  const key = writeKeyFile(join(root, ".tps", "identity"), "demo", SEEDS.demo);
+  const key = writeKeyFile(join(root, ".tps", "identity"), "demo", auth === "invalid" ? SEEDS.sender : SEEDS.demo);
   return {
     root, request, preload,
     env: { ...process.env, HOME: root, TPS_HOME: root, TPS_MAIL_DIR: join(root, "mail"), FLAIR_URL: "http://flair.test", FLAIR_KEY_PATH: key, TPS_NONO_STRICT: "", TPS_LLM_PROXY_URL: "" },
@@ -146,3 +171,29 @@ test("real runMail watch withholds a record with a damaged signature from the ho
     expect(existsSync(sentinel)).toBe(false);
   } finally { f.cleanup(); }
 }, 15_000);
+
+for (const [auth, status, error] of [
+  ["missing", 403, "AccessViolation"],
+  ["invalid", 401, "invalid_signature"],
+  ["unknown", 401, "unknown_agent"],
+] as const) {
+  test(`real runMail watch withholds signed mail when the Agent read refuses ${auth} caller credentials`, async () => {
+    const f = fixture(auth);
+    try {
+      const fresh = join(f.root, "mail", "demo", "new");
+      mkdirSync(fresh, { recursive: true });
+      const envelope = buildSignedEnvelope("sender", "demo", "signed body", SEEDS);
+      const record = join(fresh, "mail.json");
+      writeFileSync(record, JSON.stringify({ id: "local-record", from: "sender", to: "demo", body: JSON.stringify(envelope), timestamp: envelope.timestamp, read: false }));
+      const sentinel = join(f.root, "hook-ran");
+      const hook = join(f.root, "hook.mjs");
+      writeFileSync(hook, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(sentinel)}, "ran");`);
+      const output = await watchUntil(f, ["mail", "watch", "demo", "--sandbox-required", "--exec", "node", hook, "--version"], "verification error");
+      expect(output).toContain(`→ ${status}:`);
+      expect(output).toContain(error);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(record)).toBe(true);
+      expect(existsSync(join(f.root, "mail", "demo", "cur", "mail.json"))).toBe(false);
+    } finally { f.cleanup(); }
+  }, 15_000);
+}
