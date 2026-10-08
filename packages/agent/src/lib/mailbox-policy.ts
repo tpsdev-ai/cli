@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -213,9 +213,6 @@ export async function decideEnvelopeForMailbox(
 }
 
 // ─── Durable consumed-id ledger (replay gate that survives maildir GC) ───────
-//
-// The ledger is appended on consumption and pruned by age, independently of
-// maildir cleanup.
 const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
@@ -225,8 +222,10 @@ const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
  */
 export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
-  beginPlacement(messageId: string, file: string): void;
+  beginPlacement(messageId: string, file: string, sourcePath?: string): void;
+  ownsPendingPlacement(messageId: string, file: string): boolean;
   hasPendingPlacement(messageId: string, file: string): boolean;
+  hasPendingFile(file: string): boolean;
   finishPlacement(messageId: string, file: string): void;
   /**
    * Record a consumed messageId. Call ONLY after the record is in cur/; THROWS
@@ -239,7 +238,19 @@ export interface ReplayStore {
 export function mailboxReplayStore(root: string): ReplayStore {
   return {
     isConsumed: (messageId, pendingFile) => isConsumedMessageId(root, messageId, pendingFile),
-    beginPlacement: (messageId, file) => writePlacementIntent(root, messageId, file),
+    beginPlacement: (messageId, file, sourcePath) => writePlacementIntent(root, messageId, file, sourcePath),
+    ownsPendingPlacement: (messageId, file) => {
+      const intent = readPlacementIntent(root, file);
+      if (intent?.messageId !== messageId || !intent.identity) return false;
+      try {
+        const stat = lstatSync(join(root, "cur", file), { bigint: true });
+        return stat.isFile() && stat.dev.toString() === intent.identity.dev && stat.ino.toString() === intent.identity.ino;
+      } catch (err) {
+        if (isMissing(err)) return false;
+        throw err;
+      }
+    },
+    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || readPlacementIntent(root, file) !== null,
     hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
     finishPlacement: (messageId, file) => {
       if (readPlacementIntent(root, file)?.messageId !== messageId) return;
@@ -254,14 +265,51 @@ function placementIntentPath(root: string, file: string): string {
   return join(root, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
 }
 
-function readPlacementIntent(root: string, file: string): { messageId: string } | null {
+function malformedPlacement(path: string): Error {
+  const err = new Error(`malformed placement intent at ${path}`);
+  err.name = "MalformedPlacementIntentError";
+  return err;
+}
+
+function quarantinePlacement(path: string): void {
+  const err = malformedPlacement(path);
+  writeFileSync(`${path}.quarantined.reason`, `${err.name}: ${err.message}\n`, { mode: 0o600 });
+  renameSync(path, `${path}.quarantined`);
+  syncDirectory(join(path, ".."));
+  console.warn(`${err.name}: ${err.message}`);
+}
+
+interface PlacementIntent {
+  messageId: string;
+  file: string;
+  identity?: { dev: string; ino: string };
+}
+
+function parsePlacement(raw: string, path: string): PlacementIntent | null {
+  try {
+    const intent = JSON.parse(raw);
+    if (typeof intent?.file === "string" && placementIntentPath(join(path, ".."), intent.file) === path
+      && isValidEnvelopeId(intent?.messageId)
+      && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
+        && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
+        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) return intent;
+  } catch {}
+  return null;
+}
+
+function readPlacementIntent(root: string, file: string): PlacementIntent | null {
+  const path = placementIntentPath(root, file);
+  if (existsSync(`${path}.quarantined`)) throw malformedPlacement(path);
   let raw: string;
-  try { raw = readFileSync(placementIntentPath(root, file), "utf8"); } catch (err) {
+  try { raw = readFileSync(path, "utf8"); } catch (err) {
     if (isMissing(err)) return null;
     throw err;
   }
-  const intent = JSON.parse(raw);
-  if (intent?.file !== file || !isValidEnvelopeId(intent?.messageId)) throw new Error("invalid placement intent");
+  const intent = parsePlacement(raw, path);
+  if (!intent) {
+    quarantinePlacement(path);
+    throw malformedPlacement(path);
+  }
   return intent;
 }
 
@@ -270,14 +318,22 @@ function syncDirectory(root: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function writePlacementIntent(root: string, messageId: string, file: string): void {
+function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
   const path = placementIntentPath(root, file);
+  const existing = readPlacementIntent(root, file);
+  if (existing && existing.messageId !== messageId) throw new Error(`placement intent for ${file} names another message`);
+  let identity: PlacementIntent["identity"];
+  if (sourcePath !== undefined) {
+    const stat = lstatSync(sourcePath, { bigint: true });
+    if (!stat.isFile()) throw new Error("placement source is not a regular file");
+    identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
+  }
   const tmp = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);
   try {
     try {
-      writeFileSync(fd, JSON.stringify({ messageId, file }));
+      writeFileSync(fd, JSON.stringify({ messageId, file, identity }));
       fsyncSync(fd);
     } finally { closeSync(fd); }
     renameSync(tmp, path);
@@ -285,6 +341,33 @@ function writePlacementIntent(root: string, messageId: string, file: string): vo
   } finally {
     rmSync(tmp, { force: true });
   }
+}
+
+function pendingPlacementIds(root: string, quarantine = false): { ids: Set<string>; blocked: Set<string>; retainAll: boolean } {
+  const ids = new Set<string>();
+  const blocked = new Set<string>();
+  let retainAll = false;
+  for (const name of readdirSync(root)) {
+    if (!/^\.placement-[a-f0-9]{64}\.json(?:\.quarantined)?$/.test(name)) continue;
+    const path = join(root, name.replace(/\.quarantined$/, ""));
+    const raw = readFileSync(join(root, name), "utf8");
+    const intent = name.endsWith(".quarantined") ? null : parsePlacement(raw, path);
+    if (intent) {
+      ids.add(intent.messageId);
+      continue;
+    }
+    const matches = [...raw.matchAll(/"messageId"\s*:\s*("(?:[^"\\]|\\.)*")/g)];
+    if (matches.length === 0 || matches.length !== [...raw.matchAll(/"messageId"\s*:/g)].length) retainAll = true;
+    for (const match of matches) {
+      try {
+        const id = JSON.parse(match[1]!);
+        if (isValidEnvelopeId(id)) { ids.add(id); blocked.add(id); }
+        else retainAll = true;
+      } catch { retainAll = true; }
+    }
+    if (quarantine && !name.endsWith(".quarantined")) quarantinePlacement(path);
+  }
+  return { ids, blocked, retainAll };
 }
 
 function consumedLedgerPath(root: string): string {
@@ -307,11 +390,7 @@ function recordConsumedMessageId(root: string, messageId: string): void {
   appendFileSync(path, `${raw !== null && raw !== "" && !raw.endsWith("\n") ? "\n" : ""}${JSON.stringify({ id: messageId, at: new Date().toISOString() })}\n`, "utf-8");
 }
 
-/**
- * Parse ledger text, pruning entries with parseable stored timestamps before `cutoff`.
- * Both ledger readers use it, so they agree on which ids are live.
- */
-function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; kept: string[]; pruned: number } {
+function parseConsumedLedger(raw: string, cutoff: number, pendingIds: Set<string>, retainAll = false): { ids: Set<string>; kept: string[]; pruned: number } {
   const ids = new Set<string>();
   const kept: string[] = [];
   let pruned = 0;
@@ -342,7 +421,7 @@ function parseConsumedLedger(raw: string, cutoff: number): { ids: Set<string>; k
       kept.push(line);
       continue;
     }
-    if (at < cutoff) {
+    if (at < cutoff && !retainAll && !pendingIds.has(id)) {
       pruned++;
       continue;
     }
@@ -361,9 +440,10 @@ function readConsumedLedger(root: string): Set<string> {
   const path = consumedLedgerPath(root);
 
   const raw = readLedgerText(root);
-  if (raw === null) return new Set<string>();
+  const pending = pendingPlacementIds(root, true);
+  if (raw === null) return pending.blocked;
 
-  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS);
+  const { ids, kept, pruned } = parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pending.ids, pending.retainAll);
   if (pruned > 0) {
     try {
       const tmp = `${path}.tmp`;
@@ -373,6 +453,7 @@ function readConsumedLedger(root: string): Set<string> {
       // Pruning is housekeeping — non-fatal, retried on the next read.
     }
   }
+  for (const id of pending.blocked) ids.add(id);
   return ids;
 }
 
@@ -395,7 +476,8 @@ function isMissing(err: unknown): boolean {
 function peekConsumedLedger(root: string): Set<string> | null {
   const raw = readLedgerText(root);
   if (raw === null) return null;
-  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS).ids;
+  const pending = pendingPlacementIds(root);
+  return parseConsumedLedger(raw, Date.now() - CONSUMED_LEDGER_RETENTION_MS, pending.ids, pending.retainAll).ids;
 }
 
 /**

@@ -167,6 +167,23 @@ export class MailClient {
         continue;
       }
 
+      let trustTier: MailMessage["trustTier"];
+      try {
+        trustTier = verifiedMailTier(verifyResult.envelope, this.mailDir);
+      } catch (err) {
+        const detail = sanitizeError(err);
+        this.events?.emit({
+          type: "mail.receive",
+          agent: this.agentId,
+          status: "error",
+          from: verifyResult.envelope.from,
+          durationMs: Date.now() - started,
+          error: detail,
+        });
+        console.error(`[MailClient] trust tier could not be resolved for ${file} — NOT promoting: ${detail}`);
+        continue; // leave in new/
+      }
+
       try {
         const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope);
         if (committed === "already-delivered") continue;
@@ -178,7 +195,7 @@ export class MailClient {
         messages.push({
           filename: file, body, receivedAt: new Date(), headers: {}, from,
           verifiedEnvelope: verifyResult.envelope,
-          trustTier: verifiedMailTier(verifyResult.envelope, this.mailDir),
+          trustTier,
         });
         this.events?.emit({
           type: "mail.receive",
