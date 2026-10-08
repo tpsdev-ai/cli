@@ -15,13 +15,7 @@
 # (a launch-time check, not an OS boundary: a forged marker and token, or code
 # that ignores HOME, can still reach the real home — cli#434).
 
-# Dependency release-age gate (cli#529). Bun skips a version published more
-# recently than this many seconds when it resolves a range
-# (bun.com/docs/cli/install#minimum-release-age); an exact pin is taken as
-# written. 604800 = 7 days, matching the org Renovate preset's
-# `minimumReleaseAge: "7 days"`. scripts/check-dep-ages.mjs reads this value and
-# fails CI when bun.lock resolves a younger version anyway, unless
-# docs/dep-age-exceptions.md carries a dated exception for it.
+# Bun filters fresh range resolutions; exact pins are checked by the CI lock gate.
 [install]
 minimumReleaseAge = 604800
 

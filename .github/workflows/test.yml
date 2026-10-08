@@ -57,11 +57,6 @@ jobs:
       # anything but the managed note under [Unreleased]. Read-only, no secret.
       - name: Changelog fragments (cli#449)
         run: node scripts/changelog-fragments.mjs check
-      # cli#529 — the release-age gate: fails when bun.lock resolves an external
-      # version published less than bunfig.toml's [install] minimumReleaseAge
-      # (7 days) ago, unless docs/dep-age-exceptions.md carries a dated exception.
-      # It reads the checked-out bun.lock; it fails closed (exit 2) when a
-      # publish time cannot be fetched.
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
 

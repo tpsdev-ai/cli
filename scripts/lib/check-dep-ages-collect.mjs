@@ -5,16 +5,6 @@
  * test/check-dep-ages.test.ts. Nothing here touches the filesystem or the
  * network, so its logic is exercised by tests over literal inputs.
  *
- * The gate is the install-time half's twin: `bunfig.toml`'s
- * `[install] minimumReleaseAge` (seconds) makes bun skip a freshly-published
- * version when it resolves a range, and this check reads the RESOLVED versions
- * out of `bun.lock` and fails when one is younger than that same threshold — the
- * lockfile is what install actually installs, and a version can enter it
- * without a fresh `bun install` (a merged branch, a hand edit).
- *
- * Scope: every external, non-workspace entry `bun.lock` resolves, at whatever
- * depth. `@tpsdev-ai/*` entries and `workspace:` resolutions are this repo's
- * own packages.
  */
 
 /**
@@ -95,7 +85,6 @@ export function collectResolvedDeps(lock) {
     const name = spec.slice(0, at);
     const version = spec.slice(at + 1);
     if (!name || !version) continue;
-    if (name.startsWith("@tpsdev-ai/")) continue; // this repo's own packages
     if (version.startsWith("workspace:")) continue; // local workspace link
     out.set(`${name}@${version}`, { name, version });
   }
@@ -103,19 +92,8 @@ export function collectResolvedDeps(lock) {
 }
 
 /**
- * Parse the committed exception file. Entries are read ONLY from the
- * `## Exceptions` section — the prose before it (intro, the format example) is
- * never parsed, so documentation cannot register as an entry. Inside the
- * section every non-blank line must be an entry:
- *
- *   - name@version | expires:YYYY-MM-DD | reason: text
- *
- * An entry with no date, an impossible date, or a date already past is an
- * error, not a silent skip: a stale or undated exception must fail the gate,
- * never linger as a live exemption. The `expires` date is inclusive (an entry
- * is valid through the end of its expiry day, UTC). A file with no
- * `## Exceptions` heading is an error too: an unreadable list is not an empty
- * one.
+ * Parse entries after `## Exceptions`; validate every subsequent nonblank line.
+ * Expiry dates include their UTC day.
  *
  * @returns {{ entries: Map<string, {expires: string, reason: string, line: number}>,
  *             errors: Array<{line: number, text: string, message: string}> }}
@@ -125,8 +103,7 @@ export function parseExceptions(text, nowMs = Date.now()) {
   const errors = [];
   const today = new Date(nowMs).toISOString().slice(0, 10);
   const lines = String(text).split(/\r?\n/);
-  const HEADING = /^#{1,6}\s+exceptions\s*$/i;
-  const ANY_HEADING = /^#{1,6}\s/;
+  const HEADING = /^## Exceptions$/;
   let start = -1;
   for (let i = 0; i < lines.length; i++) {
     if (HEADING.test(lines[i].trim())) {
@@ -147,7 +124,6 @@ export function parseExceptions(text, nowMs = Date.now()) {
     };
   }
   for (let i = start; i < lines.length; i++) {
-    if (ANY_HEADING.test(lines[i].trim())) break; // start of the next section
     const t = lines[i].trim();
     if (!t) continue;
     const line = i + 1;

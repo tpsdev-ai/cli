@@ -67,6 +67,7 @@ describe("parseBunLock / collectResolvedDeps", () => {
     }`);
     expect(collectResolvedDeps(lock).sort((a, b) => a.name.localeCompare(b.name))).toEqual([
       { name: "@scope/dep-b", version: "4.5.6" },
+      { name: "@tpsdev-ai/cli", version: "0.8.0" },
       { name: "dep-a", version: "1.2.3" },
     ]);
   });
@@ -102,6 +103,22 @@ describe("parseExceptions", () => {
     );
     expect(errors).toEqual([]);
     expect(entries.get("dep-a@1.0.0")).toMatchObject({ expires: "2026-12-01" });
+  });
+
+  it("rejects a single-hash Exceptions heading", () => {
+    const { entries, errors } = parseExceptions(
+      "# Exceptions\n- dep-a@1.0.0 | expires:2026-12-01 | reason: urgent\n", NOW,
+    );
+    expect(entries.size).toBe(0);
+    expect(errors[0]?.message).toContain("no `## Exceptions` heading");
+  });
+
+  it("validates a heading and an undated entry after a valid exception", () => {
+    const { errors } = parseExceptions(exceptionsDoc(
+      "- dep-a@1.0.0 | expires:2026-12-01 | reason: urgent",
+      "### More", "- dep-b@1.0.0 | reason: undated",
+    ), NOW);
+    expect(errors.map((e) => e.text)).toEqual(["### More", "- dep-b@1.0.0 | reason: undated"]);
   });
 
   it("reads an empty section as no exceptions", () => {
@@ -164,11 +181,13 @@ describe("evaluateAges", () => {
   const deps = [
     { name: "old", version: "1.0.0" },
     { name: "young", version: "2.0.0" },
+    { name: "six-days", version: "1.0.0" },
     { name: "known-only", version: "3.0.0" },
   ];
   const publishTimes = new Map([
     ["old@1.0.0", NOW - 100 * day],
     ["young@2.0.0", NOW - 1 * day],
+    ["six-days@1.0.0", NOW - 6 * day],
   ]);
 
   it("flags a young version with no exception and passes an older one", () => {
@@ -179,7 +198,7 @@ describe("evaluateAges", () => {
       nowMs: NOW,
       exceptionEntries: new Map(),
     });
-    expect(r.uncovered.map((d) => `${d.name}@${d.version}`)).toEqual(["young@2.0.0"]);
+    expect(r.uncovered.map((d) => `${d.name}@${d.version}`)).toEqual(["young@2.0.0", "six-days@1.0.0"]);
     expect(r.covered).toEqual([]);
     expect(r.missing.map((d) => d.name)).toEqual(["known-only"]);
   });
@@ -192,7 +211,7 @@ describe("evaluateAges", () => {
       nowMs: NOW,
       exceptionEntries: new Map([["young@2.0.0", { expires: "2026-12-01", reason: "fix now" }]]),
     });
-    expect(r.uncovered).toEqual([]);
+    expect(r.uncovered.map((d) => d.name)).toEqual(["six-days"]);
     expect(r.covered.map((d) => `${d.name}@${d.version}`)).toEqual(["young@2.0.0"]);
   });
 
@@ -278,8 +297,8 @@ async function runGate(env: Record<string, string>, args: string[] = []) {
   return { exitCode, output };
 }
 
-const ISO_NOW = new Date(NOW).toISOString();
-const FUTURE = new Date(NOW + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+const ISO_NOW = new Date().toISOString();
+const FUTURE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 describe("CLI — a version younger than the gate fails", () => {
   it("exits 1 and names the fresh dep, with no exception", async () => {
@@ -296,6 +315,22 @@ describe("CLI — a version younger than the gate fails", () => {
     } finally {
       registry.stop();
     }
+  }, 30_000);
+
+  it("exits 1 for a young registry-resolved @tpsdev-ai package", async () => {
+    const root = writeFixtureRepo(join(scratch, "namespace"), {
+      lock: '{"packages":{"pkg":["@tpsdev-ai/age-fixture@1.0.0"]}}',
+      exceptions: "## Exceptions\n",
+    });
+    const registry = fixtureRegistry({ "@tpsdev-ai/age-fixture": { "1.0.0": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(1);
+      expect(output).toContain("@tpsdev-ai/age-fixture@1.0.0");
+      expect(registry.requests).toHaveLength(1);
+    } finally { registry.stop(); }
   }, 30_000);
 
   it("exits 0 when a valid dated exception names that exact version", async () => {
@@ -401,6 +436,21 @@ describe("CLI — refusals and fail-closed", () => {
     expect(exitCode).toBe(2);
   }, 30_000);
 
+  it("rejects both exception-heading bypasses before fetching", async () => {
+    for (const [index, exceptions, diagnostic] of [
+      [0, `# Exceptions\n- dep-a@1.0.0 | expires:${FUTURE} | reason: urgent\n`, "no `## Exceptions` heading"],
+      [1, `## Exceptions\n- dep-a@1.0.0 | expires:${FUTURE} | reason: urgent\n### More\n- dep-b@1.0.0 | reason: undated\n`, "malformed exception"],
+    ] as const) {
+      const root = writeFixtureRepo(join(scratch, `heading-${index}`), { exceptions });
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+      });
+      expect(exitCode).toBe(2);
+      expect(output).toContain(diagnostic);
+      expect(output).not.toContain("Checking");
+    }
+  }, 30_000);
+
   it("refuses the fixture-root override under the CI flag", async () => {
     const root = writeFixtureRepo(join(scratch, "ci"), { exceptions: "## Exceptions\n" });
     const { exitCode, output } = await runGate(
@@ -409,6 +459,26 @@ describe("CLI — refusals and fail-closed", () => {
     );
     expect(output).toContain("TPS_DEP_AGES_ROOT");
     expect(exitCode).toBe(2);
+  }, 30_000);
+
+  it("refuses the publish-time registry override under --ci, including empty values", async () => {
+    for (const value of ["http://127.0.0.1:1", ""]) {
+      const { exitCode, output } = await runGate({ TPS_DEP_AGES_REGISTRY: value }, ["--ci"]);
+      expect(exitCode).toBe(2);
+      expect(output).toContain("TPS_DEP_AGES_REGISTRY");
+      expect(output).toContain("Refusing");
+    }
+  }, 30_000);
+
+  it("names alternate registry overrides refused under --ci", async () => {
+    for (const name of ["npm_config_registry", "NPM_CONFIG_REGISTRY", "BUN_CONFIG_DEFAULT_REGISTRY", "BUN_CONFIG_REGISTRY"]) {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1", [name]: "",
+      }, ["--ci"]);
+      expect(exitCode).toBe(2);
+      expect(output).toContain(name);
+      expect(output).toContain("Refusing");
+    }
   }, 30_000);
 
   it("refuses an unknown argument before scanning", async () => {

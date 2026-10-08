@@ -1,7 +1,5 @@
-- **Add a 7-day release-age gate: bun's `minimumReleaseAge` skips fresh versions, and CI fails when `bun.lock` resolves one without a dated exception.**
+- **Add a 7-day release-age gate for fresh range resolutions and locked non-workspace versions.**
 
-  Bun's `minimumReleaseAge` skips a freshly-published version when it resolves a
-  range; `scripts/check-dep-ages.mjs` reads the versions `bun.lock` resolved and
-  fails when one is younger than that same gate. A version is let through only
-  by a dated entry in `docs/dep-age-exceptions.md`; an undated or expired entry
-  fails the gate instead of exempting.
+  Bun filters fresh range resolutions. `scripts/check-dep-ages.mjs` checks locked
+  non-workspace versions; young versions require a dated exception in
+  `docs/dep-age-exceptions.md`. Invalid exception lines fail the gate.

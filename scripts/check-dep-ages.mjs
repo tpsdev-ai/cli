@@ -2,25 +2,9 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Fails when `bun.lock` resolves any external package version published less
- * than `minimumReleaseAge` seconds ago (read from bunfig.toml's `[install]`),
- * unless docs/dep-age-exceptions.md carries a valid, unexpired exception for
- * that exact `name@version`. Defends against the "compromised package not yet
- * detected" window: the install-time gate in bunfig.toml skips a fresh version
- * when it resolves a range, and this fails the build when a fresh version is in
- * the lockfile anyway.
- *
- * THIS SCRIPT IS THE CLI ENTRY POINT and always runs the gate.
- *
- * Overrides, for fixture tests:
- *   TPS_DEP_AGES_ROOT=/path/to/fixture     the repo root to scan
- *   TPS_DEP_AGES_REGISTRY=http://…         the publish-time registry
- * `--ci` marks THIS invocation as the CI gate; it scans the checked-out
- * repository whatever the environment says, so it REFUSES to run when the
- * ROOT override is PRESENT (even empty) alongside `--ci`.
- *
- * The gate accepts ONLY no arguments or exactly `--ci`; any other argument
- * exits 2 before scanning.
+ * Checks non-workspace bun.lock resolutions against bunfig.toml's minimumReleaseAge.
+ * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
+ * --ci refuses root and registry overrides.
  *
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
@@ -30,9 +14,6 @@
  *       bunfig.toml, an invalid exception entry, a REFUSED CI run, an
  *       unexpected argument, or a registry fetch failure (fail closed)
  *
- * Network: it fetches publish times from the npm registry — the same registry
- * `bun install` already uses in CI — and fails closed with a named error when
- * a fetch fails, so an offline or registry-degraded run is red, never green.
  */
 
 import { readFileSync } from "node:fs";
@@ -65,6 +46,20 @@ if (IS_CI_GATE && ROOT_OVERRIDE !== undefined) {
     "Refusing to run. Unset TPS_DEP_AGES_ROOT: it is for tests, which point the gate at a fixture repository and do not pass --ci.",
   );
   process.exit(2);
+}
+const REGISTRY_OVERRIDES = [
+  "TPS_DEP_AGES_REGISTRY",
+  "npm_config_registry",
+  "NPM_CONFIG_REGISTRY",
+  "BUN_CONFIG_DEFAULT_REGISTRY",
+  "BUN_CONFIG_REGISTRY",
+];
+if (IS_CI_GATE) {
+  const present = REGISTRY_OVERRIDES.filter((name) => process.env[name] !== undefined);
+  if (present.length > 0) {
+    console.error(`check-dep-ages: Refusing ${present.join(", ")} under --ci; unset registry overrides.`);
+    process.exit(2);
+  }
 }
 const ROOT = ROOT_OVERRIDE ?? join(dirname(fileURLToPath(import.meta.url)), "..");
 const REGISTRY = process.env.TPS_DEP_AGES_REGISTRY ?? "https://registry.npmjs.org";
