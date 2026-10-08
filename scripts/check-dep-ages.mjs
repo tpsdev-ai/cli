@@ -2,7 +2,7 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Checks non-workspace bun.lock resolutions against bunfig.toml's minimumReleaseAge.
+ * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *

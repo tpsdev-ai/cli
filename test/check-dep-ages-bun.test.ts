@@ -1,7 +1,7 @@
 import { expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,7 @@ import { collectResolvedDeps, parseBunLock } from "../scripts/lib/check-dep-ages
 const GATE = fileURLToPath(new URL("../scripts/check-dep-ages.mjs", import.meta.url));
 const NAME = "@tpsdev-ai/age-fixture";
 
-async function checkResolution(spec: string, expectedVersion: string, expectedGateExit: number) {
+async function checkResolution(spec: string, expectedVersion: string | null) {
   const root = mkdtempSync(join(tmpdir(), "age-bun-"));
   let server: ReturnType<typeof Bun.serve> | undefined;
   try {
@@ -68,8 +68,19 @@ async function checkResolution(spec: string, expectedVersion: string, expectedGa
       cwd: project, env, stdout: "pipe", stderr: "pipe", timeout: 30000,
     });
     const installOutput = await new Response(install.stdout).text() + await new Response(install.stderr).text();
-    expect({ exit: await install.exited, output: installOutput }).toMatchObject({ exit: 0 });
-    expect(collectResolvedDeps(parseBunLock(readFileSync(join(project, "bun.lock"), "utf8")))).toEqual([
+    const installExit = await install.exited;
+    const lockPath = join(project, "bun.lock");
+    if (expectedVersion === null) {
+      expect(installExit).not.toBe(0);
+      expect(installOutput).toContain("blocked by minimum-release-age: 604800 seconds");
+      expect(installOutput).toContain(NAME);
+      expect(installOutput).toContain(spec);
+      const deps = existsSync(lockPath) ? collectResolvedDeps(parseBunLock(readFileSync(lockPath, "utf8"))) : [];
+      expect(deps).not.toContainEqual({ name: NAME, version: spec });
+      return;
+    }
+    expect({ exit: installExit, output: installOutput }).toMatchObject({ exit: 0 });
+    expect(collectResolvedDeps(parseBunLock(readFileSync(lockPath, "utf8")))).toEqual([
       { name: NAME, version: expectedVersion },
     ]);
     expect(requests).toContain(`/tar/${expectedVersion}.tgz`);
@@ -78,8 +89,7 @@ async function checkResolution(spec: string, expectedVersion: string, expectedGa
       stdout: "pipe", stderr: "pipe", timeout: 30000,
     });
     const output = await new Response(gate.stdout).text() + await new Response(gate.stderr).text();
-    expect({ exit: await gate.exited, output }).toMatchObject({ exit: expectedGateExit });
-    if (expectedGateExit === 1) expect(output).toContain(`${NAME}@${expectedVersion}`);
+    expect({ exit: await gate.exited, output }).toMatchObject({ exit: 0 });
   } finally {
     server?.stop(true);
     rmSync(root, { recursive: true, force: true });
@@ -87,9 +97,9 @@ async function checkResolution(spec: string, expectedVersion: string, expectedGa
 }
 
 it("Bun selects an aged version for a fresh range and the lock gate accepts it", async () => {
-  await checkResolution("^1.0.0", "1.0.0", 0);
+  await checkResolution("^1.0.0", "1.0.0");
 }, 60000);
 
-it("Bun installs a young exact pin and the lock gate rejects it", async () => {
-  await checkResolution("1.1.0", "1.1.0", 1);
+it("Bun refuses a young exact pin and writes no lock entry for it", async () => {
+  await checkResolution("1.1.0", null);
 }, 60000);

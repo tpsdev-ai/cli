@@ -1,5 +1,5 @@
-- **Add a 7-day release-age gate for fresh range resolutions and locked non-workspace versions.**
+- **Add a 7-day release-age gate for dependency resolutions and locked external versions.**
 
-  Bun filters fresh range resolutions. `scripts/check-dep-ages.mjs` checks locked
-  non-workspace versions; young versions require a dated exception in
+  Bun refuses young versions at resolution time. `scripts/check-dep-ages.mjs` checks every
+  external version in `bun.lock`; young versions require a dated exception in
   `docs/dep-age-exceptions.md`. Invalid exception lines fail the gate.

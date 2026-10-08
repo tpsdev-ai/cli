@@ -15,7 +15,7 @@
 # (a launch-time check, not an OS boundary: a forged marker and token, or code
 # that ignores HOME, can still reach the real home — cli#434).
 
-# Bun filters fresh range resolutions; exact pins are checked by the CI lock gate.
+# Bun refuses young versions at resolution time; CI checks external versions in bun.lock.
 [install]
 minimumReleaseAge = 604800
 

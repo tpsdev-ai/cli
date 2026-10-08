@@ -1,6 +1,6 @@
 # Dependency release-age exceptions
 
-`scripts/check-dep-ages.mjs` checks non-workspace locked versions against
+`scripts/check-dep-ages.mjs` checks every external version in `bun.lock` against
 `[install] minimumReleaseAge` in `bunfig.toml`.
 
 Add one line per exception under the `## Exceptions` heading below, in this
