@@ -66,6 +66,11 @@ for (const name of ["writeFileSync", "openSync", "linkSync", "appendFileSync", "
   };
 }
 
+const { stubFlairHandler } = await import("./stub-flair.ts");
+const seeds = Object.fromEntries(Object.entries(JSON.parse(process.env.TPS_FLAIR_TEST_SEEDS)).map(([id, seed]) => [id, Buffer.from(seed, "base64")]));
+const handler = stubFlairHandler(seeds);
+globalThis.fetch = async (input, init) => handler(new Request(input, init));
+
 const [agent, source] = process.argv.slice(2);
 const mod = await import(process.env.TPS_PROMOTE_MODULE);
 const result = await mod.promote(agent, source);

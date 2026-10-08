@@ -1364,10 +1364,17 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   //    re-verification, is quarantined, not shown. Acked history never reaches
   //    this branch.
   for (const f of listMessageFiles(inbox.cur)) {
-    try { if (mailboxReplayStore(inbox.root).hasPendingFile(f)) continue; } catch { continue; }
     const full = join(inbox.cur, f);
     let msg: MailMessage;
-    try { msg = readMessageFile(full); } catch { continue; }
+    try {
+      msg = readMessageFile(full);
+      const replay = mailboxReplayStore(inbox.root);
+      if (replay.hasPendingFile(f) && (
+        !msg.envelopeId || !replay.hasPendingPlacement(msg.envelopeId, f) ||
+        !hasCommittedMessageId(inbox.root, msg.envelopeId) ||
+        !isConfirmedAbsent(join(inbox.fresh, f)) || !isConfirmedAbsent(join(inbox.dlq, f))
+      )) continue;
+    } catch { continue; }
     if (msg.read || msg.nackedAt) continue;
     if (msg.retryAfter && Date.parse(msg.retryAfter) > nowMs) continue;
     if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
@@ -1379,13 +1386,22 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       continue;
     }
     if (!recovered.ok) continue; // quarantined
-    const result = updateExistingRecord<MailMessage>(full, (fresh) => {
-      if (fresh.read || fresh.ackedAt || fresh.nackedAt) return null;
-      if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
-      if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
-      return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
-    }, { snapshot: recovered.snapshot, nonBlocking: true });
-    if (result.status === "updated") messages.push(result.record);
+    try {
+      const result = updateExistingRecord<MailMessage>(full, (fresh) => {
+        if (fresh.read || fresh.ackedAt || fresh.nackedAt) return null;
+        if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
+        if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
+        const replay = mailboxReplayStore(inbox.root);
+        if (replay.hasPendingFile(f)) {
+          if (!fresh.envelopeId || !replay.hasPendingPlacement(fresh.envelopeId, f) ||
+            !hasCommittedMessageId(inbox.root, fresh.envelopeId) ||
+            !isConfirmedAbsent(join(inbox.fresh, f)) || !isConfirmedAbsent(join(inbox.dlq, f))) return null;
+          replay.finishPlacement(fresh.envelopeId, f);
+        }
+        return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
+      }, { snapshot: recovered.snapshot, nonBlocking: true });
+      if (result.status === "updated") messages.push(result.record);
+    } catch { continue; }
   }
 
   // Best-effort GC: purge acked/expired messages older than 24h on every check

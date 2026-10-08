@@ -107,7 +107,7 @@ test("committed pending recovery uses the cur lease", async () => {
   expect(await mail.checkMessages(agent)).toEqual([]);
 });
 
-test("pending recovery rejects a replanted source after ledger pruning", async () => {
+test("pending recovery rejects a replanted source with a missing ledger entry", async () => {
   const { source, cur, inbox, record, envelope } = pending();
   const replay = mailboxReplayStore(inbox.root);
   replay.recordConsumed(envelope.messageId);
@@ -125,7 +125,7 @@ test("pending recovery rejects a replanted source after ledger pruning", async (
   expect(await mail.checkMessages(agent)).toEqual([]);
 });
 
-test("pending recovery rejects an archived ID after ledger pruning", async () => {
+test("pending recovery rejects an archived ID with a missing ledger entry", async () => {
   const { source, cur, inbox, envelope } = pending();
   mailboxReplayStore(inbox.root).recordConsumed(envelope.messageId);
   fs.writeFileSync(join(inbox.root, "consumed.jsonl"), "");
@@ -243,3 +243,17 @@ test("rollback retains the intent until cur absence is confirmed", async () => {
   expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
   expect(await mail.checkMessages(agent)).toEqual([]);
 });
+
+for (const committed of [true, false]) {
+  test(`orphaned pending cur copy ${committed ? "recovers a committed delivery" : "withholds an uncommitted delivery"}`, async () => {
+    const { source, cur, inbox, envelope } = pending();
+    if (committed) mailboxReplayStore(inbox.root).recordConsumed(envelope.messageId);
+    fs.rmSync(source);
+    const copy = JSON.parse(fs.readFileSync(cur, "utf8"));
+    copy.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    fs.writeFileSync(cur, JSON.stringify(copy));
+    expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(committed ? ["hello"] : []);
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(intents(inbox)).toHaveLength(committed ? 0 : 1);
+  });
+}

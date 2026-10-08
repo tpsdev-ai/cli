@@ -7,7 +7,7 @@
  * end state. Every spawned process has a deadline; roots are mkdtemp'd.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +15,7 @@ import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { hasCommittedMessageId } from "@tpsdev-ai/agent";
 import { checkMessages, getInbox, promote } from "../src/utils/mail.js";
-import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
+import { buildSignedEnvelope, stubFlairHandler, writeKeyFile } from "./helpers/stub-flair.js";
 
 const AGENT = "agent-a";
 const FROM = "agent-b";
@@ -41,24 +41,25 @@ interface KillRun {
 describe("promotion at the listed pause points (cli#515)", () => {
   let root: string;
   let keysDir: string;
-  let stub: StubFlair;
+  let fetchMock: ReturnType<typeof spyOn>;
   let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "promote-kill-"));
     keysDir = join(root, "keys");
-    stub = startStubFlair({ [FROM]: FROM_SEED, [AGENT]: AGENT_SEED });
+    const handler = stubFlairHandler({ [FROM]: FROM_SEED, [AGENT]: AGENT_SEED });
+    fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input, init) => handler(new Request(input, init))) as typeof fetch);
     writeKeyFile(keysDir, AGENT, AGENT_SEED);
     savedEnv = {};
     for (const k of ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH"]) savedEnv[k] = process.env[k];
     process.env.HOME = root;
     process.env.TPS_MAIL_DIR = join(root, "mail");
-    process.env.FLAIR_URL = stub.url;
+    process.env.FLAIR_URL = "http://flair.test";
     process.env.FLAIR_KEY_PATH = join(keysDir, `${AGENT}.key`);
   });
 
   afterEach(() => {
-    stub.stop();
+    fetchMock.mockRestore();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
@@ -88,7 +89,8 @@ describe("promotion at the listed pause points (cli#515)", () => {
         HOME: root,
         PATH: process.env.PATH,
         TPS_MAIL_DIR: process.env.TPS_MAIL_DIR,
-        FLAIR_URL: stub.url,
+        FLAIR_URL: process.env.FLAIR_URL,
+        TPS_FLAIR_TEST_SEEDS: JSON.stringify({ [FROM]: FROM_SEED.toString("base64"), [AGENT]: AGENT_SEED.toString("base64") }),
         FLAIR_KEY_PATH: process.env.FLAIR_KEY_PATH,
         TPS_PROMOTE_MODULE: DIST_MAIL,
         TPS_KILL_AT: killAt,
@@ -154,6 +156,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
     { at: "scratch-removal" }, // after the link, before the scratch copy is dropped
     { at: "ledger-commit" }, // after cur/ holds the record, before the consumed id is committed
     { at: "source-removal" }, // after the consumed id is committed, before new/ loses the source
+    { at: "intent-finish" },
   ];
 
   for (const { at } of CASES) {
@@ -163,8 +166,14 @@ describe("promotion at the listed pause points (cli#515)", () => {
       const run = await runAndKillAt(at, source);
       expect(run.reached, `child never reached ${at}; stderr=${run.stderr}`).toBe(true);
       expect(run.signal).toBe("SIGKILL");
+      if (at === "intent-finish") {
+        const inbox = getInbox(AGENT);
+        expect(existsSync(source)).toBe(false);
+        expect(hasCommittedMessageId(inbox.root, messageId)).toBe(true);
+        expect(readdirSync(inbox.root).some((name) => name.startsWith(".placement-") && name.endsWith(".json"))).toBe(true);
+      }
 
-      if (["scratch-removal", "ledger-commit", "source-removal"].includes(at)) {
+      if (["scratch-removal", "ledger-commit", "source-removal", "intent-finish"].includes(at)) {
         expect(await checkMessages(AGENT)).toEqual([]);
         const cur = join(getInbox(AGENT).cur, "record.json");
         const record = JSON.parse(readFileSync(cur, "utf-8"));
