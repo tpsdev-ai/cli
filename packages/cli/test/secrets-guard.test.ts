@@ -606,7 +606,7 @@ describe("audit log append", () => {
 // cli#517 — the guard's own mode flags end at the wrapped command
 // ---------------------------------------------------------------------------
 
-describe("wrapped command flags are data (cli#517)", () => {
+describe("wrapped guard mode flags are data (cli#517)", () => {
   const BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 
   // Each of the guard's own mode flags, and both together.
@@ -662,7 +662,7 @@ describe("wrapped command flags are data (cli#517)", () => {
     }, 20_000);
   }
 
-  test("a flag before the wrapped command still sets the mode", () => {
+  test("bare guard mode flags before the wrapped command set the mode", () => {
     const root = mkdtempSync(join(tmpdir(), "tps-guard-mode-"));
     try {
       const home = join(root, "home");
@@ -708,4 +708,91 @@ describe("wrapped command flags are data (cli#517)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+
+describe("guard mode flag validation", () => {
+  const BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+  const refused = [
+    ...["--check", "--no-guard"].flatMap((flag) =>
+      ["true", "false", "", "invalid"].map((value) => [`${flag}=${value}`])
+    ),
+    ...["--no-check", "--no-no-guard", "--guard", "--noGuard", "--no-noGuard", "--noCheck"].flatMap((flag) =>
+      [[flag], [`${flag}=true`], [`${flag}=false`]]
+    ),
+    ["--check", "--no-guard"],
+    ["--no-guard", "--check"],
+    ["--check", "--check=false"],
+    ["--no-guard", "--no-guard=false"],
+  ];
+  const accepted: { flags: string[]; mode: string; childFlags: string[]; command?: string }[] = [
+    { flags: ["--check"], mode: "check", childFlags: [] },
+    { flags: ["--no-guard"], mode: "bypass", childFlags: [] },
+    { flags: ["--check", "--check"], mode: "check", childFlags: [] },
+    { flags: ["--no-guard", "--no-guard"], mode: "bypass", childFlags: [] },
+    { flags: ["--"], mode: "guard", childFlags: ["--check", "--no-guard"] },
+    { flags: ["--no-guard", "--"], mode: "bypass", childFlags: ["--check"] },
+    { flags: ["--"], mode: "guard", childFlags: ["--no-guard"], command: "--check" },
+    { flags: ["--"], mode: "guard", childFlags: ["--check"], command: "--no-guard" },
+    { flags: ["--no-guard", "--"], mode: "bypass", childFlags: ["--no-guard"], command: "--check" },
+    { flags: [], mode: "guard", childFlags: refused.flat() },
+  ];
+
+  for (const scenario of [
+    ...refused.map((flags) => ({ flags, mode: "refuse", childFlags: [], command: undefined })),
+    ...accepted,
+  ]) {
+    test(`${scenario.flags.join(" ") || "no prefix"}: ${scenario.mode} wrapping ${scenario.command ?? "node"} with child guard flags ${scenario.childFlags.join(" ")}`, () => {
+      const root = mkdtempSync(join(tmpdir(), "tps-guard-validation-"));
+      try {
+        const home = join(root, "home");
+        mkdirSync(home);
+        const argvFile = join(root, "child-argv.jsonl");
+        const child = join(root, "child.mjs");
+        writeFileSync(child,
+          'import { writeFileSync } from "node:fs";\n' +
+          'writeFileSync(process.env.CHILD_ARGV_FILE, JSON.stringify(process.argv.slice(2)));\n' +
+          'console.log("CHILD_RAN ghp_abcdefghijklmnopqrstuvwxyz1234567890");\n'
+        );
+        if (scenario.command) {
+          writeFileSync(join(root, scenario.command), `#!/usr/bin/env node\n${readFileSync(child, "utf-8")}`, { mode: 0o700 });
+        }
+        const childCommand = scenario.command ? [scenario.command] : [process.execPath, child];
+        const result = spawnSync(process.execPath,
+          [BIN, "secrets-guard", ...scenario.flags, ...childCommand, ...scenario.childFlags],
+          {
+            encoding: "utf-8", input: "", timeout: 15_000, killSignal: "SIGKILL", cwd: root,
+            env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_ARGV_FILE: argvFile, PATH: `${root}:${process.env.PATH}` },
+          }
+        );
+        const output = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+        expect(result.error).toBeUndefined();
+        if (scenario.mode === "refuse" || scenario.mode === "check") {
+          expect(() => readFileSync(argvFile)).toThrow();
+          expect(output).not.toContain("CHILD_RAN");
+          if (scenario.mode === "refuse") {
+            expect(result.status).toBe(1);
+            expect(output).toContain("InvalidSecretsGuardMode:");
+            expect(output).not.toContain("matches:");
+          } else {
+            expect(result.status).toBe(0);
+            expect(output).toMatch(/^matches: \d+/);
+          }
+        } else {
+          expect(result.status).toBe(0);
+          expect(JSON.parse(readFileSync(argvFile, "utf-8"))).toEqual(scenario.childFlags);
+          expect(output).toContain("CHILD_RAN");
+          if (scenario.mode === "guard") {
+            expect(output).toContain("[REDACTED-shape]");
+            expect(output).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz1234567890");
+          } else {
+            expect(output).toContain("ghp_abcdefghijklmnopqrstuvwxyz1234567890");
+            expect(output).not.toContain("[REDACTED-shape]");
+          }
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }, 20_000);
+  }
 });

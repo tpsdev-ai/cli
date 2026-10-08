@@ -125,6 +125,14 @@ const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
   secrets: ["window"],
 };
 
+let guardMode: { check: boolean; noGuard: boolean } | undefined;
+try {
+  if (process.argv[2] === "secrets-guard") guardMode = parseGuardMode(process.argv.slice(2));
+} catch (err) {
+  console.error((err as Error).message);
+  process.exit(1);
+}
+
 const helpArgs = parseHelpArgs(process.argv.slice(2));
 
 const launchFlags = readLaunchFlags(process.argv);
@@ -428,22 +436,19 @@ function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: str
   return { requested, argv: parsed };
 }
 
-/**
- * secrets-guard's own mode flags, read only up to the start of the wrapped
- * command. parseHelpArgs closes that region with `--` before the first
- * non-flag argument, so this scan never reads a flag-shaped word out of the
- * wrapped command's arguments. Called with the parsed argv, so `--no-guard`
- * survives as written (meow's own parser treats it as a negation).
- */
 function parseGuardMode(argv: readonly string[]): { check: boolean; noGuard: boolean } {
-  const start = argv.indexOf("secrets-guard");
   let check = false;
   let noGuard = false;
-  for (let i = Math.max(start, 0) + 1; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === "--") break;
+  for (const arg of argv.slice(1)) {
+    if (arg === "--" || !arg.startsWith("-")) break;
     if (arg === "--check") check = true;
     else if (arg === "--no-guard") noGuard = true;
+    else if (/^--(?:check|no-check|no-guard|no-no-guard|guard|noGuard|no-noGuard|noCheck)(?:=|$)/.test(arg)) {
+      throw new Error(`InvalidSecretsGuardMode: ${arg}; use bare --check or --no-guard`);
+    }
+    if (check && noGuard) {
+      throw new Error("InvalidSecretsGuardMode: --check and --no-guard conflict");
+    }
   }
   return { check, noGuard };
 }
@@ -1049,9 +1054,7 @@ async function main() {
     case "secrets-guard": {
       const { runSecretsGuard } = await import("../src/commands/secrets-guard.js");
 
-      // Flags are read only up to the start of the wrapped command; a
-      // flag-shaped word in the wrapped command's arguments is data.
-      const mode = parseGuardMode(helpArgs.argv);
+      const mode = guardMode ?? parseGuardMode(helpArgs.argv.slice(helpArgs.argv.indexOf("secrets-guard")));
 
       // --check mode: read stdin, print match count
       if (mode.check) {
