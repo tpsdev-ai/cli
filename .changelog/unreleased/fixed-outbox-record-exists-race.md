@@ -1,1 +1,1 @@
-- **Outbox queueing treats a record moved by a concurrent drain as absent.** The existence check reads the record once instead of checking and then reading it.
+- **Outbox queueing no longer fails when a concurrent drain moves a record.** The existence check reads the record once instead of checking and then reading it; a record moved from `new/` to `sent/` is found in `sent/` and reported as a duplicate.

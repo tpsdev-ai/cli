@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -151,6 +152,27 @@ describe("outbox", () => {
     expect(count + drainOutbox().length).toBe(1);
     queueOutboxMessage("host", "body", "github-webhook", id);
     expect(drainOutbox()).toEqual([]);
+  });
+
+  test("a record that moves to sent/ between the existence check and the read is a duplicate", () => {
+    const id = "a".repeat(64);
+    expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("queued");
+    const newDir = join(root, ".tps", "outbox", "new");
+    const name = `github-${id}.json`;
+    drainOutbox();
+    expect(existsSync(join(root, ".tps", "outbox", "sent", name))).toBe(true);
+    // The record is visible at new/ to an existence check, then gone when it is read.
+    writeFileSync(join(newDir, name), "{}");
+    const original = fs.readFileSync;
+    const read = spyOn(fs, "readFileSync").mockImplementation(((...args: any[]) => {
+      if (String(args[0]) === join(newDir, name)) throw Object.assign(new Error("moved"), { code: "ENOENT" });
+      return (original as any)(...args);
+    }) as any);
+    try {
+      expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("duplicate");
+    } finally {
+      read.mockRestore();
+    }
   });
 
   test("releaseOutboxRecord removes only that delivery's record, from new/ or sent/", () => {
