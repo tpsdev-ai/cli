@@ -15,5 +15,9 @@
 # (a launch-time check, not an OS boundary: a forged marker and token, or code
 # that ignores HOME, can still reach the real home — cli#434).
 
+# Bun refuses young versions at resolution time; CI checks external versions in bun.lock.
+[install]
+minimumReleaseAge = 604800
+
 [test]
 preload = ["./scripts/home-isolation-preload.ts"]
