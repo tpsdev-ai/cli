@@ -1,0 +1,1 @@
+- **Relay acceptance leaves an inbox record written in another format where it is.** The dedupe scan quarantines a malformed record only when it names a relay delivery and sits in the recipient's own mailbox.
