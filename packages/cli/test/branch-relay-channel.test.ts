@@ -12,6 +12,10 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 import type { TransportChannel, TransportServer, TpsMessage } from "../src/utils/transport.js";
 import { MailDeliverBodySchema, MSG_HEARTBEAT, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
+// The real fs.watch, taken before any test spies on it: each test wraps this
+// one, never whatever fs.watch is at that moment.
+const realWatch = fs.watch;
+
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -87,20 +91,21 @@ describe("branch relay authenticated channels", () => {
     receiverChannels = [];
     acknowledgements = [];
     signals = new Map((["SIGTERM", "SIGINT"] as const).map((signal) => [signal, new Set(process.listeners(signal))]));
-    const watch = fs.watch;
     spyOn(fs, "watch").mockImplementation(((filename: fs.PathLike, listener: fs.WatchListener<string>) => {
-      const watcher = watch(filename, listener);
+      const watcher = realWatch(filename, listener);
       watchers.push(watcher);
       return watcher;
     }) as typeof fs.watch);
   });
 
+  // Idempotent: a second call finds nothing left to close.
   async function stop(): Promise<void> {
+    const running = server;
+    server = undefined;
     for (const channel of channels.splice(0)) await channel.close();
     for (const channel of receiverChannels.splice(0)) await channel.close();
     for (const watcher of watchers.splice(0)) watcher.close();
-    await server?.close();
-    server = undefined;
+    await running?.close();
     for (const [signal, before] of signals) {
       for (const listener of process.listeners(signal)) if (!before.has(listener)) process.removeListener(signal, listener);
     }
@@ -108,13 +113,16 @@ describe("branch relay authenticated channels", () => {
   }
 
   afterEach(async () => {
-    await stop();
-    mock.restore();
-    for (const [key, value] of Object.entries(savedEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+    try {
+      await stop();
+    } finally {
+      mock.restore();
+      for (const [key, value] of Object.entries(savedEnv)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      fs.rmSync(root, { recursive: true, force: true });
     }
-    fs.rmSync(root, { recursive: true, force: true });
   });
 
   for (const transport of ["ws", "tcp"] as const) {
