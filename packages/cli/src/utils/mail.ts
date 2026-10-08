@@ -1022,6 +1022,11 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     if (pendingPlacement) {
       let interrupted: MailMessage | undefined;
       const rejectMismatch = (): PromoteReject => {
+        if (!replay.ownsPendingPlacement(envelope.messageId, filename)) {
+          const reason = `destination already exists: ${filename}`;
+          rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+          return { ok: false, class: "storage-unavailable", reason };
+        }
         mkdirSync(dirs.dlq, { recursive: true });
         writeReasonSidecar(dirs.dlq, filename, "unverified", "placement-copy-mismatch");
         syncMailFile(join(dirs.dlq, `${filename}.reason`));
@@ -1101,7 +1106,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
       scratchCreated = true;
-      replay.beginPlacement(envelope.messageId, filename);
+      replay.beginPlacement(envelope.messageId, filename, scratchPath);
       const placement = placeCurRecord(scratchPath, curPath);
       if (placement.status !== "placed") {
         throw new Error(`destination already exists: ${filename}`);

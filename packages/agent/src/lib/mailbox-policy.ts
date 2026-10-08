@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -222,7 +222,8 @@ const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
  */
 export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
-  beginPlacement(messageId: string, file: string): void;
+  beginPlacement(messageId: string, file: string, sourcePath?: string): void;
+  ownsPendingPlacement(messageId: string, file: string): boolean;
   hasPendingPlacement(messageId: string, file: string): boolean;
   hasPendingFile(file: string): boolean;
   finishPlacement(messageId: string, file: string): void;
@@ -237,7 +238,18 @@ export interface ReplayStore {
 export function mailboxReplayStore(root: string): ReplayStore {
   return {
     isConsumed: (messageId, pendingFile) => isConsumedMessageId(root, messageId, pendingFile),
-    beginPlacement: (messageId, file) => writePlacementIntent(root, messageId, file),
+    beginPlacement: (messageId, file, sourcePath) => writePlacementIntent(root, messageId, file, sourcePath),
+    ownsPendingPlacement: (messageId, file) => {
+      const intent = readPlacementIntent(root, file);
+      if (intent?.messageId !== messageId || !intent.identity) return false;
+      try {
+        const stat = lstatSync(join(root, "cur", file), { bigint: true });
+        return stat.isFile() && stat.dev.toString() === intent.identity.dev && stat.ino.toString() === intent.identity.ino;
+      } catch (err) {
+        if (isMissing(err)) return false;
+        throw err;
+      }
+    },
     hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || readPlacementIntent(root, file) !== null,
     hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
     finishPlacement: (messageId, file) => {
@@ -267,16 +279,25 @@ function quarantinePlacement(path: string): void {
   console.warn(`${err.name}: ${err.message}`);
 }
 
-function parsePlacement(raw: string, path: string): { messageId: string; file: string } | null {
+interface PlacementIntent {
+  messageId: string;
+  file: string;
+  identity?: { dev: string; ino: string };
+}
+
+function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
     const intent = JSON.parse(raw);
     if (typeof intent?.file === "string" && placementIntentPath(join(path, ".."), intent.file) === path
-      && isValidEnvelopeId(intent?.messageId)) return intent;
+      && isValidEnvelopeId(intent?.messageId)
+      && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
+        && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
+        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) return intent;
   } catch {}
   return null;
 }
 
-function readPlacementIntent(root: string, file: string): { messageId: string } | null {
+function readPlacementIntent(root: string, file: string): PlacementIntent | null {
   const path = placementIntentPath(root, file);
   if (existsSync(`${path}.quarantined`)) throw malformedPlacement(path);
   let raw: string;
@@ -297,14 +318,20 @@ function syncDirectory(root: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function writePlacementIntent(root: string, messageId: string, file: string): void {
+function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
   const path = placementIntentPath(root, file);
+  let identity: PlacementIntent["identity"];
+  if (sourcePath !== undefined) {
+    const stat = lstatSync(sourcePath, { bigint: true });
+    if (!stat.isFile()) throw new Error("placement source is not a regular file");
+    identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
+  }
   const tmp = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);
   try {
     try {
-      writeFileSync(fd, JSON.stringify({ messageId, file }));
+      writeFileSync(fd, JSON.stringify({ messageId, file, identity }));
       fsyncSync(fd);
     } finally { closeSync(fd); }
     renameSync(tmp, path);

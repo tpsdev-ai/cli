@@ -49,7 +49,7 @@ function pending() {
     ...record, body: envelope.body, envelopeId: envelope.messageId, envelope,
     checkedOutAt: new Date().toISOString(), checkedOutBy: agent, deliveryAttempts: 1,
   }));
-  mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json");
+  mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json", scratch);
   fs.linkSync(scratch, cur);
   return fixture;
 }
@@ -90,6 +90,43 @@ for (const check of ["signature", "binding", "source equality", "record identity
     expect(await mail.checkMessages(agent)).toEqual([]);
     expect(fs.statSync(dlq).mtimeMs).toBe(before);
     expect(fs.readdirSync(inbox.dlq).filter((name) => name.endsWith(".json"))).toEqual(["record.json"]);
+  });
+}
+
+test("an unconsumed filename collision remains retryable after repeated checks", async () => {
+  const { source, cur, inbox } = plant("delivered-id");
+  expect((await mail.checkMessages(agent)).map((msg) => msg.body)).toEqual(["hello"]);
+  const before = fs.readFileSync(cur, "utf8");
+  const envelope = buildSignedEnvelope("kern", agent, "different", { kern: seed }, { messageId: "collision-id" });
+  fs.writeFileSync(source, JSON.stringify({
+    id: "collision-record", from: "kern", to: agent, body: JSON.stringify(envelope), timestamp: envelope.timestamp,
+  }));
+  for (const _ of [0, 1]) {
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(fs.readFileSync(cur, "utf8")).toBe(before);
+    expect(fs.readFileSync(join(inbox.dlq, "record.json.reason"), "utf8")).toContain("class: storage-unavailable");
+    expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+  }
+});
+
+for (const binding of ["different inode", "legacy intent"] as const) {
+  test(`pending mismatch with ${binding} preserves a pre-existing cur collision`, async () => {
+    const { source, cur, inbox, envelope, record } = plant();
+    const collision = JSON.stringify({ ...record, id: "pre-existing", body: "other" });
+    fs.writeFileSync(cur, collision);
+    const scratch = join(inbox.tmp, "record.json.promote");
+    fs.writeFileSync(scratch, JSON.stringify(record));
+    mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json", binding === "different inode" ? scratch : undefined);
+    for (const path of [source, join(inbox.dlq, "record.json")]) {
+      const result = await mail.promote(agent, path);
+      expect(result.ok).toBe(false);
+      if (result.ok) throw new Error("expected refusal");
+      expect(result.class).toBe("storage-unavailable");
+      expect(fs.readFileSync(cur, "utf8")).toBe(collision);
+      expect(hasCommittedMessageId(inbox.root, envelope.messageId)).toBe(false);
+      expect(fs.readFileSync(join(inbox.dlq, "record.json.reason"), "utf8")).toContain("class: storage-unavailable");
+      expect(intents(inbox)).toHaveLength(1);
+    }
   });
 }
 
