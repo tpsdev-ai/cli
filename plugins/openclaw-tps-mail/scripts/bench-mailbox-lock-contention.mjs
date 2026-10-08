@@ -192,6 +192,7 @@ async function roleMain() {
     return;
   }
   const calls = [];
+  const iterations = [];
   const removals = [];
   if (F.role === "writer") {
     for (let j = 0; j < positive("writes", 10); j++) {
@@ -214,34 +215,40 @@ async function roleMain() {
     if (holder !== null && (!Number.isFinite(holder) || holder < 0)) throw new Error("invalid holder");
     for (let j = 0; j < positive("sweeps", 8); j++) {
       seedAgedBatch(mailDir, seed, j);
-      const start = nowMs();
+      const iterationStart = nowMs();
       for (;;) {
         try {
+          let callLatency;
           if (holder !== null) {
+            const callStart = nowMs();
             const lock = acquireMailLockSync(store, { timeoutMs: 0 });
             if (!lock) { await pause(RETRY_MS); continue; }
             try {
               if (holder > 0) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, holder);
             } finally { lock.release(); }
+            callLatency = nowMs() - callStart;
           } else {
             const failed = metrics.failed;
+            const callStart = nowMs();
             const res = sweepTerminalObligations(mailDir, AGENT, RETENTION_DAYS, SWEEP_LOG);
+            callLatency = nowMs() - callStart;
             if (metrics.failed > failed) { await pause(RETRY_MS); continue; }
             removals.push(res.removed);
             if (res.removed !== seed || res.receiptsRemoved !== seed || res.unreadable || res.receiptsUnreadable) {
               throw new Error(`incomplete sweep: ${JSON.stringify(res)}`);
             }
           }
+          calls.push(callLatency);
           break;
         } catch (err) {
           metrics.errors++;
           throw new Error(`${holder !== null ? "holder" : "sweep"} iteration failed: ${String(err)}`, { cause: err });
         }
       }
-      calls.push(nowMs() - start);
+      iterations.push(nowMs() - iterationStart);
     }
   }
-  writeFileSync(F.out, JSON.stringify({ ...metrics, calls, removals }), { flag: "wx" });
+  writeFileSync(F.out, JSON.stringify({ ...metrics, calls, iterations, removals }), { flag: "wx" });
 }
 
 export function startChild(role, opts, timeoutMs) {
@@ -266,7 +273,7 @@ function samples(values, count, label) {
 }
 
 export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder, launch = startChild) {
-  const result = { writerWaits: [], writerCalls: [], sweepWaits: [], sweepCalls: [], sweepHolds: [],
+  const result = { writerWaits: [], writerCalls: [], sweepWaits: [], sweepCalls: [], sweepIterations: [], sweepHolds: [],
     writerAcquisitions: 0, writerCollisions: 0, sweepAcquisitions: 0, sweepCollisions: 0, sweepContendedAttempts: 0 };
   for (let round = 0; round < rounds; round++) {
     const base = safeTempBase();
@@ -321,10 +328,13 @@ export async function measure(n, rounds, writes, sweeps, seed, timeoutMs, holder
           result.writerAcquisitions += r.acquisitions;
           result.writerCollisions += r.collisions;
         } else {
+          samples(r.iterations, count, "iteration");
+          if (r.iterations.some((v, i) => v < r.calls[i])) throw new Error("iteration shorter than call");
           if (holder === undefined && (!Array.isArray(r.removals) || r.removals.length !== sweeps || r.removals.some((v) => v !== seed))) {
             throw new Error("invalid sweep removals");
           }
           result.sweepCalls.push(...r.calls);
+          result.sweepIterations.push(...r.iterations);
           result.sweepWaits.push(...r.waits);
           result.sweepAcquisitions += r.acquisitions;
           result.sweepCollisions += r.collisions;
@@ -372,11 +382,11 @@ async function main() {
     results[n] = { rounds, writerLockWaitMs: stats(r.writerWaits), wholeWriteLatencyMs: stats(r.writerCalls),
       writerAcquisitions: r.writerAcquisitions, writerCollisions: r.writerCollisions,
       ...(F.holder === undefined ? {
-        sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls), sweepLockWaitMs: stats(r.sweepWaits),
+        sampledSweepOwnerSpanMs: stats(r.sweepHolds), sweepCallLatencyMs: stats(r.sweepCalls), sweepIterationLatencyMs: stats(r.sweepIterations), sweepLockWaitMs: stats(r.sweepWaits),
         sweepAcquisitions: r.sweepAcquisitions, sweepCollisions: r.sweepCollisions,
         sweepContendedAttempts: r.sweepContendedAttempts,
       } : {
-        sampledHolderOwnerSpanMs: stats(r.sweepHolds), holderCallLatencyMs: stats(r.sweepCalls), holderLockWaitMs: stats(r.sweepWaits),
+        sampledHolderOwnerSpanMs: stats(r.sweepHolds), holderCallLatencyMs: stats(r.sweepCalls), holderIterationLatencyMs: stats(r.sweepIterations), holderLockWaitMs: stats(r.sweepWaits),
         holderAcquisitions: r.sweepAcquisitions, holderCollisions: r.sweepCollisions,
         holderContendedAttempts: r.sweepContendedAttempts,
       }) };

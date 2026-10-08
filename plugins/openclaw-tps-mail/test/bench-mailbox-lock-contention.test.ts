@@ -41,7 +41,7 @@ test("benchmark runs real writers, sweep and watcher", async () => {
 }, 15000);
 
 for (const holder of [undefined, 10]) {
-  test(`${holder === undefined ? "sweep" : "holder"} retries and counts a busy lock`, async () => {
+  test(`${holder === undefined ? "sweep" : "holder"} times the successful call separately from the iteration including busy retries`, async () => {
     let release: (() => void) | undefined;
     const launch = (role: string, opts: any, timeout: number) => {
       if (role !== "sweeper") return startChild(role, opts, timeout);
@@ -76,6 +76,12 @@ for (const holder of [undefined, 10]) {
     };
     try {
       const result = await measure(1, 1, 1, 1, 200, 10000, holder, launch);
+      expect(result.sweepCalls).toHaveLength(1);
+      expect(result.sweepIterations).toHaveLength(1);
+      const failedWait = result.sweepWaits.slice(0, -1).reduce((sum: number, wait: number) => sum + wait, 0);
+      expect(result.sweepCalls[0]).toBeGreaterThanOrEqual(result.sweepWaits.at(-1));
+      if (holder !== undefined) expect(result.sweepCalls[0]).toBeGreaterThanOrEqual(holder);
+      expect(result.sweepIterations[0] - result.sweepCalls[0]).toBeGreaterThanOrEqual(failedWait + result.sweepContendedAttempts);
       expect(result.sweepAcquisitions).toBe(1);
       expect(result.sweepContendedAttempts).toBeGreaterThan(0);
       expect(result.sweepCollisions).toBe(result.sweepContendedAttempts);
@@ -85,23 +91,28 @@ for (const holder of [undefined, 10]) {
   }, 15000);
 }
 
-test("holder JSON uses holder keys", () => {
-  const result = run("--n=1", "--rounds=1", "--writes=1", "--sweeps=1", "--seed=200", "--holder=10", "--timeout=10", "--json");
-  expect(result.exitCode).toBe(0);
-  const line = result.stdout.toString().split("\n").find((line) => line.startsWith("JSON "))!;
-  const data = JSON.parse(line.slice(5))["1"];
-  expect(data.holderAcquisitions).toBe(1);
-  expect(data.holderCollisions).toBeGreaterThanOrEqual(0);
-  expect(data.sampledHolderOwnerSpanMs.n).toBeGreaterThan(0);
-  expect(data.holderCallLatencyMs.n).toBe(1);
-  expect(Object.keys(data).some((key) => /sweep/i.test(key))).toBe(false);
+for (const holder of [undefined, 10]) {
+  test(`${holder === undefined ? "sweep" : "holder"} JSON reports call and iteration latency`, () => {
+    const result = run("--n=1", "--rounds=1", "--writes=1", "--sweeps=1", "--seed=200", ...(holder === undefined ? [] : ["--holder=10"]), "--timeout=10", "--json");
+    expect(result.exitCode).toBe(0);
+    const line = result.stdout.toString().split("\n").find((line) => line.startsWith("JSON "))!;
+    const data = JSON.parse(line.slice(5))["1"];
+    const prefix = holder === undefined ? "sweep" : "holder";
+    expect(data[`${prefix}Acquisitions`]).toBe(1);
+    expect(data[`${prefix}Collisions`]).toBeGreaterThanOrEqual(0);
+    expect(data[holder === undefined ? "sampledSweepOwnerSpanMs" : "sampledHolderOwnerSpanMs"].n).toBeGreaterThan(0);
+    expect(data[`${prefix}CallLatencyMs`].n).toBe(1);
+    expect(data[`${prefix}IterationLatencyMs`].n).toBe(1);
+    expect(data[`${prefix}IterationLatencyMs`].max).toBeGreaterThanOrEqual(data[`${prefix}CallLatencyMs`].max);
+    expect(Object.keys(data).some((key) => (holder === undefined ? /holder/i : /sweep/i).test(key))).toBe(false);
 }, 20000);
+}
 
-for (const fault of ["exit", "missing-output", "writer-error", "missing-samples", "failed-acquisition", "removals", "missing-watcher", "empty-watcher"]) {
+for (const fault of ["exit", "missing-output", "writer-error", "missing-samples", "missing-iterations", "iteration-shorter-than-call", "failed-acquisition", "removals", "missing-watcher", "empty-watcher"]) {
   test(`benchmark rejects ${fault}`, async () => {
     const launch = (role: string, opts: any, timeout: number) => {
       const job = startChild(role, opts, timeout);
-      const victim = fault.includes("watcher") ? "watch" : fault === "removals" ? "sweeper" : "writer";
+      const victim = fault.includes("watcher") ? "watch" : ["removals", "missing-iterations", "iteration-shorter-than-call"].includes(fault) ? "sweeper" : "writer";
       if (role !== victim) return job;
       const done = job.done.then((status: any) => {
         if (fault === "exit") return { ...status, code: 7 };
@@ -110,6 +121,8 @@ for (const fault of ["exit", "missing-output", "writer-error", "missing-samples"
           const data = JSON.parse(readFileSync(opts.flags.out, "utf8"));
           if (fault === "writer-error") data.errors = 1;
           if (fault === "missing-samples") data.calls.pop();
+          if (fault === "missing-iterations") data.iterations.pop();
+          if (fault === "iteration-shorter-than-call") data.iterations[0] = data.calls[0] / 2;
           if (fault === "failed-acquisition") data.failed = 1;
           if (fault === "removals") data.removals[0] = 0;
           writeFileSync(opts.flags.out, JSON.stringify(fault === "empty-watcher" ? [] : data));
