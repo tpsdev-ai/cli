@@ -1,35 +1,21 @@
 #!/usr/bin/env node
 import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
-import { cliFlagDefinitions, cliOptionConsumesValue, cliOptionTypes } from "../src/utils/cli-flags.js";
-import { parseGuardMode } from "../src/utils/secrets-guard-args.js";
+import { cliFlagDefinitions } from "../src/utils/cli-flags.js";
+import { parseCliArgs } from "../src/utils/cli-args.js";
 import { enforceLaunchControl, readLaunchFlags } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
 
 
-const RAW_VALUE_FLAGS: Record<string, readonly string[]> = {
-  init: ["model", "flair-url"],
-  agent: ["model", "flair-url", "display-name", "soul-file", "repo", "message", "pr-title", "scope-warn-threshold"],
-  mail: ["type", "retry-after", "max-age", "pr", "status"],
-  facts: ["command", "args"],
-  memory: ["focus", "tag", "older-than", "flair-url", "durability"],
-  bridge: ["adapter", "openclaw-url", "discord-token", "discord-token-file", "discord-channel", "webhook-url", "bridge-agent-id", "default-agent", "mail-dir", "bot-user-id", "require-mention", "discord-poll-ms", "discord-prompt"],
-  skill: ["flair-url", "include-rules", "rule-name-format", "registry"],
-  flair: ["flair-dir", "auth-mode", "auth-path", "flair-url"],
-  secrets: ["window"],
-};
-
-let guardMode: { check: boolean; noGuard: boolean } | undefined;
+let helpArgs: ReturnType<typeof parseCliArgs>;
 try {
-  if (process.argv[2] === "secrets-guard") guardMode = parseGuardMode(process.argv.slice(2));
+  helpArgs = parseCliArgs(process.argv.slice(2));
 } catch (err) {
   console.error((err as Error).message);
   process.exit(1);
 }
-
-const helpArgs = parseHelpArgs(process.argv.slice(2));
 
 const launchFlags = readLaunchFlags(process.argv);
 if (launchFlags.refusal) enforceLaunchControl({ argv: process.argv });
@@ -274,60 +260,8 @@ const USAGE: Record<string, string> = {
   pulse: "Usage: tps pulse [start|status|list] [--json] [--dry-run] [--interval <seconds>] [--repo <owner/name>]",
 };
 
-/** `--` ends TPS help detection; option values and command tails are data. */
-function parseHelpArgs(argv: readonly string[]): { requested: boolean; argv: string[] } {
-  const parsed: string[] = [];
-  const positionals: string[] = [];
-  let requested = false;
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    const [cmd, action] = positionals;
-    if (arg === "--") {
-      parsed.push(...argv.slice(i));
-      break;
-    }
-    if ((cmd === "secrets-guard" && !arg.startsWith("-")) || (cmd === "office" && action === "exec" && positionals.length === 3)) {
-      parsed.push("--", ...argv.slice(i));
-      break;
-    }
-    if ((cmd === "mail" && action === "watch" && arg === "--exec") ||
-        (cmd === "agent" && action === "run" && arg === "--message")) {
-      parsed.push(arg, "--", ...argv.slice(i + 1));
-      break;
-    }
-    parsed.push(arg);
-    if (arg === "--help" || arg === "-h") {
-      requested = true;
-      continue;
-    }
-    const rawValue = RAW_VALUE_FLAGS[cmd ?? ""]?.some((name) => arg === `--${name}`);
-    const author = cmd === "agent" && action === "commit" && arg === "--author";
-    const branch = cmd === "agent" && action === "commit" && arg === "--branch";
-    if (cliOptionConsumesValue(arg, argv[i + 1]) || rawValue || author || branch || (cmd === "secrets" && arg === "-n")) {
-      if (argv[i + 1] === "--") {
-        parsed.push(...argv.slice(i + 1));
-        break;
-      }
-      if (!author && (argv[i + 1] === "-h" || argv[i + 1] === "--help")) {
-        parsed[parsed.length - 1] = `${arg}=${argv[i + 1]}`;
-      } else {
-        parsed.push(...argv.slice(i + 1, i + (author ? 3 : 2)));
-      }
-      i += author ? 2 : 1;
-    } else if (cliOptionTypes.get(arg) === "boolean") {
-      if (argv[i + 1] === "true" || argv[i + 1] === "false") parsed.push(argv[++i]);
-    } else if (cmd !== "secrets-guard" && arg.startsWith("-") && !arg.startsWith("--no-") && !arg.includes("=") &&
-               argv[i + 1] && !argv[i + 1].startsWith("-")) {
-      parsed.push(argv[++i]);
-    } else if (!arg.startsWith("-")) {
-      positionals.push(arg);
-    }
-  }
-  return { requested, argv: parsed };
-}
-
 async function main() {
-  if (process.argv.includes("--version") || process.argv.includes("-v")) {
+  if (helpArgs.versionRequested) {
     // Version is injected at build time to avoid runtime package.json reads,
     // which fail in compiled Bun binaries (the $bunfs path is inaccessible).
     // See: https://bun.sh/docs/bundler/executables#embed-a-file
@@ -927,7 +861,7 @@ async function main() {
     case "secrets-guard": {
       const { runSecretsGuard } = await import("../src/commands/secrets-guard.js");
 
-      const mode = guardMode ?? parseGuardMode(helpArgs.argv.slice(helpArgs.argv.indexOf("secrets-guard")));
+      const mode = helpArgs.guardMode;
 
       // --check mode: read stdin, print match count
       if (mode.check) {

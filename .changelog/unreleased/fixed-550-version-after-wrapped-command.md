@@ -1,0 +1,1 @@
+- **Scope TPS version detection to its argument prefix (Closes #550).**

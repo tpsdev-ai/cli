@@ -42,6 +42,8 @@
  */
 
 import meow from "meow";
+import { launchFlagDefinitions } from "./cli-flags.js";
+export { launchFlagDefinitions } from "./cli-flags.js";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -1214,10 +1216,6 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   if (command === "office") return sub === "connect";
   return false;
 }
-
-export const launchFlagDefinitions = {
-  sandboxRequired: { type: "boolean" as const, default: false },
-};
 
 export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<string, unknown>): {
   sandboxRequired: boolean; noSandbox: boolean; refusal?: string;
