@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  closeListener,
   type BranchTarget,
   type TransportChannel,
   type TransportServer,
@@ -163,9 +164,15 @@ class WsNoiseServer implements TransportServer {
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve) => this.wss.close(() => resolve()));
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer.close((err) => (err ? reject(err) : resolve()));
+    await closeListener({
+      // Settles with a live host channel: terminate the accepted sockets and
+      // stop the WSS before the HTTP server's own close, which otherwise waits
+      // on them (and, under bun, never settles after a server-side close).
+      terminate: () => {
+        for (const client of this.wss.clients) client.terminate();
+        this.wss.close();
+      },
+      server: this.httpServer,
     });
   }
 }
@@ -356,10 +363,16 @@ export async function listenForJoinWs(
   // Wrap as a TransportServer (for close(); onConnection not used in join mode)
   const serverWrapper: TransportServer = {
     onConnection: () => {},
+    // Settles with a peer connected, and at once when already closed: terminate
+    // the accepted sockets, then force-stop the HTTP server rather than wait on
+    // them.
     close: () =>
-      new Promise<void>((resolve, reject) => {
-        wss.close();
-        httpServer.close((err) => (err ? reject(err) : resolve()));
+      closeListener({
+        terminate: () => {
+          for (const client of wss.clients) client.terminate();
+          wss.close();
+        },
+        server: httpServer,
       }),
   };
 
@@ -498,18 +511,12 @@ export async function listenForHostWs(
     // so the `close` callback that follows reports ERR_SERVER_NOT_RUNNING,
     // which here means "closed".
     close: () =>
-      new Promise<void>((resolve, reject) => {
-        for (const client of wss.clients) client.terminate();
-        wss.close();
-        if (!httpServer.listening) {
-          resolve();
-          return;
-        }
-        httpServer.closeAllConnections();
-        httpServer.close((err) => {
-          if (err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(err);
-          else resolve();
-        });
+      closeListener({
+        terminate: () => {
+          for (const client of wss.clients) client.terminate();
+          wss.close();
+        },
+        server: httpServer,
       }),
   };
 }
