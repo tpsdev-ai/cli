@@ -32,7 +32,10 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
-/** The line `office connect` prints for each accepted delivery. */
+/**
+ * Newly published inbox records are announced; resends and dead-lettered
+ * write failures are ACKed without a line.
+ */
 const ANNOUNCEMENT = "Mail received";
 
 const ENV_KEYS = ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"];
@@ -219,10 +222,7 @@ describe("tps office connect, run as a process against a local relay", () => {
     await deliver(channel, second);
     await waitFor("the second announcement", () => announcements() >= 2);
 
-    // The command prints a delivery's announcement before it sends that
-    // delivery's ACK, so every line for these three deliveries was written
-    // before the last ACK arrived. Once the process has closed, all of them
-    // have been read: the count is exact.
+    // The logging call precedes the ACK. After the process closes, count its output.
     await stopCommand();
     expect(announcements(), `stdout:\n${stdout}\nstderr:\n${stderr}`).toBe(2);
     expect(jsonFiles(getInbox("local").fresh).length).toBe(2);
@@ -244,7 +244,7 @@ describe("office connect announcement follows local acceptance", () => {
    */
   let loopDetached = false;
   let acks: TpsMessage[];
-  /** The inbox record count observed each time an accepted delivery is announced. */
+  /** The inbox record count observed at each announcement. */
   let announced: number[];
 
   beforeEach(async () => {
@@ -324,7 +324,7 @@ describe("office connect announcement follows local acceptance", () => {
     for (let i = 0; i < 200 && acks.length === 0; i++) await Bun.sleep(5);
   }
 
-  test("an accepted delivery is announced after its inbox record is published", async () => {
+  test("a new delivery is announced after its inbox record is published", async () => {
     deliver(body("hello"));
     await settled();
     expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
@@ -362,7 +362,7 @@ describe("office connect announcement follows local acceptance", () => {
     expect(announced).toEqual([1]);
   });
 
-  test("a delivery whose inbox write fails is quarantined and is not announced", async () => {
+  test("a delivery whose inbox write fails is dead-lettered and is not announced", async () => {
     const inbox = getInbox("local");
     const write = fs.writeFileSync;
     let failed = false;
