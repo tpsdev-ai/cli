@@ -420,6 +420,16 @@ const MailRecordSchema = RelayPayloadSchema.extend({
   relayWireTo: MailDeliverBodySchema.shape.to.optional(),
 }).passthrough();
 
+/**
+ * Records without a `relayDelivery` property stay in place (cli#560).
+ * Malformed records with it are quarantined only in the recipient's mailbox,
+ * even when its value is invalid (e.g. null).
+ */
+function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
+  if (parsed !== null && typeof parsed === "object") return (parsed as Record<string, unknown>).relayDelivery !== undefined;
+  return /"relayDelivery"\s*:/.test(raw);
+}
+
 export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to): string | undefined {
   let root: string;
   try { root = mailboxRoot(agent); } catch (error) {
@@ -438,6 +448,11 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
       }
     }
   }
+  // The scan reads every mailbox — a same-id resend may name a different
+  // recipient, and its conflict must still be found. But it may only MOVE a
+  // record out of the recipient's own mailbox (cli#560): a record in any other
+  // mailbox that is not this delivery's is left exactly where it is.
+  const recipientRoot = root;
   for (const root of roots) {
     mkdirMailDirectory(root);
     const lock = acquireMailLockSync(root);
@@ -456,12 +471,22 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
             console.error(`[mail] ${message}`);
             throw new Error(message, { cause: error });
           }
-          let record: MailMessage;
+          let record: MailMessage | undefined;
+          let parsed: unknown;
+          let parseError: unknown;
           try {
-            record = JSON.parse(raw) as MailMessage;
-            MailRecordSchema.parse(record);
+            parsed = JSON.parse(raw);
+            MailRecordSchema.parse(parsed);
+            record = parsed as MailMessage;
           } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
+            parseError = error;
+          }
+          if (!record) {
+            // cli#560: records without a relayDelivery property stay in place.
+            // Malformed records with it are quarantined only in the recipient's
+            // own mailbox, even when its value is invalid (e.g. null).
+            if (root !== recipientRoot || !carriesRelayDelivery(parsed, raw)) continue;
+            const reason = parseError instanceof Error ? parseError.message : String(parseError);
             console.error(`[mail] unreadable record ${source}: ${reason}`);
             const quarantine = join(root, "quarantine");
             mkdirMailDirectory(quarantine);
