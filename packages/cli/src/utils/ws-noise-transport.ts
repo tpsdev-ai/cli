@@ -488,10 +488,28 @@ export async function listenForHostWs(
 
   return {
     onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },
+    // Settles once the listener has stopped, with or without a live host
+    // channel, and resolves at once when it is already closed. `wss.close()`
+    // leaves accepted sockets open when the HTTP server is external, and a
+    // graceful `httpServer.close()` waits for them: under bun it never settles
+    // after any server-initiated socket close (a rejected handshake, a frame
+    // that fails to decrypt, a superseded host channel). Terminate the sockets
+    // and force-stop the server first; bun's `closeAllConnections()` stops it,
+    // so the `close` callback that follows reports ERR_SERVER_NOT_RUNNING,
+    // which here means "closed".
     close: () =>
       new Promise<void>((resolve, reject) => {
+        for (const client of wss.clients) client.terminate();
         wss.close();
-        httpServer.close((err) => (err ? reject(err) : resolve()));
+        if (!httpServer.listening) {
+          resolve();
+          return;
+        }
+        httpServer.closeAllConnections();
+        httpServer.close((err) => {
+          if (err && (err as NodeJS.ErrnoException).code !== "ERR_SERVER_NOT_RUNNING") reject(err);
+          else resolve();
+        });
       }),
   };
 }
