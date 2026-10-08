@@ -134,11 +134,7 @@ function mailboxRoot(agent: string): string {
   return existsSync(branchMailRoot) ? branchMailRoot : join(mailDirPath(), agent);
 }
 
-/**
- * The mailbox root relay acceptance locks and publishes into: `agent`'s own
- * mailbox, or the host-level `.undeliverable` tree when `agent` is not a valid
- * id (a relayed delivery to an invalid recipient is dead-lettered there).
- */
+/** The selected relay mailbox, or `.undeliverable` for an invalid recipient. */
 export function relayAcceptRoot(agent: string): string {
   try {
     return mailboxRoot(agent);
@@ -148,8 +144,21 @@ export function relayAcceptRoot(agent: string): string {
   }
 }
 
+export function relayAcceptLockRoot(agent: string): string {
+  try {
+    assertValidAgentId(agent);
+    return join(mailDirPath(), agent);
+  } catch (error) {
+    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
+    return join(mailDirPath(), ".undeliverable");
+  }
+}
+
 export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
-  const root = mailboxRoot(agent);
+  return inboxAtRoot(mailboxRoot(agent));
+}
+
+function inboxAtRoot(root: string): ReturnType<typeof getInbox> {
   const tmp = join(root, "tmp");
   const fresh = join(root, "new");
   const cur = join(root, "cur");
@@ -444,8 +453,8 @@ function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   return /"relayDelivery"\s*:/.test(raw);
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
-  const root = relayAcceptRoot(agent);
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; heldAcceptanceRoot?: string; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
+  const root = options.heldRoot ?? relayAcceptRoot(agent);
   const roots = new Set([root]);
   for (const parent of [mailDirPath(), join(process.env.HOME || homedir(), ".tps", "branch-office")]) {
     if (!existsSync(parent)) continue;
@@ -468,7 +477,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     // A caller that already holds this mailbox's lock (relay acceptance holds
     // the recipient's across check, publication and marker) passes it here so
     // the scan does not re-acquire it — a nested acquisition is a hard error.
-    const held = root === options.heldRoot;
+    const held = root === options.heldRoot || root === options.heldAcceptanceRoot;
     const lock = held ? null : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
     if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
     try {
@@ -542,7 +551,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
   return undefined;
 }
 
-export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string, wireRecipient = to): MailMessage & { filePath: string } {
+export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string, wireRecipient = to, inboxRoot?: string): MailMessage & { filePath: string } {
   assertValidAgentId(to);
   const sender = from || "unknown";
   assertValidAgentId(sender);
@@ -560,8 +569,8 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
     );
   }
 
-  const inbox = getInbox(to);
-  const quotaCount = countInboxMessages(to);
+  const inbox = inboxRoot === undefined ? getInbox(to) : inboxAtRoot(inboxRoot);
+  const quotaCount = readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length;
   if (quotaCount >= MAX_INBOX_MESSAGES) {
     throw new Error(inboxFullMessage(to, quotaCount));
   }
@@ -688,10 +697,12 @@ export function deadLetterUndelivered(
   cls: PromoteRejectClass,
   reason: string,
   relayDelivery?: { branchId: string; id: string },
+  inboxRoot?: string,
 ): string {
   validateMessageId(record.id);
   let inbox: { tmp: string; dlq: string };
-  try {
+  if (inboxRoot !== undefined) inbox = inboxAtRoot(inboxRoot);
+  else try {
     assertValidAgentId(agent);
     inbox = getInbox(agent);
   } catch (error) {

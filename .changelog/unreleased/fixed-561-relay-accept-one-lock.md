@@ -1,1 +1,1 @@
-- **Relay acceptance runs the existing-record check, the record write and the acceptance marker under the recipient's mailbox lock.** For the same branch, recipient and id, at most one receiver accepts: the second sees a duplicate (identical payload), refuses (differing payload), or gets the timeout refusal. A timeout publishes no mail record or acceptance marker.
+- **Relay acceptance serializes receivers with a stable recipient lock and publishes into the selected mailbox.** A timeout publishes no mail record or acceptance marker.

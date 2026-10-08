@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailSyncError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailSyncError, relayAcceptRoot, relayAcceptLockRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
@@ -396,12 +396,16 @@ export class RelayAcceptLockTimeoutError extends Error {
   }
 }
 
+let relayAcceptTestHook: ((root: string) => void) | undefined;
+
+export function setRelayAcceptTestHook(hook?: (root: string) => void): void {
+  if (process.env.NODE_ENV !== "test") throw new Error("relay acceptance test hook requires test mode");
+  relayAcceptTestHook = hook;
+}
+
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
   MailDeliverBodySchema.shape.id.parse(body.id);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
-  // The recipient's lock spans check, publication and marker. For the same
-  // branch, recipient and id, at most one receiver accepts; the second sees a
-  // duplicate (identical payload), refuses (differing payload), or gets the timeout refusal.
   const deadline = Date.now() + relayAcceptLockTimeoutMs();
   const acquireLock = (root: string) => {
     const remaining = deadline - Date.now();
@@ -410,20 +414,22 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
     return lock;
   };
-  const recipientRoot = relayAcceptRoot(body.to);
-  // Create the recipient's mailbox (and register its creation for fsync) before
-  // the lock, in the same order findRelayedRecord used to, so an unlocked
-  // mkdir never swallows the parent-directory sync.
-  mkdirMailDirectory(recipientRoot);
-  const lock = acquireLock(recipientRoot);
+  const acceptanceRoot = relayAcceptLockRoot(body.to);
+  mkdirMailDirectory(acceptanceRoot);
+  const acceptanceLock = acquireLock(acceptanceRoot);
+  let mailboxLock: ReturnType<typeof acquireLock> | undefined;
   try {
+    const recipientRoot = relayAcceptRoot(body.to);
+    mkdirMailDirectory(recipientRoot);
+    if (recipientRoot !== acceptanceRoot) mailboxLock = acquireLock(recipientRoot);
+    relayAcceptTestHook?.(recipientRoot);
     // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
     const marker = join(acceptedDir, body.id);
     const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
     const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
     const delivery = { branchId, id: body.id };
-    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, acquireLock });
+    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, acquireLock });
     if (existingMarker && existingRecord) {
       syncMailFile(existingMarker);
       syncMailDirectory(dirname(existingMarker));
@@ -436,7 +442,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
 
     let delivered: boolean;
     try {
-      sendMessage(body.to, body.content, body.from, delivery, body.timestamp);
+      sendMessage(body.to, body.content, body.from, delivery, body.timestamp, body.to, recipientRoot);
       delivered = true;
     } catch (e: unknown) {
       if (e instanceof MailSyncError) throw e;
@@ -452,6 +458,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
           cls,
           reason,
           delivery,
+          recipientRoot,
         );
       } catch (dlqErr: unknown) {
         console.error(
@@ -464,7 +471,8 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     recordAcceptance(acceptedDir, marker);
     return delivered;
   } finally {
-    lock.release();
+    mailboxLock?.release();
+    acceptanceLock.release();
   }
 }
 

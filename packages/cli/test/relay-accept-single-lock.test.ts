@@ -1,14 +1,10 @@
 /**
  * relay-accept-single-lock.test.ts — cli#561.
- *
- * For the same branch, recipient and id, at most one receiver accepts; the
- * second sees a duplicate (identical payload), refuses (differing payload),
- * or gets the timeout refusal.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getInbox } from "../src/utils/mail.js";
@@ -34,7 +30,24 @@ if (mode === "hold") {
   process.stdout.write("ready");
   process.stdin.once("data", () => { lock.release(); process.exit(0); });
 } else {
-  const { deliverRelayedToLocal } = await import(url);
+  const { deliverRelayedToLocal, setRelayAcceptTestHook } = await import(url);
+  const pause = process.env.RELAY_CHILD_PAUSE;
+  if (pause) {
+    const { existsSync, writeFileSync } = await import("node:fs");
+    setRelayAcceptTestHook((root) => {
+      writeFileSync(pause + ".ready", root);
+      const deadline = Date.now() + 10000;
+      const wait = new Int32Array(new SharedArrayBuffer(4));
+      while (!existsSync(pause + ".release")) {
+        if (Date.now() >= deadline) throw new Error("test pause timed out");
+        Atomics.wait(wait, 0, 0, 5);
+      }
+    });
+  }
+  if (process.env.RELAY_CHILD_STARTED) {
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(process.env.RELAY_CHILD_STARTED, "");
+  }
   const ids = JSON.parse(process.env.RELAY_CHILD_IDS);
   const counts = { delivered: 0, duplicate: 0, refused: 0 };
   for (const id of ids) {
@@ -43,7 +56,7 @@ if (mode === "hold") {
         id,
         from: process.env.RELAY_CHILD_FROM,
         to: process.env.RELAY_CHILD_TO,
-        content: process.env.RELAY_CHILD_PREFIX + id,
+        content: JSON.parse(process.env.RELAY_CHILD_PREFIX) + id,
         timestamp: ${JSON.stringify(TIMESTAMP)},
       });
       if (ok) counts.delivered += 1; else counts.duplicate += 1;
@@ -87,7 +100,7 @@ function jsonFiles(dir: string): string[] {
 }
 
 /** Run one delivering child and resolve with its counts when it exits. */
-function deliverChild(prefix: string, ids: string[]): Promise<Counts> {
+function deliverChild(prefix: string, ids: string[], env: Record<string, string> = {}): Promise<Counts> {
   const child = spawn("bun", [childScript], {
     env: {
       ...process.env,
@@ -95,8 +108,9 @@ function deliverChild(prefix: string, ids: string[]): Promise<Counts> {
       RELAY_CHILD_BRANCH: BRANCH,
       RELAY_CHILD_TO: RECIPIENT,
       RELAY_CHILD_FROM: FROM,
-      RELAY_CHILD_PREFIX: prefix,
+      RELAY_CHILD_PREFIX: JSON.stringify(prefix),
       RELAY_CHILD_IDS: JSON.stringify(ids),
+      ...env,
     },
     stdio: ["ignore", "pipe", "inherit"],
   });
@@ -140,7 +154,49 @@ function recordsByDeliveryId(): Map<string, string[]> {
   return byId;
 }
 
-describe("relay acceptance holds the recipient's mailbox lock across check, publication and marker (cli#561)", () => {
+async function waitForFile(path: string): Promise<void> {
+  const deadline = Date.now() + 10000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`test child did not create ${path}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+describe("relay acceptance (cli#561)", () => {
+  test.each(["new", "dlq"])("routing change before %s publication", async (destination) => {
+    const id = randomUUID();
+    const hostRoot = getInbox(RECIPIENT).root;
+    const branchRoot = join(root, ".tps", "branch-office", RECIPIENT, "mail");
+    const pause = join(root, "pause");
+    const started = join(root, "started");
+    const prefix = destination === "new" ? "same-" : "\u0000same-";
+    const first = deliverChild(prefix, [id], { RELAY_CHILD_PAUSE: pause });
+    let second: Promise<Counts> | undefined;
+    let results: [Counts, Counts | undefined];
+    try {
+      await waitForFile(pause + ".ready");
+      expect(readFileSync(pause + ".ready", "utf8")).toBe(hostRoot);
+      expect(existsSync(join(hostRoot, ".mail-lock"))).toBe(true);
+      mkdirSync(branchRoot, { recursive: true });
+      second = deliverChild(prefix, [id], { RELAY_CHILD_STARTED: started });
+      await waitForFile(started);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(jsonFiles(join(branchRoot, "new"))).toEqual([]);
+      expect(existsSync(join(mail, ".relay-accepted", "by-branch", BRANCH, id))).toBe(false);
+    } finally {
+      writeFileSync(pause + ".release", "");
+      results = await Promise.all([first, second]);
+    }
+    const [a, b] = results;
+    expect(a.delivered).toBe(destination === "new" ? 1 : 0);
+    expect(b?.delivered).toBe(0);
+    expect(b?.duplicate).toBe(1);
+    expect(a.refused + (b?.refused ?? 0)).toBe(0);
+    const files = jsonFiles(join(hostRoot, destination));
+    expect(files).toHaveLength(1);
+    expect(JSON.parse(readFileSync(join(hostRoot, destination, files[0]!), "utf8")).relayDelivery).toEqual({ branchId: BRANCH, id });
+    for (const dir of ["new", "cur", "dlq"]) expect(jsonFiles(join(branchRoot, dir))).toEqual([]);
+  }, 60_000);
   test("two processes delivering identical payloads store one record per id and one delivered", async () => {
     const ids = Array.from({ length: IDS }, () => randomUUID());
     const [a, b] = await Promise.all([deliverChild("same-", ids), deliverChild("same-", ids)]);
