@@ -134,6 +134,20 @@ function mailboxRoot(agent: string): string {
   return existsSync(branchMailRoot) ? branchMailRoot : join(mailDirPath(), agent);
 }
 
+/**
+ * The mailbox root relay acceptance locks and publishes into: `agent`'s own
+ * mailbox, or the host-level `.undeliverable` tree when `agent` is not a valid
+ * id (a relayed delivery to an invalid recipient is dead-lettered there).
+ */
+export function relayAcceptRoot(agent: string): string {
+  try {
+    return mailboxRoot(agent);
+  } catch (error) {
+    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
+    return join(mailDirPath(), ".undeliverable");
+  }
+}
+
 export function getInbox(agent: string): { root: string; tmp: string; fresh: string; cur: string; dlq: string } {
   const root = mailboxRoot(agent);
   const tmp = join(root, "tmp");
@@ -430,12 +444,8 @@ function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   return /"relayDelivery"\s*:/.test(raw);
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to): string | undefined {
-  let root: string;
-  try { root = mailboxRoot(agent); } catch (error) {
-    if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
-    root = join(mailDirPath(), ".undeliverable");
-  }
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string } = {}): string | undefined {
+  const root = relayAcceptRoot(agent);
   const roots = new Set([root]);
   for (const parent of [mailDirPath(), join(process.env.HOME || homedir(), ".tps", "branch-office")]) {
     if (!existsSync(parent)) continue;
@@ -455,8 +465,12 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
   const recipientRoot = root;
   for (const root of roots) {
     mkdirMailDirectory(root);
-    const lock = acquireMailLockSync(root);
-    if (!lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    // A caller that already holds this mailbox's lock (relay acceptance holds
+    // the recipient's across check, publication and marker) passes it here so
+    // the scan does not re-acquire it — a nested acquisition is a hard error.
+    const held = root === options.heldRoot;
+    const lock = held ? null : acquireMailLockSync(root);
+    if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
     try {
       for (const dir of ["new", "cur", "dlq"]) {
         const path = join(root, dir);
@@ -523,7 +537,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
           }
         }
       }
-    } finally { lock.release(); }
+    } finally { lock?.release(); }
   }
   return undefined;
 }

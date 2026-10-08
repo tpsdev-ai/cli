@@ -1,0 +1,1 @@
+- **Relay acceptance runs the existing-record check, the record write and the acceptance marker under the recipient's mailbox lock.** Two receivers serving the same branch can no longer both accept a delivery: the second sees a duplicate (identical payload) or refuses (differing payload).
