@@ -1,1 +1,1 @@
-- **Relay acceptance leaves an inbox record written in another format where it is.** The dedupe scan quarantines a malformed record only when it names a relay delivery and sits in the recipient's own mailbox.
+- **Relay acceptance leaves records without a `relayDelivery` property in place.** Malformed records with that property are quarantined only in the recipient's own mailbox, even when its value is invalid (e.g. `null`).

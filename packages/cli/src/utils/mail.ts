@@ -421,11 +421,9 @@ const MailRecordSchema = RelayPayloadSchema.extend({
 }).passthrough();
 
 /**
- * True when a record the relay format could not describe carries a
- * `relayDelivery` field — the relay id/branch this scan matches on. Read from
- * the parsed object when the JSON parses, else from the raw text (a truncated
- * write may never close). A malformed record that carries none is left where it
- * is (cli#560).
+ * Records without a `relayDelivery` property stay in place (cli#560).
+ * Malformed records with it are quarantined only in the recipient's mailbox,
+ * even when its value is invalid (e.g. null).
  */
 function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   if (parsed !== null && typeof parsed === "object") return (parsed as Record<string, unknown>).relayDelivery !== undefined;
@@ -484,10 +482,9 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
             parseError = error;
           }
           if (!record) {
-            // cli#560: a malformed record that names no relay delivery is not
-            // this delivery's relay record and is left exactly where it is (the
-            // agent runtime writes `{from,to,body,sentAt}`, for one). Only a
-            // malformed relay record in the recipient's own mailbox is quarantined.
+            // cli#560: records without a relayDelivery property stay in place.
+            // Malformed records with it are quarantined only in the recipient's
+            // own mailbox, even when its value is invalid (e.g. null).
             if (root !== recipientRoot || !carriesRelayDelivery(parsed, raw)) continue;
             const reason = parseError instanceof Error ? parseError.message : String(parseError);
             console.error(`[mail] unreadable record ${source}: ${reason}`);

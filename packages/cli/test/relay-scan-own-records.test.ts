@@ -8,9 +8,11 @@
  * so an unrelated relay accept moved a runtime-written message out of its
  * recipient's `new/` and into `quarantine/`.
  *
- * These tests write the message with the REAL agent MailClient, accept one
+ * The first two tests write the message with the REAL agent MailClient, accept one
  * unrelated relayed delivery, and assert the runtime message is still in
  * `new/` and is received.
+ * The third writes a malformed relay record directly in another agent's mailbox
+ * and checks that it stays in place.
  */
 import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import { mkdtempSync, rmSync, readdirSync, readFileSync, existsSync, writeFileSync } from "node:fs";
