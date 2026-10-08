@@ -37,18 +37,14 @@ describe("communication archive (SQLite)", () => {
     expect(events[0].body).toBe("hello kern");
   });
 
+  // cli#519 — assert the hit itself, not a count that cannot fail: a backend
+  // that returns no row, or the wrong row, is red here.
   test("queryArchive searches body using FTS", () => {
     logEvent({ event: "sent", from: "a", to: "b", messageId: "1" }, "the quick brown fox");
     logEvent({ event: "sent", from: "a", to: "b", messageId: "2" }, "lazy dog");
 
-    // FTS5 might need a moment or explicit commit? Bun:sqlite usually handles it.
-    // Let's try matching.
     const results = queryArchive({ search: "quick" });
-    // If results is 0, let's debug.
-    if (results.length === 0) {
-       console.log("FTS search returned 0 results in test");
-    }
-    expect(results.length).toBeGreaterThanOrEqual(0); 
+    expect(results.map((r) => r.messageId)).toEqual(["1"]);
   });
 
   test("queryArchive filters by agent", () => {

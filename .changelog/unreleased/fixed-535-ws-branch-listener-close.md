@@ -1,0 +1,1 @@
+- **The WebSocket branch daemon now exits on SIGTERM while a host is connected.** Closing its listener ends the live host channel and settles under bun even after the listener has itself closed a socket (a rejected handshake, a frame that fails to decrypt), where it previously never settled and the daemon stayed running after `tps branch stop`.

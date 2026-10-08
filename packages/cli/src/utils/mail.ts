@@ -47,6 +47,7 @@ export interface MailMessage {
   envelopeId?: string;
   relayDelivery?: { branchId: string; id: string };
   relayPayload?: { from: string; to: string; body: string; timestamp: string };
+  relayWireTo?: string;
   /**
    * The full SIGNED envelope, persisted at promotion so a later cur/ re-read
    * (crash recovery / lease sweep) can re-verify it. Binds "verified at
@@ -416,9 +417,10 @@ const MailRecordSchema = RelayPayloadSchema.extend({
   rejectReason: z.string().optional(),
   relayDelivery: z.object({ branchId: z.string().regex(/^[a-zA-Z0-9_-]+$/), id: MailDeliverBodySchema.shape.id }).optional(),
   relayPayload: RelayPayloadSchema.optional(),
+  relayWireTo: MailDeliverBodySchema.shape.to.optional(),
 }).passthrough();
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>): string | undefined {
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to): string | undefined {
   let root: string;
   try { root = mailboxRoot(agent); } catch (error) {
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
@@ -445,14 +447,22 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
         const path = join(root, dir);
         for (const file of listMessageFiles(path)) {
           const source = join(path, file);
+          let raw: string;
+          try {
+            raw = readFileSync(source, "utf-8");
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            const message = `relayed record read failed: ${source}: ${reason}`;
+            console.error(`[mail] ${message}`);
+            throw new Error(message, { cause: error });
+          }
           let record: MailMessage;
           try {
-            record = readMessageFile(source);
+            record = JSON.parse(raw) as MailMessage;
             MailRecordSchema.parse(record);
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             console.error(`[mail] unreadable record ${source}: ${reason}`);
-            if ((error as NodeJS.ErrnoException)?.code) continue;
             const quarantine = join(root, "quarantine");
             mkdirMailDirectory(quarantine);
             const target = join(quarantine, `${dir}-${randomUUID()}-${file}`);
@@ -472,7 +482,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
               record.body !== record.envelope.body || record.timestamp !== record.envelope.timestamp ||
               !originalEnvelope?.ok || !isDeepStrictEqual(originalEnvelope.envelope, record.envelope)
             );
-            if (projectionChanged || stored.from !== payload.from || stored.to !== payload.to || stored.body !== payload.body || stored.timestamp !== payload.timestamp) {
+            if (projectionChanged || (record.relayWireTo ?? stored.to) !== wireRecipient || stored.from !== payload.from || stored.to !== payload.to || stored.body !== payload.body || stored.timestamp !== payload.timestamp) {
               throw new Error(`relayed delivery conflict for branch ${delivery.branchId} message ${delivery.id}`);
             }
             const target = join(path, file);
@@ -493,7 +503,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
   return undefined;
 }
 
-export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string): MailMessage & { filePath: string } {
+export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string, wireRecipient = to): MailMessage & { filePath: string } {
   assertValidAgentId(to);
   const sender = from || "unknown";
   assertValidAgentId(sender);
@@ -527,7 +537,7 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
     timestamp: senderTimestamp ?? timestamp,
     read: false,
     headers: { "X-TPS-Trust": "user", "X-TPS-Sender": sender },
-    ...(relayDelivery ? { relayDelivery, relayPayload: { from: sender, to, body, timestamp: senderTimestamp ?? timestamp }, receivedAt: timestamp } : {}),
+    ...(relayDelivery ? { relayDelivery, relayWireTo: wireRecipient, relayPayload: { from: sender, to, body, timestamp: senderTimestamp ?? timestamp }, receivedAt: timestamp } : {}),
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
