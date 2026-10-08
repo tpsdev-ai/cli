@@ -22,3 +22,4 @@ heading must be an entry; an entry that is undated, has an impossible or past
 date, has no reason, uses invalid semver, or is absent from `bun.lock` fails the gate (exit 2).
 
 ## Exceptions
+- handlebars@4.7.10 | expires:2026-10-13 | reason: first release patched for GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f, GHSA-xw65-4hp5-5hc7

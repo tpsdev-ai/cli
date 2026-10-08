@@ -476,8 +476,33 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
   }
 }
 
-async function acceptRelayedMail(channel: TransportChannel, branchId: string, msg: TpsMessage, body: MailDeliverBody): Promise<boolean> {
+async function acceptRelayedMail(
+  channel: TransportChannel,
+  branchId: string,
+  msg: TpsMessage,
+  body: MailDeliverBody,
+  onAccepted?: () => void,
+): Promise<boolean> {
   const delivered = deliverRelayedToLocal(branchId, body);
+  // Fire the caller's accepted-delivery hook only when this call published a
+  // new inbox record. `delivered` is false for a resend whose record already
+  // exists, and for an inbox write failure that deliverRelayedToLocal handled
+  // by dead-lettering the message; both are still ACKed below. A same-id
+  // conflict throws before this point, as does a sync failure or a failed
+  // dead-letter, so none of those is announced or ACKed.
+  if (delivered) {
+    const reportError = () => {
+      console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);
+    };
+    try {
+      const result: unknown = onAccepted?.();
+      if (result != null && typeof (result as { then?: unknown }).then === "function") {
+        void Promise.resolve(result).catch(reportError);
+      }
+    } catch {
+      reportError();
+    }
+  }
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
   return delivered;
 }
@@ -752,7 +777,7 @@ async function probeServiceHealth(): Promise<ServiceHealth[]> {
 
 export async function connectAndKeepAlive(
   branchId: string,
-  opts: { onMessage?: (msg: TpsMessage) => void } = {}
+  opts: { onMessage?: (msg: TpsMessage) => void; onAccepted?: (msg: TpsMessage) => void } = {}
 ): Promise<() => Promise<void>> {
   let stopped = false;
   let reconnectCount = 0;
@@ -831,7 +856,7 @@ export async function connectAndKeepAlive(
             state.lastHeartbeatAck = now; // any traffic = alive
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
             if (parsed.success) {
-              void acceptRelayedMail(channel, branchId, msg, parsed.data).catch((error: unknown) => {
+              void acceptRelayedMail(channel, branchId, msg, parsed.data, () => opts.onAccepted?.(msg)).catch((error: unknown) => {
                 console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
               });
             } else {
