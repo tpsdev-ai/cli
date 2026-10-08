@@ -444,7 +444,13 @@ async function acceptRelayedMail(
   // by dead-lettering the message; both are still ACKed below. A same-id
   // conflict throws before this point, as does a sync failure or a failed
   // dead-letter, so none of those is announced or ACKed.
-  if (delivered) onAccepted?.();
+  if (delivered) {
+    try {
+      onAccepted?.();
+    } catch {
+      console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);
+    }
+  }
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
   return delivered;
 }

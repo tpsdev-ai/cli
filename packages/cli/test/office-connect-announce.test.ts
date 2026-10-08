@@ -246,6 +246,7 @@ describe("office connect announcement follows local acceptance", () => {
   let acks: TpsMessage[];
   /** The inbox record count observed at each announcement. */
   let announced: number[];
+  let onAcceptedError: Error | undefined;
 
   beforeEach(async () => {
     root = fs.mkdtempSync(join(tmpdir(), "tps-connect-announce-"));
@@ -257,6 +258,7 @@ describe("office connect announcement follows local acceptance", () => {
     loopDetached = false;
     acks = [];
     announced = [];
+    onAcceptedError = undefined;
     let alive = true;
     const channel: TransportChannel = {
       async send(msg) { if (msg.type === MSG_MAIL_ACK) acks.push(msg); },
@@ -268,7 +270,10 @@ describe("office connect announcement follows local acceptance", () => {
     };
     connectSpy = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
     stop = await connectAndKeepAlive("remote", {
-      onAccepted: () => announced.push(jsonFiles(getInbox("local").fresh).length),
+      onAccepted: () => {
+        announced.push(jsonFiles(getInbox("local").fresh).length);
+        if (onAcceptedError) throw onAcceptedError;
+      },
     });
     for (let i = 0; handlers.size === 0 && i < 200; i++) await Bun.sleep(5);
     expect(handlers.size).toBeGreaterThan(0);
@@ -345,6 +350,36 @@ describe("office connect announcement follows local acceptance", () => {
     expect(acks.length).toBe(1);
     expect(jsonFiles(getInbox("local").fresh).length).toBe(1);
     expect(announced).toEqual([1]);
+  });
+
+  test("an onAccepted exception is reported and the recorded delivery is ACKed", async () => {
+    const accepted = body("private message content");
+    onAcceptedError = new Error(`announcement failed: ${accepted.content}`);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      deliver(accepted);
+      await settled();
+      expect(acks).toEqual([{
+        type: MSG_MAIL_ACK, seq: 1, ts: expect.any(String), body: { id: accepted.id, accepted: true },
+      }]);
+      const inbox = getInbox("local").fresh;
+      const records = jsonFiles(inbox);
+      expect(records.length).toBe(1);
+      expect(JSON.parse(fs.readFileSync(join(inbox, records[0]!), "utf8")).body).toBe(accepted.content);
+      expect(announced).toEqual([1]);
+      expect(errors.mock.calls).toEqual([[`[relay] onAccepted failed for message ${accepted.id} to ${accepted.to}`]]);
+      expect(errors.mock.calls.flat().join("\n")).not.toContain(accepted.content);
+
+      acks.length = 0;
+      deliver(accepted);
+      await settled();
+      expect(acks.length).toBe(1);
+      expect(jsonFiles(inbox)).toEqual(records);
+      expect(announced).toEqual([1]);
+      expect(errors.mock.calls.length).toBe(1);
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   test("a same-id conflict is not acknowledged and is not announced", async () => {
