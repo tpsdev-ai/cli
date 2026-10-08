@@ -86,3 +86,23 @@ for (const { flags, mode } of cases) {
     }
   }, 35_000);
 }
+
+test("a guard flag before the secrets-guard subcommand is refused (cli#563)", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  for (const args of [
+    ["--check", "secrets-guard", "child"],
+    ["--no-guard", "secrets-guard", "child"],
+    ["--check=false", "secrets-guard", "child"],
+  ]) {
+    expect(() => parseCliArgs(args)).toThrow(/^InvalidSecretsGuardMode: .* before the secrets-guard subcommand/);
+  }
+  // A guard flag before a subcommand that is not secrets-guard sets no guard mode
+  // and is not refused by this scan.
+  expect(parseCliArgs(["--check", "status"]).guardMode).toEqual({ check: false, noGuard: false });
+});
+
+test("a guard flag after the secrets-guard subcommand is unchanged (cli#563)", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  expect(parseCliArgs(["secrets-guard", "--check"]).guardMode).toEqual({ check: true, noGuard: false });
+  expect(parseCliArgs(["secrets-guard", "--no-guard", "child"]).guardMode).toEqual({ check: false, noGuard: true });
+});

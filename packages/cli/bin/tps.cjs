@@ -20,7 +20,18 @@ function getCliVersion() {
   }
 }
 
-if (parseCliArgs(process.argv.slice(2)).versionRequested) {
+let versionRequested = false;
+try {
+  versionRequested = parseCliArgs(process.argv.slice(2)).versionRequested;
+} catch (err) {
+  // The shared scan refuses a guard-mode flag placed before the subcommand
+  // (cli#563). Report the named error the way the CLI does, rather than letting
+  // the throw escape as a stack trace before the fast path below.
+  console.error(err.message);
+  process.exit(1);
+}
+
+if (versionRequested) {
   // Fast-path version output even when native binary package is missing.
   console.log(getCliVersion());
   process.exit(0);

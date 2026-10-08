@@ -221,3 +221,30 @@ test("a resolved binary that cannot start with no JS entry prints accurate guida
   expect(result.stderr).toContain("Or install platform binary directly:");
   expect(result.spawned).toBe(1);
 });
+
+describe("tps launcher guard-mode refusals (cli#563)", () => {
+  for (const flag of ["--check", "--no-guard"]) {
+    test(`launcher ${flag} before the secrets-guard subcommand is refused and launches nothing`, () => {
+      const harness = makeLauncherHarness(
+        "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.TPS_TEST_BINARY_MARKER, 'ran');\n",
+      );
+      const root = resolve(harness.launcher, "../..");
+      const binaryMarker = join(root, "binary-ran.marker");
+      writeFileSync(join(root, "child.mjs"), 'console.log("CHILD_RAN");\n');
+
+      const result = spawnSync(NODE, [harness.launcher, flag, "secrets-guard", NODE, join(root, "child.mjs")], {
+        encoding: "utf-8",
+        env: {
+          ...process.env,
+          TPS_TEST_FALLBACK_MARKER: harness.fallbackMarker,
+          TPS_TEST_BINARY_MARKER: binaryMarker,
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`InvalidSecretsGuardMode: ${flag} before the secrets-guard subcommand`);
+      expect(existsSync(binaryMarker)).toBe(false);
+      expect(existsSync(harness.fallbackMarker)).toBe(false);
+    });
+  }
+});

@@ -105,6 +105,32 @@ const cliOptionTypes = new Map(
   )
 );
 
+// The guard's mode flags are the boolean options `check` and `noGuard` in the
+// shared table above. The accepted spellings are that table's hyphenated forms
+// (`--check`, `--no-guard`); `--noGuard` and the other guard-shaped forms below
+// are refused.
+const GUARD_MODE_OPTION_NAMES = /** @type {readonly string[]} */ (["check", "noGuard"]);
+const guardModeFlagName = new Map(
+  Object.keys(cliFlagDefinitions)
+    .filter((name) => GUARD_MODE_OPTION_NAMES.includes(name))
+    .map((name) => [`--${name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`, name])
+);
+const MALFORMED_GUARD_MODE = /^--(?:check|no-check|no-guard|no-no-guard|guard|noGuard|no-noGuard|noCheck)(?:=|$)/;
+
+/**
+ * What a token says about the guard's mode: "check"/"noGuard" for an accepted
+ * spelling, `false` for a guard-shaped token the CLI refuses, and undefined for
+ * anything else.
+ * @param {string} arg
+ * @returns {"check" | "noGuard" | false | undefined}
+ */
+function guardModeToken(arg) {
+  const name = guardModeFlagName.get(arg);
+  if (name === "check" || name === "noGuard") return name;
+  if (MALFORMED_GUARD_MODE.test(arg)) return false;
+  return undefined;
+}
+
 /** @param {string} arg @param {string | undefined} next */
 function cliOptionConsumesValue(arg, next) {
   const type = cliOptionTypes.get(arg);
@@ -133,6 +159,8 @@ function parseCliArgs(argv) {
   const parsed = [];
   /** @type {string[]} */
   const positionals = [];
+  /** guard-mode flags seen before the subcommand, decided once it is known @type {string[]} */
+  const guardFlagsBeforeCommand = [];
   let requested = false;
   let versionRequested = false;
   for (let i = 0; i < argv.length; i++) {
@@ -151,16 +179,21 @@ function parseCliArgs(argv) {
       parsed.push(arg, "--", ...argv.slice(i + 1));
       break;
     }
+    const guard = guardModeToken(arg);
     if (cmd === "secrets-guard") {
-      if (arg === "--check") check = true;
-      else if (arg === "--no-guard") noGuard = true;
-      else if (/^--(?:check|no-check|no-guard|no-no-guard|guard|noGuard|no-noGuard|noCheck)(?:=|$)/.test(arg)) {
+      if (guard === "check") check = true;
+      else if (guard === "noGuard") noGuard = true;
+      else if (guard === false) {
         throw new Error(`InvalidSecretsGuardMode: ${arg}; use bare --check or --no-guard`);
       }
       if (check && noGuard) throw new Error("InvalidSecretsGuardMode: --check and --no-guard conflict");
-      if ((arg === "--check" || arg === "--no-guard") && (argv[i + 1] === "true" || argv[i + 1] === "false")) {
+      if (guard && (argv[i + 1] === "true" || argv[i + 1] === "false")) {
         throw new Error(`InvalidSecretsGuardMode: ${arg} ${argv[i + 1]}; use bare --check or --no-guard`);
       }
+    } else if (positionals.length === 0 && guard !== undefined) {
+      // A guard-mode flag before the subcommand names a mode for secrets-guard
+      // only, so hold it until that subcommand is known (cli#563).
+      guardFlagsBeforeCommand.push(arg);
     }
     parsed.push(arg);
     if (arg === "--help" || arg === "-h") {
@@ -192,6 +225,11 @@ function parseCliArgs(argv) {
     } else if (!arg.startsWith("-")) {
       positionals.push(arg);
     }
+  }
+  if (positionals[0] === "secrets-guard" && guardFlagsBeforeCommand.length > 0) {
+    throw new Error(
+      `InvalidSecretsGuardMode: ${guardFlagsBeforeCommand[0]} before the secrets-guard subcommand; put the guard flag after the subcommand`
+    );
   }
   return { requested, versionRequested, argv: parsed, guardMode: { check, noGuard } };
 }
