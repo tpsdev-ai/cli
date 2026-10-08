@@ -444,7 +444,7 @@ function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   return /"relayDelivery"\s*:/.test(raw);
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string } = {}): string | undefined {
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
   const root = relayAcceptRoot(agent);
   const roots = new Set([root]);
   for (const parent of [mailDirPath(), join(process.env.HOME || homedir(), ".tps", "branch-office")]) {
@@ -469,7 +469,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     // the recipient's across check, publication and marker) passes it here so
     // the scan does not re-acquire it — a nested acquisition is a hard error.
     const held = root === options.heldRoot;
-    const lock = held ? null : acquireMailLockSync(root);
+    const lock = held ? null : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
     if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
     try {
       for (const dir of ["new", "cur", "dlq"]) {

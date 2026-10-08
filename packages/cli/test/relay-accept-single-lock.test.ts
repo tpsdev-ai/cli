@@ -1,15 +1,9 @@
 /**
  * relay-accept-single-lock.test.ts — cli#561.
  *
- * Relay acceptance checks for an existing record, publishes the record and
- * writes the acceptance marker. Only the check used to run under the mailbox
- * lock, so two receivers serving the same branch could each publish the same
- * branch+id: 193 of 200 ids got two inbox records and both calls reported
- * delivered. One cross-process lock — the recipient's mailbox lock — now spans
- * the check, the publication and the marker, so exactly one receiver accepts a
- * delivery for a branch+id.
- *
- * These tests run two real child processes delivering the same ids at once.
+ * For the same branch, recipient and id, at most one receiver accepts; the
+ * second sees a duplicate (identical payload), refuses (differing payload),
+ * or gets the timeout refusal.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -118,10 +112,10 @@ function deliverChild(prefix: string, ids: string[]): Promise<Counts> {
   });
 }
 
-/** Spawn a real process that holds the recipient's mailbox lock until released. */
-function holdLock(): Promise<{ release: () => Promise<void> }> {
+/** Spawn a real process that holds a mailbox lock until released. */
+function holdLock(agent = RECIPIENT): Promise<{ release: () => Promise<void> }> {
   const child = spawn("bun", [childScript], {
-    env: { ...process.env, RELAY_CHILD_MODE: "hold", RELAY_CHILD_ROOT: join(mail, RECIPIENT) },
+    env: { ...process.env, RELAY_CHILD_MODE: "hold", RELAY_CHILD_ROOT: join(mail, agent) },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
@@ -171,13 +165,30 @@ describe("relay acceptance holds the recipient's mailbox lock across check, publ
     for (const id of ids) expect(byId.get(id)).toHaveLength(1);
   }, 60_000);
 
-  test("a lock held past the bound refuses by name and writes nothing", async () => {
+  test("a recipient lock timeout refuses by name, publishing no mail record or acceptance marker", async () => {
     const holder = await holdLock();
     try {
       process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
       const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "timed out", timestamp: TIMESTAMP };
       expect(() => deliverRelayedToLocal(BRANCH, body)).toThrow(RelayAcceptLockTimeoutError);
       expect(jsonFiles(getInbox(RECIPIENT).fresh)).toEqual([]);
+      expect(existsSync(join(mail, ".relay-accepted"))).toBe(false);
+    } finally {
+      await holder.release();
+    }
+  }, 60_000);
+
+  test("a different mailbox's lock uses the acceptance deadline and refuses by name, publishing no mail record or acceptance marker", async () => {
+    const holder = await holdLock("other");
+    try {
+      process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
+      const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "timed out", timestamp: TIMESTAMP };
+      const started = Date.now();
+      expect(() => deliverRelayedToLocal(BRANCH, body)).toThrow(RelayAcceptLockTimeoutError);
+      expect(Date.now() - started).toBeLessThan(1000);
+      for (const agent of [RECIPIENT, "other"]) {
+        for (const dir of ["new", "cur", "dlq"]) expect(jsonFiles(join(mail, agent, dir))).toEqual([]);
+      }
       expect(existsSync(join(mail, ".relay-accepted"))).toBe(false);
     } finally {
       await holder.release();

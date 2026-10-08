@@ -380,9 +380,7 @@ function recordAcceptance(acceptedDir: string, marker: string): void {
   syncMailDirectory(acceptedDir);
 }
 
-/** How long relay acceptance waits for the recipient's mailbox lock before it
- *  refuses. Bounded: past it the delivery is refused by name, never skipped and
- *  never waited for indefinitely. */
+/** The shared wait budget for relay acceptance's mailbox locks. */
 const RELAY_ACCEPT_LOCK_TIMEOUT_MS = 2000;
 
 function relayAcceptLockTimeoutMs(): number {
@@ -390,8 +388,7 @@ function relayAcceptLockTimeoutMs(): number {
   return Number.isFinite(raw) && raw > 0 ? raw : RELAY_ACCEPT_LOCK_TIMEOUT_MS;
 }
 
-/** The named refusal relay acceptance raises when the recipient's mailbox lock
- *  is held past the bound. */
+/** The named refusal when an acceptance mailbox lock times out. */
 export class RelayAcceptLockTimeoutError extends Error {
   constructor(recipient: string) {
     super(`relay acceptance timed out waiting for the mailbox lock for ${recipient}`);
@@ -402,19 +399,23 @@ export class RelayAcceptLockTimeoutError extends Error {
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
   MailDeliverBodySchema.shape.id.parse(body.id);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
-  // ONE cross-process lock — the recipient's mailbox lock — held across the
-  // existing-record check, the record publication and the acceptance marker, so
-  // exactly one receiver accepts a delivery for a branch+id: the other sees a
-  // duplicate (identical payload) or refuses (differing payload). Every fact the
-  // accept decision uses is read under this lock, and the recipient's mailbox is
-  // the one the record is published into, so the lock serializes both receivers.
+  // The recipient's lock spans check, publication and marker. For the same
+  // branch, recipient and id, at most one receiver accepts; the second sees a
+  // duplicate (identical payload), refuses (differing payload), or gets the timeout refusal.
+  const deadline = Date.now() + relayAcceptLockTimeoutMs();
+  const acquireLock = (root: string) => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new RelayAcceptLockTimeoutError(body.to);
+    const lock = acquireMailLockSync(root, { timeoutMs: remaining });
+    if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
+    return lock;
+  };
   const recipientRoot = relayAcceptRoot(body.to);
   // Create the recipient's mailbox (and register its creation for fsync) before
   // the lock, in the same order findRelayedRecord used to, so an unlocked
   // mkdir never swallows the parent-directory sync.
   mkdirMailDirectory(recipientRoot);
-  const lock = acquireMailLockSync(recipientRoot, { timeoutMs: relayAcceptLockTimeoutMs() });
-  if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
+  const lock = acquireLock(recipientRoot);
   try {
     // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
@@ -422,7 +423,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
     const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
     const delivery = { branchId, id: body.id };
-    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot });
+    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, acquireLock });
     if (existingMarker && existingRecord) {
       syncMailFile(existingMarker);
       syncMailDirectory(dirname(existingMarker));
