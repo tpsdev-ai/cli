@@ -163,6 +163,27 @@ describe("archive runtime adapter (cli#395)", () => {
     DEADLINE_MS + 5_000,
   );
 
+  // cli#519 — the node adapter's FTS search returns the hit it should: the
+  // search path is asserted through the real node process, not only under bun.
+  test.if(nodeHasSqlite)(
+    "the node adapter's FTS search returns the matching message id",
+    () => {
+      logEvent({ event: "sent", from: "a", to: "b", messageId: "1" }, "the quick brown fox");
+      logEvent({ event: "sent", from: "a", to: "b", messageId: "2" }, "lazy dog");
+
+      const script = `
+        const a = await import(${JSON.stringify(archiveJs)});
+        console.log("HITS=" + JSON.stringify(a.queryArchive({ search: "quick" }).map((r) => r.messageId)));
+      `;
+      const res = runNode(script, process.env);
+      expect(res.signal).toBeNull();
+      expect(res.status).toBe(0);
+      const hits = JSON.parse(((res.stdout.split("HITS=")[1] ?? "").split("\n")[0] || "null")) as unknown;
+      expect(hits).toEqual(["1"]);
+    },
+    DEADLINE_MS + 5_000,
+  );
+
   test.if(nodeHasSqlite)(
     "bun checks row counts for both runtimes’ batches",
     async () => {
