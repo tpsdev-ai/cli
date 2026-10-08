@@ -20,10 +20,18 @@ import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 
 describe("office connect announcement follows local acceptance", () => {
-  let root: string;
-  let savedEnv: Record<string, string | undefined>;
+  let root: string | undefined;
+  let savedEnv: Record<string, string | undefined> = {};
   let stop: (() => Promise<void>) | undefined;
-  let handlers: Set<(msg: TpsMessage) => void>;
+  /** The spy on `WsNoiseTransport.prototype.connect`; restored after every test. */
+  let connectSpy: { mockRestore(): void } | undefined;
+  let handlers = new Set<(msg: TpsMessage) => void>();
+  /**
+   * Set when the keep-alive loop removes its message handler, which it does
+   * only on its way out (the service-proxy handler it also registers is never
+   * removed, so an empty `handlers` set is not the signal).
+   */
+  let loopDetached = false;
   let acks: TpsMessage[];
   /** The inbox record count observed each time an accepted delivery is announced. */
   let announced: number[];
@@ -47,18 +55,19 @@ describe("office connect announcement follows local acceptance", () => {
     fs.writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "unused", port: 1, transport: "ws" }));
 
     handlers = new Set();
+    loopDetached = false;
     acks = [];
     announced = [];
     let alive = true;
     const channel: TransportChannel = {
       async send(msg) { if (msg.type === MSG_MAIL_ACK) acks.push(msg); },
       onMessage(handler) { handlers.add(handler); },
-      offMessage(handler) { handlers.delete(handler); },
+      offMessage(handler) { handlers.delete(handler); loopDetached = true; },
       async close() { alive = false; },
       isAlive() { return alive; },
       peerFingerprint() { return "remote"; },
     };
-    spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    connectSpy = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
     stop = await connectAndKeepAlive("remote", {
       onAccepted: () => announced.push(jsonFiles(getInbox("local").fresh).length),
     });
@@ -67,12 +76,38 @@ describe("office connect announcement follows local acceptance", () => {
   });
 
   afterEach(async () => {
-    if (stop) await stop();
-    for (const [k, v] of Object.entries(savedEnv)) {
-      if (v === undefined) delete process.env[k];
-      else process.env[k] = v;
+    let detached = true;
+    try {
+      if (stop) await stop();
+      // stop() returns before the keep-alive loop has finished: the loop checks
+      // the channel once a second, then clears its timers and detaches its
+      // handler. Wait (bounded) for that detach, so no loop from this test is
+      // still running when the spy is restored and the next test file starts.
+      // A loop that never attached (setup failed before connecting) has
+      // nothing to wait for.
+      if (handlers.size > 0) {
+        for (let i = 0; !loopDetached && i < 200; i++) await Bun.sleep(10);
+        detached = loopDetached;
+      }
+    } finally {
+      // Every step runs even when an earlier one threw, and each clears what it
+      // undid, so a second pass is a no-op. The spy is process-wide: left in
+      // place, every later WsNoiseTransport.connect in this bun process would
+      // return this file's fake channel instead of opening a socket.
+      stop = undefined;
+      handlers = new Set();
+      loopDetached = false;
+      connectSpy?.mockRestore();
+      connectSpy = undefined;
+      for (const [k, v] of Object.entries(savedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      savedEnv = {};
+      if (root) fs.rmSync(root, { recursive: true, force: true });
+      root = undefined;
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    expect(detached).toBe(true);
   });
 
   function jsonFiles(dir: string): string[] {
