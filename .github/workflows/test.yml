@@ -529,6 +529,8 @@ jobs:
           cp target/release/nono "$HOME/.local/nono-pin/nono"
       - name: Run the profile gate against the pinned nono
         run: NONO_BIN="$HOME/.local/nono-pin/nono" ./scripts/check-nono-profiles.sh
+      - name: Custom profile access and launch-policy checks
+        run: NONO_BIN="$HOME/.local/nono-pin/nono" bun run scripts/check-custom-nono-profile.ts
 
   # SAST (Static Application Security Testing) using Semgrep.
   # Semgrep scans the codebase for security vulnerabilities, hardcoded secrets, and bad practices

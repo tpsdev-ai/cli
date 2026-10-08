@@ -402,7 +402,7 @@ describe("cli#483 — launcher grant checks", () => {
         const custom = join(sb.root, "claude-custom");
         const r = spawnSync(process.execPath, [join(import.meta.dir, "helpers/runtime-dir-launch-driver.ts")], {
           cwd: fromHome ? sb.home : sb.ws,
-          env: cliEnv(sb, { HOME: fromHome ? sb.home : "../home", CLAUDE_CONFIG_DIR: custom }),
+          env: cliEnv(sb, { HOME: sb.home, CLAUDE_CONFIG_DIR: custom }),
           encoding: "utf8", timeout: 10_000,
         });
         const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;

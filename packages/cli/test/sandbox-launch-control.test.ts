@@ -25,10 +25,10 @@ import {
   mkdirSync,
   chmodSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 import { evaluateLaunchControl } from "../src/utils/nono.js";
 import meow from "meow";
@@ -119,7 +119,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
     // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
     // sit inside that grant and the overlap assert would refuse before spawning.
-    const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+    const base = "/var/tmp";
     const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");
@@ -160,6 +160,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
         "#!/usr/bin/env bash",
         'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
         'if [ "${1:-}" = "profile" ]; then exit 0; fi',
+        `if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi`,
         'echo "NONO-ARGV $*" >> "${NONO_ARGV_LOG:?}"',
         "exit 0",
         "",
@@ -169,6 +170,7 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       chmodSync(shimPath, 0o755);
 
       spawnSync("bun", [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
+        cwd: ws,
         encoding: "utf-8",
         timeout: 8000,
         killSignal: "SIGKILL",
@@ -189,8 +191,8 @@ describe("T5 — the pinned-path launch spawns nono and the child argv asserts t
       expect(log).toContain("agent start --id probe");
       // cli#350 r4g — /tmp is granted IN ADDITION to the configured TMPDIR
       // (bun's temp dir is /tmp regardless of TMPDIR).
-      expect(log).toContain(`--allow ${join(home, "tmp")}`);
-      expect(log).toContain("--allow /tmp");
+      expect(log).toContain(`--allow ${realpathSync(join(home, "tmp"))}`);
+      expect(log).toContain(`--allow ${realpathSync("/tmp")}`);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
