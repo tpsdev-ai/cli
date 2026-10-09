@@ -190,13 +190,13 @@ function collectPackageJsons(root) {
     for (const entry of entries) {
       if (entry.name === "node_modules" || entry.name === ".git") continue;
       const path = dir ? `${dir}${sep}${entry.name}` : entry.name;
-      const { stat } = inspect(path);
+      const { real: realPath, stat } = inspect(path);
       if (stat.isDirectory()) {
         pending.push(path);
       } else if (stat.isFile() && entry.name === "package.json") {
         let json;
         try {
-          json = JSON.parse(readFileSync(join(root, path), "utf8"));
+          json = JSON.parse(readFileSync(realPath, "utf8"));
         } catch (err) {
           console.error(`check-dep-ages: cannot parse ${path}: ${err?.message ?? err}`);
           process.exit(2);
