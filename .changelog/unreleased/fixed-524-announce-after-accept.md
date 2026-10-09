@@ -1,0 +1,1 @@
+- **`tps office connect` announces a relayed message after its inbox record is published (Closes #524).** Conflicts and deliveries dead-lettered after a write failure are not announced. Quarantining a corrupt existing record can precede publication, ACK and announcement of the incoming delivery.

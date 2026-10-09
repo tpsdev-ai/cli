@@ -18,6 +18,11 @@
 # Bun refuses young versions at resolution time; CI checks external versions in bun.lock.
 [install]
 minimumReleaseAge = 604800
+# handlebars 4.7.10 is the first release patched for GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f and
+# GHSA-xw65-4hp5-5hc7; it is younger than the window. Remove this exclude on or after 2026-10-13
+# (docs/dep-age-exceptions.md has the matching dated entry). The exclude names the package, so
+# handlebars is pinned exactly to 4.7.10 while it is in place; restore the range when removing it.
+minimumReleaseAgeExcludes = ["handlebars"]
 
 [test]
 preload = ["./scripts/home-isolation-preload.ts"]

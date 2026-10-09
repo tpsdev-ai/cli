@@ -146,6 +146,17 @@ if [[ "${1:-}" == "profile" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "why" ]]; then
+  log "WHY $*"
+  if [[ -n "${NONO_FAKE_WHY_FAIL:-}" ]]; then exit 1; fi
+  if [[ -n "${NONO_FAKE_WHY_OUTPUT:-}" ]]; then
+    printf '%s\n' "$NONO_FAKE_WHY_OUTPUT"
+  else
+    printf '%s\n' '{"status":"denied","reason":"path_not_granted"}'
+  fi
+  exit 0
+fi
+
 # -----------------------------------------------------------------------
 # Subcommand: run
 # -----------------------------------------------------------------------

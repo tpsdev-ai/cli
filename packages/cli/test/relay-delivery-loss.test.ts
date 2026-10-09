@@ -15,6 +15,10 @@ import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, MSG_HEARTBEAT, type MailDeliverBody } f
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { writeKeyFile, buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
 for (const entry of ["sync", "connect"] as const) {

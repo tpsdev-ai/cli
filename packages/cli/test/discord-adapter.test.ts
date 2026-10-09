@@ -1,6 +1,10 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import { DiscordAdapter, classifyMessage } from "../src/bridge/discord-adapter.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("DiscordAdapter", () => {
   let fetchMock: ReturnType<typeof mock>;
   const originalFetch = globalThis.fetch;

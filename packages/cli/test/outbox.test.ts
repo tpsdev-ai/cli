@@ -1,12 +1,18 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
+import * as mailLock from "../src/utils/mail-lock.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 describe("outbox", () => {
   let root: string;
+  const originalHome = process.env.HOME;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-outbox-"));
@@ -15,7 +21,8 @@ describe("outbox", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
   });
 
   test("queueOutboxMessage writes to ~/.tps/outbox/new", () => {
@@ -154,24 +161,28 @@ describe("outbox", () => {
     expect(drainOutbox()).toEqual([]);
   });
 
-  test("a record that moves to sent/ between the existence check and the read is a duplicate", () => {
+  test("queueing tolerates ENOENT for new/ when sent/ has the record", () => {
     const id = "a".repeat(64);
-    expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("queued");
-    const newDir = join(root, ".tps", "outbox", "new");
-    const name = `github-${id}.json`;
-    drainOutbox();
-    expect(existsSync(join(root, ".tps", "outbox", "sent", name))).toBe(true);
-    // The record is visible at new/ to an existence check, then gone when it is read.
-    writeFileSync(join(newDir, name), "{}");
-    const original = fs.readFileSync;
-    const read = spyOn(fs, "readFileSync").mockImplementation(((...args: any[]) => {
-      if (String(args[0]) === join(newDir, name)) throw Object.assign(new Error("moved"), { code: "ENOENT" });
-      return (original as any)(...args);
-    }) as any);
+    const lock = spyOn(mailLock, "tryAcquireMailLock").mockReturnValue({ release() {} });
     try {
-      expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("duplicate");
+      expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("queued");
+      const newDir = join(root, ".tps", "outbox", "new");
+      const sentDir = join(root, ".tps", "outbox", "sent");
+      const name = `github-${id}.json`;
+      mkdirSync(sentDir, { recursive: true });
+      const original = fs.readFileSync;
+      const read = spyOn(fs, "readFileSync").mockImplementation(((...args: any[]) => {
+        if (String(args[0]) === join(newDir, name)) fs.renameSync(join(newDir, name), join(sentDir, name));
+        return (original as any)(...args);
+      }) as any);
+      try {
+        expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("duplicate");
+        expect(existsSync(join(sentDir, name))).toBe(true);
+      } finally {
+        read.mockRestore();
+      }
     } finally {
-      read.mockRestore();
+      lock.mockRestore();
     }
   });
 

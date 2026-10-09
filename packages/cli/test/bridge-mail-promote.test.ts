@@ -29,6 +29,7 @@ const IMPOSTOR_SEED = Buffer.alloc(32, 0x23);
 let stub: StubFlair;
 let root: string;
 let stops: Array<() => void> = [];
+let savedFlairEnv: Record<string, string | undefined>;
 
 const inbox = (d: "new" | "cur" | "dlq") => join(root, BRIDGE, d);
 const files = (d: "new" | "cur" | "dlq") =>
@@ -38,6 +39,7 @@ beforeAll(() => {
   root = join(tmpdir(), `tps-bridge-mail-${randomUUID()}`);
   mkdirSync(root, { recursive: true });
   stub = startStubFlair({ [BRIDGE]: BRIDGE_SEED, [SENDER]: SENDER_SEED });
+  savedFlairEnv = { FLAIR_URL: process.env.FLAIR_URL, FLAIR_KEY_PATH: process.env.FLAIR_KEY_PATH };
   process.env.FLAIR_URL = stub.url;
   process.env.FLAIR_KEY_PATH = writeKeyFile(join(root, "keys"), BRIDGE, BRIDGE_SEED);
   for (const d of ["new", "cur", "dlq", "tmp"] as const) mkdirSync(inbox(d), { recursive: true });
@@ -50,6 +52,12 @@ afterEach(() => {
 
 afterAll(() => {
   stub?.stop();
+  // Restore the process-wide FLAIR_* env this file set in beforeAll, so nothing
+  // leaks to a later file in the same bun process (cli#555).
+  for (const [k, v] of Object.entries(savedFlairEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
   rmSync(root, { recursive: true, force: true });
 });
 

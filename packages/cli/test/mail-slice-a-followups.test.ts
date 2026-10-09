@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,6 +11,10 @@ import { signOutboundBody } from "../src/utils/mail-sign.js";
 import { catchUpTopics, createTopic, publishToTopic, subscribe, updateCursor } from "../src/utils/mail-topics.js";
 import { MailClient } from "../../agent/src/io/mail.js";
 import { signEnvelope } from "../../agent/src/lib/signEnvelope.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const seed = Buffer.alloc(32, 0x11);
 let home: string;

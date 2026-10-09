@@ -1,20 +1,7 @@
-/**
- * stub-flair.ts — a hermetic stub Flair HTTP server + signing helpers for the
- * mail-promotion tests.
- *
- * promote() constructs its Flair client UNCONDITIONALLY (there is no client
- * parameter to inject), so these tests exercise the real path: they point
- * FLAIR_URL at this stub and FLAIR_KEY_PATH at a key file, and let the real
- * CLI FlairClient sign its requests and read agent public keys back.
- *
- * The stub ignores Authorization (it only needs to hand back public keys); any
- * 32-byte key file satisfies the client's request signing.
- */
-
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import * as ed from "@noble/ed25519";
-import { createHash } from "node:crypto";
+import { createHash, createPublicKey, verify } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 // Wire sha512 for sync sign operations (same pattern as the other mail tests).
@@ -32,27 +19,54 @@ export interface StubFlair {
   stop(): void;
 }
 
-/** Start a stub Flair that serves `<base>/Agent/<name>` → { publicKey: base64 }. */
-export function startStubFlair(seeds: Record<string, Buffer>): StubFlair {
+export function stubFlairHandler(seeds: Record<string, Buffer>): (req: Request) => Response {
   const pubs: Record<string, string> = {};
   for (const [name, seed] of Object.entries(seeds)) {
     pubs[name] = pubkeyFromSeed(seed).toString("base64");
   }
-  const server = Bun.serve({
-    port: 0,
-    fetch(req) {
-      const url = new URL(req.url);
-      if (url.pathname === "/Health") return new Response("ok");
-      const m = url.pathname.match(/^\/Agent\/(.+)$/);
-      if (m) {
-        const name = decodeURIComponent(m[1]!);
-        const pk = pubs[name];
-        if (!pk) return new Response("not found", { status: 404 });
-        return Response.json({ id: name, name, publicKey: pk });
-      }
-      return new Response("not found", { status: 404 });
-    },
-  });
+  const nonces = new Set<string>();
+  return (req) => {
+    const url = new URL(req.url);
+    if (url.pathname === "/Health") return new Response("ok");
+    const header = req.headers.get("Authorization") ?? "";
+    const auth = header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/.exec(header) : null;
+    if (!auth) return Response.json({
+      type: "error:AccessViolation", code: "AccessViolation", title: "Unauthorized access to resource",
+      status: 403, instance: url.pathname + url.search,
+    }, { status: 403 });
+    const [, caller, timestamp, nonce, signature] = auth;
+    const refuse = (error: string) => Response.json({ error }, { status: 401 });
+    const now = Date.now();
+    if (!Number.isFinite(Number(timestamp)) || Math.abs(now - Number(timestamp)) > 30_000)
+      return refuse("timestamp_out_of_window");
+    const replayKey = `${caller}:${nonce}`;
+    if (nonces.has(replayKey)) return refuse("nonce_replay_detected");
+    if (!caller || !Object.hasOwn(pubs, caller)) return refuse("unknown_agent");
+    try {
+      const payload = `${caller}:${timestamp}:${nonce}:${req.method}:${url.pathname}${url.search}`;
+      const key = createPublicKey({
+        key: Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(pubs[caller]!, "base64")]),
+        format: "der", type: "spki",
+      });
+      if (!verify(null, Buffer.from(payload), key, Buffer.from(signature!, "base64")))
+        return refuse("invalid_signature");
+    } catch {
+      return refuse("signature_verification_failed");
+    }
+    nonces.add(replayKey);
+    const m = url.pathname.match(/^\/Agent\/(.+)$/);
+    if (m) {
+      const name = decodeURIComponent(m[1]!);
+      const pk = Object.hasOwn(pubs, name) ? pubs[name] : undefined;
+      if (!pk) return new Response("not found", { status: 404 });
+      return Response.json({ id: name, name, publicKey: pk });
+    }
+    return new Response("not found", { status: 404 });
+  };
+}
+
+export function startStubFlair(seeds: Record<string, Buffer>): StubFlair {
+  const server = Bun.serve({ port: 0, fetch: stubFlairHandler(seeds) });
   return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
 }
 

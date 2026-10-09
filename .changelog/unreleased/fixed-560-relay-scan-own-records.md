@@ -1,0 +1,1 @@
+- **Relay acceptance leaves records without a `relayDelivery` property in place.** Malformed records with that property are quarantined only in the recipient's own mailbox, even when its value is invalid (e.g. `null`).

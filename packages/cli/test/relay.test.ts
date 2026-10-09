@@ -1,8 +1,13 @@
-import { beforeEach, afterEach, describe, expect, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { deliverToSandbox, processOutboxOnce, resolveAgentMailRoot } from "../src/utils/relay.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 function writeJson(path: string, obj: unknown) {
   writeFileSync(path, JSON.stringify(obj, null, 2), "utf-8");
@@ -68,6 +73,25 @@ describe("relay utils", () => {
     const failed = join(root, ".tps", "branch-office", "brancha", "mail", "outbox", "failed");
     const ff = readdirSync(failed).filter((f) => f.endsWith(".json"));
     expect(ff.length).toBeGreaterThan(0);
+  });
+
+  test("relay reads a rejected outbox record once", async () => {
+    const out = outboxNew("brancha");
+    const path = join(out, "bad.json");
+    writeJson(path, { from: "x", to: "../../etc/passwd", body: "oops" });
+    const original = fs.readFileSync;
+    const read = spyOn(fs, "readFileSync");
+    try {
+      const res = await processOutboxOnce("brancha");
+      expect(res.failed).toBe(1);
+      expect(read.mock.calls.filter(([file]) => String(file) === path)).toHaveLength(1);
+      const failed = join(root, ".tps", "branch-office", "brancha", "mail", "outbox", "failed", "bad.json");
+      expect(JSON.parse(original(failed, "utf-8"))).toMatchObject({
+        body: "oops", error: "Invalid recipient id: ../../etc/passwd",
+      });
+    } finally {
+      read.mockRestore();
+    }
   });
 
   test("relay enforces recipient inbox quota", async () => {

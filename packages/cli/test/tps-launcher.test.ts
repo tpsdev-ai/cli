@@ -3,8 +3,10 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 const SOURCE_LAUNCHER = resolve(import.meta.dir, "../bin/tps.cjs");
+const BUILT_CLI = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TMP_PREFIX = "tps-launcher-test-";
 const PLATFORM_PKG = `@tpsdev-ai/cli-${process.platform}-${process.arch}`;
 // The launcher is documented to run under node (`#!/usr/bin/env node`). Run it
@@ -21,6 +23,7 @@ function makeIsolatedLauncher(): string {
   const binDir = join(dir, "bin");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(binDir, "tps.cjs"), readFileSync(SOURCE_LAUNCHER));
+  writeFileSync(join(binDir, "cli-args.cjs"), readFileSync(resolve(SOURCE_LAUNCHER, "../cli-args.cjs")));
   return join(binDir, "tps.cjs");
 }
 
@@ -38,6 +41,7 @@ function makeLauncherHarness(fakeBinary: string | null): LauncherHarness {
   const binDir = join(dir, "bin");
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(binDir, "tps.cjs"), readFileSync(SOURCE_LAUNCHER));
+  writeFileSync(join(binDir, "cli-args.cjs"), readFileSync(resolve(SOURCE_LAUNCHER, "../cli-args.cjs")));
 
   const fallbackMarker = join(dir, "fallback-ran.marker");
   const fallbackDir = join(dir, "dist", "bin");
@@ -89,6 +93,34 @@ describe("tps launcher version fallback", () => {
     expect(result.stderr.trim()).toBe("");
   });
 });
+
+for (const flag of ["--version", "-v"]) {
+  for (const prefix of [[], ["--no-guard", "--base-model", "fixture"], ["--config", flag], ["--"]]) {
+    test(`launcher secrets-guard ${prefix.join(" ")} child receives ${flag}`, () => {
+      const harness = makeLauncherHarness(null);
+      const root = resolve(harness.launcher, "../..");
+      writeFileSync(join(root, "dist", "bin", "tps.js"), `import(${JSON.stringify(pathToFileURL(BUILT_CLI).href)});\n`);
+      const child = join(root, "child.mjs");
+      writeFileSync(child, 'console.log("CHILD_ARGV=" + JSON.stringify(process.argv.slice(2)));\n');
+      const result = runLauncher(harness, ["secrets-guard", ...prefix, NODE, child, flag]);
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain(`CHILD_ARGV=${JSON.stringify([flag])}`);
+    });
+  }
+
+  for (const prefix of [[], ["secrets-guard"]]) {
+    test(`launcher ${prefix.join(" ")} ${flag} prints the version before a wrapped command`, () => {
+      const harness = makeLauncherHarness(null);
+      const result = runLauncher(harness, [...prefix, flag, NODE, "child.mjs"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe(process.env.TPS_CLI_VERSION || process.env.npm_package_version || "dev");
+      expect(existsSync(harness.fallbackMarker)).toBe(false);
+    });
+  }
+}
 
 describe("tps launcher exit status", () => {
   test("propagates the platform binary's non-zero exit and does not run the fallback", () => {
@@ -188,4 +220,37 @@ test("a resolved binary that cannot start with no JS entry prints accurate guida
   expect(result.stderr).toContain("Try reinstalling main package:");
   expect(result.stderr).toContain("Or install platform binary directly:");
   expect(result.spawned).toBe(1);
+});
+
+describe("tps launcher guard-mode refusals (cli#563)", () => {
+  for (const flag of ["--check", "--no-guard"]) {
+    for (const prefix of [[flag], [flag, "--"], [flag, "--config", "--"],
+      [flag, "-x", "--"], ["-x", "--", flag], [flag, "--config=--"],
+      [flag, "-x--"], [flag, "-abc--"], [flag, "-x=--"], [flag, "-x1"], [flag, "--unknown", "-7"],
+      [flag, "--help", "true"], [flag, "-h", "--"]]) {
+      test(`launcher ${prefix.join(" ")} before the secrets-guard subcommand is refused and launches nothing`, () => {
+        const harness = makeLauncherHarness(
+          "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.TPS_TEST_BINARY_MARKER, 'ran');\n",
+        );
+        const root = resolve(harness.launcher, "../..");
+        const binaryMarker = join(root, "binary-ran.marker");
+        writeFileSync(join(root, "child.mjs"), 'console.log("CHILD_RAN");\n');
+
+        const result = spawnSync(NODE, [harness.launcher, ...prefix, "secrets-guard", NODE, join(root, "child.mjs")], {
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            TPS_TEST_FALLBACK_MARKER: harness.fallbackMarker,
+            TPS_TEST_BINARY_MARKER: binaryMarker,
+          },
+        });
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(`InvalidSecretsGuardMode: ${flag} before the secrets-guard subcommand`);
+        expect(result.stderr).toContain("put the guard flag after the subcommand");
+        expect(existsSync(binaryMarker)).toBe(false);
+        expect(existsSync(harness.fallbackMarker)).toBe(false);
+      });
+    }
+  }
 });

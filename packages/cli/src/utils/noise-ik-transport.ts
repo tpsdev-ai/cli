@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  closeListener,
   type BranchTarget,
   type TransportChannel,
   type TransportServer,
@@ -181,8 +182,14 @@ class NoiseIkChannel implements TransportChannel {
 
 class NoiseIkServer implements TransportServer {
   private onConn: ((channel: TransportChannel) => void) | null = null;
+  private readonly sockets = new Set<Socket>();
 
-  constructor(private readonly server: Server) {}
+  constructor(private readonly server: Server) {
+    server.on("connection", (socket: Socket) => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
+    });
+  }
 
   port(): number {
     const addr = this.server.address();
@@ -199,8 +206,13 @@ class NoiseIkServer implements TransportServer {
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      this.server.close((err) => (err ? reject(err) : resolve()));
+    await closeListener({
+      // Settles with a peer connected: net.Server.close() waits for accepted
+      // sockets to end, so destroy the ones this listener accepted first.
+      terminate: () => {
+        for (const socket of this.sockets) socket.destroy();
+      },
+      server: this.server,
     });
   }
 }

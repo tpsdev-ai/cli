@@ -42,10 +42,12 @@
  */
 
 import meow from "meow";
+import { launchFlagDefinitions } from "./cli-flags.js";
+export { launchFlagDefinitions } from "./cli-flags.js";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, copyFileSync, readdirSync, readFileSync, writeFileSync, unlinkSync, realpathSync, lstatSync, readlinkSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, dirname, basename, isAbsolute, resolve } from "node:path";
+import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
@@ -342,6 +344,222 @@ function tpsCredentialRoots(
   }));
 }
 
+function sandboxProfileDirectories(
+  env: NodeJS.ProcessEnv = process.env,
+): Array<{ label: string; path: string }> {
+  const home = env.HOME || homedir() || "/tmp";
+  const dirs = [
+    { label: "~/.config/nono/profiles", path: join(home, ".config", "nono", "profiles") },
+    { label: "the XDG nono profile directory", path: join(env.XDG_CONFIG_HOME || join(home, ".config"), "nono", "profiles") },
+    { label: "the bundled nono-profiles directory", path: findBundledProfilesDir() },
+  ];
+  const seen = new Set<string>();
+  return dirs.filter((d) => {
+    if (seen.has(d.path)) return false;
+    seen.add(d.path);
+    return true;
+  });
+}
+
+/** Expand a profile grant's leading `~` against HOME. */
+function expandHome(p: string, env: NodeJS.ProcessEnv): string {
+  const home = env.HOME || homedir() || "/tmp";
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return join(home, p.slice(2));
+  return p;
+}
+
+interface ProfileGrant {
+  kind: string;
+  path: string;
+}
+
+function sandboxProfileGrants(profile: string, env: NodeJS.ProcessEnv): ProfileGrant[] {
+  const grants: ProfileGrant[] = [];
+  const seen = new Set<string>();
+  const visit = (name: string, from: string | null, depth: number): void => {
+    if (depth > 16) throw new Error(`the profile chain from '${profile}' extends more than 16 deep`);
+    if (from && env.XDG_CONFIG_HOME &&
+      canonicalPath(env.XDG_CONFIG_HOME) !== canonicalPath(join(env.HOME || homedir(), ".config"))) {
+      throw new Error(`unsupported extends '${name}' with a different XDG_CONFIG_HOME — unset XDG_CONFIG_HOME for launches or set it to HOME/.config`);
+    }
+    if (from && (name.includes("/") || name.endsWith(".json"))) {
+      throw new Error(`unsupported extends path '${name}' in sandbox profile ${from}`);
+    }
+    const path = resolveProfilePath(name, env);
+    if (!path) {
+      if (from && name === "default") return;
+      throw new Error(`cannot resolve sandbox profile '${name}'${from ? ` in extends of ${from}` : ""}`);
+    }
+    const canon = canonicalPath(path);
+    if (seen.has(canon)) return;
+    seen.add(canon);
+    let doc: unknown;
+    try {
+      doc = JSON.parse(readFileSync(path, "utf8"));
+    } catch (err) {
+      throw new Error(`cannot read sandbox profile ${path}: ${(err as Error).message}`);
+    }
+    grants.push(...declaredGrants(doc, path, env));
+    const parents = (doc as Record<string, unknown>).extends;
+    if (parents === undefined || parents === null) return;
+    const names = typeof parents === "string" ? [parents] : parents;
+    if (!Array.isArray(names) || !names.length || names.some((name) => typeof name !== "string")) {
+      throw new Error(`unsupported extends in sandbox profile ${path}`);
+    }
+    for (const parent of names) visit(parent, path, depth + 1);
+  };
+  visit(profile, null, 0);
+  return grants;
+}
+
+function declaredGrants(doc: unknown, path: string, env: NodeJS.ProcessEnv): ProfileGrant[] {
+  if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
+    throw new Error(`sandbox profile ${path} is not a JSON object`);
+  }
+  const record = doc as Record<string, unknown>;
+  for (const key of ["platform_overrides", "unsafe_macos_seatbelt_rules", "packs", "command_policies"]) {
+    if (record[key] !== undefined && record[key] !== null) {
+      throw new Error(`unsupported ${key} in sandbox profile ${path}`);
+    }
+  }
+  const filesystem = record.filesystem;
+  if (filesystem === undefined) return [];
+  if (typeof filesystem !== "object" || filesystem === null || Array.isArray(filesystem)) {
+    throw new Error(`sandbox profile ${path} has a non-object filesystem section`);
+  }
+  const grants: ProfileGrant[] = [];
+  for (const [key, entries] of Object.entries(filesystem)) {
+    if (["deny", "bypass_protection", "suppress_save_prompt", "ignore"].includes(key)) continue;
+    if (!["read", "allow", "write", "read_file", "allow_file", "write_file"].includes(key)) {
+      throw new Error(`unsupported filesystem.${key} in sandbox profile ${path}`);
+    }
+    if (!Array.isArray(entries)) {
+      throw new Error(`sandbox profile ${path} has a non-list filesystem.${key}`);
+    }
+    for (const entry of entries) {
+      let value: unknown = entry;
+      if (typeof entry === "object" && entry !== null && !Array.isArray(entry)) {
+        if (Object.keys(entry).some((key) => key !== "path" && key !== "when")) {
+          throw new Error(`unsupported conditional-path filesystem.${key} entry in ${path}`);
+        }
+        value = entry.path;
+      }
+      if (typeof value !== "string") {
+        throw new Error(`unsupported filesystem.${key} path in sandbox profile ${path}`);
+      }
+      const refusal = parentDirectoryRefusal(value, `filesystem.${key}`)
+        ?? parentDirectoryRefusal(expandHome(value, env), `filesystem.${key}`);
+      if (refusal) throw new Error(refusal);
+      if (/[*?\[\]{}]/.test(value)) {
+        throw new Error(`unsupported filesystem.${key} glob '${value}' in sandbox profile ${path}`);
+      }
+      if (value.includes("$") || (!isAbsolute(value) && value !== "~" && !value.startsWith("~/"))) {
+        throw new Error(`unsupported filesystem.${key} path expansion '${value}' in sandbox profile ${path}`);
+      }
+      grants.push({ kind: key, path: expandHome(value, env) });
+    }
+  }
+  return grants;
+}
+
+function parentDirectoryRefusal(path: string, label: string): string | null {
+  return path.split(sep === "\\" ? /[\\/]/ : sep).includes("..")
+    ? `unsupported parent-directory segment '..' in ${label} '${path}' — give the resolved absolute path`
+    : null;
+}
+
+export function sandboxProfileGrantRefusal(
+  profile: string,
+  env: NodeJS.ProcessEnv = process.env,
+  runtime?: string,
+  bin: string | undefined = env.NONO_BIN,
+): string | null {
+  let grants: ProfileGrant[];
+  try {
+    grants = sandboxProfileGrants(profile, env);
+  } catch (err) {
+    return `cannot read the sandbox profile '${profile}': ${(err as Error).message}`;
+  }
+  try {
+    const asComparison = (p: string) => (caseInsensitivePath(p) ? p.toLowerCase() : p);
+    const roots = tpsCredentialRoots(env).map((r) => ({
+      ...r,
+      comparison: asComparison(canonicalPath(r.path)),
+    }));
+    const profileDirs = sandboxProfileDirectories(env).map((d) => ({
+      ...d, comparison: asComparison(canonicalPath(d.path)),
+    }));
+    const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
+    const foreignFiles = runtimes
+      .filter((rt) => rt !== runtime)
+      .flatMap((rt) => [...runtimeCredentialFiles(rt, env), providerAuthPath(runtimeProviders[rt], env)])
+      .map((f) => ({ path: f, comparison: asComparison(canonicalPath(f)) }));
+    for (const grant of grants) {
+      const comparison = asComparison(canonicalPath(grant.path));
+      const writable = ["allow", "write", "allow_file", "write_file"].includes(grant.kind);
+      const profileDir = writable && profileDirs.find((d) => pathsOverlap(comparison, d.comparison));
+      if (profileDir) {
+        return `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', which overlaps the sandbox profile directory ${profileDir.path}`;
+      }
+      const root = roots.find((r) => pathsOverlap(comparison, r.comparison));
+      if (root) {
+        return (
+          `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', ` +
+          `which overlaps the TPS credential root ${root.label} (${root.path})`
+        );
+      }
+      const foreign = foreignFiles.find((f) => pathContainsOrEquals(comparison, f.comparison));
+      if (foreign) {
+        return (
+          `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', ` +
+          `which covers ${foreign.path}, another runtime's credential file`
+        );
+      }
+    }
+  } catch (err) {
+    return `cannot resolve sandbox profile '${profile}' file grants: ${(err as Error).message}`;
+  }
+  if (!bin || !isAbsolute(bin)) return `cannot query sandbox profile '${profile}': nono must be an absolute path — Install nono >= 0.70 or set NONO_BIN`;
+  const path = resolveProfilePath(profile, env);
+  if (!path) return `cannot query sandbox profile '${profile}': profile not found`;
+  const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
+  const protectedPaths = [
+    ...runtimes.filter((rt) => rt !== runtime).flatMap((rt) => runtimeCredentialFiles(rt, env)),
+    ...runtimes.map((rt) => providerAuthPath(runtimeProviders[rt], env)),
+    ...tpsCredentialRoots(env).map((root) => root.path),
+  ];
+  const queries = [
+    ...[...new Set(protectedPaths)].flatMap((path) => [
+      { path, op: "read" }, { path, op: "write" },
+    ]),
+    ...sandboxProfileDirectories(env).map((dir) => ({ path: dir.path, op: "write" })),
+  ];
+  for (const query of queries) {
+    try {
+      const result = spawnSync(bin, ["why", "--json", "--profile", path, "--path", query.path, "--op", query.op], {
+        env, encoding: "utf8", timeout: 5_000,
+      });
+      if (result.error || result.status !== 0) throw new Error("nono why failed");
+      const answer: unknown = JSON.parse(result.stdout);
+      if (typeof answer !== "object" || answer === null || Array.isArray(answer)) throw new Error("invalid nono why output");
+      const record = answer as Record<string, unknown>;
+      if (record.status === "allowed") {
+        const details = ["reason", "granted_path", "access", "source"]
+          .filter((key) => record[key] !== undefined && record[key] !== null)
+          .map((key) => `${key}=${JSON.stringify(record[key])}`);
+        return `the sandbox profile '${profile}': nono reports ${query.op} access to ${query.path}${details.length ? ` (${details.join(", ")})` : ""}`;
+      }
+      if (record.status !== "denied" || typeof record.reason !== "string" || !["path_not_granted", "insufficient_access", "filesystem_deny"].includes(record.reason)) {
+        throw new Error("invalid nono why denial");
+      }
+    } catch (err) {
+      return `cannot query sandbox profile '${profile}' ${query.op} access to ${query.path}: ${(err as Error).message}`;
+    }
+  }
+  return null;
+}
+
 function caseInsensitivePath(p: string): boolean {
   let ancestor = p;
   for (;;) {
@@ -388,30 +606,35 @@ function appendUnresolved(ancestor: string, tail: string[]): string {
 
 function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
   if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
-  let cur = isAbsolute(p) ? resolve(p) : resolve(cwd, p);
-  const tail: string[] = [];
-  for (;;) {
+  const inputRoot = parse(p).root;
+  const base = sep === "\\" && inputRoot ? resolve(cwd, inputRoot) : cwd;
+  const absolute = isAbsolute(p) ? p : `${base}${sep}${p.slice(inputRoot.length)}`;
+  const root = parse(absolute).root;
+  let cur = root;
+  for (const part of absolute.slice(root.length).split(sep === "\\" ? /[\\/]/ : sep)) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      cur = dirname(cur);
+      continue;
+    }
+    const next = join(cur, part);
     try {
-      const real = realpathSync(cur);
-      return appendUnresolved(real, tail.reverse());
+      cur = realpathSync(next);
     } catch (err) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
       try {
-        if (lstatSync(cur).isSymbolicLink()) {
-          const target = canonicalPath(readlinkSync(cur), dirname(cur), links + 1);
-          return appendUnresolved(target, tail.reverse());
-        }
+        cur = lstatSync(next).isSymbolicLink()
+          ? canonicalPath(readlinkSync(next), cur, links + 1)
+          : appendUnresolved(cur, [part]);
       } catch (linkErr) {
         const linkCode = (linkErr as NodeJS.ErrnoException).code;
         if (linkCode !== "ENOENT" && linkCode !== "ENOTDIR") throw linkErr;
+        cur = appendUnresolved(cur, [part]);
       }
-      const parent = dirname(cur);
-      if (parent === cur) throw err;
-      tail.push(basename(cur));
-      cur = parent;
     }
   }
+  return cur;
 }
 
 function pathContainsOrEquals(dir: string, p: string): boolean {
@@ -432,6 +655,21 @@ export function approveRuntimeNonoOptions(
   const options: NonoOptions = {};
   const runtimeDirectories: string[] = [];
   const result = (refusal: string | null) => ({ options, runtimeDirectories, refusal });
+  const runtimeOptions = runtimeNonoOptions(runtime, env);
+  for (const source of [grants, runtimeOptions]) {
+    for (const key of ["workdir", "cwd", "read", "allow", "readFiles", "allowFiles"] as const) {
+      const value = source[key];
+      const paths = typeof value === "string" ? [value] : value ?? [];
+      for (const path of paths) {
+        const refusal = parentDirectoryRefusal(path, `launch option ${key}`);
+        if (refusal) return result(refusal);
+      }
+    }
+  }
+  for (const { variable, path } of runtimeDirVariables(runtime, env)) {
+    const refusal = parentDirectoryRefusal(path, variable);
+    if (refusal) return result(refusal);
+  }
   const resolved = new Map<string, string>();
   const canonical = (p: string): string => {
     if (!resolved.has(p)) resolved.set(p, canonicalPath(p));
@@ -451,6 +689,13 @@ export function approveRuntimeNonoOptions(
         return { ...r, canon: canonical(r.path) };
       } catch (err) {
         throw new Error(`cannot resolve TPS credential root ${r.label} (${r.path}): ${(err as Error).message}`);
+      }
+    });
+    const profileDirs = sandboxProfileDirectories(env).map((d) => {
+      try {
+        return { ...d, canon: canonical(d.path) };
+      } catch (err) {
+        throw new Error(`cannot resolve sandbox profile directory ${d.label} (${d.path}): ${(err as Error).message}`);
       }
     });
 
@@ -473,16 +718,30 @@ export function approveRuntimeNonoOptions(
           `the runtime profile would grant it read-write access to a credential root`
         );
       }
+      const profileHit = profileDirs.find((d) => overlaps(canon, d.canon));
+      if (profileHit) {
+        return result(
+          `${variable}=${path} overlaps the sandbox profile directory ${profileHit.label} (${profileHit.path}) — ` +
+          `a runtime directory must not resolve into the directory the sandbox profile is loaded from`
+        );
+      }
     }
 
-    const dirGrants: Array<{ label: string; path: string }> = [];
-    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir });
-    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd });
+    const dirGrants: Array<{ label: string; path: string; writable?: boolean }> = [];
+    if (grants.workdir) dirGrants.push({ label: "the workdir grant", path: grants.workdir, writable: true });
+    if (grants.cwd) dirGrants.push({ label: "the current-directory grant", path: grants.cwd, writable: true });
     for (const p of grants.read ?? []) dirGrants.push({ label: `the read grant '${p}'`, path: p });
-    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p });
+    for (const p of grants.allow ?? []) dirGrants.push({ label: `the writable grant '${p}'`, path: p, writable: true });
     for (const p of runtimeNonoOptions(runtime, env).allow ?? []) {
+      const profileDir = profileDirs.find((d) => overlaps(canonical(p), d.canon));
+      if (profileDir) {
+        return result(
+          `the runtime directory '${p}' overlaps the sandbox profile directory ${profileDir.label} (${profileDir.path}) — ` +
+          `a runtime directory must not resolve into the directory the sandbox profile is loaded from`
+        );
+      }
       runtimeDirectories.push(canonical(p));
-      dirGrants.push({ label: `the runtime directory '${p}'`, path: p });
+      dirGrants.push({ label: `the runtime directory '${p}'`, path: p, writable: true });
     }
 
     const runtimes = Object.keys(runtimeProviders) as CredentialRuntime[];
@@ -503,6 +762,10 @@ export function approveRuntimeNonoOptions(
               ? `set the workspace to a directory outside the credential roots`
               : `remove or narrow this grant to a directory outside the credential roots`)
         );
+      }
+      const profileHit = grant.writable && profileDirs.find((d) => overlaps(canon, d.canon));
+      if (profileHit) {
+        return result(`${grant.label} (${grant.path}) overlaps the sandbox profile directory ${profileHit.label} (${profileHit.path})`);
       }
       const foreign = foreignFiles.find((f) => contains(canon, f.canon));
       if (foreign) {
@@ -953,10 +1216,6 @@ export function launchesAgent(command: string | undefined, rest: readonly string
   if (command === "office") return sub === "connect";
   return false;
 }
-
-export const launchFlagDefinitions = {
-  sandboxRequired: { type: "boolean" as const, default: false },
-};
 
 export function readLaunchFlags(argv: readonly string[], parsedFlags?: Record<string, unknown>): {
   sandboxRequired: boolean; noSandbox: boolean; refusal?: string;

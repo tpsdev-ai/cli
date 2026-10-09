@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ const STALL_SCRIPT = join(process.cwd(), "scripts/stall-monitor.ts");
 describe("Stall Monitor Logic", () => {
   let tempDir: string;
   const originalHome = process.env.HOME;
+  const originalVaultKey = process.env.TPS_VAULT_KEY;
 
   beforeEach(() => {
     tempDir = join(tmpdir(), `tps-stall-test-${Date.now()}`);
@@ -20,6 +21,8 @@ describe("Stall Monitor Logic", () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
+    if (originalVaultKey === undefined) delete process.env.TPS_VAULT_KEY;
+    else process.env.TPS_VAULT_KEY = originalVaultKey;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

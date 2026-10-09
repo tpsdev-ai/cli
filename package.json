@@ -24,7 +24,7 @@
     "blake2b": "^2.1.4",
     "canonicalize": "^3.0.0",
     "chacha20-universal": "^1.0.4",
-    "handlebars": "^4.7.9",
+    "handlebars": "4.7.10",
     "nanoassert": "^3.1.0",
     "sha256-universal": "^1.2.1",
     "sha512-universal": "^1.2.1",

@@ -42,6 +42,7 @@ import {
 // ---------------------------------------------------------------------------
 
 let testHome: string;
+const originalEnv = { HOME: process.env.HOME, TPS_HOME: process.env.TPS_HOME };
 
 function setupTestHome(): string {
   const dir = mkdtempSync(join(tmpdir(), "tps-facts-cmd-test-"));
@@ -119,6 +120,10 @@ beforeAll(() => {
 
 afterAll(() => {
   cleanupTestHome();
+  for (const [name, value] of Object.entries(originalEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
 });
 
 beforeEach(() => {

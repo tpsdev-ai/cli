@@ -798,3 +798,48 @@ describe("guard mode flag validation", () => {
     }, 20_000);
   }
 });
+
+// ---------------------------------------------------------------------------
+// cli#563 — a guard-mode flag before the subcommand
+// ---------------------------------------------------------------------------
+
+describe("guard mode flags before the subcommand (cli#563)", () => {
+  const BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+
+  for (const flag of ["--check", "--no-guard"]) {
+    for (const prefix of [[flag], [flag, "--"], [flag, "--config", "--"],
+      [flag, "-x", "--"], ["-x", "--", flag], [flag, "--config=--"],
+      [flag, "-x--"], [flag, "-abc--"], [flag, "-x=--"], [flag, "-x1"], [flag, "--unknown", "-7"],
+      [flag, "--help", "true"], [flag, "-h", "--"]]) {
+      test(`tps ${prefix.join(" ")} secrets-guard <cmd> is refused and runs no child`, () => {
+        const root = mkdtempSync(join(tmpdir(), "tps-guard-before-"));
+        try {
+          const home = join(root, "home");
+          mkdirSync(home);
+          const sentinel = join(root, "child-ran");
+          const child = join(root, "child.mjs");
+          writeFileSync(child, 'import { writeFileSync } from "node:fs";\n' +
+            'writeFileSync(process.env.CHILD_SENTINEL, "ran");\nconsole.log("CHILD_RAN");\n');
+
+          const result = spawnSync(process.execPath,
+            [BIN, ...prefix, "secrets-guard", process.execPath, child],
+            {
+              encoding: "utf-8", input: "", timeout: 15_000, killSignal: "SIGKILL", cwd: root,
+              env: { ...process.env, HOME: home, TPS_HOME: home, CHILD_SENTINEL: sentinel },
+            }
+          );
+          const out = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+
+          expect(result.error).toBeUndefined();
+          expect(result.status).toBe(1);
+          expect(out).toContain(`InvalidSecretsGuardMode: ${flag} before the secrets-guard subcommand`);
+          expect(out).toContain("put the guard flag after the subcommand");
+          expect(existsSync(sentinel)).toBe(false);
+          expect(out).not.toContain("CHILD_RAN");
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      }, 20_000);
+    }
+  }
+});

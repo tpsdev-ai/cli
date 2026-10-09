@@ -14,7 +14,7 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** Discover top-level commands with a regex over the USAGE map. */
 function topLevelCommands(): string[] {
 	const source = readFileSync(BIN_SOURCE, "utf-8");
-	const usage = source.slice(source.indexOf("const USAGE:"), source.indexOf("/** `--` ends TPS"));
+	const usage = source.slice(source.indexOf("const USAGE:"), source.indexOf("async function main()"));
 	const names = [...usage.matchAll(/^ {2}"?([a-z0-9-]+)"?:/gm)].map((m) => m[1]!);
 	return [...new Set(names)].sort();
 }
@@ -207,7 +207,7 @@ describe("TPS help requests and argument passthrough (cli#342)", () => {
 				try { expectHelpIsInert(r); } finally { r.cleanup(); }
 			});
 		}
-		test(`agent run receives ${flag} as message data`, () => {
+		test(`agent run adapter passes ${flag} as message data`, () => {
 			const r = runHelp(["agent", "run", "--id", "demo", "--message", flag], true);
 			try {
 				expect(r.status).toBe(0);
@@ -235,16 +235,16 @@ describe("TPS help requests and argument passthrough (cli#342)", () => {
 		});
 
 		for (const separator of [false, true]) {
-			test(`office exec child receives ${flag} ${separator ? "after --" : "without a separator"}`, () => {
+			test(`office exec adapter passes ${flag} ${separator ? "after --" : "without a separator"}`, () => {
 				expectChildData(["office", "exec", "demo", ...(separator ? ["--"] : [])], flag);
 			});
 		}
 		for (const options of [["--json", "false"], ["--unknown-option", "data"]]) {
-			test(`office exec child receives ${flag} with ${options[0]} before the command`, () => {
+			test(`office exec adapter passes ${flag} with ${options[0]} before the command`, () => {
 				expectChildData([...options, "office", "exec", "demo"], flag);
 			});
 		}
-		test(`mail watch hook receives ${flag}`, () => {
+		test(`mail watch adapter passes ${flag}`, () => {
 			expectChildData(["mail", "watch", "demo", "--sandbox-required", "--exec"], flag);
 		});
 		test(`secrets-guard child receives ${flag}`, () => {
@@ -253,11 +253,66 @@ describe("TPS help requests and argument passthrough (cli#342)", () => {
 	}
 });
 
+describe("TPS version scope probes (cli#550)", () => {
+	for (const flag of ["-v", "--version"]) {
+		test(`tps ${flag} prints the version and exits 0`, () => {
+			const r = runHelp([flag]);
+			try {
+				expect(r.signal).toBeNull();
+				expect(r.status).toBe(0);
+				expect(r.out.trim()).toBe("dev");
+				expect(r.out).not.toContain("Usage");
+				expect(r.files).toEqual([]);
+				expect(r.nonoRuns).toBe("");
+			} finally { r.cleanup(); }
+		});
+
+		test(`secrets-guard ${flag} before the wrapped command prints the version`, () => {
+			const r = runHelp(["secrets-guard", flag]);
+			try {
+				expect(r.signal).toBeNull();
+				expect(r.status).toBe(0);
+				expect(r.out.trim()).toBe("dev");
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		test(`agent run adapter passes ${flag} as message data`, () => {
+			const r = runHelp(["agent", "run", "--id", "demo", "--message", flag], true);
+			try {
+				expect(r.status).toBe(0);
+				expect(r.out).toContain(JSON.stringify({ message: flag }));
+				expect(r.out).not.toContain("Usage");
+			} finally { r.cleanup(); }
+		});
+
+		for (const separator of [false, true]) {
+			test(`office exec adapter passes ${flag} ${separator ? "after --" : "without a separator"}`, () => {
+				expectChildData(["office", "exec", "demo", ...(separator ? ["--"] : [])], flag);
+			});
+		}
+		for (const options of [["--json", "false"], ["--unknown-option", "data"]]) {
+			test(`office exec adapter passes ${flag} with ${options[0]} before the command`, () => {
+				expectChildData([...options, "office", "exec", "demo"], flag);
+			});
+		}
+		test(`mail watch adapter passes ${flag}`, () => {
+			expectChildData(["mail", "watch", "demo", "--sandbox-required", "--exec"], flag);
+		});
+		test(`secrets-guard child receives ${flag}`, () => {
+			expectChildData(["secrets-guard"], flag);
+		});
+		test(`secrets-guard --no-guard child receives ${flag}`, () => {
+			expectChildData(["secrets-guard", "--no-guard"], flag);
+		});
+	}
+});
+
 function expectChildData(prefix: string[], flag: string): void {
 	const root = mkdtempSync(join(tmpdir(), "tps-help-child-"));
 	const child = join(root, "child.mjs");
 	writeFileSync(child, 'console.log("CHILD_ARGV=" + JSON.stringify(process.argv.slice(2)));');
-	const r = runHelp([...prefix, process.execPath, child, flag], true);
+	const r = runHelp([...prefix, process.execPath, child, flag], prefix.includes("office") || prefix.includes("mail"));
 	try {
 		expect(r.signal).toBeNull();
 		expect(r.status).toBe(0);
@@ -267,4 +322,19 @@ function expectChildData(prefix: string[], flag: string): void {
 		r.cleanup();
 		rmSync(root, { recursive: true, force: true });
 	}
+}
+
+for (const flag of ["--version", "-v", "--help", "-h"]) {
+  for (const prefix of [["--quietNonoCheck"], ["--dryRun"], ["--baseModel", "fixture"], ["--base-model", "fixture"], ["--config", flag]]) {
+    test(`secrets-guard real child gets ${flag} after ${prefix.join(" ")}`, () => {
+      expectChildData(["secrets-guard", "--no-guard", ...prefix], flag);
+    });
+  }
+  test(`context summary receives ${flag} as a value`, () => {
+    const r = runHelp(["context", "update", "probe", "--summary", flag, "--json"]);
+    try {
+      expect(r.status).toBe(0);
+      expect(JSON.parse(r.out).summary).toBe(flag);
+    } finally { r.cleanup(); }
+  });
 }

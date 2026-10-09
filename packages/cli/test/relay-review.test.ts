@@ -8,6 +8,10 @@ import { deliverRelayedToLocal } from "../src/utils/relay.js";
 import { runMail } from "../src/commands/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 const seeds = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
 describe("relay review regressions", () => {

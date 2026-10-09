@@ -566,4 +566,22 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     expect(files("dlq")).toContain("m1.json");
     expect(readFileSync(join(inbox("dlq"), "m1.json.reason"), "utf-8")).toContain("class: invalid");
   });
+
+  test("MailClient retains new mail on trust-tier resolution errors", async () => {
+    const env = signedEnvelope("flint", AGENT, "tier", { flint: FLINT });
+    plant(wrapper("flint", env));
+    mkdirSync(join(tmpDir, ".bridge-principals"), { recursive: true });
+    writeFileSync(join(tmpDir, ".bridge-principals", "broken.json"), "not json", "utf-8");
+
+    const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(files("new")).toEqual(["m1.json"]);
+    expect(files("cur")).toEqual([]);
+    expect(files("dlq")).toEqual([]);
+
+    rmSync(join(tmpDir, ".bridge-principals"), { recursive: true, force: true });
+    expect((await client.checkNewMail()).length).toBe(1);
+    expect(files("new")).toEqual([]);
+    expect(files("cur")).toEqual(["m1.json"]);
+  });
 });

@@ -140,7 +140,7 @@ function makeSandbox(name: string, seedProfiles = true): Sandbox {
   // OUTSIDE /tmp: the launch grants /tmp unconditionally (cli#350 r4g), so a
   // HOME under /tmp would put the private dir inside that grant and the overlap
   // assert would (correctly) refuse. /var/tmp keeps HOME and every grant disjoint.
-  const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
+  const base = "/var/tmp";
   const root = mkdtempSync(join(base, `tps-attest-${name}-`));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
@@ -180,6 +180,7 @@ const FAKE_NONO = `#!/usr/bin/env bash
 # bind to).
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then
@@ -581,12 +582,10 @@ describe("4e fixtures — the launcher refuses (fake nono, pinned absolute path)
     }
   });
 
-  test("the private dir inside the granted tmpdir → refused BEFORE spawning (overlap assert)", () => {
+  test("HOME inside the granted tmpdir → credential root overlap refused BEFORE spawning", () => {
     const sb = makeSandbox("priv-in-tmp");
     try {
       const bin = writeFakeNono(sb, FAKE_NONO);
-      // A full HOME inside the granted tmpdir: the private dir then lands inside
-      // the TMPDIR grant (a naive mkdtemp under TMPDIR).
       seedHome(sb.tmp, sb.ws);
       const r = runLauncher(sb, ["agent", "start", "--id", "probe", SANDBOX_REQUIRED_FLAG], {
         [NONO_BIN_ENV]: bin,
@@ -594,8 +593,8 @@ describe("4e fixtures — the launcher refuses (fake nono, pinned absolute path)
         TMPDIR: sb.tmp,
       });
       const text = out(r);
-      expect(text).toContain("OUTSIDE canary");
-      expect(text).toContain("inside the grant");
+      expect(text).toContain(`the writable grant '${sb.tmp}'`);
+      expect(text).toContain("overlaps the TPS credential root ~/.tps/auth");
       expect(r.status).toBe(78);
       expect(fakeNonoRuns(sb)).toEqual([]); // refused BEFORE spawning
       expect(launchDirs({ home: sb.tmp } as Sandbox)).toEqual([]);
@@ -665,6 +664,7 @@ async function runLauncherInProcess(opts: {
   const script = `#!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then
@@ -1005,6 +1005,7 @@ function runLauncherTty(
 const CONFINING_FAKE_NONO = `#!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
 log="\${FAKE_NONO_LOG:?}"
 printf '%s\\n' "ARGV $*" >> "$log"
 if [ "\${1:-}" = "ps" ]; then
