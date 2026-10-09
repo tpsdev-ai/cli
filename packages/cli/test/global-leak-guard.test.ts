@@ -61,7 +61,7 @@ describe("guarded-global preload (cli#568)", () => {
     expect(run.output).toContain("1 pass");
   });
 
-  test("passes hook-patched through case cleanup (green fixture)", () => {
+  test("passes hook-patched through file cleanup (green fixture)", () => {
     const run = runFixture("hook-patched", [join(import.meta.dir, "helpers", "patch-shared.ts")]);
     expect(run.status, run.output).toBe(0);
     expect(run.output).toContain("2 pass");
