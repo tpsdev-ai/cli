@@ -4,14 +4,22 @@ import { afterAll } from "bun:test";
 const patches = new WeakMap<object, Map<PropertyKey, Array<() => void>>>();
 
 function savePatch<T extends object, K extends keyof T>(target: T, property: K, value: T[K]): () => void {
-  const original = target[property];
+  const original = Object.getOwnPropertyDescriptor(target, property);
   let properties = patches.get(target);
   if (!properties) { properties = new Map(); patches.set(target, properties); }
   let stack = properties.get(property);
   if (!stack) { stack = []; properties.set(property, stack); }
   const pending = stack;
-  const undo = () => { target[property] = original; };
-  target[property] = value;
+  const undo = () => {
+    if (original) Object.defineProperty(target, property, original);
+    else delete target[property];
+  };
+  Object.defineProperty(target, property, {
+    configurable: original?.configurable ?? true,
+    enumerable: original?.enumerable ?? true,
+    writable: true,
+    value,
+  });
   pending.push(undo);
   const restore = () => {
     const index = pending.indexOf(undo);
