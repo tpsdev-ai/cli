@@ -16,10 +16,10 @@ import {
   auditExcludes,
   collectResolvedDeps,
   evaluateAges,
+  excludesFromInstallTable,
   isExactVersionPin,
   parseBunLock,
   parseExceptions,
-  parseMinReleaseAgeExcludes,
   parseMinReleaseAgeSeconds,
 } from "../scripts/lib/check-dep-ages-collect.mjs";
 
@@ -52,36 +52,38 @@ describe("parseMinReleaseAgeSeconds", () => {
   });
 });
 
-describe("parseMinReleaseAgeExcludes", () => {
+describe("excludesFromInstallTable", () => {
+  const read = (text: string) => excludesFromInstallTable(Bun.TOML.parse(text).install);
+
   it("reads this repo's install-time exclude list", () => {
-    const { names, error } = parseMinReleaseAgeExcludes(readFileSync(join(REPO, "bunfig.toml"), "utf8"));
+    const { names, error } = read(readFileSync(join(REPO, "bunfig.toml"), "utf8"));
     expect(error).toBeNull();
     expect(names).toEqual(["handlebars"]);
   });
 
   it("reads an empty list, and an absent key, as no excludes", () => {
-    expect(parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = []\n').names).toEqual([]);
-    expect(parseMinReleaseAgeExcludes('[install]\nminimumReleaseAge = 604800\n').names).toEqual([]);
+    expect(read('[install]\nminimumReleaseAgeExcludes = []\n')).toEqual({ names: [], error: null });
+    expect(read('[install]\nminimumReleaseAge = 604800\n')).toEqual({ names: [], error: null });
   });
 
   it("reads a multi-line array and drops comments", () => {
-    const { names, error } = parseMinReleaseAgeExcludes(
-      '[install]\nminimumReleaseAgeExcludes = [\n  "dep-a", # first\n  "dep-b",\n]\n',
-    );
+    const { names, error } = read('[install]\nminimumReleaseAgeExcludes = [\n  "dep-a", # first\n  "dep-b",\n]\n');
     expect(error).toBeNull();
     expect(names).toEqual(["dep-a", "dep-b"]);
   });
 
   it("ignores the key in another section", () => {
-    expect(parseMinReleaseAgeExcludes('[test]\nminimumReleaseAgeExcludes = ["dep-a"]\n').names).toEqual([]);
+    expect(read('[test]\nminimumReleaseAgeExcludes = ["dep-a"]\n')).toEqual({ names: [], error: null });
   });
 
   it("refuses a value that is not an array of strings instead of reading it as empty", () => {
-    const notArray = parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = "dep-a"\n');
+    const notArray = read('[install]\nminimumReleaseAgeExcludes = "dep-a"\n');
     expect(notArray.names).toEqual([]);
     expect(notArray.error).not.toBeNull();
-    const badEntry = parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = ["dep-a", 3]\n');
+    const badEntry = read('[install]\nminimumReleaseAgeExcludes = ["dep-a", 3]\n');
     expect(badEntry.error).toContain("unparseable");
+    const tableArray = read('[[install]]\nminimumReleaseAgeExcludes = ["dep-a"]\n');
+    expect(tableArray).toMatchObject({ names: [], error: expect.stringContaining("not a table") });
   });
 });
 
@@ -671,7 +673,7 @@ it("exits 2 for a missing publish time alongside an uncovered young version", as
 
 /* ──────────────────── install-time excludes vs exceptions ───────────────── */
 
-describe("CLI — every minimumReleaseAgeExcludes name needs an unexpired exception and exact declarations", () => {
+describe("CLI — an excluded name needs an unexpired exception and exact declarations", () => {
   const PINNED = { name: "fixture", dependencies: { "dep-a": "1.0.0" } };
 
   it("passes when the exclude has a dated entry and an exact pin", async () => {

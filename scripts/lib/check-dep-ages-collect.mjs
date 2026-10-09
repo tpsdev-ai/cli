@@ -211,55 +211,24 @@ export function evaluateAges({ deps, publishTimes, gateSeconds, nowMs, exception
   return { young, uncovered, covered, missing };
 }
 
-/** Read install exclusions with Bun's parser, or a restricted single-line fallback. */
-export function parseMinReleaseAgeExcludes(tomlText) {
-  const text = String(tomlText);
+/**
+ * The exclusion list from bunfig's `install` table as Bun's TOML parser returned
+ * it (scripts/check-dep-ages.mjs gets the table from `Bun.TOML.parse`).
+ *
+ * @returns {{ names: string[], error: string | null }}
+ */
+export function excludesFromInstallTable(install) {
   const refuse = (detail) => ({
     names: [], error: `unparseable minimumReleaseAgeExcludes: ${detail}`,
   });
-  if (globalThis.Bun?.TOML?.parse) {
-    try {
-      const names = globalThis.Bun.TOML.parse(text).install?.minimumReleaseAgeExcludes;
-      if (names === undefined) return { names: [], error: null };
-      if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) {
-        return refuse("expected an array of strings");
-      }
-      return { names, error: null };
-    } catch (err) {
-      return refuse(err?.message ?? String(err));
-    }
+  if (install === null || install === undefined) return { names: [], error: null };
+  if (typeof install !== "object" || Array.isArray(install)) return refuse("install is not a table");
+  const names = install.minimumReleaseAgeExcludes;
+  if (names === undefined) return { names: [], error: null };
+  if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) {
+    return refuse("expected an array of strings");
   }
-
-  let section = "";
-  let names;
-  for (const raw of text.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#")) continue;
-    const header = line.match(/^\[([^\]]+)\]\s*(?:#.*)?$/);
-    if (header) {
-      section = header[1].trim();
-      if (!/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(section)) {
-        return refuse("unsupported table syntax without Bun.TOML.parse");
-      }
-      continue;
-    }
-    if (!line.includes("minimumReleaseAgeExcludes")) {
-      if (/^["']/.test(line) || /^(?:install|["']install["'])\s*=/.test(line)) {
-        return refuse("unsupported key or install table syntax without Bun.TOML.parse");
-      }
-      continue;
-    }
-    if (section !== "install") {
-      if (section === "test" && /^minimumReleaseAgeExcludes\s*=/.test(line)) continue;
-      return refuse("unsupported key or install table syntax without Bun.TOML.parse");
-    }
-    const match = line.match(/^minimumReleaseAgeExcludes\s*=\s*\[\s*((?:"[A-Za-z0-9@/_.-]*"\s*(?:,\s*"[A-Za-z0-9@/_.-]*"\s*)*,?\s*)?)\]\s*(?:#.*)?$/);
-    if (!match || names !== undefined) {
-      return refuse("unsupported or duplicate declaration without Bun.TOML.parse");
-    }
-    names = [...match[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
-  }
-  return { names: names ?? [], error: null };
+  return { names, error: null };
 }
 
 /** A bare version such as `4.7.10`; a range, tag or URL is not an exact pin. */
@@ -276,7 +245,9 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
 
 /**
  * Check bunfig's install-time excludes against the dated exceptions and the
- * exact pins in the repository's package.json files.
+ * exact pins in the repository's package.json files. Bun applies `overrides`
+ * from the root package.json (path `package.json`), not from a workspace or
+ * other nested manifest, so an excluded name in a nested `overrides` is refused.
  *
  * @param {{ excludes: string[], exceptionEntries: Map<string, object>,
  *           exceptionErrors: Array<{key: string | null, message: string}>,
@@ -284,6 +255,7 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
  * @returns Array<{kind: "uncovered", name: string,
  *                 error: {message: string} | null}
  *             | {kind: "range", name: string, path: string, spec: string}
+ *             | {kind: "nested-override", name: string, path: string}
  *             | {kind: "unpinned", name: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
@@ -308,6 +280,10 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
       for (const field of DEP_FIELDS) {
         const deps = pj.json?.[field];
         if (!deps || typeof deps !== "object" || !Object.hasOwn(deps, name)) continue;
+        if (field === "overrides" && pj.path !== "package.json") {
+          problems.push({ kind: "nested-override", name, path: pj.path });
+          continue;
+        }
         declared = true;
         const spec = deps[name];
         if (!isExactVersionPin(spec)) problems.push({ kind: "range", name, path: pj.path, spec });

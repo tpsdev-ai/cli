@@ -4,61 +4,66 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { auditExcludes, parseMinReleaseAgeExcludes } from "../scripts/lib/check-dep-ages-collect.mjs";
+import { auditExcludes } from "../scripts/lib/check-dep-ages-collect.mjs";
 
 const gate = fileURLToPath(new URL("../scripts/check-dep-ages.mjs", import.meta.url));
-const collector = new URL("../scripts/lib/check-dep-ages-collect.mjs", import.meta.url).href;
+const node = Bun.which("node");
 
-function fallback(text: string) {
-  const run = spawnSync("node", ["--input-type=module", "-e",
-    `import { parseMinReleaseAgeExcludes } from ${JSON.stringify(collector)};
-     console.log(JSON.stringify(parseMinReleaseAgeExcludes(process.argv[1])));`, text], { encoding: "utf8" });
-  expect(run.status).toBe(0);
-  return JSON.parse(run.stdout);
-}
+const AGE = "[install]\nminimumReleaseAge = 604800\n";
 
-describe("exclusion parser conformance", () => {
+describe("the gate reads exclusions with Bun's TOML parser", () => {
   it.each([
-    'minimumReleaseAgeExcludes = ["foo", "bar"]',
-    '"minimumReleaseAgeExcludes" = ["foo", "bar"]',
-    '"minimumReleaseAge\\u0045xcludes" = ["foo", "bar"]',
-    "'minimumReleaseAgeExcludes' = ['foo', 'bar']",
-    'minimumReleaseAgeExcludes = [\n "foo",\n "bar",\n]',
-  ])("matches real Bun.TOML.parse for %s", (declaration) => {
-    const text = `[install]\n${declaration}\n`;
-    expect(parseMinReleaseAgeExcludes(text)).toEqual({
-      names: Bun.TOML.parse(text).install.minimumReleaseAgeExcludes, error: null,
+    ["a plain [install] key", `${AGE}minimumReleaseAgeExcludes = ["foo", "bar"]\n`],
+    ["a dotted key", `install.minimumReleaseAgeExcludes = ["foo", "bar"]\n${AGE}`],
+    ["a quoted dotted key", `install."minimumReleaseAgeExcludes" = ["foo", "bar"]\n${AGE}`],
+    ["an escaped dotted key", `install."minimumReleaseAge\\u0045xcludes" = ["foo", "bar"]\n${AGE}`],
+    ["a literal dotted key", `install.'minimumReleaseAgeExcludes' = ['foo', 'bar']\n${AGE}`],
+    ["an inline table", `install = { minimumReleaseAgeExcludes = ["foo", "bar"] }\n${AGE}`],
+    ["a multi-line array", `${AGE}minimumReleaseAgeExcludes = [\n  "foo",\n  "bar",\n]\n`],
+    ["comments", `${AGE}# minimumReleaseAgeExcludes = ["decoy"]\nminimumReleaseAgeExcludes = [ # names\n  "foo", # first\n  # none here\n  "bar", ] # end\n`],
+  ])("lists what Bun parses from %s, and fails without a dated exception", (_label, bunfig) => {
+    const parsed = Bun.TOML.parse(bunfig).install.minimumReleaseAgeExcludes;
+    expect(parsed).toEqual(["foo", "bar"]);
+    linkedFixture((root) => {
+      writeFileSync(join(root, "bunfig.toml"), bunfig);
+      writeFileSync(join(root, "docs", "dep-age-exceptions.md"), "## Exceptions\n");
+      const output = runGate(root);
+      expect([...output.matchAll(/^ {4}(\S+): no dated entry under/gm)].map((m) => m[1])).toEqual(parsed);
+      expect(output).not.toContain("Checking");
     });
   });
 
-  it("keeps the ordinary Node fallback form", () => {
-    const text = '[install]\nminimumReleaseAgeExcludes = ["foo", "bar",] # names\n';
-    expect(fallback(text)).toEqual({ names: ["foo", "bar"], error: null });
-    expect(fallback('[install]\nminimumReleaseAge = 604800\n')).toEqual({ names: [], error: null });
-    expect(fallback('[install]\nminimumReleaseAgeExcludes = []\n')).toEqual({ names: [], error: null });
+  it("fails closed with a named error when bun cannot be run", () => {
+    if (!node) throw new Error("test setup failed: node is not on PATH");
+    linkedFixture((root) => {
+      const noBun = join(root, "..", "no-bun");
+      mkdirSync(noBun);
+      const run = spawnSync(node, [gate], {
+        env: { PATH: noBun, TPS_DEP_AGES_ROOT: root }, encoding: "utf8", timeout: 5000,
+      });
+      expect(run.status).toBe(2);
+      expect(run.stderr).toContain("cannot read bunfig.toml with Bun's TOML parser: cannot run bun");
+      expect(run.stderr).not.toContain("bun.lock");
+    });
   });
 
-  it.each([
-    '[install]\n"minimumReleaseAgeExcludes" = ["foo"]',
-    '[install]\n"minimumReleaseAge\\u0045xcludes" = ["foo"]',
-    "[install]\n'minimumReleaseAgeExcludes' = ['foo']",
-    '[install]\nminimumReleaseAgeExcludes = ["foo",, "bar"]',
-    '[install]\nminimumReleaseAgeExcludes = [\n "foo",\n "bar"\n]',
-    '[install]\nminimumReleaseAgeExcludes = { name = "foo" }',
-    'install = { minimumReleaseAgeExcludes = ["foo"] }',
-    '["install"]\nminimumReleaseAgeExcludes = ["foo"]',
-    '["install"]\n"minimumReleaseAge\\u0045xcludes" = ["foo"]',
-    '"inst\\u0061ll" = { "minimumReleaseAge\\u0045xcludes" = ["foo"] }',
-    '[install]\nminimumReleaseAgeExcludes = ["foo"]\nminimumReleaseAgeExcludes = []',
-  ])("refuses unsupported fallback syntax: %s", (text) => {
-    expect(fallback(text)).toMatchObject({ names: [], error: expect.stringContaining("minimumReleaseAgeExcludes") });
+  it("fails closed with a named error when Bun's parser rejects bunfig.toml", () => {
+    const bunfig = `${AGE}minimumReleaseAgeExcludes = ["foo",, "bar"]\n`;
+    expect(() => Bun.TOML.parse(bunfig)).toThrow();
+    linkedFixture((root) => {
+      writeFileSync(join(root, "bunfig.toml"), bunfig);
+      const output = runGate(root);
+      expect(output).toContain("cannot read bunfig.toml with Bun's TOML parser: the parser rejected it");
+      expect(output).not.toContain("bun.lock");
+    });
   });
 
-  it("refuses a malformed array under real Bun", () => {
-    const text = '[install]\nminimumReleaseAgeExcludes = ["foo",, "bar"]';
-    expect(() => Bun.TOML.parse(text)).toThrow();
-    expect(parseMinReleaseAgeExcludes(text)).toMatchObject({
-      names: [], error: expect.stringContaining("minimumReleaseAgeExcludes"),
+  it("does not load the repository's bunfig.toml preload into the parsing process", () => {
+    linkedFixture((root) => {
+      writeFileSync(join(root, "patch.ts"), "Bun.TOML.parse = () => ({});\n");
+      writeFileSync(join(root, "bunfig.toml"), `preload = ["./patch.ts"]\n${AGE}minimumReleaseAgeExcludes = ["foo"]\n`);
+      writeFileSync(join(root, "docs", "dep-age-exceptions.md"), "## Exceptions\n");
+      expect(runGate(root)).toContain("foo: no dated entry under");
     });
   });
 });
@@ -77,6 +82,19 @@ describe("excluded declarations", () => {
       writeFileSync(join(root, "package.json"), JSON.stringify({ overrides: { foo: "1.0.0" } }));
       expect(runGate(root)).toContain("bun.lock is not parseable");
     });
+  });
+
+  it("refuses an excluded name in a nested package.json's overrides and does not count it", () => {
+    expect(auditExcludes({
+      excludes: ["foo"], exceptionEntries: new Map([["foo@1.0.0", {}]]), exceptionErrors: [],
+      packageJsons: [
+        { path: "package.json", json: { workspaces: ["packages/*"] } },
+        { path: join("packages", "w", "package.json"), json: { overrides: { foo: "1.0.0" } } },
+      ],
+    })).toEqual([
+      { kind: "nested-override", name: "foo", path: join("packages", "w", "package.json") },
+      { kind: "unpinned", name: "foo" },
+    ]);
   });
 
   it.each(["devDependencies", "optionalDependencies", "peerDependencies", "overrides"])(

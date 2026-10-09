@@ -3,33 +3,39 @@
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
  * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge,
- * and that every minimumReleaseAgeExcludes name has an unexpired entry in
- * docs/dep-age-exceptions.md and at least one exact declaration; every
- * declaration must be exact.
+ * and that every minimumReleaseAgeExcludes name, as Bun's TOML parser reads it, has
+ * an unexpired entry in docs/dep-age-exceptions.md and at least one exact
+ * declaration; every declaration must be exact, and an override must be in the
+ * root package.json.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
- *       exception covers it), and every install-time exclude has an unexpired entry and exact declarations
+ *       exception covers it), and every excluded name Bun reads has an unexpired entry,
+ *       exact declarations, and no override in a nested package.json
  *   1 — all required publish times are available and an uncovered version is too fresh
- *   2 — missing publish times, unreadable or unparseable required files,
- *       missing or invalid threshold, invalid or unused exceptions, an excluded
- *       name without an unexpired exception or without exact declarations, no external
- *       resolutions, refused CI overrides, unexpected arguments, or registry fetch failures
+ *   2 — missing publish times, unreadable or unparseable required files, Bun not
+ *       runnable or rejecting bunfig.toml, missing or invalid threshold, invalid or
+ *       unused exceptions, an excluded name without an unexpired exception or without
+ *       exact declarations, an excluded name in a nested package.json's overrides, no
+ *       external resolutions, refused CI overrides, unexpected arguments, or registry
+ *       fetch failures
  *
  */
 
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   auditExcludes,
   collectResolvedDeps,
   evaluateAges,
+  excludesFromInstallTable,
   parseBunLock,
   parseExceptions,
-  parseMinReleaseAgeExcludes,
   parseMinReleaseAgeSeconds,
 } from "./lib/check-dep-ages-collect.mjs";
 
@@ -78,6 +84,72 @@ function readOrExit(path, what) {
     console.error(`check-dep-ages: cannot read ${what} (${path}): ${err?.code ?? err?.message ?? err}`);
     process.exit(2);
   }
+}
+
+// Bun parses the text from stdin in an empty directory with only PATH set, so the
+// repository's bunfig.toml, and any preload it names, is not loaded by the parser.
+const BUN_READ_INSTALL = `
+let parsed;
+try {
+  parsed = Bun.TOML.parse(await Bun.stdin.text());
+} catch (err) {
+  console.error(String(err?.message ?? err));
+  process.exit(3);
+}
+process.stdout.write(JSON.stringify({ install: parsed.install ?? null }));
+`;
+
+/** bunfig's \`install\` table as Bun's TOML parser reads it; exits 2 when Bun cannot read it. */
+function readInstallTableWithBun(text) {
+  let cwd;
+  let run;
+  let detail = null;
+  try {
+    cwd = mkdtempSync(join(tmpdir(), "check-dep-ages-"));
+    run = spawnSync("bun", ["-e", BUN_READ_INSTALL], {
+      cwd,
+      input: text,
+      encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "" },
+      timeout: 30_000,
+      maxBuffer: 16 * 1024 * 1024,
+    });
+  } catch (err) {
+    detail = `cannot run bun: ${err?.message ?? err}`;
+  } finally {
+    try {
+      if (cwd !== undefined) rmSync(cwd, { recursive: true, force: true });
+    } catch (err) {
+      detail ??= `cannot remove ${cwd}: ${err?.message ?? err}`;
+    }
+  }
+  let out;
+  if (detail === null) {
+    if (run.error) {
+      detail = `cannot run bun: ${run.error.code ?? run.error.message ?? run.error}`;
+    } else if (run.status === 3) {
+      detail = `the parser rejected it: ${String(run.stderr).trim()}`;
+    } else if (run.status !== 0) {
+      detail = `bun exited ${run.status ?? run.signal}: ${String(run.stderr).trim()}`;
+    } else {
+      try {
+        out = JSON.parse(run.stdout);
+      } catch {
+        out = undefined;
+      }
+      if (out === null || typeof out !== "object" || !Object.hasOwn(out, "install")) {
+        detail = "bun printed no parsed table";
+      }
+    }
+  }
+  if (detail !== null) {
+    console.error(`check-dep-ages: cannot read bunfig.toml with Bun's TOML parser: ${detail}`);
+    console.error(
+      "Refusing, because an unread exclusion list must not read as an empty one. Put bun on PATH, or fix bunfig.toml.",
+    );
+    process.exit(2);
+  }
+  return out.install;
 }
 
 // The limit counts parsed package.json files, not directories or directory entries.
@@ -150,8 +222,10 @@ if (gateSeconds === null || !Number.isFinite(gateSeconds) || gateSeconds < 0) {
 }
 const gateDays = gateSeconds / (24 * 60 * 60);
 
-// ── Install-time excludes, from the same array the install-time gate uses ────
-const { names: excludeNames, error: excludeParseError } = parseMinReleaseAgeExcludes(bunfigText);
+// ── Install-time excludes, as Bun's TOML parser reads bunfig.toml ───────────
+const { names: excludeNames, error: excludeParseError } = excludesFromInstallTable(
+  readInstallTableWithBun(bunfigText),
+);
 if (excludeParseError !== null) {
   console.error(`check-dep-ages: bunfig.toml [install] minimumReleaseAgeExcludes is malformed: ${excludeParseError}`);
   console.error("Refusing, because an unreadable exclude list must not read as an empty one.");
@@ -163,7 +237,7 @@ const { entries: exceptionEntries, errors: exceptionErrors } = parseExceptions(
   readOrExit(EXCEPTIONS_PATH, "docs/dep-age-exceptions.md"),
 );
 
-// ── Every exclude needs an unexpired exception and exact declarations ──────────
+// ── Every name Bun excludes needs an unexpired exception and exact declarations ──
 // Bun excludes by package name; the dated entry bounds how long CI accepts it.
 if (excludeNames.length > 0) {
   const packageJsons = collectPackageJsons(ROOT);
@@ -186,6 +260,13 @@ if (excludeNames.length > 0) {
         console.error(`    ${problem.name}: ${why}`);
         console.error(
           `        Remedy: add a valid \`- ${problem.name}@<resolved-version> | expires:YYYY-MM-DD | reason: ...\` line to docs/dep-age-exceptions.md, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      } else if (problem.kind === "nested-override") {
+        console.error(
+          `    ${problem.path}: \`${problem.name}\` is in overrides, which Bun applies from the root package.json, not from this file.`,
+        );
+        console.error(
+          `        Remedy: move the override to the root package.json, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
         );
       } else if (problem.kind === "unpinned") {
         console.error(
