@@ -50,8 +50,8 @@ function spawnLockHolder(): { child: ChildProcess; ready: Promise<void>; exited:
 test("a contended synchronous acquisition returns null after waiting about timeoutMs", async () => {
   const timeoutMs = 400;
   // The holder is a real second process, so the wait below is genuine
-  // inter-process contention. The lower bound fails a holder that gives up
-  // early (after one retry, or on a fraction of timeoutMs).
+  // inter-process contention. The lower bound rejects an acquirer whose measured
+  // wait is below 0.9 * timeoutMs, targeting the one-retry and small-cap regressions.
   const { child, ready, exited } = spawnLockHolder();
   try {
     await ready;
