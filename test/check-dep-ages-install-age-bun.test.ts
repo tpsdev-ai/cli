@@ -9,9 +9,9 @@
  * refuses a too-young version on a fresh resolve and when the lockfile must
  * change, and that adding the name to `minimumReleaseAgeExcludes` admits it.
  *
- * No network: the registry is an in-process HTTP server. The server is stopped
- * and its tree removed in `finally`; every spawned install carries an explicit
- * timeout.
+ * No external network (loopback-only local registry). Setup runs inside `try`;
+ * `finally` stops the registry if started and removes the temporary tree.
+ * Every spawned install carries an explicit timeout.
  */
 
 import { expect, it } from "bun:test";
@@ -28,7 +28,7 @@ const FRESH = "1.1.0"; // published 1 day before the run
 const WINDOW_SECONDS = 604800;
 const BLOCKED = `blocked by minimum-release-age: ${WINDOW_SECONDS} seconds`;
 
-/** A local registry (no network) serving both versions of NAME and their tarballs. */
+/** No external network (loopback-only local registry). */
 function startRegistry(root: string) {
   const tarballs = new Map<string, Buffer>();
   for (const version of [AGED, FRESH]) {
@@ -121,8 +121,9 @@ it(
   "real Bun refuses a too-young version on a fresh resolve and under --frozen-lockfile",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "age-install-age-"));
-    const registry = startRegistry(root);
+    let registry: ReturnType<typeof startRegistry> | undefined;
     try {
+      registry = startRegistry(root);
       // A fresh resolve of an exact pin that only the too-young version satisfies.
       const fresh = writeProject(root, FRESH, registry.url);
       const first = await bunInstall(fresh, ["--no-cache"]);
@@ -143,8 +144,11 @@ it(
       expect(second.output).toContain(BLOCKED);
       expect(lockVersions(frozen)).toEqual([{ name: NAME, version: AGED }]);
     } finally {
-      registry.stop();
-      rmSync(root, { recursive: true, force: true });
+      try {
+        registry?.stop();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   },
   60000,
@@ -154,20 +158,24 @@ it(
   "adding the package to minimumReleaseAgeExcludes admits the too-young version",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "age-exclude-"));
-    const registry = startRegistry(root);
+    let registry: ReturnType<typeof startRegistry> | undefined;
     try {
+      registry = startRegistry(root);
       const project = writeProject(root, FRESH, registry.url, { excludes: [NAME] });
       const install = await bunInstall(project, ["--no-cache"]);
       expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
       expect(lockVersions(project)).toEqual([{ name: NAME, version: FRESH }]);
       expect(registry.requests).toContain(`/tar/${FRESH}.tgz`);
 
-      // With the version now locked, the same exclusion keeps --frozen-lockfile green.
+      // A complete lockfile installs the too-young version without an age check.
       const recheck = await bunInstall(project, ["--frozen-lockfile", "--no-cache"]);
       expect({ exit: recheck.exit, output: recheck.output }).toMatchObject({ exit: 0 });
     } finally {
-      registry.stop();
-      rmSync(root, { recursive: true, force: true });
+      try {
+        registry?.stop();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   },
   60000,

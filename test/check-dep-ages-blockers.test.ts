@@ -64,6 +64,21 @@ describe("exclusion parser conformance", () => {
 });
 
 describe("excluded declarations", () => {
+  it("fails with a named error when an excluded name has no declaration", () => {
+    linkedFixture((root) => {
+      const output = runGate(root);
+      expect(output).toContain("foo: excluded but not pinned: declare it exactly, e.g. via overrides, or remove the exclude");
+      expect(output).not.toContain("Checking");
+    });
+  });
+
+  it("passes the exclusion audit with only an exact override", () => {
+    linkedFixture((root) => {
+      writeFileSync(join(root, "package.json"), JSON.stringify({ overrides: { foo: "1.0.0" } }));
+      expect(runGate(root)).toContain("bun.lock is not parseable");
+    });
+  });
+
   it.each(["devDependencies", "optionalDependencies", "peerDependencies", "overrides"])(
     "reports a range in %s after an exact dependency", (field) => {
       expect(auditExcludes({

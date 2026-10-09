@@ -283,7 +283,8 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
  *           packageJsons: Array<{path: string, json: object}> }}
  * @returns Array<{kind: "uncovered", name: string,
  *                 error: {message: string} | null}
- *             | {kind: "range", name: string, path: string, spec: string}>
+ *             | {kind: "range", name: string, path: string, spec: string}
+ *             | {kind: "unpinned", name: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
@@ -302,14 +303,17 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
         ) ?? null;
       problems.push({ kind: "uncovered", name, error });
     }
+    let declared = false;
     for (const pj of packageJsons ?? []) {
       for (const field of DEP_FIELDS) {
         const deps = pj.json?.[field];
         if (!deps || typeof deps !== "object" || !Object.hasOwn(deps, name)) continue;
+        declared = true;
         const spec = deps[name];
         if (!isExactVersionPin(spec)) problems.push({ kind: "range", name, path: pj.path, spec });
       }
     }
+    if (!declared) problems.push({ kind: "unpinned", name });
   }
   return problems;
 }

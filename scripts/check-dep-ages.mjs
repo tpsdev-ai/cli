@@ -4,18 +4,18 @@
  *
  * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge,
  * and that every minimumReleaseAgeExcludes name has an unexpired entry in
- * docs/dep-age-exceptions.md and is pinned exactly wherever a package.json
- * declares it.
+ * docs/dep-age-exceptions.md and at least one exact declaration; every
+ * declaration must be exact.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
- *       exception covers it), and every install-time exclude is covered
+ *       exception covers it), and every install-time exclude has an unexpired entry and exact declarations
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files,
  *       missing or invalid threshold, invalid or unused exceptions, an excluded
- *       name without an unexpired exception or without an exact pin, no external
+ *       name without an unexpired exception or without exact declarations, no external
  *       resolutions, refused CI overrides, unexpected arguments, or registry fetch failures
  *
  */
@@ -163,7 +163,7 @@ const { entries: exceptionEntries, errors: exceptionErrors } = parseExceptions(
   readOrExit(EXCEPTIONS_PATH, "docs/dep-age-exceptions.md"),
 );
 
-// ── Every exclude must have an unexpired exception and an exact pin ──────────
+// ── Every exclude needs an unexpired exception and exact declarations ──────────
 // Bun excludes by package name; the dated entry bounds how long CI accepts it.
 if (excludeNames.length > 0) {
   const packageJsons = collectPackageJsons(ROOT);
@@ -186,6 +186,10 @@ if (excludeNames.length > 0) {
         console.error(`    ${problem.name}: ${why}`);
         console.error(
           `        Remedy: add a valid \`- ${problem.name}@<resolved-version> | expires:YYYY-MM-DD | reason: ...\` line to docs/dep-age-exceptions.md, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      } else if (problem.kind === "unpinned") {
+        console.error(
+          `    ${problem.name}: excluded but not pinned: declare it exactly, e.g. via overrides, or remove the exclude`,
         );
       } else {
         console.error(

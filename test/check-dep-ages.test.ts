@@ -252,7 +252,7 @@ describe("auditExcludes", () => {
         excludes: ["dep-a"],
         exceptionEntries: new Map(),
         exceptionErrors: [],
-        packageJsons: [],
+        packageJsons: [pkg({ dependencies: { "dep-a": "1.0.0" } })],
       }),
     ).toEqual([{ kind: "uncovered", name: "dep-a", error: null }]);
   });
@@ -266,7 +266,7 @@ describe("auditExcludes", () => {
       excludes: ["dep-a"],
       exceptionEntries: entries,
       exceptionErrors: errors,
-      packageJsons: [],
+      packageJsons: [pkg({ dependencies: { "dep-a": "1.0.0" } })],
     });
     expect(problems).toHaveLength(1);
     expect(problems[0]).toMatchObject({ kind: "uncovered", name: "dep-a" });
@@ -671,7 +671,7 @@ it("exits 2 for a missing publish time alongside an uncovered young version", as
 
 /* ──────────────────── install-time excludes vs exceptions ───────────────── */
 
-describe("CLI — every minimumReleaseAgeExcludes name needs an unexpired exception and an exact pin", () => {
+describe("CLI — every minimumReleaseAgeExcludes name needs an unexpired exception and exact declarations", () => {
   const PINNED = { name: "fixture", dependencies: { "dep-a": "1.0.0" } };
 
   it("passes when the exclude has a dated entry and an exact pin", async () => {
