@@ -49,6 +49,10 @@ describe("mock restore guard (cli#555)", () => {
     "nested-import-leaked.fixture.ts",
     "cast-global-leaked.fixture.ts",
     "bare-global-leaked.fixture.ts",
+    "destructured-alias-leaked.fixture.ts",
+    "object-destructured-alias-leaked.fixture.ts",
+    "property-read-alias-leaked.fixture.ts",
+    "module-alias-non-mock-leaked.fixture.ts",
   ]) {
     test(`reports ${name} (red fixture)`, () => {
       expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
@@ -76,6 +80,7 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     "direct-global-restored.fixture.ts",
     "direct-module-restored.fixture.ts",
     "mock-helper-restored.fixture.ts",
+    "local-shadow-cleared.fixture.ts",
   ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);
