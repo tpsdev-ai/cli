@@ -86,3 +86,161 @@ for (const { flags, mode } of cases) {
     }
   }, 35_000);
 }
+
+test("a guard flag before the secrets-guard subcommand is refused (cli#563)", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  for (const args of [
+    ["--check", "secrets-guard", "child"],
+    ["--no-guard", "secrets-guard", "child"],
+    ["--check=false", "secrets-guard", "child"],
+    ["--check", "--", "secrets-guard", "child"],
+    ["--no-guard", "--config", "--", "secrets-guard", "child"],
+  ]) {
+    expect(() => parseCliArgs(args)).toThrow(/^InvalidSecretsGuardMode: .* before the secrets-guard subcommand/);
+  }
+  // A guard flag before a subcommand that is not secrets-guard sets no guard mode
+  // and is not refused by this scan.
+  expect(parseCliArgs(["--check", "status"]).guardMode).toEqual({ check: false, noGuard: false });
+});
+
+test("a guard flag after the secrets-guard subcommand is unchanged (cli#563)", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  expect(parseCliArgs(["secrets-guard", "--check"]).guardMode).toEqual({ check: true, noGuard: false });
+  expect(parseCliArgs(["secrets-guard", "--no-guard", "child"]).guardMode).toEqual({ check: false, noGuard: true });
+});
+
+for (const option of ["-x", "-abc"]) {
+  test(`${option} consumes a -- value through meow`, async () => {
+    const { parseCliArgs } = await import("../src/utils/cli-args.js");
+    const { cliFlagDefinitions } = await import("../src/utils/cli-flags.js");
+    const argv = [option, "--", "secrets-guard", "--check", "child"];
+    const scanned = parseCliArgs(argv);
+    const parsed = meow("", {
+      importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false,
+      argv: scanned.argv,
+    });
+    expect(parsed.input).toEqual(["secrets-guard", "child"]);
+    expect(parsed.flags[option.slice(-1)]).toBe("--");
+    expect(scanned.guardMode).toEqual({ check: true, noGuard: false });
+    expect(() => parseCliArgs([option, "--", "--check", "secrets-guard", "child"]))
+      .toThrow("InvalidSecretsGuardMode: --check before the secrets-guard subcommand; put the guard flag after the subcommand");
+  });
+}
+
+test("a -- before secrets-guard leaves following tokens positional", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  const args = ["--", "secrets-guard", "--check", "child"];
+  const scanned = parseCliArgs(args);
+  expect(scanned.argv).toEqual(args);
+  expect(scanned.guardMode).toEqual({ check: false, noGuard: false });
+});
+
+for (const option of ["-x--", "-abc--", "-x=--", "-x1"]) {
+  test(`${option} leaves secrets-guard positional through meow`, async () => {
+    const { parseCliArgs } = await import("../src/utils/cli-args.js");
+    const { cliFlagDefinitions } = await import("../src/utils/cli-flags.js");
+    const argv = ["--check", option, "secrets-guard", "child"];
+    const parsed = meow("", {
+      importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false, argv,
+    });
+    expect(parsed.input).toEqual(["secrets-guard", "child"]);
+    expect(() => parseCliArgs(argv)).toThrow("InvalidSecretsGuardMode: --check before the secrets-guard subcommand");
+  });
+}
+
+const delimiterGuardSpellings = [
+  "--check", "--no-check", "--no-guard", "--no-no-guard", "--guard",
+  "--noGuard", "--no-noGuard", "--noCheck",
+].flatMap((flag) => [flag, `${flag}=true`, `${flag}=false`]);
+
+for (const option of ["-x", "-abc", "-xx.", "-xx=", "-xx/", "-x.", "-éé"]) {
+  test(`${option} consuming the wrapped delimiter is refused before meow`, async () => {
+    const { parseCliArgs } = await import("../src/utils/cli-args.js");
+    const { cliFlagDefinitions } = await import("../src/utils/cli-flags.js");
+    for (const guard of delimiterGuardSpellings) {
+      const raw = ["secrets-guard", option, "--", "node", guard];
+      const parsed = meow("", {
+        importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false, argv: raw,
+      });
+      expect(parsed.input).toEqual(["secrets-guard", "node"]);
+      expect(JSON.stringify(parsed.flags)).toContain('"--"');
+      expect(() => parseCliArgs(raw)).toThrow(`InvalidSecretsGuardOption: ${option}`);
+      expect(() => parseCliArgs(["secrets-guard", option, "node", guard]))
+        .toThrow(`InvalidSecretsGuardOption: ${option}`);
+    }
+  });
+
+  test(`${option} consuming the wrapped delimiter is refused by the built CLI`, () => {
+    const root = mkdtempSync(join(tmpdir(), "guard-delimiter-"));
+    try {
+      const sentinel = join(root, "child-ran");
+      const child = join(root, "child.mjs");
+      writeFileSync(child, 'import { writeFileSync } from "node:fs"; writeFileSync(process.env.CHILD_SENTINEL, "ran");');
+      for (const guard of delimiterGuardSpellings) {
+        for (const command of [["node", guard], [process.execPath, child, guard]]) {
+          const result = spawnSync(process.execPath, [
+            resolve(import.meta.dir, "../dist/bin/tps.js"), "secrets-guard", option, "--", ...command,
+          ], {
+            encoding: "utf-8", input: "", timeout: 15_000, killSignal: "SIGKILL", cwd: root,
+            env: { ...process.env, HOME: root, TPS_HOME: root, CHILD_SENTINEL: sentinel },
+          });
+          expect(result.error).toBeUndefined();
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain(`InvalidSecretsGuardOption: ${option}`);
+          expect(existsSync(sentinel)).toBe(false);
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+}
+
+test("declared value flags preserve the wrapped delimiter through meow", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  const { cliFlagDefinitions, cliOptionTypes } = await import("../src/utils/cli-flags.js");
+  for (const [flag, type] of cliOptionTypes) {
+    if (type === "boolean") continue;
+    for (const guard of delimiterGuardSpellings) {
+      const raw = ["secrets-guard", flag, "--", "node", guard];
+      const scanned = parseCliArgs(raw);
+      const parsed = meow("", {
+        importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false, argv: scanned.argv,
+      });
+      expect(parsed.input).toEqual(["secrets-guard", "node", guard]);
+      expect(scanned.guardMode).toEqual({ check: false, noGuard: false });
+    }
+  }
+});
+
+test("declared value flags with a wrapped delimiter in the built CLI", async () => {
+  const { cliOptionTypes } = await import("../src/utils/cli-flags.js");
+  const wrappedArguments = [...delimiterGuardSpellings, "-x", "-abc", "-xx.", "-x=--"];
+  const root = mkdtempSync(join(tmpdir(), "guard-value-delimiter-"));
+  try {
+    const argvFile = join(root, "argv.json");
+    const child = join(root, "child.mjs");
+    writeFileSync(child, 'import { writeFileSync } from "node:fs"; writeFileSync(process.env.CHILD_ARGV_FILE, JSON.stringify(process.argv.slice(2)));');
+    for (const [flag, type] of cliOptionTypes) {
+      if (type === "boolean") continue;
+      rmSync(argvFile, { force: true });
+      const result = spawnSync(process.execPath, [
+        resolve(import.meta.dir, "../dist/bin/tps.js"), "secrets-guard", flag, "--",
+        process.execPath, child, ...wrappedArguments,
+      ], {
+        encoding: "utf-8", input: "", timeout: 15_000, killSignal: "SIGKILL", cwd: root,
+        env: { ...process.env, HOME: root, TPS_HOME: root, CHILD_ARGV_FILE: argvFile },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      if (flag === "--version") {
+        expect(result.stdout).toBe("dev\n");
+        expect(existsSync(argvFile)).toBe(false);
+      } else {
+        expect(JSON.parse(readFileSync(argvFile, "utf-8"))).toEqual(wrappedArguments);
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 35_000);
