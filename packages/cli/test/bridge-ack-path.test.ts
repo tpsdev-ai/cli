@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -15,7 +17,7 @@ afterEach(() => {
 const BRIDGE = "ack-bridge";
 const seed = Buffer.alloc(32, 0x22);
 let root: string;
-let verifier: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 let stops: Array<() => void>;
 let faults: Array<ReturnType<typeof spyOn>>;
 const path = (dir: string, file = "record.json") => join(root, BRIDGE, dir, file);
@@ -24,16 +26,16 @@ const record = () => JSON.parse(fs.readFileSync(path("cur"), "utf8"));
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "bridge-ack-"));
   for (const dir of ["new", "cur", "tmp", "dlq"]) fs.mkdirSync(path(dir, ""), { recursive: true });
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
     id: "kern", name: "kern", publicKey: pubkeyFromSeed(seed).toString("base64"),
-  });
+  }));
   stops = [];
   faults = [];
 });
 afterEach(() => {
   for (const stop of stops) stop();
   for (const fault of faults) fault.mockRestore();
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   fs.rmSync(root, { recursive: true, force: true });
 });
 

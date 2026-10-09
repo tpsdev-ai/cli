@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * ops-31.1 — tps memory CLI tests
  */
@@ -26,7 +28,7 @@ let _savedFetch: typeof globalThis.fetch;
 const _savedAgentId = process.env.TPS_AGENT_ID;
 beforeEach(() => { _savedFetch = globalThis.fetch; process.env.TPS_AGENT_ID = "operator"; });
 afterEach(() => {
-  globalThis.fetch = _savedFetch;
+  patchShared(globalThis, "fetch", _savedFetch);
   if (_savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
   else process.env.TPS_AGENT_ID = _savedAgentId;
 });
@@ -37,7 +39,7 @@ const PENDING_MEMORIES = [
 ];
 
 function mockFetch(handler: (url: string, opts?: RequestInit) => Response | Promise<Response>) {
-  globalThis.fetch = handler as any;
+  patchShared(globalThis, "fetch", handler as any);
 }
 
 describe("ops-31.1: tps memory review", () => {
@@ -50,10 +52,10 @@ describe("ops-31.1: tps memory review", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "review", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     expect(lines.some((l) => l.includes("flint-lesson-042"))).toBe(true);
     expect(lines.some((l) => l.includes("flint-pattern-018"))).toBe(true);
@@ -65,10 +67,10 @@ describe("ops-31.1: tps memory review", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "review", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     expect(lines.some((l) => l.includes("No memories pending"))).toBe(true);
   });
@@ -167,10 +169,10 @@ describe("ops-31.1: tps memory list", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "list", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     const output = lines.join("\n");
     expect(output).toContain("m1");
@@ -187,10 +189,10 @@ describe("ops-31.1: tps memory list", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "list", agentId: "flint", includeArchived: true, flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     const output = lines.join("\n");
     expect(output).toContain("m1");
@@ -206,10 +208,10 @@ describe("ops-31.1: tps memory show", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "show", memoryId: "flint-lesson-042", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     const output = lines.join("\n");
     expect(output).toContain("flint-lesson-042");
@@ -230,10 +232,10 @@ describe("ops-31.1: tps memory search", () => {
     const { runMemory } = await import("../src/commands/memory.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...a: any[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: any[]) => lines.push(a.join(" ")));
 
     await runMemory({ action: "search", agentId: "flint", query: "gh commands", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     expect(lines.some((l) => l.includes("0.910"))).toBe(true);
     expect(lines.some((l) => l.includes("gh commands lesson"))).toBe(true);

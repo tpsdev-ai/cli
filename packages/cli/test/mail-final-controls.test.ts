@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -14,15 +16,15 @@ afterEach(() => {
 const seed = Buffer.alloc(32, 1);
 let root: string;
 let oldMail: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "final-controls-"));
   oldMail = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({ id: "flint", name: "flint", publicKey: pubkeyFromSeed(seed).toString("base64") });
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({ id: "flint", name: "flint", publicKey: pubkeyFromSeed(seed).toString("base64") }));
 });
 afterEach(() => {
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   if (oldMail === undefined) delete process.env.TPS_MAIL_DIR; else process.env.TPS_MAIL_DIR = oldMail;
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -32,7 +34,7 @@ function plant() {
 }
 
 test("promotion delivers with the public key registered by agent create", async () => {
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   const id = "created-promotion-regression";
   const oldUrl = process.env.FLAIR_URL;
   const oldKey = process.env.FLAIR_KEY_PATH;

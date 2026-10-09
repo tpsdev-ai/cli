@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 // cli#499 — branch and memory resolve the operator identity from configuration
 // and refuse by name when none is set. The branch hostname fragment and the
 // memory "admin" literal fallbacks are gone.
@@ -25,12 +27,12 @@ afterAll(() => {
 
 beforeEach(() => {
   delete process.env.TPS_AGENT_ID;
-  globalThis.fetch = savedFetch;
+  patchShared(globalThis, "fetch", savedFetch);
 });
 afterEach(() => {
   if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
   else process.env.TPS_AGENT_ID = savedAgentId;
-  globalThis.fetch = savedFetch;
+  patchShared(globalThis, "fetch", savedFetch);
 });
 
 describe("cli#499 — branch identity", () => {
@@ -58,7 +60,7 @@ describe("cli#499 — branch identity", () => {
 
 describe("cli#499 — memory operator identity", () => {
   test("refuses by name when no operator identity is configured", async () => {
-    globalThis.fetch = (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch;
+    patchShared(globalThis, "fetch", (async () => new Response("{}", { status: 200 })) as unknown as typeof fetch);
     await expect(
       runMemory({ action: "archive", memoryId: "m1", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH }),
     ).rejects.toThrow(/no memory operator id/);
@@ -66,14 +68,14 @@ describe("cli#499 — memory operator identity", () => {
 
   test("resolves the operator from TPS_AGENT_ID", async () => {
     process.env.TPS_AGENT_ID = "kern";
-    globalThis.fetch = (async () => new Response("[]", { status: 200 })) as unknown as typeof fetch;
+    patchShared(globalThis, "fetch", (async () => new Response("[]", { status: 200 })) as unknown as typeof fetch);
     const lines: string[] = [];
     const orig = console.log;
-    console.log = (...a: unknown[]) => lines.push(a.join(" "));
+    patchShared(console, "log", (...a: unknown[]) => lines.push(a.join(" ")));
     try {
       await runMemory({ action: "review", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
     } finally {
-      console.log = orig;
+      patchShared(console, "log", orig);
     }
     expect(lines.some((l) => l.includes("No memories pending review for flint."))).toBe(true);
   });

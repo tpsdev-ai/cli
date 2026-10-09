@@ -1,0 +1,10 @@
+import { afterEach, mock } from "bun:test";
+import * as ed from "@noble/ed25519";
+import { createPatchShared } from "../../helpers/patch-shared.js";
+const patchShared = createPatchShared();
+afterEach(() => mock.restore());
+const x = { m: () => {} };
+patchShared(x as any, "m", mock(() => {}));
+patchShared(ed.hashes, "sha512", mock(() => new Uint8Array()));
+patchShared(globalThis as any, "x", mock(() => {}));
+patchShared(globalThis, "fetch", mock(async () => new Response("fixture")));

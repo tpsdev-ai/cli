@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * ops-36 Phase 2 — OpenClaw Mail Bridge tests (Ed25519 auth)
  */
@@ -66,7 +68,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17891;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -76,7 +78,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 
@@ -84,7 +86,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17892;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -97,7 +99,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 
@@ -105,7 +107,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17893;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -122,7 +124,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 
@@ -130,7 +132,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17894;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "test-anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -161,7 +163,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 
@@ -169,7 +171,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17895;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -189,7 +191,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 
@@ -197,7 +199,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     const { startBridgeDaemon } = await import("../src/utils/mail-bridge.js");
     const port = 17896;
     const origExit = process.exit;
-    (process as any).exit = () => {};
+    patchShared((process as any), "exit", () => {});
     startBridgeDaemon({ port, mailDir, bridgeAgentId: "test-bridge", defaultAgentId: "anvil" });
     await new Promise((r) => setTimeout(r, 80));
     try {
@@ -210,7 +212,7 @@ describe("ops-36p2: inbound HTTP security", () => {
     } finally {
       process.kill(process.pid, "SIGTERM");
       await new Promise((r) => setTimeout(r, 20));
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
   });
 });

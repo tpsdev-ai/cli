@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { signEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { promote, redriveRetryable, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
 
@@ -12,7 +14,7 @@ afterEach(() => {
   mock.restore();
 });
 
-hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
+patchShared(hashes, "sha512", (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest()));
 
 const SENDER = "agent-a";
 const MAILBOX = "agent-b";
@@ -22,7 +24,7 @@ const SENDER_PUB = Buffer.from(ed.getPublicKey(new Uint8Array(SENDER_SEED)));
 
 let home: string;
 let flairKeyPath: string;
-let fetchSpy: ReturnType<typeof spyOn>;
+const fetchSpyState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 let savedEnv: Record<string, string | undefined>;
 /** What the stub hub serves as the sender's publicKey. */
 let servedKey: string;
@@ -41,8 +43,8 @@ beforeEach(() => {
   process.env.TPS_TEST_KEYS_DIR = keys;
   flairKeyPath = join(keys, "reader.key");
   writeFileSync(flairKeyPath, READER_SEED);
-  fetchSpy = spyOn(globalThis, "fetch");
-  fetchSpy.mockImplementation(async (input) => {
+  patchShared(fetchSpyState, "value", spyOn(globalThis, "fetch"));
+  fetchSpyState.value.mockImplementation(async (input) => {
     const url = new URL(String(input));
     expect(url.origin).toBe("http://flair.test");
     if (url.pathname === "/Health") return new Response("ok");
@@ -52,7 +54,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fetchSpy.mockRestore();
+  fetchSpyState.value.mockRestore();
   for (const [name, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;

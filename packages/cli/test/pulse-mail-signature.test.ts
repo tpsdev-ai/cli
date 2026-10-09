@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -62,15 +64,15 @@ describe("pulse signing identity preflight", () => {
     writeFileSync(join(root, ".tps", "identity", "github.key"), Buffer.alloc(32, 0x76));
     previousFetch = globalThis.fetch;
     fetchCalls = [];
-    globalThis.fetch = (async (url, init) => {
+    patchShared(globalThis, "fetch", (async (url, init) => {
       fetchCalls.push(String(url));
       expect(init?.method).toBe("GET");
       expect((init?.headers as Record<string, string>).Authorization).toMatch(/^TPS-Ed25519 pulse:/);
       return new Response("not found", { status: 404 });
-    }) as typeof fetch;
+    }) as typeof fetch);
   });
   afterEach(() => {
-    globalThis.fetch = previousFetch;
+    patchShared(globalThis, "fetch", previousFetch);
     for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(root, { recursive: true, force: true });
   });
@@ -117,7 +119,7 @@ describe("pulse signing identity preflight", () => {
   }
   test("a registered matching pulse key permits the first poll", async () => {
     writeFileSync(join(root, ".tps", "identity", "pulse.key"), seed);
-    globalThis.fetch = (async () => Response.json({ id: "pulse", name: "pulse", publicKey: Buffer.from(ed.getPublicKey(seed)).toString("base64") })) as typeof fetch;
+    patchShared(globalThis, "fetch", (async () => Response.json({ id: "pulse", name: "pulse", publicKey: Buffer.from(ed.getPublicKey(seed)).toString("base64") })) as typeof fetch);
     let polls = 0;
     const callbacks: Array<() => void> = [];
     const running = startPollLoop(config, { version: 1, lastPollAt: "", instances: {} }, {
@@ -133,7 +135,7 @@ describe("pulse signing identity preflight", () => {
   });
   test("a mismatched registered key refuses before polling", async () => {
     writeFileSync(join(root, ".tps", "identity", "pulse.key"), seed);
-    globalThis.fetch = (async () => Response.json({ id: "pulse", publicKey: Buffer.from(ed.getPublicKey(Buffer.alloc(32, 0x77))).toString("base64") })) as typeof fetch;
+    patchShared(globalThis, "fetch", (async () => Response.json({ id: "pulse", publicKey: Buffer.from(ed.getPublicKey(Buffer.alloc(32, 0x77))).toString("base64") })) as typeof fetch);
     await refuses(/pulse.*does not match.*tps agent create --id pulse/);
   });
 });

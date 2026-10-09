@@ -10,8 +10,9 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 
-hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
+patchShared(hashes, "sha512", (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest()));
 
 import { promote, sendMessage } from "../src/utils/mail.js";
 import { sendSignedMail } from "../src/utils/mail-producer.js";

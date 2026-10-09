@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * ops-31.3 — tps agent create onboarding seed tests
  */
@@ -35,19 +37,19 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  globalThis.fetch = _savedFetch;
+  patchShared(globalThis, "fetch", _savedFetch);
 });
 
 describe("ops-31.3: FlairClient.seedAgent()", () => {
   test("sends correct payload to /AgentSeed", async () => {
     let capturedBody: any;
-    globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
       if (String(url).includes("/AgentSeed")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify(SEED_RESPONSE), { status: 200 });
       }
       return new Response("{}", { status: 200 });
-    }) as any;
+    }) as any);
 
     const { createFlairClient } = await import("../src/utils/flair-client.js");
     const { generateKeyPairSync: gkp } = await import("node:crypto");
@@ -71,13 +73,13 @@ describe("ops-31.3: FlairClient.seedAgent()", () => {
 
   test("passes starterMemories to /AgentSeed", async () => {
     let capturedBody: any;
-    globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
       if (String(url).includes("/AgentSeed")) {
         capturedBody = JSON.parse(opts?.body as string);
         return new Response(JSON.stringify(SEED_RESPONSE), { status: 200 });
       }
       return new Response("{}", { status: 200 });
-    }) as any;
+    }) as any);
 
     const { createFlairClient } = await import("../src/utils/flair-client.js");
     const { generateKeyPairSync: gkp2 } = await import("node:crypto");
@@ -99,14 +101,14 @@ describe("ops-31.3: updateAgent()", () => {
   test("read-modify-write: fetches existing record then PUTs merged", async () => {
     const existing = { id: TEST_AGENT_ID, name: "old", role: "agent", publicKey: "pending", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" };
     let putBody: any;
-    globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
       if (String(url).includes("/Agent/")) {
         if (opts?.method === "PUT") { putBody = JSON.parse(opts.body as string); return new Response("{}", { status: 200 }); }
         return new Response(JSON.stringify(existing), { status: 200 });
       }
       if (opts?.method === "POST") return new Response(JSON.stringify([existing]), { status: 200 });
       return new Response("{}", { status: 200 });
-    }) as any;
+    }) as any);
 
     const { createFlairClient } = await import("../src/utils/flair-client.js");
     const { generateKeyPairSync: gkp3 } = await import("node:crypto");

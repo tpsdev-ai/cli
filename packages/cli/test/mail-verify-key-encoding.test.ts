@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { signEnvelope, verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { promote, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
 import { createMailVerifyClient } from "../src/utils/mail-verify.js";
@@ -14,7 +16,7 @@ afterEach(() => {
 });
 
 // Wire sha512 for the sync signing operations (same pattern as the other mail tests).
-hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
+patchShared(hashes, "sha512", (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest()));
 
 const SENDER = "flint";
 const MAILBOX = "anvil";
@@ -36,7 +38,7 @@ const SENDER_PUB = Buffer.from(ed.getPublicKey(new Uint8Array(SENDER_SEED)));
 let home: string;
 let keys: string;
 let flairKeyPath: string;
-let fetchSpy: ReturnType<typeof spyOn>;
+const fetchSpyState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 let savedEnv: Record<string, string | undefined>;
 
 beforeEach(() => {
@@ -53,11 +55,11 @@ beforeEach(() => {
   process.env.TPS_TEST_KEYS_DIR = keys;
   flairKeyPath = join(keys, "reader.key");
   writeFileSync(flairKeyPath, READER_SEED);
-  fetchSpy = spyOn(globalThis, "fetch");
+  patchShared(fetchSpyState, "value", spyOn(globalThis, "fetch"));
 });
 
 afterEach(() => {
-  fetchSpy.mockRestore();
+  fetchSpyState.value.mockRestore();
   for (const [name, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[name];
     else process.env[name] = value;
@@ -67,7 +69,7 @@ afterEach(() => {
 
 /** Stub the hub: `/Agent/<name>` returns `publicKeyFor(name)`, /Health is up. */
 function stubHub(publicKeyFor: (name: string) => string | null): void {
-  fetchSpy.mockImplementation(async (input) => {
+  fetchSpyState.value.mockImplementation(async (input) => {
     const url = new URL(String(input));
     expect(url.origin).toBe("http://flair.test");
     if (url.pathname === "/Health") return new Response("ok");
@@ -157,7 +159,7 @@ for (const encoding of ["hex", "base64url", "base64"] as const) {
 for (const failure of ["malformed", "unreachable"] as const) {
   test(`promote keeps a ${failure} Flair key failure in its proper rejection class`, async () => {
     if (failure === "malformed") stubHub(() => "not-a-key!!");
-    else fetchSpy.mockImplementation(async () => { throw new Error("Flair unreachable"); });
+    else fetchSpyState.value.mockImplementation(async () => { throw new Error("Flair unreachable"); });
     const inbox = join(home, "mail", MAILBOX);
     const fresh = join(inbox, "new");
     mkdirSync(fresh, { recursive: true });

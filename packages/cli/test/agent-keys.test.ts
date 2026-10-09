@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { generateKeyPairSync, createHash, createPrivateKey } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 import {
   toEd25519Seed,
   readAgentPrivateKey,
@@ -17,7 +18,7 @@ import {
 } from "../src/utils/agent-keys.js";
 
 // Wire sync sha512 so @noble sign/verify run synchronously (same as signEnvelope.ts).
-hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest());
+patchShared(hashes, "sha512", (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest()));
 
 /** Mint an Ed25519 keypair and expose every on-disk representation we care about. */
 function makeKey() {

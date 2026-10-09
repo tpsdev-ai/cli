@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * cli#350 round 4e — the launcher's confinement attestation.
  *
@@ -712,9 +714,9 @@ exit 0
   try {
     const captured: string[] = [];
     const original = console.error;
-    console.error = (...parts: unknown[]) => {
+    patchShared(console, "error", (...parts: unknown[]) => {
       captured.push(parts.map((p) => String(p)).join(" "));
-    };
+    });
     const exitCode = await launchAttested(
       "tps-agent-run",
       {
@@ -746,7 +748,7 @@ exit 0
       }
     );
     await peerProc.done;
-    console.error = original;
+    patchShared(console, "error", original);
     return { exitCode, stderr: captured.join("\n") };
   } finally {
     peerProc.kill();

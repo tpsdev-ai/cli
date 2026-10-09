@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { runOfficeStatus } from "../src/commands/office-status.js";
 
@@ -11,14 +13,14 @@ beforeEach(() => {
   _savedLog = console.log;
   _savedError = console.error;
   output = [];
-  console.log = (...args: unknown[]) => { output.push(args.join(" ")); };
-  console.error = (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); };
+  patchShared(console, "log", (...args: unknown[]) => { output.push(args.join(" ")); });
+  patchShared(console, "error", (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); });
 });
 
 afterEach(() => {
-  globalThis.fetch = _savedFetch;
-  console.log = _savedLog;
-  console.error = _savedError;
+  patchShared(globalThis, "fetch", _savedFetch);
+  patchShared(console, "log", _savedLog);
+  patchShared(console, "error", _savedError);
 });
 
 const AGENTS = [
@@ -44,7 +46,7 @@ const BASE_OPTS = { flairUrl: "http://localhost:9926", agentId: "anvil", keyPath
 
 describe("tps office status", () => {
   test("renders agent table from Flair", async () => {
-    globalThis.fetch = makeFetch(AGENTS, EVENTS) as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", makeFetch(AGENTS, EVENTS) as typeof globalThis.fetch);
     await runOfficeStatus(BASE_OPTS);
     const joined = output.join("\n");
     expect(joined).toContain("Anvil");
@@ -54,13 +56,13 @@ describe("tps office status", () => {
   });
 
   test("shows task status from OrgEvents", async () => {
-    globalThis.fetch = makeFetch(AGENTS, EVENTS) as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", makeFetch(AGENTS, EVENTS) as typeof globalThis.fetch);
     await runOfficeStatus(BASE_OPTS);
     expect(output.join("\n")).toContain("Implemented ops-71");
   });
 
   test("json output includes agents and openPrs arrays", async () => {
-    globalThis.fetch = makeFetch(AGENTS, []) as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", makeFetch(AGENTS, []) as typeof globalThis.fetch);
     await runOfficeStatus({ ...BASE_OPTS, json: true });
     const parsed = JSON.parse(output.join(""));
     expect(parsed.agents).toHaveLength(2);
@@ -69,14 +71,14 @@ describe("tps office status", () => {
   });
 
   test("no PR section when repo not configured", async () => {
-    globalThis.fetch = makeFetch(AGENTS, []) as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", makeFetch(AGENTS, []) as typeof globalThis.fetch);
     await runOfficeStatus(BASE_OPTS);
     expect(output.join("\n")).not.toContain("open PR");
   });
 
   test("shows blocker from OrgEvents", async () => {
     const blockerEvents = [{ id: "b1", kind: "blocker", authorId: "ember", summary: "Missing Ember PAT", createdAt: new Date().toISOString() }];
-    globalThis.fetch = makeFetch(AGENTS, blockerEvents) as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", makeFetch(AGENTS, blockerEvents) as typeof globalThis.fetch);
     await runOfficeStatus(BASE_OPTS);
     expect(output.join("\n")).toContain("BLOCKER: Missing Ember PAT");
   });

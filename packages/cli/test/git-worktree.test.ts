@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdirSync, rmSync, existsSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -74,17 +76,17 @@ describe("tps git worktree", () => {
     let exited = false;
     const oldExit = process.exit;
     // @ts-ignore
-    process.exit = ((code?: number) => {
+    patchShared(process, "exit", ((code?: number) => {
       exited = true;
       throw new Error(`exit:${code}`);
-    }) as any;
+    }) as any);
 
     try {
       await runGit({ action: "worktree", agent: "testbot", repoPath, branchName: "-b" });
     } catch {
       // expected
     } finally {
-      process.exit = oldExit;
+      patchShared(process, "exit", oldExit);
     }
 
     expect(exited).toBe(true);

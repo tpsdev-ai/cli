@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * ops-31.1 — tps soul CLI tests
  */
@@ -25,7 +27,7 @@ afterAll(() => {
 });
 let _savedFetch: typeof globalThis.fetch;
 beforeEach(() => { _savedFetch = globalThis.fetch; });
-afterEach(() => { globalThis.fetch = _savedFetch; });
+afterEach(() => { patchShared(globalThis, "fetch", _savedFetch); });
 
 const SOUL_ENTRIES = [
   { id: "flint-role", agentId: "flint", key: "role", value: "Chief Strategy Officer" },
@@ -49,44 +51,44 @@ function makeMockFetch(responses: Record<string, any>) {
 
 describe("ops-31.1: tps soul show", () => {
   test("shows soul entries as key: value lines", async () => {
-    globalThis.fetch = makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any;
+    patchShared(globalThis, "fetch", makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any);
 
     const { runSoul } = await import("../src/commands/soul.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...args: any[]) => lines.push(args.join(" "));
+    patchShared(console, "log", (...args: any[]) => lines.push(args.join(" ")));
 
     await runSoul({ action: "show", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     expect(lines.some((l) => l.includes("role:"))).toBe(true);
     expect(lines.some((l) => l.includes("Chief Strategy Officer"))).toBe(true);
   });
 
   test("shows empty message when no soul entries", async () => {
-    globalThis.fetch = makeMockFetch({ "/Soul/": [] }) as any;
+    patchShared(globalThis, "fetch", makeMockFetch({ "/Soul/": [] }) as any);
 
     const { runSoul } = await import("../src/commands/soul.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...args: any[]) => lines.push(args.join(" "));
+    patchShared(console, "log", (...args: any[]) => lines.push(args.join(" ")));
 
     await runSoul({ action: "show", agentId: "empty-agent", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     expect(lines.some((l) => l.includes("No soul entries"))).toBe(true);
   });
 
   test("--json outputs valid JSON array", async () => {
-    globalThis.fetch = makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any;
+    patchShared(globalThis, "fetch", makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any);
 
     const { runSoul } = await import("../src/commands/soul.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...args: any[]) => lines.push(args.join(" "));
+    patchShared(console, "log", (...args: any[]) => lines.push(args.join(" ")));
 
     await runSoul({ action: "show", agentId: "flint", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH, json: true });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
 
     const parsed = JSON.parse(lines[0]);
     expect(Array.isArray(parsed)).toBe(true);
@@ -97,12 +99,12 @@ describe("ops-31.1: tps soul show", () => {
 describe("ops-31.1: tps soul set", () => {
   test("sets soul from a file", async () => {
     const puts: any[] = [];
-    globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
       if (opts?.method === "PUT" && url.includes("/Soul/")) {
         puts.push(JSON.parse(opts.body as string));
       }
       return new Response("{}", { status: 200 });
-    }) as any;
+    }) as any);
 
     const { writeFileSync, unlinkSync } = await import("node:fs");
     const tmpFile = "/tmp/soul-test-ops311.txt";
@@ -122,20 +124,20 @@ describe("ops-31.1: tps soul set", () => {
     const { runSoul } = await import("../src/commands/soul.js");
     const origExit = process.exit;
     let exitCode: number | undefined;
-    (process as any).exit = (code: number) => { exitCode = code; throw new Error("exit"); };
+    patchShared((process as any), "exit", (code: number) => { exitCode = code; throw new Error("exit"); });
 
     try {
       await runSoul({ action: "set", agentId: "flint", file: "/nonexistent/soul.txt", flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
     } catch {}
 
-    (process as any).exit = origExit;
+    patchShared((process as any), "exit", origExit);
     expect(exitCode).toBe(1);
   });
 });
 
 describe("ops-31.1: tps soul diff", () => {
   test("reports no differences when identical", async () => {
-    globalThis.fetch = makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any;
+    patchShared(globalThis, "fetch", makeMockFetch({ "/Soul/": SOUL_ENTRIES }) as any);
 
     const { writeFileSync, unlinkSync } = await import("node:fs");
     const tmpFile = "/tmp/soul-diff-test.txt";
@@ -144,10 +146,10 @@ describe("ops-31.1: tps soul diff", () => {
     const { runSoul } = await import("../src/commands/soul.js");
     const lines: string[] = [];
     const origLog = console.log;
-    console.log = (...args: any[]) => lines.push(args.join(" "));
+    patchShared(console, "log", (...args: any[]) => lines.push(args.join(" ")));
 
     await runSoul({ action: "diff", agentId: "flint", file: tmpFile, flairUrl: "http://127.0.0.1:19926", keyPath: TEST_KEY_PATH });
-    console.log = origLog;
+    patchShared(console, "log", origLog);
     unlinkSync(tmpFile);
 
     expect(lines.some((l) => l.includes("No differences"))).toBe(true);

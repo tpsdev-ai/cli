@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,15 +19,15 @@ beforeEach(() => {
   tempHome = join(tmpdir(), agentId);
   originalLog = console.log;
   originalFetch = globalThis.fetch;
-  originalExit = process.exit.bind(process);
+  originalExit = process.exit;
   originalTpsHome = process.env.TPS_HOME;
   output = [];
 
   process.env.TPS_HOME = tempHome;
-  console.log = (...args: unknown[]) => output.push(args.join(" "));
-  (process as typeof process & { exit: (code?: number) => never }).exit = ((code?: number) => {
+  patchShared(console, "log", (...args: unknown[]) => output.push(args.join(" ")));
+  patchShared((process as typeof process & { exit: (code?: number) => never }), "exit", ((code?: number) => {
     throw new Error(`exit:${code ?? 0}`);
-  }) as typeof process.exit;
+  }) as typeof process.exit);
 
   mkdirSync(join(tempHome, ".tps", "agents", agentId), { recursive: true });
   writeFileSync(join(tempHome, ".tps", "agents", agentId, "agent.yaml"), `agentId: ${agentId}\n`);
@@ -37,9 +39,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  console.log = originalLog;
-  globalThis.fetch = originalFetch;
-  process.exit = originalExit;
+  patchShared(console, "log", originalLog);
+  patchShared(globalThis, "fetch", originalFetch);
+  patchShared(process, "exit", originalExit);
   if (originalTpsHome === undefined) delete process.env.TPS_HOME;
   else process.env.TPS_HOME = originalTpsHome;
   rmSync(tempHome, { recursive: true, force: true });
@@ -59,7 +61,7 @@ function mockFlairAuth(status = 200): typeof globalThis.fetch {
 
 describe("tps agent healthcheck", () => {
   test("prints PASS lines and exits 0 when all checks pass", async () => {
-    globalThis.fetch = mockFlairAuth(200);
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
 
     await expect(
       healthcheckAgent({ action: "healthcheck", id: agentId }),
@@ -74,7 +76,7 @@ describe("tps agent healthcheck", () => {
   });
 
   test("exits 1 and prints FAIL lines when checks fail", async () => {
-    globalThis.fetch = mockFlairAuth(503);
+    patchShared(globalThis, "fetch", mockFlairAuth(503));
     rmSync(join(tempHome, ".tps", "agents", agentId, "agent.yaml"), { force: true });
     rmSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), { force: true });
     rmSync(join(tempHome, ".tps", "mail", agentId), { recursive: true, force: true });
@@ -92,7 +94,7 @@ describe("tps agent healthcheck", () => {
   });
 
   test("json output reports failing checks", async () => {
-    globalThis.fetch = mockFlairAuth(200);
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
     rmSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), { force: true });
 
     await expect(
