@@ -211,53 +211,55 @@ export function evaluateAges({ deps, publishTimes, gateSeconds, nowMs, exception
   return { young, uncovered, covered, missing };
 }
 
-/**
- * Read `[install] minimumReleaseAgeExcludes` (an array of package names) from a
- * bunfig.toml body. The key is optional: an absent key is an empty list.
- *
- * @returns {{ names: string[], error: string | null }} `names` is the parsed
- *   list; `error` is non-null when the key is present but not a TOML array of
- *   strings, so the caller can refuse rather than read a malformed list as
- *   "no excludes".
- */
+/** Read install exclusions with Bun's parser, or a restricted single-line fallback. */
 export function parseMinReleaseAgeExcludes(tomlText) {
-  const lines = String(tomlText).split(/\r?\n/);
+  const text = String(tomlText);
+  const refuse = (detail) => ({
+    names: [], error: `unparseable minimumReleaseAgeExcludes: ${detail}`,
+  });
+  if (globalThis.Bun?.TOML?.parse) {
+    try {
+      const names = globalThis.Bun.TOML.parse(text).install?.minimumReleaseAgeExcludes;
+      if (names === undefined) return { names: [], error: null };
+      if (!Array.isArray(names) || names.some((name) => typeof name !== "string")) {
+        return refuse("expected an array of strings");
+      }
+      return { names, error: null };
+    } catch (err) {
+      return refuse(err?.message ?? String(err));
+    }
+  }
+
   let section = "";
-  let start = -1;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].replace(/#.*$/, "").trim();
-    if (!line) continue;
-    const header = line.match(/^\[([^\]]+)\]$/);
+  let names;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const header = line.match(/^\[([^\]]+)\]\s*(?:#.*)?$/);
     if (header) {
       section = header[1].trim();
+      if (!/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(section)) {
+        return refuse("unsupported table syntax without Bun.TOML.parse");
+      }
       continue;
     }
-    if (section !== "install") continue;
-    if (/^minimumReleaseAgeExcludes\s*=/.test(line)) {
-      start = i;
-      break;
+    if (!line.includes("minimumReleaseAgeExcludes")) {
+      if (/^["']/.test(line) || /^(?:install|["']install["'])\s*=/.test(line)) {
+        return refuse("unsupported key or install table syntax without Bun.TOML.parse");
+      }
+      continue;
     }
-  }
-  if (start === -1) return { names: [], error: null };
-
-  // The value is a TOML array; join lines (dropping comments) until its `]`.
-  // Bounded so a missing bracket cannot scan an unbounded file.
-  let joined = lines[start].replace(/#.*$/, "");
-  for (let i = start + 1; !joined.includes("]"); i++) {
-    if (i >= lines.length || i - start > 100) {
-      return { names: [], error: "minimumReleaseAgeExcludes is not a closed TOML array" };
+    if (section !== "install") {
+      if (section === "test" && /^minimumReleaseAgeExcludes\s*=/.test(line)) continue;
+      return refuse("unsupported key or install table syntax without Bun.TOML.parse");
     }
-    joined += ` ${lines[i].replace(/#.*$/, "").trim()}`;
+    const match = line.match(/^minimumReleaseAgeExcludes\s*=\s*\[\s*((?:"[A-Za-z0-9@/_.-]*"\s*(?:,\s*"[A-Za-z0-9@/_.-]*"\s*)*,?\s*)?)\]\s*(?:#.*)?$/);
+    if (!match || names !== undefined) {
+      return refuse("unsupported or duplicate declaration without Bun.TOML.parse");
+    }
+    names = [...match[1].matchAll(/"([^"]*)"/g)].map((m) => m[1]);
   }
-  const value = joined.slice(joined.indexOf("=") + 1).trim();
-  const array = value.match(/^\[(.*?)\]\s*$/);
-  if (!array) return { names: [], error: "minimumReleaseAgeExcludes is not a TOML array" };
-  const inner = array[1].trim();
-  const residue = inner.replace(/"[^"]*"/g, "").replace(/[,\s]/g, "");
-  if (residue !== "") {
-    return { names: [], error: `unparseable minimumReleaseAgeExcludes entry: ${residue}` };
-  }
-  return { names: [...inner.matchAll(/"([^"]*)"/g)].map((m) => m[1]), error: null };
+  return { names: names ?? [], error: null };
 }
 
 /** A bare version such as `4.7.10`; a range, tag or URL is not an exact pin. */
@@ -270,27 +272,11 @@ function exceptionName(key) {
   return key.slice(0, key.lastIndexOf("@"));
 }
 
-const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
-
-/** The spec a package.json declares for `name`, or null when it does not declare it. */
-function declaredSpec(json, name) {
-  if (!json || typeof json !== "object") return null;
-  for (const field of DEP_FIELDS) {
-    const deps = json[field];
-    if (deps && typeof deps === "object" && typeof deps[name] === "string") return deps[name];
-  }
-  return null;
-}
+const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "overrides"];
 
 /**
  * Check bunfig's install-time excludes against the dated exceptions and the
  * exact pins in the repository's package.json files.
- *
- * Every excluded name must be covered by an unexpired entry in
- * docs/dep-age-exceptions.md, and every package.json that declares an excluded
- * name must pin it exactly. An exclusion exists to admit one fresh version;
- * an open-ended range would let the install-time gate admit any later version
- * too, and an exception that expires stops justifying the exclusion.
  *
  * @param {{ excludes: string[], exceptionEntries: Map<string, object>,
  *           exceptionErrors: Array<{key: string | null, message: string}>,
@@ -317,9 +303,12 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
       problems.push({ kind: "uncovered", name, error });
     }
     for (const pj of packageJsons ?? []) {
-      const spec = declaredSpec(pj.json, name);
-      if (spec === null) continue;
-      if (!isExactVersionPin(spec)) problems.push({ kind: "range", name, path: pj.path, spec });
+      for (const field of DEP_FIELDS) {
+        const deps = pj.json?.[field];
+        if (!deps || typeof deps !== "object" || !Object.hasOwn(deps, name)) continue;
+        const spec = deps[name];
+        if (!isExactVersionPin(spec)) problems.push({ kind: "range", name, path: pj.path, spec });
+      }
     }
   }
   return problems;

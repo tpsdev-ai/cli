@@ -20,9 +20,8 @@
  *
  */
 
-import { readdirSync } from "node:fs";
-import { readFileSync } from "node:fs";
-import { dirname, join, sep } from "node:path";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   auditExcludes,
@@ -81,34 +80,47 @@ function readOrExit(path, what) {
   }
 }
 
-// Bound the walk so a malformed tree cannot scan without limit. The repository
-// has a handful of package.json files; a symlinked directory is skipped (it is
-// never a directory entry) so a link cycle cannot keep the walk going.
+// The limit counts parsed package.json files, not directories or directory entries.
 const MAX_PACKAGE_JSON = 2000;
 
-/**
- * Every package.json under `root` (skipping node_modules and .git), read and
- * parsed. A file that cannot be read or parsed refuses with exit 2: a manifest
- * this check cannot inspect must not read as "declares nothing".
- */
+/** Read manifests through in-root links; refuse unreadable or outside-root paths. */
 function collectPackageJsons(root) {
   const out = [];
   const pending = [""];
+  const visited = new Set();
+  const realRoot = realpathSync(root);
+  function inspect(path) {
+    try {
+      const real = realpathSync(join(root, path));
+      const rel = relative(realRoot, real);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        throw new Error("symlink resolves outside repository root");
+      }
+      return { real, stat: statSync(real) };
+    } catch (err) {
+      console.error(`check-dep-ages: cannot inspect ${path || root}: ${err?.message ?? err}`);
+      process.exit(2);
+    }
+  }
   while (pending.length > 0) {
     const dir = pending.pop();
+    const { real } = inspect(dir);
+    if (visited.has(real)) continue;
+    visited.add(real);
     let entries;
     try {
-      entries = readdirSync(join(root, dir), { withFileTypes: true });
+      entries = readdirSync(real, { withFileTypes: true });
     } catch (err) {
       console.error(`check-dep-ages: cannot list ${join(root, dir)}: ${err?.code ?? err?.message ?? err}`);
       process.exit(2);
     }
     for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name === ".git") continue;
-        pending.push(dir ? `${dir}${sep}${entry.name}` : entry.name);
-      } else if (entry.isFile() && entry.name === "package.json") {
-        const path = dir ? `${dir}${sep}${entry.name}` : entry.name;
+      if (entry.name === "node_modules" || entry.name === ".git") continue;
+      const path = dir ? `${dir}${sep}${entry.name}` : entry.name;
+      const { stat } = inspect(path);
+      if (stat.isDirectory()) {
+        pending.push(path);
+      } else if (stat.isFile() && entry.name === "package.json") {
         let json;
         try {
           json = JSON.parse(readFileSync(join(root, path), "utf8"));
@@ -152,10 +164,7 @@ const { entries: exceptionEntries, errors: exceptionErrors } = parseExceptions(
 );
 
 // ── Every exclude must have an unexpired exception and an exact pin ──────────
-// An exclusion admits one fresh version past the install-time gate; the dated
-// entry in docs/dep-age-exceptions.md is what bounds it. Without the entry the
-// exclusion has no expiry, and with a range instead of an exact pin it would
-// keep admitting later versions after the exception lapses.
+// Bun excludes by package name; the dated entry bounds how long CI accepts it.
 if (excludeNames.length > 0) {
   const packageJsons = collectPackageJsons(ROOT);
   const problems = auditExcludes({

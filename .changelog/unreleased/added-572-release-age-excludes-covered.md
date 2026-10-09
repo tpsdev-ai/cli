@@ -1,5 +1,6 @@
-- **A release-age exclusion now requires an unexpired dated exception and an exact pin.**
-  `scripts/check-dep-ages.mjs` fails when a name in bunfig's `minimumReleaseAgeExcludes` has no
-  unexpired entry in `docs/dep-age-exceptions.md`, or is declared with a range instead of a bare
-  version in a `package.json` that lists it. A real-Bun test covers the install-time refusal of a
-  too-young version and the exclusion that admits it.
+- **Release-age exclusions need unexpired dated exceptions.**
+  Their declarations in dependencies, devDependencies, optionalDependencies,
+  peerDependencies and overrides must be exact pins. Outside node_modules and .git, it follows in-root manifest and
+  directory symlinks and refuses outside-root links. Excludes use `Bun.TOML.parse` under Bun;
+  Node refuses unsupported forms.
+  A real-Bun test covers install-time refusal and the exclusion that admits a young version.
