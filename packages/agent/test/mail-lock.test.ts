@@ -32,7 +32,10 @@ function spawnLockHolder(): { child: ChildProcess; ready: Promise<void>; exited:
     process.stdin.resume();
     process.stdin.once("end", () => { lock.release(); process.exit(0); });
   `], { stdio: ["pipe", "pipe", "pipe"] });
-  const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
+  const exited = new Promise<number | null>((resolve) => {
+    child.once("exit", resolve);
+    child.once("error", () => resolve(null));
+  });
   const ready = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error("lock holder did not become ready in time")), 10000);
     child.once("error", (err) => { clearTimeout(timer); reject(err); });
