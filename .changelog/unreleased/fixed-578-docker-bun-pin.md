@@ -1,0 +1,1 @@
+- **The Docker integration image is built with a `BUN_VERSION` build arg instead of a floating `oven/bun` tag (Closes #578).** The Docker Integration job derives it from the root `package.json` `packageManager` and fails when the image's Bun differs from that pin. Locally, compose accepts any nonempty `BUN_VERSION`. Image tags are mutable; a digest pin is not part of this change.

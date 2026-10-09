@@ -1,4 +1,9 @@
-FROM oven/bun:1-slim
+# BUN_VERSION is required and has no default: an omitted arg makes the FROM
+# reference invalid (`oven/bun:-slim`) and the build fails. The Docker
+# Integration job fails when the image's Bun differs from the root
+# package.json packageManager pin. Image tags are mutable; no digest is pinned.
+ARG BUN_VERSION
+FROM oven/bun:${BUN_VERSION}-slim
 
 WORKDIR /app
 

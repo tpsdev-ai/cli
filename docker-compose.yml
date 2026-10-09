@@ -1,8 +1,16 @@
+# BUN_VERSION is required (`${BUN_VERSION:?...}`): unset or empty is refused.
+# Locally, any nonempty value is accepted; the Docker Integration job fails when
+# the image's Bun differs from the root package.json packageManager pin.
+# Set it with: BUN_VERSION="$(scripts/docker-bun-version.sh)" docker compose build
+x-test-build: &test-build
+  context: .
+  dockerfile: Dockerfile.test
+  args:
+    BUN_VERSION: "${BUN_VERSION:?BUN_VERSION is unset — export the repository's packageManager pin, see scripts/docker-bun-version.sh}"
+
 services:
   test:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
+    build: *test-build
     command: bun run test
     environment:
       - HOME=/home/tps
@@ -11,9 +19,7 @@ services:
       - /tmp:exec,size=64M
 
   integration:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
+    build: *test-build
     command: bun run test
     environment:
       - HOME=/home/tps
@@ -36,9 +42,7 @@ services:
   # mounted binary at /usr/local/bin/nono, the first of the pinned locations
   # (DEFAULT_NONO_PATHS in packages/cli/src/utils/launch-attestation.ts).
   attested:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
+    build: *test-build
     command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts packages/cli/test/runtime-attested-launch.test.ts
     user: tps
     working_dir: /app
@@ -51,9 +55,7 @@ services:
       - /tmp:exec,size=64M
 
   office:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
+    build: *test-build
     command: /bin/sh
     stdin_open: true
     tty: true
