@@ -1,28 +1,26 @@
 /**
  * cli#554 — a production Flair signer with no stub-backed test is a hole.
- * `helpers/flair-signer-scan.ts` finds every production signing path in the
- * packages' src trees; this inventory fails when the scan finds a signer that
- * no test file is mapped to, and when a mapped signer no longer exists. See
- * `helpers/stub-flair.ts` for the stub each mapped test drives its signer
- * through (it verifies the caller's TPS-Ed25519 signature).
+ * `helpers/flair-signer-scan.ts` lists every occurrence of the `TPS-Ed25519`
+ * literal in the packages' src trees, plus every reference to a binding that
+ * holds it. Each listed site is either a signer mapped to a test that drives it
+ * against `helpers/stub-flair.ts` (which verifies the caller's signature) or an
+ * explicit non-signer with a reason. An unclassified site, a stale entry, or a
+ * reference the scan cannot resolve fails.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
-  analyzeSignerSource,
   checkSignerInventory,
   findSignerSites,
-  type SignerSite,
+  readSources,
+  type SignerExclusion,
+  scanSources,
 } from "./helpers/flair-signer-scan.js";
 
 const REPO = join(import.meta.dir, "..", "..", "..");
 
-/**
- * Each production signer and the test file that drives it against
- * `helpers/stub-flair.ts`, asserting an accepted signed request and a refused
- * one.
- */
+/** Each production signer and the test file that drives it against `helpers/stub-flair.ts`. */
 const INVENTORY: Record<string, string> = {
   "packages/cli/src/utils/flair-client.ts#FlairClient.sign": "packages/cli/test/mail-flair-read-auth.test.ts",
   "packages/cli/src/commands/init.ts#registerWithFlair": "packages/cli/test/flair-signer-commands.test.ts",
@@ -31,22 +29,33 @@ const INVENTORY: Record<string, string> = {
   "packages/agent/src/io/flair.ts#FlairContextProvider.sign": "packages/cli/test/flair-signer-agent.test.ts",
 };
 
-/** Signed requests that are not Flair requests, with the reason each is out of scope. */
-const EXCLUDED: Record<string, string> = {
-  "packages/agent/src/llm/provider.ts#ProviderManager.completeViaProxy":
-    "signs an LLM proxy request, not a Flair request",
+/** Sites that are not Flair signers, each with the reason. */
+const NON_SIGNERS: Record<string, SignerExclusion> = {
+  "packages/agent/src/llm/provider.ts#ProviderManager.completeViaProxy": {
+    reason: "signs an LLM proxy request, not a Flair request",
+  },
+  "packages/cli/src/bridge/openclaw-adapter.ts#verifyTpsEd25519": {
+    reason: "verifier: startsWith/slice on an inbound header",
+  },
+  "packages/cli/src/bridge/openclaw-adapter.ts#OpenClawAdapter.start": {
+    reason: "names the scheme in a 401 error message",
+  },
+  "packages/cli/src/utils/llm-proxy.ts#verifyRequest": {
+    reason: "verifier: startsWith/slice on an inbound header",
+  },
 };
 
-describe("cli#554 — every Flair signer is mapped to a stub-backed test", () => {
-  const sites = findSignerSites(REPO);
+describe("cli#554 — every TPS-Ed25519 site is classified", () => {
+  const scan = findSignerSites(REPO);
 
-  test("the scan finds signing sites and locates each", () => {
-    expect(sites.length).toBeGreaterThan(0);
-    for (const site of sites) expect(site.line, site.key).toBeGreaterThan(0);
+  test("the scan finds sites and resolves every reference", () => {
+    expect(scan.sites.length).toBeGreaterThan(0);
+    for (const site of scan.sites) expect(site.line, site.key).toBeGreaterThan(0);
+    expect(scan.unresolved).toEqual([]);
   });
 
-  test("every signer is mapped or excluded, and no entry is stale", () => {
-    const result = checkSignerInventory(sites, INVENTORY, EXCLUDED);
+  test("every site is a mapped signer or an explained non-signer, and no entry is stale", () => {
+    const result = checkSignerInventory(scan.sites, INVENTORY, NON_SIGNERS);
     expect(result.unmapped).toEqual([]);
     expect(result.stale).toEqual([]);
     expect(result.staleExclusions).toEqual([]);
@@ -54,45 +63,78 @@ describe("cli#554 — every Flair signer is mapped to a stub-backed test", () =>
 
   test("each mapped signer names a test file that exists", () => {
     for (const [signer, testFile] of Object.entries(INVENTORY)) {
-      expect(signer).not.toBeEmpty();
       expect(existsSync(join(REPO, testFile)), `${signer} -> ${testFile}`).toBe(true);
     }
   });
+
+  test("each non-signer has a reason", () => {
+    for (const [site, { reason }] of Object.entries(NON_SIGNERS)) expect(reason, site).not.toBeEmpty();
+  });
 });
 
-describe("cli#554 — the inventory is a live check (mutation on a copy)", () => {
-  test("a new signing call site is unmapped and fails the inventory", () => {
-    const added = analyzeSignerSource(
-      "packages/cli/src/commands/extra.ts",
-      "export function extraSign(a: string) { return `TPS-Ed25519 ${a}:1:n:s`; }",
-    );
-    expect(added.map((s) => s.key)).toEqual(["packages/cli/src/commands/extra.ts#extraSign"]);
-    const result = checkSignerInventory([...findSignerSites(REPO), ...added], INVENTORY, EXCLUDED);
-    expect(result.unmapped).toEqual(["packages/cli/src/commands/extra.ts#extraSign"]);
+describe("cli#554 — the inventory is a live check (mutation on a copy of the sources)", () => {
+  const real = readSources(REPO);
+  const scanWith = (added: Record<string, string>) => {
+    const scan = scanSources({ ...real, ...added });
+    return {
+      unresolved: scan.unresolved,
+      unmapped: checkSignerInventory(scan.sites, INVENTORY, NON_SIGNERS).unmapped,
+    };
+  };
+  const EXTRA = "packages/cli/src/commands/extra.ts";
+
+  test("a template-form signer is unmapped", () => {
+    const r = scanWith({
+      [EXTRA]: "export function extraSign(a: string) { return `TPS-Ed25519 ${a}:1:n:s`; }",
+    });
+    expect(r.unmapped).toEqual([`${EXTRA}#extraSign`]);
   });
 
-  test("removing a signer leaves its inventory entry stale and fails", () => {
-    const sites = findSignerSites(REPO);
-    const removed = sites.find((s) => s.key.endsWith("#makeAuth"));
-    expect(removed).toBeDefined();
-    const without: SignerSite[] = sites.filter((s) => s.key !== removed!.key);
-    const result = checkSignerInventory(without, INVENTORY, EXCLUDED);
-    expect(result.stale).toEqual([removed!.key]);
+  test("a concatenation-form signer is unmapped", () => {
+    const r = scanWith({
+      [EXTRA]: 'export function extraSign(a: string) { return "TPS-Ed25519 " + a; }',
+    });
+    expect(r.unmapped).toEqual([`${EXTRA}#extraSign`]);
   });
 
-  test("a verifier's plain-string header prefix is not a signer", () => {
-    const verifier = analyzeSignerSource(
-      "packages/cli/src/utils/check.ts",
-      'export function check(h: string) { return h.startsWith("TPS-Ed25519 "); }',
-    );
-    expect(verifier).toEqual([]);
+  test("a join-form signer is unmapped", () => {
+    const r = scanWith({
+      [EXTRA]: 'export function extraSign(a: string) { return ["TPS-Ed25519", a].join(" "); }',
+    });
+    expect(r.unmapped).toEqual([`${EXTRA}#extraSign`]);
   });
 
-  test("a stale exclusion (its site is gone) fails the inventory", () => {
-    const sites = findSignerSites(REPO).filter(
-      (s) => s.key !== "packages/agent/src/llm/provider.ts#ProviderManager.completeViaProxy",
-    );
-    const result = checkSignerInventory(sites, INVENTORY, EXCLUDED);
-    expect(result.staleExclusions).toEqual(["packages/agent/src/llm/provider.ts#ProviderManager.completeViaProxy"]);
+  test("a constant-prefix signer is unmapped, through an alias and a re-export", () => {
+    const r = scanWith({
+      "packages/cli/src/commands/scheme.ts": 'export const PREFIX = "TPS-Ed25519 ";',
+      "packages/cli/src/commands/reexport.ts": 'export { PREFIX as SCHEME } from "./scheme.js";',
+      [EXTRA]:
+        'import { SCHEME } from "./reexport.js";\nconst P = SCHEME;\nexport function extraSign(a: string) { return P + a; }',
+    });
+    expect(r.unmapped).toContain(`${EXTRA}#extraSign`);
+    expect(r.unmapped).toContain("packages/cli/src/commands/scheme.ts#PREFIX");
+  });
+
+  test("a reference the scan cannot resolve fails", () => {
+    const r = scanWith({
+      "packages/cli/src/commands/scheme.ts": 'export const PREFIX = "TPS-Ed25519 ";',
+      [EXTRA]:
+        'import { PREFIX } from "./scheme.js";\nexport function extraSign() { const { length } = PREFIX; return length; }',
+    });
+    expect(r.unresolved).not.toEqual([]);
+  });
+
+  test("removing a signer leaves its inventory entry stale", () => {
+    const sources = { ...real };
+    delete sources["packages/cli/src/commands/roster.ts"];
+    const result = checkSignerInventory(scanSources(sources).sites, INVENTORY, NON_SIGNERS);
+    expect(result.stale).toEqual(["packages/cli/src/commands/roster.ts#makeAuth"]);
+  });
+
+  test("a stale non-signer entry (its site is gone) fails", () => {
+    const sources = { ...real };
+    delete sources["packages/cli/src/utils/llm-proxy.ts"];
+    const result = checkSignerInventory(scanSources(sources).sites, INVENTORY, NON_SIGNERS);
+    expect(result.staleExclusions).toEqual(["packages/cli/src/utils/llm-proxy.ts#verifyRequest"]);
   });
 });
