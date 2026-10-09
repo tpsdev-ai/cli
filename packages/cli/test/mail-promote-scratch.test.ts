@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -14,21 +16,21 @@ const agent = "scratch-test";
 const seed = Buffer.alloc(32, 0x22);
 let root: string;
 let priorMailDir: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
-let fault: ReturnType<typeof spyOn> | undefined;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
+const faultState = { value: undefined as unknown as ReturnType<typeof spyOn> | undefined };
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "promote-scratch-"));
   priorMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
     id: "kern", name: "kern", publicKey: pubkeyFromSeed(seed).toString("base64"),
-  });
+  }));
 });
 afterEach(() => {
-  fault?.mockRestore();
-  fault = undefined;
-  verifier.mockRestore();
+  faultState.value?.mockRestore();
+  patchShared(faultState, "value", undefined);
+  verifierState.value.mockRestore();
   if (priorMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = priorMailDir;
   fs.rmSync(root, { recursive: true, force: true });
@@ -83,13 +85,13 @@ test("exclusive scratch creation refuses an existing hard link without changing 
   const incoming = plant("different");
   const write = fs.writeFileSync;
   let planted: string | undefined;
-  fault = spyOn(fs, "writeFileSync").mockImplementation(((...args: Parameters<typeof write>) => {
+  patchShared(faultState, "value", spyOn(fs, "writeFileSync").mockImplementation(((...args: Parameters<typeof write>) => {
     if (typeof args[0] === "string" && args[0].endsWith(".promote")) {
       planted = args[0];
       fs.linkSync(cur, planted);
     }
     return write(...args);
-  }) as typeof write);
+  }) as typeof write));
   const result = await mail.promote(agent, incoming);
   expect(result.ok).toBe(false);
   if (result.ok) throw new Error("existing scratch accepted");

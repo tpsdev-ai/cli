@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { spawn } from "node:child_process";
@@ -21,19 +23,19 @@ const { buildSignedEnvelope, pubkeyFromSeed } = await import("./helpers/stub-fla
 const SEED = Buffer.alloc(32, 1);
 let root: string;
 let oldMailDir: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "mail-delivery-controls-"));
   oldMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockImplementation(async (name: string) => (
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockImplementation(async (name: string) => (
     name === "flint" ? { id: name, name, publicKey: pubkeyFromSeed(SEED).toString("base64") } : null
-  ));
+  )));
 });
 
 afterEach(() => {
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   if (oldMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = oldMailDir;
   fs.rmSync(root, { recursive: true, force: true });

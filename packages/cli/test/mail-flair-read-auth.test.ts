@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -17,7 +19,7 @@ const sender = "auth-sender";
 const seed = Buffer.alloc(32, 0x31);
 const wrongSeed = Buffer.alloc(32, 0x32);
 let root: string;
-let fetchMock: ReturnType<typeof spyOn> | undefined;
+const fetchMockState = { value: undefined as unknown as ReturnType<typeof spyOn> | undefined };
 let savedMailDir: string | undefined;
 
 beforeEach(() => {
@@ -27,8 +29,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fetchMock?.mockRestore();
-  fetchMock = undefined;
+  fetchMockState.value?.mockRestore();
+  patchShared(fetchMockState, "value", undefined);
   if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = savedMailDir;
   rmSync(root, { recursive: true, force: true });
@@ -36,8 +38,8 @@ afterEach(() => {
 
 function intercept() {
   const handler = stubFlairHandler({ [receiver]: seed, [sender]: seed });
-  fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input, init) =>
-    handler(new Request(input, init))) as typeof fetch);
+  patchShared(fetchMockState, "value", spyOn(globalThis, "fetch").mockImplementation((async (input, init) =>
+    handler(new Request(input, init))) as typeof fetch));
   return handler;
 }
 

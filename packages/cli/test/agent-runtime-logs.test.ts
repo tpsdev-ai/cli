@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -32,9 +34,9 @@ describe("tps agent logs runtime tail", () => {
     process.env.HOME = originalHome;
     if (originalTpsHome === undefined) delete process.env.TPS_HOME;
     else process.env.TPS_HOME = originalTpsHome;
-    process.stdout.write = originalWrite;
-    console.error = originalError;
-    process.exit = originalExit;
+    patchShared(process.stdout, "write", originalWrite);
+    patchShared(console, "error", originalError);
+    patchShared(process, "exit", originalExit);
     rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -45,10 +47,10 @@ describe("tps agent logs runtime tail", () => {
       "ember",
       Array.from({ length: 60 }, (_, index) => `line-${index + 1}`).join("\n") + "\n",
     );
-    process.stdout.write = ((chunk: string | Uint8Array) => {
+    patchShared(process.stdout, "write", ((chunk: string | Uint8Array) => {
       output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
       return true;
-    }) as typeof process.stdout.write;
+    }) as typeof process.stdout.write);
 
     await runAgent({ action: "logs", id: "ember" });
 
@@ -64,10 +66,10 @@ describe("tps agent logs runtime tail", () => {
       "ember",
       ["alpha", "beta", "gamma", "delta"].join("\n"),
     );
-    process.stdout.write = ((chunk: string | Uint8Array) => {
+    patchShared(process.stdout, "write", ((chunk: string | Uint8Array) => {
       output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
       return true;
-    }) as typeof process.stdout.write;
+    }) as typeof process.stdout.write);
 
     await runAgent({ action: "logs", id: "ember", lines: 2 });
 
@@ -77,12 +79,12 @@ describe("tps agent logs runtime tail", () => {
   test("fails when the runtime log does not exist", async () => {
     const { runAgent } = await import("../src/commands/agent.js");
     const errors: string[] = [];
-    console.error = ((value?: unknown) => {
+    patchShared(console, "error", ((value?: unknown) => {
       errors.push(String(value ?? ""));
-    }) as typeof console.error;
-    process.exit = (((code?: number) => {
+    }) as typeof console.error);
+    patchShared(process, "exit", (((code?: number) => {
       throw new Error(`exit:${code ?? 0}`);
-    }) as typeof process.exit);
+    }) as typeof process.exit));
 
     await expect(runAgent({ action: "logs", id: "ember" })).rejects.toThrow("exit:1");
     expect(errors.join("\n")).toContain("No log file found for ember");

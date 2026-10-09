@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import { DiscordAdapter, classifyMessage } from "../src/bridge/discord-adapter.js";
 
@@ -6,16 +8,16 @@ afterEach(() => {
 });
 
 describe("DiscordAdapter", () => {
-  let fetchMock: ReturnType<typeof mock>;
+  const fetchMockState = { value: undefined as unknown as ReturnType<typeof mock> };
   const originalFetch = globalThis.fetch;
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    patchShared(globalThis, "fetch", originalFetch);
   });
 
   beforeEach(() => {
     let pollCount = 0;
-    fetchMock = mock(async (url: string, opts?: RequestInit) => {
+    patchShared(fetchMockState, "value", mock(async (url: string, opts?: RequestInit) => {
       const u = String(url);
       // Poll call (after=<snowflake>) — first poll returns new message, rest empty
       if (u.includes("after=")) {
@@ -25,8 +27,8 @@ describe("DiscordAdapter", () => {
         }
       }
       return { ok: true, json: async () => [] };
-    });
-    globalThis.fetch = fetchMock as any;
+    }));
+    patchShared(globalThis, "fetch", fetchMockState.value as any);
   });
 
   test("seeds lastMessageId on start and delivers new messages", async () => {
@@ -45,11 +47,11 @@ describe("DiscordAdapter", () => {
   });
 
   test("skips bot messages", async () => {
-    fetchMock = mock(async () => ({
+    patchShared(fetchMockState, "value", mock(async () => ({
       ok: true,
       json: async () => [{ id: "1002", author: { bot: true, id: "b1", username: "BotUser" }, content: "I am a bot", timestamp: "2026-01-01T00:02:00Z", guild_id: "g1" }],
-    }));
-    globalThis.fetch = fetchMock as any;
+    })));
+    patchShared(globalThis, "fetch", fetchMockState.value as any);
 
     const adapter = new DiscordAdapter({ token: "tok", channelId: "chan2", pollIntervalMs: 999999, requireMention: false });
     const received: any[] = [];
@@ -62,11 +64,11 @@ describe("DiscordAdapter", () => {
 
   test("send posts to Discord API", async () => {
     const posts: any[] = [];
-    fetchMock = mock(async (url: string, opts?: RequestInit) => {
+    patchShared(fetchMockState, "value", mock(async (url: string, opts?: RequestInit) => {
       if (opts?.method === "POST") posts.push({ url, body: opts.body });
       return { ok: true, json: async () => [] };
-    });
-    globalThis.fetch = fetchMock as any;
+    }));
+    patchShared(globalThis, "fetch", fetchMockState.value as any);
 
     const adapter = new DiscordAdapter({ token: "tok", channelId: "chan3", pollIntervalMs: 999999, requireMention: false });
     await adapter.start(() => "ok");
@@ -80,13 +82,13 @@ describe("DiscordAdapter", () => {
 
   test("send posts to configured webhook URL for outbound replies", async () => {
     const posts: any[] = [];
-    fetchMock = mock(async (url: string, opts?: RequestInit) => {
+    patchShared(fetchMockState, "value", mock(async (url: string, opts?: RequestInit) => {
       if (opts?.method === "POST") {
         posts.push({ url, body: opts.body, headers: opts.headers });
       }
       return { ok: true, json: async () => [] };
-    });
-    globalThis.fetch = fetchMock as any;
+    }));
+    patchShared(globalThis, "fetch", fetchMockState.value as any);
 
     const adapter = new DiscordAdapter({
       token: "tok",

@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,31 +17,31 @@ afterEach(() => {
 const seed = Buffer.alloc(32, 0x11);
 let root: string;
 let priorMailDir: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
-let tokenReader: ReturnType<typeof spyOn> | undefined;
-let syncWait: ReturnType<typeof spyOn>;
-let asyncWait: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
+const tokenReaderState = { value: undefined as unknown as ReturnType<typeof spyOn> | undefined };
+const syncWaitState = { value: undefined as unknown as ReturnType<typeof spyOn> };
+const asyncWaitState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "mail-lock-contention-"));
   priorMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
     id: "flint", name: "flint", publicKey: pubkeyFromSeed(seed).toString("base64"),
-  });
+  }));
   if (processStartToken(process.pid) === null) {
-    tokenReader = spyOn(childProcess, "execFileSync").mockReturnValue("fixture birth\n");
+    patchShared(tokenReaderState, "value", spyOn(childProcess, "execFileSync").mockReturnValue("fixture birth\n"));
   }
-  syncWait = spyOn(Atomics, "wait");
-  asyncWait = spyOn(globalThis, "setTimeout");
+  patchShared(syncWaitState, "value", spyOn(Atomics, "wait"));
+  patchShared(asyncWaitState, "value", spyOn(globalThis, "setTimeout"));
 });
 
 afterEach(() => {
-  verifier.mockRestore();
-  tokenReader?.mockRestore();
-  tokenReader = undefined;
-  syncWait.mockRestore();
-  asyncWait.mockRestore();
+  verifierState.value.mockRestore();
+  tokenReaderState.value?.mockRestore();
+  patchShared(tokenReaderState, "value", undefined);
+  syncWaitState.value.mockRestore();
+  asyncWaitState.value.mockRestore();
   if (priorMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = priorMailDir;
   rmSync(root, { recursive: true, force: true });
@@ -101,8 +103,8 @@ for (const [name, owner] of shapes) {
     expect(performance.now() - leasing).toBeLessThan(500);
     expect(JSON.parse(readFileSync(curPath, "utf8"))).toEqual(record);
     expect(readFileSync(join(lockDir, "owner.json"), "utf8")).toBe(rawOwner);
-    expect(syncWait).not.toHaveBeenCalled();
-    expect(asyncWait).not.toHaveBeenCalled();
+    expect(syncWaitState.value).not.toHaveBeenCalled();
+    expect(asyncWaitState.value).not.toHaveBeenCalled();
     rmSync(lockDir, { recursive: true });
     expect(await checkMessages("kern")).toHaveLength(1);
   }, 15000);
@@ -119,8 +121,8 @@ for (const [label, content] of [["corrupt", "{"], ["unverified", JSON.stringify(
     expect(await recoverPromoted("kern", path)).toMatchObject({ ok: false, class: "busy" });
     expect(readFileSync(path, "utf8")).toBe(content);
     expect(readdirSync(inbox.dlq)).toEqual([]);
-    expect(syncWait).not.toHaveBeenCalled();
-    expect(asyncWait).not.toHaveBeenCalled();
+    expect(syncWaitState.value).not.toHaveBeenCalled();
+    expect(asyncWaitState.value).not.toHaveBeenCalled();
     rmSync(lockDir, { recursive: true });
     expect((await recoverPromoted("kern", path)).ok).toBe(false);
     expect(existsSync(path)).toBe(false);

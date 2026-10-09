@@ -9,8 +9,11 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPatchShared } from "./helpers/patch-shared.js";
 import { runOfficeStatus } from "../src/commands/office-status.js";
 import { installStubFlairFetch, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
+
+const patchShared = createPatchShared();
 
 const SEED = Buffer.alloc(32, 0x71);
 
@@ -51,15 +54,15 @@ beforeEach(() => {
   savedLog = console.log;
   savedError = console.error;
   savedExit = process.exit;
-  console.log = (...args: unknown[]) => { output.push(args.join(" ")); };
-  console.error = (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); };
+  patchShared(console, "log", (...args: unknown[]) => { output.push(args.join(" ")); });
+  patchShared(console, "error", (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); });
 });
 
 afterEach(() => {
   stub.stop();
-  console.log = savedLog;
-  console.error = savedError;
-  process.exit = savedExit;
+  patchShared(console, "log", savedLog);
+  patchShared(console, "error", savedError);
+  patchShared(process, "exit", savedExit);
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -106,7 +109,7 @@ describe("tps office status", () => {
   });
 
   test("a missing key sends no Authorization and office-status reports the refusal (HTTP 403)", async () => {
-    process.exit = mock(((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit);
+    patchShared(process, "exit", mock(((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit));
     await expect(runOfficeStatus({ ...baseOpts(), keyPath: "/nonexistent" })).rejects.toThrow("exit:1");
     expect(output.join("\n")).toContain(`Flair unreachable at ${stub.url} (HTTP 403)`);
   });

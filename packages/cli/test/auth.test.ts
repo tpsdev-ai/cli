@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -16,11 +18,11 @@ describe("tps auth", () => {
 
     logs = [];
     oldLog = console.log;
-    console.log = (...args: any[]) => logs.push(args.join(" "));
+    patchShared(console, "log", (...args: any[]) => logs.push(args.join(" ")));
   });
 
   afterEach(() => {
-    console.log = oldLog;
+    patchShared(console, "log", oldLog);
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
     rmSync(root, { recursive: true, force: true });
@@ -67,7 +69,7 @@ describe("tps auth", () => {
   test("refresh updates access token", async () => {
     const mod = await import(`../src/commands/auth.js?x=${Date.now()}`);
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "new-token", expires_in: 3600 }), { status: 200 })) as any;
+    patchShared(globalThis, "fetch", (async () => new Response(JSON.stringify({ access_token: "new-token", expires_in: 3600 }), { status: 200 })) as any);
 
     const refreshed = await mod.refreshAnthropicToken({
       provider: "anthropic",
@@ -80,7 +82,7 @@ describe("tps auth", () => {
 
     expect(refreshed.accessToken).toBe("new-token");
     expect(refreshed.expiresAt).toBeGreaterThan(Date.now());
-    globalThis.fetch = originalFetch;
+    patchShared(globalThis, "fetch", originalFetch);
   });
 
   test("status never shows token values", async () => {
@@ -109,7 +111,7 @@ describe("tps auth", () => {
   test("refresh google updates access token", async () => {
     const mod = await import(`../src/commands/auth.js?x=${Date.now()}`);
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: "g-new", expires_in: 3600 }), { status: 200 })) as any;
+    patchShared(globalThis, "fetch", (async () => new Response(JSON.stringify({ access_token: "g-new", expires_in: 3600 }), { status: 200 })) as any);
 
     const refreshed = await mod.refreshGoogleToken({
       provider: "google",
@@ -122,7 +124,7 @@ describe("tps auth", () => {
 
     expect(refreshed.accessToken).toBe("g-new");
     expect(refreshed.expiresAt).toBeGreaterThan(Date.now());
-    globalThis.fetch = originalFetch;
+    patchShared(globalThis, "fetch", originalFetch);
   });
 
   // cli#430: the tests above import a fresh copy of auth.ts per test with

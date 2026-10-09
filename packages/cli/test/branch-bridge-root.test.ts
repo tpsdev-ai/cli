@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { configureBridgeIdentity } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -51,9 +53,9 @@ async function promotedPath() {
 async function output(action: "read" | "list") {
   const logs: string[] = [];
   const previous = console.log;
-  console.log = (value) => { logs.push(String(value)); };
+  patchShared(console, "log", (value) => { logs.push(String(value)); });
   try { await runMail({ action, agent: "kern", messageId: "branch-record", json: true }); }
-  finally { console.log = previous; }
+  finally { patchShared(console, "log", previous); }
   return JSON.parse(logs.join(""));
 }
 
@@ -88,7 +90,7 @@ test("branch bridge in-place watch verification refuses hook dispatch", async ()
   const seen: string[] = [];
   const errors: string[] = [];
   const previous = console.error;
-  console.error = (...values) => { errors.push(values.join(" ")); };
+  patchShared(console, "error", (...values) => { errors.push(values.join(" ")); });
   const watcher = watchMail({ agent: "kern", debounceMs: 10, pollMs: 20,
     watchImpl: () => ({ close() {} }), onMessage: (message) => { seen.push(message.body); },
     hook: { args: [process.execPath, "-e", 'require("fs").writeFileSync(process.env.HOOK_OUT,"ran")'], env: { HOOK_OUT: out } } });
@@ -96,5 +98,5 @@ test("branch bridge in-place watch verification refuses hook dispatch", async ()
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect({ refused: errors.some((line) => line.includes("external-tier")), seen, ran: existsSync(out) })
       .toEqual({ refused: true, seen: [], ran: false });
-  } finally { watcher.stop(); console.error = previous; }
+  } finally { watcher.stop(); patchShared(console, "error", previous); }
 });

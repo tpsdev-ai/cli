@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,21 +18,21 @@ const agent = "placement-test";
 const seed = Buffer.alloc(32, 0x22);
 let root: string;
 let savedMailDir: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 const faults: Array<ReturnType<typeof spyOn>> = [];
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "placement-recovery-"));
   savedMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue({
     id: "kern", name: "kern", publicKey: pubkeyFromSeed(seed).toString("base64"),
-  });
+  }));
 });
 
 afterEach(() => {
   for (const fault of faults.splice(0)) fault.mockRestore();
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = savedMailDir;
   fs.rmSync(root, { recursive: true, force: true });

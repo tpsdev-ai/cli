@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
@@ -16,18 +18,18 @@ const principal = { id: "kern", name: "kern", publicKey: pubkeyFromSeed(seed).to
 let root: string;
 let target: string;
 let priorMailDir: string | undefined;
-let verifier: ReturnType<typeof spyOn>;
+const verifierState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 const faults: Array<ReturnType<typeof spyOn>> = [];
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "existing-update-"));
   priorMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
   target = join(mail.getInbox(agent).cur, "record.json");
-  verifier = spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue(principal);
+  patchShared(verifierState, "value", spyOn(FlairClient.prototype, "getAgentForVerification").mockResolvedValue(principal));
 });
 afterEach(() => {
   for (const fault of faults.splice(0)) fault.mockRestore();
-  verifier.mockRestore();
+  verifierState.value.mockRestore();
   if (priorMailDir === undefined) delete process.env.TPS_MAIL_DIR;
   else process.env.TPS_MAIL_DIR = priorMailDir;
   fs.rmSync(root, { recursive: true, force: true });
@@ -77,7 +79,7 @@ for (const change of ["ack", "body", "id", "lease", "receipt"]) {
     let verifying = false;
     let release!: () => void;
     const barrier = new Promise<void>((resolve) => { release = resolve; });
-    verifier.mockImplementation(async () => { verifying = true; await barrier; return principal; });
+    verifierState.value.mockImplementation(async () => { verifying = true; await barrier; return principal; });
     const checking = mail.checkMessages(agent);
     await waitFor(() => verifying);
     expect(fs.existsSync(join(mail.getInbox(agent).root, ".mail-lock"))).toBe(false);

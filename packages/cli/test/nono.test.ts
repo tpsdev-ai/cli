@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * nono integration tests — ops-12.1
  *
@@ -303,13 +305,13 @@ describe("runCommandUnderNono()", () => {
 
     const originalWarn = console.warn;
     const warnings: string[] = [];
-    console.warn = (...args) => warnings.push(args.join(" "));
+    patchShared(console, "warn", (...args) => warnings.push(args.join(" ")));
 
     let exitCode: number;
     try {
       exitCode = runCommandUnderNono("tps-hire", {}, ["echo", "fallback"]);
     } finally {
-      console.warn = originalWarn;
+      patchShared(console, "warn", originalWarn);
       process.env.PATH = savedPath; // always restore PATH
       require("node:fs").rmSync(fakeDir, { recursive: true, force: true });
     }
@@ -323,9 +325,9 @@ describe("runCommandUnderNono()", () => {
     process.env.TPS_NONO_STRICT = "1";
 
     const originalError = console.error;
-    console.error = () => {};
+    patchShared(console, "error", () => {});
     const exitCode = runCommandUnderNono("tps-hire", {}, ["echo", "strict"]);
-    console.error = originalError;
+    patchShared(console, "error", originalError);
 
     expect(exitCode).toBe(1);
   });

@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * mail-promotion-kill-safety.test.ts — cli#515.
  *
@@ -45,14 +47,14 @@ interface KillRun {
 describe("promotion at the listed pause points (cli#515)", () => {
   let root: string;
   let keysDir: string;
-  let fetchMock: ReturnType<typeof spyOn>;
+  const fetchMockState = { value: undefined as unknown as ReturnType<typeof spyOn> };
   let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "promote-kill-"));
     keysDir = join(root, "keys");
     const handler = stubFlairHandler({ [FROM]: FROM_SEED, [AGENT]: AGENT_SEED });
-    fetchMock = spyOn(globalThis, "fetch").mockImplementation((async (input, init) => handler(new Request(input, init))) as typeof fetch);
+    patchShared(fetchMockState, "value", spyOn(globalThis, "fetch").mockImplementation((async (input, init) => handler(new Request(input, init))) as typeof fetch));
     writeKeyFile(keysDir, AGENT, AGENT_SEED);
     savedEnv = {};
     for (const k of ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH"]) savedEnv[k] = process.env[k];
@@ -63,7 +65,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
   });
 
   afterEach(() => {
-    fetchMock.mockRestore();
+    fetchMockState.value.mockRestore();
     for (const [k, v] of Object.entries(savedEnv)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

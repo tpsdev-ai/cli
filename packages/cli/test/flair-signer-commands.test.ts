@@ -9,9 +9,12 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createPatchShared } from "./helpers/patch-shared.js";
 import { runInit } from "../src/commands/init.js";
 import { runDashboard } from "../src/commands/roster.js";
 import { pubkeyFromSeed, startStubFlair, type StubFlair } from "./helpers/stub-flair.js";
+
+const patchShared = createPatchShared();
 
 const SEED = Buffer.alloc(32, 0x51);
 
@@ -33,15 +36,15 @@ beforeEach(() => {
   savedLog = console.log;
   savedError = console.error;
   savedStdout = process.stdout.write;
-  console.log = ((...args: unknown[]) => { logs.push(args.join(" ")); }) as typeof console.log;
-  console.error = ((...args: unknown[]) => { logs.push("[ERR] " + args.join(" ")); }) as typeof console.error;
-  process.stdout.write = ((chunk: string) => { logs.push(String(chunk)); return true; }) as typeof process.stdout.write;
+  patchShared(console, "log", ((...args: unknown[]) => { logs.push(args.join(" ")); }) as typeof console.log);
+  patchShared(console, "error", ((...args: unknown[]) => { logs.push("[ERR] " + args.join(" ")); }) as typeof console.error);
+  patchShared(process.stdout, "write", ((chunk: string) => { logs.push(String(chunk)); return true; }) as typeof process.stdout.write);
 });
 
 afterEach(() => {
-  console.log = savedLog;
-  console.error = savedError;
-  process.stdout.write = savedStdout;
+  patchShared(console, "log", savedLog);
+  patchShared(console, "error", savedError);
+  patchShared(process.stdout, "write", savedStdout);
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
   if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
@@ -111,8 +114,7 @@ describe("cli#554 — runDashboard signs its Flair reads", () => {
   });
 
   test("a viewer with no key sends no Authorization and the read is refused", async () => {
-    const savedExit = process.exit;
-    process.exit = mock(((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit);
+    const restoreExit = patchShared(process, "exit", mock(((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit));
     const stub = startStubFlair({ "viewer-a": SEED }, routes);
     try {
       await expect(
@@ -121,7 +123,7 @@ describe("cli#554 — runDashboard signs its Flair reads", () => {
       expect(logs.join("\n")).toContain(`Cannot reach Flair at ${stub.url} (HTTP 403)`);
     } finally {
       stub.stop();
-      process.exit = savedExit;
+      restoreExit();
     }
   });
 });
