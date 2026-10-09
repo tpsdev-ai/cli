@@ -47,6 +47,10 @@ jobs:
         run: ./scripts/check-nono-pin.sh
       - name: nono pin gate — fails-first fixtures (cli#341 S4)
         run: ./scripts/test-check-nono-pin.sh
+      - name: Bun pin gate (cli#578)
+        run: ./scripts/check-bun-pin.sh
+      - name: Bun pin gate — fails-first fixtures (cli#578)
+        run: ./scripts/test-check-bun-pin.sh
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
@@ -378,6 +382,15 @@ jobs:
             cd /tmp/nono && cargo build --release -p nono-cli
             cp target/release/nono /out/nono'
           "$HOME/.local/nono-pin-bookworm/nono" --version
+      - name: Pin the container Bun to package.json's packageManager (cli#578)
+        id: bun
+        run: |
+          v="$(./scripts/docker-bun-version.sh)"
+          printf '%s' "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::scripts/docker-bun-version.sh printed '$v'"
+            exit 1
+          }
+          echo "BUN_VERSION=$v" >> "$GITHUB_ENV"
       - name: Run tests in Docker
         run: docker compose run --rm test
       - name: Supervisor harness (Part B fake nono + Part C real nono) in the container
