@@ -191,7 +191,7 @@ for (const entry of ["sync", "connect"] as const) {
         expect(acks).toEqual([]);
         expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
         expect(jsonFiles(inbox.dlq)).toEqual([]);
-        if (fault === "crash-before-publish") expect(fs.readdirSync(inbox.dlq).some((f) => f.endsWith(".reason"))).toBe(true);
+        if (fault === "crash-before-publish") expect(fs.readdirSync(inbox.dlq).some((f) => f.endsWith(".reason"))).toBe(false);
         const logs = errors.mock.calls.flat().join("\n");
         expect(logs).toContain(body.id);
         expect(logs).toContain("local");

@@ -408,6 +408,21 @@ export function syncMailDirectory(path: string): void {
   syncMailFile(path);
 }
 
+/** Remove a file, confirm it is gone, and sync its directory; throws if removal cannot be confirmed. */
+export function removeMailFileConfirmed(path: string): void {
+  try { unlinkSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  try { lstatSync(path); }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") { syncMailDirectory(dirname(path)); return; }
+    throw error;
+  }
+  throw new Error("file still present after removal");
+}
+
+export class DeadLetterCleanupError extends Error {}
+
 const pendingDirectorySyncs = new Set<string>();
 
 export function mkdirMailDirectory(path: string): void {
@@ -738,11 +753,20 @@ export function deadLetterUndelivered(
   const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
   writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery, relayPayload: { from: record.from, to: record.to, body: record.body, timestamp: record.timestamp }, receivedAt: new Date().toISOString() } : {}) }, null, 2), "utf-8");
-  writeReasonSidecar(inbox.dlq, filename, cls, reason);
-  if (relayDelivery) {
-    syncMailFile(join(inbox.dlq, `${filename}.reason`));
-    publishRelayedRecord(tmpPath, join(inbox.dlq, filename));
-  } else renameSync(tmpPath, join(inbox.dlq, filename));
+  const sidecar = join(inbox.dlq, `${filename}.reason`);
+  try {
+    writeReasonSidecar(inbox.dlq, filename, cls, reason);
+    if (relayDelivery) {
+      syncMailFile(sidecar);
+      publishRelayedRecord(tmpPath, join(inbox.dlq, filename));
+    } else renameSync(tmpPath, join(inbox.dlq, filename));
+  } catch (error) {
+    if (relayDelivery && !existsSync(join(inbox.dlq, filename))) {
+      try { removeMailFileConfirmed(sidecar); }
+      catch { throw new DeadLetterCleanupError("dead-letter sidecar removal could not be confirmed"); }
+    }
+    throw error;
+  }
   return join(inbox.dlq, filename);
 }
 

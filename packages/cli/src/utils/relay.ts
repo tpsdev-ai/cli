@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
@@ -478,7 +478,10 @@ function recordAcceptance(acceptedDir: string, marker: string, receipt: RelayAcc
       try { unlinkSync(marker); syncMailDirectory(dirname(marker)); }
       catch { throw new ReceiptRecoveryIncompleteError("relay receipt recovery incomplete; retry may duplicate"); }
     }
-    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    try { removeMailFileConfirmed(tmp); }
+    catch {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new ReceiptRecoveryIncompleteError("relay receipt recovery incomplete; retry may duplicate");
+    }
     throw error;
   }
   try {
@@ -654,7 +657,8 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
           delivery,
           recipientRoot,
         );
-      } catch {
+      } catch (deadLetterError) {
+        if (deadLetterError instanceof DeadLetterCleanupError) throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`);
         try { undoNewRelayRecord(recipientRoot, delivery); }
         catch { throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`); }
         console.error(`[relay] dead-letter failed for message ${body.id} to ${body.to}`);
