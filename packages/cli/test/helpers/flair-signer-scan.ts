@@ -313,3 +313,62 @@ export function checkSignerInventory(
     staleExclusions: [...excused].filter((k) => !keys.has(k)).sort(),
   };
 }
+
+const STUB_FLAIR = "packages/cli/test/helpers/stub-flair.ts";
+const VERIFYING_HELPERS = new Set(["startStubFlair", "installStubFlairFetch", "stubFlairHandler"]);
+
+/**
+ * Why `source` (the file at repo-relative `testFile`) does not drive a signer
+ * through the verifying stub, or `null`: it must import a verifying helper
+ * from `stub-flair.ts` (the specifier is resolved), call it, and have an
+ * `expect(...)` that names a 401, a 403 or AccessViolation.
+ */
+export function verifyingStubProblem(testFile: string, source: string): string | null {
+  const sf = ts.createSourceFile(testFile, source, ts.ScriptTarget.Latest, true);
+  const dir = testFile.split("/").slice(0, -1);
+  const resolveSpecifier = (spec: string): string => {
+    const parts = spec.startsWith(".") ? [...dir] : [];
+    for (const part of spec.replace(/\.js$/, ".ts").split("/")) {
+      if (part === "..") parts.pop();
+      else if (part !== ".") parts.push(part);
+    }
+    return parts.join("/");
+  };
+  const locals = new Set<string>();
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    if (resolveSpecifier(stmt.moduleSpecifier.text) !== STUB_FLAIR) continue;
+    const bindings = stmt.importClause?.namedBindings;
+    if (!bindings || !ts.isNamedImports(bindings)) continue;
+    for (const el of bindings.elements) {
+      if (VERIFYING_HELPERS.has((el.propertyName ?? el.name).text)) locals.add(el.name.text);
+    }
+  }
+  if (locals.size === 0) return `${testFile} imports no verifying helper from ${STUB_FLAIR}`;
+  let called = false;
+  let refusal = false;
+  /** True for `expect(...)` and for any matcher chain rooted at it, e.g. `expect(x).rejects.toThrow(...)`. */
+  const rootedAtExpect = (call: ts.CallExpression): boolean => {
+    let e: ts.Expression = call.expression;
+    while (ts.isPropertyAccessExpression(e) || ts.isCallExpression(e)) e = e.expression;
+    return ts.isIdentifier(e) && e.text === "expect";
+  };
+  const insideExpect = (node: ts.Node): boolean => {
+    for (let n: ts.Node | undefined = node; n; n = n.parent) {
+      if (ts.isCallExpression(n) && rootedAtExpect(n)) return true;
+    }
+    return false;
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && locals.has(node.expression.text)) called = true;
+    const refusalText =
+      (ts.isNumericLiteral(node) && /^(401|403)$/.test(node.text)) ||
+      ((ts.isStringLiteralLike(node) || ts.isTemplateLiteralToken(node)) && /\b(401|403)\b|AccessViolation/.test(node.text));
+    if (refusalText && insideExpect(node)) refusal = true;
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  if (!called) return `${testFile} imports a verifying helper but never calls it`;
+  if (!refusal) return `${testFile} has no refusal assertion (an expect naming 401, 403 or AccessViolation)`;
+  return null;
+}

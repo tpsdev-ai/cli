@@ -1,4 +1,4 @@
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -26,7 +26,7 @@ describe("trust ceiling at promotion (cli#433 slice B2-1)", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "tps-trust-ceiling-"));
     keysDir = join(tempRoot, "keys");
-    stub = startFetchFlair(SEEDS);
+    stub = startUnverifiedFetchFlair(SEEDS);
     writeKeyFile(keysDir, "kern", KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
 

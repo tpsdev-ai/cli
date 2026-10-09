@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createMailVerifyClient } from "../src/utils/mail-verify.js";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { verifyEnvelope } from "@tpsdev-ai/agent";
 import { defaultMailSender, handleTransition, startPollLoop, pollOnce, checkReminders, type PulseState, type PulseConfig, type PrInstance } from "../src/commands/pulse.js";
 
@@ -15,7 +15,7 @@ test("pulse notification delivers an envelope signed by pulse", async () => {
   const saved = Object.fromEntries(["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR"].map((k) => [k, process.env[k]]));
   const seed = Buffer.alloc(32, 0x65);
   const publicKey = Buffer.from(ed.getPublicKey(seed));
-  const flair = startFetchFlair({ pulse: seed });
+  const flair = startUnverifiedFetchFlair({ pulse: seed });
   try {
     process.env.HOME = home;
     process.env.TPS_MAIL_DIR = join(home, "mail");

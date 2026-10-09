@@ -8,7 +8,7 @@
  * reference the scan cannot resolve fails.
  */
 import { describe, expect, test } from "bun:test";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   checkSignerInventory,
@@ -16,6 +16,7 @@ import {
   readSources,
   type SignerExclusion,
   scanSources,
+  verifyingStubProblem,
 } from "./helpers/flair-signer-scan.js";
 
 const REPO = join(import.meta.dir, "..", "..", "..");
@@ -64,6 +65,13 @@ describe("cli#554 — every TPS-Ed25519 site is classified", () => {
   test("each mapped signer names a test file that exists", () => {
     for (const [signer, testFile] of Object.entries(INVENTORY)) {
       expect(existsSync(join(REPO, testFile)), `${signer} -> ${testFile}`).toBe(true);
+    }
+  });
+
+  test("each mapped signer test drives the verifying stub and asserts a refusal", () => {
+    for (const [signer, testFile] of Object.entries(INVENTORY)) {
+      const source = readFileSync(join(REPO, testFile), "utf8");
+      expect(verifyingStubProblem(testFile, source), signer).toBeNull();
     }
   });
 
@@ -136,5 +144,37 @@ describe("cli#554 — the inventory is a live check (mutation on a copy of the s
     delete sources["packages/cli/src/utils/llm-proxy.ts"];
     const result = checkSignerInventory(scanSources(sources).sites, INVENTORY, NON_SIGNERS);
     expect(result.staleExclusions).toEqual(["packages/cli/src/utils/llm-proxy.ts#verifyRequest"]);
+  });
+});
+
+describe("cli#554 — a mapped test must drive the verifying stub (mutation on a copy of a test)", () => {
+  const FILE = "packages/cli/test/flair-signer-agent.test.ts";
+  const real = readFileSync(join(REPO, FILE), "utf8");
+
+  test("the real test passes", () => {
+    expect(verifyingStubProblem(FILE, real)).toBeNull();
+  });
+
+  test("a test on the non-verifying stub fails", () => {
+    const source = [
+      "import { startUnverifiedFetchFlair } from \"./helpers/fetch-flair.js\";",
+      "test(\"x\", async () => { startUnverifiedFetchFlair({}); expect((await fetch(\"http://x\")).status).toBe(403); });",
+    ].join("\n");
+    expect(verifyingStubProblem(FILE, source)).toContain("imports no verifying helper");
+  });
+
+  test("a verifying helper imported from another module fails", () => {
+    const source = real.replace("./helpers/stub-flair.js", "./helpers/fetch-flair.js");
+    expect(verifyingStubProblem(FILE, source)).toContain("imports no verifying helper");
+  });
+
+  test("a verifying helper that is imported but never called fails", () => {
+    const source = real.replaceAll("startStubFlair(", "unusedStub(");
+    expect(verifyingStubProblem(FILE, source)).toContain("never calls it");
+  });
+
+  test("a test with no refusal assertion fails", () => {
+    const source = real.replace(/\b(401|403)\b|AccessViolation/g, "200");
+    expect(verifyingStubProblem(FILE, source)).toContain("no refusal assertion");
   });
 });

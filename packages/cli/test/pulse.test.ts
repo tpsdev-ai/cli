@@ -23,7 +23,7 @@ import {
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -457,7 +457,7 @@ describe("pruneState", () => {
 describe("startPollLoop", () => {
   let root: string;
   let saved: Record<string, string | undefined>;
-  let flair: ReturnType<typeof startFetchFlair>;
+  let flair: ReturnType<typeof startUnverifiedFetchFlair>;
   beforeEach(() => {
     saved = { HOME: process.env.HOME, TPS_TEST_KEYS_DIR: process.env.TPS_TEST_KEYS_DIR };
     root = mkdtempSync(join(tmpdir(), "pulse-loop-"));
@@ -467,7 +467,7 @@ describe("startPollLoop", () => {
     mkdirSync(dir, { recursive: true });
     const seed = Buffer.alloc(32, 0x78);
     writeFileSync(join(dir, "pulse.key"), seed);
-    flair = startFetchFlair({ pulse: seed });
+    flair = startUnverifiedFetchFlair({ pulse: seed });
   });
   afterEach(() => {
     flair.stop();

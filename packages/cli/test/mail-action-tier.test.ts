@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runMail } from "../src/commands/mail.js";
 import { checkMessages, sendMessage, listMessages } from "../src/utils/mail.js";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { buildSignedEnvelope } from "./helpers/stub-flair.js";
 
 for (const action of ["ack", "nack"] as const) {
@@ -12,7 +12,7 @@ for (const action of ["ack", "nack"] as const) {
     const root = mkdtempSync(join(tmpdir(), "mail-action-tier-"));
     const saved = { ...process.env };
     const seeds = { flint: Buffer.alloc(32, 9), kern: Buffer.alloc(32, 10) };
-    const stub = startFetchFlair(seeds);
+    const stub = startUnverifiedFetchFlair(seeds);
     try {
       process.env.TPS_MAIL_DIR = join(root, "mail"); process.env.TPS_AGENT_ID = "kern";
       process.env.FLAIR_KEY_PATH = join(root, "key"); process.env.FLAIR_URL = stub.url;

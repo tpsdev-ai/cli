@@ -1,7 +1,7 @@
 import { mock } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { startFetchFlair } from "./fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./fetch-flair.js";
 import { buildSignedEnvelope } from "./stub-flair.js";
 
 const [runtime, root] = process.argv.slice(2);
@@ -15,7 +15,7 @@ mock.module(join(utils, "agent-lifecycle.ts"), () => ({
 }));
 mock.module(join(utils, "flair-task-loop.ts"), () => ({ startTaskLoop: () => () => {} }));
 const seeds = { flint: Buffer.alloc(32, 1), "openclaw-bridge": Buffer.alloc(32, 2), kern: Buffer.alloc(32, 3) };
-const stub = startFetchFlair(seeds);
+const stub = startUnverifiedFetchFlair(seeds);
 process.env.TPS_MAIL_DIR = join(root!, "mail");
 process.env.FLAIR_URL = stub.url;
 process.env.FLAIR_KEY_PATH = join(root!, "kern.key");

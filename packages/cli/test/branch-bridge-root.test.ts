@@ -8,13 +8,13 @@ import { dirname, join } from "node:path";
 import { runMail } from "../src/commands/mail.js";
 import { watchMail } from "../src/commands/mail-watch.js";
 import { getInbox, listMessages, promote } from "../src/utils/mail.js";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { buildSignedEnvelope } from "./helpers/stub-flair.js";
 
 const seeds = { "branch-custom-bridge": Buffer.alloc(32, 0x71), kern: Buffer.alloc(32, 0x72) };
 let root: string;
 let saved: NodeJS.ProcessEnv;
-let stub: ReturnType<typeof startFetchFlair>;
+let stub: ReturnType<typeof startUnverifiedFetchFlair>;
 let path: string;
 
 beforeEach(() => {
@@ -26,7 +26,7 @@ beforeEach(() => {
   mkdirSync(join(root, ".tps", "branch-office", "kern", "mail"), { recursive: true });
   const inbox = getInbox("kern");
   configureBridgeIdentity(dirname(inbox.root), "stdio", "branch-custom-bridge");
-  stub = startFetchFlair(seeds);
+  stub = startUnverifiedFetchFlair(seeds);
   process.env.FLAIR_URL = stub.url;
   process.env.FLAIR_KEY_PATH = join(root, "kern.key");
   writeFileSync(process.env.FLAIR_KEY_PATH, seeds.kern);

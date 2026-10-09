@@ -15,7 +15,7 @@
  * at promotion (the bridge-tier promotion suite is B2-1's); this suite reuses that,
  * it does not duplicate it.
  */
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -54,7 +54,7 @@ describe("channel bridge signs as its own identity (cli#433 slice B2-2)", () => 
   let mailDir: string;
   let keysDir: string;
   let emptyKeys: string;
-  let stub: ReturnType<typeof startFetchFlair>;
+  let stub: ReturnType<typeof startUnverifiedFetchFlair>;
   let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
@@ -69,7 +69,7 @@ describe("channel bridge signs as its own identity (cli#433 slice B2-2)", () => 
     writeFileSync(join(keysDir, `${BRIDGE_ID}.key`), BRIDGE_SEED);
     writeFileSync(join(keysDir, "kern.key"), KERN_SEED);
 
-    stub = startFetchFlair(SEEDS);
+    stub = startUnverifiedFetchFlair(SEEDS);
 
     savedEnv = {};
     for (const k of ["HOME", "TPS_MAIL_DIR", "TPS_TEST_KEYS_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_BRIDGE_AGENT_ID"]) {

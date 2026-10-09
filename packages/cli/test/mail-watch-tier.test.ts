@@ -1,4 +1,4 @@
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 /**
  * mail-watch-tier.test.ts — `mail watch` hooks honour the SIGNED tier
  * (cli#433 slice B2-1).
@@ -39,7 +39,7 @@ describe("mail watch honours the signed tier (cli#433 slice B2-1)", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-tier-"));
     keysDir = join(tempRoot, "keys");
-    stub = startFetchFlair(SEEDS);
+    stub = startUnverifiedFetchFlair(SEEDS);
     writeKeyFile(keysDir, AGENT, KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
 

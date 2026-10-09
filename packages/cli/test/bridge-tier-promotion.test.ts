@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { checkMessages, getInbox, recoverPromoted, sendMessage } from "../src/utils/mail.js";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 import { buildSignedEnvelope } from "./helpers/stub-flair.js";
 
 const seeds = { "custom-bridge": Buffer.alloc(32, 4), "openclaw-bridge": Buffer.alloc(32, 5), kern: Buffer.alloc(32, 6) };
@@ -13,7 +13,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 test("--bridge-agent-id binds sender and receiver; defaults remain external; recovery recomputes the tier", async () => {
   const root = mkdtempSync(join(tmpdir(), "bridge-configured-"));
   const saved = { ...process.env };
-  const stub = startFetchFlair(seeds);
+  const stub = startUnverifiedFetchFlair(seeds);
   let child: ReturnType<typeof spawn> | undefined;
   let childError = "";
   try {
@@ -74,7 +74,7 @@ test("bridge outbound dispatch and cur recovery refuse external mail before adap
   const root = mkdtempSync(join(tmpdir(), "bridge-outbound-"));
   const saved = { ...process.env };
   const outboundSeeds = { flint: Buffer.alloc(32, 7), "stdio-bridge": Buffer.alloc(32, 8) };
-  const stub = startFetchFlair(outboundSeeds);
+  const stub = startUnverifiedFetchFlair(outboundSeeds);
   let core: InstanceType<typeof BridgeCore> | undefined;
   try {
     process.env.TPS_MAIL_DIR = join(root, "mail");

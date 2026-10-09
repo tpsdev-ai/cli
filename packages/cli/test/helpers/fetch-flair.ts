@@ -1,6 +1,7 @@
 import { pubkeyFromSeed } from "./stub-flair.js";
 
-export function startFetchFlair(seeds: Record<string, Buffer>) {
+/** Answers without checking the caller's Authorization; a test of a signer must use stub-flair.ts instead. */
+export function startUnverifiedFetchFlair(seeds: Record<string, Buffer>) {
   const previous = globalThis.fetch;
   globalThis.fetch = (async (input: string | URL | Request) => {
     const path = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url).pathname;
