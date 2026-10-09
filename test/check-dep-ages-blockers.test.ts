@@ -12,23 +12,39 @@ const node = Bun.which("node");
 const AGE = "[install]\nminimumReleaseAge = 604800\n";
 
 describe("the gate reads exclusions with Bun's TOML parser", () => {
+  const DOTTED_AGE = "install.minimumReleaseAge = 604800\n";
+  // `toml10`: the text defines `install` once, as TOML 1.0 requires, so the running Bun must
+  // parse it; those cases cannot pass on a refusal. The other case defines `install` twice:
+  // the expectation follows whatever the running Bun does with it.
   it.each([
-    ["a plain [install] key", `${AGE}minimumReleaseAgeExcludes = ["foo", "bar"]\n`],
-    ["a dotted key", `install.minimumReleaseAgeExcludes = ["foo", "bar"]\n${AGE}`],
-    ["a quoted dotted key", `install."minimumReleaseAgeExcludes" = ["foo", "bar"]\n${AGE}`],
-    ["an escaped dotted key", `install."minimumReleaseAge\\u0045xcludes" = ["foo", "bar"]\n${AGE}`],
-    ["a literal dotted key", `install.'minimumReleaseAgeExcludes' = ['foo', 'bar']\n${AGE}`],
-    ["an inline table", `install = { minimumReleaseAgeExcludes = ["foo", "bar"] }\n${AGE}`],
-    ["a multi-line array", `${AGE}minimumReleaseAgeExcludes = [\n  "foo",\n  "bar",\n]\n`],
-    ["comments", `${AGE}# minimumReleaseAgeExcludes = ["decoy"]\nminimumReleaseAgeExcludes = [ # names\n  "foo", # first\n  # none here\n  "bar", ] # end\n`],
-  ])("lists what Bun parses from %s, and fails without a dated exception", (_label, bunfig) => {
-    const parsed = Bun.TOML.parse(bunfig).install.minimumReleaseAgeExcludes;
-    expect(parsed).toEqual(["foo", "bar"]);
+    ["a plain [install] key", `${AGE}minimumReleaseAgeExcludes = ["foo", "bar"]\n`, true],
+    ["a dotted key", `${DOTTED_AGE}install.minimumReleaseAgeExcludes = ["foo", "bar"]\n`, true],
+    ["a quoted dotted key", `${DOTTED_AGE}install."minimumReleaseAgeExcludes" = ["foo", "bar"]\n`, true],
+    ["an escaped dotted key", `${DOTTED_AGE}install."minimumReleaseAge\\u0045xcludes" = ["foo", "bar"]\n`, true],
+    ["a literal dotted key", `${DOTTED_AGE}install.'minimumReleaseAgeExcludes' = ['foo', 'bar']\n`, true],
+    ["an inline table", `install = { minimumReleaseAge = 604800, minimumReleaseAgeExcludes = ["foo", "bar"] }\n`, true],
+    ["a multi-line array", `${AGE}minimumReleaseAgeExcludes = [\n  "foo",\n  "bar",\n]\n`, true],
+    ["comments", `${AGE}# minimumReleaseAgeExcludes = ["decoy"]\nminimumReleaseAgeExcludes = [ # names\n  "foo", # first\n  # none here\n  "bar", ] # end\n`, true],
+    ["an escaped dotted key before an [install] table", `install."minimumReleaseAge\\u0045xcludes" = ["foo", "bar"]\n${AGE}`, false],
+  ])("matches the running Bun's parse of %s, and fails without a dated exception", (_label, bunfig, toml10) => {
+    let parsed: unknown;
+    let rejected: unknown = null;
+    try {
+      parsed = Bun.TOML.parse(bunfig).install.minimumReleaseAgeExcludes;
+    } catch (err) {
+      rejected = err;
+    }
+    if (toml10) expect(rejected).toBeNull();
     linkedFixture((root) => {
       writeFileSync(join(root, "bunfig.toml"), bunfig);
       writeFileSync(join(root, "docs", "dep-age-exceptions.md"), "## Exceptions\n");
       const output = runGate(root);
-      expect([...output.matchAll(/^ {4}(\S+): no dated entry under/gm)].map((m) => m[1])).toEqual(parsed);
+      if (rejected === null) {
+        expect(parsed).toEqual(["foo", "bar"]);
+        expect([...output.matchAll(/^ {4}(\S+): no dated entry under/gm)].map((m) => m[1])).toEqual(parsed);
+      } else {
+        expect(output).toContain("cannot read bunfig.toml with Bun's TOML parser: the parser rejected it");
+      }
       expect(output).not.toContain("Checking");
     });
   });
