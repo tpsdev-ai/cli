@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage } from "../src/utils/mail.js";
+import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
 import { runMail } from "../src/commands/mail.js";
 import { syncRemoteBranch, connectAndKeepAlive, deliverRelayedToLocal } from "../src/utils/relay.js";
@@ -309,9 +309,6 @@ for (const entry of ["sync", "connect"] as const) {
         const source = join(dir, "incomplete.json");
         const incomplete = JSON.stringify({ relayDelivery: { branchId: "remote", id: body.id } });
         fs.writeFileSync(source, incomplete);
-        const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
-        fs.mkdirSync(join(marker, ".."), { recursive: true });
-        fs.writeFileSync(marker, "");
         const errors = spyOn(console, "error").mockImplementation(() => {});
         await start();
         const send = channel.send;
@@ -500,14 +497,106 @@ for (const entry of ["sync", "connect"] as const) {
       expect(drainOutbox(false)).toEqual([]);
     });
 
-    for (const state of ["removed-unread", "consumed", "legacy"] as const) {
-      test(`existing ${state} marker with no record republishes before ACK`, async () => {
+    async function ackOnlyRecord(): Promise<void> {
+      const inbox = getInbox("local");
+      const [file] = jsonFiles(inbox.fresh);
+      ackMessageAtPath(join(inbox.fresh, file));
+      expect(jsonFiles(inbox.fresh)).toEqual([]);
+    }
+
+    test("an identical resend after ACK is a duplicate: one record, no second delivered", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+      await ackOnlyRecord();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
+      expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }, { id: body.id, accepted: true }]);
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(jsonFiles(getInbox("local").cur)).toEqual([]);
+      expect(drainOutbox(false)).toEqual([]);
+    });
+
+    test("a differing resend after ACK is refused without a second delivery", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      await ackOnlyRecord();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: { ...body, content: "changed payload" } });
+      expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(jsonFiles(getInbox("local").dlq)).toEqual([]);
+      expect(errors.mock.calls.flat().join("\n")).toContain("conflict");
+    });
+
+    test("a receipt older than the prune bound no longer blocks a resend", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "late", SEEDS)));
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      await ackOnlyRecord();
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = "1000";
+      const old = new Date(Date.now() - 5000);
+      fs.utimesSync(marker, old, old);
+      try {
+        await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
+      } finally {
+        delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+      }
+      expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }, { id: body.id, accepted: true }]);
+      expect(jsonFiles(getInbox("local").fresh)).toHaveLength(1);
+    });
+
+    test("acceptance receipts past the prune bound are removed when a new one is written", async () => {
+      const first = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "first accepted", SEEDS)));
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: first });
+      const accepted = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
+      const firstMarker = join(accepted, first.id);
+      expect(fs.existsSync(firstMarker)).toBe(true);
+      process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = "1000";
+      const old = new Date(Date.now() - 5000);
+      fs.utimesSync(firstMarker, old, old);
+      const second = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "second accepted", SEEDS)));
+      try {
+        await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: second });
+      } finally {
+        delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+      }
+      expect(fs.existsSync(firstMarker)).toBe(false);
+      expect(fs.existsSync(join(accepted, second.id))).toBe(true);
+      expect(jsonFiles(getInbox("local").fresh)).toHaveLength(2);
+    });
+
+    test("a marker read failure refuses the delivery without an ACK", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "marker read", SEEDS)));
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      await ackOnlyRecord();
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      const read = fs.readFileSync;
+      const fault = spyOn(fs, "readFileSync").mockImplementation((path, options) => {
+        if (String(path) === marker) throw Object.assign(new Error("injected marker read denied"), { code: "EACCES" });
+        return read(path, options as BufferEncoding);
+      });
+      try {
+        await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
+      } finally {
+        fault.mockRestore();
+      }
+      expect(acks.length).toBe(1);
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(errors.mock.calls.flat().join("\n")).toContain("injected marker read denied");
+    });
+
+    for (const state of ["removed-unread", "consumed"] as const) {
+      test(`an existing ${state} receipt with no record dedups an identical resend and is ACKed`, async () => {
         const envelope = buildSignedEnvelope("remote", "local", state, SEEDS);
         const body = queue(JSON.stringify(envelope));
         const inbox = getInbox("local");
-        const marker = state === "legacy"
-          ? join(process.env.TPS_MAIL_DIR!, ".relay-accepted", body.id)
-          : join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+        const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
         const client = new MailClient(process.env.TPS_MAIL_DIR!, undefined, "local", {
           async getAgent(id) {
             const seed = SEEDS[id as keyof typeof SEEDS];
@@ -517,54 +606,61 @@ for (const entry of ["sync", "connect"] as const) {
         spyOn(console, "error").mockImplementation(() => {});
         await start();
         const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
-        if (state === "legacy") {
-          fs.mkdirSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted"), { recursive: true });
-          fs.writeFileSync(marker, "");
-        } else {
-          const send = channel.send;
-          channel.send = async () => { throw new Error("injected lost ACK"); };
-          await deliverDirect(msg);
-          channel.send = send;
-          expect(acks).toEqual([]);
-          expect(fs.readFileSync(marker, "utf8")).toBe("");
-          expect(jsonFiles(inbox.fresh)).toHaveLength(1);
-          if (state === "consumed") {
-            expect(await client.checkNewMail()).toHaveLength(1);
-            expect(hasCommittedMessageId(join(process.env.TPS_MAIL_DIR!, "local"), envelope.messageId)).toBe(true);
-            expect(envelope.messageId).not.toBe(body.id);
-          } else {
-            expect(hasCommittedMessageId(join(process.env.TPS_MAIL_DIR!, "local"), envelope.messageId)).toBe(false);
-          }
-          const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 2000);
-          try { expect(gcMessages("local", "24h", undefined, "1s")).toBe(1); }
-          finally { clock.mockRestore(); }
-          expect(jsonFiles(inbox.fresh)).toEqual([]);
-          expect(jsonFiles(inbox.cur)).toEqual([]);
-        }
-        const recordsAtAck: number[] = [];
         const send = channel.send;
+        channel.send = async () => { throw new Error("injected lost ACK"); };
+        await deliverDirect(msg);
+        channel.send = send;
+        expect(acks).toEqual([]);
+        expect(jsonFiles(inbox.fresh)).toHaveLength(1);
+        if (state === "consumed") {
+          expect(await client.checkNewMail()).toHaveLength(1);
+          expect(hasCommittedMessageId(join(process.env.TPS_MAIL_DIR!, "local"), envelope.messageId)).toBe(true);
+        }
+        const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 2000);
+        try { expect(gcMessages("local", "24h", undefined, "1s")).toBe(1); }
+        finally { clock.mockRestore(); }
+        expect(jsonFiles(inbox.fresh)).toEqual([]);
+        expect(jsonFiles(inbox.cur)).toEqual([]);
+
+        const recordsAtAck: number[] = [];
+        const ackSend = channel.send;
         channel.send = async (ack) => {
           if (ack.type === MSG_MAIL_ACK) recordsAtAck.push(jsonFiles(inbox.fresh).length);
-          return send(ack);
+          return ackSend(ack);
         };
         await deliverDirect(msg);
-        expect(recordsAtAck).toEqual([1]);
-        expect(jsonFiles(inbox.fresh)).toHaveLength(1);
+        expect(recordsAtAck).toEqual([0]);
+        expect(jsonFiles(inbox.fresh)).toEqual([]);
         expect(jsonFiles(inbox.cur)).toEqual([]);
         expect(jsonFiles(inbox.dlq)).toEqual([]);
         expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
         expect(drainOutbox(false)).toEqual([]);
-        const promoted = await client.checkNewMail();
-        expect(promoted).toHaveLength(state === "consumed" ? 0 : 1);
-        if (state === "consumed") {
-          const [file] = jsonFiles(inbox.dlq);
-          expect(fs.readFileSync(join(inbox.dlq, `${file}.reason`), "utf8")).toContain("class: replay");
-        }
+        expect(await client.checkNewMail()).toEqual([]);
+        expect(fs.existsSync(marker)).toBe(true);
       });
     }
 
+    test("an empty pre-receipt marker with no record refuses without an ACK", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "legacy", SEEDS)));
+      const inbox = getInbox("local");
+      const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
+      const marker = join(legacy, body.id);
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      fs.mkdirSync(legacy, { recursive: true });
+      fs.writeFileSync(marker, "");
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
+      expect(acks).toEqual([]);
+      expect(errors.mock.calls.flat().join("\n")).toContain("conflict");
+      expect(jsonFiles(inbox.fresh)).toEqual([]);
+      expect(jsonFiles(inbox.cur)).toEqual([]);
+      expect(jsonFiles(inbox.dlq)).toEqual([]);
+      expect(drainOutbox(false).map((item) => item.id)).toEqual([body.id]);
+      expect(fs.readFileSync(marker, "utf8")).toBe("");
+    });
+
     for (const signature of ["valid", "invalid"] as const) {
-      test(`resend with an unrelated consumed id and ${signature} signature republishes before ACK`, async () => {
+      test(`a delivery whose envelope reuses a consumed message id is refused at promotion (${signature} signature)`, async () => {
         const original = buildSignedEnvelope("remote", "local", "unrelated", SEEDS);
         sendMessage("local", JSON.stringify(original), "remote");
         const client = new MailClient(process.env.TPS_MAIL_DIR!, undefined, "local", {
@@ -578,29 +674,9 @@ for (const entry of ["sync", "connect"] as const) {
         if (signature === "invalid") envelope.body = "tampered";
         const body = queue(JSON.stringify(envelope));
         const inbox = getInbox("local");
-        const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
         spyOn(console, "error").mockImplementation(() => {});
         await start();
-        const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
-        const send = channel.send;
-        channel.send = async () => { throw new Error("injected lost ACK"); };
-        await deliverDirect(msg);
-        channel.send = send;
-        expect(acks).toEqual([]);
-        expect(fs.readFileSync(marker, "utf8")).toBe("");
-        const clock = spyOn(Date, "now").mockReturnValue(Date.now() + 2000);
-        try { expect(gcMessages("local", "24h", undefined, "1s")).toBe(2); }
-        finally { clock.mockRestore(); }
-        expect(jsonFiles(inbox.fresh)).toEqual([]);
-        expect(jsonFiles(inbox.cur)).toEqual([]);
-        expect(jsonFiles(inbox.dlq)).toEqual([]);
-        const recordsAtAck: number[] = [];
-        channel.send = async (ack) => {
-          if (ack.type === MSG_MAIL_ACK) recordsAtAck.push(jsonFiles(inbox.fresh).length);
-          return send(ack);
-        };
-        await deliverDirect(msg);
-        expect(recordsAtAck).toEqual([1]);
+        await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
         expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
         expect(drainOutbox(false)).toEqual([]);
         expect(await client.checkNewMail()).toEqual([]);

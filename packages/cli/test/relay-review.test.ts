@@ -98,11 +98,16 @@ describe("relay review regressions", () => {
     expect(deliverRelayedToLocal("remote", message)).toBe(false);
     expect(synced).toContain(acceptedRoot);
     expect(synced).toContain(mail);
-    expect(fs.readFileSync(join(acceptedRoot, "by-branch", "remote", message.id), "utf8")).toBe("");
+    expect(JSON.parse(fs.readFileSync(join(acceptedRoot, "by-branch", "remote", message.id), "utf8"))).toEqual({
+      from: message.from,
+      to: message.to,
+      body: message.content,
+      timestamp: message.timestamp,
+    });
   });
 
   for (const dir of ["new", "cur", "dlq"] as const) {
-    test(`a truncated ${dir} record is preserved and reported while a marked delivery is republished`, () => {
+    test(`a truncated ${dir} record is preserved and reported; a marked delivery with no usable receipt is refused`, () => {
       const inbox = getInbox("local");
       const message = body();
       const corrupt = join(inbox.root, dir, "truncated.json");
@@ -112,7 +117,7 @@ describe("relay review regressions", () => {
       fs.mkdirSync(accepted, { recursive: true });
       fs.writeFileSync(join(accepted, message.id), "");
       const errors = spyOn(console, "error").mockImplementation(() => {});
-      expect(deliverRelayedToLocal("remote", message)).toBe(true);
+      expect(() => deliverRelayedToLocal("remote", message)).toThrow(`relayed delivery conflict for branch remote message ${message.id}`);
       const quarantine = join(inbox.root, "quarantine");
       const files = fs.readdirSync(quarantine).filter((file) => file.endsWith(".json"));
       expect(files).toHaveLength(1);
@@ -121,7 +126,8 @@ describe("relay review regressions", () => {
       expect(fs.readFileSync(`${path}.reason`, "utf8")).toContain(corrupt);
       expect(errors.mock.calls.flat().join("\n")).toContain(corrupt);
       expect(fs.readdirSync(join(inbox.root, dir))).not.toContain("truncated.json");
-      expect(deliverRelayedToLocal("remote", message)).toBe(false);
+      fs.rmSync(join(accepted, message.id));
+      expect(deliverRelayedToLocal("remote", message)).toBe(true);
       const records = fs.readdirSync(inbox.fresh).filter((file) => file.endsWith(".json"));
       expect(records).toHaveLength(1);
       expect(JSON.parse(fs.readFileSync(join(inbox.fresh, records[0]!), "utf8")).body).toBe(message.content);

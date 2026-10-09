@@ -1,1 +1,1 @@
-- **Inbox-routed branch relay deliveries are recorded before ACK and reused or republished on resend.** Inbox payload conflicts are refused without ACK. Reply, forward and drop handler outcomes are outside this guarantee. Promotion rejects repeated signed-envelope messageIds.
+- **Inbox-routed branch relay deliveries are recorded before ACK.** Inbox payload conflicts are refused without ACK. Reply, forward and drop handler outcomes are outside this guarantee. Promotion rejects repeated signed-envelope messageIds.

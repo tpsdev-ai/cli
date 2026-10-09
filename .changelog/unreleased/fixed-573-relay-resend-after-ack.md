@@ -1,0 +1,1 @@
+- **A relay delivery sent again while its acceptance receipt remains on disk is judged against it.** An identical payload is acknowledged as a duplicate with no second record; a differing payload is refused. Receipts are pruned past a bounded age, after which a resend counts as a fresh delivery.

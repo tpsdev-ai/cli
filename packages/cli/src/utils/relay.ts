@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -16,7 +16,7 @@ import { registerServiceProxyHandler } from "./service-proxy-host.js";
 import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
-import type { ZodError } from "zod";
+import { z, type ZodError } from "zod";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
 
 
@@ -371,13 +371,118 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
-function recordAcceptance(acceptedDir: string, marker: string): void {
+/**
+ * The payload an acceptance receipt binds to its branch+id: the relay payload
+ * of the delivery that was accepted, so a later resend can be judged against it
+ * after the inbox record is gone.
+ */
+const RelayAcceptReceiptSchema = z.object({
+  from: MailDeliverBodySchema.shape.from,
+  to: MailDeliverBodySchema.shape.to,
+  body: z.string(),
+  timestamp: MailDeliverBodySchema.shape.timestamp,
+});
+type RelayAcceptReceipt = z.infer<typeof RelayAcceptReceiptSchema>;
+
+function acceptReceipt(body: MailDeliverBody): RelayAcceptReceipt {
+  return { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp };
+}
+
+/** Receipts older than this no longer block a resend: a resend that late is a fresh delivery. */
+const RELAY_ACCEPT_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function relayAcceptReceiptTtlMs(): number {
+  const raw = Number(process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : RELAY_ACCEPT_RECEIPT_TTL_MS;
+}
+
+/** The most directory entries one prune pass examines, so the prune's work is bounded however large the directory is. */
+const RELAY_ACCEPT_PRUNE_MAX = 4096;
+
+/**
+ * Remove acceptance receipts older than `ttlMs` from one branch's directory and
+ * return how many were removed. The scan examines at most
+ * RELAY_ACCEPT_PRUNE_MAX entries, so a call's work has a hard bound that does
+ * not depend on the directory's size.
+ */
+export function pruneRelayAcceptanceReceipts(acceptedDir: string, now = Date.now(), ttlMs = relayAcceptReceiptTtlMs()): number {
+  if (!existsSync(acceptedDir)) return 0;
+  let removed = 0;
+  let examined = 0;
+  for (const entry of readdirSync(acceptedDir, { withFileTypes: true })) {
+    if (examined >= RELAY_ACCEPT_PRUNE_MAX) break;
+    examined++;
+    if (!entry.isFile()) continue;
+    const path = join(acceptedDir, entry.name);
+    let mtimeMs: number;
+    try {
+      mtimeMs = statSync(path).mtimeMs;
+    } catch {
+      continue; // gone or undatable: nothing to prune
+    }
+    if (now - mtimeMs <= ttlMs) continue;
+    try {
+      unlinkSync(path);
+      removed++;
+    } catch {
+      // The resend decision already ignores an expired receipt, so a failed
+      // unlink does not block a resend; a later pass retries.
+    }
+  }
+  if (removed > 0) syncMailDirectory(acceptedDir);
+  return removed;
+}
+
+function recordAcceptance(acceptedDir: string, marker: string, receipt: RelayAcceptReceipt): void {
   mkdirMailDirectory(acceptedDir);
   const tmp = `${marker}.tmp`;
-  writeFileSync(tmp, "", { mode: 0o600 });
+  writeFileSync(tmp, JSON.stringify(receipt), { mode: 0o600 });
   syncMailFile(tmp);
   renameSync(tmp, marker);
   syncMailDirectory(acceptedDir);
+  // Bounded hygiene: whenever a new receipt is written, drop the ones past the
+  // TTL.
+  try {
+    pruneRelayAcceptanceReceipts(acceptedDir);
+  } catch (error: unknown) {
+    console.error(`[relay] acceptance receipt prune failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/**
+ * The acceptance marker for a delivery, or undefined when there is none or the
+ * one present has aged past the receipt TTL (an expired receipt no longer
+ * blocks). The marker is keyed by branch+id; its receipt records the payload.
+ */
+function existingAcceptanceMarker(marker: string, legacyMarker: string): string | undefined {
+  const path = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
+  if (!path) return undefined;
+  try {
+    if (Date.now() - statSync(path).mtimeMs > relayAcceptReceiptTtlMs()) return undefined;
+  } catch {
+    // A stat failure keeps it and lets the verdict read it (fail closed).
+  }
+  return path;
+}
+
+/**
+ * Whether a surviving marker's receipt is for the same payload. A marker with
+ * no readable receipt (an empty pre-receipt marker, or a corrupt one) is a
+ * conflict: the delivery's identity is unproven, so publishing again could
+ * deliver a second copy. A read failure propagates and refuses the delivery.
+ */
+function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
+  const raw = readFileSync(path, "utf-8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  const receipt = RelayAcceptReceiptSchema.safeParse(parsed);
+  if (!receipt.success) return false;
+  const r = receipt.data;
+  return r.from === expected.from && r.to === expected.to && r.body === expected.body && r.timestamp === expected.timestamp;
 }
 
 /** The shared wait budget for relay acceptance's mailbox locks. */
@@ -427,17 +532,33 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
     const marker = join(acceptedDir, body.id);
     const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
-    const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
+    const receipt = acceptReceipt(body);
+    const existingMarker = existingAcceptanceMarker(marker, legacyMarker);
     const delivery = { branchId, id: body.id };
     const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, acquireLock });
-    if (existingMarker && existingRecord) {
-      syncMailFile(existingMarker);
-      syncMailDirectory(dirname(existingMarker));
+    if (existingRecord) {
+      // The record is still live: this delivery is already stored. Keep a
+      // receipt (or upgrade a pre-receipt marker) so a resend after the record is
+      // ACKed is still recognised.
+      if (existingMarker && acceptanceReceiptMatches(existingMarker, receipt)) {
+        syncMailFile(existingMarker);
+        syncMailDirectory(dirname(existingMarker));
+      } else {
+        recordAcceptance(acceptedDir, marker, receipt);
+      }
       return false;
     }
-    if (!existingMarker && existingRecord) {
-      recordAcceptance(acceptedDir, marker);
-      return false;
+    if (existingMarker) {
+      // No record, but this branch+id was accepted before (a normal mail ACK
+      // removes the record). A matching payload is a duplicate; anything else —
+      // a different payload, or a marker with no usable receipt — is refused,
+      // publishing no second record.
+      if (acceptanceReceiptMatches(existingMarker, receipt)) {
+        syncMailFile(existingMarker);
+        syncMailDirectory(dirname(existingMarker));
+        return false;
+      }
+      throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}`);
     }
 
     let delivered: boolean;
@@ -468,7 +589,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
       }
       delivered = false;
     }
-    recordAcceptance(acceptedDir, marker);
+    recordAcceptance(acceptedDir, marker, receipt);
     return delivered;
   } finally {
     mailboxLock?.release();
