@@ -105,10 +105,8 @@ const cliOptionTypes = new Map(
   )
 );
 
-// The guard's mode flags are the boolean options `check` and `noGuard` in the
-// shared table above. The accepted spellings are that table's hyphenated forms
-// (`--check`, `--no-guard`); `--noGuard` and the other guard-shaped forms below
-// are refused.
+// In scanned secrets-guard option positions, only bare --check and --no-guard
+// select a mode; other guard-shaped forms require contextual rejection.
 const GUARD_MODE_OPTION_NAMES = /** @type {readonly string[]} */ (["check", "noGuard"]);
 const guardModeFlagName = new Map(
   Object.keys(cliFlagDefinitions)
@@ -119,7 +117,7 @@ const MALFORMED_GUARD_MODE = /^--(?:check|no-check|no-guard|no-no-guard|guard|no
 
 /**
  * What a token says about the guard's mode: "check"/"noGuard" for an accepted
- * spelling, `false` for a guard-shaped token the CLI refuses, and undefined for
+ * spelling, `false` for a malformed guard spelling, and undefined for
  * anything else.
  * @param {string} arg
  * @returns {"check" | "noGuard" | false | undefined}
@@ -221,6 +219,10 @@ function parseCliArgs(argv) {
     }
     if (arg === "--version" || arg === "-v") {
       versionRequested = true;
+    }
+    if (cmd === "secrets-guard" && arg.startsWith("-") && !arg.startsWith("--") &&
+        arg !== "-v" && arg !== "-" && !/^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(arg)) {
+      throw new Error(`InvalidSecretsGuardOption: ${arg}; put wrapped options after the command`);
     }
     const rawValue = RAW_VALUE_FLAGS[cmd ?? ""]?.some((name) => arg === `--${name}`);
     const author = cmd === "agent" && action === "commit" && arg === "--author";
