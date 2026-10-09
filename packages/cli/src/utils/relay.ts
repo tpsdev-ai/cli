@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { acquireMailLockSync } from "./mail-lock.js";
@@ -544,6 +544,12 @@ function undoNewRelayRecord(root: string, delivery: { branchId: string; id: stri
 
 /** Wait budget for relay acceptance locks. */
 const RELAY_ACCEPT_LOCK_TIMEOUT_MS = 2000;
+export const RELAY_ACCEPT_LOCK_STRIPES = 64;
+
+export function relayAcceptanceLockRoot(branchId: string, id: string): string {
+  const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
+  return join(getMailDir(), ".relay-accept-locks", String(stripe));
+}
 
 function relayAcceptLockTimeoutMs(): number {
   const raw = Number(process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS);
@@ -576,11 +582,12 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
     return lock;
   };
-  const acceptanceRoot = join(getMailDir(), ".relay-accept-locks", branchId, body.id);
+  const acceptanceRoot = relayAcceptanceLockRoot(branchId, body.id);
   mkdirMailDirectory(acceptanceRoot);
   const acceptanceLock = acquireLock(acceptanceRoot);
   let mailboxLock: ReturnType<typeof acquireLock> | undefined;
   try {
+    // Hold the stripe before each mailbox lock; release mailbox locks before the stripe.
     const recipientRoot = relayAcceptRoot(body.to);
     mkdirMailDirectory(recipientRoot);
     if (recipientRoot !== acceptanceRoot) mailboxLock = acquireLock(recipientRoot);

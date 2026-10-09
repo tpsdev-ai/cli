@@ -8,7 +8,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ackMessageAtPath, getInbox } from "../src/utils/mail.js";
-import { RelayAcceptLockTimeoutError, deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
+import { RELAY_ACCEPT_LOCK_STRIPES, RelayAcceptLockTimeoutError, deliverRelayedToLocal, relayAcceptanceLockRoot, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 
 const BRANCH = "remote";
 const RECIPIENT = "local";
@@ -127,9 +127,9 @@ function deliverChild(prefix: string, ids: string[], env: Record<string, string>
 }
 
 /** Spawn a real process that holds a mailbox lock until released. */
-function holdLock(agent = RECIPIENT): Promise<{ release: () => Promise<void> }> {
+function holdLock(lockRoot = join(mail, RECIPIENT)): Promise<{ release: () => Promise<void> }> {
   const child = spawn("bun", [childScript], {
-    env: { ...process.env, RELAY_CHILD_MODE: "hold", RELAY_CHILD_ROOT: join(mail, agent) },
+    env: { ...process.env, RELAY_CHILD_MODE: "hold", RELAY_CHILD_ROOT: lockRoot },
     stdio: ["pipe", "pipe", "inherit"],
   });
   const exited = new Promise<number | null>((resolve) => child.once("exit", resolve));
@@ -242,6 +242,39 @@ describe("relay acceptance (cli#561)", () => {
     for (const id of ids) expect(byId.get(id)).toHaveLength(1);
   }, 60_000);
 
+  test("lock directories stay bounded across distinct deliveries", () => {
+    for (let i = 0; i < RELAY_ACCEPT_LOCK_STRIPES * 2 + 1; i++) {
+      const id = randomUUID();
+      expect(deliverRelayedToLocal(BRANCH, { id, from: FROM, to: RECIPIENT, content: id, timestamp: TIMESTAMP })).toBe(true);
+      const [file] = jsonFiles(getInbox(RECIPIENT).fresh);
+      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!));
+    }
+    const lockRoot = join(mail, ".relay-accept-locks");
+    const countDirectories = (dir: string): number => readdirSync(dir, { withFileTypes: true }).reduce(
+      (total, entry) => total + (entry.isDirectory() ? 1 + countDirectories(join(dir, entry.name)) : 0), 0,
+    );
+    expect(countDirectories(lockRoot)).toBeLessThanOrEqual(RELAY_ACCEPT_LOCK_STRIPES);
+  }, 60_000);
+
+  test("different ids on one stripe each publish once across processes", async () => {
+    const seen = new Map<string, string>();
+    let pair: [string, string] | undefined;
+    for (let i = 0; i <= RELAY_ACCEPT_LOCK_STRIPES; i++) {
+      const id = randomUUID();
+      const stripe = relayAcceptanceLockRoot(BRANCH, id);
+      const prior = seen.get(stripe);
+      if (prior) { pair = [prior, id]; break; }
+      seen.set(stripe, id);
+    }
+    expect(pair).toBeDefined();
+    const [a, b] = await Promise.all([deliverChild("same-", pair!), deliverChild("same-", pair!)]);
+    expect(a.delivered + b.delivered).toBe(2);
+    expect(a.duplicate + b.duplicate).toBe(2);
+    expect(a.refused + b.refused).toBe(0);
+    const byId = recordsByDeliveryId();
+    for (const id of pair!) expect(byId.get(id)).toHaveLength(1);
+  }, 20_000);
+
   test("two recipients resending the same id around local ACK keep the original receipt", async () => {
     const id = randomUUID();
     const body = { id, from: FROM, to: RECIPIENT, content: `same-${id}`, timestamp: TIMESTAMP };
@@ -249,7 +282,7 @@ describe("relay acceptance (cli#561)", () => {
     const marker = relayAcceptanceReceiptPath(BRANCH, id);
     const original = readFileSync(marker, "utf8");
     const inode = statSync(marker).ino;
-    const holder = await holdLock(join(".relay-accept-locks", BRANCH, id));
+    const holder = await holdLock(relayAcceptanceLockRoot(BRANCH, id));
     const local = deliverChild("same-", [id]);
     const other = deliverChild("same-", [id], { RELAY_CHILD_TO: "other" });
     try {
@@ -265,9 +298,9 @@ describe("relay acceptance (cli#561)", () => {
     expect(jsonFiles(getInbox("other").fresh)).toEqual([]);
   }, 60_000);
 
-  test("the delivery id lock blocks every recipient for that id", async () => {
+  test("the stripe lock blocks every recipient for that id", async () => {
     const id = randomUUID();
-    const holder = await holdLock(join(".relay-accept-locks", BRANCH, id));
+    const holder = await holdLock(relayAcceptanceLockRoot(BRANCH, id));
     try {
       process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
       for (const to of [RECIPIENT, "other"]) {
@@ -292,7 +325,7 @@ describe("relay acceptance (cli#561)", () => {
   }, 60_000);
 
   test("a different mailbox's lock uses the acceptance deadline and refuses by name, publishing no mail record or acceptance marker", async () => {
-    const holder = await holdLock("other");
+    const holder = await holdLock(join(mail, "other"));
     try {
       process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
       const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "timed out", timestamp: TIMESTAMP };

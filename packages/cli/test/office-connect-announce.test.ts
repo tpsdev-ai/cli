@@ -445,7 +445,7 @@ describe("office connect announcement follows local acceptance", () => {
     expect(announced).toEqual([1]);
   });
 
-  test("a delivery whose inbox write fails is dead-lettered and is not announced", async () => {
+  test("an inbox write failure is unacked and unannounced", async () => {
     const inbox = getInbox("local");
     const write = fs.writeFileSync;
     let failed = false;
@@ -463,9 +463,9 @@ describe("office connect announcement follows local acceptance", () => {
       fault.mockRestore();
     }
     expect(failed).toBe(true);
-    expect(acks.length).toBe(1);
+    expect(acks.length).toBe(0);
     expect(jsonFiles(inbox.fresh)).toEqual([]);
-    expect(jsonFiles(inbox.dlq).length).toBe(1);
+    expect(jsonFiles(inbox.dlq)).toEqual([]);
     expect(announced).toEqual([]);
   });
 });
