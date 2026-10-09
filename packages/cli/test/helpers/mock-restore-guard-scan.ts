@@ -153,8 +153,9 @@ function declaredNames(file: ts.SourceFile): Set<string> {
 
 /**
  * Every identifier that names an imported module object or derives from one, by
- * plain alias, destructuring or a property read. Any member assignment on such
- * an identifier is a member of a module object wherever the alias hides it.
+ * plain alias, destructuring or a property read. A member assignment on such an
+ * identifier is reported as a member assignment on the module object, so an
+ * alias no longer hides it.
  */
 function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
   const names = new Map<string, string>();
