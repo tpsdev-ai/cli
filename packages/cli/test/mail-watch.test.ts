@@ -20,7 +20,7 @@
  * tests stand up a stub Flair and point FLAIR_URL/FLAIR_KEY_PATH at it.
  */
 
-import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -35,6 +35,10 @@ import {
   writeKeyFile,
   type StubFlair,
 } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const AGENT = "kern";
 const FLINT_SEED = Buffer.alloc(32, 0x11);

@@ -1,10 +1,14 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as mail from "../src/utils/mail.js";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const agent = "update-test";
 const seed = Buffer.alloc(32, 0x22);

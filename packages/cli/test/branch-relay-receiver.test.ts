@@ -13,6 +13,10 @@ import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/uti
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { writeKeyFile, buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 // The peer host's fingerprint, as the branch channel reports it.
 const HOST_FP = "a".repeat(64);

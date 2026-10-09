@@ -15,7 +15,7 @@
  *   without it, and the refusals (a same-id conflict, an injected inbox write
  *   failure) never reach it.
  */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import net from "node:net";
@@ -29,6 +29,10 @@ import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import type { TransportChannel, TransportServer, TpsMessage } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");

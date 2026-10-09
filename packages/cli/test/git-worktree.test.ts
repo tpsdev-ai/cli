@@ -11,6 +11,7 @@ describe("tps git worktree", () => {
   let tempDir: string;
   let repoPath: string;
   const originalHome = process.env.HOME;
+  const originalVaultKey = process.env.TPS_VAULT_KEY;
 
   beforeEach(() => {
     tempDir = join(tmpdir(), `tps-git-test-${Date.now()}`);
@@ -31,6 +32,8 @@ describe("tps git worktree", () => {
 
   afterEach(() => {
     process.env.HOME = originalHome;
+    if (originalVaultKey === undefined) delete process.env.TPS_VAULT_KEY;
+    else process.env.TPS_VAULT_KEY = originalVaultKey;
     rmSync(tempDir, { recursive: true, force: true });
   });
 

@@ -1,7 +1,7 @@
 // cli#486 — the last three `?? "anvil"` identity defaults are gone: the bridge
 // core, the roster dashboard and `tps agent commit` take a configured identity
 // and refuse by name when none is set.
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,6 +10,10 @@ import { BridgeCore } from "../src/bridge/core.js";
 import type { BridgeAdapter } from "../src/bridge/adapter.js";
 import { runDashboard } from "../src/commands/roster.js";
 import { startFetchFlair } from "./helpers/fetch-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 

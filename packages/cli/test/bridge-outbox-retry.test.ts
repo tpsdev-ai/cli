@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,6 +7,10 @@ import type { BridgeAdapter, BridgeEnvelope } from "../src/bridge/adapter.js";
 import { FlairClient } from "../src/utils/flair-client.js";
 import * as mail from "../src/utils/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const BRIDGE = "test-bridge";
 const SEED = Buffer.alloc(32, 0x42);
