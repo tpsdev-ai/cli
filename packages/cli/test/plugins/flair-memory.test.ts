@@ -1,5 +1,9 @@
-import { describe, expect, it, mock } from "bun:test";
+import { describe, expect, it, mock, afterEach } from "bun:test";
 import { FlairMemoryProvider } from "../../src/plugins/flair-memory.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 function makeClient() {
   return {

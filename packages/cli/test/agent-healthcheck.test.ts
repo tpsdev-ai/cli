@@ -40,7 +40,8 @@ afterEach(() => {
   console.log = originalLog;
   globalThis.fetch = originalFetch;
   process.exit = originalExit;
-  process.env.TPS_HOME = originalTpsHome;
+  if (originalTpsHome === undefined) delete process.env.TPS_HOME;
+  else process.env.TPS_HOME = originalTpsHome;
   rmSync(tempHome, { recursive: true, force: true });
 });
 

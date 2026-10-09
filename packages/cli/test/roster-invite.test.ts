@@ -3,6 +3,10 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("tps roster invite", () => {
   let tempHome: string;
   let configPath: string;

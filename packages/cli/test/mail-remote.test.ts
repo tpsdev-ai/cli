@@ -30,6 +30,7 @@ const PROLOGUE = Buffer.from("tps-v1");
 
 describe("deliverToRemoteBranch", () => {
   let root: string;
+  const originalHome = process.env.HOME;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-mail-remote-"));
@@ -43,7 +44,8 @@ describe("deliverToRemoteBranch", () => {
 
   afterEach(() => {
     rmSync(root, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
     delete process.env.TPS_VAULT_KEY;
     delete process.env.TPS_IDENTITY_DIR;
     delete process.env.TPS_REGISTRY_DIR;

@@ -3,6 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+afterEach(() => {
+  mock.restore();
+});
+
 describe("tps office health", () => {
   let tempHome: string;
   let originalHome: string | undefined;

@@ -49,8 +49,13 @@ describe("branch daemon SIGTERM with a host connected", () => {
   let root: string;
   let child: ChildProcess | undefined;
   let cleanups: Array<Promise<void> | void>;
+  let savedEnv: Record<string, string | undefined>;
 
   beforeEach(() => {
+    savedEnv = {};
+    for (const key of ["HOME", "TPS_ROOT", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_AGENT_ID", "TPS_VAULT_KEY"]) {
+      savedEnv[key] = process.env[key];
+    }
     root = mkdtempSync(join(tmpdir(), "tps-daemon-sigterm-"));
     process.env.HOME = root;
     process.env.TPS_ROOT = join(root, ".tps");
@@ -73,8 +78,9 @@ describe("branch daemon SIGTERM with a host connected", () => {
       }
     }
     rmSync(root, { recursive: true, force: true });
-    for (const key of ["HOME", "TPS_ROOT", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_AGENT_ID", "TPS_VAULT_KEY"]) {
-      delete process.env[key];
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
     }
   });
 

@@ -12,6 +12,10 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 import type { TransportChannel, TransportServer, TpsMessage } from "../src/utils/transport.js";
 import { MailDeliverBodySchema, MSG_HEARTBEAT, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 // The real fs.watch, taken before any test spies on it: each test wraps this
 // one, never whatever fs.watch is at that moment.
 const realWatch = fs.watch;

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { join } from "node:path";
 import { homedir, tmpdir } from "node:os";
@@ -7,6 +7,10 @@ import { FlairClient } from "../src/utils/flair-client.js";
 import { getInbox, promote, recoverPromoted, redriveRetryable, sendMessage } from "../src/utils/mail.js";
 import { runAgent } from "../src/commands/agent.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 const seed = Buffer.alloc(32, 1);
 let root: string;
 let oldMail: string | undefined;

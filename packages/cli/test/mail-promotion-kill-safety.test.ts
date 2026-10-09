@@ -7,7 +7,7 @@
  * end state. Every spawned process has a deadline; roots are mkdtemp'd.
  */
 
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +16,10 @@ import { fileURLToPath } from "node:url";
 import { hasCommittedMessageId } from "@tpsdev-ai/agent";
 import { checkMessages, getInbox, promote } from "../src/utils/mail.js";
 import { buildSignedEnvelope, stubFlairHandler, writeKeyFile } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const AGENT = "agent-a";
 const FROM = "agent-b";

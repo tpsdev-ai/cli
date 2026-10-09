@@ -7,7 +7,7 @@
  *
  */
 
-import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -17,6 +17,10 @@ import { processStartToken } from "../src/utils/mail-lock.js";
 import { spawnSync } from "node:child_process";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const KERN_SEED = Buffer.alloc(32, 0x02);

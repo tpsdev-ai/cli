@@ -24,6 +24,10 @@ import { deliverRelayedToLocal } from "../src/utils/relay.js";
 import { getInbox } from "../src/utils/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
+afterEach(() => {
+  mock.restore();
+});
+
 const SEEDS = {
   alice: Buffer.alloc(32, 0x31),
   bob: Buffer.alloc(32, 0x32),

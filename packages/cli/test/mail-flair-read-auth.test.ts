@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,6 +7,10 @@ import { hasCommittedMessageId } from "@tpsdev-ai/agent";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { checkMessages, getInbox } from "../src/utils/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed, stubFlairHandler, writeKeyFile } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const receiver = "auth-receiver";
 const sender = "auth-sender";

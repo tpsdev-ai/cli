@@ -12,10 +12,12 @@ import {
 
 describe("connection-state", () => {
   let home = "";
+  const originalHome = process.env.HOME;
 
   afterEach(() => {
     if (home) rmSync(home, { recursive: true, force: true });
-    delete process.env.HOME;
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
   });
 
   test("write + read round-trips", () => {

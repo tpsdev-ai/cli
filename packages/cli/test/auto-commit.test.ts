@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, test, afterEach } from "bun:test";
 import {
   composeSystemPrompt,
   hasWorkspaceChangesOrNewCommit,
@@ -7,6 +7,10 @@ import {
   syncWorkspaceBeforeTask,
   type CodexRuntimeConfig,
 } from "../src/utils/codex-runtime.ts";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const config: CodexRuntimeConfig = {
   agentId: "ember",

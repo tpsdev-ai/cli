@@ -65,7 +65,8 @@ beforeEach(() => {
 
 afterEach(() => {
   process.env.PATH = origPath;
-  process.env.TPS_NONO_STRICT = origNonoStrict;
+  if (origNonoStrict === undefined) delete process.env.TPS_NONO_STRICT;
+  else process.env.TPS_NONO_STRICT = origNonoStrict;
   delete process.env.NONO_FAKE_LOG;
   delete process.env.NONO_PROFILES_DIR;
   rmSync(tmpDir, { recursive: true, force: true });
