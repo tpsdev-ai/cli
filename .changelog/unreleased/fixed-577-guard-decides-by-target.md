@@ -4,5 +4,6 @@
   guarded global (`globalThis.*`, `Date.*`, `process.*` except `process.env`,
   `console.*`, `Bun.*`, and the bare snapshot names such as `fetch`), must go
   through `patchShared` however the value was computed. A destructured or
-  property-derived alias no longer hides such a patch, and a name that a local
-  binding declares is not treated as the global.
+  property-derived alias no longer hides such a patch, and a name that an
+  enclosing scope declares is not treated as the global. An alias of a guarded
+  global root is treated as that root.
