@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * home-per-call.test.ts — cli#439.
  *
@@ -175,7 +177,7 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     writeFileSync(join(homeB, ".tps", "identity", "anvil.key"), Buffer.alloc(32, 7));
 
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/Agent/") && method === "GET") {
@@ -186,10 +188,10 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
       }
       if (url.endsWith("/OrgEvent/")) return new Response("", { status: 204 });
       throw new Error(`unexpected fetch: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
 
     const originalLog = console.log;
-    console.log = () => {};
+    patchShared(console, "log", () => {});
     try {
       const tick = await mod.runOfficeHealthTick({
         viewerId: "anvil",
@@ -210,8 +212,8 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
       expect(existsSync(join(homeA, ".tps", "office-health"))).toBe(false);
       expect(existsSync(join(homeA, ".tps", "cursors"))).toBe(false);
     } finally {
-      globalThis.fetch = originalFetch;
-      console.log = originalLog;
+      patchShared(globalThis, "fetch", originalFetch);
+      patchShared(console, "log", originalLog);
     }
   }, 20_000);
 
@@ -227,20 +229,20 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     writeFileSync(join(homeB, ".tps", "secrets", "bob-github-pat"), "ghp_bob\n");
 
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () =>
+    patchShared(globalThis, "fetch", (async () =>
       new Response(JSON.stringify({ login: "bob" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
-      })) as typeof globalThis.fetch;
+      })) as typeof globalThis.fetch);
 
     const originalLog = console.log;
     const logs: string[] = [];
-    console.log = ((...args: unknown[]) => logs.push(args.join(" "))) as typeof console.log;
+    patchShared(console, "log", ((...args: unknown[]) => logs.push(args.join(" "))) as typeof console.log);
     try {
       await mod.runListGithubPats({ json: true });
     } finally {
-      globalThis.fetch = originalFetch;
-      console.log = originalLog;
+      patchShared(globalThis, "fetch", originalFetch);
+      patchShared(console, "log", originalLog);
     }
 
     const out = logs.join("\n");
@@ -267,11 +269,11 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
 
     const originalLog = console.log;
     const logs: string[] = [];
-    console.log = ((...args: unknown[]) => logs.push(args.join(" "))) as typeof console.log;
+    patchShared(console, "log", ((...args: unknown[]) => logs.push(args.join(" "))) as typeof console.log);
     try {
       await mod.flairCommand("logs", {});
     } finally {
-      console.log = originalLog;
+      patchShared(console, "log", originalLog);
     }
 
     expect(logs.join("\n")).toBe(`No logs yet at ${join(homeB, ".tps", "logs", "flair.log")}`);
@@ -303,14 +305,14 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     process.env.FLAIR_KEY_PATH = smokeKey;
     const originalFetch = globalThis.fetch;
     const hostPublicKey = Buffer.from(ed.getPublicKey(Buffer.alloc(32, 9))).toString("base64");
-    globalThis.fetch = (async (input: string | URL) => {
+    patchShared(globalThis, "fetch", (async (input: string | URL) => {
       const path = new URL(String(input)).pathname;
       if (path === "/Agent/host") {
         return Response.json({ id: "host", name: "host", publicKey: hostPublicKey });
       }
       if (path === "/Health") return new Response("ok");
       return new Response("not found", { status: 404 });
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
     // The health checks shell out: a fake `nono` (the lane's fake, as the other
     // bootstrap cases use) plus an `openclaw` that reports a healthy gateway.
     const fakeBin = mkdtempSync(join(tmpdir(), "tps-bootstrap-bin-"));
@@ -340,12 +342,12 @@ exit 0
     }
 
     const originalLog = console.log;
-    console.log = () => {};
+    patchShared(console, "log", () => {});
     try {
       await mod.runBootstrap({ agentId });
     } finally {
-      console.log = originalLog;
-      globalThis.fetch = originalFetch;
+      patchShared(console, "log", originalLog);
+      patchShared(globalThis, "fetch", originalFetch);
       process.env.PATH = originalPath;
       if (originalFlairKeyPath === undefined) delete process.env.FLAIR_KEY_PATH;
       else process.env.FLAIR_KEY_PATH = originalFlairKeyPath;

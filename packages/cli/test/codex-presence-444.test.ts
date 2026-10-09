@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 // cli#444 — the codex runtime records liveness on Flair's Presence resource and
 // NEVER writes the agent's own Agent row: in Flair `Agent.status` is the
 // principal's lifecycle state, so a value other than `active` deactivates the
@@ -64,7 +66,7 @@ async function driveRuntime(signal: "SIGTERM" | "SIGINT") {
   const inboxCur = join(mailRoot, "testbot", "cur");
 
   process.env.TPS_MAIL_DIR = mailRoot;
-  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+  patchShared(globalThis, "fetch", (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
@@ -75,10 +77,10 @@ async function driveRuntime(signal: "SIGTERM" | "SIGINT") {
       return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
     }
     return new Response("", { status: 204 });
-  }) as typeof globalThis.fetch;
-  process.exit = ((code?: number) => {
+  }) as typeof globalThis.fetch);
+  patchShared(process, "exit", ((code?: number) => {
     exitCode = code;
-  }) as never;
+  }) as never);
 
   try {
     runCodexRuntime({
@@ -99,8 +101,8 @@ async function driveRuntime(signal: "SIGTERM" | "SIGINT") {
     await waitFor(() => exitCode !== undefined, 5000); // signal handler ran
     await waitFor(() => presenceBodies.some((b) => b.includes("idle")), 5000);
   } finally {
-    globalThis.fetch = savedFetch;
-    process.exit = savedExit;
+    patchShared(globalThis, "fetch", savedFetch);
+    patchShared(process, "exit", savedExit);
     if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
     else process.env.TPS_MAIL_DIR = savedMailDir;
     for (const l of process.listeners("SIGTERM")) if (!savedSigterm.includes(l)) process.off("SIGTERM", l);
@@ -270,14 +272,14 @@ describe("codex runtime presence (cli#444)", () => {
       };
       const warnings: string[] = [];
       const realWarn = console.warn;
-      console.warn = ((msg?: unknown) => {
+      patchShared(console, "warn", ((msg?: unknown) => {
         warnings.push(String(msg ?? ""));
-      }) as typeof console.warn;
+      }) as typeof console.warn);
       try {
         await publishRuntimePresence(client as never, "testbot");
         await shutdownPresenceBeat(client as never, "testbot", 100);
       } finally {
-        console.warn = realWarn;
+        patchShared(console, "warn", realWarn);
       }
       // Both beats were attempted; each LOGGED its failure and neither fell back
       // to an Agent write.
@@ -340,7 +342,7 @@ describe("codex runtime presence (cli#444)", () => {
       let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 
       process.env.TPS_MAIL_DIR = join(dir, "mail");
-      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      patchShared(globalThis, "fetch", (async (input: string | URL | Request, init?: RequestInit) => {
         const path = String(input).replace(/^https?:\/\/[^/]+/, "");
         if (init?.method === "POST" && path === "/Presence") presenceBodies.push(String(init.body ?? ""));
         if (path === "/Health") return new Response("ok", { status: 200 });
@@ -348,15 +350,15 @@ describe("codex runtime presence (cli#444)", () => {
           return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
         }
         return new Response("", { status: 204 });
-      }) as typeof globalThis.fetch;
-      globalThis.setInterval = ((...args: Parameters<typeof setInterval>) => {
+      }) as typeof globalThis.fetch);
+      patchShared(globalThis, "setInterval", ((...args: Parameters<typeof setInterval>) => {
         if (args[1] === HEARTBEAT_INTERVAL_MS) {
           args[1] = 20;
           heartbeatTimer = savedSetInterval(...args);
           return heartbeatTimer;
         }
         return savedSetInterval(...args);
-      }) as typeof setInterval;
+      }) as typeof setInterval);
 
       try {
         await expect(runCodexRuntime({
@@ -374,8 +376,8 @@ describe("codex runtime presence (cli#444)", () => {
         await sleep(80);
         expect(presenceBodies.length).toBe(beatsAtRejection);
       } finally {
-        globalThis.fetch = savedFetch;
-        globalThis.setInterval = savedSetInterval;
+        patchShared(globalThis, "fetch", savedFetch);
+        patchShared(globalThis, "setInterval", savedSetInterval);
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
         else process.env.TPS_MAIL_DIR = savedMailDir;

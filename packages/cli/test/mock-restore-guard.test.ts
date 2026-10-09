@@ -1,26 +1,4 @@
-/**
- * mock-restore-guard.test.ts — cli#555.
- *
- * Every cli test file runs in ONE bun process with every other file, so a spy
- * (`spyOn`) a file leaves in place changes what a later file observes: cli#544's
- * `WsNoiseTransport.prototype.connect` spy made two transport tests time out only
- * in suite order, while passing when run alone. `mock.module` is the same kind of
- * shared-state change, but mock.restore() does not undo it (see the probe below).
- *
- * This guard parses each discovered cli test file (see
- * helpers/mock-restore-guard-scan.ts) and fails when a file
- *   - calls `mock.module(...)`, or
- *   - assigns to a global (other than a `globalThis` name the runtime preload
- *     checks: guarded-globals.ts) or to a property of an imported module object,
- *     outside the `patchShared` helper — `mock.restore()` does not undo such an
- *     assignment.
- *
- * Fixture files under fixtures/mock-restore-guard/ pin the verdicts: each red
- * fixture must be reported, each green fixture must be clean. process.env is
- * checked at run time by helpers/env-leak-preload.ts and the well-known globals
- * by helpers/global-leak-preload.ts (global-leak-guard.test.ts) — both appended
- * by helpers/leak-preload.ts.
- */
+/** Static guard fixtures and cli test-tree scan. */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -39,7 +17,7 @@ function kindsFor(name: string): string[] {
 }
 
 describe("mock restore guard (cli#555)", () => {
-  test("discovered cli test files: no mock.module() call, and the mock.restore() teardown wherever the check requires it", () => {
+  test("discovered cli test files satisfy the static guard", () => {
     const offenders = discoverCliTestFiles(TEST_ROOT)
       .map((file) => ({ file, findings: analyzeSource(readFileSync(file, "utf8")) }))
       .filter((entry) => entry.findings.length > 0)
@@ -67,17 +45,23 @@ describe("mock restore guard (cli#555)", () => {
   for (const name of [
     "direct-global-leaked.fixture.ts",
     "direct-module-leaked.fixture.ts",
+    "cast-member-leaked.fixture.ts",
+    "nested-import-leaked.fixture.ts",
+    "cast-global-leaked.fixture.ts",
+    "bare-global-leaked.fixture.ts",
   ]) {
     test(`reports ${name} (red fixture)`, () => {
       expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
     });
   }
 
-  test("a direct assignment to a globalThis name the runtime preload checks is left to that preload", () => {
+  test("refuses inline fetch restoration", () => {
     expect(
-      analyzeSource(`import { test } from "bun:test";
-test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof globalThis.fetch; });`),
-    ).toEqual([]);
+      analyzeSource(`import { afterAll, test } from "bun:test";
+const original = globalThis.fetch;
+afterAll(() => { globalThis.fetch = original; });
+test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof globalThis.fetch; });`).map(finding => finding.kind),
+    ).toContain("direct-assignment-needs-restore");
   });
 
   test("an assignment to a local object is not an assignment to a global or a module object", () => {
@@ -91,6 +75,7 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     "spy-namespace-restored.fixture.ts",
     "direct-global-restored.fixture.ts",
     "direct-module-restored.fixture.ts",
+    "mock-helper-restored.fixture.ts",
   ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);
@@ -132,6 +117,25 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
         .map((finding) => finding.kind)).toContain("missing-mock-restore-teardown");
     });
   }
+
+  test("names an unclassified mock assignment target", () => {
+    expect(analyzeSource('import { mock, afterEach } from "bun:test"; afterEach(() => mock.restore()); getTarget().m = mock();'))
+      .toContainEqual({ kind: "unclassified-assignment-target", detail: "cannot classify mock assignment target: getTarget().m" });
+  });
+
+  for (const rhs of ["mock(() => {})", "spyOn(object, 'm')", "mock.module('x', () => ({}))", "alias", "spy.mockImplementation(() => {})"]) {
+    test(`refuses mock assignment: ${rhs}`, () => {
+      expect(analyzeSource(`import { mock, spyOn, afterEach } from "bun:test";
+        afterEach(() => mock.restore()); const alias = mock(); const spy = spyOn(object, 'm'); local.m = ${rhs};`)
+        .map(finding => finding.kind)).toContain("direct-assignment-needs-restore");
+    });
+  }
+
+  test("refuses a mock identifier bound by a logical assignment", () => {
+    expect(analyzeSource(`import { mock, afterEach } from "bun:test"; afterEach(() => mock.restore());
+      let replacement; replacement ||= mock(() => {}); object.m = replacement;`).filter(finding => finding.kind === "direct-assignment-needs-restore"))
+      .toHaveLength(2);
+  });
 
   test("mock.restore() does not undo mock.module(): a later consumer still receives the replacement", () => {
     const probe = spawnSync(process.execPath, ["test", "./module-mock-probe.ts"], {

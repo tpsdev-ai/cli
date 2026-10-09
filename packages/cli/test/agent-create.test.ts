@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * ops-36 — tps agent create / list / status tests
  */
@@ -138,14 +140,14 @@ describe("ops-36: tps agent create — file system side effects", () => {
 
     let exitCode: number | undefined;
     const origExit = process.exit;
-    (process as any).exit = (code: number) => { exitCode = code; throw new Error(`exit:${code}`); };
+    patchShared((process as any), "exit", (code: number) => { exitCode = code; throw new Error(`exit:${code}`); });
 
     try {
       await runAgent({ action: "status", id: "nonexistent-agent-xyz" });
     } catch (e) {
       expect(String(e)).toContain("exit:1");
     } finally {
-      (process as any).exit = origExit;
+      patchShared((process as any), "exit", origExit);
     }
     expect(exitCode).toBe(1);
   });
@@ -170,7 +172,7 @@ llm:
       logs.push(line);
     });
     const originalLog = console.log;
-    console.log = logSpy as typeof console.log;
+    patchShared(console, "log", logSpy as typeof console.log);
 
     try {
       await runAgent({
@@ -180,7 +182,7 @@ llm:
         flairUrl: "http://127.0.0.1:19926",
       });
     } finally {
-      console.log = originalLog;
+      patchShared(console, "log", originalLog);
     }
 
     const output = logs.join("\n");

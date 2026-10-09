@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   loadConfig,
@@ -260,14 +262,14 @@ describe("printStatus", () => {
     });
     const logs: string[] = [];
     const originalLog = console.log;
-    console.log = (value?: unknown) => {
+    patchShared(console, "log", (value?: unknown) => {
       logs.push(String(value));
-    };
+    });
 
     try {
       printStatus({ json: true }, state);
     } finally {
-      console.log = originalLog;
+      patchShared(console, "log", originalLog);
     }
 
     expect(logs).toHaveLength(1);
@@ -734,7 +736,7 @@ describe("mail send failure resilience", () => {
 
     const errors: string[] = [];
     const originalError = console.error;
-    console.error = (msg: string) => { errors.push(msg); };
+    patchShared(console, "error", (msg: string) => { errors.push(msg); });
 
     const mailLog: string[] = [];
     let slowResolved = false;
@@ -774,7 +776,7 @@ describe("mail send failure resilience", () => {
       expect(slowResolved).toBe(false);
       expect(mailLog).toContain("kern");
     } finally {
-      console.error = originalError;
+      patchShared(console, "error", originalError);
       setSendTimeoutMs(5_000);
     }
   });

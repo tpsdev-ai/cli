@@ -5,12 +5,6 @@
  * for each `.test`/`.spec` file it loads (bun runs only the first plugin whose
  * onLoad matches, so both checks share one plugin).
  *
- * Every cli test file runs in ONE bun process, so a value a file writes onto a
- * well-known global (guarded-globals.ts: `fetch`, the timer family, `Date.now`,
- * `process.exit`, console methods) and does not put back is still there when
- * later files run. `mock.restore()` does not undo such an assignment (measured
- * on bun 1.3.10), so a file that patches one of these must restore it itself.
- *
  * The preload records the guarded globals' values for each file as bun loads
  * it and appends one line to the file's source. That line registers an afterAll
  * at the end of the file's top-level code, so it runs after the top-level

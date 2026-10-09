@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,8 +33,8 @@ describe("tps office health", () => {
     process.env.HOME = originalHome;
     if (originalAgentId === undefined) delete process.env.TPS_AGENT_ID;
     else process.env.TPS_AGENT_ID = originalAgentId;
-    globalThis.fetch = originalFetch;
-    console.log = originalLog;
+    patchShared(globalThis, "fetch", originalFetch);
+    patchShared(console, "log", originalLog);
     rmSync(tempHome, { recursive: true, force: true });
   });
 
@@ -52,7 +54,7 @@ describe("tps office health", () => {
       { id: "flint", name: "Flint", publicKey: "pk2", lastHeartbeat: freshIso },
     ];
 
-    globalThis.fetch = mock(async (input: string | URL, init?: RequestInit) => {
+    patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/Agent/") && method === "GET") {
@@ -66,7 +68,7 @@ describe("tps office health", () => {
         return new Response("", { status: 204 });
       }
       throw new Error(`unexpected fetch: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
 
     const { runOfficeHealthTick } = await import("../src/commands/office-health.js");
     const keyPath = join(tempHome, ".tps", "identity", "anvil.key");
@@ -133,8 +135,8 @@ describe("tps office health", () => {
 
   test("runOfficeHealth emits one json object per tick when --json is enabled", async () => {
     const logs: string[] = [];
-    console.log = mock((value?: unknown) => logs.push(String(value ?? ""))) as typeof console.log;
-    globalThis.fetch = mock(async (input: string | URL, init?: RequestInit) => {
+    patchShared(console, "log", mock((value?: unknown) => logs.push(String(value ?? ""))) as typeof console.log);
+    patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       if (url.endsWith("/Agent/") && method === "GET") {
@@ -146,7 +148,7 @@ describe("tps office health", () => {
         });
       }
       throw new Error(`unexpected fetch: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
 
     const { runOfficeHealth } = await import("../src/commands/office-health.js");
     await runOfficeHealth({ once: true, json: true, flairUrl: "http://127.0.0.1:9926", viewerId: "anvil", keyPath: join(tempHome, ".tps", "identity", "anvil.key") });

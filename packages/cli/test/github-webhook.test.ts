@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
@@ -216,12 +218,12 @@ describe("handleGithubWebhook", () => {
   });
   describe("completion records", () => {
     const release = mock(() => {});
-    let acquire: { mockRestore(): void };
+    const acquireState = { value: undefined as { mockRestore(): void } };
     beforeEach(() => {
       release.mockClear();
-      acquire = spyOn(mailLock, "tryAcquireMailLock").mockReturnValue({ release });
+      patchShared(acquireState, "value", spyOn(mailLock, "tryAcquireMailLock").mockReturnValue({ release }));
     });
-    afterEach(() => acquire.mockRestore());
+    afterEach(() => acquireState.value.mockRestore());
 
     for (const kind of ["new", "sent"] as const) {
       test(`a main-format record in ${kind}/ does not prove completion after upgrade`, async () => {

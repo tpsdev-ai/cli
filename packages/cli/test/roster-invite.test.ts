@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -50,21 +52,21 @@ describe("tps roster invite", () => {
     } else {
       process.env.TPS_MAIL_DIR = originalMailDir;
     }
-    globalThis.fetch = originalFetch;
-    console.log = originalLog;
-    console.error = originalError;
-    process.exit = originalExit;
+    patchShared(globalThis, "fetch", originalFetch);
+    patchShared(console, "log", originalLog);
+    patchShared(console, "error", originalError);
+    patchShared(process, "exit", originalExit);
     rmSync(tempHome, { recursive: true, force: true });
   });
 
   test("verifies identity, sends standard invite mail, and publishes org.invited with custom detail", async () => {
     const logs: string[] = [];
-    console.log = mock((value?: unknown) => {
+    patchShared(console, "log", mock((value?: unknown) => {
       logs.push(String(value ?? ""));
-    }) as typeof console.log;
+    }) as typeof console.log);
 
     const requests: Array<{ url: string; method: string; body?: any }> = [];
-    globalThis.fetch = mock(async (input: string | URL, init?: RequestInit) => {
+    patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       const method = init?.method ?? "GET";
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
@@ -82,7 +84,7 @@ describe("tps roster invite", () => {
       }
 
       throw new Error(`unexpected fetch: ${method} ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
 
     const { runRoster } = await import("../src/commands/roster.js");
     await runRoster({
@@ -124,8 +126,8 @@ describe("tps roster invite", () => {
 
   test("uses the standard invite text as org event detail when no custom message is provided", async () => {
     let eventBody: any;
-    console.log = mock(() => {}) as typeof console.log;
-    globalThis.fetch = mock(async (input: string | URL, init?: RequestInit) => {
+    patchShared(console, "log", mock(() => {}) as typeof console.log);
+    patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/Identity/flint") && (init?.method ?? "GET") === "GET") {
         return new Response(JSON.stringify({ id: "flint" }), {
@@ -138,7 +140,7 @@ describe("tps roster invite", () => {
         return new Response("", { status: 204 });
       }
       throw new Error(`unexpected fetch: ${init?.method ?? "GET"} ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
     const { runRoster } = await import("../src/commands/roster.js");
     await runRoster({
       action: "invite",
@@ -154,21 +156,21 @@ describe("tps roster invite", () => {
 
   test("exits when the target identity is missing in Flair", async () => {
     const errors: string[] = [];
-    console.log = mock(() => {}) as typeof console.log;
-    console.error = mock((value?: unknown) => {
+    patchShared(console, "log", mock(() => {}) as typeof console.log);
+    patchShared(console, "error", mock((value?: unknown) => {
       errors.push(String(value ?? ""));
-    }) as typeof console.error;
-    process.exit = mock(((code?: number) => {
+    }) as typeof console.error);
+    patchShared(process, "exit", mock(((code?: number) => {
       throw new Error(`exit:${code ?? 0}`);
-    }) as typeof process.exit);
+    }) as typeof process.exit));
 
-    globalThis.fetch = mock(async (input: string | URL) => {
+    patchShared(globalThis, "fetch", mock(async (input: string | URL) => {
       const url = String(input);
       if (url.endsWith("/Identity/ghost")) {
         return new Response("missing", { status: 404 });
       }
       throw new Error(`unexpected fetch: ${url}`);
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
     const { runRoster } = await import("../src/commands/roster.js");
     await expect(
       runRoster({

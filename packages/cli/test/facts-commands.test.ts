@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * facts-commands.test.ts — Facts Substrate S1: CLI integration tests
  * (ops-568p child)
@@ -72,13 +74,13 @@ function fixtureFile(name: string, content: string): string {
 async function captureStdout(fn: () => Promise<void>): Promise<string> {
   const orig = console.log;
   let output = "";
-  console.log = (msg: string) => { output += msg + "\n"; };
+  patchShared(console, "log", (msg: string) => { output += msg + "\n"; });
   try {
     await fn();
   } catch (e: any) {
     if (!e.message?.startsWith("EXIT_")) throw e;
   } finally {
-    console.log = orig;
+    patchShared(console, "log", orig);
   }
   return output.trim();
 }
@@ -86,13 +88,13 @@ async function captureStdout(fn: () => Promise<void>): Promise<string> {
 async function captureStderr(fn: () => Promise<void>): Promise<string> {
   const orig = console.error;
   let output = "";
-  console.error = (msg: string) => { output += msg + "\n"; };
+  patchShared(console, "error", (msg: string) => { output += msg + "\n"; });
   try {
     await fn();
   } catch (e: any) {
     if (!e.message?.startsWith("EXIT_")) throw e;
   } finally {
-    console.error = orig;
+    patchShared(console, "error", orig);
   }
   return output.trim();
 }
@@ -105,13 +107,13 @@ let origExit: typeof process.exit;
 
 function stubExit() {
   origExit = process.exit;
-  process.exit = (code?: number) => {
+  patchShared(process, "exit", (code?: number) => {
     throw new Error(`EXIT_${code ?? 0}`);
-  };
+  });
 }
 
 function restoreExit() {
-  process.exit = origExit;
+  patchShared(process, "exit", origExit);
 }
 
 beforeAll(() => {

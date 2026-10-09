@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
-import { patchShared } from "./helpers/patch-shared.js";
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 
 patchShared(hashes, "sha512", (data) => new Uint8Array(createHash("sha512").update(data).digest()));
 const seeds: Record<string, Buffer> = {
@@ -34,7 +35,7 @@ beforeEach(() => {
   process.env.TPS_TEST_KEYS_DIR = keys;
   process.env.FLAIR_KEY_PATH = join(keys, "kern.key");
   originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: string | URL) => {
+  patchShared(globalThis, "fetch", (async (input: string | URL) => {
     const path = new URL(String(input)).pathname;
     const match = /^\/Agent\/(.+)$/.exec(path);
     if (match) {
@@ -51,10 +52,10 @@ beforeEach(() => {
     }
     if (path === "/Health") return new Response("ok");
     return new Response("not found", { status: 404 });
-  }) as typeof globalThis.fetch;
+  }) as typeof globalThis.fetch);
 });
 afterEach(() => {
-  globalThis.fetch = originalFetch;
+  patchShared(globalThis, "fetch", originalFetch);
   for (const [name, value] of Object.entries(saved)) {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
   }

@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -20,7 +22,7 @@ const seed = Buffer.alloc(32, 0x11);
 let home: string;
 let keys: string;
 let savedEnv: Record<string, string | undefined>;
-let fetchSpy: ReturnType<typeof spyOn>;
+const fetchSpyState = { value: undefined as unknown as ReturnType<typeof spyOn> };
 let warnings: string;
 let output: Writable;
 let logger: SnoopLogg;
@@ -44,7 +46,7 @@ beforeEach(() => {
   writeFileSync(join(keys, "flint.key"), seed);
   writeFileSync(join(keys, "local-agent.key"), seed);
   const publicKey = Buffer.from(ed.getPublicKey(seed)).toString("base64");
-  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+  patchShared(fetchSpyState, "value", spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = new URL(String(input));
     if (url.origin !== "http://flair.test") throw new Error(`unexpected request: ${url.origin}`);
     if (url.pathname === "/Health") return new Response("ok");
@@ -52,14 +54,14 @@ beforeEach(() => {
     return name && ["flint", "local-agent", "resident"].includes(name)
       ? Response.json({ id: name, publicKey })
       : new Response("not found", { status: 404 });
-  });
+  }));
   warnings = "";
   output = new Writable({ write(chunk, _encoding, done) { warnings += chunk.toString(); done(); } });
   logger = new SnoopLogg().enable("tps:mail").snoop().pipe(output, { colors: false });
 });
 
 afterEach(() => {
-  fetchSpy.mockRestore();
+  fetchSpyState.value.mockRestore();
   logger.unsnoop().unpipe(output);
   for (const [name, value] of Object.entries(savedEnv)) {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;
@@ -220,8 +222,8 @@ for (const status of [401, 403, 500]) {
     subscribe("alerts", "kern", true);
     updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
     const before = cursorBytes();
-    const healthy = fetchSpy.getMockImplementation()!;
-    fetchSpy.mockImplementation(async (input, init) => {
+    const healthy = fetchSpyState.value.getMockImplementation()!;
+    fetchSpyState.value.mockImplementation(async (input, init) => {
       if (new URL(String(input)).pathname === "/Health") return new Response("ok");
       expect(new Headers(init?.headers).get("Authorization")).toMatch(/^TPS-Ed25519 kern:/);
       return new Response("lookup refused", { status });
@@ -232,7 +234,7 @@ for (const status of [401, 403, 500]) {
     expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
     expect(warnings).toContain("topic-catch-up-verification-unavailable");
     expect(warnings).not.toContain("skipping");
-    fetchSpy.mockImplementation(healthy);
+    fetchSpyState.value.mockImplementation(healthy);
     expect(await catchUpTopics("kern")).toBe(2);
   });
 }
@@ -242,7 +244,7 @@ test("catch-up skips a verifiably absent principal with its named warning", asyn
   const entry = publishToTopic("alerts", "flint", "original");
   subscribe("alerts", "kern", true);
   updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
-  fetchSpy.mockImplementation(async (input) => new URL(String(input)).pathname === "/Health"
+  fetchSpyState.value.mockImplementation(async (input) => new URL(String(input)).pathname === "/Health"
     ? new Response("ok") : new Response("not found", { status: 404 }));
   expect(await catchUpTopics("kern")).toBe(0);
   expect(JSON.parse(cursorBytes()).alerts).toBe(`@${entry.id}`);
@@ -259,7 +261,7 @@ test("catch-up authenticates with the runtime's configured endpoint and key", as
   const flairKeyPath = join(keys, "runtime.key");
   writeFileSync(flairKeyPath, runtimeSeed);
   const requests: string[] = [];
-  fetchSpy.mockImplementation(async (input, init) => {
+  fetchSpyState.value.mockImplementation(async (input, init) => {
     const url = new URL(String(input));
     requests.push(url.origin);
     const auth = new Headers(init?.headers).get("Authorization")!;
@@ -283,7 +285,7 @@ for (const record of [null, {}, { publicKey: "bad-key" }]) {
     subscribe("alerts", "kern", true);
     updateCursor("kern", "alerts", "1970-01-01T00:00:00Z");
     const before = cursorBytes();
-    fetchSpy.mockImplementation(async () => Response.json(record));
+    fetchSpyState.value.mockImplementation(async () => Response.json(record));
     expect(await catchUpTopics("kern")).toBe(0);
     expect(cursorBytes()).toBe(before);
     expect(warnings).toContain("topic-catch-up-verification-unavailable");
@@ -299,12 +301,12 @@ test("indeterminate verification stops catch-up before any later topic", async (
     updateCursor("kern", topic, "1970-01-01T00:00:00Z");
   }
   const before = cursorBytes();
-  const healthy = fetchSpy.getMockImplementation()!;
-  fetchSpy.mockImplementationOnce(async () => new Response("unauthorized", { status: 401 }));
+  const healthy = fetchSpyState.value.getMockImplementation()!;
+  fetchSpyState.value.mockImplementationOnce(async () => new Response("unauthorized", { status: 401 }));
   expect(await catchUpTopics("kern", ["alerts", "later"])).toBe(0);
   expect(cursorBytes()).toBe(before);
   expect(readdirSync(getInbox("kern").fresh)).toEqual([]);
-  fetchSpy.mockImplementation(healthy);
+  fetchSpyState.value.mockImplementation(healthy);
   expect(await catchUpTopics("kern", ["alerts", "later"])).toBe(2);
 });
 
@@ -449,11 +451,11 @@ test("catch-up keeps its cursor on a verification outage and retries", async () 
   createTopic("alerts");
   publishToTopic("alerts", "flint", "original");
   subscribe("alerts", "kern", true);
-  const implementation = fetchSpy.getMockImplementation()!;
-  fetchSpy.mockImplementation(async () => { throw new Error("offline"); });
+  const implementation = fetchSpyState.value.getMockImplementation()!;
+  fetchSpyState.value.mockImplementation(async () => { throw new Error("offline"); });
   expect(await catchUpTopics("kern")).toBe(0);
   expect(warnings).toContain("topic-catch-up-verification-unavailable");
-  fetchSpy.mockImplementation(implementation);
+  fetchSpyState.value.mockImplementation(implementation);
   expect(await catchUpTopics("kern")).toBe(1);
   expect(await promotedBodies()).toEqual(["original"]);
 });

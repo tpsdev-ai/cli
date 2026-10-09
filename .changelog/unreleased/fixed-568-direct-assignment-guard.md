@@ -1,8 +1,10 @@
-- **cli test files: the guard also checks that a direct assignment to a shared object is restored.** A cli
-  test file that assigns to a global other than a `globalThis` name the runtime preload
-  checks, or to a property of an imported module object, fails the guard unless it uses
-  the `patchShared` helper, which saves the original and restores it in a top-level
-  `afterAll`. `mock.restore()` does not undo such an assignment (measured on bun 1.3.10).
-  The preload now also snapshots the well-known globals per file — `globalThis.fetch`,
-  the timer family, `Date.now`, `process.exit` and the `console.log`/`console.error`/`console.warn`
-  methods — and fails a file that left one changed, naming it.
+- **cli test mock assignments require `patchShared`; inline restoration is refused.** The static
+  scan rejects assignments of `mock(...)`, `spyOn(...)` results, `mock.module(...)`,
+  and file-local aliases of those results to identifiers or members, including
+  parentheses, casts, nested and computed members. Unclassified mock targets fail
+  with `unclassified-assignment-target`. Members rooted at `globalThis`, `global`,
+  `console`, `Date`, `process` (except plain `process.env` writes), or imports also
+  require the helper. Runtime snapshots check `globalThis.fetch`,
+  `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, `setImmediate`,
+  `clearImmediate`, `queueMicrotask`, `Date.now`, `process.exit`, `console.log`,
+  `console.error`, and `console.warn` for changes left after a file.

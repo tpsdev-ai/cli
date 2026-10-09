@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * cli#524: `office connect` announces a relayed message after the local
  * acceptance path (#532) has published its inbox record.
@@ -236,7 +238,7 @@ describe("office connect announcement follows local acceptance", () => {
   let savedEnv: Record<string, string | undefined> = {};
   let stop: (() => Promise<void>) | undefined;
   /** The spy on `WsNoiseTransport.prototype.connect`; restored after every test. */
-  let connectSpy: { mockRestore(): void } | undefined;
+  const connectSpyState = { value: undefined as { mockRestore(): void } | undefined };
   let handlers = new Set<(msg: TpsMessage) => void>();
   /**
    * Set when the keep-alive loop removes its message handler, which it does
@@ -271,7 +273,7 @@ describe("office connect announcement follows local acceptance", () => {
       isAlive() { return alive; },
       peerFingerprint() { return "remote"; },
     };
-    connectSpy = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    patchShared(connectSpyState, "value", spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel));
     stop = await connectAndKeepAlive("remote", {
       onAccepted: () => {
         announced.push(jsonFiles(getInbox("local").fresh).length);
@@ -306,8 +308,8 @@ describe("office connect announcement follows local acceptance", () => {
       handlers = new Set();
       loopDetached = false;
       try {
-        const spy = connectSpy;
-        connectSpy = undefined;
+        const spy = connectSpyState.value;
+        patchShared(connectSpyState, "value", undefined);
         spy?.mockRestore();
       } finally {
         try {

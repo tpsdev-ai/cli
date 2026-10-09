@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * cli#509 — tps memory governance:
  *   - archive / unarchive fail closed on a failed or incomplete read, then
@@ -31,7 +33,7 @@ let _savedFetch: typeof globalThis.fetch;
 const _savedAgentId = process.env.TPS_AGENT_ID;
 beforeEach(() => { _savedFetch = globalThis.fetch; process.env.TPS_AGENT_ID = "operator"; });
 afterEach(() => {
-  globalThis.fetch = _savedFetch;
+  patchShared(globalThis, "fetch", _savedFetch);
   if (_savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
   else process.env.TPS_AGENT_ID = _savedAgentId;
 });
@@ -40,11 +42,11 @@ interface Call { method?: string; url: string; body?: any; auth?: string }
 
 /** Route the read through `read`; capture every write. */
 function routeFetch(calls: Call[], read: () => Response) {
-  globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+  patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
     if (opts?.method === "GET") return read();
     calls.push({ method: opts?.method, url, body: opts?.body ? JSON.parse(opts.body as string) : undefined, auth: (opts?.headers as any)?.Authorization });
     return new Response("{}", { status: 200 });
-  }) as any;
+  }) as any);
 }
 
 describe("cli#509: archive / unarchive fail closed", () => {
@@ -101,10 +103,10 @@ describe("cli#509: archive / unarchive fail closed", () => {
 describe("cli#509: search signs as the operator", () => {
   test("signs as TPS_AGENT_ID and carries the target as the agentId parameter", async () => {
     let seen: Call | undefined;
-    globalThis.fetch = (async (url: string, opts?: RequestInit) => {
+    patchShared(globalThis, "fetch", (async (url: string, opts?: RequestInit) => {
       seen = { method: opts?.method, url, body: JSON.parse(opts?.body as string), auth: (opts?.headers as any)?.Authorization };
       return new Response(JSON.stringify({ results: [] }), { status: 200 });
-    }) as any;
+    }) as any);
     const { runMemory } = await import("../src/commands/memory.js");
 
     await runMemory({ action: "search", agentId: "target-a", query: "hello", flairUrl: FLAIR_URL, keyPath: TEST_KEY_PATH });

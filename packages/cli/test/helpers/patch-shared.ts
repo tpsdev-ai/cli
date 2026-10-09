@@ -1,33 +1,42 @@
-/**
- * patch-shared.ts — cli#568: the one canonical way a cli test file may write a
- * value onto a shared global or onto a property of an imported module object.
- *
- * `mock.restore()` does not undo a direct assignment such as
- * `globalThis.fetch = mock(...)` or `obj.method = mock(...)` (measured on bun
- * 1.3.10): the assignment replaces the binding and registers nothing with the
- * mock registry, so `mock.restore()` has nothing to put back. A file that
- * patches a shared object must therefore save the original and restore it
- * itself. This helper does both: it saves the original, assigns the value, and
- * registers an unconditional top-level `afterAll` that restores the original
- * when the file's tests are done, so the next test file in the process sees it.
- *
- * Call it at the top level of a test file. The well-known globals in
- * guarded-globals.ts are checked at run time by helpers/global-leak-preload.ts;
- * this helper is what the static scan (helpers/mock-restore-guard-scan.ts)
- * requires for every other direct assignment to a global or to an imported
- * module object's property.
- */
+/** Canonical save/restore helper for cli test patches. */
 import { afterAll } from "bun:test";
 
-/**
- * Save `target[property]`, set it to `value`, and restore the saved original in
- * an unconditional top-level `afterAll`. Returns nothing: the restore is
- * registered, so a caller cannot forget it.
- */
-export function patchShared<T extends object, K extends keyof T>(target: T, property: K, value: T[K]): void {
+const patches = new WeakMap<object, Map<PropertyKey, Array<() => void>>>();
+
+function savePatch<T extends object, K extends keyof T>(target: T, property: K, value: T[K]): () => void {
   const original = target[property];
+  let properties = patches.get(target);
+  if (!properties) { properties = new Map(); patches.set(target, properties); }
+  let stack = properties.get(property);
+  if (!stack) { stack = []; properties.set(property, stack); }
+  const pending = stack;
+  const undo = () => { target[property] = original; };
   target[property] = value;
+  pending.push(undo);
+  const restore = () => {
+    const index = pending.indexOf(undo);
+    if (index < 0) return;
+    while (pending.length > index) pending.pop()!();
+    if (pending.length === 0) properties.delete(property);
+  };
+  return restore;
+}
+
+export function patchShared<T extends object, K extends keyof T>(target: T, property: K, value: T[K]): () => void {
+  const restore = savePatch(target, property, value);
+  afterAll(restore);
+  return restore;
+}
+
+/** Call at file scope before patches made in hooks or tests. */
+export function createPatchShared(): typeof patchShared {
+  const restores: Array<() => void> = [];
   afterAll(() => {
-    target[property] = original;
+    while (restores.length > 0) restores.pop()!();
   });
+  return (target, property, value) => {
+    const restore = savePatch(target, property, value);
+    restores.push(restore);
+    return restore;
+  };
 }

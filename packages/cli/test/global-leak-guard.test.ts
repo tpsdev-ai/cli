@@ -48,6 +48,12 @@ describe("guarded-global preload (cli#568)", () => {
     expect(run.output).toContain("left a guarded global changed from when it loaded: globalThis.fetch");
   });
 
+  test("fails immediate-leaked and names globalThis.setImmediate (red fixture)", () => {
+    const run = runFixture("immediate-leaked");
+    expect(run.status, run.output).not.toBe(0);
+    expect(run.output).toContain("left a guarded global changed from when it loaded: globalThis.setImmediate");
+  });
+
   test("passes global-restored, which puts fetch back (green fixture)", () => {
     const run = runFixture("global-restored");
     expect(run.status, run.output).toBe(0);
@@ -55,7 +61,13 @@ describe("guarded-global preload (cli#568)", () => {
     expect(run.output).toContain("1 pass");
   });
 
-  test("passes global-patched, which patches fetch through the patchShared helper (green fixture)", () => {
+  test("passes hook-patched through case cleanup (green fixture)", () => {
+    const run = runFixture("hook-patched", [join(import.meta.dir, "helpers", "patch-shared.ts")]);
+    expect(run.status, run.output).toBe(0);
+    expect(run.output).toContain("2 pass");
+  });
+
+  test("passes global-patched, which patches fetch twice through the patchShared helper (green fixture)", () => {
     const run = runFixture("global-patched", [join(import.meta.dir, "helpers", "patch-shared.ts")]);
     expect(run.status, run.output).toBe(0);
     expect(run.output).not.toContain("left a guarded global changed");

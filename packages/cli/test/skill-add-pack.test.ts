@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 /**
  * feat-skill-add-pack — tests for the pack-loading logic and addPack flow
  *
@@ -343,7 +345,7 @@ describe("buildNpmPackArgs — shell safety", () => {
 describe("metadata propagation", () => {
   let _savedFetch: typeof globalThis.fetch;
   beforeEach(() => { _savedFetch = globalThis.fetch; });
-  afterEach(() => { globalThis.fetch = _savedFetch; });
+  afterEach(() => { patchShared(globalThis, "fetch", _savedFetch); });
 
   test("registerSkill is called with source: npm:<pkg>@<ver>", async () => {
     const dir = makeTempDir();

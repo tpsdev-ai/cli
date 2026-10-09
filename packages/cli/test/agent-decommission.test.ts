@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -17,7 +19,7 @@ describe("tps agent decommission", () => {
   });
 
   afterEach(() => {
-    globalThis.fetch = originalFetch;
+    patchShared(globalThis, "fetch", originalFetch);
     const home = homedir();
     rmSync(join(home, ".tps", "identity", `${agentId}.key`), { force: true });
     rmSync(join(home, ".tps", "identity", `${agentId}.pub`), { force: true });
@@ -70,7 +72,7 @@ describe("tps agent decommission", () => {
       }
       throw new Error(`unexpected fetch: ${url} ${init?.method ?? "GET"}`);
     });
-    globalThis.fetch = fetchMock as typeof globalThis.fetch;
+    patchShared(globalThis, "fetch", fetchMock as typeof globalThis.fetch);
 
     await runAgent({
       action: "decommission",

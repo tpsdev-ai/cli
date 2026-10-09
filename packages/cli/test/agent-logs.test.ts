@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,18 +37,18 @@ describe("tps agent logs", () => {
     process.env.HOME = originalHome;
     if (originalAgentId === undefined) delete process.env.TPS_AGENT_ID;
     else process.env.TPS_AGENT_ID = originalAgentId;
-    globalThis.fetch = originalFetch;
-    console.log = originalLog;
-    console.error = originalError;
-    process.exit = originalExit;
+    patchShared(globalThis, "fetch", originalFetch);
+    patchShared(console, "log", originalLog);
+    patchShared(console, "error", originalError);
+    patchShared(process, "exit", originalExit);
     rmSync(tempHome, { recursive: true, force: true });
   });
 
   test("interleaves flair events and mail sorted by timestamp", async () => {
     const out: string[] = [];
     const requests: Array<{ url: string; auth?: string }> = [];
-    console.log = mock((value?: unknown) => out.push(String(value ?? ""))) as typeof console.log;
-    globalThis.fetch = mock(async (input: string | URL, init?: RequestInit) => {
+    patchShared(console, "log", mock((value?: unknown) => out.push(String(value ?? ""))) as typeof console.log);
+    patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const headers = (init?.headers ?? {}) as Record<string, string>;
       requests.push({ url: String(input), auth: String(headers.Authorization ?? "") });
       return new Response(JSON.stringify([
@@ -54,7 +56,7 @@ describe("tps agent logs", () => {
         { id: "e2", authorId: "host", kind: "task.assigned", summary: "Assigned follow-up", createdAt: "2026-03-07T10:04:00.000Z", targetIds: ["ember"] },
         { id: "e3", authorId: "host", kind: "org.note", summary: "Ignore me", createdAt: "2026-03-07T10:06:00.000Z", targetIds: ["someone-else"] },
       ]), { status: 200, headers: { "Content-Type": "application/json" } });
-    }) as typeof globalThis.fetch;
+    }) as typeof globalThis.fetch);
 
     const mailDir = join(tempHome, ".tps", "mail");
     mkdirSync(join(mailDir, "ember", "new"), { recursive: true });
@@ -83,11 +85,11 @@ describe("tps agent logs", () => {
   test("emits json rows and fails without a viewer identity", async () => {
     const out: string[] = [];
     const errors: string[] = [];
-    console.log = mock((value?: unknown) => out.push(String(value ?? ""))) as typeof console.log;
-    console.error = mock((value?: unknown) => errors.push(String(value ?? ""))) as typeof console.error;
-    globalThis.fetch = mock(async () => new Response(JSON.stringify([
+    patchShared(console, "log", mock((value?: unknown) => out.push(String(value ?? ""))) as typeof console.log);
+    patchShared(console, "error", mock((value?: unknown) => errors.push(String(value ?? ""))) as typeof console.error);
+    patchShared(globalThis, "fetch", mock(async () => new Response(JSON.stringify([
       { id: "e1", authorId: "ember", kind: "task.completed", summary: "Completed ops-72", createdAt: "2026-03-07T10:02:00.000Z", targetIds: [] },
-    ]), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof globalThis.fetch;
+    ]), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof globalThis.fetch);
 
     const mailDir = join(tempHome, ".tps", "mail");
     mkdirSync(join(mailDir, "ember", "new"), { recursive: true });
@@ -102,7 +104,7 @@ describe("tps agent logs", () => {
       { source: "flair", kind: "task.completed", summary: "Completed ops-72", timestamp: "2026-03-07T10:02:00.000Z" },
     ]);
 
-    process.exit = mock(((code?: number) => { throw new Error("exit:" + (code ?? 0)); }) as typeof process.exit);
+    patchShared(process, "exit", mock(((code?: number) => { throw new Error("exit:" + (code ?? 0)); }) as typeof process.exit));
     delete process.env.TPS_AGENT_ID;
     await expect(runAgentLogs({ agentId: "ember" })).rejects.toThrow("exit:1");
     expect(errors.join("\n")).toContain("Invalid viewer id");

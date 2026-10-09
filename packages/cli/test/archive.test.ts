@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
@@ -70,14 +72,14 @@ describe("communication archive (SQLite)", () => {
   test("under bun the 'archive unavailable' note is NOT printed", () => {
     const original = console.error;
     const seen: unknown[][] = [];
-    console.error = ((...args: unknown[]) => {
+    patchShared(console, "error", ((...args: unknown[]) => {
       seen.push(args);
-    }) as typeof console.error;
+    }) as typeof console.error);
     try {
       logEvent({ event: "sent", from: "a", to: "b", messageId: "note-check" }, "body");
       queryArchive();
     } finally {
-      console.error = original;
+      patchShared(console, "error", original);
     }
     const notes = seen.filter((args) => String(args[0]).includes("archive unavailable"));
     expect(notes).toHaveLength(0);
