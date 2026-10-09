@@ -175,8 +175,9 @@ export async function processOutboxOnce(agentId: string): Promise<{ processed: n
   for (const f of files) {
     const src = join(outNew, f);
     const failedPath = join(outFailed, f);
+    let raw: string | undefined;
     try {
-      const raw = readFileSync(src, "utf-8");
+      raw = readFileSync(src, "utf-8");
       const msg = JSON.parse(raw) as RelayMessage;
 
       // Loop detection — check before delivery
@@ -235,18 +236,14 @@ export async function processOutboxOnce(agentId: string): Promise<{ processed: n
       processed += 1;
     } catch (e: any) {
       try {
-        const raw = existsSync(src) ? readFileSync(src, "utf-8") : "{}";
+        if (raw === undefined) throw e;
         const parsed = JSON.parse(raw || "{}") as Record<string, unknown>;
         parsed.error = e?.message || "Relay failed";
         atomicWriteJson(failedPath, parsed);
-        if (existsSync(src)) {
-          try { renameSync(src, join(outFailed, `${Date.now()}-${f}`)); } catch {}
-        }
+        try { renameSync(src, join(outFailed, `${Date.now()}-${f}`)); } catch {}
       } catch {
         // fallback: best effort move raw file
-        if (existsSync(src)) {
-          try { renameSync(src, failedPath); } catch {}
-        }
+        try { renameSync(src, failedPath); } catch {}
       }
       failed += 1;
     }

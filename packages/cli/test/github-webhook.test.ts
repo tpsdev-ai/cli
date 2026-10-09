@@ -247,7 +247,8 @@ describe("handleGithubWebhook", () => {
         expect(calls).toBe(1);
       });
 
-      for (const operation of ["statSync", "readFileSync"] as const) {
+      // recordExists reads a completion record once (no separate stat), so the read is the call to fail.
+      for (const operation of ["readFileSync"] as const) {
         test(`an unreadable completed ${kind}/ record (${operation}) returns 503 without another GitHub call`, async () => {
           const payload = JSON.stringify({ action: "dismissed", repository: { full_name: "example/repo" },
             pull_request: { number: 42 }, review: { user: { login: "reviewer" } } });

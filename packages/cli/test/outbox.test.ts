@@ -1,8 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
+import * as mailLock from "../src/utils/mail-lock.js";
 
 afterEach(() => {
   mock.restore();
@@ -157,6 +159,31 @@ describe("outbox", () => {
     expect(count + drainOutbox().length).toBe(1);
     queueOutboxMessage("host", "body", "github-webhook", id);
     expect(drainOutbox()).toEqual([]);
+  });
+
+  test("queueing tolerates ENOENT for new/ when sent/ has the record", () => {
+    const id = "a".repeat(64);
+    const lock = spyOn(mailLock, "tryAcquireMailLock").mockReturnValue({ release() {} });
+    try {
+      expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("queued");
+      const newDir = join(root, ".tps", "outbox", "new");
+      const sentDir = join(root, ".tps", "outbox", "sent");
+      const name = `github-${id}.json`;
+      mkdirSync(sentDir, { recursive: true });
+      const original = fs.readFileSync;
+      const read = spyOn(fs, "readFileSync").mockImplementation(((...args: any[]) => {
+        if (String(args[0]) === join(newDir, name)) fs.renameSync(join(newDir, name), join(sentDir, name));
+        return (original as any)(...args);
+      }) as any);
+      try {
+        expect(queueOutboxMessage("host", "hello", "austin", id)).toBe("duplicate");
+        expect(existsSync(join(sentDir, name))).toBe(true);
+      } finally {
+        read.mockRestore();
+      }
+    } finally {
+      lock.mockRestore();
+    }
   });
 
   test("releaseOutboxRecord removes only that delivery's record, from new/ or sent/", () => {

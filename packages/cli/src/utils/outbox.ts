@@ -1,4 +1,4 @@
-import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -60,13 +60,14 @@ function outboxLockPath(deliveryId: string): string {
 }
 
 function recordExists(path: string): boolean {
+  // One read, not stat-then-read: a concurrent drain can move the record between two calls, and
+  // the second call's ENOENT would surface as an error instead of "not there".
   try {
-    statSync(path);
+    readFileSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   }
-  readFileSync(path);
   return true;
 }
 
