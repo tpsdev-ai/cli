@@ -394,6 +394,9 @@ export class MailSyncError extends Error {
   }
 }
 
+export class MailSendInputError extends Error {}
+export class MailInboxFullError extends Error {}
+
 export function syncMailFile(path: string): void {
   try {
     const fd = openSync(path, "r");
@@ -568,10 +571,14 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
 }
 
 export function sendMessage(to: string, body: string, from?: string, relayDelivery?: { branchId: string; id: string }, senderTimestamp?: string, wireRecipient = to, inboxRoot?: string): MailMessage & { filePath: string } {
-  assertValidAgentId(to);
   const sender = from || "unknown";
-  assertValidAgentId(sender);
-  assertValidBody(body);
+  try {
+    assertValidAgentId(to);
+    assertValidAgentId(sender);
+    assertValidBody(body);
+  } catch (error) {
+    throw new MailSendInputError(error instanceof Error ? error.message : String(error));
+  }
 
   // Guard: when running in test mode or when the caller has explicitly
   // opted in, refuse to write to the default ~/.tps/mail/ directory
@@ -588,7 +595,7 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
   const inbox = inboxRoot === undefined ? getInbox(to) : inboxAtRoot(inboxRoot);
   const quotaCount = readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length;
   if (quotaCount >= MAX_INBOX_MESSAGES) {
-    throw new Error(inboxFullMessage(to, quotaCount));
+    throw new MailInboxFullError(inboxFullMessage(to, quotaCount));
   }
 
   const timestamp = new Date().toISOString();

@@ -4,11 +4,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getInbox } from "../src/utils/mail.js";
-import { RelayAcceptLockTimeoutError, deliverRelayedToLocal } from "../src/utils/relay.js";
+import { ackMessageAtPath, getInbox } from "../src/utils/mail.js";
+import { RelayAcceptLockTimeoutError, deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 
 const BRANCH = "remote";
 const RECIPIENT = "local";
@@ -163,6 +163,27 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 describe("relay acceptance (cli#561)", () => {
+  test("a second recipient waits for the same delivery id before any publication", async () => {
+    const id = randomUUID();
+    const pause = join(root, "cross-recipient-pause");
+    const started = join(root, "cross-recipient-started");
+    const first = deliverChild("same-", [id], { RELAY_CHILD_PAUSE: pause });
+    let second: Promise<Counts> | undefined;
+    try {
+      await waitForFile(pause + ".ready");
+      second = deliverChild("same-", [id], { RELAY_CHILD_TO: "other", RELAY_CHILD_STARTED: started });
+      await waitForFile(started);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(jsonFiles(getInbox("other").fresh)).toEqual([]);
+      expect(existsSync(relayAcceptanceReceiptPath(BRANCH, id))).toBe(false);
+    } finally { writeFileSync(pause + ".release", ""); }
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toEqual({ delivered: 1, duplicate: 0, refused: 0 });
+    expect(b).toEqual({ delivered: 0, duplicate: 0, refused: 1 });
+    expect(jsonFiles(getInbox(RECIPIENT).fresh)).toHaveLength(1);
+    expect(jsonFiles(getInbox("other").fresh)).toEqual([]);
+  }, 60_000);
+
   test.each(["new", "dlq"])("routing change before %s publication", async (destination) => {
     const id = randomUUID();
     const hostRoot = getInbox(RECIPIENT).root;
@@ -182,7 +203,7 @@ describe("relay acceptance (cli#561)", () => {
       await waitForFile(started);
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(jsonFiles(join(branchRoot, "new"))).toEqual([]);
-      expect(existsSync(join(mail, ".relay-accepted", "by-branch", BRANCH, id))).toBe(false);
+      expect(existsSync(relayAcceptanceReceiptPath(BRANCH, id))).toBe(false);
     } finally {
       writeFileSync(pause + ".release", "");
       results = await Promise.all([first, second]);
@@ -219,6 +240,42 @@ describe("relay acceptance (cli#561)", () => {
     const byId = recordsByDeliveryId();
     expect([...byId.keys()].sort()).toEqual([...ids].sort());
     for (const id of ids) expect(byId.get(id)).toHaveLength(1);
+  }, 60_000);
+
+  test("two recipients resending the same id around local ACK keep the original receipt", async () => {
+    const id = randomUUID();
+    const body = { id, from: FROM, to: RECIPIENT, content: `same-${id}`, timestamp: TIMESTAMP };
+    expect(deliverRelayedToLocal(BRANCH, body)).toBe(true);
+    const marker = relayAcceptanceReceiptPath(BRANCH, id);
+    const original = readFileSync(marker, "utf8");
+    const inode = statSync(marker).ino;
+    const holder = await holdLock(join(".relay-accept-locks", BRANCH, id));
+    const local = deliverChild("same-", [id]);
+    const other = deliverChild("same-", [id], { RELAY_CHILD_TO: "other" });
+    try {
+      const [file] = jsonFiles(getInbox(RECIPIENT).fresh);
+      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!));
+    } finally { await holder.release(); }
+    const [a, b] = await Promise.all([local, other]);
+    expect(a).toEqual({ delivered: 0, duplicate: 1, refused: 0 });
+    expect(b).toEqual({ delivered: 0, duplicate: 0, refused: 1 });
+    expect(readFileSync(marker, "utf8")).toBe(original);
+    expect(statSync(marker).ino).toBe(inode);
+    expect(jsonFiles(getInbox(RECIPIENT).fresh)).toEqual([]);
+    expect(jsonFiles(getInbox("other").fresh)).toEqual([]);
+  }, 60_000);
+
+  test("the delivery id lock blocks every recipient for that id", async () => {
+    const id = randomUUID();
+    const holder = await holdLock(join(".relay-accept-locks", BRANCH, id));
+    try {
+      process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
+      for (const to of [RECIPIENT, "other"]) {
+        expect(() => deliverRelayedToLocal(BRANCH, { id, from: FROM, to, content: "held", timestamp: TIMESTAMP })).toThrow(RelayAcceptLockTimeoutError);
+        expect(jsonFiles(getInbox(to).fresh)).toEqual([]);
+      }
+      expect(existsSync(relayAcceptanceReceiptPath(BRANCH, id))).toBe(false);
+    } finally { await holder.release(); }
   }, 60_000);
 
   test("a recipient lock timeout refuses by name, publishing no mail record or acceptance marker", async () => {
