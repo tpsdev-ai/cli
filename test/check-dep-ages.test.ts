@@ -9,14 +9,17 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
 import {
+  auditExcludes,
   collectResolvedDeps,
   evaluateAges,
+  isExactVersionPin,
   parseBunLock,
   parseExceptions,
+  parseMinReleaseAgeExcludes,
   parseMinReleaseAgeSeconds,
 } from "../scripts/lib/check-dep-ages-collect.mjs";
 
@@ -46,6 +49,60 @@ describe("parseMinReleaseAgeSeconds", () => {
   it("returns null when the key is absent", () => {
     expect(parseMinReleaseAgeSeconds('[test]\npreload = ["./x.ts"]\n')).toBeNull();
     expect(parseMinReleaseAgeSeconds("")).toBeNull();
+  });
+});
+
+describe("parseMinReleaseAgeExcludes", () => {
+  it("reads this repo's install-time exclude list", () => {
+    const { names, error } = parseMinReleaseAgeExcludes(readFileSync(join(REPO, "bunfig.toml"), "utf8"));
+    expect(error).toBeNull();
+    expect(names).toEqual(["handlebars"]);
+  });
+
+  it("reads an empty list, and an absent key, as no excludes", () => {
+    expect(parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = []\n').names).toEqual([]);
+    expect(parseMinReleaseAgeExcludes('[install]\nminimumReleaseAge = 604800\n').names).toEqual([]);
+  });
+
+  it("reads a multi-line array and drops comments", () => {
+    const { names, error } = parseMinReleaseAgeExcludes(
+      '[install]\nminimumReleaseAgeExcludes = [\n  "dep-a", # first\n  "dep-b",\n]\n',
+    );
+    expect(error).toBeNull();
+    expect(names).toEqual(["dep-a", "dep-b"]);
+  });
+
+  it("ignores the key in another section", () => {
+    expect(parseMinReleaseAgeExcludes('[test]\nminimumReleaseAgeExcludes = ["dep-a"]\n').names).toEqual([]);
+  });
+
+  it("refuses a value that is not an array of strings instead of reading it as empty", () => {
+    const notArray = parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = "dep-a"\n');
+    expect(notArray.names).toEqual([]);
+    expect(notArray.error).not.toBeNull();
+    const badEntry = parseMinReleaseAgeExcludes('[install]\nminimumReleaseAgeExcludes = ["dep-a", 3]\n');
+    expect(badEntry.error).toContain("unparseable");
+  });
+});
+
+describe("isExactVersionPin", () => {
+  it("accepts a bare version and refuses a range, tag or URL", () => {
+    expect(isExactVersionPin("4.7.10")).toBe(true);
+    expect(isExactVersionPin("1.0.0-rc.1")).toBe(true);
+    for (const spec of [
+      "^4.7.10",
+      "~4.7.10",
+      ">=4.7.10",
+      "4.7.x",
+      "4.x",
+      "*",
+      "latest",
+      "workspace:*",
+      "file:../dep",
+      "npm:other@1.0.0",
+    ]) {
+      expect(isExactVersionPin(spec)).toBe(false);
+    }
   });
 });
 
@@ -171,6 +228,71 @@ describe("parseExceptions", () => {
   });
 });
 
+describe("auditExcludes", () => {
+  const pkg = (json: object, path = "package.json") => ({ path, json });
+
+  it("passes when the excluded name has an unexpired entry and an exact pin", () => {
+    const { entries } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2026-12-01 | reason: urgent"),
+      NOW,
+    );
+    expect(
+      auditExcludes({
+        excludes: ["dep-a"],
+        exceptionEntries: entries,
+        exceptionErrors: [],
+        packageJsons: [pkg({ name: "fixture", dependencies: { "dep-a": "1.0.0" } })],
+      }),
+    ).toEqual([]);
+  });
+
+  it("reports an excluded name with no entry", () => {
+    expect(
+      auditExcludes({
+        excludes: ["dep-a"],
+        exceptionEntries: new Map(),
+        exceptionErrors: [],
+        packageJsons: [],
+      }),
+    ).toEqual([{ kind: "uncovered", name: "dep-a", error: null }]);
+  });
+
+  it("reports an excluded name whose entry has expired", () => {
+    const { entries, errors } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2020-01-01 | reason: stale"),
+      NOW,
+    );
+    const problems = auditExcludes({
+      excludes: ["dep-a"],
+      exceptionEntries: entries,
+      exceptionErrors: errors,
+      packageJsons: [],
+    });
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatchObject({ kind: "uncovered", name: "dep-a" });
+    expect(problems[0].error?.message).toContain("expired");
+  });
+
+  it("reports the declaring package.json when the pin is a range", () => {
+    const { entries } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2026-12-01 | reason: urgent"),
+      NOW,
+    );
+    const problems = auditExcludes({
+      excludes: ["dep-a"],
+      exceptionEntries: entries,
+      exceptionErrors: [],
+      packageJsons: [
+        pkg({ name: "a", dependencies: { "dep-a": "1.0.0" } }),
+        pkg({ name: "b", devDependencies: { "dep-a": "^1.0.0" } }, "packages/b/package.json"),
+      ],
+    });
+    expect(problems).toEqual([
+      { kind: "range", name: "dep-a", path: "packages/b/package.json", spec: "^1.0.0" },
+    ]);
+  });
+});
+
 describe("evaluateAges", () => {
   const day = 24 * 60 * 60 * 1000;
   const gateSeconds = 7 * 24 * 60 * 60;
@@ -263,17 +385,29 @@ const FIXTURE_LOCK = `{
 /** Write a fixture repo root. `minAge` null omits the [install] section. */
 function writeFixtureRepo(
   root: string,
-  opts: { minAge?: number | null; lock?: string; exceptions?: string } = {},
+  opts: {
+    minAge?: number | null;
+    lock?: string;
+    exceptions?: string;
+    excludes?: string[];
+    packages?: Record<string, unknown>;
+  } = {},
 ): string {
   mkdirSync(join(root, "docs"), { recursive: true });
   const minAge = opts.minAge === undefined ? 604800 : opts.minAge;
-  writeFileSync(
-    join(root, "bunfig.toml"),
-    minAge === null ? '[test]\npreload = ["./x.ts"]\n' : `[install]\nminimumReleaseAge = ${minAge}\n`,
-  );
+  const excludes = opts.excludes ?? [];
+  let bunfig = minAge === null ? '[test]\npreload = ["./x.ts"]\n' : `[install]\nminimumReleaseAge = ${minAge}\n`;
+  if (minAge !== null && excludes.length > 0) {
+    bunfig += `minimumReleaseAgeExcludes = [${excludes.map((n) => `"${n}"`).join(", ")}]\n`;
+  }
+  writeFileSync(join(root, "bunfig.toml"), bunfig);
   writeFileSync(join(root, "bun.lock"), opts.lock ?? FIXTURE_LOCK);
   if (opts.exceptions !== undefined) {
     writeFileSync(join(root, "docs", "dep-age-exceptions.md"), opts.exceptions);
+  }
+  for (const [path, json] of Object.entries(opts.packages ?? {})) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), JSON.stringify(json));
   }
   if (!existsSync(join(root, "bun.lock"))) setupFailure(`fixture lock not written under ${root}`);
   return root;
@@ -534,6 +668,80 @@ it("exits 2 for a missing publish time alongside an uncovered young version", as
   expect(exitCode).toBe(2);
   expect(output).toContain("missing@2.0.0: no publish time");
 }, 30_000);
+
+/* ──────────────────── install-time excludes vs exceptions ───────────────── */
+
+describe("CLI — every minimumReleaseAgeExcludes name needs an unexpired exception and an exact pin", () => {
+  const PINNED = { name: "fixture", dependencies: { "dep-a": "1.0.0" } };
+
+  it("passes when the exclude has a dated entry and an exact pin", async () => {
+    const root = writeFixtureRepo(join(scratch, "excl-pass"), {
+      excludes: ["dep-a"],
+      exceptions: `## Exceptions\n- dep-a@1.0.0 | expires:${FUTURE} | reason: urgent fix, backport pending\n`,
+      packages: { "package.json": PINNED },
+    });
+    const registry = fixtureRegistry({ "dep-a": { "1.0.0": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(0);
+      expect(output).toContain("allowed by a dated exception");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it.each([
+    [
+      "missing",
+      "## Exceptions\n",
+      "dep-a: no dated entry under",
+    ],
+    [
+      "expired",
+      "## Exceptions\n- dep-a@1.0.0 | expires:2020-01-01 | reason: stale\n",
+      "dep-a: its dated entry is invalid: exception expired on 2020-01-01",
+    ],
+  ])("fails, naming the remedy, when the exclusion's entry is %s", async (_label, exceptions, diagnostic) => {
+    const root = writeFixtureRepo(join(scratch, `excl-${_label}`), {
+      excludes: ["dep-a"],
+      exceptions,
+      packages: { "package.json": PINNED },
+    });
+    // The registry is dead on purpose: the check must refuse before it fetches.
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("minimumReleaseAgeExcludes is not covered");
+    expect(output).toContain(diagnostic);
+    expect(output).toContain("Remedy:");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("fails, naming the remedy, when a declaring package.json pins a range", async () => {
+    const root = writeFixtureRepo(join(scratch, "excl-range"), {
+      excludes: ["dep-a"],
+      exceptions: `## Exceptions\n- dep-a@1.0.0 | expires:${FUTURE} | reason: urgent fix, backport pending\n`,
+      packages: {
+        "package.json": { name: "fixture", dependencies: { "dep-a": "1.0.0" } },
+        "packages/b/package.json": { name: "fixture-b", dependencies: { "dep-a": "^1.0.0" } },
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("minimumReleaseAgeExcludes is not covered");
+    expect(output).toContain("packages/b/package.json: `dep-a` is declared as `^1.0.0`");
+    expect(output).toContain("Remedy:");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+});
 
 function assertInstallGates(source: string) {
   const workflow = load(source) as {

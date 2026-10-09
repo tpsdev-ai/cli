@@ -2,28 +2,35 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge.
+ * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge,
+ * and that every minimumReleaseAgeExcludes name has an unexpired entry in
+ * docs/dep-age-exceptions.md and is pinned exactly wherever a package.json
+ * declares it.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
- *       exception covers it)
+ *       exception covers it), and every install-time exclude is covered
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files,
- *       missing or invalid threshold, invalid or unused exceptions, no external
+ *       missing or invalid threshold, invalid or unused exceptions, an excluded
+ *       name without an unexpired exception or without an exact pin, no external
  *       resolutions, refused CI overrides, unexpected arguments, or registry fetch failures
  *
  */
 
+import { readdirSync } from "node:fs";
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  auditExcludes,
   collectResolvedDeps,
   evaluateAges,
   parseBunLock,
   parseExceptions,
+  parseMinReleaseAgeExcludes,
   parseMinReleaseAgeSeconds,
 } from "./lib/check-dep-ages-collect.mjs";
 
@@ -74,8 +81,55 @@ function readOrExit(path, what) {
   }
 }
 
+// Bound the walk so a malformed tree cannot scan without limit. The repository
+// has a handful of package.json files; a symlinked directory is skipped (it is
+// never a directory entry) so a link cycle cannot keep the walk going.
+const MAX_PACKAGE_JSON = 2000;
+
+/**
+ * Every package.json under `root` (skipping node_modules and .git), read and
+ * parsed. A file that cannot be read or parsed refuses with exit 2: a manifest
+ * this check cannot inspect must not read as "declares nothing".
+ */
+function collectPackageJsons(root) {
+  const out = [];
+  const pending = [""];
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    let entries;
+    try {
+      entries = readdirSync(join(root, dir), { withFileTypes: true });
+    } catch (err) {
+      console.error(`check-dep-ages: cannot list ${join(root, dir)}: ${err?.code ?? err?.message ?? err}`);
+      process.exit(2);
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        pending.push(dir ? `${dir}${sep}${entry.name}` : entry.name);
+      } else if (entry.isFile() && entry.name === "package.json") {
+        const path = dir ? `${dir}${sep}${entry.name}` : entry.name;
+        let json;
+        try {
+          json = JSON.parse(readFileSync(join(root, path), "utf8"));
+        } catch (err) {
+          console.error(`check-dep-ages: cannot parse ${path}: ${err?.message ?? err}`);
+          process.exit(2);
+        }
+        out.push({ path, json });
+        if (out.length > MAX_PACKAGE_JSON) {
+          console.error(`check-dep-ages: more than ${MAX_PACKAGE_JSON} package.json files under the repository root — refusing.`);
+          process.exit(2);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // ── Gate value, from the same bunfig.toml the install-time gate uses ────────
-const gateSeconds = parseMinReleaseAgeSeconds(readOrExit(join(ROOT, "bunfig.toml"), "bunfig.toml"));
+const bunfigText = readOrExit(join(ROOT, "bunfig.toml"), "bunfig.toml");
+const gateSeconds = parseMinReleaseAgeSeconds(bunfigText);
 if (gateSeconds === null || !Number.isFinite(gateSeconds) || gateSeconds < 0) {
   console.error(
     "check-dep-ages: bunfig.toml has no valid [install] minimumReleaseAge — refusing, because the gate has no threshold to enforce.",
@@ -84,10 +138,59 @@ if (gateSeconds === null || !Number.isFinite(gateSeconds) || gateSeconds < 0) {
 }
 const gateDays = gateSeconds / (24 * 60 * 60);
 
+// ── Install-time excludes, from the same array the install-time gate uses ────
+const { names: excludeNames, error: excludeParseError } = parseMinReleaseAgeExcludes(bunfigText);
+if (excludeParseError !== null) {
+  console.error(`check-dep-ages: bunfig.toml [install] minimumReleaseAgeExcludes is malformed: ${excludeParseError}`);
+  console.error("Refusing, because an unreadable exclude list must not read as an empty one.");
+  process.exit(2);
+}
+
 // ── Exceptions ─────────────────────────────────────────────────────────────
 const { entries: exceptionEntries, errors: exceptionErrors } = parseExceptions(
   readOrExit(EXCEPTIONS_PATH, "docs/dep-age-exceptions.md"),
 );
+
+// ── Every exclude must have an unexpired exception and an exact pin ──────────
+// An exclusion admits one fresh version past the install-time gate; the dated
+// entry in docs/dep-age-exceptions.md is what bounds it. Without the entry the
+// exclusion has no expiry, and with a range instead of an exact pin it would
+// keep admitting later versions after the exception lapses.
+if (excludeNames.length > 0) {
+  const packageJsons = collectPackageJsons(ROOT);
+  const problems = auditExcludes({
+    excludes: excludeNames,
+    exceptionEntries,
+    exceptionErrors,
+    packageJsons,
+  });
+  if (problems.length > 0) {
+    console.error(
+      "check-dep-ages: bunfig.toml [install] minimumReleaseAgeExcludes is not covered by docs/dep-age-exceptions.md and exact pins:",
+    );
+    console.error("");
+    for (const problem of problems) {
+      if (problem.kind === "uncovered") {
+        const why = problem.error
+          ? `its dated entry is invalid: ${problem.error.message}`
+          : "no dated entry under `## Exceptions` names it";
+        console.error(`    ${problem.name}: ${why}`);
+        console.error(
+          `        Remedy: add a valid \`- ${problem.name}@<resolved-version> | expires:YYYY-MM-DD | reason: ...\` line to docs/dep-age-exceptions.md, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      } else {
+        console.error(
+          `    ${problem.path}: \`${problem.name}\` is declared as \`${problem.spec}\` — an excluded package must be pinned exactly (a bare version such as \`1.0.0\`).`,
+        );
+        console.error(
+          `        Remedy: pin \`${problem.name}\` exactly in ${problem.path}, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      }
+    }
+    process.exit(2);
+  }
+}
+
 if (exceptionErrors.length > 0) {
   console.error("check-dep-ages: docs/dep-age-exceptions.md has invalid entries:");
   for (const e of exceptionErrors) {
