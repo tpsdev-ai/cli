@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 import { signEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { promote, redriveRetryable, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
 
@@ -12,7 +13,7 @@ afterEach(() => {
   mock.restore();
 });
 
-hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
+patchShared(hashes, "sha512", (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest()));
 
 const SENDER = "agent-a";
 const MAILBOX = "agent-b";

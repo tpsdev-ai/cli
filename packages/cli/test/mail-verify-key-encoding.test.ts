@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 import { signEnvelope, verifyEnvelope, type Envelope } from "@tpsdev-ai/agent";
 import { promote, RETRYABLE_REJECT_CLASSES } from "../src/utils/mail.js";
 import { createMailVerifyClient } from "../src/utils/mail-verify.js";
@@ -14,7 +15,7 @@ afterEach(() => {
 });
 
 // Wire sha512 for the sync signing operations (same pattern as the other mail tests).
-hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
+patchShared(hashes, "sha512", (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest()));
 
 const SENDER = "flint";
 const MAILBOX = "anvil";

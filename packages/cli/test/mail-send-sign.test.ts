@@ -20,9 +20,10 @@ import { signOutboundBody } from "../src/utils/mail-sign.js";
 
 // Wire sha512 for sync sign operations.
 import { hashes } from "@noble/ed25519";
-hashes.sha512 = (message: Uint8Array) => {
+import { patchShared } from "./helpers/patch-shared.js";
+patchShared(hashes, "sha512", (message: Uint8Array) => {
   return new Uint8Array(createHash("sha512").update(message).digest());
-};
+});
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 

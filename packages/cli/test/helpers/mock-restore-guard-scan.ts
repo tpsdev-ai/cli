@@ -1,10 +1,11 @@
 /**
- * mock-restore-guard-scan.ts — the static check behind the cli#555 guard.
+ * mock-restore-guard-scan.ts — the static check behind the cli#555 guard,
+ * extended by cli#568.
  *
  * A cli test file runs in ONE bun process with every other test file the suite
- * loads, so a spy or a module mock a file leaves in place changes what a later
- * file observes (cli#544: a prototype `connect` spy made two transport tests
- * time out only in suite order).
+ * loads, so a spy, a module mock or a value left on a global changes what a
+ * later file observes (cli#544: a prototype `connect` spy made two transport
+ * tests time out only in suite order).
  *
  * The check parses a test file's source with the TypeScript compiler and
  * reports:
@@ -12,15 +13,64 @@
  *     Measured on bun 1.3.10, `mock.restore()` does not undo a module mock
  *     (mock-restore-guard.test.ts runs that probe), so such a file needs
  *     child-process isolation.
+ *   - `missing-mock-restore-teardown`: the file names a mock API without the
+ *     teardown that clears it.
+ *   - `direct-assignment-needs-restore`: the file assigns to a global (other
+ *     than a `globalThis` name the runtime preload checks: guarded-globals.ts)
+ *     or to a property of an imported module object, outside the `patchShared`
+ *     helper — `mock.restore()` does not undo such an assignment, so it leaks
+ *     into later files.
  */
 
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript";
+import { RUNTIME_GLOBALS } from "./guarded-globals.js";
 
 export type Finding =
   | { kind: "module-mock-needs-child-process"; detail: string }
-  | { kind: "missing-mock-restore-teardown"; detail: string };
+  | { kind: "missing-mock-restore-teardown"; detail: string }
+  | { kind: "direct-assignment-needs-restore"; detail: string };
+
+/**
+ * One direct assignment that leaks: to a global (not a runtime-checked
+ * `globalThis` name) or to a property of an imported module object. `patchShared`
+ * is the sanctioned form and performs the assignment itself, so a file using it
+ * has no such assignment to report.
+ */
+function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>): Finding | undefined {
+  const lhs = assignment.left;
+  let base: string | undefined;
+  let property: string | undefined;
+  let computed = false;
+  if (ts.isPropertyAccessExpression(lhs) && !lhs.questionDotToken && ts.isIdentifier(lhs.expression)) {
+    base = lhs.expression.text;
+    property = lhs.name.text;
+  } else if (ts.isElementAccessExpression(lhs) && !lhs.questionDotToken && ts.isIdentifier(lhs.expression)) {
+    base = lhs.expression.text;
+    const argument = lhs.argumentExpression;
+    if (argument && ts.isStringLiteral(argument)) property = argument.text;
+    else computed = true;
+  } else {
+    return undefined;
+  }
+  if (moduleObjects.has(base)) {
+    const where = computed ? "" : `.${property}`;
+    return {
+      kind: "direct-assignment-needs-restore",
+      detail: `assigns to the imported module object '${base}'${where} without the patchShared helper, which mock.restore() does not undo`,
+    };
+  }
+  if (base === "globalThis" || base === "global") {
+    if (!computed && property !== undefined && base === "globalThis" && RUNTIME_GLOBALS.has(property)) return undefined;
+    const where = computed ? "[…]" : `.${property}`;
+    return {
+      kind: "direct-assignment-needs-restore",
+      detail: `assigns to the global '${base}${where}' without the patchShared helper, and it is not a globalThis name the runtime preload checks`,
+    };
+  }
+  return undefined;
+}
 
 /** The identifiers that make a file need the teardown. */
 const MOCK_API = new Set(["spyOn", "mock", "jest", "vi"]);
@@ -94,10 +144,31 @@ class BunTestBindings {
 export function analyzeSource(source: string): Finding[] {
   const file = ts.createSourceFile("guarded.test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bindings = new BunTestBindings(file);
+  const moduleObjects = new Map<string, string>();
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    const clause = statement.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    if (clause.name) moduleObjects.set(clause.name.text, statement.moduleSpecifier.text);
+    const namedBindings = clause.namedBindings;
+    if (!namedBindings) continue;
+    if (ts.isNamespaceImport(namedBindings)) {
+      moduleObjects.set(namedBindings.name.text, statement.moduleSpecifier.text);
+    } else {
+      for (const element of namedBindings.elements) {
+        if (!element.isTypeOnly) moduleObjects.set(element.name.text, statement.moduleSpecifier.text);
+      }
+    }
+  }
   let moduleMocks = 0;
   const named = new Set([...bindings.named.values()].filter((name) => MOCK_API.has(name)));
+  const directAssignments: Finding[] = [];
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) return;
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const finding = directAssignmentFinding(node, moduleObjects);
+      if (finding) directAssignments.push(finding);
+    }
     const exported = bindings.exportOf(node);
     if (exported && MOCK_API.has(exported)) named.add(exported);
     if (exported === "mock") {
@@ -137,6 +208,7 @@ export function analyzeSource(source: string): Finding[] {
   visit(file);
 
   const findings: Finding[] = [];
+  findings.push(...directAssignments);
   if (moduleMocks > 0) {
     findings.push({
       kind: "module-mock-needs-child-process",

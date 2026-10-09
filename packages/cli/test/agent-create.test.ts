@@ -137,7 +137,7 @@ describe("ops-36: tps agent create — file system side effects", () => {
     const { runAgent } = await import("../src/commands/agent.js");
 
     let exitCode: number | undefined;
-    const origExit = process.exit.bind(process);
+    const origExit = process.exit;
     (process as any).exit = (code: number) => { exitCode = code; throw new Error(`exit:${code}`); };
 
     try {

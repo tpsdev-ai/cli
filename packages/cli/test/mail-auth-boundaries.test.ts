@@ -6,8 +6,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 
-hashes.sha512 = (data) => new Uint8Array(createHash("sha512").update(data).digest());
+patchShared(hashes, "sha512", (data) => new Uint8Array(createHash("sha512").update(data).digest()));
 const seeds: Record<string, Buffer> = {
   anvil: Buffer.alloc(32, 0x22),
   host: Buffer.alloc(32, 0x33),

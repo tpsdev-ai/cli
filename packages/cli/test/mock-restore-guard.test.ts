@@ -9,11 +9,17 @@
  *
  * This guard parses each discovered cli test file (see
  * helpers/mock-restore-guard-scan.ts) and fails when a file
- *   - calls `mock.module(...)`.
+ *   - calls `mock.module(...)`, or
+ *   - assigns to a global (other than a `globalThis` name the runtime preload
+ *     checks: guarded-globals.ts) or to a property of an imported module object,
+ *     outside the `patchShared` helper — `mock.restore()` does not undo such an
+ *     assignment.
  *
  * Fixture files under fixtures/mock-restore-guard/ pin the verdicts: each red
  * fixture must be reported, each green fixture must be clean. process.env is
- * checked at run time by helpers/env-leak-preload.ts (env-leak-guard.test.ts).
+ * checked at run time by helpers/env-leak-preload.ts and the well-known globals
+ * by helpers/global-leak-preload.ts (global-leak-guard.test.ts) — both appended
+ * by helpers/leak-preload.ts.
  */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -59,10 +65,32 @@ describe("mock restore guard (cli#555)", () => {
   }
 
   for (const name of [
+    "direct-global-leaked.fixture.ts",
+    "direct-module-leaked.fixture.ts",
+  ]) {
+    test(`reports ${name} (red fixture)`, () => {
+      expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
+    });
+  }
+
+  test("a direct assignment to a globalThis name the runtime preload checks is left to that preload", () => {
+    expect(
+      analyzeSource(`import { test } from "bun:test";
+test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof globalThis.fetch; });`),
+    ).toEqual([]);
+  });
+
+  test("an assignment to a local object is not an assignment to a global or a module object", () => {
+    expect(analyzeSource(`const local = { a: 1 };\nlocal.a = 2;`)).toEqual([]);
+  });
+
+  for (const name of [
     "prototype-spy-restored.fixture.ts",
     "spy-restored-expression.fixture.ts",
     "spy-aliased-restored.fixture.ts",
     "spy-namespace-restored.fixture.ts",
+    "direct-global-restored.fixture.ts",
+    "direct-module-restored.fixture.ts",
   ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);

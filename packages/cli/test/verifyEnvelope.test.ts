@@ -16,9 +16,10 @@ import {
 
 // Wire sha512 for sync sign operations (same as production).
 import { hashes } from "@noble/ed25519";
-hashes.sha512 = (message: Uint8Array) => {
+import { patchShared } from "./helpers/patch-shared.js";
+patchShared(hashes, "sha512", (message: Uint8Array) => {
   return new Uint8Array(createHash("sha512").update(message).digest());
-};
+});
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

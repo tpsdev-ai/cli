@@ -1,6 +1,7 @@
 /**
- * env-leak-guard.test.ts — cli#555: the env leak preload
- * (helpers/env-leak-preload.ts, listed in packages/cli/bunfig.toml).
+ * env-leak-guard.test.ts — cli#555: the process.env check in the cli test leak
+ * preload (helpers/env-leak-preload.ts, run by helpers/leak-preload.ts, listed
+ * in packages/cli/bunfig.toml).
  *
  * Each fixture under fixtures/env-leak-guard/ is copied to a temp dir as a
  * *.test.ts file and run in a child bun with the preload, so the real plugin,
@@ -13,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { guardedFiles } from "./helpers/env-leak-preload.js";
 
-const PRELOAD = join(import.meta.dir, "helpers", "env-leak-preload.ts");
+const PRELOAD = join(import.meta.dir, "helpers", "leak-preload.ts");
 const FIXTURES = join(import.meta.dir, "fixtures", "env-leak-guard");
 const dirs: string[] = [];
 

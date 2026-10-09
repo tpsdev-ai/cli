@@ -14,11 +14,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { hashes } from "@noble/ed25519";
+import { patchShared } from "./helpers/patch-shared.js";
 import { BridgeCore } from "../src/bridge/core.js";
 import type { BridgeAdapter, BridgeEnvelope } from "../src/bridge/adapter.js";
 import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
-hashes.sha512 = (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest());
+patchShared(hashes, "sha512", (m: Uint8Array) => new Uint8Array(createHash("sha512").update(m).digest()));
 
 const BRIDGE = "test-bridge";
 const BRIDGE_SEED = Buffer.alloc(32, 0x21);

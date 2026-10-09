@@ -17,7 +17,7 @@ beforeEach(() => {
   tempHome = join(tmpdir(), agentId);
   originalLog = console.log;
   originalFetch = globalThis.fetch;
-  originalExit = process.exit.bind(process);
+  originalExit = process.exit;
   originalTpsHome = process.env.TPS_HOME;
   output = [];
 

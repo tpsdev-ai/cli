@@ -1,22 +1,23 @@
 /**
- * env-leak-preload.ts — cli#555: appends a process.env check to each cli test
- * file. Listed in packages/cli/bunfig.toml as a test preload.
+ * env-leak-preload.ts — cli#555: the process.env half of the cli test leak
+ * guard. helpers/leak-preload.ts is the preload bun runs (listed in
+ * packages/cli/bunfig.toml) and calls the install/onLoad/snippet functions here
+ * for each `.test`/`.spec` file it loads (cli#568: bun runs only the first
+ * plugin whose onLoad matches, so both checks share one plugin).
  *
  * Every cli test file runs in ONE bun process, so an env name a file sets and
  * does not put back is still set when later files run. Measured on bun 1.3.10:
  * a preload's own beforeAll/afterAll run once for the whole run, not per file,
  * and a runtime plugin's onLoad runs for each test file as bun loads it, after
- * the previous file has finished. So this preload registers a plugin whose
- * onLoad, for each `.test`/`.spec` file, copies process.env and appends one
- * line to the file's source. That line registers an afterAll at the end of the
- * file's top-level code, so it runs after the top-level afterAll hooks the file
- * registered before it; it fails the file when process.env differs from the
- * copy, naming the names added, removed or changed (never their values).
+ * the previous file has finished. So the preload copies process.env for each
+ * file and appends one line to its source. That line registers an afterAll at
+ * the end of the file's top-level code, so it runs after the top-level afterAll
+ * hooks the file registered before it; it fails the file when process.env
+ * differs from the copy, naming the names added, removed or changed (never
+ * their values).
  */
-import { plugin } from "bun";
 import { afterAll } from "bun:test";
 
-const TEST_FILE = /[._](?:test|spec)\.[cm]?[jt]sx?$/;
 const STATE = Symbol.for("tps.cli-test.env-leak-guard");
 
 type Env = Record<string, string | undefined>;
@@ -46,6 +47,23 @@ export function guardedFiles(): string[] {
   return [...state().atLoad.keys()];
 }
 
+/** Install the process.env guard state. helpers/leak-preload.ts calls this once. */
+export function installEnvGuard(): void {
+  if ((globalThis as Record<symbol, unknown>)[STATE]) return;
+  const guard: GuardState = { atLoad: new Map(), check };
+  (globalThis as Record<symbol, unknown>)[STATE] = guard;
+}
+
+/** Copy process.env for a test file as the preload loads it. */
+export function envGuardOnLoad(path: string): void {
+  state().atLoad.set(path, { ...process.env });
+}
+
+/** The line the preload appends to a test file's source to check it at the end. */
+export function envGuardSnippet(path: string): string {
+  return `globalThis[Symbol.for(${JSON.stringify(STATE.description)})].check(${JSON.stringify(path)});`;
+}
+
 function state(): GuardState {
   const existing = (globalThis as Record<symbol, GuardState | undefined>)[STATE];
   if (!existing) throw new Error("env-leak-preload: the guard is not installed in this process");
@@ -64,27 +82,5 @@ function check(path: string): void {
       changed.length > 0 ? `changed ${changed.join(", ")}` : "",
     ].filter(Boolean);
     throw new Error(`${path} left process.env different from when it loaded: ${parts.join("; ")}`);
-  });
-}
-
-function loaderFor(path: string): "ts" | "tsx" | "js" | "jsx" {
-  if (path.endsWith("tsx")) return "tsx";
-  if (path.endsWith("jsx")) return "jsx";
-  return /ts$/.test(path) ? "ts" : "js";
-}
-
-if (!(globalThis as Record<symbol, unknown>)[STATE]) {
-  const guard: GuardState = { atLoad: new Map(), check };
-  (globalThis as Record<symbol, unknown>)[STATE] = guard;
-  plugin({
-    name: "cli-test-env-leak-guard",
-    setup(build) {
-      build.onLoad({ filter: TEST_FILE }, async ({ path }) => {
-        guard.atLoad.set(path, { ...process.env });
-        const source = await Bun.file(path).text();
-        const call = `globalThis[Symbol.for(${JSON.stringify(STATE.description)})].check(${JSON.stringify(path)});`;
-        return { contents: `${source}\n;${call}\n`, loader: loaderFor(path) };
-      });
-    },
   });
 }
