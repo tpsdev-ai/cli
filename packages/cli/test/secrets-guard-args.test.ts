@@ -93,6 +93,8 @@ test("a guard flag before the secrets-guard subcommand is refused (cli#563)", as
     ["--check", "secrets-guard", "child"],
     ["--no-guard", "secrets-guard", "child"],
     ["--check=false", "secrets-guard", "child"],
+    ["--check", "--", "secrets-guard", "child"],
+    ["--no-guard", "--config", "--", "secrets-guard", "child"],
   ]) {
     expect(() => parseCliArgs(args)).toThrow(/^InvalidSecretsGuardMode: .* before the secrets-guard subcommand/);
   }
@@ -106,3 +108,42 @@ test("a guard flag after the secrets-guard subcommand is unchanged (cli#563)", a
   expect(parseCliArgs(["secrets-guard", "--check"]).guardMode).toEqual({ check: true, noGuard: false });
   expect(parseCliArgs(["secrets-guard", "--no-guard", "child"]).guardMode).toEqual({ check: false, noGuard: true });
 });
+
+for (const option of ["-x", "-abc"]) {
+  test(`${option} consumes a -- value through meow`, async () => {
+    const { parseCliArgs } = await import("../src/utils/cli-args.js");
+    const { cliFlagDefinitions } = await import("../src/utils/cli-flags.js");
+    const argv = [option, "--", "secrets-guard", "--check", "child"];
+    const scanned = parseCliArgs(argv);
+    const parsed = meow("", {
+      importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false,
+      argv: scanned.argv,
+    });
+    expect(parsed.input).toEqual(["secrets-guard", "child"]);
+    expect(parsed.flags[option.slice(-1)]).toBe("--");
+    expect(scanned.guardMode).toEqual({ check: true, noGuard: false });
+    expect(() => parseCliArgs([option, "--", "--check", "secrets-guard", "child"]))
+      .toThrow("InvalidSecretsGuardMode: --check before the secrets-guard subcommand; put the guard flag after the subcommand");
+  });
+}
+
+test("a -- before secrets-guard leaves following tokens positional", async () => {
+  const { parseCliArgs } = await import("../src/utils/cli-args.js");
+  const args = ["--", "secrets-guard", "--check", "child"];
+  const scanned = parseCliArgs(args);
+  expect(scanned.argv).toEqual(args);
+  expect(scanned.guardMode).toEqual({ check: false, noGuard: false });
+});
+
+for (const option of ["-x--", "-abc--", "-x=--", "-x1"]) {
+  test(`${option} leaves secrets-guard positional through meow`, async () => {
+    const { parseCliArgs } = await import("../src/utils/cli-args.js");
+    const { cliFlagDefinitions } = await import("../src/utils/cli-flags.js");
+    const argv = ["--check", option, "secrets-guard", "child"];
+    const parsed = meow("", {
+      importMeta: import.meta, flags: cliFlagDefinitions, autoHelp: false, autoVersion: false, argv,
+    });
+    expect(parsed.input).toEqual(["secrets-guard", "child"]);
+    expect(() => parseCliArgs(argv)).toThrow("InvalidSecretsGuardMode: --check before the secrets-guard subcommand");
+  });
+}

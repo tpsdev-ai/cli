@@ -138,6 +138,23 @@ function cliOptionConsumesValue(arg, next) {
     (!next.startsWith("-") || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(next) || next === "--help" || next === "-h" || next === "--version" || next === "-v");
 }
 
+/** @param {string} arg @param {string | undefined} next */
+function unknownOptionConsumesValue(arg, next) {
+  if (next === undefined || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(arg)) return false;
+  if (arg.startsWith("--")) return !next.startsWith("-") || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(next);
+  if (/^-.\..+/.test(arg)) return !next.startsWith("-");
+  const letters = arg.slice(1, -1);
+  for (let j = 0; j < letters.length; j++) {
+    const tail = arg.slice(j + 2);
+    if (tail === "-") continue;
+    if (arg[j + 2] === "=" ||
+        (/[A-Za-z]/.test(letters[j]) && /^-?\d+(\.\d*)?(e-?\d+)?$/.test(tail)) ||
+        /\W/.test(arg[j + 2])) return false;
+  }
+  return arg.length > 1 && !arg.endsWith("-") &&
+    (!/^(-|--)[^-]/.test(next) || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(next));
+}
+
 /** @type {Record<string, readonly string[]>} */
 const RAW_VALUE_FLAGS = {
   init: ["model", "flair-url"],
@@ -168,6 +185,7 @@ function parseCliArgs(argv) {
     const [cmd, action] = positionals;
     if (arg === "--") {
       parsed.push(...argv.slice(i));
+      if (positionals.length === 0) positionals.push(...argv.slice(i + 1));
       break;
     }
     if ((cmd === "secrets-guard" && !arg.startsWith("-")) || (cmd === "office" && action === "exec" && positionals.length === 3)) {
@@ -198,6 +216,7 @@ function parseCliArgs(argv) {
     parsed.push(arg);
     if (arg === "--help" || arg === "-h") {
       requested = true;
+      if (positionals.length === 0 && unknownOptionConsumesValue(arg, argv[i + 1])) parsed.push(argv[++i]);
       continue;
     }
     if (arg === "--version" || arg === "-v") {
@@ -220,9 +239,9 @@ function parseCliArgs(argv) {
     } else if (cliOptionTypes.get(arg) === "boolean") {
       if (argv[i + 1] === "true" || argv[i + 1] === "false") parsed.push(argv[++i]);
     } else if (cmd !== "secrets-guard" && arg.startsWith("-") && !arg.startsWith("--no-") && !arg.includes("=") &&
-               argv[i + 1] && !argv[i + 1].startsWith("-")) {
+               unknownOptionConsumesValue(arg, argv[i + 1])) {
       parsed.push(argv[++i]);
-    } else if (!arg.startsWith("-")) {
+    } else if (!arg.startsWith("-") || arg === "-" || /^-([0-9]+(\.[0-9]+)?|\.[0-9]+)$/.test(arg)) {
       positionals.push(arg);
     }
   }

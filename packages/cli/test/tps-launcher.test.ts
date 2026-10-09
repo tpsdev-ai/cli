@@ -224,27 +224,33 @@ test("a resolved binary that cannot start with no JS entry prints accurate guida
 
 describe("tps launcher guard-mode refusals (cli#563)", () => {
   for (const flag of ["--check", "--no-guard"]) {
-    test(`launcher ${flag} before the secrets-guard subcommand is refused and launches nothing`, () => {
-      const harness = makeLauncherHarness(
-        "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.TPS_TEST_BINARY_MARKER, 'ran');\n",
-      );
-      const root = resolve(harness.launcher, "../..");
-      const binaryMarker = join(root, "binary-ran.marker");
-      writeFileSync(join(root, "child.mjs"), 'console.log("CHILD_RAN");\n');
+    for (const prefix of [[flag], [flag, "--"], [flag, "--config", "--"],
+      [flag, "-x", "--"], ["-x", "--", flag], [flag, "--config=--"],
+      [flag, "-x--"], [flag, "-abc--"], [flag, "-x=--"], [flag, "-x1"], [flag, "--unknown", "-7"],
+      [flag, "--help", "true"], [flag, "-h", "--"]]) {
+      test(`launcher ${prefix.join(" ")} before the secrets-guard subcommand is refused and launches nothing`, () => {
+        const harness = makeLauncherHarness(
+          "#!/usr/bin/env node\nrequire('node:fs').writeFileSync(process.env.TPS_TEST_BINARY_MARKER, 'ran');\n",
+        );
+        const root = resolve(harness.launcher, "../..");
+        const binaryMarker = join(root, "binary-ran.marker");
+        writeFileSync(join(root, "child.mjs"), 'console.log("CHILD_RAN");\n');
 
-      const result = spawnSync(NODE, [harness.launcher, flag, "secrets-guard", NODE, join(root, "child.mjs")], {
-        encoding: "utf-8",
-        env: {
-          ...process.env,
-          TPS_TEST_FALLBACK_MARKER: harness.fallbackMarker,
-          TPS_TEST_BINARY_MARKER: binaryMarker,
-        },
+        const result = spawnSync(NODE, [harness.launcher, ...prefix, "secrets-guard", NODE, join(root, "child.mjs")], {
+          encoding: "utf-8",
+          env: {
+            ...process.env,
+            TPS_TEST_FALLBACK_MARKER: harness.fallbackMarker,
+            TPS_TEST_BINARY_MARKER: binaryMarker,
+          },
+        });
+
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(`InvalidSecretsGuardMode: ${flag} before the secrets-guard subcommand`);
+        expect(result.stderr).toContain("put the guard flag after the subcommand");
+        expect(existsSync(binaryMarker)).toBe(false);
+        expect(existsSync(harness.fallbackMarker)).toBe(false);
       });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain(`InvalidSecretsGuardMode: ${flag} before the secrets-guard subcommand`);
-      expect(existsSync(binaryMarker)).toBe(false);
-      expect(existsSync(harness.fallbackMarker)).toBe(false);
-    });
+    }
   }
 });
