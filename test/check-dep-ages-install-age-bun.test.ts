@@ -8,9 +8,10 @@
  * lock gate (scripts/check-dep-ages.mjs) cannot: that the install-time gate
  * refuses a too-young version on a fresh resolve and when the lockfile must
  * change, and that adding the name to `minimumReleaseAgeExcludes` admits it.
- * Two cases exclude a transitive dependency and pin it with an exact override:
+ * Other cases exclude a transitive dependency and pin it with an exact override:
  * Bun applies the override from the root package.json and the gate accepts it;
- * Bun ignores it in a workspace package.json and the gate refuses it.
+ * Bun ignores it in a workspace package.json and the gate refuses it. A root
+ * resolution of the excluded name is refused whether or not Bun applies it.
  *
  * No external network (loopback-only local registry). Setup runs inside `try`;
  * `finally` stops the registry if started and removes the temporary tree.
@@ -280,6 +281,45 @@ it(
       expect(gate.output).toContain(
         `${workspace}: \`${CHILD}\` is in overrides, which Bun applies from the root package.json, not from this file.`,
       );
+      expect(gate.output).not.toContain("Checking");
+    } finally {
+      try {
+        registry?.stop();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  },
+  60000,
+);
+
+it.each([
+  ["keyed by its name", CHILD, PINNED, {}, PINNED],
+  ["keyed by **/ and its name", `**/${CHILD}`, PINNED, {}, PINNED],
+  ["beside an empty overrides", CHILD, PINNED, { overrides: {} }, "1.2.0"],
+  ["with a range, beside an exact direct dependency", `**/${CHILD}`, "^1.0.0", { [CHILD]: PINNED }, "1.2.0"],
+] as const)(
+  "a root resolution %s: Bun installs the expected version, and the gate refuses it",
+  async (_label, key, spec, extra, installed) => {
+    const root = mkdtempSync(join(tmpdir(), "age-resolution-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      registry = startRegistry(root, OVERRIDE_FIXTURE);
+      const { overrides, ...direct } = extra as { overrides?: object };
+      const manifest = {
+        name: "fixture",
+        dependencies: { [PARENT]: "1.0.0", ...direct },
+        resolutions: { [key]: spec },
+        ...(overrides ? { overrides } : {}),
+      };
+      const project = writeProject(root, { "package.json": manifest }, registry.url, { excludes: [CHILD] });
+      const install = await bunInstall(project, ["--no-cache"]);
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      expect(lockVersions(project).filter((d) => d.name === CHILD)).toEqual([{ name: CHILD, version: installed }]);
+
+      const gate = await runGate(project, registry.url, `${CHILD}@${installed}`);
+      expect(gate.exit).toBe(2);
+      expect(gate.output).toContain(`package.json: \`${CHILD}\` is in resolutions (key \`${key}\`)`);
       expect(gate.output).not.toContain("Checking");
     } finally {
       try {

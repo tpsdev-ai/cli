@@ -7,27 +7,26 @@
  *
  */
 
+/** The lowest threshold the gate accepts: cli#529 set a 7-day gate. */
+export const MIN_RELEASE_AGE_SECONDS = 7 * 24 * 60 * 60;
+
 /**
- * Read `[install] minimumReleaseAge` (seconds) from a bunfig.toml body.
+ * `minimumReleaseAge` (seconds) from bunfig's `install` table as Bun's TOML
+ * parser returned it (scripts/check-dep-ages.mjs gets the table from `Bun.TOML.parse`).
  *
- * @returns the number of seconds, or null when the key is absent (the caller
- *   refuses rather than assume a threshold).
+ * @returns {{ seconds: number | null, error: string | null }}
  */
-export function parseMinReleaseAgeSeconds(tomlText) {
-  let section = "";
-  for (const raw of String(tomlText).split(/\r?\n/)) {
-    const line = raw.replace(/#.*$/, "").trim();
-    if (!line) continue;
-    const header = line.match(/^\[([^\]]+)\]$/);
-    if (header) {
-      section = header[1].trim();
-      continue;
-    }
-    if (section !== "install") continue;
-    const m = line.match(/^minimumReleaseAge\s*=\s*"?(\d+)"?\s*$/);
-    if (m) return Number(m[1]);
+export function thresholdFromInstallTable(install) {
+  const table = install !== null && typeof install === "object" && !Array.isArray(install) ? install : {};
+  const value = table.minimumReleaseAge;
+  if (value === undefined) return { seconds: null, error: "the key is missing" };
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return { seconds: null, error: `expected a non-negative number of seconds, got ${JSON.stringify(value)}` };
   }
-  return null;
+  if (value < MIN_RELEASE_AGE_SECONDS) {
+    return { seconds: null, error: `${value} is below the ${MIN_RELEASE_AGE_SECONDS}-second (7-day) floor` };
+  }
+  return { seconds: value, error: null };
 }
 
 /**
@@ -248,6 +247,9 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
  * exact pins in the repository's package.json files. Bun applies `overrides`
  * from the root package.json (path `package.json`), not from a workspace or
  * other nested manifest, so an excluded name in a nested `overrides` is refused.
+ * Bun 1.3.10 applies root `resolutions` (key `name` or `**\/name`) over a direct
+ * pin, and ignores them while the root has an `overrides` key, so a resolutions
+ * key naming an excluded package is refused in any manifest.
  *
  * @param {{ excludes: string[], exceptionEntries: Map<string, object>,
  *           exceptionErrors: Array<{key: string | null, message: string}>,
@@ -256,6 +258,7 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
  *                 error: {message: string} | null}
  *             | {kind: "range", name: string, path: string, spec: string}
  *             | {kind: "nested-override", name: string, path: string}
+ *             | {kind: "resolution", name: string, path: string, key: string}
  *             | {kind: "unpinned", name: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
@@ -277,6 +280,14 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
     }
     let declared = false;
     for (const pj of packageJsons ?? []) {
+      const resolutions = pj.json?.resolutions;
+      if (resolutions && typeof resolutions === "object") {
+        for (const key of Object.keys(resolutions)) {
+          if ((key.startsWith("**/") ? key.slice(3) : key) === name) {
+            problems.push({ kind: "resolution", name, path: pj.path, key });
+          }
+        }
+      }
       for (const field of DEP_FIELDS) {
         const deps = pj.json?.[field];
         if (!deps || typeof deps !== "object" || !Object.hasOwn(deps, name)) continue;

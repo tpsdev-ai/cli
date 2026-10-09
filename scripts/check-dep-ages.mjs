@@ -2,25 +2,26 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Checks every external version in bun.lock against bunfig.toml's minimumReleaseAge,
- * and that every minimumReleaseAgeExcludes name, as Bun's TOML parser reads it, has
- * an unexpired entry in docs/dep-age-exceptions.md and at least one exact
- * declaration; every declaration must be exact, and an override must be in the
- * root package.json.
+ * Reads bunfig.toml's install table with Bun's TOML parser. Checks every external
+ * version in bun.lock against its minimumReleaseAge (at least 7 days), and that
+ * every minimumReleaseAgeExcludes name has an unexpired entry in
+ * docs/dep-age-exceptions.md and at least one exact declaration; every
+ * declaration must be exact, an override must be in the root package.json, and
+ * a resolutions key of `name` or `**\/name` is refused.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
  * Exit codes:
  *   0 — every external resolved version is at least the gate old (or a valid
  *       exception covers it), and every excluded name Bun reads has an unexpired entry,
- *       exact declarations, and no override in a nested package.json
+ *       exact declarations, no override in a nested package.json, and no resolutions key naming it
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files, Bun not
- *       runnable or rejecting bunfig.toml, missing or invalid threshold, invalid or
- *       unused exceptions, an excluded name without an unexpired exception or without
- *       exact declarations, an excluded name in a nested package.json's overrides, no
- *       external resolutions, refused CI overrides, unexpected arguments, or registry
- *       fetch failures
+ *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold
+ *       or one below 7 days, invalid or unused exceptions, an excluded name without an
+ *       unexpired exception or without exact declarations, an excluded name in a nested
+ *       package.json's overrides or as a resolutions key, no external resolutions, refused
+ *       CI overrides, unexpected arguments, or registry fetch failures
  *
  */
 
@@ -36,7 +37,7 @@ import {
   excludesFromInstallTable,
   parseBunLock,
   parseExceptions,
-  parseMinReleaseAgeSeconds,
+  thresholdFromInstallTable,
 } from "./lib/check-dep-ages-collect.mjs";
 
 const ARGS = process.argv.slice(2);
@@ -145,7 +146,7 @@ function readInstallTableWithBun(text) {
   if (detail !== null) {
     console.error(`check-dep-ages: cannot read bunfig.toml with Bun's TOML parser: ${detail}`);
     console.error(
-      "Refusing, because an unread exclusion list must not read as an empty one. Put bun on PATH, or fix bunfig.toml.",
+      "Refusing, because the threshold and the exclusion list are read with Bun's parser. Put bun on PATH, or fix bunfig.toml.",
     );
     process.exit(2);
   }
@@ -211,21 +212,18 @@ function collectPackageJsons(root) {
   return out;
 }
 
-// ── Gate value, from the same bunfig.toml the install-time gate uses ────────
-const bunfigText = readOrExit(join(ROOT, "bunfig.toml"), "bunfig.toml");
-const gateSeconds = parseMinReleaseAgeSeconds(bunfigText);
-if (gateSeconds === null || !Number.isFinite(gateSeconds) || gateSeconds < 0) {
-  console.error(
-    "check-dep-ages: bunfig.toml has no valid [install] minimumReleaseAge — refusing, because the gate has no threshold to enforce.",
-  );
+// ── Gate value, as Bun's TOML parser reads bunfig.toml ──────────────────────
+const installTable = readInstallTableWithBun(readOrExit(join(ROOT, "bunfig.toml"), "bunfig.toml"));
+const { seconds: gateSeconds, error: thresholdError } = thresholdFromInstallTable(installTable);
+if (thresholdError !== null) {
+  console.error(`check-dep-ages: bunfig.toml has no valid [install] minimumReleaseAge: ${thresholdError}.`);
+  console.error("Refusing, because the gate enforces the threshold Bun reads, and at least 7 days.");
   process.exit(2);
 }
 const gateDays = gateSeconds / (24 * 60 * 60);
 
-// ── Install-time excludes, as Bun's TOML parser reads bunfig.toml ───────────
-const { names: excludeNames, error: excludeParseError } = excludesFromInstallTable(
-  readInstallTableWithBun(bunfigText),
-);
+// ── Install-time excludes, from the same parsed table ───────────────────────
+const { names: excludeNames, error: excludeParseError } = excludesFromInstallTable(installTable);
 if (excludeParseError !== null) {
   console.error(`check-dep-ages: bunfig.toml [install] minimumReleaseAgeExcludes is malformed: ${excludeParseError}`);
   console.error("Refusing, because an unreadable exclude list must not read as an empty one.");
@@ -267,6 +265,13 @@ if (excludeNames.length > 0) {
         );
         console.error(
           `        Remedy: move the override to the root package.json, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      } else if (problem.kind === "resolution") {
+        console.error(
+          `    ${problem.path}: \`${problem.name}\` is in resolutions (key \`${problem.key}\`); an excluded package is pinned with the root package.json's overrides.`,
+        );
+        console.error(
+          `        Remedy: move the pin to the root package.json's overrides, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
         );
       } else if (problem.kind === "unpinned") {
         console.error(

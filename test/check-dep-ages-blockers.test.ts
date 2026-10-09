@@ -97,6 +97,18 @@ describe("excluded declarations", () => {
     ]);
   });
 
+  it("refuses an excluded name in resolutions, keyed by its name or **/ and its name", () => {
+    expect(auditExcludes({
+      excludes: ["foo"], exceptionEntries: new Map([["foo@1.0.0", {}]]), exceptionErrors: [],
+      packageJsons: [{ path: "package.json", json: {
+        overrides: { foo: "1.0.0" }, resolutions: { foo: "1.0.0", "**/foo": "1.0.0", "**/foobar": "1.0.0" },
+      } }],
+    })).toEqual([
+      { kind: "resolution", name: "foo", path: "package.json", key: "foo" },
+      { kind: "resolution", name: "foo", path: "package.json", key: "**/foo" },
+    ]);
+  });
+
   it.each(["devDependencies", "optionalDependencies", "peerDependencies", "overrides"])(
     "reports a range in %s after an exact dependency", (field) => {
       expect(auditExcludes({

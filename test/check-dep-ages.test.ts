@@ -18,9 +18,10 @@ import {
   evaluateAges,
   excludesFromInstallTable,
   isExactVersionPin,
+  MIN_RELEASE_AGE_SECONDS,
   parseBunLock,
   parseExceptions,
-  parseMinReleaseAgeSeconds,
+  thresholdFromInstallTable,
 } from "../scripts/lib/check-dep-ages-collect.mjs";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -34,21 +35,25 @@ const NOW = Date.parse("2026-10-07T00:00:00Z");
 
 /* ────────────────────────────── pure functions ───────────────────────────── */
 
-describe("parseMinReleaseAgeSeconds", () => {
+describe("thresholdFromInstallTable", () => {
+  const read = (text: string) => thresholdFromInstallTable(Bun.TOML.parse(text).install);
+
   it("reads the value CI installs with from this repo's bunfig.toml", () => {
-    const value = parseMinReleaseAgeSeconds(readFileSync(join(REPO, "bunfig.toml"), "utf8"));
-    expect(value).toBe(604800); // 7 days, the value the fragment and docs cite
+    // 7 days, the value the fragment and docs cite
+    expect(read(readFileSync(join(REPO, "bunfig.toml"), "utf8"))).toEqual({ seconds: 604800, error: null });
   });
 
-  it("ignores the key in another section and handles spacing, quotes and comments", () => {
-    expect(parseMinReleaseAgeSeconds('[install]\nminimumReleaseAge = 259200\n')).toBe(259200);
-    expect(parseMinReleaseAgeSeconds('[install]\nminimumReleaseAge="86400" # one day\n')).toBe(86400);
-    expect(parseMinReleaseAgeSeconds('[test]\nminimumReleaseAge = 1\n')).toBeNull();
+  it("accepts a value at or above the 7-day floor and ignores the key in another section", () => {
+    expect(read("[install]\nminimumReleaseAge = 1209600 # two weeks\n")).toEqual({ seconds: 1209600, error: null });
+    expect(read("[test]\nminimumReleaseAge = 604800\n").error).toBe("the key is missing");
   });
 
-  it("returns null when the key is absent", () => {
-    expect(parseMinReleaseAgeSeconds('[test]\npreload = ["./x.ts"]\n')).toBeNull();
-    expect(parseMinReleaseAgeSeconds("")).toBeNull();
+  it("refuses a missing, non-numeric, negative or below-floor value", () => {
+    expect(read('[test]\npreload = ["./x.ts"]\n')).toEqual({ seconds: null, error: "the key is missing" });
+    expect(read('[install]\nminimumReleaseAge = "604800"\n').error).toContain("non-negative number");
+    expect(read("[install]\nminimumReleaseAge = -1\n").error).toContain("non-negative number");
+    expect(read("[install]\nminimumReleaseAge = 86400\n").error).toContain("below the 604800-second (7-day) floor");
+    expect(MIN_RELEASE_AGE_SECONDS).toBe(604800);
   });
 });
 
@@ -543,6 +548,29 @@ describe("CLI — the current lockfile passes", () => {
   }, 60_000);
 });
 
+describe("CLI — the threshold is the value Bun parses", () => {
+  const threeDaysAgo = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
+
+  it.each([
+    ["multi-line-string", '[install]\nnote = """\nminimumReleaseAge = 1\n"""\nminimumReleaseAge = 604800\n'],
+    ["escaped-dotted-key", 'install."minimumReleaseAg\\u0065" = 604800\n'],
+    ["inline-table", "install = { minimumReleaseAge = 604800 }\n"],
+  ])("checks a 3-day-old version against Bun's 7 days (%s)", async (label, bunfig) => {
+    expect(Bun.TOML.parse(bunfig).install.minimumReleaseAge).toBe(604800);
+    const root = writeFixtureRepo(join(scratch, `bun-threshold-${label}`), { exceptions: "## Exceptions\n" });
+    writeFileSync(join(root, "bunfig.toml"), bunfig);
+    const registry = fixtureRegistry({ "dep-a": { "1.0.0": threeDaysAgo } });
+    try {
+      const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: registry.url });
+      expect(output).toContain("younger than the 7-day release-age gate");
+      expect(output).toContain("dep-a@1.0.0");
+      expect(exitCode).toBe(1);
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+});
+
 describe("CLI — refusals and fail-closed", () => {
   it("exits 2 when a publish time cannot be fetched", async () => {
     const root = writeFixtureRepo(join(scratch, "dead"), { exceptions: "## Exceptions\n" });
@@ -557,7 +585,20 @@ describe("CLI — refusals and fail-closed", () => {
   it("exits 2 when bunfig.toml has no [install] minimumReleaseAge", async () => {
     const root = writeFixtureRepo(join(scratch, "no-gate"), { minAge: null, exceptions: "## Exceptions\n" });
     const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root });
-    expect(output).toContain("no valid [install] minimumReleaseAge");
+    expect(output).toContain("no valid [install] minimumReleaseAge: the key is missing");
+    expect(exitCode).toBe(2);
+  }, 30_000);
+
+  it.each([
+    ["non-numeric", 'minimumReleaseAge = "604800"', "expected a non-negative number of seconds"],
+    ["negative", "minimumReleaseAge = -1", "expected a non-negative number of seconds"],
+    ["below-floor", "minimumReleaseAge = 86400", "86400 is below the 604800-second (7-day) floor"],
+  ])("exits 2 when minimumReleaseAge is %s", async (label, line, diagnostic) => {
+    const root = writeFixtureRepo(join(scratch, `threshold-${label}`), { exceptions: "## Exceptions\n" });
+    writeFileSync(join(root, "bunfig.toml"), `[install]\n${line}\n`);
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(output).toContain(`no valid [install] minimumReleaseAge: ${diagnostic}`);
+    expect(output).not.toContain("Checking");
     expect(exitCode).toBe(2);
   }, 30_000);
 
