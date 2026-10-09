@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# Print the Bun version this repository pins, from package.json's
-# "packageManager" (e.g. 1.3.10). This is the single source of truth for the
-# Docker integration image's Bun (cli#578): docker-compose.yml forwards it as
-# the BUN_VERSION build arg and .github/workflows/test.yml's Docker Integration
-# job derives it here, so the CI image is built from the repository's pin.
-# scripts/check-bun-pin.sh checks that wiring.
-#
-# Refuses anything but bun@<x.y.z>, so a malformed pin fails loudly instead of
-# producing an unusable build arg.
+# Print the Bun version in the ROOT package.json "packageManager" (e.g. 1.3.10),
+# read with a JSON parser. Fails if the root pin is missing, malformed, or not
+# bun@<x.y.z>.
 #
 # Usage: BUN_VERSION="$(scripts/docker-bun-version.sh)" docker compose build
 set -euo pipefail
@@ -18,11 +12,16 @@ fail() { printf 'docker-bun-version: %s\n' "$1" >&2; exit 1; }
 
 [ -f "$root/package.json" ] || fail "missing $root/package.json"
 
-n="$(grep -c '"packageManager"' "$root/package.json" || true)"
-[ "$n" = "1" ] || fail "package.json must carry exactly one \"packageManager\" field (found $n)"
+pm="$(node -e '
+const fs = require("fs");
+let pkg;
+try { pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+catch (e) { console.error("package.json is not valid JSON: " + e.message); process.exit(2); }
+const pm = pkg !== null && typeof pkg === "object" ? pkg.packageManager : undefined;
+process.stdout.write(typeof pm === "string" ? pm : "");
+' "$root/package.json")" || fail "cannot read $root/package.json"
 
-pm="$(sed -n 's/^[[:space:]]*"packageManager"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$root/package.json")"
 printf '%s' "$pm" | grep -qE '^bun@[0-9]+\.[0-9]+\.[0-9]+$' \
-  || fail "package.json packageManager must be bun@<x.y.z> (got: ${pm:-<missing>})"
+  || fail "root package.json packageManager must be bun@<x.y.z> (got: ${pm:-<missing>})"
 
 printf '%s\n' "${pm#bun@}"

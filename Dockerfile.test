@@ -1,11 +1,7 @@
-# The integration image runs the Bun this repository pins, not a hard-coded
-# floating tag (cli#578): cli#575's TOML cases passed under the pin and failed
-# under the newer floating image. BUN_VERSION is REQUIRED — it deliberately has
-# no default, so an omitted arg expands the FROM reference to the invalid
-# `oven/bun:-slim` and the build fails loudly instead of following a moving tag.
-# docker-compose.yml forwards it and the Docker Integration workflow derives it
-# from package.json's packageManager (scripts/docker-bun-version.sh);
-# scripts/check-bun-pin.sh fails when those disagree.
+# BUN_VERSION is required and has no default: an omitted arg makes the FROM
+# reference invalid (`oven/bun:-slim`) and the build fails. The Docker
+# Integration job fails when the image's Bun differs from the root
+# package.json packageManager pin. Image tags are mutable; no digest is pinned.
 ARG BUN_VERSION
 FROM oven/bun:${BUN_VERSION}-slim
 

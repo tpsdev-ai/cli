@@ -1,8 +1,7 @@
-# Every service builds the same Dockerfile.test with the Bun this repository
-# pins (cli#578). BUN_VERSION has no default in the Dockerfile, and
-# `${BUN_VERSION:?...}` refuses an unset value here, so an unset value is
-# refused rather than silently falling back to a floating oven/bun tag. Set it
-# for local builds with: BUN_VERSION="$(scripts/docker-bun-version.sh)" docker compose build
+# BUN_VERSION is required (`${BUN_VERSION:?...}`): unset or empty is refused.
+# Locally, any nonempty value is accepted; the Docker Integration job fails when
+# the image's Bun differs from the root package.json packageManager pin.
+# Set it with: BUN_VERSION="$(scripts/docker-bun-version.sh)" docker compose build
 x-test-build: &test-build
   context: .
   dockerfile: Dockerfile.test
