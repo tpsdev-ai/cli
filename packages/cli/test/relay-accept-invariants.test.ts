@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { ackMessageAtPath, getInbox } from "../src/utils/mail.js";
+import { ackMessageAtPath, getInbox, sendMessage } from "../src/utils/mail.js";
 import { deliverRelayedToLocal, pruneRelayAcceptanceReceipts, relayAcceptanceReceiptPath, startRelay } from "../src/utils/relay.js";
 
 let root: string;
@@ -136,6 +136,33 @@ test("old day buckets with more than one former pass expire together", () => {
   }
   expect(pruneRelayAcceptanceReceipts(accepted, Date.now(), 1000)).toBe(2);
   expect(fs.readdirSync(accepted)).toEqual([]);
+});
+
+test("a flat per-branch marker with a live record remains an in-flight duplicate", () => {
+  const item = body();
+  const original = sendMessage(item.to, item.content, item.from, { branchId: "remote", id: item.id }, item.timestamp);
+  const flatMarker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", item.id);
+  fs.mkdirSync(dirname(flatMarker), { recursive: true });
+  fs.writeFileSync(flatMarker, "");
+  expect(deliverRelayedToLocal("remote", item)).toBe(false);
+  expect(records()).toHaveLength(1);
+  expect(fs.existsSync(relayAcceptanceReceiptPath("remote", item.id))).toBe(true);
+  ackMessageAtPath(original.filePath);
+  expect(deliverRelayedToLocal("remote", item)).toBe(false);
+  expect(records()).toEqual([]);
+});
+
+test("flat per-branch markers expire with receipts", () => {
+  const accepted = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
+  fs.mkdirSync(accepted, { recursive: true });
+  const old = join(accepted, randomUUID());
+  const current = join(accepted, randomUUID());
+  fs.writeFileSync(old, "");
+  fs.writeFileSync(current, "");
+  fs.utimesSync(old, new Date(0), new Date(0));
+  expect(pruneRelayAcceptanceReceipts(accepted, Date.now(), 1000)).toBe(1);
+  expect(fs.existsSync(old)).toBe(false);
+  expect(fs.existsSync(current)).toBe(true);
 });
 
 test("relay timer retries a failed prune without a new delivery", async () => {

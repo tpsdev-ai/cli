@@ -1,1 +1,1 @@
-- **Deduplicate relay resends after local ACK while the receipt remains.** A fixed set of lock stripes serializes acceptance; failed acceptance writes roll back new records; old receipt buckets are pruned on relay start and a timer.
+- **Deduplicate relay resends after local ACK while the receipt remains.** A fixed set of lock stripes serializes acceptance; failed acceptance writes roll back what the attempt wrote, and incomplete rollback refuses delivery with a possible-duplicate warning; the receipt TTL also applies to flat per-branch markers.

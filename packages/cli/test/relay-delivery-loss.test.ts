@@ -530,6 +530,24 @@ for (const entry of ["sync", "connect"] as const) {
       expect(errors.mock.calls.flat().join("\n")).toContain("conflict");
     });
 
+    test("a flat per-branch marker from before receipts refuses resend after local ACK without ACK", async () => {
+      const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "legacy acceptance", SEEDS)));
+      const original = sendMessage("local", body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
+      const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
+      fs.mkdirSync(join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote"), { recursive: true });
+      fs.writeFileSync(marker, "");
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await start();
+      ackMessageAtPath(original.filePath);
+      await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
+      expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
+      expect(jsonFiles(getInbox("local").dlq)).toEqual([]);
+      expect(acks).toEqual([]);
+      expect(drainOutbox(false).map((item) => item.id)).toContain(body.id);
+      expect(fs.existsSync(relayAcceptanceReceiptPath("remote", body.id))).toBe(false);
+      expect(errors.mock.calls.flat().join("\n")).toContain(`relayed delivery conflict for branch remote message ${body.id}: accepted before receipts existed; payload cannot be compared; sender must not retry`);
+    });
+
     test("a receipt older than the prune bound no longer blocks a resend", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "late", SEEDS)));
       await start();
