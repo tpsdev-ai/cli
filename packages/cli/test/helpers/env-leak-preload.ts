@@ -1,9 +1,7 @@
 /**
  * env-leak-preload.ts — cli#555: the process.env half of the cli test leak
- * guard. helpers/leak-preload.ts is the preload bun runs (listed in
- * packages/cli/bunfig.toml) and calls the install/onLoad/snippet functions here
- * for each `.test`/`.spec` file it loads (cli#568: bun runs only the first
- * plugin whose onLoad matches, so both checks share one plugin).
+ * guard. helpers/leak-preload.ts installs the guard state once, then calls
+ * the snapshot/snippet functions here for each `.test`/`.spec` file it loads.
  *
  * Every cli test file runs in ONE bun process, so an env name a file sets and
  * does not put back is still set when later files run. Measured on bun 1.3.10:

@@ -1,5 +1,5 @@
 /**
- * leak-preload.ts — cli#568: the one preload bun runs for the cli test lane
+ * leak-preload.ts — cli#568: the combined leak preload for the cli test lane
  * (listed in packages/cli/bunfig.toml). It appends both per-file leak checks to
  * each `.test`/`.spec` file: the process.env check (cli#555,
  * helpers/env-leak-preload.ts) and the guarded-global check (cli#568,

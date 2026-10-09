@@ -1,9 +1,7 @@
 /**
  * global-leak-preload.ts — cli#568: the guarded-global half of the cli test leak
- * guard. helpers/leak-preload.ts is the preload bun runs (listed in
- * packages/cli/bunfig.toml) and calls the install/onLoad/snippet functions here
- * for each `.test`/`.spec` file it loads (bun runs only the first plugin whose
- * onLoad matches, so both checks share one plugin).
+ * guard. helpers/leak-preload.ts installs the guard state once, then calls
+ * the snapshot/snippet functions here for each `.test`/`.spec` file it loads.
  *
  * The preload records the guarded globals' values for each file as bun loads
  * it and appends one line to the file's source. That line registers an afterAll
