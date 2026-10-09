@@ -13,8 +13,8 @@
  * Bun ignores it in a workspace package.json and the gate refuses it. A root
  * resolution of the excluded name is refused whether or not Bun applies it.
  *
- * No external network (loopback-only local registry). Setup runs inside `try`;
- * `finally` stops the registry if started and removes the temporary tree.
+ * No external network (loopback-only local registry). Registry startup runs inside
+ * `try`; `finally` stops it if started and removes the temporary tree.
  * Every spawned install carries an explicit timeout.
  */
 
