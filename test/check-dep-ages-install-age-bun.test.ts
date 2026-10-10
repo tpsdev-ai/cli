@@ -25,7 +25,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectResolvedDeps, parseBunLock } from "../scripts/lib/check-dep-ages-collect.mjs";
+import { appliedManifestPaths, collectResolvedDeps, parseBunLock } from "../scripts/lib/check-dep-ages-collect.mjs";
 
 const GATE = fileURLToPath(new URL("../scripts/check-dep-ages.mjs", import.meta.url));
 
@@ -327,6 +327,36 @@ it.each([
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
+    }
+  },
+  60000,
+);
+
+it(
+  "the gate applies the same workspaces real Bun installs for negated and nested ** patterns",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "age-workspaces-"));
+    try {
+      const dirs = ["packages/a/b", "packages/c", "packages/x", "packages/x/y", "tools/t"];
+      const manifests: Record<string, unknown> = {
+        "package.json": { name: "fixture", workspaces: ["packages/**", "!packages/x", "!packages/c"] },
+      };
+      for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll("/", "-")}` };
+      const project = writeProject(root, manifests, "http://127.0.0.1:1");
+      const install = await bunInstall(project, ["--no-cache"]);
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      const installed = Object.keys(lock.workspaces)
+        .filter((key) => key !== "")
+        .map((key) => `${key}/package.json`)
+        .sort();
+      expect(installed).toEqual(["packages/a/b/package.json", "packages/x/y/package.json"]);
+
+      const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
+      const gate = [...appliedManifestPaths(packageJsons)].filter((path) => path !== "package.json").sort();
+      expect(gate).toEqual(installed);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   },
   60000,

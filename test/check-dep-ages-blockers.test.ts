@@ -176,6 +176,33 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
+  // Each row matches what a real `bun install` (1.3.10) installs for that layout.
+  it.each([
+    ["a ** pattern reaches a nested directory", ["packages/**"], "packages/a/b", true],
+    ["a negation removes a * match", ["packages/*", "!packages/x"], "packages/x", false],
+    ["a negation leaves other * matches", ["packages/*", "!packages/x"], "packages/y", true],
+    ["a negation before its positive pattern loses", ["!packages/x", "packages/*"], "packages/x", true],
+    ["a positive pattern after a negation wins", ["packages/*", "!packages/x", "packages/x"], "packages/x", true],
+    ["a ? pattern matches one character", ["packages/?"], "packages/a", true],
+    ["a ? pattern does not match two characters", ["packages/?"], "packages/ab", false],
+    ["a ./ prefix and trailing slash", ["./packages/*/"], "packages/a", true],
+    ["a * pattern does not reach a nested directory", ["packages/*"], "packages/a/b", false],
+  ])("%s", (_label, workspaces, dir, expectApplied) => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces });
+      writeManifest(root, join(dir, "package.json"), { name: "w", dependencies: { "dep-a": "1.0.0" } });
+      const output = runGate(root);
+      if (expectApplied) {
+        expect(output).toContain("bun.lock is not parseable");
+      } else {
+        expect(output).toContain(
+          `${dir}/package.json: \`dep-a\` is declared exactly here, but this manifest is neither the root package.json nor a workspace`,
+        );
+        expect(output).not.toContain("Checking");
+      }
+    });
+  });
+
   it("fails with its path when a workspace manifest cannot be read or parsed", () => {
     for (const [label, content, message] of [
       ["unreadable", "", "cannot inspect"],

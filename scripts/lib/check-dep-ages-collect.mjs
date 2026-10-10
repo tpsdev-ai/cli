@@ -281,7 +281,7 @@ function matchGlobDir(dir, pattern) {
  * The globs use the `*`, `?` and `**` segments Bun resolves; a `!`-prefixed
  * pattern removes an earlier match (the last matching pattern wins).
  */
-function appliedManifestPaths(manifests) {
+export function appliedManifestPaths(manifests) {
   const applied = new Set(["package.json"]);
   const root = manifests.find((pj) => pj.path === "package.json");
   const workspaces = root?.json?.workspaces;
