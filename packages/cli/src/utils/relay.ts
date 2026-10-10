@@ -501,17 +501,20 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
       if (!receiptMayExist(path)) continue;
       try {
         if (Date.now() - statSync(path).mtimeMs > relayAcceptReceiptTtlMs()) continue;
-      } catch {}
+      } catch {
+        if (!receiptMayExist(path)) continue;
+      }
       return path;
     }
   }
   const flatMarker = join(acceptedDir, id);
   if (receiptMayExist(flatMarker)) {
     try { if (Date.now() - statSync(flatMarker).mtimeMs <= relayAcceptReceiptTtlMs()) return flatMarker; }
-    catch { return flatMarker; }
+    catch { if (receiptMayExist(flatMarker)) return flatMarker; }
   }
   if (!receiptMayExist(legacyMarker)) return undefined;
-  try { if (Date.now() - statSync(legacyMarker).mtimeMs > relayAcceptReceiptTtlMs()) return undefined; } catch {}
+  try { if (Date.now() - statSync(legacyMarker).mtimeMs > relayAcceptReceiptTtlMs()) return undefined; }
+  catch { if (!receiptMayExist(legacyMarker)) return undefined; }
   return legacyMarker;
 }
 
@@ -688,6 +691,7 @@ async function acceptRelayedMail(
   onAccepted?: () => void,
 ): Promise<boolean> {
   const delivered = deliverRelayedToLocal(branchId, body);
+  // A delivery with delivered=false (dead-lettered or receipt-backed duplicate) is still ACKed below.
   if (delivered) {
     const reportError = () => {
       console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);

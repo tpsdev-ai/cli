@@ -152,6 +152,37 @@ test("a flat per-branch marker with a live record remains an in-flight duplicate
   expect(records()).toEqual([]);
 });
 
+test("a receipt in an ended day bucket younger than the TTL survives prune and still dedups", () => {
+  const item = body();
+  expect(deliverRelayedToLocal("remote", item)).toBe(true);
+  const [file] = records();
+  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  const marker = relayAcceptanceReceiptPath("remote", item.id);
+  const accepted = dirname(dirname(marker));
+  const ended = join(accepted, new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
+  fs.renameSync(dirname(marker), ended);
+  expect(pruneRelayAcceptanceReceipts(accepted, Date.now(), 7 * 24 * 60 * 60 * 1000)).toBe(0);
+  expect(fs.existsSync(join(ended, item.id))).toBe(true);
+  expect(deliverRelayedToLocal("remote", item)).toBe(false);
+  expect(records()).toEqual([]);
+});
+
+test("a receipt that vanishes between listing and stat is treated as absent", () => {
+  const item = body();
+  expect(deliverRelayedToLocal("remote", item)).toBe(true);
+  const [file] = records();
+  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  const marker = relayAcceptanceReceiptPath("remote", item.id);
+  const stat = fs.statSync;
+  const fault = spyOn(fs, "statSync").mockImplementation(((path: fs.PathLike, options?: unknown) => {
+    if (String(path) === marker) fs.unlinkSync(marker);
+    return (stat as (p: fs.PathLike, o?: unknown) => unknown)(path, options);
+  }) as typeof fs.statSync);
+  try { expect(deliverRelayedToLocal("remote", item)).toBe(true); }
+  finally { fault.mockRestore(); }
+  expect(records()).toHaveLength(1);
+});
+
 test("flat per-branch markers expire with receipts", () => {
   const accepted = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
   fs.mkdirSync(accepted, { recursive: true });

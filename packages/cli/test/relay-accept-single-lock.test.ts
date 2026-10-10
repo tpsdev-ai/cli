@@ -154,6 +154,23 @@ function recordsByDeliveryId(): Map<string, string[]> {
   return byId;
 }
 
+/** The stored receipt carries the delivered body, and a resend of that body dedups after ACK. */
+function expectReceiptKeepsBody(id: string, content: string): void {
+  const receipt = JSON.parse(readFileSync(relayAcceptanceReceiptPath(BRANCH, id), "utf8")) as { body: string };
+  expect(receipt.body).toBe(content);
+  expect(deliverRelayedToLocal(BRANCH, { id, from: FROM, to: RECIPIENT, content, timestamp: TIMESTAMP })).toBe(false);
+  expect(recordsByDeliveryId().has(id)).toBe(false);
+}
+
+function expectReceiptMatchesDeliveredRecord(id: string, bodyPattern: RegExp): void {
+  const [file] = recordsByDeliveryId().get(id)!;
+  const path = join(getInbox(RECIPIENT).fresh, file!);
+  const record = JSON.parse(readFileSync(path, "utf8")) as { body: string };
+  expect(record.body).toMatch(bodyPattern);
+  ackMessageAtPath(path);
+  expectReceiptKeepsBody(id, record.body);
+}
+
 async function waitForFile(path: string): Promise<void> {
   const deadline = Date.now() + 10000;
   while (!existsSync(path)) {
@@ -240,6 +257,41 @@ describe("relay acceptance (cli#561)", () => {
     const byId = recordsByDeliveryId();
     expect([...byId.keys()].sort()).toEqual([...ids].sort());
     for (const id of ids) expect(byId.get(id)).toHaveLength(1);
+
+    for (const id of ids) expectReceiptMatchesDeliveredRecord(id, /^[AB]-/);
+  }, 60_000);
+
+  test("a differing payload waiting on the stripe is refused and the receipt keeps the delivered body", async () => {
+    const id = randomUUID();
+    const pause = join(root, "differing-pause");
+    const started = join(root, "differing-started");
+    const first = deliverChild("A-", [id], { RELAY_CHILD_PAUSE: pause });
+    let second: Promise<Counts> | undefined;
+    try {
+      await waitForFile(pause + ".ready");
+      second = deliverChild("B-", [id], { RELAY_CHILD_STARTED: started });
+      await waitForFile(started);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    } finally { writeFileSync(pause + ".release", ""); }
+    // ACK each record the moment it appears, so a waiter that took the lock late finds no record.
+    const acked: string[] = [];
+    let settled = false;
+    const both = Promise.all([first, second]).finally(() => { settled = true; });
+    while (!settled) {
+      for (const file of jsonFiles(getInbox(RECIPIENT).fresh)) {
+        const path = join(getInbox(RECIPIENT).fresh, file);
+        try {
+          acked.push((JSON.parse(readFileSync(path, "utf8")) as { body: string }).body);
+          ackMessageAtPath(path);
+        } catch {}
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const [a, b] = await both;
+    expect(a).toEqual({ delivered: 1, duplicate: 0, refused: 0 });
+    expect(b).toEqual({ delivered: 0, duplicate: 0, refused: 1 });
+    expect(acked).toEqual([`A-${id}`]);
+    expectReceiptKeepsBody(id, `A-${id}`);
   }, 60_000);
 
   test("lock directories stay bounded across distinct deliveries", () => {
