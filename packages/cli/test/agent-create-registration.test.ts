@@ -63,11 +63,13 @@ function refusePut(url: URL, id: string): Response | undefined {
 async function runCreate(
   url: string,
   id: string,
-  flags: { noSeed?: boolean } = {},
-): Promise<{ exitCode: number | undefined; stdout: string; stderr: string }> {
+  flags: { noSeed?: boolean; credential?: string } = {},
+): Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: string | null }> {
   const home = mkdtempSync(join(tmpdir(), "create-registration-"));
   const savedHome = process.env.HOME;
+  const savedCredential = process.env.FLAIR_ADMIN_AUTH;
   process.env.HOME = home;
+  if (flags.credential !== undefined) process.env.FLAIR_ADMIN_AUTH = flags.credential;
   const stdout: string[] = [];
   const stderr: string[] = [];
   const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => { stdout.push(args.join(" ")); });
@@ -77,18 +79,21 @@ async function runCreate(
     exitCode = code;
     throw new Error(`exit:${code}`);
   }) as never);
+  let error: string | null = null;
   try {
     await runAgent({ action: "create", id, name: id, flairUrl: url, noSeed: flags.noSeed });
   } catch (err) {
-    if (!String(err).includes("exit:")) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    if (!message.includes("exit:")) error = message;
   } finally {
     exitSpy.mockRestore();
     logSpy.mockRestore();
     errSpy.mockRestore();
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
+    if (savedCredential === undefined) delete process.env.FLAIR_ADMIN_AUTH; else process.env.FLAIR_ADMIN_AUTH = savedCredential;
     rmSync(home, { recursive: true, force: true });
   }
-  return { exitCode, stdout: stdout.join("\n"), stderr: stderr.join("\n") };
+  return { exitCode, stdout: stdout.join("\n"), stderr: stderr.join("\n"), error };
 }
 
 test("refused write and no Agent row: exits non-zero, prints no success, names agent, URL and remedy", async () => {
@@ -152,7 +157,7 @@ test("the stored key differs from the generated one: exits non-zero", async () =
   }
 });
 
-test("the read-back fails: exits non-zero, never treating a failed read as absent", async () => {
+test("the read-back fails: exits non-zero, never treating a failed read as absent, and names both remedy branches", async () => {
   const id = `${AGENT}-read-fail`;
   const fake = startFakeFlair(async (req, url) => {
     if (req.method === "PUT") return Response.json({}, { status: 200 });
@@ -164,6 +169,12 @@ test("the read-back fails: exits non-zero, never treating a failed read as absen
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
     expect(res.stderr).toContain("the read-back failed");
+    // cli#593: a non-404 read failure leaves the row's existence unknown, so the
+    // remedy names the remove branch as well as the add branch.
+    expect(res.stderr).toContain(`flair agent show ${id}`);
+    expect(res.stderr).toContain(`flair agent remove ${id}`);
+    expect(res.stderr).toContain(`flair agent add ${id} --keys-dir`);
+    expect(res.stderr).toContain("Memory and Soul rows");
   } finally {
     fake.stop();
   }
@@ -275,3 +286,88 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   },
   30_000,
 );
+
+/**
+ * cli#593 — create uses one operator credential (FLAIR_ADMIN_AUTH, sent as a
+ * Basic Authorization header on the Agent PUT and the read-back GET). Each create
+ * refusal path and the success path below runs with a unique marker embedded in
+ * that credential, and the marker is asserted absent from stdout, stderr and any
+ * thrown error. Paths: the missing-id usage refusal; a refused write over no Agent
+ * row; a refused write with --no-seed; a failed read-back (row existence unknown);
+ * a row holding no public key; a row holding a different key; the success path
+ * (the key reads back equal).
+ */
+test("every create refusal path and the success path keep the operator credential out of stdout, stderr and thrown errors", async () => {
+  const marker = `credential-593-${randomUUID()}-${"z".repeat(40)}`;
+  const credential = `operator:${marker}`;
+  const wire = Buffer.from(credential).toString("base64");
+
+  const fakes: FakeFlair[] = [];
+  const make = (basic: (req: Request, url: URL) => Promise<Response | undefined>): FakeFlair => {
+    const fake = startFakeFlair(basic);
+    fakes.push(fake);
+    return fake;
+  };
+
+  const noRowId = `${AGENT}-cred-no-row`;
+  const noRow = make(async (req, url) => (req.method === "PUT" ? refusePut(url, noRowId) : undefined));
+
+  const noSeedId = `${AGENT}-cred-no-seed`;
+  const noSeed = make(async (req, url) => (req.method === "PUT" ? refusePut(url, noSeedId) : undefined));
+
+  const readFailId = `${AGENT}-cred-read-fail`;
+  const readFail = make(async (req, url) => {
+    if (req.method === "PUT") return Response.json({}, { status: 200 });
+    if (url.pathname === `/Agent/${readFailId}`) return new Response("boom", { status: 500 });
+    return undefined;
+  });
+
+  const noKeyId = `${AGENT}-cred-no-key`;
+  const noKey = make(async (req, url) => {
+    if (req.method === "PUT") return refusePut(url, noKeyId);
+    if (url.pathname === `/Agent/${noKeyId}`) return Response.json({ id: noKeyId, name: noKeyId });
+    return undefined;
+  });
+
+  const differId = `${AGENT}-cred-differ`;
+  const differ = make(async (req, url) => {
+    if (req.method === "PUT") return refusePut(url, differId);
+    if (url.pathname === `/Agent/${differId}`) return Response.json({ id: differId, name: differId, publicKey: "de".repeat(32) });
+    return undefined;
+  });
+
+  const okId = `${AGENT}-cred-ok`;
+  let okStored: string | null = null;
+  const ok = make(async (req, url) => {
+    if (url.pathname === `/Agent/${okId}` && req.method === "PUT") {
+      const body = (await req.json()) as { publicKey?: string };
+      okStored = body.publicKey ?? null;
+      return Response.json({}, { status: 200 });
+    }
+    if (url.pathname === `/Agent/${okId}` && okStored !== null) return Response.json({ id: okId, name: okId, publicKey: okStored });
+    return undefined;
+  });
+
+  const paths: Array<[string, () => Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: string | null }>]> = [
+    ["missing id", () => runCreate("http://127.0.0.1:1", "", { credential })],
+    ["refused write over no row", () => runCreate(noRow.url, noRowId, { credential })],
+    ["refused write, --no-seed", () => runCreate(noSeed.url, noSeedId, { credential, noSeed: true })],
+    ["failed read-back", () => runCreate(readFail.url, readFailId, { credential })],
+    ["row holds no key", () => runCreate(noKey.url, noKeyId, { credential })],
+    ["row holds a different key", () => runCreate(differ.url, differId, { credential })],
+    ["success", () => runCreate(ok.url, okId, { credential })],
+  ];
+
+  try {
+    expect(paths.length).toBe(7);
+    for (const [name, run] of paths) {
+      const res = await run();
+      for (const stream of [res.stdout, res.stderr, res.error ?? ""]) {
+        expect(`${name}: ${stream}`).not.toContain(marker);
+        expect(`${name}: ${stream}`).not.toContain(wire);
+      }
+    }
+  } finally {
+    for (const fake of fakes) fake.stop();
+  }
+});
