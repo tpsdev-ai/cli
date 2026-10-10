@@ -104,6 +104,7 @@ test("refused write and no Agent row: exits non-zero, prints no success, names a
     expect(res.stderr).toContain("seed or key update failed");
     expect(res.stderr).toContain("flair#2266");
     expect(res.stderr).toContain(`flair agent add ${id} --keys-dir`);
+    expect(res.stderr).not.toContain("remove");
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.pub`));
     expect(res.stderr).toContain(join(".tps", "identity"));
@@ -124,6 +125,10 @@ test("the stored key is still `pending`: exits non-zero naming the stored value"
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
     expect(res.stderr).toContain("the stored public key is 'pending'");
+    const remove = res.stderr.indexOf(`flair agent remove ${id}`);
+    expect(remove).toBeGreaterThan(-1);
+    expect(remove).toBeLessThan(res.stderr.indexOf(`flair agent add ${id}`));
+    expect(res.stderr).toContain("Memory and Soul rows");
   } finally {
     fake.stop();
   }
