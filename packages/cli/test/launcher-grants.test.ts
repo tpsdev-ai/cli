@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
@@ -36,9 +36,12 @@ describe("sandboxHomeBase", () => {
   });
 
   test("skips a non-writable directory candidate and returns the next writable uncovered one", () => {
-    const dir = mkdtempSync(join(tmpdir(), "lg-ro-"));
-    const next = mkdtempSync(join(tmpdir(), "lg-rw-"));
+    const parent = mkdtempSync(join(sandboxHomeBase(), "lg-skip-"));
+    const dir = join(parent, "ro");
+    const next = join(parent, "rw");
     try {
+      mkdirSync(dir);
+      mkdirSync(next);
       chmodSync(dir, 0o500);
       try {
         rmSync(mkdtempSync(join(dir, "w-")));
@@ -48,8 +51,7 @@ describe("sandboxHomeBase", () => {
       expect(sandboxHomeBase([dir, next])).toBe(realpathSync(next));
     } finally {
       chmodSync(dir, 0o700);
-      rmSync(next, { recursive: true, force: true });
-      rmSync(dir, { recursive: true, force: true });
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
