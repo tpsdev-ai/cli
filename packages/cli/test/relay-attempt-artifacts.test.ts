@@ -101,4 +101,31 @@ test("dead-letter sidecar: publish fails and the sidecar delete succeeds -> no s
   expect(refusal).toContain("relay dead-letter failed; retry delivery");
   expect(fs.readdirSync(dlq).filter((file) => file.endsWith(".reason"))).toEqual([]);
   expect(records()).toHaveLength(MAX_INBOX_MESSAGES);
+  expect(fs.readdirSync(getInbox("local").tmp).filter((file) => file.endsWith(".json"))).toEqual([]);
+});
+
+test("dead-letter temp record: publish fails and the temp delete succeeds -> no tmp record left, retryable refusal", () => {
+  const item = body();
+  fillInbox();
+  const inbox = getInbox("local");
+  const rename = failOn("renameSync", (path) => path.startsWith(inbox.dlq), "injected dead-letter publish failure");
+  let refusal = "";
+  try { refusal = refusalOf(item); }
+  finally { rename.mockRestore(); }
+  expect(refusal).toContain("relay dead-letter failed; retry delivery");
+  expect(fs.readdirSync(inbox.tmp).filter((file) => file.endsWith(".json"))).toEqual([]);
+});
+
+test("dead-letter temp record: publish fails and the temp delete fails -> incomplete-recovery refusal", () => {
+  const item = body();
+  fillInbox();
+  const inbox = getInbox("local");
+  const rename = failOn("renameSync", (path) => path.startsWith(inbox.dlq), "injected dead-letter publish failure");
+  const unlink = failOn("unlinkSync", (path) => path.startsWith(inbox.tmp) && path.endsWith(".json"), "injected temp delete failure");
+  let refusal = "";
+  try { refusal = refusalOf(item); }
+  finally { unlink.mockRestore(); rename.mockRestore(); }
+  expect(refusal).toContain("relay record recovery incomplete");
+  expect(refusal).toContain("retry may duplicate");
+  expect(refusal).not.toContain("retry delivery");
 });

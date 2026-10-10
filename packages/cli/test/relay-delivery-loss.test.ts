@@ -169,7 +169,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(rejected.some((r) => r.id === bodies[2]!.id)).toBe(true);
     });
 
-    for (const fault of ["sidecar", "record", "crash-before-publish"] as const) {
+    for (const fault of ["sidecar", "record", "publish-throws"] as const) {
       test(`${fault} failure leaves the branch source unacked and retryable`, async () => {
         fillInbox();
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "retry me", SEEDS)));
@@ -178,9 +178,9 @@ for (const entry of ["sync", "connect"] as const) {
         await start();
         const write = fs.writeFileSync;
         const rename = fs.renameSync;
-        const injected = fault === "crash-before-publish"
+        const injected = fault === "publish-throws"
           ? spyOn(fs, "renameSync").mockImplementation((src, dst) => {
-            if (String(dst).startsWith(inbox.dlq)) throw new Error("simulated crash before publish");
+            if (String(dst).startsWith(inbox.dlq)) throw new Error("simulated publish failure");
             return rename(src, dst);
           })
           : spyOn(fs, "writeFileSync").mockImplementation((path, data, opts) => {
@@ -191,7 +191,7 @@ for (const entry of ["sync", "connect"] as const) {
         expect(acks).toEqual([]);
         expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
         expect(jsonFiles(inbox.dlq)).toEqual([]);
-        if (fault === "crash-before-publish") expect(fs.readdirSync(inbox.dlq).some((f) => f.endsWith(".reason"))).toBe(false);
+        if (fault === "publish-throws") expect(fs.readdirSync(inbox.dlq).some((f) => f.endsWith(".reason"))).toBe(false);
         const logs = errors.mock.calls.flat().join("\n");
         expect(logs).toContain(body.id);
         expect(logs).toContain("local");
