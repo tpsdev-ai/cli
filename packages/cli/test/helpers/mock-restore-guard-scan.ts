@@ -23,23 +23,60 @@ function targetRoot(node: ts.Expression): string | undefined {
   return undefined;
 }
 
-function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>,
-  mockValue: (node: ts.Expression) => boolean): Finding | undefined {
-  const root = targetRoot(assignment.left);
-  const isMock = mockValue(assignment.right);
-  if (!root) {
-    if (!isMock) return undefined;
-    return { kind: "unclassified-assignment-target", detail: `cannot classify mock assignment target: ${assignment.left.getText()}` };
+/**
+ * Roots whose members are guarded globals: whatever the right-hand side, an
+ * assignment to one must go through patchShared. globalThis/Date/process/
+ * console match the runtime guard's snapshot objects; Bun is the runtime's
+ * own global object.
+ */
+const GUARDED_GLOBAL_ROOTS = new Set(["globalThis", "global", "Date", "process", "console", "Bun"]);
+
+/** Bare global identifiers that name a global the runtime guard snapshots. */
+const GUARDED_BARE_GLOBALS = new Set(["fetch", "setTimeout", "clearTimeout", "setInterval",
+  "clearInterval", "setImmediate", "clearImmediate", "queueMicrotask"]);
+
+/** True when the target is a guarded global or a member of an imported module object. */
+function guardedTarget(lhs: ts.Expression, moduleObjects: Map<string, string>, aliases: GuardedAliases): boolean {
+  const node = unwrap(lhs);
+  if (ts.isIdentifier(node)) return GUARDED_BARE_GLOBALS.has(node.text) && !resolveScope(node);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    if (isImportCall(rootExpression(node))) return true;
+    const rootNode = rootIdentifier(node);
+    if (rootNode === undefined) return false;
+    if (moduleObjects.has(rootNode.text)) return true;
+    const root = guardedRootOf(rootNode, aliases);
+    if (root === undefined) return false;
+    // process.env is the env-leak preload's object, not a guarded global.
+    return !(root === "process" && isEnvMemberOf(node, rootNode));
   }
-  const lhs = unwrap(assignment.left);
-  const shared = root === "globalThis" || root === "global" ||
-    (!ts.isIdentifier(lhs) && (moduleObjects.has(root) || ["console", "Date", "process"].includes(root)) &&
-      !(root === "process" && /^process\.env(?:$|\.|\[)/.test(lhs.getText())));
-  if (!isMock && !shared) return undefined;
-  return {
-    kind: "direct-assignment-needs-restore",
-    detail: `assignment to '${assignment.left.getText()}' requires patchShared; inline restoration is refused`,
-  };
+  return false;
+}
+
+/** True when the member of `rootNode` that `node` reaches through is `.env` or `["env"]`. */
+function isEnvMemberOf(node: ts.Expression, rootNode: ts.Identifier): boolean {
+  node = unwrap(node);
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  if (unwrap(node.expression) === rootNode) {
+    return ts.isPropertyAccessExpression(node) ? node.name.text === "env" :
+      ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === "env";
+  }
+  return isEnvMemberOf(node.expression, rootNode);
+}
+
+function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>,
+  aliases: GuardedAliases, mockValue: (node: ts.Expression) => boolean): Finding | undefined {
+  const detail = `assignment to '${assignment.left.getText()}' requires patchShared; inline restoration is refused`;
+  if (guardedTarget(assignment.left, moduleObjects, aliases)) {
+    return { kind: "direct-assignment-needs-restore", detail };
+  }
+  const root = targetRoot(assignment.left);
+  if (!root) {
+    const base = rootExpression(assignment.left);
+    if (base.kind === ts.SyntaxKind.ThisKeyword || ts.isObjectLiteralExpression(base) || ts.isArrayLiteralExpression(base)) return undefined;
+    return { kind: "unclassified-assignment-target", detail: `cannot classify assignment target: ${assignment.left.getText()}` };
+  }
+  if (!mockValue(assignment.right)) return undefined;
+  return { kind: "direct-assignment-needs-restore", detail };
 }
 
 function mockValues(file: ts.SourceFile, bindings: BunTestBindings): (node: ts.Expression) => boolean {
@@ -92,6 +129,199 @@ function mockValues(file: ts.SourceFile, bindings: BunTestBindings): (node: ts.E
     walk(file);
   }
   return value;
+}
+
+function bindingNames(name: ts.BindingName, out: Set<string>): void {
+  if (ts.isIdentifier(name)) out.add(name.text);
+  else for (const element of name.elements) if (ts.isBindingElement(element)) bindingNames(element.name, out);
+}
+
+function isFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaration {
+  return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node) || ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node);
+}
+
+function hoistedVars(node: ts.Node, out: Set<string>): void {
+  ts.forEachChild(node, (child) => {
+    if (isFunctionLike(child)) return;
+    if (ts.isVariableDeclarationList(child) && !(child.flags & ts.NodeFlags.BlockScoped)) {
+      for (const declaration of child.declarations) bindingNames(declaration.name, out);
+    }
+    hoistedVars(child, out);
+  });
+}
+
+function statementNames(statements: readonly ts.Statement[], out: Set<string>): void {
+  for (const statement of statements) {
+    if (ts.isVariableStatement(statement) && statement.declarationList.flags & ts.NodeFlags.BlockScoped) {
+      for (const declaration of statement.declarationList.declarations) bindingNames(declaration.name, out);
+    } else if ((ts.isFunctionDeclaration(statement) || ts.isClassDeclaration(statement) ||
+      ts.isEnumDeclaration(statement)) && statement.name) {
+      out.add(statement.name.text);
+    } else if (ts.isImportEqualsDeclaration(statement)) {
+      out.add(statement.name.text);
+    } else if (ts.isImportDeclaration(statement) && statement.importClause) {
+      const clause = statement.importClause;
+      if (clause.name) out.add(clause.name.text);
+      const named = clause.namedBindings;
+      if (named && ts.isNamespaceImport(named)) out.add(named.name.text);
+      else if (named) for (const element of named.elements) out.add(element.name.text);
+    }
+  }
+}
+
+/** The names a scope node itself declares: parameters, lexical statements, hoisted vars or a catch binding. */
+function scopeNames(node: ts.Node): Set<string> {
+  const out = new Set<string>();
+  if (ts.isSourceFile(node)) {
+    statementNames(node.statements, out);
+    hoistedVars(node, out);
+  } else if (ts.isBlock(node) || ts.isModuleBlock(node)) {
+    statementNames(node.statements, out);
+  } else if (ts.isCaseBlock(node)) {
+    for (const clause of node.clauses) statementNames(clause.statements, out);
+  } else if (isFunctionLike(node)) {
+    for (const parameter of node.parameters) bindingNames(parameter.name, out);
+    if (ts.isFunctionExpression(node) && node.name) out.add(node.name.text);
+    if (node.body) hoistedVars(node.body, out);
+  } else if (ts.isCatchClause(node)) {
+    if (node.variableDeclaration) bindingNames(node.variableDeclaration.name, out);
+  } else if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+    const initializer = node.initializer;
+    if (initializer && ts.isVariableDeclarationList(initializer)) {
+      for (const declaration of initializer.declarations) bindingNames(declaration.name, out);
+    }
+  } else if (ts.isClassExpression(node) && node.name) {
+    out.add(node.name.text);
+  }
+  return out;
+}
+
+/** The nearest enclosing scope that declares the identifier's name, or undefined when it names a global. */
+function resolveScope(id: ts.Identifier): ts.Node | undefined {
+  for (let node: ts.Node | undefined = id.parent; node; node = node.parent) {
+    if (scopeNames(node).has(id.text)) return node;
+  }
+  return undefined;
+}
+
+/** The innermost expression a member chain hangs off, without the members. */
+function rootExpression(node: ts.Expression): ts.Expression {
+  node = unwrap(node);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return rootExpression(node.expression);
+  return node;
+}
+
+function isImportCall(node: ts.Expression): boolean {
+  node = unwrap(node);
+  if (ts.isAwaitExpression(node)) return isImportCall(node.expression);
+  return ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+}
+
+function rootIdentifier(node: ts.Expression): ts.Identifier | undefined {
+  node = unwrap(node);
+  if (ts.isIdentifier(node)) return node;
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return rootIdentifier(node.expression);
+  return undefined;
+}
+
+type GuardedAliases = Map<ts.Node, Map<string, string>>;
+
+/** The guarded global root an identifier names, directly or through an alias of one. */
+function guardedRootOf(id: ts.Identifier, aliases: GuardedAliases): string | undefined {
+  const scope = resolveScope(id);
+  if (!scope) return GUARDED_GLOBAL_ROOTS.has(id.text) ? id.text : undefined;
+  return aliases.get(scope)?.get(id.text);
+}
+
+/** Variables initialised or assigned from a guarded global root, or from another such alias. */
+function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
+  const aliases: GuardedAliases = new Map();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const add = (target: ts.Identifier, value: ts.Expression): void => {
+      const source = rootIdentifier(value);
+      if (!source) return;
+      const root = guardedRootOf(source, aliases);
+      // process.env is the env-leak preload's object, not a guarded global.
+      if (root === "process" && isEnvMemberOf(value, source)) return;
+      const scope = resolveScope(target);
+      if (!root || !scope) return;
+      let names = aliases.get(scope);
+      if (!names) aliases.set(scope, (names = new Map()));
+      if (!names.has(target.text)) { names.set(target.text, root); changed = true; }
+    };
+    const walk = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) add(node.name, node.initializer);
+      else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+        const left = unwrap(node.left);
+        if (ts.isIdentifier(left)) add(left, node.right);
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(file);
+  }
+  return aliases;
+}
+
+/**
+ * Every identifier that names an imported module object or derives from one, by
+ * plain alias, destructuring or a property read. A member assignment on such an
+ * identifier is reported as a member assignment on the module object, so an
+ * alias no longer hides it.
+ */
+function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const statement of file.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
+    const clause = statement.importClause;
+    if (!clause || clause.isTypeOnly) continue;
+    if (clause.name) names.set(clause.name.text, statement.moduleSpecifier.text);
+    const namedBindings = clause.namedBindings;
+    if (!namedBindings) continue;
+    if (ts.isNamespaceImport(namedBindings)) {
+      names.set(namedBindings.name.text, statement.moduleSpecifier.text);
+    } else {
+      for (const element of namedBindings.elements) {
+        if (!element.isTypeOnly) names.set(element.name.text, statement.moduleSpecifier.text);
+      }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const derived = (node: ts.Expression): boolean => {
+      node = unwrap(node);
+      if (isImportCall(node)) return true;
+      if (ts.isIdentifier(node)) return names.has(node.text);
+      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return derived(node.expression);
+      return false;
+    };
+    const add = (name: string): void => {
+      if (!names.has(name)) { names.set(name, "<alias>"); changed = true; }
+    };
+    const walk = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        if (ts.isIdentifier(node.name)) {
+          if (derived(node.initializer)) add(node.name.text);
+        } else if ((ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name)) &&
+          derived(node.initializer)) {
+          const bound = new Set<string>();
+          bindingNames(node.name, bound);
+          for (const name of bound) add(name);
+        }
+      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+        node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+        const left = unwrap(node.left);
+        if (ts.isIdentifier(left) && derived(node.right)) add(left.text);
+      }
+      ts.forEachChild(node, walk);
+    };
+    walk(file);
+  }
+  return names;
 }
 
 /** The identifiers that make a file need the teardown. */
@@ -166,22 +396,8 @@ class BunTestBindings {
 export function analyzeSource(source: string): Finding[] {
   const file = ts.createSourceFile("guarded.test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bindings = new BunTestBindings(file);
-  const moduleObjects = new Map<string, string>();
-  for (const statement of file.statements) {
-    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
-    const clause = statement.importClause;
-    if (!clause || clause.isTypeOnly) continue;
-    if (clause.name) moduleObjects.set(clause.name.text, statement.moduleSpecifier.text);
-    const namedBindings = clause.namedBindings;
-    if (!namedBindings) continue;
-    if (ts.isNamespaceImport(namedBindings)) {
-      moduleObjects.set(namedBindings.name.text, statement.moduleSpecifier.text);
-    } else {
-      for (const element of namedBindings.elements) {
-        if (!element.isTypeOnly) moduleObjects.set(element.name.text, statement.moduleSpecifier.text);
-      }
-    }
-  }
+  const moduleObjects = moduleObjectNames(file);
+  const aliases = guardedAliasNames(file);
   const mockValue = mockValues(file, bindings);
   let moduleMocks = 0;
   const named = new Set([...bindings.named.values()].filter((name) => MOCK_API.has(name)));
@@ -189,7 +405,7 @@ export function analyzeSource(source: string): Finding[] {
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) return;
     if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
-      const finding = directAssignmentFinding(node, moduleObjects, mockValue);
+      const finding = directAssignmentFinding(node, moduleObjects, aliases, mockValue);
       if (finding) directAssignments.push(finding);
     }
     const exported = bindings.exportOf(node);
