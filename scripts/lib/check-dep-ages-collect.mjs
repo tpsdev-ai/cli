@@ -264,6 +264,8 @@ function matchGlobSegment(value, pattern) {
 function matchGlobDir(dir, pattern) {
   const value = pathSegments(dir);
   const glob = pathSegments(pattern);
+  // Bun's glob walk skips dot-directories; only a pattern without `*` or `?` reaches one.
+  if (/[*?]/.test(pattern) && value.some((segment) => segment.startsWith("."))) return false;
   function match(i, j) {
     if (j === glob.length) return i === value.length;
     if (glob[j] === "**") {

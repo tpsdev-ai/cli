@@ -340,6 +340,16 @@ it.each([
     ["packages/a/b", "packages/x/y"],
   ],
   ["a ? pattern", ["packages/?"], ["packages/a", "packages/ab"], ["packages/a"]],
+  ["a dot-directory under *", ["packages/*"], ["packages/a", "packages/.hidden", "packages/.b"], ["packages/a"]],
+  ["a dot-directory under ?", ["packages/?b"], ["packages/ab", "packages/.b"], ["packages/ab"]],
+  ["a dot-directory under **", ["packages/**"], ["packages/a/y", "packages/.x/y", "packages/a/.z/w"], ["packages/a/y"]],
+  ["a dot-directory named by a literal", ["packages/.hidden"], ["packages/.hidden", "packages/a"], ["packages/.hidden"]],
+  [
+    "a dot-directory named by a literal beside *",
+    ["packages/.hidden", "packages/*"],
+    ["packages/.hidden", "packages/a"],
+    ["packages/.hidden", "packages/a"],
+  ],
   ["a ./ prefix and trailing slash", ["./packages/*/"], ["packages/a", "packages/a/b"], ["packages/a"]],
   ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], ["packages/x", "packages/y"]],
   [

@@ -204,6 +204,21 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
+  it("refuses an excluded name pinned exactly only in a dot-directory under a * workspace pattern", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
+      writeManifest(root, join("packages", "a", "package.json"), { name: "a" });
+      writeManifest(root, join("packages", ".hidden", "package.json"), {
+        name: "hidden", dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain(
+        "packages/.hidden/package.json: `dep-a` is declared exactly here, but this manifest is neither the root package.json nor a workspace",
+      );
+      expect(output).not.toContain("Checking");
+    });
+  });
+
   it("fails with its path when a workspace manifest cannot be read or parsed", () => {
     for (const [label, content, message] of [
       ["unreadable", "", "cannot inspect"],
