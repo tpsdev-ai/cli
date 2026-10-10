@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { BridgeCore } from "../src/bridge/core.js";
 import type { BridgeAdapter } from "../src/bridge/adapter.js";
 import { runDashboard } from "../src/commands/roster.js";
-import { startFetchFlair } from "./helpers/fetch-flair.js";
+import { startUnverifiedFetchFlair } from "./helpers/fetch-flair.js";
 
 afterEach(() => {
   mock.restore();
@@ -69,7 +69,7 @@ describe("cli#486 — configured identity, no anvil default", () => {
   });
 
   test("roster dashboard refuses without a configured viewer and runs when set", async () => {
-    const stub = startFetchFlair({});
+    const stub = startUnverifiedFetchFlair({});
     const requests: string[] = [];
     const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = new URL(typeof input === "string" || input instanceof URL ? String(input) : input.url);
