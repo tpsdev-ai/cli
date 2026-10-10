@@ -242,9 +242,11 @@ function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
   while (changed) {
     changed = false;
     const add = (target: ts.Identifier, value: ts.Expression): void => {
-      const source = unwrap(value);
-      if (!ts.isIdentifier(source)) return;
+      const source = rootIdentifier(value);
+      if (!source) return;
       const root = guardedRootOf(source, aliases);
+      // process.env is the env-leak preload's object, not a guarded global.
+      if (root === "process" && isEnvMemberOf(value, source)) return;
       const scope = resolveScope(target);
       if (!root || !scope) return;
       let names = aliases.get(scope);

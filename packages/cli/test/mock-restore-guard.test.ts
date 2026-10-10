@@ -56,6 +56,7 @@ describe("mock restore guard (cli#555)", () => {
     "shadow-in-other-scope-leaked.fixture.ts",
     "global-alias-leaked.fixture.ts",
     "process-alias-leaked.fixture.ts",
+    "global-member-alias-leaked.fixture.ts",
     "dynamic-import-module-patched.fixture.ts",
     "nested-destructured-module-patched.fixture.ts",
     "process-cast-non-env-leaked.fixture.ts",
