@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
@@ -43,14 +43,31 @@ describe("sandboxHomeBase", () => {
       mkdirSync(dir);
       mkdirSync(next);
       chmodSync(dir, 0o500);
+      let writable = false;
       try {
-        rmSync(mkdtempSync(join(dir, "w-")));
-        console.warn("directory is still writable (running as root?), case skipped");
-        return;
+        rmSync(mkdtempSync(join(dir, "w-")), { recursive: true });
+        writable = true;
       } catch {}
+      if (writable) {
+        console.warn("a 0o500 directory is still writable (running as root?), case skipped");
+        return;
+      }
       expect(sandboxHomeBase([dir, next])).toBe(realpathSync(next));
     } finally {
       chmodSync(dir, 0o700);
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("skips a candidate that is a regular file and returns the next writable directory", () => {
+    const parent = mkdtempSync(join(sandboxHomeBase(), "lg-file-"));
+    try {
+      const file = join(parent, "file");
+      const next = join(parent, "dir");
+      writeFileSync(file, "");
+      mkdirSync(next);
+      expect(sandboxHomeBase([file, next])).toBe(realpathSync(next));
+    } finally {
       rmSync(parent, { recursive: true, force: true });
     }
   });
