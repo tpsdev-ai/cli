@@ -448,8 +448,9 @@ export function workspacePatterns(workspaces) {
  * `*`, `?`, `**`, `[...]` and `{a,b}`. A `!`-negated pattern removes an earlier
  * glob match it matches; a literal directory is never removed.
  *
- * @returns {{ applied: Set<string>, error: string | null }} `error` names a
- *   `workspaces` shape the audit cannot read, and `applied` then holds only the root.
+ * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
+ *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
+ *   is then incomplete and must not be used. `pattern` is set only for a pattern.
  */
 export function appliedManifestPaths(manifests) {
   const applied = new Set(["package.json"]);
@@ -474,7 +475,9 @@ export function appliedManifestPaths(manifests) {
   }
   for (const glob of globs) {
     const reason = globError(glob);
-    if (reason !== null) return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}` };
+    if (reason !== null) {
+      return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}`, pattern: glob };
+    }
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);
@@ -513,13 +516,13 @@ export function appliedManifestPaths(manifests) {
  *             | {kind: "resolution", name: string, path: string, key: string}
  *             | {kind: "unused-manifest", name: string, path: string}
  *             | {kind: "unpinned", name: string}
- *             | {kind: "workspaces", message: string}>
+ *             | {kind: "workspaces", message: string, pattern?: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
   const manifests = packageJsons ?? [];
-  const { applied, error: workspacesError } = appliedManifestPaths(manifests);
-  if (workspacesError !== null) return [{ kind: "workspaces", message: workspacesError }];
+  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests);
+  if (workspacesError !== null) return [{ kind: "workspaces", message: workspacesError, pattern }];
   for (const name of excludes ?? []) {
     let covered = false;
     for (const key of (exceptionEntries ?? new Map()).keys()) {

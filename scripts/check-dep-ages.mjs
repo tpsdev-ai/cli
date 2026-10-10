@@ -25,7 +25,7 @@
  *       unexpired exception or an exact declaration Bun applies, an excluded name pinned
  *       exactly only in a manifest Bun does not apply, an excluded name in a nested
  *       package.json's overrides or as a resolutions key, an unreadable `workspaces`
- *       shape in the root package.json, no external resolutions, refused
+ *       shape or pattern in the root package.json, no external resolutions, refused
  *       CI overrides, unexpected arguments, or registry fetch failures
  *
  */
@@ -261,7 +261,9 @@ if (excludeNames.length > 0) {
           `    the root package.json \`workspaces\` could not be read: ${problem.message}.`,
         );
         console.error(
-          "        Remedy: declare `workspaces` as an array of strings, or as an object with a `packages` array of strings, which is what Bun reads.",
+          problem.pattern !== undefined
+            ? `        Remedy: fix or remove the \`workspaces\` pattern \`${problem.pattern}\`.`
+            : "        Remedy: declare `workspaces` as an array of strings, or as an object with a `packages` array of strings, which is what Bun reads.",
         );
       } else if (problem.kind === "uncovered") {
         const why = problem.error
