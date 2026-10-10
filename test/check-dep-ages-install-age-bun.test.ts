@@ -407,6 +407,24 @@ it.each([
     ["packages/x", "packages/y"],
     ["packages/x"],
   ],
+  [
+    "a negated wildcard pattern",
+    ["!packages/*"],
+    ["packages/a", "packages/b", "tools/t"],
+    ["tools/t"],
+  ],
+  [
+    "a positive pattern beside its negated wildcard",
+    ["packages/*", "!packages/*"],
+    ["packages/a", "packages/b", "tools/t"],
+    ["tools/t"],
+  ],
+  [
+    "a negated literal pattern, without a wildcard",
+    ["!packages/x"],
+    ["packages/x", "packages/y", "tools/t"],
+    [],
+  ],
 ] as const)(
   "the gate applies the same workspaces real Bun installs for %s",
   async (_label, workspaces, dirs, expected) => {

@@ -396,17 +396,35 @@ function matchSegments(value, glob) {
   return match(0, 0);
 }
 
-/** Whether a workspace glob matches a manifest's directory. */
-function matchGlobDir(dir, pattern) {
-  const expanded = expandBraces(pattern);
-  if (expanded === null) return false;
+/**
+ * Whether a workspace glob matches a manifest's directory. A `negated` pattern is
+ * Bun's `!`-form: the walker negates its FIRST segment only, so the directory must
+ * match every segment after the first and its first segment must match none of the
+ * first segment's brace alternatives.
+ */
+function matchGlobDir(dir, pattern, negated = false) {
   const value = pathSegments(dir);
   // Bun's glob walk skips dot-directories; only a pattern without glob syntax reaches one.
-  if (isGlobPattern(pattern) && value.some((segment) => segment.startsWith("."))) return false;
-  for (const candidate of expanded) {
-    if (matchSegments(value, pathSegments(candidate))) return true;
+  if ((negated || isGlobPattern(pattern)) && value.some((segment) => segment.startsWith("."))) return false;
+  const expanded = expandBraces(pattern);
+  if (expanded === null) return false;
+  if (!negated) {
+    for (const candidate of expanded) {
+      if (matchSegments(value, pathSegments(candidate))) return true;
+    }
+    return false;
   }
-  return false;
+  const segments = pathSegments(pattern);
+  if (segments.length === 0 || value.length === 0) return false;
+  const first = expandBraces(segments[0]);
+  if (first === null || first.some((alternative) => matchGlobSegment(value[0], alternative))) {
+    return false;
+  }
+  const rest = segments.slice(1);
+  if (rest.length === 0) return value.length === 1;
+  const alternatives = expandBraces(rest.join("/"));
+  if (alternatives === null) return false;
+  return alternatives.some((alternative) => matchSegments(value.slice(1), pathSegments(alternative)));
 }
 
 /**
@@ -446,7 +464,9 @@ export function workspacePatterns(workspaces) {
  * manifests of the directories the root manifest's `workspaces` patterns name.
  * A pattern without glob syntax is a literal directory; a glob one is walked with
  * `*`, `?`, `**`, `[...]` and `{a,b}`. A `!`-negated pattern removes an earlier
- * glob match it matches; a literal directory is never removed.
+ * glob match it matches and, mirroring Bun's walker, contributes matches of its own:
+ * the directories whose first segment is outside its negated first segment and whose
+ * remaining segments match (cli#590). A literal directory is never removed.
  *
  * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
  *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
@@ -481,9 +501,8 @@ export function appliedManifestPaths(manifests) {
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);
-    if (negated) continue; // a negated pattern removes an earlier glob match, and adds none of its own
     for (const [dir, path] of byDir) {
-      if (!matchGlobDir(dir, inner)) continue;
+      if (!matchGlobDir(dir, inner, negated)) continue;
       const excluded = globs.slice(i + 1).some((later) => {
         const removed = stripNegation(later);
         return removed.negated && matchGlobDir(dir, removed.inner);
