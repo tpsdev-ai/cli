@@ -60,11 +60,18 @@ describe("mock restore guard (cli#555)", () => {
     "dynamic-import-module-patched.fixture.ts",
     "nested-destructured-module-patched.fixture.ts",
     "process-cast-non-env-leaked.fixture.ts",
+    "guarded-alias-rebound-before-leaked.fixture.ts",
   ]) {
     test(`reports ${name} (red fixture)`, () => {
       expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
     });
   }
+
+  test("reports a guarded member assignment only before the alias is rebound", () => {
+    expect(findingsFor("guarded-alias-rebound-before-leaked.fixture.ts")).toEqual([
+      { kind: "direct-assignment-needs-restore", detail: "assignment to 'g.fetch' requires patchShared; inline restoration is refused" },
+    ]);
+  });
 
   test("reports call-rooted-global-leaked.fixture.ts (red fixture)", () => {
     expect(kindsFor("call-rooted-global-leaked.fixture.ts")).toContain("unclassified-assignment-target");
@@ -96,6 +103,8 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     "intermediate-const-local.fixture.ts",
     "process-env-cast-exempt.fixture.ts",
     "process-env-computed-exempt.fixture.ts",
+    "shadow-parameter-cleared.fixture.ts",
+    "guarded-alias-rebound-cleared.fixture.ts",
   ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);

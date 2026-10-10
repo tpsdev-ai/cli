@@ -36,15 +36,15 @@ const GUARDED_BARE_GLOBALS = new Set(["fetch", "setTimeout", "clearTimeout", "se
   "clearInterval", "setImmediate", "clearImmediate", "queueMicrotask"]);
 
 /** True when the target is a guarded global or a member of an imported module object. */
-function guardedTarget(lhs: ts.Expression, moduleObjects: Map<string, string>, aliases: GuardedAliases): boolean {
+function guardedTarget(lhs: ts.Expression, moduleAliases: AliasTable, guardedAliases: AliasTable): boolean {
   const node = unwrap(lhs);
   if (ts.isIdentifier(node)) return GUARDED_BARE_GLOBALS.has(node.text) && !resolveScope(node);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     if (isImportCall(rootExpression(node))) return true;
     const rootNode = rootIdentifier(node);
     if (rootNode === undefined) return false;
-    if (moduleObjects.has(rootNode.text)) return true;
-    const root = guardedRootOf(rootNode, aliases);
+    if (aliasRootAt(moduleAliases, rootNode) !== undefined) return true;
+    const root = guardedRootOf(rootNode, guardedAliases);
     if (root === undefined) return false;
     // process.env is the env-leak preload's object, not a guarded global.
     return !(root === "process" && isEnvMemberOf(node, rootNode));
@@ -63,10 +63,10 @@ function isEnvMemberOf(node: ts.Expression, rootNode: ts.Identifier): boolean {
   return isEnvMemberOf(node.expression, rootNode);
 }
 
-function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>,
-  aliases: GuardedAliases, mockValue: (node: ts.Expression) => boolean): Finding | undefined {
+function directAssignmentFinding(assignment: ts.BinaryExpression, moduleAliases: AliasTable,
+  guardedAliases: AliasTable, mockValue: (node: ts.Expression) => boolean): Finding | undefined {
   const detail = `assignment to '${assignment.left.getText()}' requires patchShared; inline restoration is refused`;
-  if (guardedTarget(assignment.left, moduleObjects, aliases)) {
+  if (guardedTarget(assignment.left, moduleAliases, guardedAliases)) {
     return { kind: "direct-assignment-needs-restore", detail };
   }
   const root = targetRoot(assignment.left);
@@ -226,102 +226,130 @@ function rootIdentifier(node: ts.Expression): ts.Identifier | undefined {
   return undefined;
 }
 
-type GuardedAliases = Map<ts.Node, Map<string, string>>;
+/** One binding's alias history in source order; a `root` of undefined ends the alias. */
+type AliasEvents = { at: number; root: string | undefined }[];
 
-/** The guarded global root an identifier names, directly or through an alias of one. */
-function guardedRootOf(id: ts.Identifier, aliases: GuardedAliases): string | undefined {
-  const scope = resolveScope(id);
-  if (!scope) return GUARDED_GLOBAL_ROOTS.has(id.text) ? id.text : undefined;
-  return aliases.get(scope)?.get(id.text);
+/**
+ * Alias events keyed by the scope that declares the binding and the binding's
+ * name. A read takes the last event at or before its position, so an assignment
+ * that rebinds the name ends the alias for the reads after it.
+ */
+type AliasTable = Map<ts.Node, Map<string, AliasEvents>>;
+
+function aliasEvents(table: AliasTable, scope: ts.Node, name: string): AliasEvents {
+  let byName = table.get(scope);
+  if (!byName) table.set(scope, (byName = new Map()));
+  let events = byName.get(name);
+  if (!events) byName.set(name, (events = []));
+  return events;
 }
 
-/** Variables initialised or assigned from a guarded global root, or from another such alias. */
-function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
-  const aliases: GuardedAliases = new Map();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    const add = (target: ts.Identifier, value: ts.Expression): void => {
+/** The alias root a binding names at this identifier's position, or undefined. */
+function aliasRootAt(table: AliasTable, id: ts.Identifier): string | undefined {
+  const scope = resolveScope(id);
+  if (!scope) return undefined;
+  const events = table.get(scope)?.get(id.text);
+  if (!events) return undefined;
+  const at = id.getStart();
+  let root: string | undefined;
+  for (const event of events) if (event.at <= at) root = event.root;
+  return root;
+}
+
+/** Establishes the alias when `root` is set; ends it otherwise, or is a no-op when it never began. */
+function recordAlias(table: AliasTable, target: ts.Identifier, root: string | undefined): void {
+  const scope = resolveScope(target);
+  if (!scope) return;
+  if (root === undefined && !table.get(scope)?.get(target.text)?.length) return;
+  aliasEvents(table, scope, target.text).push({ at: target.getStart(), root });
+}
+
+/** Every identifier a binding pattern introduces, nested patterns included. */
+function bindingIdentifiers(name: ts.BindingName, out: ts.Identifier[]): void {
+  if (ts.isIdentifier(name)) out.push(name);
+  else for (const element of name.elements) if (ts.isBindingElement(element)) bindingIdentifiers(element.name, out);
+}
+
+/** The guarded global root an identifier names, directly or through an alias of one. */
+function guardedRootOf(id: ts.Identifier, aliases: AliasTable): string | undefined {
+  const root = aliasRootAt(aliases, id);
+  if (root !== undefined) return root;
+  return resolveScope(id) === undefined && GUARDED_GLOBAL_ROOTS.has(id.text) ? id.text : undefined;
+}
+
+/** The bindings that name a guarded global root, directly or through another such binding. */
+function guardedAliasNames(file: ts.SourceFile): AliasTable {
+  const aliases: AliasTable = new Map();
+  const walk = (node: ts.Node): void => {
+    let target: ts.Identifier | undefined;
+    let value: ts.Expression | undefined;
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+      target = node.name;
+      value = node.initializer;
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const left = unwrap(node.left);
+      if (ts.isIdentifier(left)) { target = left; value = node.right; }
+    }
+    if (target && value) {
       const source = rootIdentifier(value);
-      if (!source) return;
-      const root = guardedRootOf(source, aliases);
+      const root = source ? guardedRootOf(source, aliases) : undefined;
       // process.env is the env-leak preload's object, not a guarded global.
-      if (root === "process" && isEnvMemberOf(value, source)) return;
-      const scope = resolveScope(target);
-      if (!root || !scope) return;
-      let names = aliases.get(scope);
-      if (!names) aliases.set(scope, (names = new Map()));
-      if (!names.has(target.text)) { names.set(target.text, root); changed = true; }
-    };
-    const walk = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) add(node.name, node.initializer);
-      else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-        const left = unwrap(node.left);
-        if (ts.isIdentifier(left)) add(left, node.right);
-      }
-      ts.forEachChild(node, walk);
-    };
-    walk(file);
-  }
+      recordAlias(aliases, target, root === "process" && source && isEnvMemberOf(value, source) ? undefined : root);
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(file);
   return aliases;
 }
 
 /**
- * Every identifier that names an imported module object or derives from one, by
- * plain alias, destructuring or a property read. A member assignment on such an
- * identifier is reported as a member assignment on the module object, so an
- * alias no longer hides it.
+ * Every binding that names an imported module object or derives from one, by
+ * plain alias, destructuring or a property read. A member assignment on such a
+ * binding is reported as a member assignment on the module object, so an alias
+ * no longer hides it, and a rebinding to a local value ends the alias.
  */
-function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
-  const names = new Map<string, string>();
+function moduleObjectAliases(file: ts.SourceFile): AliasTable {
+  const aliases: AliasTable = new Map();
   for (const statement of file.statements) {
     if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
     const clause = statement.importClause;
     if (!clause || clause.isTypeOnly) continue;
-    if (clause.name) names.set(clause.name.text, statement.moduleSpecifier.text);
+    const specifier = statement.moduleSpecifier.text;
+    if (clause.name) recordAlias(aliases, clause.name, specifier);
     const namedBindings = clause.namedBindings;
     if (!namedBindings) continue;
     if (ts.isNamespaceImport(namedBindings)) {
-      names.set(namedBindings.name.text, statement.moduleSpecifier.text);
+      recordAlias(aliases, namedBindings.name, specifier);
     } else {
-      for (const element of namedBindings.elements) {
-        if (!element.isTypeOnly) names.set(element.name.text, statement.moduleSpecifier.text);
-      }
+      for (const element of namedBindings.elements) if (!element.isTypeOnly) recordAlias(aliases, element.name, specifier);
     }
   }
-  let changed = true;
-  while (changed) {
-    changed = false;
-    const derived = (node: ts.Expression): boolean => {
-      node = unwrap(node);
-      if (isImportCall(node)) return true;
-      if (ts.isIdentifier(node)) return names.has(node.text);
-      if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return derived(node.expression);
-      return false;
-    };
-    const add = (name: string): void => {
-      if (!names.has(name)) { names.set(name, "<alias>"); changed = true; }
-    };
-    const walk = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && node.initializer) {
-        if (ts.isIdentifier(node.name)) {
-          if (derived(node.initializer)) add(node.name.text);
-        } else if ((ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name)) &&
-          derived(node.initializer)) {
-          const bound = new Set<string>();
-          bindingNames(node.name, bound);
-          for (const name of bound) add(name);
-        }
-      } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
-        node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
-        const left = unwrap(node.left);
-        if (ts.isIdentifier(left) && derived(node.right)) add(left.text);
+  const derived = (node: ts.Expression): boolean => {
+    node = unwrap(node);
+    if (isImportCall(node)) return true;
+    if (ts.isIdentifier(node)) return aliasRootAt(aliases, node) !== undefined;
+    if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return derived(node.expression);
+    return false;
+  };
+  const walk = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node) && node.initializer) {
+      if (ts.isIdentifier(node.name)) {
+        recordAlias(aliases, node.name, derived(node.initializer) ? "<alias>" : undefined);
+      } else if ((ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name)) &&
+        derived(node.initializer)) {
+        const bound: ts.Identifier[] = [];
+        bindingIdentifiers(node.name, bound);
+        for (const name of bound) recordAlias(aliases, name, "<alias>");
       }
-      ts.forEachChild(node, walk);
-    };
-    walk(file);
-  }
-  return names;
+    } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
+      const left = unwrap(node.left);
+      if (ts.isIdentifier(left)) recordAlias(aliases, left, derived(node.right) ? "<alias>" : undefined);
+    }
+    ts.forEachChild(node, walk);
+  };
+  walk(file);
+  return aliases;
 }
 
 /** The identifiers that make a file need the teardown. */
@@ -396,8 +424,8 @@ class BunTestBindings {
 export function analyzeSource(source: string): Finding[] {
   const file = ts.createSourceFile("guarded.test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const bindings = new BunTestBindings(file);
-  const moduleObjects = moduleObjectNames(file);
-  const aliases = guardedAliasNames(file);
+  const moduleAliases = moduleObjectAliases(file);
+  const guardedAliases = guardedAliasNames(file);
   const mockValue = mockValues(file, bindings);
   let moduleMocks = 0;
   const named = new Set([...bindings.named.values()].filter((name) => MOCK_API.has(name)));
@@ -405,7 +433,7 @@ export function analyzeSource(source: string): Finding[] {
   const visit = (node: ts.Node): void => {
     if (ts.isImportDeclaration(node)) return;
     if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment && node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
-      const finding = directAssignmentFinding(node, moduleObjects, aliases, mockValue);
+      const finding = directAssignmentFinding(node, moduleAliases, guardedAliases, mockValue);
       if (finding) directAssignments.push(finding);
     }
     const exported = bindings.exportOf(node);
