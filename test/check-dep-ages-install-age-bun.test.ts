@@ -332,14 +332,29 @@ it.each([
   60000,
 );
 
-it(
-  "the gate applies the same workspaces real Bun installs for negated and nested ** patterns",
-  async () => {
+it.each([
+  [
+    "negated and nested ** patterns",
+    ["packages/**", "!packages/x", "!packages/c"],
+    ["packages/a/b", "packages/c", "packages/x", "packages/x/y", "tools/t"],
+    ["packages/a/b", "packages/x/y"],
+  ],
+  ["a ? pattern", ["packages/?"], ["packages/a", "packages/ab"], ["packages/a"]],
+  ["a ./ prefix and trailing slash", ["./packages/*/"], ["packages/a", "packages/a/b"], ["packages/a"]],
+  ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], ["packages/x", "packages/y"]],
+  [
+    "a positive pattern after a negation",
+    ["packages/*", "!packages/x", "packages/x"],
+    ["packages/x", "packages/y"],
+    ["packages/x", "packages/y"],
+  ],
+] as const)(
+  "the gate applies the same workspaces real Bun installs for %s",
+  async (_label, workspaces, dirs, expected) => {
     const root = mkdtempSync(join(tmpdir(), "age-workspaces-"));
     try {
-      const dirs = ["packages/a/b", "packages/c", "packages/x", "packages/x/y", "tools/t"];
       const manifests: Record<string, unknown> = {
-        "package.json": { name: "fixture", workspaces: ["packages/**", "!packages/x", "!packages/c"] },
+        "package.json": { name: "fixture", workspaces: [...workspaces] },
       };
       for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll("/", "-")}` };
       const project = writeProject(root, manifests, "http://127.0.0.1:1");
@@ -350,7 +365,7 @@ it(
         .filter((key) => key !== "")
         .map((key) => `${key}/package.json`)
         .sort();
-      expect(installed).toEqual(["packages/a/b/package.json", "packages/x/y/package.json"]);
+      expect(installed).toEqual(expected.map((dir) => `${dir}/package.json`));
 
       const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
       const gate = [...appliedManifestPaths(packageJsons)].filter((path) => path !== "package.json").sort();

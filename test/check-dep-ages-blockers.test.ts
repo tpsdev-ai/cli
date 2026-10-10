@@ -176,7 +176,8 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
-  // Each row matches what a real `bun install` (1.3.10) installs for that layout.
+  // Also run against real Bun in check-dep-ages-install-age-bun.test.ts: the ** row, both ? rows, the ./ row
+  // and both rows that put a negation before or after a positive pattern. The other rows are expectations only.
   it.each([
     ["a ** pattern reaches a nested directory", ["packages/**"], "packages/a/b", true],
     ["a negation removes a * match", ["packages/*", "!packages/x"], "packages/x", false],
