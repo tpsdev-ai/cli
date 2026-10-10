@@ -101,8 +101,11 @@ test("refused write and no Agent row: exits non-zero, prints no success, names a
     expect(res.stderr).toContain(id);
     expect(res.stderr).toContain(fake.url);
     expect(res.stderr).toContain("no Agent row exists");
-    expect(res.stderr).toContain("flair agent remove");
-    expect(res.stderr).toContain("flair agent add");
+    expect(res.stderr).toContain("seed or key update failed");
+    expect(res.stderr).toContain("flair#2266");
+    expect(res.stderr).toContain(`flair agent add ${id}`);
+    expect(res.stderr).toContain(`flair agent rotate-key ${id}`);
+    expect(res.stderr).toContain(join(".tps", "identity"));
   } finally {
     fake.stop();
   }
@@ -206,7 +209,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
       expect(res.stdout).not.toContain("✅");
       expect(res.stderr).toContain(id);
       expect(res.stderr).toContain(baseUrl);
-      expect(res.stderr).toContain("flair agent remove");
+      expect(res.stderr).toContain("flair#2266");
       // Independently of the CLI's own read-back: the real Flair stored no row.
       const record = await fetch(`${baseUrl}/Agent/${encodeURIComponent(id)}`, {
         headers: { Authorization: `Basic ${Buffer.from(admin).toString("base64")}` },
