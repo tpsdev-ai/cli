@@ -316,6 +316,9 @@ export function checkSignerInventory(
 
 const STUB_FLAIR = "packages/cli/test/helpers/stub-flair.ts";
 const VERIFYING_HELPERS = new Set(["startStubFlair", "installStubFlairFetch", "stubFlairHandler"]);
+const REFUSAL_MATCHERS = new Set(["toBe", "toEqual", "toStrictEqual", "toContain", "toMatch", "toMatchObject", "toThrow", "toHaveProperty"]);
+const TEST_ROOTS = new Set(["test", "it", "describe"]);
+const RUNNING_MODIFIERS = new Set(["only", "concurrent", "serial"]);
 
 /**
  * Why `source` (the file at repo-relative `testFile`) does not drive a signer
@@ -353,22 +356,59 @@ export function verifyingStubProblem(testFile: string, source: string): string |
     while (ts.isPropertyAccessExpression(e) || ts.isCallExpression(e)) e = e.expression;
     return ts.isIdentifier(e) && e.text === "expect";
   };
-  const insideExpect = (node: ts.Node): boolean => {
-    for (let n: ts.Node | undefined = node; n; n = n.parent) {
-      if (ts.isCallExpression(n) && rootedAtExpect(n)) return true;
+  /** Property names along a call chain, outermost first, with the root identifier and the modifier calls. */
+  const chainOf = (start: ts.Expression): { root: string; names: string[]; mods: ts.CallExpression[] } => {
+    const names: string[] = [];
+    const mods: ts.CallExpression[] = [];
+    let e = start;
+    while (ts.isPropertyAccessExpression(e) || ts.isCallExpression(e)) {
+      if (ts.isPropertyAccessExpression(e)) names.unshift(e.name.text);
+      else mods.unshift(e);
+      e = e.expression;
+    }
+    return { root: ts.isIdentifier(e) ? e.text : "", names, mods };
+  };
+  /** A test or describe call Bun will not run, or whose modifiers are not recognised. */
+  const notRun = (call: ts.CallExpression): boolean => {
+    const { root, names, mods } = chainOf(call.expression);
+    if (/^x(test|it|describe)$/.test(root)) return true;
+    if (!TEST_ROOTS.has(root)) return false;
+    let cond = 0;
+    for (const name of names) {
+      if (RUNNING_MODIFIERS.has(name)) continue;
+      const arg = name === "skipIf" || name === "if" ? mods[cond++]?.arguments[0] : undefined;
+      const runs = (name === "skipIf" && arg?.kind === ts.SyntaxKind.FalseKeyword) || (name === "if" && arg?.kind === ts.SyntaxKind.TrueKeyword);
+      if (!runs) return true;
     }
     return false;
   };
+  /** Inside an expect whose matcher is a listed one and whose chain has no `.not`. */
+  const positiveRefusal = (node: ts.Node): boolean => {
+    let matched = false;
+    for (let n: ts.Node | undefined = node; n; n = n.parent) {
+      if (!ts.isCallExpression(n) || !rootedAtExpect(n)) continue;
+      const { names } = chainOf(n.expression);
+      if (names.includes("not")) return false;
+      if (names.some((name) => REFUSAL_MATCHERS.has(name))) matched = true;
+    }
+    return matched;
+  };
+  let skipped = false;
   const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && notRun(node)) {
+      skipped = true;
+      return;
+    }
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && locals.has(node.expression.text)) called = true;
     const refusalText =
       (ts.isNumericLiteral(node) && /^(401|403)$/.test(node.text)) ||
       ((ts.isStringLiteralLike(node) || ts.isTemplateLiteralToken(node)) && /\b(401|403)\b|AccessViolation/.test(node.text));
-    if (refusalText && insideExpect(node)) refusal = true;
+    if (refusalText && positiveRefusal(node)) refusal = true;
     ts.forEachChild(node, visit);
   };
   visit(sf);
-  if (!called) return `${testFile} imports a verifying helper but never calls it`;
-  if (!refusal) return `${testFile} has no refusal assertion (an expect naming 401, 403 or AccessViolation)`;
+  const why = skipped ? " outside skipped or unclassifiable tests" : "";
+  if (!called) return `${testFile} imports a verifying helper but never calls it${why}`;
+  if (!refusal) return `${testFile} has no refusal assertion (an expect naming 401, 403 or AccessViolation)${why}`;
   return null;
 }

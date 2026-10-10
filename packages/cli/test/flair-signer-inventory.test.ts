@@ -177,4 +177,32 @@ describe("cli#554 — a mapped test must drive the verifying stub (mutation on a
     const source = real.replace(/\b(401|403)\b|AccessViolation/g, "200");
     expect(verifyingStubProblem(FILE, source)).toContain("no refusal assertion");
   });
+
+  const IMPORT = 'import { startStubFlair } from "./helpers/stub-flair.js";';
+  const body = "{ startStubFlair(); expect(res.status).toBe(403); }";
+  const accepted = (wrapper: string) => verifyingStubProblem(FILE, `${IMPORT}\n${wrapper}`);
+
+  test("a stub call and refusal inside a running test are accepted", () => {
+    expect(accepted(`test("x", async () => ${body});`)).toBeNull();
+    expect(accepted(`describe("s", () => { test("x", async () => ${body}); });`)).toBeNull();
+    expect(accepted(`test.skipIf(false)("x", async () => ${body});`)).toBeNull();
+  });
+
+  test.each([
+    ["test.skip", `test.skip("x", async () => ${body});`],
+    ["it.skip", `it.skip("x", async () => ${body});`],
+    ["describe.skip", `describe.skip("s", () => { test("x", async () => ${body}); });`],
+    ["test.todo", `test.todo("x", async () => ${body});`],
+    ["xtest", `xtest("x", async () => ${body});`],
+    ["test.skipIf(true)", `test.skipIf(true)("x", async () => ${body});`],
+    ["test.skipIf(cond)", `test.skipIf(cond)("x", async () => ${body});`],
+    ["test.if(false)", `test.if(false)("x", async () => ${body});`],
+  ])("a stub call and refusal inside %s are rejected", (_label, wrapper) => {
+    expect(accepted(wrapper)).toContain("outside skipped or unclassifiable tests");
+  });
+
+  test("a negated status assertion is not a refusal", () => {
+    const source = `${IMPORT}\ntest("x", async () => { startStubFlair(); expect(res.status).not.toBe(403); });`;
+    expect(verifyingStubProblem(FILE, source)).toContain("no refusal assertion");
+  });
 });
