@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { auditExcludes } from "../scripts/lib/check-dep-ages-collect.mjs";
 
@@ -136,6 +136,130 @@ describe("excluded declarations", () => {
     },
   );
 });
+
+describe("the exclusion audit counts only the declarations Bun applies", () => {
+  it("refuses an excluded name pinned exactly only in a manifest Bun does not apply", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
+      writeManifest(root, join("packages", "w", "package.json"), { name: "w" });
+      writeManifest(root, join("tools", "helper", "package.json"), {
+        name: "helper", dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain(
+        "tools/helper/package.json: `dep-a` is declared exactly here, but this manifest is neither the root package.json nor a workspace",
+      );
+      expect(output).not.toContain("Checking");
+    });
+  });
+
+  it.each([
+    ["the root dependency", { workspaces: ["packages/*"], dependencies: { "dep-a": "1.0.0" } }],
+    ["a root override", { workspaces: ["packages/*"], overrides: { "dep-a": "1.0.0" } }],
+  ])("accepts a pin in %s", (_label, rootJson) => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", ...(rootJson as object) });
+      writeManifest(root, join("packages", "w", "package.json"), { name: "w" });
+      writeManifest(root, join("tools", "helper", "package.json"), { name: "helper" });
+      expect(runGate(root)).toContain("bun.lock is not parseable");
+    });
+  });
+
+  it("accepts a pin in a workspace's dependencies", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
+      writeManifest(root, join("packages", "w", "package.json"), {
+        name: "w", dependencies: { "dep-a": "1.0.0" },
+      });
+      writeManifest(root, join("tools", "helper", "package.json"), { name: "helper" });
+      expect(runGate(root)).toContain("bun.lock is not parseable");
+    });
+  });
+
+  // Also run against real Bun in check-dep-ages-install-age-bun.test.ts: the ** row, both ? rows, the ./ row
+  // and both rows that put a negation before or after a positive pattern. The other rows are expectations only.
+  it.each([
+    ["a ** pattern reaches a nested directory", ["packages/**"], "packages/a/b", true],
+    ["a negation removes a * match", ["packages/*", "!packages/x"], "packages/x", false],
+    ["a negation leaves other * matches", ["packages/*", "!packages/x"], "packages/y", true],
+    ["a negation before its positive pattern loses", ["!packages/x", "packages/*"], "packages/x", true],
+    ["a positive pattern after a negation wins", ["packages/*", "!packages/x", "packages/x"], "packages/x", true],
+    ["a ? pattern matches one character", ["packages/?"], "packages/a", true],
+    ["a ? pattern does not match two characters", ["packages/?"], "packages/ab", false],
+    ["a ./ prefix and trailing slash", ["./packages/*/"], "packages/a", true],
+    ["a * pattern does not reach a nested directory", ["packages/*"], "packages/a/b", false],
+  ])("%s", (_label, workspaces, dir, expectApplied) => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces });
+      writeManifest(root, join(dir, "package.json"), { name: "w", dependencies: { "dep-a": "1.0.0" } });
+      const output = runGate(root);
+      if (expectApplied) {
+        expect(output).toContain("bun.lock is not parseable");
+      } else {
+        expect(output).toContain(
+          `${dir}/package.json: \`dep-a\` is declared exactly here, but this manifest is neither the root package.json nor a workspace`,
+        );
+        expect(output).not.toContain("Checking");
+      }
+    });
+  });
+
+  it("refuses an excluded name pinned exactly only in a dot-directory under a * workspace pattern", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
+      writeManifest(root, join("packages", "a", "package.json"), { name: "a" });
+      writeManifest(root, join("packages", ".hidden", "package.json"), {
+        name: "hidden", dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain(
+        "packages/.hidden/package.json: `dep-a` is declared exactly here, but this manifest is neither the root package.json nor a workspace",
+      );
+      expect(output).not.toContain("Checking");
+    });
+  });
+
+  it("fails with its path when a workspace manifest cannot be read or parsed", () => {
+    for (const [label, content, message] of [
+      ["unreadable", "", "cannot inspect"],
+      ["unparseable", "{ not json", "cannot parse"],
+    ]) {
+      appliedFixture((root) => {
+        writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
+        const manifest = join("packages", "w", "package.json");
+        mkdirSync(join(root, "packages", "w"), { recursive: true });
+        if (label === "unreadable") symlinkSync("missing.json", join(root, manifest));
+        else writeFileSync(join(root, manifest), content);
+        const output = runGate(root);
+        expect(output).toContain(`${message} ${manifest}`);
+        expect(output).not.toContain("Checking");
+      });
+    }
+  });
+});
+
+/** A real on-disk layout: a root manifest, an optional workspace and an unused manifest. */
+function appliedFixture(write: (root: string) => void) {
+  const scratch = mkdtempSync(join(tmpdir(), "age-applied-"));
+  const root = join(scratch, "repo");
+  try {
+    mkdirSync(join(root, "docs"), { recursive: true });
+    writeFileSync(join(root, "bunfig.toml"), '[install]\nminimumReleaseAge = 604800\nminimumReleaseAgeExcludes = ["dep-a"]\n');
+    writeFileSync(
+      join(root, "docs", "dep-age-exceptions.md"),
+      "## Exceptions\n- dep-a@1.0.0 | expires:9999-12-31 | reason: fixture\n",
+    );
+    writeFileSync(join(root, "bun.lock"), "invalid lock");
+    write(root);
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
+function writeManifest(root: string, path: string, json: unknown) {
+  mkdirSync(dirname(join(root, path)), { recursive: true });
+  writeFileSync(join(root, path), JSON.stringify(json));
+}
 
 function linkedFixture(check: (root: string, outside: string) => void) {
   const scratch = mkdtempSync(join(tmpdir(), "age-links-"));

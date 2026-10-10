@@ -25,7 +25,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { collectResolvedDeps, parseBunLock } from "../scripts/lib/check-dep-ages-collect.mjs";
+import { appliedManifestPaths, collectResolvedDeps, parseBunLock } from "../scripts/lib/check-dep-ages-collect.mjs";
 
 const GATE = fileURLToPath(new URL("../scripts/check-dep-ages.mjs", import.meta.url));
 
@@ -327,6 +327,61 @@ it.each([
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
+    }
+  },
+  60000,
+);
+
+it.each([
+  [
+    "negated and nested ** patterns",
+    ["packages/**", "!packages/x", "!packages/c"],
+    ["packages/a/b", "packages/c", "packages/x", "packages/x/y", "tools/t"],
+    ["packages/a/b", "packages/x/y"],
+  ],
+  ["a ? pattern", ["packages/?"], ["packages/a", "packages/ab"], ["packages/a"]],
+  ["a dot-directory under *", ["packages/*"], ["packages/a", "packages/.hidden", "packages/.b"], ["packages/a"]],
+  ["a dot-directory under ?", ["packages/?b"], ["packages/ab", "packages/.b"], ["packages/ab"]],
+  ["a dot-directory under **", ["packages/**"], ["packages/a/y", "packages/.x/y", "packages/a/.z/w"], ["packages/a/y"]],
+  ["a dot-directory named by a literal", ["packages/.hidden"], ["packages/.hidden", "packages/a"], ["packages/.hidden"]],
+  [
+    "a dot-directory named by a literal beside *",
+    ["packages/.hidden", "packages/*"],
+    ["packages/.hidden", "packages/a"],
+    ["packages/.hidden", "packages/a"],
+  ],
+  ["a ./ prefix and trailing slash", ["./packages/*/"], ["packages/a", "packages/a/b"], ["packages/a"]],
+  ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], ["packages/x", "packages/y"]],
+  [
+    "a positive pattern after a negation",
+    ["packages/*", "!packages/x", "packages/x"],
+    ["packages/x", "packages/y"],
+    ["packages/x", "packages/y"],
+  ],
+] as const)(
+  "the gate applies the same workspaces real Bun installs for %s",
+  async (_label, workspaces, dirs, expected) => {
+    const root = mkdtempSync(join(tmpdir(), "age-workspaces-"));
+    try {
+      const manifests: Record<string, unknown> = {
+        "package.json": { name: "fixture", workspaces: [...workspaces] },
+      };
+      for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll("/", "-")}` };
+      const project = writeProject(root, manifests, "http://127.0.0.1:1");
+      const install = await bunInstall(project, ["--no-cache"]);
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      const installed = Object.keys(lock.workspaces)
+        .filter((key) => key !== "")
+        .map((key) => `${key}/package.json`)
+        .sort();
+      expect(installed).toEqual(expected.map((dir) => `${dir}/package.json`));
+
+      const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
+      const gate = [...appliedManifestPaths(packageJsons)].filter((path) => path !== "package.json").sort();
+      expect(gate).toEqual(installed);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   },
   60000,
