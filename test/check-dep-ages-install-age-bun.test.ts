@@ -358,19 +358,70 @@ it.each([
     ["packages/x", "packages/y"],
     ["packages/x", "packages/y"],
   ],
+  [
+    "the object form of workspaces",
+    { packages: ["packages/*"] },
+    ["packages/a", "tools/t"],
+    ["packages/a"],
+  ],
+  [
+    "a character class",
+    ["packages/[ab]"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/a", "packages/b"],
+  ],
+  [
+    "a negated character class",
+    ["packages/[!a]"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/b", "packages/c"],
+  ],
+  ["a ^-negated character class", ["packages/[^a]"], ["packages/a", "packages/b"], ["packages/b"]],
+  [
+    "a dot-directory under a character class",
+    ["packages/[.a]*"],
+    ["packages/.h", "packages/a", "packages/ab"],
+    ["packages/a", "packages/ab"],
+  ],
+  [
+    "a dot-directory under brace alternatives",
+    ["packages/{.h,a}"],
+    ["packages/.h", "packages/a", "packages/b"],
+    ["packages/a"],
+  ],
+  [
+    "a brace branch spanning /",
+    ["packages/{a/b,c}"],
+    ["packages/a/b", "packages/c", "packages/a"],
+    [],
+  ],
+  [
+    "brace alternatives",
+    ["packages/{a,b}"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/a", "packages/b"],
+  ],
+  [
+    "a negation of a literal pattern",
+    ["packages/x", "!packages/x"],
+    ["packages/x", "packages/y"],
+    ["packages/x"],
+  ],
 ] as const)(
   "the gate applies the same workspaces real Bun installs for %s",
   async (_label, workspaces, dirs, expected) => {
     const root = mkdtempSync(join(tmpdir(), "age-workspaces-"));
     try {
       const manifests: Record<string, unknown> = {
-        "package.json": { name: "fixture", workspaces: [...workspaces] },
+        "package.json": { name: "fixture", workspaces },
       };
       for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll("/", "-")}` };
       const project = writeProject(root, manifests, "http://127.0.0.1:1");
       const install = await bunInstall(project, ["--no-cache"]);
       expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
-      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      const lockPath = join(project, "bun.lock");
+      // Bun writes no lockfile when no workspace and no dependency is installed.
+      const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
       const installed = Object.keys(lock.workspaces)
         .filter((key) => key !== "")
         .map((key) => `${key}/package.json`)
@@ -378,7 +429,9 @@ it.each([
       expect(installed).toEqual(expected.map((dir) => `${dir}/package.json`));
 
       const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
-      const gate = [...appliedManifestPaths(packageJsons)].filter((path) => path !== "package.json").sort();
+      const gate = [...appliedManifestPaths(packageJsons).applied]
+        .filter((path) => path !== "package.json")
+        .sort();
       expect(gate).toEqual(installed);
     } finally {
       rmSync(root, { recursive: true, force: true });

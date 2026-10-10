@@ -249,23 +249,142 @@ function pathSegments(path) {
     .filter((segment) => segment !== "" && segment !== ".");
 }
 
-/** Whether one glob segment (`*` matches any run within a segment, `?` one unit) matches a path segment. */
-function matchGlobSegment(value, pattern) {
-  let source = "^";
-  for (const ch of pattern) {
-    if (ch === "*") source += "[^/]*";
-    else if (ch === "?") source += "[^/]";
-    else source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  }
-  return new RegExp(`${source}$`).test(value);
+/**
+ * Bun's `detect_glob_syntax`: a pattern is a glob when it is `!`-prefixed or
+ * carries a `*`, `{`, `[` or `?`.
+ */
+function isGlobPattern(pattern) {
+  if (pattern.startsWith("!")) return true;
+  return /[*{[?]/.test(pattern);
 }
 
-/** Whether a workspace glob matches a manifest's directory; `**` spans segments. */
-function matchGlobDir(dir, pattern) {
-  const value = pathSegments(dir);
-  const glob = pathSegments(pattern);
-  // Bun's glob walk skips dot-directories; only a pattern without `*` or `?` reaches one.
-  if (/[*?]/.test(pattern) && value.some((segment) => segment.startsWith("."))) return false;
+/** Strip every leading `!`; an odd count is a negation. */
+function stripNegation(pattern) {
+  let i = 0;
+  while (i < pattern.length && pattern[i] === "!") i++;
+  return { inner: pattern.slice(i), negated: i % 2 === 1 };
+}
+
+/** Split a brace body on its top-level commas (a comma inside `{...}` or `[...]` is a member). */
+function splitBraceAlternatives(body) {
+  const alternatives = [];
+  let depth = 0;
+  let inClass = false;
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (!inClass && ch === "{") depth++;
+    else if (!inClass && ch === "}") depth--;
+    else if (!inClass && depth === 0 && ch === ",") {
+      alternatives.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  alternatives.push(body.slice(start));
+  return alternatives;
+}
+
+/**
+ * Expand `{a,b}` into its alternatives (Bun matches one comma-separated branch;
+ * branches nest). A branch that spans a separator is not a form Bun's directory
+ * walk expands, so the whole pattern matches nothing — `null` reports that.
+ */
+function expandBraces(pattern) {
+  const expanded = [];
+  const recurse = (current) => {
+    const open = current.indexOf("{");
+    if (open === -1) {
+      expanded.push(current);
+      return true;
+    }
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < current.length; i++) {
+      if (current[i] === "{") depth++;
+      else if (current[i] === "}") {
+        depth--;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    if (close === -1) return false;
+    const body = current.slice(open + 1, close);
+    if (body.includes("/")) return false;
+    for (const alternative of splitBraceAlternatives(body)) {
+      if (!recurse(current.slice(0, open) + alternative + current.slice(close + 1))) return false;
+    }
+    return true;
+  };
+  return recurse(pattern) ? expanded : null;
+}
+
+const REGEX_SPECIAL = /[.+^${}()|[\]\\]/;
+
+/**
+ * Whether one glob segment matches one path segment: `*` and `?` stay inside the
+ * segment, `[...]` is a character class (`[!...]`/`[^...]` negate it, `a-z` is a
+ * range) and `\` escapes the next character.
+ */
+function segmentRegex(pattern) {
+  let source = "^";
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      source += "[^/]*";
+      i++;
+    } else if (ch === "?") {
+      source += "[^/]";
+      i++;
+    } else if (ch === "[") {
+      let end = i + 1;
+      if (pattern[end] === "!" || pattern[end] === "^") end++;
+      if (pattern[end] === "]") end++;
+      while (end < pattern.length && pattern[end] !== "]") end++;
+      if (end >= pattern.length) {
+        source += "\\[";
+        i++;
+        continue;
+      }
+      const body = pattern.slice(i + 1, end);
+      const negated = body.startsWith("!") || body.startsWith("^");
+      const members = negated ? body.slice(1) : body;
+      source += `[${negated ? "^" : ""}${members.replace(/\\/g, "\\\\")}]`;
+      i = end + 1;
+    } else if (ch === "\\" && i + 1 < pattern.length) {
+      const next = pattern[i + 1];
+      source += REGEX_SPECIAL.test(next) ? `\\${next}` : next;
+      i += 2;
+    } else {
+      source += REGEX_SPECIAL.test(ch) ? `\\${ch}` : ch;
+      i++;
+    }
+  }
+  return new RegExp(`${source}$`);
+}
+
+function matchGlobSegment(value, pattern) {
+  return segmentRegex(pattern).test(value);
+}
+
+/** The message of the error a glob's segments raise when compiled, or `null` when they all compile. */
+function globError(pattern) {
+  const expanded = expandBraces(stripNegation(pattern).inner);
+  if (expanded === null) return null;
+  try {
+    for (const candidate of expanded) for (const segment of pathSegments(candidate)) segmentRegex(segment);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return null;
+}
+
+/** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
+function matchSegments(value, glob) {
   function match(i, j) {
     if (j === glob.length) return i === value.length;
     if (glob[j] === "**") {
@@ -277,30 +396,102 @@ function matchGlobDir(dir, pattern) {
   return match(0, 0);
 }
 
+/** Whether a workspace glob matches a manifest's directory. */
+function matchGlobDir(dir, pattern) {
+  const expanded = expandBraces(pattern);
+  if (expanded === null) return false;
+  const value = pathSegments(dir);
+  // Bun's glob walk skips dot-directories; only a pattern without glob syntax reaches one.
+  if (isGlobPattern(pattern) && value.some((segment) => segment.startsWith("."))) return false;
+  for (const candidate of expanded) {
+    if (matchSegments(value, pathSegments(candidate))) return true;
+  }
+  return false;
+}
+
+/**
+ * The workspace patterns a root manifest declares, in Bun's two accepted shapes:
+ * an array of strings, or an object whose `packages` key is an array of strings.
+ * Any other shape is refused with a named error, because a shape the audit
+ * misreads would hide the manifests Bun applies.
+ *
+ * @returns {{ patterns: string[], error: string | null }}
+ */
+export function workspacePatterns(workspaces) {
+  if (workspaces === undefined) return { patterns: [], error: null };
+  if (Array.isArray(workspaces)) {
+    if (workspaces.some((pattern) => typeof pattern !== "string")) {
+      return { patterns: [], error: "`workspaces` is an array, but not every entry is a string" };
+    }
+    return { patterns: workspaces, error: null };
+  }
+  if (workspaces !== null && typeof workspaces === "object") {
+    const packages = workspaces.packages;
+    if (!Array.isArray(packages) || packages.some((pattern) => typeof pattern !== "string")) {
+      return {
+        patterns: [],
+        error: "`workspaces` is an object, but `workspaces.packages` is not an array of strings",
+      };
+    }
+    return { patterns: packages, error: null };
+  }
+  return {
+    patterns: [],
+    error: "`workspaces` is neither an array of strings nor an object with a `packages` array",
+  };
+}
+
 /**
  * The manifests Bun applies when it installs: the root manifest, and the
  * manifests of the directories the root manifest's `workspaces` patterns name.
- * The globs use the `*`, `?` and `**` segments Bun resolves; a `!`-prefixed
- * pattern removes an earlier match (the last matching pattern wins).
+ * A pattern without glob syntax is a literal directory; a glob one is walked with
+ * `*`, `?`, `**`, `[...]` and `{a,b}`. A `!`-negated pattern removes an earlier
+ * glob match it matches; a literal directory is never removed.
+ *
+ * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
+ *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
+ *   is then incomplete and must not be used. `pattern` is set only for a pattern.
  */
 export function appliedManifestPaths(manifests) {
   const applied = new Set(["package.json"]);
   const root = manifests.find((pj) => pj.path === "package.json");
-  const workspaces = root?.json?.workspaces;
-  if (!Array.isArray(workspaces)) return applied;
-  const patterns = workspaces.filter((pattern) => typeof pattern === "string");
+  const { patterns, error } = workspacePatterns(root?.json?.workspaces);
+  if (error !== null) return { applied, error };
+  const literals = [];
+  const globs = [];
+  for (const raw of patterns) {
+    if (raw === "" || raw === "." || raw === "./" || raw === ".\\") continue;
+    if (isGlobPattern(raw)) globs.push(raw);
+    else literals.push(raw);
+  }
+  const byDir = new Map();
   for (const pj of manifests) {
     if (pj.path === "package.json") continue;
-    const dir = pathSegments(pj.path).slice(0, -1).join("/");
-    let included = false;
-    for (const raw of patterns) {
-      const negated = raw.startsWith("!");
-      const pattern = (negated ? raw.slice(1) : raw).replace(/\/+$/, "");
-      if (pattern !== "" && matchGlobDir(dir, pattern)) included = !negated;
-    }
-    if (included) applied.add(pj.path);
+    byDir.set(pathSegments(pj.path).slice(0, -1).join("/"), pj.path);
   }
-  return applied;
+  for (const literal of literals) {
+    const path = byDir.get(pathSegments(literal).join("/"));
+    if (path !== undefined) applied.add(path);
+  }
+  for (const glob of globs) {
+    const reason = globError(glob);
+    if (reason !== null) {
+      return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}`, pattern: glob };
+    }
+  }
+  for (let i = 0; i < globs.length; i++) {
+    const { inner, negated } = stripNegation(globs[i]);
+    if (negated) continue; // a negated pattern removes an earlier glob match, and adds none of its own
+    for (const [dir, path] of byDir) {
+      if (!matchGlobDir(dir, inner)) continue;
+      const excluded = globs.slice(i + 1).some((later) => {
+        const removed = stripNegation(later);
+        return removed.negated && matchGlobDir(dir, removed.inner);
+      });
+      if (!excluded) applied.add(path);
+    }
+  }
+  return { applied, error: null };
 }
 
 /**
@@ -324,12 +515,14 @@ export function appliedManifestPaths(manifests) {
  *             | {kind: "nested-override", name: string, path: string}
  *             | {kind: "resolution", name: string, path: string, key: string}
  *             | {kind: "unused-manifest", name: string, path: string}
- *             | {kind: "unpinned", name: string}>
+ *             | {kind: "unpinned", name: string}
+ *             | {kind: "workspaces", message: string, pattern?: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
   const manifests = packageJsons ?? [];
-  const applied = appliedManifestPaths(manifests);
+  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests);
+  if (workspacesError !== null) return [{ kind: "workspaces", message: workspacesError, pattern }];
   for (const name of excludes ?? []) {
     let covered = false;
     for (const key of (exceptionEntries ?? new Map()).keys()) {

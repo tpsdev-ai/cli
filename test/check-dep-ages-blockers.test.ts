@@ -188,6 +188,10 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     ["a ? pattern does not match two characters", ["packages/?"], "packages/ab", false],
     ["a ./ prefix and trailing slash", ["./packages/*/"], "packages/a", true],
     ["a * pattern does not reach a nested directory", ["packages/*"], "packages/a/b", false],
+    ["an object-form workspace", { packages: ["packages/*"] }, "packages/w", true],
+    ["a character-class workspace", ["packages/[wx]"], "packages/w", true],
+    ["a brace workspace", ["packages/{w,z}"], "packages/w", true],
+    ["a literal named once and negated", ["packages/w", "!packages/w"], "packages/w", true],
   ])("%s", (_label, workspaces, dir, expectApplied) => {
     appliedFixture((root) => {
       writeManifest(root, "package.json", { name: "fixture", workspaces });
@@ -201,6 +205,38 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
         );
         expect(output).not.toContain("Checking");
       }
+    });
+  });
+
+  it("refuses an unrecognised workspaces shape with a named error", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: "packages/*" });
+      writeManifest(root, join("packages", "w", "package.json"), {
+        name: "w",
+        dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain(
+        "`workspaces` is neither an array of strings nor an object with a `packages` array",
+      );
+      expect(output).toContain("Remedy: declare `workspaces` as an array of strings");
+      expect(output).not.toContain("Checking");
+    });
+  });
+
+  it("refuses a workspaces pattern with a reversed class range, naming it, without a stack trace", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/[z-a]"] });
+      writeManifest(root, join("packages", "a", "package.json"), {
+        name: "a",
+        dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain("workspaces pattern `packages/[z-a]` cannot be read:");
+      expect(output).toContain("Remedy: fix or remove the `workspaces` pattern `packages/[z-a]`.");
+      expect(output).not.toContain("declare `workspaces` as an array of strings");
+      expect(output).not.toContain("Checking");
+      expect(output).not.toMatch(/\n\s+at /);
     });
   });
 
