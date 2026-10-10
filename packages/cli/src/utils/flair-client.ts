@@ -287,6 +287,31 @@ export class FlairClient {
     }
   }
 
+  /**
+   * Read the public key Flair actually stores for `agentId`, over the operator
+   * (Basic admin) credential. cli#512: the read-back that decides whether a
+   * registration happened must not use the key it is verifying — an agent
+   * whose key is not registered yet cannot read its own row. A 404 is the only
+   * "no such row"; every other non-OK response throws, so a failed read is
+   * never read as "absent".
+   */
+  async readStoredPublicKey(
+    agentId: string = this.agentId,
+    adminAuth?: string,
+  ): Promise<{ found: boolean; publicKey: string | null }> {
+    const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
+    const res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
+      headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
+    });
+    if (res.status === 404) return { found: false, publicKey: null };
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new FlairRequestError(`Flair GET /Agent/${agentId} → ${res.status}: ${text}`, res.status);
+    }
+    const record = (await res.json()) as FlairAgent | null;
+    return { found: true, publicKey: typeof record?.publicKey === "string" ? record.publicKey : null };
+  }
+
   async listAgents(): Promise<FlairAgent[]> {
     try {
       return await this.request<FlairAgent[]>("GET", "/Agent/");
