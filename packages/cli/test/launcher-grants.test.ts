@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
@@ -31,6 +31,24 @@ describe("sandboxHomeBase", () => {
       }
       expect(sandboxHomeBase([link])).toBe(realpathSync("/var/tmp"));
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("skips a non-writable directory candidate and returns the next writable uncovered one", () => {
+    const dir = mkdtempSync(join(tmpdir(), "lg-ro-"));
+    const next = mkdtempSync(join(tmpdir(), "lg-rw-"));
+    try {
+      chmodSync(dir, 0o500);
+      try {
+        rmSync(mkdtempSync(join(dir, "w-")));
+        console.warn("directory is still writable (running as root?), case skipped");
+        return;
+      } catch {}
+      expect(sandboxHomeBase([dir, next])).toBe(realpathSync(next));
+    } finally {
+      chmodSync(dir, 0o700);
+      rmSync(next, { recursive: true, force: true });
       rmSync(dir, { recursive: true, force: true });
     }
   });

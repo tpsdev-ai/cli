@@ -7,7 +7,7 @@
  * The two callers are the launch-control test and the runtime-launch fixture:
  * one shared list and one shared chooser keep them from drifting apart.
  */
-import { existsSync, realpathSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { BUN_TEMP_DIR, harnessReadPaths } from "../../src/utils/nono.js";
@@ -35,6 +35,16 @@ export function launcherGrantCovering(path: string): string | null {
   return null;
 }
 
+function canCreateDirIn(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isDirectory()) return false;
+    rmSync(mkdtempSync(join(candidate, "lg-probe-")), { recursive: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * A base directory for a test sandbox HOME that lies outside every launcher
  * grant (cli#558). `/var/tmp` is the sibling of the always-granted `/tmp` and
@@ -45,12 +55,12 @@ export function launcherGrantCovering(path: string): string | null {
  */
 export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): string {
   for (const candidate of candidates) {
-    if (existsSync(candidate) && launcherGrantCovering(candidate) === null) return realpathSync(candidate);
+    if (canCreateDirIn(candidate) && launcherGrantCovering(candidate) === null) return realpathSync(candidate);
   }
-  const existing = candidates.filter((c) => existsSync(c));
+  const existing = candidates.filter((c) => canCreateDirIn(c));
   if (existing.length === 0) {
     throw new Error(
-      `no usable base directory exists (checked ${candidates.join(", ")}); ` +
+      `no usable base directory exists or is writable (checked ${candidates.join(", ")}); ` +
         "a test sandbox HOME needs a base outside every launcher grant.",
     );
   }
