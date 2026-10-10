@@ -241,9 +241,18 @@ async function loadSoulFile(filePath: string): Promise<Record<string, string>> {
   return result;
 }
 
+/** Flair stores base64url (`flair agent add`) and accepts hex or base64/base64url; only a 32-byte decode is a key. */
+function storedKeyAsHex(stored: string): string | null {
+  let bytes: Buffer;
+  if (/^[0-9a-fA-F]{64}$/.test(stored)) bytes = Buffer.from(stored, "hex");
+  else if (/^[A-Za-z0-9+/_-]+={0,2}$/.test(stored)) bytes = Buffer.from(stored, "base64");
+  else return null;
+  return bytes.length === 32 ? bytes.toString("hex") : null;
+}
+
 /**
- * cli#512 — `create` exits non-zero here unless the stored key reads back equal
- * to the generated key.
+ * cli#512 — when Flair is reachable, `create` exits non-zero here unless the
+ * stored key reads back equal to the generated key.
  */
 function refuseRegistration(
   id: string,
@@ -258,9 +267,8 @@ function refuseRegistration(
     `   Flair cannot store a key generated here yet (it drops publicKey on Agent PUT/PATCH; a supported operation is flair#2266).`,
   );
   console.error(
-    `   Until then: on the Flair host, \`flair agent add ${id}\` (or \`flair agent rotate-key ${id}\` for an existing row) generates the agent's keypair there;`,
+    `   Until then: copy ${join(identityDir, `${id}.key`)} and ${join(identityDir, `${id}.pub`)} into the Flair host's keys dir, run \`flair agent add ${id} --keys-dir <dir>\` there (it refuses while an Agent row exists), then re-run \`tps agent create\`.`,
   );
-  console.error(`   install that keypair as this agent's identity (replace the files in ${identityDir}), then re-run \`tps agent create\`.`);
   process.exit(1);
 }
 
@@ -315,7 +323,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
     try {
       const existing = await flair.getAgent(id);
       if (existing) {
-        if (existing.publicKey !== pubKeyHex) {
+        if (storedKeyAsHex(existing.publicKey ?? "") !== pubKeyHex) {
           await flair.updateAgent(id, { publicKey: pubKeyHex });
         }
         successLine = `  Agent '${id}' already registered in Flair.`;
@@ -360,7 +368,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
     }
     if (!stored.found) {
       refuseRegistration(id, flairUrl, identityDir, "no Agent row exists", writeError);
-    } else if (stored.publicKey !== pubKeyHex) {
+    } else if (stored.publicKey === null || storedKeyAsHex(stored.publicKey) !== pubKeyHex) {
       const found =
         stored.publicKey === null ? "the row has no public key" : `the stored public key is '${stored.publicKey}'`;
       refuseRegistration(id, flairUrl, identityDir, `${found}, not the generated key`, writeError);

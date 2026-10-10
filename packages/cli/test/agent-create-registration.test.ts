@@ -103,8 +103,9 @@ test("refused write and no Agent row: exits non-zero, prints no success, names a
     expect(res.stderr).toContain("no Agent row exists");
     expect(res.stderr).toContain("seed or key update failed");
     expect(res.stderr).toContain("flair#2266");
-    expect(res.stderr).toContain(`flair agent add ${id}`);
-    expect(res.stderr).toContain(`flair agent rotate-key ${id}`);
+    expect(res.stderr).toContain(`flair agent add ${id} --keys-dir`);
+    expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
+    expect(res.stderr).toContain(join(".tps", "identity", `${id}.pub`));
     expect(res.stderr).toContain(join(".tps", "identity"));
   } finally {
     fake.stop();
@@ -184,6 +185,54 @@ test("the key reads back equal: prints success and exits zero", async () => {
   } finally {
     fake.stop();
   }
+});
+
+/** A fake whose Agent row holds `encode(<the key create generated>)` */
+async function runWithStoredEncoding(
+  id: string,
+  encode: (hexKey: string) => string,
+): Promise<{ exitCode: number | undefined; stdout: string; stderr: string }> {
+  let stored: string | null = null;
+  const fake = startFakeFlair(async (req, url) => {
+    if (url.pathname === `/Agent/${id}` && req.method === "PUT") {
+      const body = (await req.json()) as { publicKey?: string };
+      stored = body.publicKey ? encode(body.publicKey) : null;
+      return Response.json({}, { status: 200 });
+    }
+    if (url.pathname === `/Agent/${id}` && stored !== null) return Response.json({ id, name: id, publicKey: stored });
+    return undefined;
+  });
+  try {
+    return await runCreate(fake.url, id);
+  } finally {
+    fake.stop();
+  }
+}
+
+const b64url = (hex: string) => Buffer.from(hex, "hex").toString("base64url");
+
+test("the row holds the base64url of the generated key (what flair stores): exits zero", async () => {
+  const res = await runWithStoredEncoding(`${AGENT}-b64-equal`, b64url);
+  expect(res.exitCode).toBeUndefined();
+  expect(res.stdout).toContain("registered in Flair");
+});
+
+test("the row holds the base64url of a different key: exits non-zero", async () => {
+  const res = await runWithStoredEncoding(`${AGENT}-b64-other`, () => b64url("de".repeat(32)));
+  expect(res.exitCode).toBe(1);
+  expect(res.stdout).not.toContain("registered in Flair");
+  expect(res.stderr).toContain("not the generated key");
+});
+
+test("the row holds the hex of the generated key (flair accepts either): exits zero", async () => {
+  const res = await runWithStoredEncoding(`${AGENT}-hex-equal`, (hex) => hex);
+  expect(res.exitCode).toBeUndefined();
+});
+
+test("the row holds a value that decodes to the wrong length: exits non-zero", async () => {
+  const res = await runWithStoredEncoding(`${AGENT}-short`, (hex) => Buffer.from(hex, "hex").subarray(0, 31).toString("base64url"));
+  expect(res.exitCode).toBe(1);
+  expect(res.stdout).not.toContain("registered in Flair");
 });
 
 /**
