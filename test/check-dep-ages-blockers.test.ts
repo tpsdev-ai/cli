@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -177,18 +177,18 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
   });
 
   it("fails with its path when a workspace manifest cannot be read or parsed", () => {
-    for (const [label, content] of [
-      ["unreadable", JSON.stringify({ name: "w" })],
-      ["unparseable", "{ not json"],
+    for (const [label, content, message] of [
+      ["unreadable", "", "cannot inspect"],
+      ["unparseable", "{ not json", "cannot parse"],
     ]) {
       appliedFixture((root) => {
         writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
         const manifest = join("packages", "w", "package.json");
-        writeManifest(root, manifest, { name: "w" });
-        writeFileSync(join(root, manifest), content);
-        if (label === "unreadable") chmodSync(join(root, manifest), 0o000);
+        mkdirSync(join(root, "packages", "w"), { recursive: true });
+        if (label === "unreadable") symlinkSync("missing.json", join(root, manifest));
+        else writeFileSync(join(root, manifest), content);
         const output = runGate(root);
-        expect(output).toContain(`cannot parse ${manifest}`);
+        expect(output).toContain(`${message} ${manifest}`);
         expect(output).not.toContain("Checking");
       });
     }
