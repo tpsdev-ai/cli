@@ -7,7 +7,8 @@
   property-derived alias no longer hides such a patch, and a name that an
   enclosing scope declares is not treated as the global. An alias of a guarded
   global root is treated as that root.
-  An assignment whose member target cannot be resolved to a root (for example
-  `getG().fetch = ...`) is reported as `unclassified-assignment-target` whatever
-  the right-hand side. A module object bound by a dynamic `import()` is treated
+  An assignment whose member target is rooted in anything other than an
+  identifier, `this`, or an object or array literal (for example
+  `getG().fetch = ...`) fails whatever the value. Destructuring targets are not
+  checked. A module object bound by a dynamic `import()` is treated
   like an imported one.
