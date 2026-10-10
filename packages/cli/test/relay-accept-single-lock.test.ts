@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -154,10 +154,11 @@ function recordsByDeliveryId(): Map<string, string[]> {
   return byId;
 }
 
-/** The stored receipt carries the delivered body, and a resend of that body dedups after ACK. */
-function expectReceiptKeepsBody(id: string, content: string): void {
-  const receipt = JSON.parse(readFileSync(relayAcceptanceReceiptPath(BRANCH, id), "utf8")) as { body: string };
-  expect(receipt.body).toBe(content);
+/** The stored receipt carries the digest of the delivered body, and a resend of that body dedups after ACK. */
+function expectReceiptKeepsDigestOfBody(id: string, content: string): void {
+  const receipt = JSON.parse(readFileSync(relayAcceptanceReceiptPath(BRANCH, id), "utf8")) as { bodySha256: string; bodyLength: number };
+  expect(receipt.bodySha256).toBe(createHash("sha256").update(content, "utf8").digest("hex"));
+  expect(receipt.bodyLength).toBe(Buffer.byteLength(content, "utf8"));
   expect(deliverRelayedToLocal(BRANCH, { id, from: FROM, to: RECIPIENT, content, timestamp: TIMESTAMP })).toBe(false);
   expect(recordsByDeliveryId().has(id)).toBe(false);
 }
@@ -168,7 +169,7 @@ function expectReceiptMatchesDeliveredRecord(id: string, bodyPattern: RegExp): v
   const record = JSON.parse(readFileSync(path, "utf8")) as { body: string };
   expect(record.body).toMatch(bodyPattern);
   ackMessageAtPath(path);
-  expectReceiptKeepsBody(id, record.body);
+  expectReceiptKeepsDigestOfBody(id, record.body);
 }
 
 async function waitForFile(path: string): Promise<void> {
@@ -291,7 +292,7 @@ describe("relay acceptance (cli#561)", () => {
     expect(a).toEqual({ delivered: 1, duplicate: 0, refused: 0 });
     expect(b).toEqual({ delivered: 0, duplicate: 0, refused: 1 });
     expect(acked).toEqual([`A-${id}`]);
-    expectReceiptKeepsBody(id, `A-${id}`);
+    expectReceiptKeepsDigestOfBody(id, `A-${id}`);
   }, 60_000);
 
   test("lock directories stay bounded across distinct deliveries", () => {
