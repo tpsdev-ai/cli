@@ -5,9 +5,12 @@
  * Reads bunfig.toml's install table with Bun's TOML parser. Checks every external
  * version in bun.lock against its minimumReleaseAge (at least 7 days), and that
  * every minimumReleaseAgeExcludes name has an unexpired entry in
- * docs/dep-age-exceptions.md and at least one exact declaration; every
- * declaration must be exact, an override must be in the root package.json, and
- * a resolutions key of `name` or `**\/name` is refused.
+ * docs/dep-age-exceptions.md and an exact declaration Bun applies: a dependency
+ * section or `overrides` of the root package.json, or a dependency section of a
+ * manifest a root `workspaces` pattern names. A name pinned exactly only in a
+ * manifest Bun does not apply is refused, naming that manifest; an override must
+ * be in the root package.json, and a resolutions key of `name` or `**\/name` is
+ * refused.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
@@ -19,7 +22,8 @@
  *   2 — missing publish times, unreadable or unparseable required files, Bun not
  *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold
  *       or one below 7 days, invalid or unused exceptions, an excluded name without an
- *       unexpired exception or without exact declarations, an excluded name in a nested
+ *       unexpired exception or an exact declaration Bun applies, an excluded name pinned
+ *       exactly only in a manifest Bun does not apply, an excluded name in a nested
  *       package.json's overrides or as a resolutions key, no external resolutions, refused
  *       CI overrides, unexpected arguments, or registry fetch failures
  *
@@ -272,6 +276,13 @@ if (excludeNames.length > 0) {
         );
         console.error(
           `        Remedy: move the pin to the root package.json's overrides, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
+        );
+      } else if (problem.kind === "unused-manifest") {
+        console.error(
+          `    ${problem.path}: \`${problem.name}\` is declared exactly here, but this manifest is neither the root package.json nor a workspace, so Bun does not apply it.`,
+        );
+        console.error(
+          `        Remedy: declare \`${problem.name}\` exactly in the root package.json (a dependency section or overrides) or in a workspace's dependencies, or remove \`${problem.name}\` from minimumReleaseAgeExcludes in bunfig.toml.`,
         );
       } else if (problem.kind === "unpinned") {
         console.error(

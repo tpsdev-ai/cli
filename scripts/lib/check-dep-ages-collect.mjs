@@ -242,14 +242,76 @@ function exceptionName(key) {
 
 const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "overrides"];
 
+/** Split a relative path into its non-empty, non-`.` segments. */
+function pathSegments(path) {
+  return String(path)
+    .split(/[\\/]/)
+    .filter((segment) => segment !== "" && segment !== ".");
+}
+
+/** Whether one glob segment (`*` matches any run within a segment, `?` one unit) matches a path segment. */
+function matchGlobSegment(value, pattern) {
+  let source = "^";
+  for (const ch of pattern) {
+    if (ch === "*") source += "[^/]*";
+    else if (ch === "?") source += "[^/]";
+    else source += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`${source}$`).test(value);
+}
+
+/** Whether a workspace glob matches a manifest's directory; `**` spans segments. */
+function matchGlobDir(dir, pattern) {
+  const value = pathSegments(dir);
+  const glob = pathSegments(pattern);
+  function match(i, j) {
+    if (j === glob.length) return i === value.length;
+    if (glob[j] === "**") {
+      for (let k = i; k <= value.length; k++) if (match(k, j + 1)) return true;
+      return false;
+    }
+    return i < value.length && matchGlobSegment(value[i], glob[j]) && match(i + 1, j + 1);
+  }
+  return match(0, 0);
+}
+
+/**
+ * The manifests Bun applies when it installs: the root manifest, and the
+ * manifests of the directories the root manifest's `workspaces` patterns name.
+ * The globs use the `*`, `?` and `**` segments Bun resolves; a `!`-prefixed
+ * pattern removes an earlier match (the last matching pattern wins).
+ */
+function appliedManifestPaths(manifests) {
+  const applied = new Set(["package.json"]);
+  const root = manifests.find((pj) => pj.path === "package.json");
+  const workspaces = root?.json?.workspaces;
+  if (!Array.isArray(workspaces)) return applied;
+  const patterns = workspaces.filter((pattern) => typeof pattern === "string");
+  for (const pj of manifests) {
+    if (pj.path === "package.json") continue;
+    const dir = pathSegments(pj.path).slice(0, -1).join("/");
+    let included = false;
+    for (const raw of patterns) {
+      const negated = raw.startsWith("!");
+      const pattern = (negated ? raw.slice(1) : raw).replace(/\/+$/, "");
+      if (pattern !== "" && matchGlobDir(dir, pattern)) included = !negated;
+    }
+    if (included) applied.add(pj.path);
+  }
+  return applied;
+}
+
 /**
  * Check bunfig's install-time excludes against the dated exceptions and the
- * exact pins in the repository's package.json files. Bun applies `overrides`
- * from the root package.json (path `package.json`), not from a workspace or
- * other nested manifest, so an excluded name in a nested `overrides` is refused.
- * Bun 1.3.10 applies root `resolutions` (key `name` or `**\/name`) over a direct
- * pin, and ignores them while the root has an `overrides` key, so a resolutions
- * key naming an excluded package is refused in any manifest.
+ * exact pins Bun applies. Only a declaration Bun applies counts: an exact entry
+ * in a dependency section of the root manifest (`package.json`) or of a manifest
+ * a root `workspaces` pattern names, and in the root manifest's `overrides`. Bun
+ * applies `overrides` from the root manifest, not from a nested one, so an
+ * excluded name in a nested `overrides` is refused. A name pinned exactly only in
+ * a manifest Bun does not apply is reported with that manifest's path. Bun 1.3.10
+ * applies root `resolutions` (key `name` or `**\/name`) over a direct pin, and
+ * ignores them while the root has an `overrides` key, so a resolutions key naming
+ * an excluded package is refused in any manifest.
  *
  * @param {{ excludes: string[], exceptionEntries: Map<string, object>,
  *           exceptionErrors: Array<{key: string | null, message: string}>,
@@ -259,10 +321,13 @@ const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "
  *             | {kind: "range", name: string, path: string, spec: string}
  *             | {kind: "nested-override", name: string, path: string}
  *             | {kind: "resolution", name: string, path: string, key: string}
+ *             | {kind: "unused-manifest", name: string, path: string}
  *             | {kind: "unpinned", name: string}>
  */
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
+  const manifests = packageJsons ?? [];
+  const applied = appliedManifestPaths(manifests);
   for (const name of excludes ?? []) {
     let covered = false;
     for (const key of (exceptionEntries ?? new Map()).keys()) {
@@ -279,7 +344,9 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
       problems.push({ kind: "uncovered", name, error });
     }
     let declared = false;
-    for (const pj of packageJsons ?? []) {
+    const unappliedExact = [];
+    for (const pj of manifests) {
+      const isApplied = applied.has(pj.path);
       const resolutions = pj.json?.resolutions;
       if (resolutions && typeof resolutions === "object") {
         for (const key of Object.keys(resolutions)) {
@@ -295,12 +362,22 @@ export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, pac
           problems.push({ kind: "nested-override", name, path: pj.path });
           continue;
         }
-        declared = true;
         const spec = deps[name];
-        if (!isExactVersionPin(spec)) problems.push({ kind: "range", name, path: pj.path, spec });
+        if (isApplied) declared = true;
+        if (!isExactVersionPin(spec)) {
+          problems.push({ kind: "range", name, path: pj.path, spec });
+        } else if (!isApplied) {
+          unappliedExact.push(pj.path);
+        }
       }
     }
-    if (!declared) problems.push({ kind: "unpinned", name });
+    if (!declared) {
+      if (unappliedExact.length > 0) {
+        for (const path of unappliedExact) problems.push({ kind: "unused-manifest", name, path });
+      } else {
+        problems.push({ kind: "unpinned", name });
+      }
+    }
   }
   return problems;
 }
