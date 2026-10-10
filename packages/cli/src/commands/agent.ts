@@ -251,9 +251,16 @@ function storedKeyAsHex(stored: string): string | null {
   return bytes.length === 32 ? bytes.toString("hex") : null;
 }
 
+/** Whether an Agent row was confirmed to exist when the registration is refused. */
+type RowState = "exists" | "absent" | "unknown";
+
 /**
  * cli#512 — when Flair is reachable, `create` exits non-zero here unless the
  * stored key reads back equal to the generated key.
+ *
+ * cli#593 — `rowState` is three-valued. A failed read-back leaves the row's
+ * existence unknown, and the remedy then names both branches rather than the
+ * no-row one.
  */
 function refuseRegistration(
   id: string,
@@ -261,7 +268,7 @@ function refuseRegistration(
   identityDir: string,
   detail: string,
   writeError: string | null,
-  rowExists: boolean,
+  rowState: RowState,
 ): never {
   const cause = writeError ? `${detail}; the registration write failed: ${writeError}` : detail;
   console.error(`❌ Agent '${id}' is not registered in Flair at ${flairUrl} — ${cause}.`);
@@ -269,13 +276,18 @@ function refuseRegistration(
     `   Flair cannot store a key generated here yet (it drops publicKey on Agent PUT/PATCH; a supported operation is flair#2266).`,
   );
   const copy = `copy ${join(identityDir, `${id}.key`)} and ${join(identityDir, `${id}.pub`)} into the Flair host's keys dir, run \`flair agent add ${id} --keys-dir <dir>\` there, then re-run \`tps agent create\``;
-  if (rowExists) {
+  if (rowState === "exists") {
     console.error(
       `   Until then: run \`flair agent remove ${id}\` on the Flair host, then ${copy}.`,
     );
     console.error(
       `   ⚠️  \`flair agent remove\` deletes the agent's Agent row, its Memory and Soul rows, and its key files in the keys dir (unless --keep-keys); registering a key on an existing pending row without deleting is flair#2266, not yet available.`,
     );
+  } else if (rowState === "unknown") {
+    console.error(
+      `   Until then: if \`flair agent show ${id}\` finds the agent, it already exists: run \`flair agent remove ${id}\` on the Flair host first (this also deletes that agent's Memory and Soul rows), then ${copy}.`,
+    );
+    console.error(`   Otherwise: ${copy}.`);
   } else {
     console.error(`   Until then: ${copy}.`);
   }
@@ -374,14 +386,16 @@ async function createAgent(args: AgentArgs): Promise<void> {
     try {
       stored = await flair.readStoredPublicKey(id);
     } catch (e) {
-      refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, false);
+      // The read failed with a non-404 error: whether a row exists is unknown, so
+      // the remedy must name the remove branch as well as the add branch (cli#593).
+      refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
     }
     if (!stored.found) {
-      refuseRegistration(id, flairUrl, identityDir, "no Agent row exists", writeError, false);
+      refuseRegistration(id, flairUrl, identityDir, "no Agent row exists", writeError, "absent");
     } else if (stored.publicKey === null || storedKeyAsHex(stored.publicKey) !== pubKeyHex) {
       const found =
         stored.publicKey === null ? "the row has no public key" : `the stored public key is '${stored.publicKey}'`;
-      refuseRegistration(id, flairUrl, identityDir, `${found}, not the generated key`, writeError, true);
+      refuseRegistration(id, flairUrl, identityDir, `${found}, not the generated key`, writeError, "exists");
     }
     console.log(successLine ?? `  Agent '${id}' registered in Flair.`);
   }
