@@ -7,19 +7,29 @@
  * The two callers are the launch-control test and the runtime-launch fixture:
  * one shared list and one shared chooser keep them from drifting apart.
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { BUN_TEMP_DIR, harnessReadPaths } from "../../src/utils/nono.js";
 
 /** Bun's temp dir and the toolchain/interpreter read roots (cli#350 r4g, cli#341 S1b). */
 export const LAUNCHER_FIXED_GRANTS = [BUN_TEMP_DIR, ...harnessReadPaths()];
 
+function realOrResolved(path: string): string {
+  const abs = resolve(path);
+  try {
+    return realpathSync(abs);
+  } catch {
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(realOrResolved(parent), basename(abs));
+  }
+}
+
 /** The launcher grant that covers `path` (equal, or an ancestor directory), or null. */
 export function launcherGrantCovering(path: string): string | null {
-  const target = resolve(path);
+  const target = realOrResolved(path);
   for (const grant of LAUNCHER_FIXED_GRANTS) {
-    const root = resolve(grant);
+    const root = realOrResolved(grant);
     if (target === root || target.startsWith(root.endsWith("/") ? root : `${root}/`)) return grant;
   }
   return null;
@@ -35,7 +45,7 @@ export function launcherGrantCovering(path: string): string | null {
  */
 export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): string {
   for (const candidate of candidates) {
-    if (existsSync(candidate) && launcherGrantCovering(candidate) === null) return candidate;
+    if (existsSync(candidate) && launcherGrantCovering(candidate) === null) return realpathSync(candidate);
   }
   const existing = candidates.filter((c) => existsSync(c));
   if (existing.length === 0) {
