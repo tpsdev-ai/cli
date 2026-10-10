@@ -47,9 +47,20 @@ function guardedTarget(lhs: ts.Expression, moduleObjects: Map<string, string>, a
     const root = guardedRootOf(rootNode, aliases);
     if (root === undefined) return false;
     // process.env is the env-leak preload's object, not a guarded global.
-    return !(root === "process" && /^\.env(?:$|\.|\[)/.test(node.getText().slice(rootNode.text.length)));
+    return !(root === "process" && isEnvMemberOf(node, rootNode));
   }
   return false;
+}
+
+/** True when the member of `rootNode` that `node` reaches through is `.env` or `["env"]`. */
+function isEnvMemberOf(node: ts.Expression, rootNode: ts.Identifier): boolean {
+  node = unwrap(node);
+  if (!ts.isPropertyAccessExpression(node) && !ts.isElementAccessExpression(node)) return false;
+  if (unwrap(node.expression) === rootNode) {
+    return ts.isPropertyAccessExpression(node) ? node.name.text === "env" :
+      ts.isStringLiteralLike(node.argumentExpression) && node.argumentExpression.text === "env";
+  }
+  return isEnvMemberOf(node.expression, rootNode);
 }
 
 function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>,
@@ -295,9 +306,9 @@ function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
           if (derived(node.initializer)) add(node.name.text);
         } else if ((ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name)) &&
           derived(node.initializer)) {
-          for (const element of node.name.elements) {
-            if (ts.isBindingElement(element) && ts.isIdentifier(element.name)) add(element.name.text);
-          }
+          const bound = new Set<string>();
+          bindingNames(node.name, bound);
+          for (const name of bound) add(name);
         }
       } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
         node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
