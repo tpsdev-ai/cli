@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch } from "../src/utils/identity.js";
 import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
+import { createPatchShared } from "./helpers/patch-shared.js";
+
+const patchShared = createPatchShared();
 
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -157,11 +160,11 @@ describe("WsNoiseTransport", () => {
 
     const captured: Buffer[] = [];
     const origSend = (await import("ws")).WebSocket.prototype.send;
-    (await import("ws")).WebSocket.prototype.send = function (data: any, ...args: any[]) {
+    const restoreSend = patchShared((await import("ws")).WebSocket.prototype, "send", function (this: any, data: any, ...args: any[]) {
       try { captured.push(Buffer.from(data)); } catch {}
       // @ts-ignore
       return origSend.call(this, data, ...args);
-    };
+    } as typeof origSend);
 
     const server = await new WsNoiseTransport(host, host).listen(port);
     server.onConnection((ch) => {
@@ -180,7 +183,7 @@ describe("WsNoiseTransport", () => {
     const joined = Buffer.concat(captured).toString("utf-8");
     expect(joined).not.toContain(secret);
 
-    (await import("ws")).WebSocket.prototype.send = origSend;
+    restoreSend();
     await ch.close();
     await server.close();
   });

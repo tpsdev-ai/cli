@@ -40,6 +40,7 @@ function guardedTarget(lhs: ts.Expression, moduleObjects: Map<string, string>, a
   const node = unwrap(lhs);
   if (ts.isIdentifier(node)) return GUARDED_BARE_GLOBALS.has(node.text) && !resolveScope(node);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
+    if (isImportCall(rootExpression(node))) return true;
     const rootNode = rootIdentifier(node);
     if (rootNode === undefined) return false;
     if (moduleObjects.has(rootNode.text)) return true;
@@ -59,8 +60,9 @@ function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects:
   }
   const root = targetRoot(assignment.left);
   if (!root) {
-    if (!mockValue(assignment.right)) return undefined;
-    return { kind: "unclassified-assignment-target", detail: `cannot classify mock assignment target: ${assignment.left.getText()}` };
+    const base = rootExpression(assignment.left);
+    if (base.kind === ts.SyntaxKind.ThisKeyword || ts.isObjectLiteralExpression(base) || ts.isArrayLiteralExpression(base)) return undefined;
+    return { kind: "unclassified-assignment-target", detail: `cannot classify assignment target: ${assignment.left.getText()}` };
   }
   if (!mockValue(assignment.right)) return undefined;
   return { kind: "direct-assignment-needs-restore", detail };
@@ -193,6 +195,19 @@ function resolveScope(id: ts.Identifier): ts.Node | undefined {
   return undefined;
 }
 
+/** The innermost expression a member chain hangs off, without the members. */
+function rootExpression(node: ts.Expression): ts.Expression {
+  node = unwrap(node);
+  if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return rootExpression(node.expression);
+  return node;
+}
+
+function isImportCall(node: ts.Expression): boolean {
+  node = unwrap(node);
+  if (ts.isAwaitExpression(node)) return isImportCall(node.expression);
+  return ts.isCallExpression(node) && node.expression.kind === ts.SyntaxKind.ImportKeyword;
+}
+
 function rootIdentifier(node: ts.Expression): ts.Identifier | undefined {
   node = unwrap(node);
   if (ts.isIdentifier(node)) return node;
@@ -266,6 +281,7 @@ function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
     changed = false;
     const derived = (node: ts.Expression): boolean => {
       node = unwrap(node);
+      if (isImportCall(node)) return true;
       if (ts.isIdentifier(node)) return names.has(node.text);
       if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return derived(node.expression);
       return false;

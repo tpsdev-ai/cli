@@ -56,11 +56,16 @@ describe("mock restore guard (cli#555)", () => {
     "shadow-in-other-scope-leaked.fixture.ts",
     "global-alias-leaked.fixture.ts",
     "process-alias-leaked.fixture.ts",
+    "dynamic-import-module-patched.fixture.ts",
   ]) {
     test(`reports ${name} (red fixture)`, () => {
       expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
     });
   }
+
+  test("reports call-rooted-global-leaked.fixture.ts (red fixture)", () => {
+    expect(kindsFor("call-rooted-global-leaked.fixture.ts")).toContain("unclassified-assignment-target");
+  });
 
   test("refuses inline fetch restoration", () => {
     expect(
@@ -85,6 +90,7 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     "mock-helper-restored.fixture.ts",
     "local-shadow-cleared.fixture.ts",
     "shadow-nested-scope-cleared.fixture.ts",
+    "intermediate-const-local.fixture.ts",
   ]) {
     test(`clears ${name} (green fixture)`, () => {
       expect(findingsFor(name)).toEqual([]);
@@ -129,7 +135,7 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
 
   test("names an unclassified mock assignment target", () => {
     expect(analyzeSource('import { mock, afterEach } from "bun:test"; afterEach(() => mock.restore()); getTarget().m = mock();'))
-      .toContainEqual({ kind: "unclassified-assignment-target", detail: "cannot classify mock assignment target: getTarget().m" });
+      .toContainEqual({ kind: "unclassified-assignment-target", detail: "cannot classify assignment target: getTarget().m" });
   });
 
   for (const rhs of ["mock(() => {})", "spyOn(object, 'm')", "mock.module('x', () => ({}))", "alias", "spy.mockImplementation(() => {})"]) {
