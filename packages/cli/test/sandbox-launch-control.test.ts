@@ -47,7 +47,7 @@ const SUPERVISED = "TPS_SUPERVISED";
  * HOME created inside any of them makes the launcher's runtime-options gate
  * refuse before the case under test runs (cli#558), so the launch-control HOME
  * must sit outside every one. Read from the launcher's own definitions so this
- * list cannot become a second copy that drifts from the code.
+ * list stays in step with the code.
  */
 const LAUNCHER_FIXED_GRANTS = [BUN_TEMP_DIR, ...harnessReadPaths()];
 
@@ -67,7 +67,7 @@ function launcherGrantCovering(path: string): string | null {
  * sibling temp root and sits outside the always-granted `/tmp`; the process temp
  * dir is the fallback. If TMPDIR has been pointed at a directory that covers both
  * candidates, refuse up front, naming TMPDIR and the grant it falls inside,
- * rather than let the gate turn every case into a misleading early refusal.
+ * rather than let the gate report a misleading early refusal.
  */
 function launchControlHomeBase(): string {
   for (const candidate of ["/var/tmp", tmpdir()]) {

@@ -266,7 +266,7 @@ export function systemReadFiles(): string[] {
 /**
  * Bun's own temp dir: `/tmp` regardless of TMPDIR (cli#350 r4g). The agent
  * launcher grants it beside the configured TMPDIR; defined once so the launcher
- * and anything that must sit outside its grants cannot drift (cli#558).
+ * and its readers stay in step (cli#558).
  */
 export const BUN_TEMP_DIR = "/tmp";
 
