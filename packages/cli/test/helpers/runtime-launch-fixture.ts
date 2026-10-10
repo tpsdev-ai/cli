@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sandboxHomeBase } from "./launcher-grants.js";
 
 export interface Sandbox {
   root: string;
@@ -44,8 +44,9 @@ function seedHome(home: string, ws: string): void {
 }
 
 export function makeSandbox(): Sandbox {
-  const base = process.platform === "linux" ? "/var/tmp" : tmpdir();
-  const root = mkdtempSync(join(base, "tps-363-rt-"));
+  // The base must lie outside every launcher grant (cli#558): a HOME inside one
+  // makes the launcher's runtime-options gate refuse before the case under test.
+  const root = mkdtempSync(join(sandboxHomeBase(), "tps-363-rt-"));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
   const ws = join(root, "ws");

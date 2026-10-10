@@ -31,6 +31,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { evaluateLaunchControl } from "../src/utils/nono.js";
+import { sandboxHomeBase } from "./helpers/launcher-grants.js";
 import meow from "meow";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
@@ -117,9 +118,9 @@ describe("T3 — missing --sandbox-required is refused in non-TTY", () => {
 
 describe("T5 — the pinned-path launch spawns nono and the child argv asserts the flags", () => {
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
-    // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
-    // sit inside that grant and the overlap assert would refuse before spawning.
-    const base = "/var/tmp";
+    // A HOME inside a launcher grant makes the runtime-options gate refuse
+    // before the case under test, whatever TMPDIR is (cli#558).
+    const base = sandboxHomeBase();
     const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");
