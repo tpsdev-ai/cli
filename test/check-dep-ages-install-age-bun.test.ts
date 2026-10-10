@@ -371,6 +371,31 @@ it.each([
     ["packages/a", "packages/b"],
   ],
   [
+    "a negated character class",
+    ["packages/[!a]"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/b", "packages/c"],
+  ],
+  ["a ^-negated character class", ["packages/[^a]"], ["packages/a", "packages/b"], ["packages/b"]],
+  [
+    "a dot-directory under a character class",
+    ["packages/[.a]*"],
+    ["packages/.h", "packages/a", "packages/ab"],
+    ["packages/a", "packages/ab"],
+  ],
+  [
+    "a dot-directory under brace alternatives",
+    ["packages/{.h,a}"],
+    ["packages/.h", "packages/a", "packages/b"],
+    ["packages/a"],
+  ],
+  [
+    "a brace branch spanning /",
+    ["packages/{a/b,c}"],
+    ["packages/a/b", "packages/c", "packages/a"],
+    [],
+  ],
+  [
     "brace alternatives",
     ["packages/{a,b}"],
     ["packages/a", "packages/b", "packages/c"],
@@ -394,7 +419,9 @@ it.each([
       const project = writeProject(root, manifests, "http://127.0.0.1:1");
       const install = await bunInstall(project, ["--no-cache"]);
       expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
-      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      const lockPath = join(project, "bun.lock");
+      // Bun writes no lockfile when no workspace and no dependency is installed.
+      const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
       const installed = Object.keys(lock.workspaces)
         .filter((key) => key !== "")
         .map((key) => `${key}/package.json`)

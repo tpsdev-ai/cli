@@ -251,7 +251,7 @@ function pathSegments(path) {
 
 /**
  * Bun's `detect_glob_syntax`: a pattern is a glob when it is `!`-prefixed or
- * carries an unescaped `*`, `{`, `[` or `?`.
+ * carries a `*`, `{`, `[` or `?`.
  */
 function isGlobPattern(pattern) {
   if (pattern.startsWith("!")) return true;
@@ -329,7 +329,7 @@ const REGEX_SPECIAL = /[.+^${}()|[\]\\]/;
  * segment, `[...]` is a character class (`[!...]`/`[^...]` negate it, `a-z` is a
  * range) and `\` escapes the next character.
  */
-function matchGlobSegment(value, pattern) {
+function segmentRegex(pattern) {
   let source = "^";
   let i = 0;
   while (i < pattern.length) {
@@ -364,7 +364,23 @@ function matchGlobSegment(value, pattern) {
       i++;
     }
   }
-  return new RegExp(`${source}$`).test(value);
+  return new RegExp(`${source}$`);
+}
+
+function matchGlobSegment(value, pattern) {
+  return segmentRegex(pattern).test(value);
+}
+
+/** The message of the error a glob's segments raise when compiled, or `null` when they all compile. */
+function globError(pattern) {
+  const expanded = expandBraces(stripNegation(pattern).inner);
+  if (expanded === null) return null;
+  try {
+    for (const candidate of expanded) for (const segment of pathSegments(candidate)) segmentRegex(segment);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return null;
 }
 
 /** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
@@ -455,6 +471,10 @@ export function appliedManifestPaths(manifests) {
   for (const literal of literals) {
     const path = byDir.get(pathSegments(literal).join("/"));
     if (path !== undefined) applied.add(path);
+  }
+  for (const glob of globs) {
+    const reason = globError(glob);
+    if (reason !== null) return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}` };
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);

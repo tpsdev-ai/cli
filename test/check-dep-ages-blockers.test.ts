@@ -223,6 +223,20 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
+  it("refuses a workspaces pattern with a reversed class range, naming it, without a stack trace", () => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/[z-a]"] });
+      writeManifest(root, join("packages", "a", "package.json"), {
+        name: "a",
+        dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      expect(output).toContain("workspaces pattern `packages/[z-a]` cannot be read:");
+      expect(output).not.toContain("Checking");
+      expect(output).not.toMatch(/\n\s+at /);
+    });
+  });
+
   it("refuses an excluded name pinned exactly only in a dot-directory under a * workspace pattern", () => {
     appliedFixture((root) => {
       writeManifest(root, "package.json", { name: "fixture", workspaces: ["packages/*"] });
