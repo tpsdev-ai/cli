@@ -1,0 +1,1 @@
+- **`tps agent create` prints success only after the generated key reads back equal from Flair.** It re-reads the agent's stored `publicKey` over the operator credential; a refused write, a failed read, a missing row, or a mismatched or `pending` stored key exits non-zero naming the agent, the Flair URL and the remedy. No registration error is swallowed.

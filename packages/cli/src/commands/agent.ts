@@ -241,6 +241,21 @@ async function loadSoulFile(filePath: string): Promise<Record<string, string>> {
   return result;
 }
 
+/**
+ * cli#512 — `create` prints its registration success line only when Flair
+ * reads back the key it generated. Every other outcome (a refused write, a
+ * failed read-back, a missing row, a mismatched or `pending` stored key) exits
+ * non-zero here, with a message naming the agent, the Flair URL, what failed,
+ * and the remedy.
+ */
+function refuseRegistration(id: string, flairUrl: string, detail: string, writeError: string | null): never {
+  const cause = writeError ? `${detail}; the registration write failed: ${writeError}` : detail;
+  console.error(`❌ Agent '${id}' is not registered in Flair at ${flairUrl} — ${cause}.`);
+  console.error(`   Remedy: an operator registers this agent's public key with Flair's admin tooling on the Flair host:`);
+  console.error(`   \`flair agent rotate-key ${id}\`, or \`flair agent remove ${id}\` then \`flair agent add ${id}\`.`);
+  process.exit(1);
+}
+
 async function createAgent(args: AgentArgs): Promise<void> {
   const id = args.id;
   if (!id) {
@@ -274,7 +289,13 @@ async function createAgent(args: AgentArgs): Promise<void> {
     console.log(`  Keys saved to ${identityDir}/`);
   }
 
-  // 2. Register in Flair
+  // 2. Register in Flair, then verify the key actually landed.
+  //
+  // cli#512: registration is reported only when Flair reads the key back equal
+  // to the key just generated. Current Flair drops `publicKey` on Agent PUT and
+  // PATCH, so neither can store it. No registration error is swallowed: the
+  // write error, a failed read-back, a missing row and a mismatched or
+  // `pending` stored key each exit non-zero naming the remedy.
   const flair = createFlairClient(id, flairUrl, keyPath);
   const online = await flair.ping();
 
@@ -282,40 +303,60 @@ async function createAgent(args: AgentArgs): Promise<void> {
     console.warn(`  ⚠️  Flair not reachable at ${flairUrl} — skipping registration.`);
     console.warn(`  Run setup-harper.sh and retry: tps agent create --id ${id}`);
   } else {
-    const existing = await flair.getAgent(id);
-    if (existing) {
-      console.log(`  Agent '${id}' already registered in Flair.`);
-      // Still register real public key if record has placeholder
-      if (existing.publicKey === "pending") {
-        await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
+    let writeError: string | null = null;
+    let successLine: string | null = null;
+    try {
+      const existing = await flair.getAgent(id);
+      if (existing) {
+        if (existing.publicKey !== pubKeyHex) {
+          await flair.updateAgent(id, { publicKey: pubKeyHex });
+        }
+        successLine = `  Agent '${id}' already registered in Flair.`;
+      } else if (!args.noSeed) {
+        // Seed agent with soul + starter memories
+        const soulTemplate = args.soulFile
+          ? await loadSoulFile(args.soulFile)
+          : undefined;
+        const starterMemories = args.starterMemories;
+        try {
+          const seeded = await flair.seedAgent({
+            agentId: id,
+            displayName: name,
+            role: "agent",
+            soulTemplate,
+            starterMemories,
+          });
+          // Update the public key on the agent record that AgentSeed created
+          await flair.updateAgent(id, { publicKey: pubKeyHex });
+          successLine = `  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`;
+        } catch {
+          // AgentSeed requires admin auth — fall back to direct registration
+          await flair.registerAgent(name, pubKeyHex);
+          successLine = `  Agent '${id}' registered in Flair (no seed — not admin).`;
+        }
+      } else {
+        // --no-seed: just register
+        await flair.registerAgent(name, pubKeyHex);
+        successLine = `  Agent '${id}' registered in Flair (seeding skipped).`;
       }
-    } else if (!args.noSeed) {
-      // Seed agent with soul + starter memories
-      const soulTemplate = args.soulFile
-        ? await loadSoulFile(args.soulFile)
-        : undefined;
-      const starterMemories = args.starterMemories;
-      try {
-        const seeded = await flair.seedAgent({
-          agentId: id,
-          displayName: name,
-          role: "agent",
-          soulTemplate,
-          starterMemories,
-        });
-        // Update the public key on the agent record that AgentSeed created
-        await flair.updateAgent(id, { publicKey: pubKeyHex }).catch(() => {});
-        console.log(`  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`);
-      } catch (_e: any) {
-        // AgentSeed requires admin auth — fall back to direct registration
-        await flair.registerAgent(name, pubKeyHex).catch(() => {});
-        console.log(`  Agent '${id}' registered in Flair (no seed — not admin).`);
-      }
-    } else {
-      // --no-seed: just register
-      await flair.registerAgent(name, pubKeyHex);
-      console.log(`  Agent '${id}' registered in Flair (seeding skipped).`);
+    } catch (e) {
+      writeError = e instanceof Error ? e.message : String(e);
     }
+
+    let stored: { found: boolean; publicKey: string | null };
+    try {
+      stored = await flair.readStoredPublicKey(id);
+    } catch (e) {
+      refuseRegistration(id, flairUrl, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError);
+    }
+    if (!stored.found) {
+      refuseRegistration(id, flairUrl, "no Agent row exists", writeError);
+    } else if (stored.publicKey !== pubKeyHex) {
+      const found =
+        stored.publicKey === null ? "the row has no public key" : `the stored public key is '${stored.publicKey}'`;
+      refuseRegistration(id, flairUrl, `${found}, not the generated key`, writeError);
+    }
+    console.log(successLine ?? `  Agent '${id}' registered in Flair.`);
   }
 
   // 3. Write agent config
