@@ -1,9 +1,9 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, deadLetterUndelivered, findRelayedRecord, getMailDir, mkdirMailDirectory, MailSyncError, relayAcceptRoot, relayAcceptLockRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
@@ -16,7 +16,7 @@ import { registerServiceProxyHandler } from "./service-proxy-host.js";
 import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
-import type { ZodError } from "zod";
+import { z, type ZodError } from "zod";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:relay");
 
 
@@ -368,27 +368,206 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
   });
 }
 
-function recordAcceptance(acceptedDir: string, marker: string): void {
-  mkdirMailDirectory(acceptedDir);
-  const tmp = `${marker}.tmp`;
-  writeFileSync(tmp, "", { mode: 0o600 });
-  syncMailFile(tmp);
-  renameSync(tmp, marker);
-  syncMailDirectory(acceptedDir);
+/**
+ * The payload an acceptance receipt binds to its branch+id: the relay payload
+ * of the delivery that was accepted, so a later resend can be judged against it
+ * after the inbox record is gone.
+ */
+const RelayAcceptReceiptSchema = z.object({
+  from: MailDeliverBodySchema.shape.from,
+  to: MailDeliverBodySchema.shape.to,
+  body: z.string(),
+  timestamp: MailDeliverBodySchema.shape.timestamp,
+});
+type RelayAcceptReceipt = z.infer<typeof RelayAcceptReceiptSchema>;
+
+function acceptReceipt(body: MailDeliverBody): RelayAcceptReceipt {
+  return { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp };
 }
 
-/** The shared wait budget for relay acceptance's mailbox locks. */
+function refusalText(error: unknown, content: string): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return content ? message.replaceAll(content, "[redacted]") : message;
+}
+
+/** A receipt stops blocking resends after this age. */
+const RELAY_ACCEPT_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function relayAcceptReceiptTtlMs(): number {
+  const raw = Number(process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : RELAY_ACCEPT_RECEIPT_TTL_MS;
+}
+
+function receiptBucket(now = Date.now()): string {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+export function relayAcceptanceReceiptPath(branchId: string, id: string, now = Date.now()): string {
+  return join(getMailDir(), ".relay-accepted", "by-branch", branchId, receiptBucket(now), id);
+}
+
+/** Remove old day buckets and expired flat per-branch markers. */
+export function pruneRelayAcceptanceReceipts(acceptedDir: string, now = Date.now(), ttlMs = relayAcceptReceiptTtlMs()): number {
+  if (!existsSync(acceptedDir)) return 0;
+  let removed = 0;
+  for (const entry of readdirSync(acceptedDir, { withFileTypes: true })) {
+    const path = join(acceptedDir, entry.name);
+    if (entry.isDirectory() && /^\d{4}-\d{2}-\d{2}$/.test(entry.name)) {
+      const end = Date.parse(`${entry.name}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
+      if (!Number.isFinite(end) || end > now - ttlMs) continue;
+      try { rmSync(path, { recursive: true }); removed++; } catch {}
+    } else if (entry.isFile() && MailDeliverBodySchema.shape.id.safeParse(entry.name).success) {
+      try {
+        if (now - statSync(path).mtimeMs <= ttlMs) continue;
+        unlinkSync(path);
+        removed++;
+      } catch {}
+    }
+  }
+  if (removed > 0) syncMailDirectory(acceptedDir);
+  return removed;
+}
+
+function startReceiptPrune(branchId?: string): () => void {
+  if (branchId && !/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error("invalid branch id for receipt prune");
+  const pass = () => {
+    const root = join(getMailDir(), ".relay-accepted", "by-branch");
+    const prune = (dir: string) => {
+      try { pruneRelayAcceptanceReceipts(dir); }
+      catch { console.error("[relay] acceptance receipt prune failed"); }
+    };
+    try {
+      if (branchId) prune(join(root, branchId));
+      else if (existsSync(root)) {
+        for (const entry of readdirSync(root, { withFileTypes: true })) {
+          if (entry.isDirectory()) prune(join(root, entry.name));
+        }
+      }
+    } catch { console.error("[relay] acceptance receipt prune failed"); }
+  };
+  pass();
+  const configured = Number(process.env.TPS_RELAY_ACCEPT_PRUNE_INTERVAL_MS);
+  const timer = setInterval(pass, Number.isFinite(configured) && configured > 0 ? configured : 60_000);
+  timer.unref();
+  return () => clearInterval(timer);
+}
+
+class ReceiptRecoveryIncompleteError extends Error {}
+
+function receiptMayExist(path: string): boolean {
+  try { lstatSync(path); return true; }
+  catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+}
+
+function recordAcceptance(acceptedDir: string, marker: string, receipt: RelayAcceptReceipt): void {
+  mkdirMailDirectory(dirname(marker));
+  const tmp = `${marker}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(receipt), { mode: 0o600, flag: "wx" });
+    syncMailFile(tmp);
+    renameSync(tmp, marker);
+    syncMailDirectory(dirname(marker));
+  } catch (error) {
+    if (receiptMayExist(marker)) {
+      try { unlinkSync(marker); syncMailDirectory(dirname(marker)); }
+      catch { throw new ReceiptRecoveryIncompleteError("relay receipt recovery incomplete; retry may duplicate"); }
+    }
+    try { removeMailFileConfirmed(tmp); }
+    catch {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new ReceiptRecoveryIncompleteError("relay receipt recovery incomplete; retry may duplicate");
+    }
+    throw error;
+  }
+  try {
+    pruneRelayAcceptanceReceipts(acceptedDir);
+  } catch {
+    console.error("[relay] acceptance receipt prune failed");
+  }
+}
+
+/**
+ * Find a marker unless its age is known to exceed the receipt TTL.
+ */
+function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker: string): string | undefined {
+  if (receiptMayExist(acceptedDir)) {
+    for (const bucket of readdirSync(acceptedDir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort().reverse()) {
+      const path = join(acceptedDir, bucket, id);
+      if (!receiptMayExist(path)) continue;
+      try {
+        if (Date.now() - statSync(path).mtimeMs > relayAcceptReceiptTtlMs()) continue;
+      } catch {
+        if (!receiptMayExist(path)) continue;
+      }
+      return path;
+    }
+  }
+  const flatMarker = join(acceptedDir, id);
+  if (receiptMayExist(flatMarker)) {
+    try { if (Date.now() - statSync(flatMarker).mtimeMs <= relayAcceptReceiptTtlMs()) return flatMarker; }
+    catch { if (receiptMayExist(flatMarker)) return flatMarker; }
+  }
+  if (!receiptMayExist(legacyMarker)) return undefined;
+  try { if (Date.now() - statSync(legacyMarker).mtimeMs > relayAcceptReceiptTtlMs()) return undefined; }
+  catch { if (!receiptMayExist(legacyMarker)) return undefined; }
+  return legacyMarker;
+}
+
+/**
+ * Whether a readable receipt matches the payload; legacy empty markers cannot be compared.
+ */
+function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
+  const raw = readFileSync(path, "utf-8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  const receipt = RelayAcceptReceiptSchema.safeParse(parsed);
+  if (!receipt.success) return false;
+  const r = receipt.data;
+  return r.from === expected.from && r.to === expected.to && r.body === expected.body && r.timestamp === expected.timestamp;
+}
+
+function undoNewRelayRecord(root: string, delivery: { branchId: string; id: string }): void {
+  for (const dir of ["tmp", "new", "dlq"]) {
+    const parent = join(root, dir);
+    if (!existsSync(parent)) continue;
+    for (const entry of readdirSync(parent, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      const path = join(parent, entry.name);
+      let record: { relayDelivery?: { branchId?: string; id?: string } };
+      try { record = JSON.parse(readFileSync(path, "utf8")); }
+      catch { throw new Error("relay record recovery incomplete; delivery may be retried"); }
+      if (record.relayDelivery?.branchId !== delivery.branchId || record.relayDelivery.id !== delivery.id) continue;
+      unlinkSync(path);
+      if (dir === "dlq" && existsSync(`${path}.reason`)) unlinkSync(`${path}.reason`);
+      syncMailDirectory(parent);
+    }
+  }
+}
+
+/** Wait budget for relay acceptance locks. */
 const RELAY_ACCEPT_LOCK_TIMEOUT_MS = 2000;
+export const RELAY_ACCEPT_LOCK_STRIPES = 64;
+
+export function relayAcceptanceLockRoot(branchId: string, id: string): string {
+  const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
+  return join(getMailDir(), ".relay-accept-locks", String(stripe));
+}
 
 function relayAcceptLockTimeoutMs(): number {
   const raw = Number(process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : RELAY_ACCEPT_LOCK_TIMEOUT_MS;
 }
 
-/** The named refusal when an acceptance mailbox lock times out. */
+/** The named refusal when relay acceptance waits too long for a lock. */
 export class RelayAcceptLockTimeoutError extends Error {
   constructor(recipient: string) {
-    super(`relay acceptance timed out waiting for the mailbox lock for ${recipient}`);
+    super(`relay acceptance timed out waiting for a lock for ${recipient}`);
     this.name = "RelayAcceptLockTimeoutError";
   }
 }
@@ -411,30 +590,49 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
     return lock;
   };
-  const acceptanceRoot = relayAcceptLockRoot(body.to);
+  const acceptanceRoot = relayAcceptanceLockRoot(branchId, body.id);
   mkdirMailDirectory(acceptanceRoot);
   const acceptanceLock = acquireLock(acceptanceRoot);
   let mailboxLock: ReturnType<typeof acquireLock> | undefined;
   try {
+    // Hold the stripe before each mailbox lock; release mailbox locks before the stripe.
     const recipientRoot = relayAcceptRoot(body.to);
     mkdirMailDirectory(recipientRoot);
     if (recipientRoot !== acceptanceRoot) mailboxLock = acquireLock(recipientRoot);
     relayAcceptTestHook?.(recipientRoot);
     // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
-    const marker = join(acceptedDir, body.id);
+    const marker = relayAcceptanceReceiptPath(branchId, body.id);
+    const flatMarker = join(acceptedDir, body.id);
     const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
-    const existingMarker = existsSync(marker) ? marker : existsSync(legacyMarker) ? legacyMarker : undefined;
+    const receipt = acceptReceipt(body);
+    const existingMarker = existingAcceptanceMarker(acceptedDir, body.id, legacyMarker);
     const delivery = { branchId, id: body.id };
     const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, acquireLock });
-    if (existingMarker && existingRecord) {
-      syncMailFile(existingMarker);
-      syncMailDirectory(dirname(existingMarker));
+    if (existingRecord) {
+      if (existingMarker && existingMarker !== legacyMarker && existingMarker !== flatMarker && !acceptanceReceiptMatches(existingMarker, receipt)) {
+        throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}`);
+      }
+      if (existingMarker && acceptanceReceiptMatches(existingMarker, receipt)) {
+        syncMailFile(existingMarker);
+        syncMailDirectory(dirname(existingMarker));
+      } else {
+        try { recordAcceptance(acceptedDir, marker, receipt); }
+        catch { throw new Error(`relay receipt recovery incomplete for message ${body.id}; retry may duplicate`); }
+      }
       return false;
     }
-    if (!existingMarker && existingRecord) {
-      recordAcceptance(acceptedDir, marker);
-      return false;
+    if (existingMarker) {
+      // A marker without a record blocks publication unless its receipt matches.
+      if (acceptanceReceiptMatches(existingMarker, receipt)) {
+        syncMailFile(existingMarker);
+        syncMailDirectory(dirname(existingMarker));
+        return false;
+      }
+      if (existingMarker === flatMarker || existingMarker === legacyMarker) {
+        throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}: accepted before receipts existed; payload cannot be compared; sender must not retry`);
+      }
+      throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}`);
     }
 
     let delivered: boolean;
@@ -442,30 +640,39 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
       sendMessage(body.to, body.content, body.from, delivery, body.timestamp, body.to, recipientRoot);
       delivered = true;
     } catch (e: unknown) {
-      if (e instanceof MailSyncError) throw e;
+      try { undoNewRelayRecord(recipientRoot, delivery); }
+      catch { throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`); }
       const reason = e instanceof Error ? e.message : String(e);
-      const cls: PromoteRejectClass = /inbox full/i.test(reason)
+      const cls: PromoteRejectClass | null = e instanceof MailInboxFullError
         ? "inbox-full"
-        : /^(Invalid agent id|Message body)/.test(reason) ? "invalid" : "storage-unavailable";
-      console.error(`[relay] local delivery failed for message ${body.id} to ${body.to}: ${reason}`);
+        : e instanceof MailSendInputError ? "invalid" : null;
+      if (!cls) throw new Error("relay inbox write failed; retry delivery");
+      console.error(`[relay] local delivery failed for message ${body.id} to ${body.to}: ${refusalText(e, body.content)}`);
       try {
         deadLetterUndelivered(
           body.to,
           { id: body.id, from: body.from, to: body.to, body: body.content, timestamp: body.timestamp },
           cls,
-          reason,
+          refusalText(e, body.content),
           delivery,
           recipientRoot,
         );
-      } catch (dlqErr: unknown) {
-        console.error(
-          `[relay] dead-letter failed for message ${body.id} to ${body.to}: ${dlqErr instanceof Error ? dlqErr.message : String(dlqErr)}`,
-        );
-        throw dlqErr;
+      } catch (deadLetterError) {
+        if (deadLetterError instanceof DeadLetterCleanupError) throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`);
+        try { undoNewRelayRecord(recipientRoot, delivery); }
+        catch { throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`); }
+        console.error(`[relay] dead-letter failed for message ${body.id} to ${body.to}`);
+        throw new Error("relay dead-letter failed; retry delivery");
       }
       delivered = false;
     }
-    recordAcceptance(acceptedDir, marker);
+    try { recordAcceptance(acceptedDir, marker, receipt); }
+    catch (error) {
+      if (error instanceof ReceiptRecoveryIncompleteError || receiptMayExist(marker)) throw new Error(`relay receipt recovery incomplete for message ${body.id}; retry may duplicate`);
+      try { undoNewRelayRecord(recipientRoot, delivery); }
+      catch { throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`); }
+      throw new Error("relay acceptance receipt write failed; retry delivery");
+    }
     return delivered;
   } finally {
     mailboxLock?.release();
@@ -481,12 +688,7 @@ async function acceptRelayedMail(
   onAccepted?: () => void,
 ): Promise<boolean> {
   const delivered = deliverRelayedToLocal(branchId, body);
-  // Fire the caller's accepted-delivery hook only when this call published a
-  // new inbox record. `delivered` is false for a resend whose record already
-  // exists, and for an inbox write failure that deliverRelayedToLocal handled
-  // by dead-lettering the message; both are still ACKed below. A same-id
-  // conflict throws before this point, as does a sync failure or a failed
-  // dead-letter, so none of those is announced or ACKed.
+  // A delivery with delivered=false (dead-lettered or receipt-backed duplicate) is still ACKed below.
   if (delivered) {
     const reportError = () => {
       console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);
@@ -512,6 +714,7 @@ function logRefusedDelivery(branchId: string, error: ZodError): void {
 
 export function startRelay(agentId: string): () => void {
   assertAgent(agentId);
+  const stopPrune = startReceiptPrune();
 
   let remoteCleanup: (() => Promise<void>) | null = null;
   connectRemoteBranches(transportRegistry, (branchId, msg) => {
@@ -536,6 +739,7 @@ export function startRelay(agentId: string): () => void {
 
   const stop = () => {
     clearInterval(timer);
+    stopPrune();
     remoteCleanup?.().catch(() => {});
   };
   return stop;
@@ -717,6 +921,7 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
   const hostKp = await loadHostIdentity();
   const transport = transportType === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
   const channel = await transport.connect({ host, port, branchId, hostPublicKey: branch.encryptionKey });
+  const stopPrune = startReceiptPrune(branchId);
 
   let received = 0;
   try {
@@ -738,13 +943,14 @@ export async function syncRemoteBranch(branchId: string): Promise<{ received: nu
         void acceptRelayedMail(channel, branchId, msg, parsed.data).then((delivered) => {
           if (delivered) received++;
         }).catch((error: unknown) => {
-          console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
+          console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${refusalText(error, parsed.data.content)}`);
         });
       };
 
       channel.onMessage(handler);
     });
   } finally {
+    stopPrune();
     await channel.close().catch(() => {});
   }
 
@@ -786,6 +992,7 @@ export async function connectAndKeepAlive(
   const branch = lookupBranch(branchId);
   if (!branch?.encryptionKey) throw new Error(`Branch '${branchId}' missing encryption key`);
   const hostKp = await loadHostIdentity();
+  const stopPrune = startReceiptPrune(branchId);
 
   const loop = async () => {
     let backoff = RECONNECT_BASE_MS;
@@ -854,7 +1061,7 @@ export async function connectAndKeepAlive(
             const parsed = MailDeliverBodySchema.safeParse(msg.body);
             if (parsed.success) {
               void acceptRelayedMail(channel, branchId, msg, parsed.data, () => opts.onAccepted?.(msg)).catch((error: unknown) => {
-                console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${String(error)}`);
+                console.error(`[relay] acceptance failed for message ${parsed.data.id} to ${parsed.data.to}: ${refusalText(error, parsed.data.content)}`);
               });
             } else {
               logRefusedDelivery(branchId, parsed.error);
@@ -888,6 +1095,7 @@ export async function connectAndKeepAlive(
 
   return async () => {
     stopped = true;
+    stopPrune();
     try { await currentChannel?.close(); } catch {}
     clearHostState(branchId);
   };

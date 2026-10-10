@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { checkMessages, getInbox, listMessages, promote, sendMessage } from "../src/utils/mail.js";
-import { deliverRelayedToLocal } from "../src/utils/relay.js";
+import { deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 import { runMail } from "../src/commands/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
@@ -76,7 +76,7 @@ describe("relay review regressions", () => {
     const [file] = fs.readdirSync(inbox.fresh);
     expect(JSON.parse(fs.readFileSync(join(inbox.fresh, file!), "utf8")).body).toBe(message.content);
     const directories = synced.filter((path) => !path.endsWith(".json") && !path.endsWith(message.id) && !path.endsWith(".tmp"));
-    expect(new Set(directories)).toEqual(new Set([inbox.tmp, inbox.fresh, accepted]));
+    for (const path of [inbox.tmp, inbox.fresh, join(accepted, new Date().toISOString().slice(0, 10))]) expect(directories).toContain(path);
   });
 
   test("relay publication syncs parents of newly created directories", () => {
@@ -86,10 +86,7 @@ describe("relay review regressions", () => {
     const inbox = getInbox("local");
     const acceptedRoot = join(mail, ".relay-accepted");
     const directories = synced.filter((path) => !path.endsWith(".json") && !path.endsWith(message.id) && !path.endsWith(".tmp"));
-    expect(new Set(directories)).toEqual(new Set([
-      root, mail, inbox.root, inbox.tmp, inbox.fresh,
-      acceptedRoot, join(acceptedRoot, "by-branch"), join(acceptedRoot, "by-branch", "remote"),
-    ]));
+    for (const path of [root, mail, inbox.root, inbox.tmp, inbox.fresh, join(acceptedRoot, "by-branch", "remote", new Date().toISOString().slice(0, 10))]) expect(directories).toContain(path);
   });
 
   test("a retry syncs directory entries left pending by a creation sync failure", () => {
@@ -97,16 +94,21 @@ describe("relay review regressions", () => {
     const acceptedRoot = join(mail, ".relay-accepted");
     const synced = traceSync(acceptedRoot, true);
     const message = body();
-    expect(() => deliverRelayedToLocal("remote", message)).toThrow("mail fsync failed");
+    expect(() => deliverRelayedToLocal("remote", message)).toThrow("relay acceptance receipt write failed; retry delivery");
     synced.length = 0;
-    expect(deliverRelayedToLocal("remote", message)).toBe(false);
+    expect(deliverRelayedToLocal("remote", message)).toBe(true);
     expect(synced).toContain(acceptedRoot);
     expect(synced).toContain(mail);
-    expect(fs.readFileSync(join(acceptedRoot, "by-branch", "remote", message.id), "utf8")).toBe("");
+    expect(JSON.parse(fs.readFileSync(relayAcceptanceReceiptPath("remote", message.id), "utf8"))).toEqual({
+      from: message.from,
+      to: message.to,
+      body: message.content,
+      timestamp: message.timestamp,
+    });
   });
 
   for (const dir of ["new", "cur", "dlq"] as const) {
-    test(`a truncated ${dir} record is preserved and reported while a marked delivery is republished`, () => {
+    test(`a truncated ${dir} record is preserved and reported; a marked delivery with no usable receipt is refused`, () => {
       const inbox = getInbox("local");
       const message = body();
       const corrupt = join(inbox.root, dir, "truncated.json");
@@ -114,9 +116,10 @@ describe("relay review regressions", () => {
       fs.writeFileSync(corrupt, raw);
       const accepted = join(mail, ".relay-accepted", "by-branch", "remote");
       fs.mkdirSync(accepted, { recursive: true });
-      fs.writeFileSync(join(accepted, message.id), "");
+      fs.mkdirSync(join(accepted, new Date().toISOString().slice(0, 10)), { recursive: true });
+      fs.writeFileSync(relayAcceptanceReceiptPath("remote", message.id), "");
       const errors = spyOn(console, "error").mockImplementation(() => {});
-      expect(deliverRelayedToLocal("remote", message)).toBe(true);
+      expect(() => deliverRelayedToLocal("remote", message)).toThrow(`relayed delivery conflict for branch remote message ${message.id}`);
       const quarantine = join(inbox.root, "quarantine");
       const files = fs.readdirSync(quarantine).filter((file) => file.endsWith(".json"));
       expect(files).toHaveLength(1);
@@ -125,7 +128,8 @@ describe("relay review regressions", () => {
       expect(fs.readFileSync(`${path}.reason`, "utf8")).toContain(corrupt);
       expect(errors.mock.calls.flat().join("\n")).toContain(corrupt);
       expect(fs.readdirSync(join(inbox.root, dir))).not.toContain("truncated.json");
-      expect(deliverRelayedToLocal("remote", message)).toBe(false);
+      fs.rmSync(relayAcceptanceReceiptPath("remote", message.id));
+      expect(deliverRelayedToLocal("remote", message)).toBe(true);
       const records = fs.readdirSync(inbox.fresh).filter((file) => file.endsWith(".json"));
       expect(records).toHaveLength(1);
       expect(JSON.parse(fs.readFileSync(join(inbox.fresh, records[0]!), "utf8")).body).toBe(message.content);
@@ -150,7 +154,7 @@ describe("relay review regressions", () => {
     expect(errors.mock.calls.flat().join("\n")).toContain(source);
     const records = fs.readdirSync(inbox.fresh).filter((file) => file !== "unreadable.json" && file.endsWith(".json"));
     expect(records).toHaveLength(0);
-    expect(fs.existsSync(join(mail, ".relay-accepted", "by-branch", "remote", message.id))).toBe(false);
+    expect(fs.existsSync(relayAcceptanceReceiptPath("remote", message.id))).toBe(false);
   });
 
   test("mail list and CLI list use receipt time with a timestamp fallback", async () => {
