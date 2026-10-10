@@ -33,14 +33,22 @@ export function launcherGrantCovering(path: string): string | null {
  * grant tmpdir() falls inside, rather than let the launcher's gate report a
  * misleading early refusal.
  */
-export function sandboxHomeBase(): string {
-  for (const candidate of ["/var/tmp", tmpdir()]) {
+export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): string {
+  for (const candidate of candidates) {
     if (existsSync(candidate) && launcherGrantCovering(candidate) === null) return candidate;
   }
-  const grant = launcherGrantCovering(tmpdir());
+  const existing = candidates.filter((c) => existsSync(c));
+  if (existing.length === 0) {
+    throw new Error(
+      `no usable base directory exists (checked ${candidates.join(", ")}); ` +
+        "a test sandbox HOME needs a base outside every launcher grant.",
+    );
+  }
+  const grant = launcherGrantCovering(existing[0]);
+  const suggestion = existing.includes("/var/tmp") ? "" : " (for example /var/tmp)";
   throw new Error(
-    `a test sandbox HOME needs a base outside every launcher grant, but TMPDIR=${tmpdir()} ` +
-      `falls inside the launcher's '${grant}' grant — point TMPDIR at a directory outside it ` +
-      `(for example /var/tmp) and re-run.`,
+    `a test sandbox HOME needs a base outside every launcher grant, but '${existing[0]}' ` +
+      `(TMPDIR=${tmpdir()}) falls inside the launcher's '${grant}' grant — point TMPDIR at a ` +
+      `directory outside it${suggestion} and re-run.`,
   );
 }
