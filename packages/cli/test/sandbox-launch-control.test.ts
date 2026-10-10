@@ -19,6 +19,7 @@
  */
 import { describe, test, expect, beforeAll } from "bun:test";
 import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   existsSync,
   mkdtempSync,
@@ -30,7 +31,7 @@ import {
   rmSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { evaluateLaunchControl } from "../src/utils/nono.js";
+import { evaluateLaunchControl, harnessReadPaths, BUN_TEMP_DIR } from "../src/utils/nono.js";
 import meow from "meow";
 import { buildPlist } from "../src/commands/mail-watch.js";
 import { generateOfficePlist, generateTunnelPlist } from "../src/commands/office-supervision.js";
@@ -39,6 +40,46 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const SANDBOX_REQUIRED = "--sandbox-required";
 const NO_SANDBOX = "--no-sandbox";
 const SUPERVISED = "TPS_SUPERVISED";
+
+/**
+ * The launcher's grants that do NOT move with the agent's HOME: bun's temp dir
+ * and the toolchain/interpreter read roots (cli#350 r4g, cli#341 S1b). A test
+ * HOME created inside any of them makes the launcher's runtime-options gate
+ * refuse before the case under test runs (cli#558), so the launch-control HOME
+ * must sit outside every one. Read from the launcher's own definitions so this
+ * list cannot become a second copy that drifts from the code.
+ */
+const LAUNCHER_FIXED_GRANTS = [BUN_TEMP_DIR, ...harnessReadPaths()];
+
+/** The launcher grant that covers `path` (equal, or an ancestor directory), or null. */
+function launcherGrantCovering(path: string): string | null {
+  const target = resolve(path);
+  for (const grant of LAUNCHER_FIXED_GRANTS) {
+    const root = resolve(grant);
+    if (target === root || target.startsWith(root.endsWith("/") ? root : `${root}/`)) return grant;
+  }
+  return null;
+}
+
+/**
+ * A base directory for the launch-control test HOME that lies outside every
+ * launcher grant, whatever TMPDIR is (cli#558). `/var/tmp` is the launcher's
+ * sibling temp root and sits outside the always-granted `/tmp`; the process temp
+ * dir is the fallback. If TMPDIR has been pointed at a directory that covers both
+ * candidates, refuse up front, naming TMPDIR and the grant it falls inside,
+ * rather than let the gate turn every case into a misleading early refusal.
+ */
+function launchControlHomeBase(): string {
+  for (const candidate of ["/var/tmp", tmpdir()]) {
+    if (existsSync(candidate) && launcherGrantCovering(candidate) === null) return candidate;
+  }
+  const grant = launcherGrantCovering(tmpdir());
+  throw new Error(
+    `the launch-control tests need a HOME outside every launcher grant, but TMPDIR=${tmpdir()} ` +
+      `falls inside the launcher's '${grant}' grant — point TMPDIR at a directory outside it ` +
+      `(for example /var/tmp) and re-run.`,
+  );
+}
 
 /** Run the built launcher with piped stdio (stdin/stdout are NOT a TTY). */
 function runLauncher(args: string[], env: Record<string, string | undefined> = {}) {
@@ -117,9 +158,9 @@ describe("T3 — missing --sandbox-required is refused in non-TTY", () => {
 
 describe("T5 — the pinned-path launch spawns nono and the child argv asserts the flags", () => {
   test("agent start --sandbox-required with a fake nono at NONO_BIN: the run argv carries both flags", () => {
-    // OUTSIDE /tmp: the launch grants /tmp too (cli#350 r4g), so a /tmp HOME would
-    // sit inside that grant and the overlap assert would refuse before spawning.
-    const base = "/var/tmp";
+    // A HOME inside a launcher grant makes the runtime-options gate refuse
+    // before the case under test, whatever TMPDIR is (cli#558).
+    const base = launchControlHomeBase();
     const home = mkdtempSync(join(base, "tps-reexec-argv-"));
     try {
       const nonoDir = join(home, "nono");

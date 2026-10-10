@@ -26,6 +26,7 @@ import {
   isSupervised,
   harnessReadPaths,
   harnessReadFiles,
+  BUN_TEMP_DIR,
   runtimeNonoOptions,
   runtimeNonoProfile,
   approveRuntimeNonoOptions,
@@ -909,7 +910,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
               // to /var/folders/…, so /tmp would otherwise not be granted at
               // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-              allow: [...new Set([mailDir, tmpDir, "/tmp", config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
+              allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
             };
             const profile = runtimeNonoProfile(selectedRuntime);
             const approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);

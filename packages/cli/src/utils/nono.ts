@@ -264,6 +264,13 @@ export function systemReadFiles(): string[] {
 }
 
 /**
+ * Bun's own temp dir: `/tmp` regardless of TMPDIR (cli#350 r4g). The agent
+ * launcher grants it beside the configured TMPDIR; defined once so the launcher
+ * and anything that must sit outside its grants cannot drift (cli#558).
+ */
+export const BUN_TEMP_DIR = "/tmp";
+
+/**
  * Read grants every TPS harness family needs: the agent identity dir, the bun
  * cache, the running interpreter's own directory, plus the system roots. One
  * definition so `agent start` and `mail watch` cannot drift apart (cli#341 S1b).
