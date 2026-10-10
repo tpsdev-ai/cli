@@ -24,7 +24,8 @@
  *       or one below 7 days, invalid or unused exceptions, an excluded name without an
  *       unexpired exception or an exact declaration Bun applies, an excluded name pinned
  *       exactly only in a manifest Bun does not apply, an excluded name in a nested
- *       package.json's overrides or as a resolutions key, no external resolutions, refused
+ *       package.json's overrides or as a resolutions key, an unreadable `workspaces`
+ *       shape in the root package.json, no external resolutions, refused
  *       CI overrides, unexpected arguments, or registry fetch failures
  *
  */
@@ -255,7 +256,14 @@ if (excludeNames.length > 0) {
     );
     console.error("");
     for (const problem of problems) {
-      if (problem.kind === "uncovered") {
+      if (problem.kind === "workspaces") {
+        console.error(
+          `    the root package.json \`workspaces\` could not be read: ${problem.message}.`,
+        );
+        console.error(
+          "        Remedy: declare `workspaces` as an array of strings, or as an object with a `packages` array of strings, which is what Bun reads.",
+        );
+      } else if (problem.kind === "uncovered") {
         const why = problem.error
           ? `its dated entry is invalid: ${problem.error.message}`
           : "no dated entry under `## Exceptions` names it";

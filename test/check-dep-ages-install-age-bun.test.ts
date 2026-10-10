@@ -358,13 +358,37 @@ it.each([
     ["packages/x", "packages/y"],
     ["packages/x", "packages/y"],
   ],
+  [
+    "the object form of workspaces",
+    { packages: ["packages/*"] },
+    ["packages/a", "tools/t"],
+    ["packages/a"],
+  ],
+  [
+    "a character class",
+    ["packages/[ab]"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/a", "packages/b"],
+  ],
+  [
+    "brace alternatives",
+    ["packages/{a,b}"],
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/a", "packages/b"],
+  ],
+  [
+    "a negation of a literal pattern",
+    ["packages/x", "!packages/x"],
+    ["packages/x", "packages/y"],
+    ["packages/x"],
+  ],
 ] as const)(
   "the gate applies the same workspaces real Bun installs for %s",
   async (_label, workspaces, dirs, expected) => {
     const root = mkdtempSync(join(tmpdir(), "age-workspaces-"));
     try {
       const manifests: Record<string, unknown> = {
-        "package.json": { name: "fixture", workspaces: [...workspaces] },
+        "package.json": { name: "fixture", workspaces },
       };
       for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll("/", "-")}` };
       const project = writeProject(root, manifests, "http://127.0.0.1:1");
@@ -378,7 +402,9 @@ it.each([
       expect(installed).toEqual(expected.map((dir) => `${dir}/package.json`));
 
       const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
-      const gate = [...appliedManifestPaths(packageJsons)].filter((path) => path !== "package.json").sort();
+      const gate = [...appliedManifestPaths(packageJsons).applied]
+        .filter((path) => path !== "package.json")
+        .sort();
       expect(gate).toEqual(installed);
     } finally {
       rmSync(root, { recursive: true, force: true });
