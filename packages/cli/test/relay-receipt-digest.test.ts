@@ -1,9 +1,8 @@
 /**
  * relay-receipt-digest.test.ts — cli#579.
  *
- * A new relay acceptance receipt binds a branch+id to the digest and byte length
- * of the accepted payload, not the payload itself, so the receipt's size does not
- * grow with what a sender sends.
+ * New relay acceptance receipts are under 384 bytes: identifiers are at most
+ * 64 ASCII characters each and ISO instant timestamps at most 35 characters.
  */
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
@@ -12,6 +11,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ackMessageAtPath, getInbox, MAX_INBOX_MESSAGES, sendMessage } from "../src/utils/mail.js";
 import { deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
+import { MailDeliverBodySchema } from "../src/utils/wire-mail.js";
 
 const sha256 = (content: string): string => createHash("sha256").update(content, "utf8").digest("hex");
 const byteLength = (content: string): number => Buffer.byteLength(content, "utf8");
@@ -50,14 +50,17 @@ function ackOnlyRecord(): void {
   expect(freshFiles()).toEqual([]);
 }
 
-test("an accepted large payload leaves a receipt under 1 KB that holds no content bytes", () => {
+test("maximal wire metadata and a large payload leave a receipt under 384 bytes without content", () => {
   const marker = `MARKER-${randomUUID()}`;
   const content = `${marker}${"x".repeat(60 * 1024)}`;
-  const item = body(content);
+  const item = { ...body(content), from: "r".repeat(64), to: "l".repeat(64), timestamp: "2026-10-10T00:00:00.123456789+00:00" };
+  expect(item.timestamp).toHaveLength(35);
   expect(deliverRelayedToLocal("remote", item)).toBe(true);
-  ackOnlyRecord();
+  const inbox = getInbox(item.to);
+  const [file] = fs.readdirSync(inbox.fresh).filter((name) => name.endsWith(".json"));
+  ackMessageAtPath(join(inbox.fresh, file!));
   const raw = fs.readFileSync(relayAcceptanceReceiptPath("remote", item.id), "utf8");
-  expect(byteLength(raw)).toBeLessThan(1024);
+  expect(byteLength(raw)).toBeLessThan(384);
   expect(raw).not.toContain(marker);
   expect(JSON.parse(raw)).toEqual({
     from: item.from,
@@ -68,17 +71,42 @@ test("an accepted large payload leaves a receipt under 1 KB that holds no conten
   });
 });
 
-test("a 5 MB payload leaves a receipt under 1 KB that holds no content bytes", () => {
+test("a 5 MB payload leaves a receipt under 384 bytes without content", () => {
   const marker = `MARKER-${randomUUID()}`;
   const content = `${marker}${"x".repeat(5 * 1024 * 1024)}`;
   const item = body(content);
   spyOn(console, "error").mockImplementation(() => {});
-  // Over the inbox body cap, so the relay dead-letters and ACKs it; either way
-  // the receipt is tiny.
   expect(deliverRelayedToLocal("remote", item)).toBe(false);
   const raw = fs.readFileSync(relayAcceptanceReceiptPath("remote", item.id), "utf8");
-  expect(byteLength(raw)).toBeLessThan(1024);
+  expect(byteLength(raw)).toBeLessThan(384);
   expect(raw).not.toContain(marker);
+});
+
+test("an oversized ISO timestamp is refused by name before any mail write", () => {
+  const item = { ...body(), timestamp: `2026-10-10T00:00:00.${"1".repeat(4096)}Z` };
+  expect(() => deliverRelayedToLocal("remote", item)).toThrow("Invalid relay timestamp");
+  expect(fs.existsSync(process.env.TPS_MAIL_DIR!)).toBe(false);
+  expect(fs.readdirSync(root)).toEqual([]);
+});
+
+test("the wire schema accepts producer ISO strings and offset instants", () => {
+  for (const timestamp of [new Date().toISOString(), new Date(-8640000000000000).toISOString(), new Date(8640000000000000).toISOString(), "2026-10-10T00:00:00Z", "2026-10-10T00:00:00.123456789+05:30"]) {
+    expect(MailDeliverBodySchema.parse({ ...body(), timestamp }).timestamp).toBe(timestamp);
+  }
+});
+
+test("malformed ISO instants are refused by name before any mail write", () => {
+  for (const timestamp of ["not-a-date", "2026-10-10T00:00:00", "2026-02-30T00:00:00Z", "2026-10-10T00:00:00Z\n", "2026-10-10T00:00:00+99:99", "2026-10-10T00:00:00-00:60"]) {
+    expect(() => deliverRelayedToLocal("remote", { ...body(), timestamp })).toThrow("Invalid relay timestamp");
+    expect(fs.readdirSync(root)).toEqual([]);
+  }
+});
+
+test("oversized sender and recipient identifiers are refused before any mail write", () => {
+  for (const field of ["from", "to"]) {
+    expect(() => deliverRelayedToLocal("remote", { ...body(), [field]: "a".repeat(65) })).toThrow(/Invalid (sender|recipient) identifier/);
+    expect(fs.readdirSync(root)).toEqual([]);
+  }
 });
 
 test("an identical resend after ACK is judged identical", () => {

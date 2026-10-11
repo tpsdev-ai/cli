@@ -606,7 +606,7 @@ export function setRelayAcceptTestHook(hook?: (root: string) => void): void {
 }
 
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
-  MailDeliverBodySchema.shape.id.parse(body.id);
+  body = MailDeliverBodySchema.parse(body);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
   const deadline = Date.now() + relayAcceptLockTimeoutMs();
   const acquireLock = (root: string) => {
