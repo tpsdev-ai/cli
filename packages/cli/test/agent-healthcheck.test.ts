@@ -87,7 +87,7 @@ describe("tps agent healthcheck", () => {
 
     expect(output).toEqual([
       `FAIL  Identity: ~/.tps/agents/${agentId}/agent.yaml unreadable or missing`,
-      'FAIL  Flair auth: Flair POST /SemanticSearch → 503: {"results":[]}',
+      'FAIL  Flair auth: Flair request POST /SemanticSearch → 503',
       "FAIL  Process: no PID file found",
       `FAIL  Mail dir: ~/.tps/mail/${agentId}/new missing`,
     ]);

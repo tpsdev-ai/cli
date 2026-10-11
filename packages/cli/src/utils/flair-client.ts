@@ -137,33 +137,97 @@ export class FlairRequestError extends Error {
   }
 }
 
-/** What a redacted credential is replaced with. */
-const REDACTED = "[REDACTED]";
+/** A server `error` code is named only when it has this shape. */
+const SAFE_ERROR_CODE = /^[a-z0-9_.-]{1,64}$/;
 
 /**
- * Redact credential material from text an error is built from. `secrets` are
- * the exact credential values the request carried — an `Authorization` header
- * value, or the operator credential a `Basic` header was built from. Each
- * occurrence of a value is replaced with `[REDACTED]`.
+ * The path an error names: the request path without its query. A query string
+ * can carry an agent id, a `since` timestamp, a filter — the error names the
+ * route, never the arguments.
  */
-function redactCredentialMaterial(text: string, secrets: readonly string[]): string {
-  let out = text;
-  for (const secret of secrets) {
-    if (secret.length === 0) continue;
-    out = out.split(secret).join(REDACTED);
+function routePath(path: string): string {
+  const query = path.indexOf("?");
+  return query === -1 ? path : path.slice(0, query);
+}
+
+/**
+ * The short `error` code of a response body, or `null`. The body itself is
+ * NEVER part of an error: a server can echo the request's credential into it,
+ * and a fragment, an encoding or a signature component would survive any
+ * exact-value redaction. Only a code matching `SAFE_ERROR_CODE` is safe.
+ */
+function responseErrorCode(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
   }
-  return out;
+  const code = (parsed as { error?: unknown } | null)?.error;
+  return typeof code === "string" && SAFE_ERROR_CODE.test(code) ? code : null;
 }
 
-/** The message of an unknown thrown value. */
-function thrownMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/** A non-OK response: the entry point, the route, the status and a safe code. */
+function responseError(entry: string, method: string, path: string, status: number, body: string): string {
+  const code = responseErrorCode(body);
+  return `Flair ${entry} ${method} ${routePath(path)} → ${status}${code ? `: ${code}` : ""}`;
 }
 
-/** The credential values a `Basic`-authenticated request carries. */
-function basicAuthSecrets(auth: string): string[] {
-  const encoded = Buffer.from(auth).toString("base64");
-  return [`Basic ${encoded}`, encoded, auth];
+/** The `code` of a thrown value, from the value or its `cause` (Node's fetch). */
+function errorCode(err: unknown): string {
+  for (const candidate of [err, (err as { cause?: unknown } | null)?.cause]) {
+    if (candidate && typeof candidate === "object") {
+      const code = (candidate as { code?: unknown }).code;
+      if (typeof code === "string") return code;
+    }
+  }
+  return "";
+}
+
+/**
+ * The reason class of a transport failure, derived from the error's `code`
+ * (Node carries it on `cause`), never from its message — a message can quote
+ * the request, including its credential. An unknown code is `network failure`.
+ */
+function transportReason(err: unknown): string {
+  switch (errorCode(err)) {
+    case "ECONNREFUSED":
+    case "ConnectionRefused":
+      return "connection refused";
+    case "ETIMEDOUT":
+    case "ESOCKETTIMEDOUT":
+    case "UND_ERR_CONNECT_TIMEOUT":
+    case "UND_ERR_HEADERS_TIMEOUT":
+    case "UND_ERR_BODY_TIMEOUT":
+    case "ConnectionTimedOut":
+      return "timeout";
+    case "ECONNRESET":
+    case "ConnectionClosed":
+    case "UND_ERR_SOCKET":
+      return "connection reset";
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+    case "DNSResolutionFailed":
+      return "dns failure";
+    case "CERT_HAS_EXPIRED":
+    case "DEPTH_ZERO_SELF_SIGNED_CERT":
+    case "SELF_SIGNED_CERT_IN_CHAIN":
+    case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+      return "TLS failure";
+    default:
+      return "network failure";
+  }
+}
+
+/** A transport failure: the entry point, the route and a fixed reason class. */
+function transportError(entry: string, method: string, path: string, err: unknown): string {
+  return `Flair ${entry} ${method} ${routePath(path)} transport error: ${transportReason(err)}`;
+}
+
+/** A successful response whose body is not valid JSON. */
+function parseError(entry: string, method: string, path: string, status: number): string {
+  return `Flair ${entry} ${method} ${routePath(path)} → ${status}: malformed response body`;
 }
 
 /**
@@ -236,7 +300,6 @@ export class FlairClient {
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const authHeader = this.sign(method, path);
-    const secrets = [authHeader];
     const headers: Record<string, string> = { Authorization: authHeader };
     if (body !== undefined) headers["Content-Type"] = "application/json";
     let res: Response;
@@ -247,20 +310,18 @@ export class FlairClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
     } catch (err) {
-      throw new FlairRequestError(
-        `Flair ${method} ${path} transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
-        0,
-      );
+      throw new FlairRequestError(transportError("request", method, path, err), 0);
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(
-        `Flair ${method} ${path} → ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
-        res.status,
-      );
+      throw new FlairRequestError(responseError("request", method, path, res.status, text), res.status);
     }
     if (res.status === 204) return undefined as T;
-    return res.json() as Promise<T>;
+    try {
+      return (await res.json()) as T;
+    } catch {
+      throw new FlairRequestError(parseError("request", method, path, res.status), res.status);
+    }
   }
 
   /**
@@ -286,7 +347,7 @@ export class FlairClient {
   ): Promise<FlairAgent> {
     const url = `${this.baseUrl}/Agent/${this.agentId}`;
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const secrets = basicAuthSecrets(auth);
+    const route = `/Agent/${this.agentId}`;
     let res: Response;
     try {
       res = await fetch(url, {
@@ -303,18 +364,18 @@ export class FlairClient {
         }),
       });
     } catch (err) {
-      throw new Error(
-        `Flair agent registration transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
-      );
+      throw new Error(transportError("registerAgent", "PUT", route, err));
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(
-        `Flair agent registration failed: ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
-      );
+      throw new Error(responseError("registerAgent", "PUT", route, res.status, text));
     }
     if (res.status === 204) return { id: this.agentId, name, publicKey } as FlairAgent;
-    return res.json() as Promise<FlairAgent>;
+    try {
+      return (await res.json()) as FlairAgent;
+    } catch {
+      throw new Error(parseError("registerAgent", "PUT", route, res.status));
+    }
   }
 
   async getAgent(id?: string): Promise<FlairAgent | null> {
@@ -351,27 +412,29 @@ export class FlairClient {
     adminAuth?: string,
   ): Promise<{ found: boolean; publicKey: string | null }> {
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const secrets = basicAuthSecrets(auth);
+    const route = `/Agent/${agentId}`;
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
         headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
       });
     } catch (err) {
-      throw new FlairRequestError(
-        `Flair GET /Agent/${agentId} transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
-        0,
-      );
+      throw new FlairRequestError(transportError("readStoredPublicKey", "GET", route, err), 0);
     }
     if (res.status === 404) return { found: false, publicKey: null };
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new FlairRequestError(
-        `Flair GET /Agent/${agentId} → ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
+        responseError("readStoredPublicKey", "GET", route, res.status, text),
         res.status,
       );
     }
-    const record = (await res.json()) as FlairAgent | null;
+    let record: FlairAgent | null;
+    try {
+      record = (await res.json()) as FlairAgent | null;
+    } catch {
+      throw new FlairRequestError(parseError("readStoredPublicKey", "GET", route, res.status), res.status);
+    }
     return { found: true, publicKey: typeof record?.publicKey === "string" ? record.publicKey : null };
   }
 

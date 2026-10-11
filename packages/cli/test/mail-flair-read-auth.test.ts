@@ -59,7 +59,7 @@ for (const caller of ["invalid", "unknown"] as const) {
     intercept();
     const reader = client(caller === "unknown" ? "unknown-caller" : receiver, wrongSeed);
     await expect(reader.getAgentForVerification(sender)).rejects.toThrow(
-      caller === "unknown" ? '401: {"error":"unknown_agent"}' : '401: {"error":"invalid_signature"}',
+      caller === "unknown" ? "→ 401: unknown_agent" : "→ 401: invalid_signature",
     );
   });
 }
@@ -107,8 +107,8 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair Agent read guar
     const anonymous = await fetch(`${baseUrl}/Agent/${from}`);
     expect(anonymous.status).toBe(403);
     expect(await anonymous.json()).toMatchObject({ type: "error:AccessViolation", code: "AccessViolation", status: 403 });
-    await expect(client(to, wrongSeed, baseUrl).getAgentForVerification(from)).rejects.toThrow('401: {"error":"invalid_signature"}');
-    await expect(client(`unknown-${randomUUID()}`, seed, baseUrl).getAgentForVerification(from)).rejects.toThrow('401: {"error":"unknown_agent"}');
+    await expect(client(to, wrongSeed, baseUrl).getAgentForVerification(from)).rejects.toThrow("→ 401: invalid_signature");
+    await expect(client(`unknown-${randomUUID()}`, seed, baseUrl).getAgentForVerification(from)).rejects.toThrow("→ 401: unknown_agent");
     expect((await client(to, seed, baseUrl).getAgentForVerification(from))?.publicKey).toBe(pubkeyFromSeed(seed).toString("base64"));
     await refusedReadRecovery(baseUrl, to, from);
   } finally {
