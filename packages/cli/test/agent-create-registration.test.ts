@@ -2,18 +2,18 @@ import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 /**
  * cli#512 — `tps agent create` reports registration only when Flair reads the
- * generated key back equal. These tests drive the create path against a fake
+ * local key back equal. These tests drive the create path against a fake
  * Flair: signed calls reach the shared verifying stub (cli#554), and the
  * operator-credentialed calls the create flow makes — the Agent PUT and the
  * read-back GET, both Basic — reach a route this file controls.
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { format } from "node:util";
 import { runAgent } from "../src/commands/agent.js";
+import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { stubFlairHandler } from "./helpers/stub-flair.js";
 
 const AGENT = "create-registration-agent";
@@ -32,13 +32,16 @@ interface FakeFlair {
 
 /**
  * A fake Flair. A request carrying a TPS-Ed25519 header reaches the shared
- * verifying stub with no registered signers — so a fresh agent's own signed
+ * verifying stub — so a fresh agent's own signed
  * read (getAgent) and seed (AgentSeed) are refused 401 `unknown_agent`, exactly
  * as a real Flair refuses an unregistered caller. A request carrying Basic
  * reaches `basic` (the Agent PUT and the read-back GET).
  */
-function startFakeFlair(basic: (req: Request, url: URL) => Promise<Response | undefined>): FakeFlair {
-  const signed = stubFlairHandler({});
+function startFakeFlair(
+  basic: (req: Request, url: URL) => Promise<Response | undefined>,
+  signers: Record<string, string> = {},
+): FakeFlair {
+  const signed = stubFlairHandler(signers, basic);
   const requests: FakeFlair["requests"] = [];
   const server = Bun.serve({
     port: 0,
@@ -64,13 +67,11 @@ function refusePut(url: URL, id: string): Response | undefined {
 async function runCreate(
   url: string,
   id: string,
-  flags: { noSeed?: boolean; credential?: string; inspectError?: boolean } = {},
+  flags: { noSeed?: boolean; credential?: string; inspectError?: boolean; keyPair?: ReturnType<typeof generateKeyPair> } = {},
   create: typeof runAgent = runAgent,
 ): Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: unknown; hasError: boolean }> {
-  const home = mkdtempSync(join(tmpdir(), "create-registration-"));
-  const savedHome = process.env.HOME;
+  const home = homedir();
   const savedCredential = process.env.FLAIR_ADMIN_AUTH;
-  process.env.HOME = home;
   if (flags.credential !== undefined) process.env.FLAIR_ADMIN_AUTH = flags.credential;
   const stdout: string[] = [];
   const stderr: string[] = [];
@@ -100,6 +101,7 @@ async function runCreate(
   let error: unknown = null;
   let hasError = false;
   try {
+    if (flags.keyPair) saveKeyPair(flags.keyPair, join(home, ".tps", "identity"), id);
     await create({ action: "create", id, name: id, flairUrl: url, noSeed: flags.noSeed });
   } catch (err) {
     if (err !== syntheticExit) {
@@ -112,9 +114,7 @@ async function runCreate(
     for (const spy of consoleSpies) spy.mockRestore();
     stdoutSpy.mockRestore();
     stderrSpy.mockRestore();
-    if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedCredential === undefined) delete process.env.FLAIR_ADMIN_AUTH; else process.env.FLAIR_ADMIN_AUTH = savedCredential;
-    rmSync(home, { recursive: true, force: true });
   }
   return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), error, hasError };
 }
@@ -183,7 +183,7 @@ test("the stored key differs from the generated one: exits non-zero", async () =
 test("the read-back fails: exits non-zero, never treating a failed read as absent, and names both remedy branches", async () => {
   const id = `${AGENT}-read-fail`;
   const fake = startFakeFlair(async (req, url) => {
-    if (req.method === "PUT") return Response.json({}, { status: 200 });
+    if (req.method === "PUT") return refusePut(url, id);
     if (url.pathname === `/Agent/${id}`) return new Response("boom", { status: 500 });
     return undefined;
   });
@@ -203,46 +203,48 @@ test("the read-back fails: exits non-zero, never treating a failed read as absen
   }
 });
 
-test("the key reads back equal: prints success and exits zero", async () => {
+test("an existing Agent with the local key: prints success without a seed or write", async () => {
   const id = `${AGENT}-ok`;
-  let stored: string | null = null;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const row = { id, name: id, publicKey, createdAt: keyPair.createdAt };
   const fake = startFakeFlair(async (req, url) => {
-    if (url.pathname === `/Agent/${id}` && req.method === "PUT") {
-      const body = (await req.json()) as { publicKey?: string };
-      stored = body.publicKey ?? null;
-      return Response.json({}, { status: 200 });
-    }
-    if (url.pathname === `/Agent/${id}` && stored !== null) return Response.json({ id, name: id, publicKey: stored });
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
     return undefined;
-  });
+  }, { [id]: publicKey });
   try {
-    const res = await runCreate(fake.url, id);
+    const res = await runCreate(fake.url, id, { keyPair, inspectError: true });
     expect(res.exitCode).toBeUndefined();
-    expect(res.stdout).toContain("registered in Flair (no seed");
+    expect(res.hasError).toBe(false);
+    expect(res.error).toBeNull();
+    expect(res.stdout).toContain("already registered in Flair");
     expect(res.stderr).toBe("");
-    expect(stored).toMatch(/^[a-f0-9]{64}$/);
+    expect(fake.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: "GET", path: `/Agent/${id}` },
+      { method: "GET", path: `/Agent/${id}` },
+    ]);
+    expect(fake.requests[0]!.auth).toStartWith(`TPS-Ed25519 ${id}:`);
+    expect(row.publicKey).toBe(publicKey);
   } finally {
     fake.stop();
   }
 });
 
-/** A fake whose Agent row holds `encode(<the key create generated>)` */
 async function runWithStoredEncoding(
   id: string,
   encode: (hexKey: string) => string,
 ): Promise<{ exitCode: number | undefined; stdout: string; stderr: string }> {
-  let stored: string | null = null;
+  const keyPair = generateKeyPair();
+  const publicKey = encode(Buffer.from(keyPair.signing.publicKey).toString("hex"));
+  const row = { id, name: id, publicKey, createdAt: keyPair.createdAt };
   const fake = startFakeFlair(async (req, url) => {
-    if (url.pathname === `/Agent/${id}` && req.method === "PUT") {
-      const body = (await req.json()) as { publicKey?: string };
-      stored = body.publicKey ? encode(body.publicKey) : null;
-      return Response.json({}, { status: 200 });
-    }
-    if (url.pathname === `/Agent/${id}` && stored !== null) return Response.json({ id, name: id, publicKey: stored });
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
     return undefined;
-  });
+  }, { [id]: /^[a-f0-9]{64}$/.test(publicKey) ? Buffer.from(publicKey, "hex").toString("base64") : publicKey });
   try {
-    return await runCreate(fake.url, id);
+    return await runCreate(fake.url, id, { keyPair });
   } finally {
     fake.stop();
   }
@@ -250,7 +252,7 @@ async function runWithStoredEncoding(
 
 const b64url = (hex: string) => Buffer.from(hex, "hex").toString("base64url");
 
-test("the row holds the base64url of the generated key (what flair stores): exits zero", async () => {
+test("the row holds the base64url of the local key: exits zero", async () => {
   const res = await runWithStoredEncoding(`${AGENT}-b64-equal`, b64url);
   expect(res.exitCode).toBeUndefined();
   expect(res.stdout).toContain("registered in Flair");
@@ -263,7 +265,7 @@ test("the row holds the base64url of a different key: exits non-zero", async () 
   expect(res.stderr).toContain("not the generated key");
 });
 
-test("the row holds the hex of the generated key (flair accepts either): exits zero", async () => {
+test("the row holds the hex of the local key: exits zero", async () => {
   const res = await runWithStoredEncoding(`${AGENT}-hex-equal`, (hex) => hex);
   expect(res.exitCode).toBeUndefined();
 });
@@ -310,6 +312,50 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   30_000,
 );
 
+test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
+  "against a real Flair, create succeeds with an existing Agent and matching local key",
+  async () => {
+    const baseUrl = process.env.TPS_TEST_FLAIR_URL ?? "http://127.0.0.1:9926";
+    const opsUrl = process.env.TPS_TEST_FLAIR_OPS_URL ?? "http://127.0.0.1:9925";
+    const admin = process.env.TPS_TEST_FLAIR_ADMIN ?? "admin:test123";
+    const id = `create-existing-${randomUUID()}`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const wire = Buffer.from(admin).toString("base64");
+    const headers = { Authorization: `Basic ${wire}`, "Content-Type": "application/json" };
+    const inserted = await fetch(opsUrl, {
+      method: "POST", headers,
+      body: JSON.stringify({
+        operation: "insert", database: "flair", table: "Agent",
+        records: [{ id, name: id, publicKey, createdAt: keyPair.createdAt }],
+      }),
+    });
+    try {
+      expect(inserted.ok).toBe(true);
+      const res = await runCreate(baseUrl, id, { keyPair, credential: admin, inspectError: true });
+      expect(res.exitCode).toBeUndefined();
+      expect(res.hasError).toBe(false);
+      expect(res.error).toBeNull();
+      expect(res.stdout).toContain("already registered in Flair");
+      expect(res.stderr).toBe("");
+      for (const stream of [res.stdout, res.stderr, format(res.error)]) {
+        expect(stream).not.toContain(admin);
+        expect(stream).not.toContain(wire);
+      }
+      const record = await fetch(`${baseUrl}/Agent/${id}`, { headers });
+      expect(record.ok).toBe(true);
+      expect((await record.json() as { publicKey: string }).publicKey).toBe(publicKey);
+    } finally {
+      const deleted = await fetch(opsUrl, {
+        method: "POST", headers,
+        body: JSON.stringify({ operation: "delete", database: "flair", table: "Agent", hash_values: [id] }),
+      });
+      expect(deleted.ok).toBe(true);
+    }
+  },
+  30_000,
+);
+
 test("selected create cases omit the credential marker and Basic encoding from captured output and errors", async () => {
   const marker = `credential-593-${randomUUID()}-${"z".repeat(40)}`;
   const credential = `operator:${marker}`;
@@ -330,7 +376,7 @@ test("selected create cases omit the credential marker and Basic encoding from c
 
   const readFailId = `${AGENT}-cred-read-fail`;
   const readFail = make(async (req, url) => {
-    if (req.method === "PUT") return Response.json({}, { status: 200 });
+    if (req.method === "PUT") return refusePut(url, readFailId);
     if (url.pathname === `/Agent/${readFailId}`) return new Response("boom", { status: 500 });
     return undefined;
   });
@@ -350,16 +396,15 @@ test("selected create cases omit the credential marker and Basic encoding from c
   });
 
   const okId = `${AGENT}-cred-ok`;
-  let okStored: string | null = null;
-  const ok = make(async (req, url) => {
-    if (url.pathname === `/Agent/${okId}` && req.method === "PUT") {
-      const body = (await req.json()) as { publicKey?: string };
-      okStored = body.publicKey ?? null;
-      return Response.json({}, { status: 200 });
-    }
-    if (url.pathname === `/Agent/${okId}` && okStored !== null) return Response.json({ id: okId, name: okId, publicKey: okStored });
+  const okKeyPair = generateKeyPair();
+  const okPublicKey = Buffer.from(okKeyPair.signing.publicKey).toString("base64url");
+  const okRow = { id: okId, name: okId, publicKey: okPublicKey, createdAt: okKeyPair.createdAt };
+  const ok = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, okId);
+    if (req.method === "GET" && url.pathname === `/Agent/${okId}`) return Response.json(okRow);
     return undefined;
-  });
+  }, { [okId]: okPublicKey });
+  fakes.push(ok);
 
   const paths = [
     { name: "missing id", url: "http://127.0.0.1:1", id: "", exitCode: 1, message: "Usage: tps agent create" },
@@ -368,12 +413,12 @@ test("selected create cases omit the credential marker and Basic encoding from c
     { name: "failed read-back", fake: readFail, id: readFailId, exitCode: 1, message: "the read-back failed", seed: true },
     { name: "row holds no key", fake: noKey, id: noKeyId, exitCode: 1, message: "the row has no public key", seed: true },
     { name: "row holds a different key", fake: differ, id: differId, exitCode: 1, message: "not the generated key", seed: true },
-    { name: "success", fake: ok, id: okId, exitCode: undefined, message: "registered in Flair (no seed", seed: true },
+    { name: "success", fake: ok, id: okId, keyPair: okKeyPair, exitCode: undefined, message: "already registered in Flair", seed: false },
   ];
 
   try {
     for (const path of paths) {
-      const res = await runCreate(path.fake?.url ?? path.url!, path.id, { credential, noSeed: path.noSeed, inspectError: true });
+      const res = await runCreate(path.fake?.url ?? path.url!, path.id, { credential, noSeed: path.noSeed, inspectError: true, keyPair: path.keyPair });
       for (const stream of [res.stdout, res.stderr, format(res.error)]) {
         expect(`${path.name}: ${stream}`).not.toContain(marker);
         expect(`${path.name}: ${stream}`).not.toContain(wire);
@@ -386,12 +431,17 @@ test("selected create cases omit the credential marker and Basic encoding from c
       else {
         expect(res.stderr).toBe("");
         expect(res.stdout).toContain("Config written to");
-        expect(okStored).toMatch(/^[a-f0-9]{64}$/);
+        expect(okRow.publicKey).toBe(okPublicKey);
+        expect(ok.requests.map(({ method, path }) => ({ method, path }))).toEqual([
+          { method: "GET", path: `/Agent/${okId}` },
+          { method: "GET", path: `/Agent/${okId}` },
+        ]);
+        expect(ok.requests[0]!.auth).toStartWith(`TPS-Ed25519 ${okId}:`);
       }
       if (path.fake) {
         const basic = path.fake.requests.filter((req) => req.auth.startsWith("Basic "));
         expect(basic).toEqual([
-          { method: "PUT", path: `/Agent/${path.id}`, auth: `Basic ${wire}` },
+          ...(path.keyPair ? [] : [{ method: "PUT", path: `/Agent/${path.id}`, auth: `Basic ${wire}` }]),
           { method: "GET", path: `/Agent/${path.id}`, auth: `Basic ${wire}` },
         ]);
         expect(path.fake.requests.some((req) => req.method === "POST" && req.path === "/AgentSeed/")).toBe(path.seed);
