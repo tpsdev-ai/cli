@@ -193,8 +193,8 @@ for (const [auth, status, code] of [
       writeFileSync(hook, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(sentinel)}, "ran");`);
       const output = await watchUntil(f, ["mail", "watch", "demo", "--sandbox-required", "--exec", "node", hook, "--version"], "verification error");
       // cli#597: a non-OK response error names the entry point, the requested path
-      // and the status, and an error code from the allow-list of codes this client's
-      // routes can return (else `unrecognized_error`) — never the response body.
+      // and the status, and a code from a fixed list (else `unrecognized_error`)
+      // — without the response body; route reachability is not asserted.
       expect(output).toContain("Flair request GET /Agent/");
       expect(output).toContain(`→ ${status}`);
       if (code) expect(output).toContain(code);

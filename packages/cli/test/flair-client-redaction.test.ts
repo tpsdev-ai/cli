@@ -1,43 +1,28 @@
 /**
- * cli#597 — a non-OK Flair response error is bounded: it contains the entry
- * point, method, the requested pathname, the status, and an allow-listed code
- * selected from the response's `error` field (else `unrecognized_error`); raw
- * bodies, other response text and transport messages are never included.
+ * cli#597 — non-OK HTTP response errors use
+ * `Flair <entry> <method> <pathname> → <status>: <code>`, with an allow-listed
+ * string from the response's `error` field (else `unrecognized_error`). These
+ * messages exclude raw bodies, other response text and transport messages.
+ * Encoded parameters stay encoded when the wrapper or caller encodes them;
+ * request() sends the path its caller supplies, without encoding ids itself.
  *
- * The client used to build an error from a response body and from a transport
- * failure's message and cause, so a server that echoed the request's credential
- * (whole, as a fragment, as an encoding, or as a signature component) put it into
- * the thrown error. Exact-value redaction cannot be the control: a fragment, a
- * base64 slice or an Ed25519 signature component survives it, and a JSON parse
- * error can quote a fragment of the body too.
+ * Caught transport failures use
+ * `Flair <entry> <method> <pathname> transport error: <reason>`.
+ * Failed successful-response JSON parses use
+ * `Flair <entry> <method> <pathname> → <status>: malformed response body`;
+ * request() and registerAgent() accept 204 without parsing.
+ * Local checks interpolate ids (promotion refusals, invalid principal records,
+ * governance read refusals and missing agents); the private-key read failure
+ * interpolates the key path and agent id. A governance read failure also embeds
+ * the caught error's message. These local messages are outside the response bound.
  *
- * The guarantee is an ALLOW-LIST. A NON-OK response error contains only: the
- * entry point, the method, the ENCODED request path the request was sent with
- * (path parameters such as agent ids included, as on the wire; never the query
- * or fragment), the HTTP status, and an error code taken from a fixed list of
- * error-code strings — any other `error` value, including a
- * regex-shaped credential fragment, becomes the constant `unrecognized_error`.
- * The list is exported as a FROZEN ARRAY, for inspection only; membership is a
- * module-private Set, so no consumer can mutate the exported view to name a new
- * code (see the mutation case below).
- * Errors with other origins have their own fixed, body-free formats, named once
- * here: a transport failure is named by a fixed reason class derived from the
- * error's `code`, a successful response whose body is not JSON names `malformed
- * response body`, and a local error carries its own fixed message. Raw
- * response bodies, unlisted response text and transport messages are excluded;
- * an allow-listed code is selected from the response's `error` field; reported
- * paths keep caller-supplied path parameters.
+ * Each entry point is driven in a Bun child importing the source client
+ * (`src/utils/flair-client.ts`) and a Node child importing the built client
+ * (`dist/src/utils/flair-client.js`). The echo server uses the shared verifying
+ * stub for a registered signer; the Basic paths use an authorized fixture with
+ * its own refusal. The native transport case asserts the thrown message only.
  *
- * The entry points that surface errors are driven in TWO spawned children, per
- * the repo's convention (cli#395, cli#566): a `bun` child and a `node` child,
- * each importing the runtime's built client module (`src/utils/flair-client.ts`
- * for Bun, the built `dist/src/utils/flair-client.js` for Node). The echo server
- * sits behind the shared VERIFYING stub (`helpers/stub-flair.ts`) for a
- * registered signer; the Basic paths sit behind an authorized fixture with its
- * own refusal. The real-transport case asserts the thrown MESSAGE only.
- *
- * Precondition: the CLI is built — root `bun run build` does that before
- * `bun run test`.
+ * Precondition: build the CLI before running this suite's Node children.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -76,8 +61,7 @@ const CLIENT_MODULE = {
 type Runtime = keyof typeof CLIENT_MODULE;
 
 /**
- * The three entry points that build errors. The route is the ENCODED path the
- * request was sent with, without its query.
+ * Entry points exercised by the child driver; route is the requested pathname.
  */
 const ENTRIES = [
   { name: "request", method: "GET", route: "/Memory/mem-1" },
@@ -412,8 +396,8 @@ for (const runtime of ["bun", "node"] as const) {
           }
 
           // A transport failure quotes the request in its message and cause; the
-          // client names only the entry point, route and a fixed reason class. The
-          // whole message is asserted by exact equality, as for the response sites.
+          // client names the entry point, method, pathname and a fixed reason class.
+          // The whole message is asserted by exact equality, as for the response sites.
           for (const entry of ENTRIES) {
             const transport = observations.find((candidate) => candidate.name === `${entry.name}:transport-mock`);
             expect(transport, `${entry.name} transport ran`).toBeDefined();
@@ -424,8 +408,7 @@ for (const runtime of ["bun", "node"] as const) {
             expectNoLeak(transport!, secretsFor(transport!.auth ?? ""));
           }
 
-          // A real transport failure under this runtime, same guarantee. It names
-          // only fixed fields, so its whole message is asserted by exact equality.
+          // The native transport failure's whole message is asserted by exact equality.
           const real = observations.find((candidate) => candidate.name === "request:transport-real");
           expect(real, "real transport ran").toBeDefined();
           expect(real!.threw).toBe(true);
@@ -466,14 +449,11 @@ test("the verifying stub refuses an unregistered signer and a bad signature befo
 });
 
 /**
- * cli#597: the allow-list is a property, not a route table. Every code the list
- * holds is named verbatim — the client repeats a constant it holds — and ANY
- * other value is the constant `unrecognized_error`, including a value shaped
- * like a code that is really a credential fragment. No route, verb or emitter is
- * asserted: a code is named because it is one of the fixed strings, not because
- * a route this client sends could return it.
+ * cli#597: request's non-OK response errors name listed codes verbatim and use
+ * `unrecognized_error` for off-list `error` values. This is a fixed-list property;
+ * route, verb and emitter reachability are not asserted.
  */
-test("every listed code is named verbatim, and any other value becomes unrecognized_error (cli#597)", async () => {
+test("request's non-OK response errors name listed codes and use unrecognized_error for off-list values (cli#597)", async () => {
   let errorValue: unknown = null;
   const restore = patchShared(globalThis, "fetch", (async () =>
     new Response(JSON.stringify({ error: errorValue }), {
@@ -510,14 +490,14 @@ test("every listed code is named verbatim, and any other value becomes unrecogni
 });
 
 /**
- * cli#597: the allow-list is module-private. `FLAIR_ERROR_CODES` is exported as
- * a FROZEN ARRAY for inspection; membership is a private Set. A consumer that
- * mutates the exported view — or tries to — cannot add a code that changes how a
- * non-OK response is formatted. Were the live Set exported again, the `push`
+ * cli#597: membership is module-private. `FLAIR_ERROR_CODES` is exported as
+ * a FROZEN ARRAY for inspection; membership is a private Set. Attempted writes
+ * to the exported view cannot add a code that changes how a
+ * non-OK response is formatted. Were the live Set exported again, the `add`
  * below would succeed and the injected code would be named verbatim, failing
  * this test.
  */
-test("mutating the exported allow-list view cannot change how a non-OK response is formatted (cli#597)", async () => {
+test("attempted writes to the frozen allow-list view leave non-OK response formatting unchanged (cli#597)", async () => {
   const injected = "injected_not_a_flair_code";
   const initialLength = FLAIR_ERROR_CODES.length;
   // The exported view as a consumer would reach it. `add` and `push` are tried
@@ -544,9 +524,9 @@ test("mutating the exported allow-list view cannot change how a non-OK response 
   }
 
   // A non-OK response naming the injected value is still the constant: the
-  // module-private membership test did not learn the code, however the exported
-  // view was written. WERE THE LIVE SET EXPORTED AGAIN (the mutation above), the
-  // `add` would land and this assertion — the one that matters — fails: the
+  // module-private membership test did not learn the code from the attempted
+  // writes to the exported view. Were the live membership Set exported again,
+  // `add` would land and this assertion would fail: the
   // injected code would be named verbatim.
   const restore = patchShared(globalThis, "fetch", (async () =>
     new Response(JSON.stringify({ error: injected }), {
@@ -606,14 +586,11 @@ test("readStoredPublicKey names the ENCODED request path, the one the request us
 });
 
 /**
- * cli#597: the reported path equals the pathname the request was actually sent
- * with, for an id carrying `#`, `?`, `/` or `%`. An id enters a path through
- * `encodeURIComponent`, so the sent pathname is the encoded one and the raw
- * character (a `#` the URL would drop as a fragment, a `?` it would read as a
- * query) never appears in the name. The echo records each request's pathname,
- * so the assertion is against the path the transport carried, not a guess.
+ * cli#597: getMemory() and registerAgent() encode the tested ids with
+ * encodeURIComponent. Their reported pathnames are checked against the
+ * echo server's recorded pathnames.
  */
-test("a path id is encoded and the error names the requested pathname, for '#', '?', '/' and '%' (cli#597)", async () => {
+test("getMemory and registerAgent encode ids and their response errors name the requested pathname, for '#', '?', '/' and '%' (cli#597)", async () => {
   const echo = startEchoFlair("text");
   const sentPathname: string[] = [];
   try {
@@ -655,16 +632,16 @@ test("a path id is encoded and the error names the requested pathname, for '#', 
       sentPathname.push(requested);
     }
 
-    // No reported path carried an unencoded `#`, `?`, `/` or `%` from the id.
+    // The recorded pathnames contain no fragment or query delimiters.
     for (const path of sentPathname) expect(path).not.toMatch(/[#?]/);
   } finally {
     echo.stop();
   }
 });
 
-// ─── A real printing caller: `tps agent create`'s read-back remedy ────────────
+// ─── Direct runAgent create command path: read-back remedy output ────────────
 
-test("tps agent create's read-back remedy prints the client error without the operator credential", async () => {
+test("direct runAgent create read-back remedy prints the client error without the operator credential", async () => {
   const id = "redaction-create-agent";
   const home = mkdtempSync(join(tmpdir(), "redaction-create-"));
   const savedHome = process.env.HOME;

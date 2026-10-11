@@ -80,8 +80,8 @@ describe("memory CLI entry", () => {
       );
       expect(result.status).toBe(1);
       // cli#597: a non-OK response error names the entry point, the requested path
-      // and the status, and a code from the allow-list of codes this client's routes
-      // can return (else `unrecognized_error`) — never the body.
+      // and the status, and a code from a fixed list (else `unrecognized_error`)
+      // — without the response body; route reachability is not asserted.
       expect(result.stderr).toContain("SemanticSearch");
       expect(result.stderr).toContain("→ 403");
       expect(result.stderr).not.toContain("agentId must match");

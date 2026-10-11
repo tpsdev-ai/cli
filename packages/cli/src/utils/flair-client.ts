@@ -138,11 +138,10 @@ export class FlairRequestError extends Error {
 }
 
 /**
- * A fixed list of error-code strings. A server names an error with a short
- * `error` code; the client repeats that code ONLY when it is one of these fixed
- * constants. Any other value becomes `UNRECOGNIZED_ERROR`. The list is not
- * claimed to be complete, and no entry is claimed reachable from any particular
- * route.
+ * A fixed list of error-code strings. When a response has an `error` field,
+ * the client reads an allow-listed string from it; other values become
+ * `unrecognized_error`. The list is not claimed complete;
+ * no entry is claimed reachable from a particular route.
  *
  * Membership is a MODULE-PRIVATE Set; the list is exported as a FROZEN ARRAY,
  * for inspection only. A `ReadonlySet` is a type-only guarantee, and a live
@@ -154,18 +153,22 @@ export class FlairRequestError extends Error {
  * credential fragment — a slice of a base64 Basic credential, a nonce, a
  * signature component — can itself be regex-shaped, so a shape test would pass
  * it straight through. Naming only an enumerated constant bounds the damage:
- * arbitrary response text cannot enter an error. An error from a NON-OK HTTP
- * RESPONSE contains the entry point, the method, the requested pathname, the
+ * arbitrary response text cannot enter a non-OK response error. An error from a
+ * NON-OK HTTP RESPONSE contains the entry point, method, requested pathname,
  * status, and an allow-listed code selected from the response's `error` field
  * (else `unrecognized_error`); raw bodies, other response text and transport
  * messages are never included. (A fixed list cannot rule out a coincidence with
  * a listed code, but the client names a constant it already holds rather than
  * echoing response text.)
  *
- * Errors with other origins have their own fixed, body-free formats: a
- * transport failure names a fixed reason class, a non-JSON body of a successful
- * response names a malformed response body, and a local error carries its own
- * fixed message.
+ * Caught transport failures use `Flair <entry> <method> <pathname> transport
+ * error: <reason>`. A failed successful-response JSON parse uses
+ * `Flair <entry> <method> <pathname> → <status>: malformed response body`;
+ * request() and registerAgent() accept 204 without parsing.
+ * Local checks interpolate ids (promotion refusals, invalid principal records,
+ * governance read refusals and missing agents); the private-key read failure
+ * interpolates the key path and agent id. A governance read failure also embeds
+ * the caught error's message. These local messages are outside the response bound.
  */
 const FLAIR_ERROR_CODE_LIST: readonly string[] = [
   "invalid_authorization_header",
@@ -247,7 +250,7 @@ const UNRECOGNIZED_ERROR = "unrecognized_error";
  * The path an error names: the `pathname` of the URL the request was actually
  * sent with — never a query and never a fragment. A query string can carry an
  * agent id, a `since` timestamp, a filter, and a fragment is not sent at all,
- * so an error names the route and not the arguments; a path parameter that was
+ * so an error's pathname omits query and fragment; a path parameter that was
  * percent-encoded (an agent id carrying a separator, say) stays encoded in the
  * name, exactly as on the wire. Deriving the name from the URL the transport
  * carried — not from the uncanonicalized string a caller supplied — keeps the
@@ -258,8 +261,8 @@ function requestedPath(url: string): string {
 }
 
 /**
- * The `error` code a response names, or `UNRECOGNIZED_ERROR`. The body itself is
- * NEVER part of an error: a server can echo the request's credential into it.
+ * The allow-listed string from a response's `error` field, or `unrecognized_error`.
+ * The body itself is excluded from the non-OK response error message.
  * Only a code that is one of the module's own fixed strings is named; every
  * other value — including a regex-shaped credential fragment — is
  * `UNRECOGNIZED_ERROR`.
@@ -275,7 +278,7 @@ function responseErrorCode(body: string): string {
   return typeof code === "string" && FLAIR_ERROR_CODE_SET.has(code) ? code : UNRECOGNIZED_ERROR;
 }
 
-/** A non-OK response: the entry point, the requested path, the status and an allow-listed code. */
+/** A non-OK response error: entry, method, pathname, status and an allow-listed code (else `unrecognized_error`). */
 function responseError(entry: string, method: string, path: string, status: number, body: string): string {
   const code = responseErrorCode(body);
   return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
@@ -328,12 +331,12 @@ function transportReason(err: unknown): string {
   }
 }
 
-/** A transport failure: the entry point, the requested path and a fixed reason class. */
+/** A caught transport failure: entry, method, pathname and a fixed reason class, without an HTTP status. */
 function transportError(entry: string, method: string, path: string, err: unknown): string {
   return `Flair ${entry} ${method} ${path} transport error: ${transportReason(err)}`;
 }
 
-/** A successful response whose body is not valid JSON. */
+/** A successful-response JSON parse failure; request() and registerAgent() skip parsing on 204. */
 function parseError(entry: string, method: string, path: string, status: number): string {
   return `Flair ${entry} ${method} ${path} → ${status}: malformed response body`;
 }
