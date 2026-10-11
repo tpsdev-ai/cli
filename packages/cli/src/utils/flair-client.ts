@@ -138,92 +138,30 @@ export class FlairRequestError extends Error {
 }
 
 /**
- * The error codes this client's routes can return — a CLOSED allow-list,
- * enumerated from Flair's resources, per route AND verb this client sends. A
- * server names an error with a short `error` code; the client repeats that code
- * ONLY when it is one of these fixed constants. Any other value becomes
- * `UNRECOGNIZED_ERROR`. This is not Flair's complete inventory: it holds the
- * codes the routes this client actually calls can emit, for the verbs it sends;
- * any other value — including one from a Flair route or verb this client never
- * uses — is `unrecognized_error`.
+ * A fixed list of error-code strings Flair defines. A server names an error
+ * with a short `error` code; the client repeats that code ONLY when it is one
+ * of these fixed constants. Any other value becomes `UNRECOGNIZED_ERROR`. The
+ * list is the union of codes from Flair's resources; it is not claimed to be
+ * complete, and no entry is claimed reachable from any particular route.
  *
  * A shape test (a regex for "a short lower-case token") is not a control: a
  * credential fragment — a slice of a base64 Basic credential, a nonce, a
  * signature component — can itself be regex-shaped, so a shape test would pass
  * it straight through. Naming only an enumerated constant bounds the damage:
- * arbitrary response text cannot enter an error. An error contains the entry
- * point, the method, the requested pathname, the status, and an allow-listed
- * code selected from the response's `error` field (else `unrecognized_error`);
- * raw bodies, other response text and transport messages are never included.
- * (A fixed list cannot rule out a coincidence with a listed code, but the client
- * names a constant it already holds rather than echoing response text.)
+ * arbitrary response text cannot enter an error. An error from a NON-OK HTTP
+ * RESPONSE contains the entry point, the method, the requested pathname, the
+ * status, and an allow-listed code selected from the response's `error` field
+ * (else `unrecognized_error`); raw bodies, other response text and transport
+ * messages are never included. (A fixed list cannot rule out a coincidence with
+ * a listed code, but the client names a constant it already holds rather than
+ * echoing response text.)
  *
- * Every entry is emitted as `{ error: "…" }` by a Flair resource, on a route AND
- * verb this client sends. Source paths are `tpsdev-ai/flair` `resources/`, with
- * the client method (and its route) that reaches each file:
- *
- *   auth-middleware.ts      invalid_authorization_header, method_not_allowed,
- *                           timestamp_out_of_window, nonce_replay_detected,
- *                           unknown_agent, principal_deactivated,
- *                           invalid_signature, signature_verification_failed,
- *                           ambiguous_memory_id            (every signed route)
- *   replay-store.ts         replay_store_unavailable        (every signed route)
- *   rate-limiter.ts         rate_limit_exceeded            (POST /SemanticSearch)
- *   Agent.ts                invalid_agent_id               (PUT /Agent/{id})
- *   AgentSeed.ts            agent_lookup_failed,
- *                           skill_assignment_not_seedable   (POST /AgentSeed/)
- *   Memory.ts               invalid_durability, invalid_visibility,
- *                           invalid_visibility_for_durability, invalid_expiry,
- *                           content_safety_violation,
- *                           reembed_no_text, reembed_row_changed,
- *                           embedding_unavailable, reindex_admin_only,
- *                           reindex_row_not_found, reindex_would_change_row,
- *                           host_source_persist_failed, host_source_delete_failed
- *                                                          (PUT/PATCH/DELETE /Memory/{id})
- *   memory-id-guard.ts      memory_id_content_suffix,
- *                           supersedes_target_unreadable,
- *                           supersedes_target_missing      (PUT /Memory/{id})
- *   write-back.ts           stored_row_changed             (PUT/PATCH /Memory/{id})
- *   provenance.ts           stored_row_read_failed         (PUT/PATCH /Memory/{id})
- *   originator-instance.ts  id_target_mismatch,
- *                           stored_row_lookup_failed       (PUT /Memory/{id}, PUT /Soul/{id})
- *   owner-field-guard.ts    owner_check_unavailable        (PUT/PATCH /Memory/{id}, PUT /Soul/{id})
- *   skill-write.ts          skill_durability, skill_write_path,
- *                           skill_scan_rejected            (PUT /Memory/{id})
- *   skill-provenance.ts     skill_source_not_durable,
- *                           skill_opt_out_not_boolean      (PUT /Memory/{id}, PUT /Soul/{id})
- *   skill-version-write.ts  skill_lineage_tag_removed,
- *                           skill_state_requires_delete, skill_self_supersede,
- *                           skill_predecessor_missing, skill_target_changed,
- *                           skill_head_missing, skill_predecessor_stale,
- *                           skill_target_stale             (PUT /Memory/{id})
- *   Soul.ts                 soul_write_requires_one_record,
- *                           soul_delete_requires_one_record (PUT /Soul/{id}, DELETE /Soul/{id})
- *   instruction-version-record.ts  soul_subject_occupied,
- *                           instruction_version_head_mismatch,
- *                           instruction_version_append_failed,
- *                           instruction_version_busy,
- *                           instruction_version_lock_unavailable
- *                                                          (PUT/DELETE /Soul/{id})
- *   Presence.ts             invalid_activity,
- *                           presence_write_failed          (POST /Presence)
- *   MemoryReflect.ts        rem_aborted, distillation_failed (POST /ReflectMemories/)
- *   WorkspaceLatest.ts      workspace_state_query_failed,
- *                           no_workspace_state_found        (GET /WorkspaceLatest/{id})
- *
- * Codes a route of this client cannot receive are deliberately absent: the
- * client never sends a verb a route refuses (`slow_down`, on the OAuth paths
- * this client never calls; the four Soul PATCH failure codes —
- * `soul_stored_state_unavailable`, `soul_patch_table_unavailable`,
- * `soul_patch_conflict`, `soul_patch_row_changed` — since the client sends Soul
- * PUT and DELETE only), a response builder with no caller
- * (`storage_quota_exceeded`), a code a route emits on a verb the client does not
- * send (`derived_from_self`, on POST /Memory only; `presence_query_failed`, on
- * GET /Presence only), and a resource this client never calls
- * (`org_skill_assignment_busy`, `org_skill_assignment_lock_unavailable`). Each
- * became `unrecognized_error`.
+ * Errors with other origins have their own fixed, body-free formats: a
+ * transport failure names a fixed reason class, a non-JSON body of a successful
+ * response names a malformed response body, and a local error carries its own
+ * fixed message.
  */
-const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
+export const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "invalid_authorization_header",
   "method_not_allowed",
   "timestamp_out_of_window",

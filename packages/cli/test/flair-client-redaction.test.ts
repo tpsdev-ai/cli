@@ -1,8 +1,8 @@
 /**
- * cli#597 — a Flair error is bounded: it contains the entry point, method, the
- * requested pathname, the status, and an allow-listed code selected from the
- * response's `error` field (else `unrecognized_error`); raw bodies, other
- * response text and transport messages are never included.
+ * cli#597 — a non-OK Flair response error is bounded: it contains the entry
+ * point, method, the requested pathname, the status, and an allow-listed code
+ * selected from the response's `error` field (else `unrecognized_error`); raw
+ * bodies, other response text and transport messages are never included.
  *
  * The client used to build an error from a response body and from a transport
  * failure's message and cause, so a server that echoed the request's credential
@@ -14,14 +14,13 @@
  * The guarantee is an ALLOW-LIST. A NON-OK response error contains only: the
  * entry point, the method, the ENCODED request path the request was sent with
  * (path parameters such as agent ids included, as on the wire; never the query
- * or fragment), the HTTP status, and an error code taken from the allow-list of
- * codes this client's routes can return — any other `error` value, including a
+ * or fragment), the HTTP status, and an error code taken from a fixed list of
+ * error-code strings Flair defines — any other `error` value, including a
  * regex-shaped credential fragment, becomes the constant `unrecognized_error`.
- * Transport failures, malformed-response errors and local errors (a missing
- * private key, a refused promotion) have their own fixed, body-free formats: a
- * transport failure is named by a fixed reason class derived from the error's
- * `code`, a successful response whose body is not JSON names `malformed response
- * body`, and a local error names the entry point and the local failure. Raw
+ * Errors with other origins have their own fixed, body-free formats, named once
+ * here: a transport failure is named by a fixed reason class derived from the
+ * error's `code`, a successful response whose body is not JSON names `malformed
+ * response body`, and a local error carries its own fixed message. Raw
  * response bodies, unlisted response text and transport messages are excluded;
  * an allow-listed code is selected from the response's `error` field; reported
  * paths keep caller-supplied path parameters.
@@ -43,8 +42,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { runAgent } from "../src/commands/agent.js";
-import { FlairClient } from "../src/utils/flair-client.js";
+import { FLAIR_ERROR_CODES, FlairClient } from "../src/utils/flair-client.js";
+import { createPatchShared } from "./helpers/patch-shared.js";
 import { stubFlairHandler, writeKeyFile } from "./helpers/stub-flair.js";
+
+// cli#555: a patch of a shared global goes through the file-scope factory, so
+// the guard accepts it and owns the teardown.
+const patchShared = createPatchShared();
 
 // cli#555: a file that names `spyOn` carries the top-level teardown; each test
 // below restores its own spies in a finally as well.
@@ -459,114 +463,46 @@ test("the verifying stub refuses an unregistered signer and a bad signature befo
 });
 
 /**
- * cli#597: the codes this change ADDS to the allow-list are named verbatim — a
- * server that returns one of them does not get `unrecognized_error`. Each code
- * is a real Flair code from a resource a route AND verb THIS client sends
- * reaches (see the enumeration in `flair-client.ts`). The cases are grouped by
- * that route and verb, not by resource: the code is driven over the route the
- * client actually sends, and the whole message is asserted by exact equality, so
- * the named route, verb, status and code are all pinned. This is the "covered"
- * half of the allow-list change: the redaction tests prove a value NOT on the
- * list is dropped, and this one proves a value ON it survives.
+ * cli#597: the allow-list is a property, not a route table. Every code the list
+ * holds is named verbatim — the client repeats a constant it holds — and ANY
+ * other value is the constant `unrecognized_error`, including a value shaped
+ * like a code that is really a credential fragment. No route, verb or emitter is
+ * asserted: a code is named because it is one of the fixed strings Flair
+ * defines, not because a route this client sends could return it.
  */
-test("each newly allow-listed Flair code is named verbatim on the route and verb this client sends (cli#597)", async () => {
-  const MEM = "mem-1";
-  const SOUL = `${AGENT}-k`;
-  // Each group is one route AND verb the client sends; every code in it is
-  // emitted by a resource that route reaches.
-  const groups: Array<{
-    method: string;
-    path: string;
-    via: (client: FlairClient) => Promise<unknown>;
-    codes: string[];
-  }> = [
-    {
-      method: "PUT",
-      path: `/Memory/${MEM}`,
-      via: (client) => client.writeMemory(MEM, "content"),
-      codes: [
-        // memory-id-guard.ts (PUT /Memory/{id})
-        "memory_id_content_suffix",
-        "supersedes_target_unreadable",
-        "supersedes_target_missing",
-        // skill-version-write.ts (PUT /Memory/{id})
-        "skill_self_supersede",
-        "skill_predecessor_missing",
-        "skill_target_changed",
-        "skill_head_missing",
-        "skill_predecessor_stale",
-        "skill_target_stale",
-      ],
-    },
-    {
-      // Agent.ts (PUT /Agent/{id})
-      method: "PUT",
-      path: `/Agent/${AGENT}`,
-      via: (client) => client.request("PUT", `/Agent/${AGENT}`, {}),
-      codes: ["invalid_agent_id"],
-    },
-    {
-      // AgentSeed.ts (POST /AgentSeed/)
-      method: "POST",
-      path: "/AgentSeed/",
-      via: (client) => client.seedAgent({ agentId: AGENT }),
-      codes: ["agent_lookup_failed", "skill_assignment_not_seedable"],
-    },
-    {
-      method: "PUT",
-      path: `/Soul/${SOUL}`,
-      via: (client) => client.setSoulEntry(AGENT, "k", "v"),
-      codes: [
-        // Soul.ts (PUT /Soul/{id})
-        "soul_write_requires_one_record",
-        // instruction-version-record.ts (PUT /Soul/{id})
-        "soul_subject_occupied",
-        "instruction_version_head_mismatch",
-        "instruction_version_append_failed",
-        "instruction_version_busy",
-        "instruction_version_lock_unavailable",
-      ],
-    },
-    {
-      // Soul.ts (DELETE /Soul/{id})
-      method: "DELETE",
-      path: `/Soul/${SOUL}`,
-      via: (client) => client.deleteSoulEntry(AGENT, "k"),
-      codes: ["soul_delete_requires_one_record"],
-    },
-  ];
-  let named = "";
-  const handler = stubFlairHandler({ [AGENT]: SEED }, () =>
-    Response.json({ error: named }, { status: 400 }),
-  );
-  const server = Bun.serve({
-    port: 0,
-    fetch: (req) => {
-      const url = new URL(req.url);
-      if (url.pathname === "/Health") return new Response("ok");
-      return handler(req);
-    },
-  });
+test("every listed code is named verbatim, and any other value becomes unrecognized_error (cli#597)", async () => {
+  let errorValue: unknown = null;
+  const restore = patchShared(globalThis, "fetch", (async () =>
+    new Response(JSON.stringify({ error: errorValue }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch);
+  const messageFor = async (): Promise<string> => {
+    try {
+      await new FlairClient({ baseUrl: "http://127.0.0.1:9", agentId: AGENT, keyPath }).getMemory("mem-1");
+      return "";
+    } catch (err) {
+      return (err as Error).message;
+    }
+  };
   try {
-    const client = new FlairClient({ baseUrl: `http://127.0.0.1:${server.port}`, agentId: AGENT, keyPath });
-    for (const group of groups) {
-      for (const code of group.codes) {
-        named = code;
-        // Reached through the wrapper that sends this route and verb; the exact
-        // message pins the route, verb, status and code.
-        let message = "";
-        try {
-          await group.via(client);
-        } catch (err) {
-          message = (err as Error).message;
-        }
-        expect(message, `the code ${code} is named on ${group.method} ${group.path}`).toBe(
-          `Flair request ${group.method} ${group.path} → 400: ${code}`,
-        );
-      }
+    expect(FLAIR_ERROR_CODES.size, "the list is non-empty").toBeGreaterThan(0);
+    for (const code of FLAIR_ERROR_CODES) {
+      errorValue = code;
+      expect(await messageFor(), `the listed code ${code} is named verbatim`).toBe(
+        `Flair request GET /Memory/mem-1 → 400: ${code}`,
+      );
+    }
+    // Any value off the list becomes the constant, never echoed: a code-shaped
+    // credential fragment, an unlisted code-shaped string, a non-string.
+    for (const value of ["op-pass-4f9c", "unrecognized_error", "not_a_flair_code", 42, null, { error: "x" }]) {
+      errorValue = value;
+      expect(await messageFor(), `a value off the list (${JSON.stringify(value)}) becomes the constant`).toBe(
+        "Flair request GET /Memory/mem-1 → 400: unrecognized_error",
+      );
     }
   } finally {
-    server.stop(true);
+    restore();
   }
 });
 
