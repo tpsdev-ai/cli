@@ -138,11 +138,17 @@ export class FlairRequestError extends Error {
 }
 
 /**
- * A fixed list of error-code strings Flair defines. A server names an error
- * with a short `error` code; the client repeats that code ONLY when it is one
- * of these fixed constants. Any other value becomes `UNRECOGNIZED_ERROR`. The
- * list is the union of codes from Flair's resources; it is not claimed to be
- * complete, and no entry is claimed reachable from any particular route.
+ * A fixed list of error-code strings. A server names an error with a short
+ * `error` code; the client repeats that code ONLY when it is one of these fixed
+ * constants. Any other value becomes `UNRECOGNIZED_ERROR`. The list is not
+ * claimed to be complete, and no entry is claimed reachable from any particular
+ * route.
+ *
+ * Membership is a MODULE-PRIVATE Set; the list is exported as a FROZEN ARRAY,
+ * for inspection only. A `ReadonlySet` is a type-only guarantee, and a live
+ * exported Set is mutable at runtime — a consumer (or a probe) could add a code
+ * and change how a non-OK response is formatted. With the set private and the
+ * exported view frozen, neither an add nor a write can do so.
  *
  * A shape test (a regex for "a short lower-case token") is not a control: a
  * credential fragment — a slice of a base64 Basic credential, a nonce, a
@@ -161,7 +167,7 @@ export class FlairRequestError extends Error {
  * response names a malformed response body, and a local error carries its own
  * fixed message.
  */
-export const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
+const FLAIR_ERROR_CODE_LIST: readonly string[] = [
   "invalid_authorization_header",
   "method_not_allowed",
   "timestamp_out_of_window",
@@ -196,7 +202,6 @@ export const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "stored_row_read_failed",
   "id_target_mismatch",
   "stored_row_lookup_failed",
-  "owner_check_unavailable",
   "skill_durability",
   "skill_write_path",
   "skill_scan_rejected",
@@ -223,7 +228,17 @@ export const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "distillation_failed",
   "workspace_state_query_failed",
   "no_workspace_state_found",
-]);
+];
+
+/**
+ * The allow-list as a FROZEN ARRAY, for inspection only; the membership test
+ * is the module-private set below. Freezing the view means a consumer cannot
+ * add or remove a code and change how a non-OK response is formatted.
+ */
+export const FLAIR_ERROR_CODES: readonly string[] = Object.freeze(FLAIR_ERROR_CODE_LIST);
+
+/** Membership — module-private, so the exported view cannot change formatting. */
+const FLAIR_ERROR_CODE_SET: ReadonlySet<string> = new Set(FLAIR_ERROR_CODE_LIST);
 
 /** The code an error carries when the server named a value not on the list. */
 const UNRECOGNIZED_ERROR = "unrecognized_error";
@@ -245,7 +260,7 @@ function requestedPath(url: string): string {
 /**
  * The `error` code a response names, or `UNRECOGNIZED_ERROR`. The body itself is
  * NEVER part of an error: a server can echo the request's credential into it.
- * Only a code that is one of Flair's own `FLAIR_ERROR_CODES` is named; every
+ * Only a code that is one of the module's own fixed strings is named; every
  * other value — including a regex-shaped credential fragment — is
  * `UNRECOGNIZED_ERROR`.
  */
@@ -257,7 +272,7 @@ function responseErrorCode(body: string): string {
     return UNRECOGNIZED_ERROR;
   }
   const code = (parsed as { error?: unknown } | null)?.error;
-  return typeof code === "string" && FLAIR_ERROR_CODES.has(code) ? code : UNRECOGNIZED_ERROR;
+  return typeof code === "string" && FLAIR_ERROR_CODE_SET.has(code) ? code : UNRECOGNIZED_ERROR;
 }
 
 /** A non-OK response: the entry point, the requested path, the status and an allow-listed code. */

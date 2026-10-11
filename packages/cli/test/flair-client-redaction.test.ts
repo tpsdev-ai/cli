@@ -15,8 +15,11 @@
  * entry point, the method, the ENCODED request path the request was sent with
  * (path parameters such as agent ids included, as on the wire; never the query
  * or fragment), the HTTP status, and an error code taken from a fixed list of
- * error-code strings Flair defines — any other `error` value, including a
+ * error-code strings — any other `error` value, including a
  * regex-shaped credential fragment, becomes the constant `unrecognized_error`.
+ * The list is exported as a FROZEN ARRAY, for inspection only; membership is a
+ * module-private Set, so no consumer can mutate the exported view to name a new
+ * code (see the mutation case below).
  * Errors with other origins have their own fixed, body-free formats, named once
  * here: a transport failure is named by a fixed reason class derived from the
  * error's `code`, a successful response whose body is not JSON names `malformed
@@ -467,8 +470,8 @@ test("the verifying stub refuses an unregistered signer and a bad signature befo
  * holds is named verbatim — the client repeats a constant it holds — and ANY
  * other value is the constant `unrecognized_error`, including a value shaped
  * like a code that is really a credential fragment. No route, verb or emitter is
- * asserted: a code is named because it is one of the fixed strings Flair
- * defines, not because a route this client sends could return it.
+ * asserted: a code is named because it is one of the fixed strings, not because
+ * a route this client sends could return it.
  */
 test("every listed code is named verbatim, and any other value becomes unrecognized_error (cli#597)", async () => {
   let errorValue: unknown = null;
@@ -486,7 +489,7 @@ test("every listed code is named verbatim, and any other value becomes unrecogni
     }
   };
   try {
-    expect(FLAIR_ERROR_CODES.size, "the list is non-empty").toBeGreaterThan(0);
+    expect(FLAIR_ERROR_CODES.length, "the list is non-empty").toBeGreaterThan(0);
     for (const code of FLAIR_ERROR_CODES) {
       errorValue = code;
       expect(await messageFor(), `the listed code ${code} is named verbatim`).toBe(
@@ -504,6 +507,68 @@ test("every listed code is named verbatim, and any other value becomes unrecogni
   } finally {
     restore();
   }
+});
+
+/**
+ * cli#597: the allow-list is module-private. `FLAIR_ERROR_CODES` is exported as
+ * a FROZEN ARRAY for inspection; membership is a private Set. A consumer that
+ * mutates the exported view — or tries to — cannot add a code that changes how a
+ * non-OK response is formatted. Were the live Set exported again, the `push`
+ * below would succeed and the injected code would be named verbatim, failing
+ * this test.
+ */
+test("mutating the exported allow-list view cannot change how a non-OK response is formatted (cli#597)", async () => {
+  const injected = "injected_not_a_flair_code";
+  const initialLength = FLAIR_ERROR_CODES.length;
+  // The exported view as a consumer would reach it. `add` and `push` are tried
+  // because the view is a frozen array while a live-Set regression would expose
+  // `add`; `Reflect` stands in for an element write, a truncate and a delete
+  // (the cli#568 guard classifies a bare index assignment as unclassified). Any
+  // attempt to add a code must not land.
+  const view = FLAIR_ERROR_CODES as unknown as {
+    push?: (value: string) => unknown;
+    add?: (value: string) => unknown;
+  };
+  for (const attempt of [
+    () => view.push?.(injected),
+    () => view.add?.(injected),
+    () => Reflect.set(view, 0, injected),
+    () => Reflect.set(view, "length", 0),
+    () => Reflect.deleteProperty(view, 0),
+  ]) {
+    try {
+      attempt();
+    } catch {
+      // frozen: the write throws
+    }
+  }
+
+  // A non-OK response naming the injected value is still the constant: the
+  // module-private membership test did not learn the code, however the exported
+  // view was written. WERE THE LIVE SET EXPORTED AGAIN (the mutation above), the
+  // `add` would land and this assertion — the one that matters — fails: the
+  // injected code would be named verbatim.
+  const restore = patchShared(globalThis, "fetch", (async () =>
+    new Response(JSON.stringify({ error: injected }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    })) as typeof fetch);
+  try {
+    let message = "";
+    try {
+      await new FlairClient({ baseUrl: "http://127.0.0.1:9", agentId: AGENT, keyPath }).getMemory("mem-1");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message, "the injected code is not named").toBe("Flair request GET /Memory/mem-1 → 400: unrecognized_error");
+  } finally {
+    restore();
+  }
+
+  // Supporting: the view is frozen, still lacks the code, and is unchanged.
+  expect(FLAIR_ERROR_CODES, "the injected code is not on the list").not.toContain(injected);
+  expect(FLAIR_ERROR_CODES.length, "the view's length is unchanged").toBe(initialLength);
+  expect(Object.isFrozen(FLAIR_ERROR_CODES), "the exported view is frozen").toBe(true);
 });
 
 test("the Basic fixture is authorized for the operator credential and refuses any other before the echo", async () => {

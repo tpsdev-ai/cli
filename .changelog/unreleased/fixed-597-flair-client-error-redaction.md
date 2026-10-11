@@ -3,10 +3,12 @@
   A non-OK Flair response error contains only the entry point, the method, the
   requested path the request was sent with (path parameters such as agent ids
   included and encoded, as on the wire; never the query or fragment), the HTTP
-  status, and an error code from a fixed list of error-code strings Flair
-  defines; any other value becomes `unrecognized_error`. An allow-listed code is
-  selected from the response's `error` field; raw bodies, other response text
-  and transport messages are never included. The client's wrapper methods encode
+  status, and an error code from a fixed list of error-code strings; any other
+  value becomes `unrecognized_error`. The list is exported as a frozen array for
+  inspection; membership is module-private, so a consumer cannot add or remove a
+  code and change the format. An allow-listed code is selected from the
+  response's `error` field; raw bodies, other response text and transport
+  messages are never included. The client's wrapper methods encode
   their ids; `request()` sends the path its caller supplies, so a direct caller
   encodes an id it builds a path from. Errors with other origins have their own
   fixed, body-free formats: a transport failure is named by a fixed reason class
