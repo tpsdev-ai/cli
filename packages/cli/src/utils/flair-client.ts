@@ -409,9 +409,10 @@ export class FlairClient {
   }
 
   /**
-   * Send a signed request. The client's wrapper methods encode their ids; request() sends the path its caller supplies — a caller that builds a path from an id
-   * must encode it with `encodeURIComponent` itself, or the URL (and the pathname
-   * an error names) will not carry the id as one segment.
+   * Send a signed request. The client's wrapper methods encode their ids;
+   * request() sends the path its caller supplies and does not encode ids.
+   * Callers should encode id parameters with `encodeURIComponent` before
+   * building paths.
    */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;

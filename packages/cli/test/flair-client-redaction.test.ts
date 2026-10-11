@@ -139,8 +139,8 @@ function echoResponse(shape: EchoShape, auth: string): Response {
     }
     case "json": {
       // The `error` field itself carries a credential fragment that is ALSO
-      // shaped like a Flair code (`[a-z0-9_.-]{8,}`): a shape test would pass it
-      // through, so only an allow-list can refuse it. For a Basic request that
+      // shaped like a Flair code (`[a-z0-9_.-]{8,}`): this fragment passes the
+      // shape check but is rejected by this fixed allow-list. For a Basic request that
       // window is an 8+ char substring of the operator credential.
       const body = JSON.stringify({
         error: codeShapedFragment(auth),
@@ -152,8 +152,8 @@ function echoResponse(shape: EchoShape, auth: string): Response {
       return new Response(body, { status: 500, headers: { "Content-Type": "application/json" } });
     }
     case "malformed": {
-      // A 2xx body that is not valid JSON and carries a credential fragment: the
-      // parser's own message would quote it.
+      // A successful response with malformed JSON exercises the client's fixed
+      // parse-error format.
       const body = `{"echo":"${secret.fragment}`;
       return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
     }
