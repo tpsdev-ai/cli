@@ -137,13 +137,137 @@ export class FlairRequestError extends Error {
   }
 }
 
-/** A server `error` code is named only when it has this shape. */
-const SAFE_ERROR_CODE = /^[a-z0-9_.-]{1,64}$/;
+/**
+ * The Flair error codes this client can receive — a CLOSED allow-list,
+ * enumerated from Flair's resources. A server names an error with a short
+ * `error` code; the client repeats that code ONLY when it is one of these
+ * fixed constants. Any other value becomes `UNRECOGNIZED_ERROR`.
+ *
+ * A shape test (a regex for "a short lower-case token") is not a control: a
+ * credential fragment — a slice of a base64 Basic credential, a nonce, a
+ * signature component — can itself be regex-shaped, so a shape test would pass
+ * it straight through. Naming only an enumerated constant cannot: no echoed
+ * fragment equals a constant written here.
+ *
+ * Every entry is emitted as `{ error: "…" }` by a Flair resource this client
+ * reaches. Source paths are `tpsdev-ai/flair` `resources/`:
+ *
+ *   auth-middleware.ts      invalid_authorization_header, method_not_allowed,
+ *                           timestamp_out_of_window, nonce_replay_detected,
+ *                           unknown_agent, principal_deactivated,
+ *                           invalid_signature, signature_verification_failed,
+ *                           ambiguous_memory_id
+ *   replay-store.ts         replay_store_unavailable
+ *   rate-limit.ts           slow_down
+ *   rate-limiter.ts         rate_limit_exceeded, storage_quota_exceeded
+ *   Memory.ts               invalid_durability, invalid_visibility,
+ *                           invalid_visibility_for_durability, invalid_expiry,
+ *                           content_safety_violation, derived_from_self,
+ *                           reembed_no_text, reembed_row_changed,
+ *                           embedding_unavailable, reindex_admin_only,
+ *                           reindex_row_not_found, reindex_would_change_row,
+ *                           host_source_persist_failed, host_source_delete_failed
+ *   write-back.ts           stored_row_changed
+ *   provenance.ts           stored_row_read_failed
+ *   originator-instance.ts  id_target_mismatch, stored_row_lookup_failed
+ *   owner-field-guard.ts    owner_check_unavailable
+ *   MemoryPurge.ts          memory_purge_ids_invalid, memory_purge_target_missing,
+ *                           memory_purge_history_cleanup_unconfirmed,
+ *                           memory_purge_pointer_cleanup_failed,
+ *                           memory_purge_unconfirmed
+ *   MemoryArchive.ts        memory_changed, forbidden
+ *   MemoryReflect.ts        rem_aborted, distillation_failed
+ *   AgentSeed.ts            agent_lookup_failed, skill_assignment_not_seedable
+ *   Soul.ts                 soul_write_requires_one_record,
+ *                           soul_stored_state_unavailable,
+ *                           soul_patch_table_unavailable,
+ *                           soul_delete_requires_one_record
+ *   Presence.ts             invalid_activity, presence_query_failed,
+ *                           presence_write_failed
+ *   WorkspaceLatest.ts      workspace_state_query_failed, no_workspace_state_found
+ *   skill-write.ts          skill_durability, skill_write_path, skill_scan_rejected
+ *   skill-provenance.ts     skill_source_not_durable, skill_opt_out_not_boolean
+ *   skill-version-write.ts  skill_lineage_tag_removed, skill_state_requires_delete
+ *   OrgSkillAssignment.ts   org_skill_assignment_busy,
+ *                           org_skill_assignment_lock_unavailable
+ *   Integration.ts          integration_owner_changed, plaintext_credentials_forbidden
+ *   Credential.ts           forbidden
+ */
+const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
+  "invalid_authorization_header",
+  "method_not_allowed",
+  "timestamp_out_of_window",
+  "nonce_replay_detected",
+  "unknown_agent",
+  "principal_deactivated",
+  "invalid_signature",
+  "signature_verification_failed",
+  "ambiguous_memory_id",
+  "replay_store_unavailable",
+  "slow_down",
+  "rate_limit_exceeded",
+  "storage_quota_exceeded",
+  "invalid_durability",
+  "invalid_visibility",
+  "invalid_visibility_for_durability",
+  "invalid_expiry",
+  "content_safety_violation",
+  "derived_from_self",
+  "reembed_no_text",
+  "reembed_row_changed",
+  "embedding_unavailable",
+  "reindex_admin_only",
+  "reindex_row_not_found",
+  "reindex_would_change_row",
+  "host_source_persist_failed",
+  "host_source_delete_failed",
+  "stored_row_changed",
+  "stored_row_read_failed",
+  "id_target_mismatch",
+  "stored_row_lookup_failed",
+  "owner_check_unavailable",
+  "memory_purge_ids_invalid",
+  "memory_purge_target_missing",
+  "memory_purge_history_cleanup_unconfirmed",
+  "memory_purge_pointer_cleanup_failed",
+  "memory_purge_unconfirmed",
+  "memory_changed",
+  "rem_aborted",
+  "distillation_failed",
+  "agent_lookup_failed",
+  "skill_assignment_not_seedable",
+  "soul_write_requires_one_record",
+  "soul_stored_state_unavailable",
+  "soul_patch_table_unavailable",
+  "soul_delete_requires_one_record",
+  "invalid_activity",
+  "presence_query_failed",
+  "presence_write_failed",
+  "workspace_state_query_failed",
+  "no_workspace_state_found",
+  "skill_durability",
+  "skill_write_path",
+  "skill_scan_rejected",
+  "skill_source_not_durable",
+  "skill_opt_out_not_boolean",
+  "skill_lineage_tag_removed",
+  "skill_state_requires_delete",
+  "org_skill_assignment_busy",
+  "org_skill_assignment_lock_unavailable",
+  "integration_owner_changed",
+  "plaintext_credentials_forbidden",
+  "forbidden",
+]);
+
+/** The code an error carries when the server named a value not on the list. */
+const UNRECOGNIZED_ERROR = "unrecognized_error";
 
 /**
- * The path an error names: the request path without its query. A query string
- * can carry an agent id, a `since` timestamp, a filter — the error names the
- * route, never the arguments.
+ * The path an error names: the request path without its query — and always the
+ * SAME encoded string the request was actually sent with. A query string can
+ * carry an agent id, a `since` timestamp, a filter, so an error names the route
+ * and not the arguments; a path parameter that was percent-encoded (an agent id
+ * carrying a separator, say) stays encoded in the name, exactly as on the wire.
  */
 function routePath(path: string): string {
   const query = path.indexOf("?");
@@ -151,26 +275,27 @@ function routePath(path: string): string {
 }
 
 /**
- * The short `error` code of a response body, or `null`. The body itself is
- * NEVER part of an error: a server can echo the request's credential into it,
- * and a fragment, an encoding or a signature component would survive any
- * exact-value redaction. Only a code matching `SAFE_ERROR_CODE` is safe.
+ * The `error` code a response names, or `UNRECOGNIZED_ERROR`. The body itself is
+ * NEVER part of an error: a server can echo the request's credential into it.
+ * Only a code that is one of Flair's own `FLAIR_ERROR_CODES` is named; every
+ * other value — including a regex-shaped credential fragment — is
+ * `UNRECOGNIZED_ERROR`.
  */
-function responseErrorCode(body: string): string | null {
+function responseErrorCode(body: string): string {
   let parsed: unknown;
   try {
     parsed = JSON.parse(body);
   } catch {
-    return null;
+    return UNRECOGNIZED_ERROR;
   }
   const code = (parsed as { error?: unknown } | null)?.error;
-  return typeof code === "string" && SAFE_ERROR_CODE.test(code) ? code : null;
+  return typeof code === "string" && FLAIR_ERROR_CODES.has(code) ? code : UNRECOGNIZED_ERROR;
 }
 
-/** A non-OK response: the entry point, the route, the status and a safe code. */
+/** A non-OK response: the entry point, the route, the status and an allow-listed code. */
 function responseError(entry: string, method: string, path: string, status: number, body: string): string {
   const code = responseErrorCode(body);
-  return `Flair ${entry} ${method} ${routePath(path)} → ${status}${code ? `: ${code}` : ""}`;
+  return `Flair ${entry} ${method} ${routePath(path)} → ${status}: ${code}`;
 }
 
 /** The `code` of a thrown value, from the value or its `cause` (Node's fetch). */
@@ -412,10 +537,13 @@ export class FlairClient {
     adminAuth?: string,
   ): Promise<{ found: boolean; publicKey: string | null }> {
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const route = `/Agent/${agentId}`;
+    // The name an error carries is this same encoded path — the string the
+    // request is sent with — so an id that needs encoding (`agent/sub`) is
+    // named `agent%2Fsub`, as on the wire, never decoded.
+    const route = `/Agent/${encodeURIComponent(agentId)}`;
     let res: Response;
     try {
-      res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
+      res = await fetch(`${this.baseUrl}${route}`, {
         headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
       });
     } catch (err) {

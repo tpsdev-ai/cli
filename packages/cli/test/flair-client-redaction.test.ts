@@ -8,19 +8,24 @@
  * base64 slice or an Ed25519 signature component survives it, and a JSON parse
  * error can quote a fragment of the body too.
  *
- * The guarantee is a WHITELIST. An error the client builds names only safe,
- * client-constructed context — the entry point, the method and path (never the
- * query), the HTTP status and, when the body is JSON with a short `error` code,
- * that code. A transport failure is named by a fixed reason class derived from
- * the error's `code`, never its message. A successful response whose body is not
- * JSON throws a safe error. No response body, transport message, parser message
- * or original `cause` is ever included.
+ * The guarantee is an ALLOW-LIST. An error the client builds contains only:
+ * the entry point, the method, the ENCODED request path the request was sent
+ * with (path parameters such as agent ids included, as on the wire; never the
+ * query), the HTTP status, and an error code taken from Flair's fixed
+ * `FLAIR_ERROR_CODES` allow-list — any other `error` value, including a
+ * regex-shaped credential fragment, becomes the constant `unrecognized_error`.
+ * A transport failure is named by a fixed reason class derived from the error's
+ * `code`, never its message. A successful response whose body is not JSON throws
+ * a safe error. No response body, transport message, parser message or original
+ * `cause` is ever included.
  *
- * The entry points that surface errors are driven twice here, per the repo's
- * convention (cli#395, cli#566): in-process, and in a spawned `node` child that
- * imports the built dist (`dist/src/utils/flair-client.js`). The echo server sits
- * behind the shared VERIFYING stub (`helpers/stub-flair.ts`) for a registered
- * signer; the Basic paths sit behind an authorized fixture with its own refusal.
+ * The entry points that surface errors are driven in TWO spawned children, per
+ * the repo's convention (cli#395, cli#566): a `bun` child and a `node` child,
+ * each importing the runtime's built client module (`src/utils/flair-client.ts`
+ * for Bun, the built `dist/src/utils/flair-client.js` for Node). The echo server
+ * sits behind the shared VERIFYING stub (`helpers/stub-flair.ts`) for a
+ * registered signer; the Basic paths sit behind an authorized fixture with its
+ * own refusal. The real-transport case asserts the thrown MESSAGE only.
  *
  * Precondition: the CLI is built — root `bun run build` does that before
  * `bun run test`.
@@ -56,7 +61,10 @@ const CLIENT_MODULE = {
 } as const;
 type Runtime = keyof typeof CLIENT_MODULE;
 
-/** The three entry points that build errors. The route is the path without its query. */
+/**
+ * The three entry points that build errors. The route is the ENCODED path the
+ * request was sent with, without its query.
+ */
 const ENTRIES = [
   { name: "request", method: "GET", route: "/Memory/mem-1" },
   { name: "registerAgent", method: "PUT", route: `/Agent/${AGENT}` },
@@ -106,6 +114,23 @@ function carriedCredential(auth: string): { whole: string; decoded: string; frag
   return { whole: auth, decoded: "", fragment: auth.slice(0, 12), signature: auth.split(":").pop() ?? "" };
 }
 
+/**
+ * An 8+ char, code-shaped window of the request's credential — the value an
+ * echoing server could choose to make look like a Flair error code. For a Basic
+ * request it is a substring of the operator credential; for a signed request it
+ * is the nonce (which is credential material the leak assertion checks).
+ */
+function codeShapedFragment(auth: string): string {
+  const candidates = auth.startsWith("Basic ")
+    ? [Buffer.from(auth.slice(6), "base64").toString("utf-8")]
+    : [auth.split(":")[2] ?? "", auth.split(":")[3] ?? ""];
+  for (const candidate of candidates) {
+    const match = /[a-z0-9_.-]{8,64}/.exec(candidate);
+    if (match) return match[0];
+  }
+  return "";
+}
+
 /** A response body that quotes the caller's credential in several shapes. */
 function echoResponse(shape: EchoShape, auth: string): Response {
   const secret = carriedCredential(auth);
@@ -115,8 +140,12 @@ function echoResponse(shape: EchoShape, auth: string): Response {
       return new Response(body, { status: 500, headers: { "Content-Type": "text/plain" } });
     }
     case "json": {
+      // The `error` field itself carries a credential fragment that is ALSO
+      // shaped like a Flair code (`[a-z0-9_.-]{8,}`): a shape test would pass it
+      // through, so only an allow-list can refuse it. For a Basic request that
+      // window is an 8+ char substring of the operator credential.
       const body = JSON.stringify({
-        error: "denied",
+        error: codeShapedFragment(auth),
         authorization: secret.whole,
         decoded: secret.decoded,
         fragment: secret.fragment,
@@ -328,7 +357,7 @@ function expectNoLeak(observation: Observation, secrets: readonly string[]): voi
 
 for (const runtime of ["bun", "node"] as const) {
   describe(
-    `cli#597 — Flair client errors contain only the entry point, method and path, status, and a short server error code when present; response bodies and transport messages are never included (${runtime})`,
+    `cli#597 — Flair client errors contain only the entry point, method and encoded path, status, and an allow-listed error code (else unrecognized_error); response bodies and transport messages are never included (${runtime})`,
     () => {
     for (const shape of ["text", "json", "malformed"] as const) {
       test(`${runtime}: a ${shape} body echoing the credential never reaches the error (signed + Basic)`, async () => {
@@ -355,12 +384,21 @@ for (const runtime of ["bun", "node"] as const) {
             observations.find((candidate) => candidate.name === `${name}:echo`)?.message;
 
           if (shape === "json") {
-            // The one response value that IS named: a short server `error` code.
-            for (const entry of ENTRIES) expect(messageOf(entry.name)).toContain("→ 500: denied");
+            // The code field carried a credential fragment shaped like a Flair
+            // code; it is not on the allow-list, so the error names the constant
+            // and none of the fragment.
+            for (const entry of ENTRIES) {
+              expect(messageOf(entry.name)).toContain("→ 500: unrecognized_error");
+              const auth =
+                echo.seen.find((s) => s.method === entry.method && s.route === entry.route)?.auth ?? "";
+              const fragment = codeShapedFragment(auth);
+              expect(fragment, "the code field carried a credential fragment").not.toBeEmpty();
+              expect(messageOf(entry.name)).not.toContain(fragment);
+            }
           } else if (shape === "malformed") {
             for (const entry of ENTRIES) expect(messageOf(entry.name)).toContain("→ 200: malformed response body");
           } else {
-            for (const entry of ENTRIES) expect(messageOf(entry.name)).toContain("→ 500");
+            for (const entry of ENTRIES) expect(messageOf(entry.name)).toContain("→ 500: unrecognized_error");
           }
 
           // A transport failure quotes the request in its message and cause; the
@@ -417,7 +455,7 @@ test("the Basic fixture is authorized for the operator credential and refuses an
   const echo = startEchoFlair("json");
   try {
     const client = new FlairClient({ baseUrl: echo.url, agentId: AGENT, keyPath });
-    await expect(client.readStoredPublicKey(AGENT, OPERATOR)).rejects.toThrow("→ 500: denied");
+    await expect(client.readStoredPublicKey(AGENT, OPERATOR)).rejects.toThrow("→ 500: unrecognized_error");
     expect(echo.seen.at(-1)?.auth).toBe(`Basic ${OPERATOR_B64}`);
 
     const served = echo.seen.length;
@@ -425,6 +463,23 @@ test("the Basic fixture is authorized for the operator credential and refuses an
     await expect(refused).rejects.toThrow("→ 403");
     await expect(refused).rejects.not.toThrow("denied");
     expect(echo.seen.length).toBe(served);
+  } finally {
+    echo.stop();
+  }
+});
+
+test("readStoredPublicKey names the ENCODED request path, the one the request used (cli#597)", async () => {
+  const echo = startEchoFlair("json");
+  try {
+    const client = new FlairClient({ baseUrl: echo.url, agentId: AGENT, keyPath });
+    const id = `${AGENT}/sub`;
+    const encoded = `/Agent/${encodeURIComponent(id)}`;
+    await expect(client.readStoredPublicKey(id, OPERATOR)).rejects.toThrow(
+      `Flair readStoredPublicKey GET ${encoded}`,
+    );
+    // The reported path is the string the request carried, not a decoded one.
+    await expect(client.readStoredPublicKey(id, OPERATOR)).rejects.not.toThrow(`/Agent/${id}`);
+    expect(echo.seen.at(-1)?.route).toBe(encoded);
   } finally {
     echo.stop();
   }
