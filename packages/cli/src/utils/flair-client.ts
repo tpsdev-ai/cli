@@ -137,6 +137,35 @@ export class FlairRequestError extends Error {
   }
 }
 
+/** What a redacted credential is replaced with. */
+const REDACTED = "[REDACTED]";
+
+/**
+ * Redact credential material from text an error is built from. `secrets` are
+ * the exact credential values the request carried — an `Authorization` header
+ * value, or the operator credential a `Basic` header was built from. Each
+ * occurrence of a value is replaced with `[REDACTED]`.
+ */
+function redactCredentialMaterial(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (secret.length === 0) continue;
+    out = out.split(secret).join(REDACTED);
+  }
+  return out;
+}
+
+/** The message of an unknown thrown value. */
+function thrownMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The credential values a `Basic`-authenticated request carries. */
+function basicAuthSecrets(auth: string): string[] {
+  const encoded = Buffer.from(auth).toString("base64");
+  return [`Basic ${encoded}`, encoded, auth];
+}
+
 /**
  * Flair exposes no operation that promotes or rejects a Memory by id: the
  * promotion operation `POST /PromoteMemoryCandidate` acts on a `MemoryCandidate`
@@ -207,16 +236,28 @@ export class FlairClient {
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const authHeader = this.sign(method, path);
+    const secrets = [authHeader];
     const headers: Record<string, string> = { Authorization: authHeader };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (err) {
+      throw new FlairRequestError(
+        `Flair ${method} ${path} transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
+        0,
+      );
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(`Flair ${method} ${path} → ${res.status}: ${text}`, res.status);
+      throw new FlairRequestError(
+        `Flair ${method} ${path} → ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
+        res.status,
+      );
     }
     if (res.status === 204) return undefined as T;
     return res.json() as Promise<T>;
@@ -245,22 +286,32 @@ export class FlairClient {
   ): Promise<FlairAgent> {
     const url = `${this.baseUrl}/Agent/${this.agentId}`;
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const res = await fetch(url, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
-      },
-      body: JSON.stringify({
-        id: this.agentId,
-        name,
-        publicKey,
-        createdAt: new Date().toISOString(),
-      }),
-    });
+    const secrets = basicAuthSecrets(auth);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
+        },
+        body: JSON.stringify({
+          id: this.agentId,
+          name,
+          publicKey,
+          createdAt: new Date().toISOString(),
+        }),
+      });
+    } catch (err) {
+      throw new Error(
+        `Flair agent registration transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
+      );
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Flair agent registration failed: ${res.status}: ${text}`);
+      throw new Error(
+        `Flair agent registration failed: ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
+      );
     }
     if (res.status === 204) return { id: this.agentId, name, publicKey } as FlairAgent;
     return res.json() as Promise<FlairAgent>;
@@ -300,13 +351,25 @@ export class FlairClient {
     adminAuth?: string,
   ): Promise<{ found: boolean; publicKey: string | null }> {
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
-      headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
-    });
+    const secrets = basicAuthSecrets(auth);
+    let res: Response;
+    try {
+      res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
+        headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
+      });
+    } catch (err) {
+      throw new FlairRequestError(
+        `Flair GET /Agent/${agentId} transport error: ${redactCredentialMaterial(thrownMessage(err), secrets)}`,
+        0,
+      );
+    }
     if (res.status === 404) return { found: false, publicKey: null };
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(`Flair GET /Agent/${agentId} → ${res.status}: ${text}`, res.status);
+      throw new FlairRequestError(
+        `Flair GET /Agent/${agentId} → ${res.status}: ${redactCredentialMaterial(text, secrets)}`,
+        res.status,
+      );
     }
     const record = (await res.json()) as FlairAgent | null;
     return { found: true, publicKey: typeof record?.publicKey === "string" ? record.publicKey : null };
