@@ -138,28 +138,38 @@ export class FlairRequestError extends Error {
 }
 
 /**
- * The Flair error codes this client can receive — a CLOSED allow-list,
+ * The error codes this client's routes can return — a CLOSED allow-list,
  * enumerated from Flair's resources. A server names an error with a short
  * `error` code; the client repeats that code ONLY when it is one of these
- * fixed constants. Any other value becomes `UNRECOGNIZED_ERROR`.
+ * fixed constants. Any other value becomes `UNRECOGNIZED_ERROR`. This is not
+ * Flair's complete inventory: it holds the codes the resources reachable from
+ * this client's routes emit; any other value — including one from a Flair route
+ * this client never calls — is `unrecognized_error`.
  *
  * A shape test (a regex for "a short lower-case token") is not a control: a
  * credential fragment — a slice of a base64 Basic credential, a nonce, a
  * signature component — can itself be regex-shaped, so a shape test would pass
- * it straight through. Naming only an enumerated constant cannot: no echoed
- * fragment equals a constant written here.
+ * it straight through. Naming only an enumerated constant bounds the damage:
+ * arbitrary response text cannot enter an error. (A fixed list cannot rule out
+ * a coincidence with a listed code, but the client copies no response text — it
+ * names a constant it already holds.)
  *
- * Every entry is emitted as `{ error: "…" }` by a Flair resource this client
- * reaches. Source paths are `tpsdev-ai/flair` `resources/`:
+ * Every entry is emitted as `{ error: "…" }` by a Flair resource a route this
+ * client calls reaches. Source paths are `tpsdev-ai/flair` `resources/`, with
+ * the client route that reaches each file:
  *
  *   auth-middleware.ts      invalid_authorization_header, method_not_allowed,
  *                           timestamp_out_of_window, nonce_replay_detected,
  *                           unknown_agent, principal_deactivated,
  *                           invalid_signature, signature_verification_failed,
- *                           ambiguous_memory_id
- *   replay-store.ts         replay_store_unavailable
- *   rate-limit.ts           slow_down
- *   rate-limiter.ts         rate_limit_exceeded, storage_quota_exceeded
+ *                           ambiguous_memory_id            (every route)
+ *   replay-store.ts         replay_store_unavailable        (every signed route)
+ *   rate-limit.ts           slow_down                       (every route)
+ *   rate-limiter.ts         rate_limit_exceeded,
+ *                           storage_quota_exceeded          (every route)
+ *   Agent.ts                invalid_agent_id                (PUT/GET /Agent/{id})
+ *   AgentSeed.ts            agent_lookup_failed,
+ *                           skill_assignment_not_seedable   (POST /AgentSeed/)
  *   Memory.ts               invalid_durability, invalid_visibility,
  *                           invalid_visibility_for_durability, invalid_expiry,
  *                           content_safety_violation, derived_from_self,
@@ -167,31 +177,43 @@ export class FlairRequestError extends Error {
  *                           embedding_unavailable, reindex_admin_only,
  *                           reindex_row_not_found, reindex_would_change_row,
  *                           host_source_persist_failed, host_source_delete_failed
- *   write-back.ts           stored_row_changed
- *   provenance.ts           stored_row_read_failed
- *   originator-instance.ts  id_target_mismatch, stored_row_lookup_failed
- *   owner-field-guard.ts    owner_check_unavailable
- *   MemoryPurge.ts          memory_purge_ids_invalid, memory_purge_target_missing,
- *                           memory_purge_history_cleanup_unconfirmed,
- *                           memory_purge_pointer_cleanup_failed,
- *                           memory_purge_unconfirmed
- *   MemoryArchive.ts        memory_changed, forbidden
- *   MemoryReflect.ts        rem_aborted, distillation_failed
- *   AgentSeed.ts            agent_lookup_failed, skill_assignment_not_seedable
+ *                                                          (PUT/PATCH/DELETE /Memory/{id})
+ *   memory-id-guard.ts      memory_id_content_suffix,
+ *                           supersedes_target_unreadable,
+ *                           supersedes_target_missing      (PUT /Memory/{id})
+ *   write-back.ts           stored_row_changed             (PUT/PATCH /Memory/{id})
+ *   provenance.ts           stored_row_read_failed         (PUT/PATCH /Memory/{id})
+ *   originator-instance.ts  id_target_mismatch,
+ *                           stored_row_lookup_failed       (PUT /Memory/{id}, PUT /Soul/{id})
+ *   owner-field-guard.ts    owner_check_unavailable        (PUT/PATCH /Memory/{id}, PUT/PATCH /Soul/{id})
+ *   skill-write.ts          skill_durability, skill_write_path,
+ *                           skill_scan_rejected            (PUT /Memory/{id})
+ *   skill-provenance.ts     skill_source_not_durable,
+ *                           skill_opt_out_not_boolean      (PUT /Memory/{id}, PUT/PATCH /Soul/{id})
+ *   skill-version-write.ts  skill_lineage_tag_removed,
+ *                           skill_state_requires_delete, skill_self_supersede,
+ *                           skill_predecessor_missing, skill_target_changed,
+ *                           skill_head_missing, skill_predecessor_stale,
+ *                           skill_target_stale             (PUT /Memory/{id})
+ *   OrgSkillAssignment.ts   org_skill_assignment_busy,
+ *                           org_skill_assignment_lock_unavailable
+ *                                                          (PUT /Memory/{id})
  *   Soul.ts                 soul_write_requires_one_record,
  *                           soul_stored_state_unavailable,
  *                           soul_patch_table_unavailable,
- *                           soul_delete_requires_one_record
+ *                           soul_delete_requires_one_record, soul_patch_conflict,
+ *                           soul_patch_row_changed         (PUT/PATCH/DELETE /Soul/{id})
+ *   instruction-version-record.ts  soul_subject_occupied,
+ *                           instruction_version_head_mismatch,
+ *                           instruction_version_append_failed,
+ *                           instruction_version_busy,
+ *                           instruction_version_lock_unavailable
+ *                                                          (PUT/DELETE /Soul/{id})
  *   Presence.ts             invalid_activity, presence_query_failed,
- *                           presence_write_failed
- *   WorkspaceLatest.ts      workspace_state_query_failed, no_workspace_state_found
- *   skill-write.ts          skill_durability, skill_write_path, skill_scan_rejected
- *   skill-provenance.ts     skill_source_not_durable, skill_opt_out_not_boolean
- *   skill-version-write.ts  skill_lineage_tag_removed, skill_state_requires_delete
- *   OrgSkillAssignment.ts   org_skill_assignment_busy,
- *                           org_skill_assignment_lock_unavailable
- *   Integration.ts          integration_owner_changed, plaintext_credentials_forbidden
- *   Credential.ts           forbidden
+ *                           presence_write_failed          (POST /Presence)
+ *   MemoryReflect.ts        rem_aborted, distillation_failed (POST /ReflectMemories/)
+ *   WorkspaceLatest.ts      workspace_state_query_failed,
+ *                           no_workspace_state_found        (GET /WorkspaceLatest/{id})
  */
 const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "invalid_authorization_header",
@@ -207,6 +229,9 @@ const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "slow_down",
   "rate_limit_exceeded",
   "storage_quota_exceeded",
+  "invalid_agent_id",
+  "agent_lookup_failed",
+  "skill_assignment_not_seedable",
   "invalid_durability",
   "invalid_visibility",
   "invalid_visibility_for_durability",
@@ -221,30 +246,14 @@ const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "reindex_would_change_row",
   "host_source_persist_failed",
   "host_source_delete_failed",
+  "memory_id_content_suffix",
+  "supersedes_target_unreadable",
+  "supersedes_target_missing",
   "stored_row_changed",
   "stored_row_read_failed",
   "id_target_mismatch",
   "stored_row_lookup_failed",
   "owner_check_unavailable",
-  "memory_purge_ids_invalid",
-  "memory_purge_target_missing",
-  "memory_purge_history_cleanup_unconfirmed",
-  "memory_purge_pointer_cleanup_failed",
-  "memory_purge_unconfirmed",
-  "memory_changed",
-  "rem_aborted",
-  "distillation_failed",
-  "agent_lookup_failed",
-  "skill_assignment_not_seedable",
-  "soul_write_requires_one_record",
-  "soul_stored_state_unavailable",
-  "soul_patch_table_unavailable",
-  "soul_delete_requires_one_record",
-  "invalid_activity",
-  "presence_query_failed",
-  "presence_write_failed",
-  "workspace_state_query_failed",
-  "no_workspace_state_found",
   "skill_durability",
   "skill_write_path",
   "skill_scan_rejected",
@@ -252,26 +261,49 @@ const FLAIR_ERROR_CODES: ReadonlySet<string> = new Set([
   "skill_opt_out_not_boolean",
   "skill_lineage_tag_removed",
   "skill_state_requires_delete",
+  "skill_self_supersede",
+  "skill_predecessor_missing",
+  "skill_target_changed",
+  "skill_head_missing",
+  "skill_predecessor_stale",
+  "skill_target_stale",
   "org_skill_assignment_busy",
   "org_skill_assignment_lock_unavailable",
-  "integration_owner_changed",
-  "plaintext_credentials_forbidden",
-  "forbidden",
+  "soul_write_requires_one_record",
+  "soul_stored_state_unavailable",
+  "soul_patch_table_unavailable",
+  "soul_delete_requires_one_record",
+  "soul_patch_conflict",
+  "soul_patch_row_changed",
+  "soul_subject_occupied",
+  "instruction_version_head_mismatch",
+  "instruction_version_append_failed",
+  "instruction_version_busy",
+  "instruction_version_lock_unavailable",
+  "invalid_activity",
+  "presence_query_failed",
+  "presence_write_failed",
+  "rem_aborted",
+  "distillation_failed",
+  "workspace_state_query_failed",
+  "no_workspace_state_found",
 ]);
 
 /** The code an error carries when the server named a value not on the list. */
 const UNRECOGNIZED_ERROR = "unrecognized_error";
 
 /**
- * The path an error names: the request path without its query — and always the
- * SAME encoded string the request was actually sent with. A query string can
- * carry an agent id, a `since` timestamp, a filter, so an error names the route
- * and not the arguments; a path parameter that was percent-encoded (an agent id
- * carrying a separator, say) stays encoded in the name, exactly as on the wire.
+ * The path an error names: the `pathname` of the URL the request was actually
+ * sent with — never a query and never a fragment. A query string can carry an
+ * agent id, a `since` timestamp, a filter, and a fragment is not sent at all,
+ * so an error names the route and not the arguments; a path parameter that was
+ * percent-encoded (an agent id carrying a separator, say) stays encoded in the
+ * name, exactly as on the wire. Deriving the name from the URL the transport
+ * carried — not from the uncanonicalized string a caller supplied — keeps the
+ * reported path equal to the path the request sent.
  */
-function routePath(path: string): string {
-  const query = path.indexOf("?");
-  return query === -1 ? path : path.slice(0, query);
+function requestedPath(url: string): string {
+  return new URL(url).pathname;
 }
 
 /**
@@ -292,10 +324,10 @@ function responseErrorCode(body: string): string {
   return typeof code === "string" && FLAIR_ERROR_CODES.has(code) ? code : UNRECOGNIZED_ERROR;
 }
 
-/** A non-OK response: the entry point, the route, the status and an allow-listed code. */
+/** A non-OK response: the entry point, the requested path, the status and an allow-listed code. */
 function responseError(entry: string, method: string, path: string, status: number, body: string): string {
   const code = responseErrorCode(body);
-  return `Flair ${entry} ${method} ${routePath(path)} → ${status}: ${code}`;
+  return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
 }
 
 /** The `code` of a thrown value, from the value or its `cause` (Node's fetch). */
@@ -345,14 +377,14 @@ function transportReason(err: unknown): string {
   }
 }
 
-/** A transport failure: the entry point, the route and a fixed reason class. */
+/** A transport failure: the entry point, the requested path and a fixed reason class. */
 function transportError(entry: string, method: string, path: string, err: unknown): string {
-  return `Flair ${entry} ${method} ${routePath(path)} transport error: ${transportReason(err)}`;
+  return `Flair ${entry} ${method} ${path} transport error: ${transportReason(err)}`;
 }
 
 /** A successful response whose body is not valid JSON. */
 function parseError(entry: string, method: string, path: string, status: number): string {
-  return `Flair ${entry} ${method} ${routePath(path)} → ${status}: malformed response body`;
+  return `Flair ${entry} ${method} ${path} → ${status}: malformed response body`;
 }
 
 /**
@@ -424,6 +456,10 @@ export class FlairClient {
 
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    // The name an error carries is the pathname of the URL actually requested — the
+    // same string the transport sent — never the caller-supplied `path` verbatim and
+    // never a query or fragment.
+    const route = requestedPath(url);
     const authHeader = this.sign(method, path);
     const headers: Record<string, string> = { Authorization: authHeader };
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -435,17 +471,17 @@ export class FlairClient {
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
     } catch (err) {
-      throw new FlairRequestError(transportError("request", method, path, err), 0);
+      throw new FlairRequestError(transportError("request", method, route, err), 0);
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(responseError("request", method, path, res.status, text), res.status);
+      throw new FlairRequestError(responseError("request", method, route, res.status, text), res.status);
     }
     if (res.status === 204) return undefined as T;
     try {
       return (await res.json()) as T;
     } catch {
-      throw new FlairRequestError(parseError("request", method, path, res.status), res.status);
+      throw new FlairRequestError(parseError("request", method, route, res.status), res.status);
     }
   }
 
@@ -470,9 +506,14 @@ export class FlairClient {
     publicKey: string,
     adminAuth?: string,
   ): Promise<FlairAgent> {
-    const url = `${this.baseUrl}/Agent/${this.agentId}`;
+    // The agent id is a path parameter: encode it so the URL — and the path an
+    // error names — carries it as one encoded segment. An id containing `#` or
+    // `?` would otherwise be dropped as a fragment or read as a query, and the
+    // error would name text the request never sent.
+    const route = `/Agent/${encodeURIComponent(this.agentId)}`;
+    const url = `${this.baseUrl}${route}`;
+    const requestedRoute = requestedPath(url);
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const route = `/Agent/${this.agentId}`;
     let res: Response;
     try {
       res = await fetch(url, {
@@ -489,23 +530,23 @@ export class FlairClient {
         }),
       });
     } catch (err) {
-      throw new Error(transportError("registerAgent", "PUT", route, err));
+      throw new Error(transportError("registerAgent", "PUT", requestedRoute, err));
     }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(responseError("registerAgent", "PUT", route, res.status, text));
+      throw new Error(responseError("registerAgent", "PUT", requestedRoute, res.status, text));
     }
     if (res.status === 204) return { id: this.agentId, name, publicKey } as FlairAgent;
     try {
       return (await res.json()) as FlairAgent;
     } catch {
-      throw new Error(parseError("registerAgent", "PUT", route, res.status));
+      throw new Error(parseError("registerAgent", "PUT", requestedRoute, res.status));
     }
   }
 
   async getAgent(id?: string): Promise<FlairAgent | null> {
     try {
-      return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`);
+      return await this.request<FlairAgent>("GET", `/Agent/${encodeURIComponent(id ?? this.agentId)}`);
     } catch {
       return null;
     }
@@ -537,23 +578,25 @@ export class FlairClient {
     adminAuth?: string,
   ): Promise<{ found: boolean; publicKey: string | null }> {
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    // The name an error carries is this same encoded path — the string the
-    // request is sent with — so an id that needs encoding (`agent/sub`) is
-    // named `agent%2Fsub`, as on the wire, never decoded.
+    // The name an error carries is the pathname of this same URL — the string the
+    // request is sent with — so an id that needs encoding (`agent/sub`) is named
+    // `agent%2Fsub`, as on the wire, never decoded and never a query or fragment.
     const route = `/Agent/${encodeURIComponent(agentId)}`;
+    const url = `${this.baseUrl}${route}`;
+    const requestedRoute = requestedPath(url);
     let res: Response;
     try {
-      res = await fetch(`${this.baseUrl}${route}`, {
+      res = await fetch(url, {
         headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
       });
     } catch (err) {
-      throw new FlairRequestError(transportError("readStoredPublicKey", "GET", route, err), 0);
+      throw new FlairRequestError(transportError("readStoredPublicKey", "GET", requestedRoute, err), 0);
     }
     if (res.status === 404) return { found: false, publicKey: null };
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       throw new FlairRequestError(
-        responseError("readStoredPublicKey", "GET", route, res.status, text),
+        responseError("readStoredPublicKey", "GET", requestedRoute, res.status, text),
         res.status,
       );
     }
@@ -561,7 +604,7 @@ export class FlairClient {
     try {
       record = (await res.json()) as FlairAgent | null;
     } catch {
-      throw new FlairRequestError(parseError("readStoredPublicKey", "GET", route, res.status), res.status);
+      throw new FlairRequestError(parseError("readStoredPublicKey", "GET", requestedRoute, res.status), res.status);
     }
     return { found: true, publicKey: typeof record?.publicKey === "string" ? record.publicKey : null };
   }
@@ -590,7 +633,7 @@ export class FlairClient {
       tags?: string[];
     } = {},
   ): Promise<void> {
-    await this.request("PUT", `/Memory/${id}`, {
+    await this.request("PUT", `/Memory/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       content,
@@ -602,7 +645,7 @@ export class FlairClient {
   }
 
   async getMemory(id: string): Promise<Memory> {
-    return this.request<Memory>("GET", `/Memory/${id}`);
+    return this.request<Memory>("GET", `/Memory/${encodeURIComponent(id)}`);
   }
 
   async getSoul(): Promise<SoulEntry[]> {
@@ -614,7 +657,7 @@ export class FlairClient {
 
   async setSoul(key: string, value: string): Promise<void> {
     const id = `${this.agentId}-${key}`;
-    await this.request("PUT", `/Soul/${id}`, {
+    await this.request("PUT", `/Soul/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       key,
@@ -759,11 +802,11 @@ export class FlairClient {
   }
 
   async purgeMemory(id: string): Promise<void> {
-    await this.request("DELETE", `/Memory/${id}`);
+    await this.request("DELETE", `/Memory/${encodeURIComponent(id)}`);
   }
 
   async proposeMemory(id: string, content: string, tags?: string[]): Promise<void> {
-    await this.request("PUT", `/Memory/${id}`, {
+    await this.request("PUT", `/Memory/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       content,
@@ -783,7 +826,7 @@ export class FlairClient {
 
   async setSoulEntry(agentId: string, key: string, value: string): Promise<void> {
     const id = `${agentId}-${key}`;
-    await this.request("PUT", `/Soul/${id}`, {
+    await this.request("PUT", `/Soul/${encodeURIComponent(id)}`, {
       id,
       agentId,
       key,
@@ -795,7 +838,7 @@ export class FlairClient {
 
   async deleteSoulEntry(agentId: string, key: string): Promise<void> {
     const id = `${agentId}-${key}`;
-    await this.request("DELETE", `/Soul/${id}`);
+    await this.request("DELETE", `/Soul/${encodeURIComponent(id)}`);
   }
 
 
@@ -803,7 +846,7 @@ export class FlairClient {
   async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
     const existing = await this.getAgent(agentId);
     if (!existing) throw new Error(`Agent ${agentId} not found`);
-    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
+    await this.request("PUT", `/Agent/${encodeURIComponent(agentId)}`, { ...existing, ...patch });
   }
 
   async seedAgent(opts: {

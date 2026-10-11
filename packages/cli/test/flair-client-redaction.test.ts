@@ -8,16 +8,20 @@
  * base64 slice or an Ed25519 signature component survives it, and a JSON parse
  * error can quote a fragment of the body too.
  *
- * The guarantee is an ALLOW-LIST. An error the client builds contains only:
- * the entry point, the method, the ENCODED request path the request was sent
- * with (path parameters such as agent ids included, as on the wire; never the
- * query), the HTTP status, and an error code taken from Flair's fixed
- * `FLAIR_ERROR_CODES` allow-list — any other `error` value, including a
+ * The guarantee is an ALLOW-LIST. A NON-OK response error contains only: the
+ * entry point, the method, the ENCODED request path the request was sent with
+ * (path parameters such as agent ids included, as on the wire; never the query
+ * or fragment), the HTTP status, and an error code taken from the allow-list of
+ * codes this client's routes can return — any other `error` value, including a
  * regex-shaped credential fragment, becomes the constant `unrecognized_error`.
- * A transport failure is named by a fixed reason class derived from the error's
- * `code`, never its message. A successful response whose body is not JSON throws
- * a safe error. No response body, transport message, parser message or original
- * `cause` is ever included.
+ * Transport failures, malformed-response errors and local errors (a missing
+ * private key, a refused promotion) have their own fixed, body-free formats: a
+ * transport failure is named by a fixed reason class derived from the error's
+ * `code`, a successful response whose body is not JSON names `malformed response
+ * body`, and a local error names the entry point and the local failure. Raw
+ * response bodies, unlisted response text and transport messages are excluded;
+ * an allow-listed code is selected from the response's `error` field; reported
+ * paths keep caller-supplied path parameters.
  *
  * The entry points that surface errors are driven in TWO spawned children, per
  * the repo's convention (cli#395, cli#566): a `bun` child and a `node` child,
@@ -357,7 +361,7 @@ function expectNoLeak(observation: Observation, secrets: readonly string[]): voi
 
 for (const runtime of ["bun", "node"] as const) {
   describe(
-    `cli#597 — Flair client errors contain only the entry point, method and encoded path, status, and an allow-listed error code (else unrecognized_error); response bodies and transport messages are never included (${runtime})`,
+    `cli#597 — a non-OK response error contains only the entry point, method and requested path, status, and an allow-listed error code (else unrecognized_error); raw bodies, unlisted response text and transport messages are excluded (${runtime})`,
     () => {
     for (const shape of ["text", "json", "malformed"] as const) {
       test(`${runtime}: a ${shape} body echoing the credential never reaches the error (signed + Basic)`, async () => {
@@ -451,6 +455,63 @@ test("the verifying stub refuses an unregistered signer and a bad signature befo
   }
 });
 
+/**
+ * cli#597: the codes this change ADDS to the allow-list are named verbatim — a
+ * server that returns one of them does not get `unrecognized_error`. Each code
+ * is a real Flair code from a resource the client's routes reach (see the
+ * enumeration in `flair-client.ts`): Agent.ts / AgentSeed.ts, memory-id-guard.ts,
+ * skill-version-write.ts, Soul.ts and instruction-version-record.ts. This is the
+ * "covered" half of the allow-list change: the redaction tests prove a value NOT
+ * on the list is dropped, and this one proves a value ON it survives.
+ */
+test("each newly allow-listed Flair code is named verbatim, not replaced by unrecognized_error (cli#597)", async () => {
+  const addedCodes = [
+    // Agent.ts (PUT/GET /Agent/{id}) and AgentSeed.ts (POST /AgentSeed/)
+    "invalid_agent_id",
+    // memory-id-guard.ts (PUT /Memory/{id})
+    "memory_id_content_suffix",
+    "supersedes_target_unreadable",
+    "supersedes_target_missing",
+    // skill-version-write.ts (PUT /Memory/{id})
+    "skill_self_supersede",
+    "skill_predecessor_missing",
+    "skill_target_changed",
+    "skill_head_missing",
+    "skill_predecessor_stale",
+    "skill_target_stale",
+    // Soul.ts (PUT/DELETE /Soul/{id})
+    "soul_patch_conflict",
+    "soul_patch_row_changed",
+    // instruction-version-record.ts (PUT/DELETE /Soul/{id})
+    "soul_subject_occupied",
+    "instruction_version_head_mismatch",
+    "instruction_version_append_failed",
+    "instruction_version_busy",
+    "instruction_version_lock_unavailable",
+  ];
+  let named = "";
+  const handler = stubFlairHandler({ [AGENT]: SEED }, () =>
+    Response.json({ error: named }, { status: 400 }),
+  );
+  const server = Bun.serve({
+    port: 0,
+    fetch: (req) => {
+      const url = new URL(req.url);
+      if (url.pathname === "/Health") return new Response("ok");
+      return handler(req);
+    },
+  });
+  try {
+    const client = new FlairClient({ baseUrl: `http://127.0.0.1:${server.port}`, agentId: AGENT, keyPath });
+    for (const code of addedCodes) {
+      named = code;
+      await expect(client.getMemory("mem-1")).rejects.toThrow(`→ 400: ${code}`);
+    }
+  } finally {
+    server.stop(true);
+  }
+});
+
 test("the Basic fixture is authorized for the operator credential and refuses any other before the echo", async () => {
   const echo = startEchoFlair("json");
   try {
@@ -480,6 +541,63 @@ test("readStoredPublicKey names the ENCODED request path, the one the request us
     // The reported path is the string the request carried, not a decoded one.
     await expect(client.readStoredPublicKey(id, OPERATOR)).rejects.not.toThrow(`/Agent/${id}`);
     expect(echo.seen.at(-1)?.route).toBe(encoded);
+  } finally {
+    echo.stop();
+  }
+});
+
+/**
+ * cli#597: the reported path equals the pathname the request was actually sent
+ * with, for an id carrying `#`, `?`, `/` or `%`. An id enters a path through
+ * `encodeURIComponent`, so the sent pathname is the encoded one and the raw
+ * character (a `#` the URL would drop as a fragment, a `?` it would read as a
+ * query) never appears in the name. The echo records each request's pathname,
+ * so the assertion is against the path the transport carried, not a guess.
+ */
+test("a path id is encoded and the error names the requested pathname, for '#', '?', '/' and '%' (cli#597)", async () => {
+  const echo = startEchoFlair("text");
+  const sentPathname: string[] = [];
+  try {
+    // `request()` reports the pathname of the URL it fetched.
+    const client = new FlairClient({ baseUrl: echo.url, agentId: AGENT, keyPath });
+    for (const ch of ["#", "?", "/", "%"]) {
+      const id = `mem-1${ch}tail`;
+      let message = "";
+      try {
+        await client.getMemory(id);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      const requested = echo.seen.at(-1)?.route ?? "";
+      expect(requested, `an id containing '${ch}' reached the echo`).not.toBeEmpty();
+      expect(requested, `the id is a single encoded segment ('${ch}')`).toBe(
+        `/Memory/${encodeURIComponent(id)}`,
+      );
+      expect(message).toContain(`Flair request GET ${requested} → 500`);
+      sentPathname.push(requested);
+    }
+
+    // `registerAgent` builds its own URL from the raw agent id.
+    for (const ch of ["#", "?", "/", "%"]) {
+      const id = `agent-a${ch}tail`;
+      const raw = new FlairClient({ baseUrl: echo.url, agentId: id, keyPath });
+      let message = "";
+      try {
+        await raw.registerAgent(id, "public-key", OPERATOR);
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      const requested = echo.seen.at(-1)?.route ?? "";
+      expect(requested, `an agent id containing '${ch}' reached the echo`).not.toBeEmpty();
+      expect(requested, `the agent id is a single encoded segment ('${ch}')`).toBe(
+        `/Agent/${encodeURIComponent(id)}`,
+      );
+      expect(message).toContain(`Flair registerAgent PUT ${requested} → 500`);
+      sentPathname.push(requested);
+    }
+
+    // No reported path carried an unencoded `#`, `?`, `/` or `%` from the id.
+    for (const path of sentPathname) expect(path).not.toMatch(/[#?]/);
   } finally {
     echo.stop();
   }

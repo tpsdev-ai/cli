@@ -1,10 +1,13 @@
 - **The Flair client builds its errors only from safe, client-constructed context (Closes #597).**
 
-  Flair client errors contain only the entry point, the method, the encoded
-  request path the request was sent with (path parameters such as agent ids
-  included, as on the wire), the HTTP status, and an error code drawn from a
-  fixed allow-list of the Flair error codes this client can receive; any other
-  value becomes `unrecognized_error`. Response bodies and transport messages are
-  never included. Untrusted text is left out, never sanitised into an error: a
-  transport failure is named by a fixed reason class derived from the error's
-  `code`, and a successful response whose body is not JSON throws a safe error.
+  A non-OK Flair response error contains only the entry point, the method, the
+  requested path the request was sent with (path parameters such as agent ids
+  included and encoded, as on the wire; never the query or fragment), the HTTP
+  status, and an error code from the allow-list of codes this client's routes can
+  return; any other value becomes `unrecognized_error`. Raw response bodies,
+  unlisted response text and transport messages are excluded: an allow-listed
+  code is selected from the response's `error` field, and reported paths keep
+  caller-supplied path parameters. Transport failures, malformed-response errors
+  and local errors have their own fixed, body-free formats — a transport failure
+  is named by a fixed reason class derived from the error's `code`, a non-JSON 2xx
+  body names `malformed response body`, and a local error names the entry point.

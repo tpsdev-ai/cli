@@ -79,8 +79,9 @@ describe("memory CLI entry", () => {
         { env: { ...process.env, HOME: home, TPS_AGENT_ID: "operator" }, encoding: "utf8", timeout: 10_000 },
       );
       expect(result.status).toBe(1);
-      // cli#597: the error names the entry point, the encoded route and the status,
-      // and a code from a fixed allow-list (else `unrecognized_error`) — never the body.
+      // cli#597: a non-OK response error names the entry point, the requested path
+      // and the status, and a code from the allow-list of codes this client's routes
+      // can return (else `unrecognized_error`) — never the body.
       expect(result.stderr).toContain("SemanticSearch");
       expect(result.stderr).toContain("→ 403");
       expect(result.stderr).not.toContain("agentId must match");
