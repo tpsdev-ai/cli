@@ -5,16 +5,14 @@ const patchShared = createPatchShared();
  * generated key back equal. These tests drive the create path against a fake
  * Flair: signed calls reach the shared verifying stub (cli#554), and the
  * operator-credentialed calls the create flow makes — the Agent PUT and the
- * read-back GET, both Basic — reach a route this file controls. Each failure
- * branch (refused write, no row, `pending` stored, mismatch, failed read) and
- * the success branch is covered; the real-Harper case runs under
- * TPS_TEST_REAL_FLAIR=1.
+ * read-back GET, both Basic — reach a route this file controls.
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { format } from "node:util";
 import { runAgent } from "../src/commands/agent.js";
 import { stubFlairHandler } from "./helpers/stub-flair.js";
 
@@ -29,6 +27,7 @@ afterEach(() => {
 interface FakeFlair {
   url: string;
   stop(): void;
+  requests: Array<{ method: string; path: string; auth: string }>;
 }
 
 /**
@@ -40,17 +39,19 @@ interface FakeFlair {
  */
 function startFakeFlair(basic: (req: Request, url: URL) => Promise<Response | undefined>): FakeFlair {
   const signed = stubFlairHandler({});
+  const requests: FakeFlair["requests"] = [];
   const server = Bun.serve({
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/Health") return new Response("ok");
       const auth = req.headers.get("Authorization") ?? "";
+      requests.push({ method: req.method, path: url.pathname, auth });
       if (auth.startsWith("Basic ")) return (await basic(req, url)) ?? new Response("not found", { status: 404 });
       return signed(req);
     },
   });
-  return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
+  return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true), requests };
 }
 
 /** A Basic `PUT /Agent/<id>` that Flair refuses (it drops `publicKey`, so the write cannot complete). */
@@ -63,8 +64,9 @@ function refusePut(url: URL, id: string): Response | undefined {
 async function runCreate(
   url: string,
   id: string,
-  flags: { noSeed?: boolean; credential?: string } = {},
-): Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: string | null }> {
+  flags: { noSeed?: boolean; credential?: string; inspectError?: boolean } = {},
+  create: typeof runAgent = runAgent,
+): Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: unknown; hasError: boolean }> {
   const home = mkdtempSync(join(tmpdir(), "create-registration-"));
   const savedHome = process.env.HOME;
   const savedCredential = process.env.FLAIR_ADMIN_AUTH;
@@ -72,28 +74,49 @@ async function runCreate(
   if (flags.credential !== undefined) process.env.FLAIR_ADMIN_AUTH = flags.credential;
   const stdout: string[] = [];
   const stderr: string[] = [];
-  const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => { stdout.push(args.join(" ")); });
-  const errSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => { stderr.push(args.join(" ")); });
+  const consoleSpies = (["log", "info", "warn", "error"] as const).map((method) =>
+    spyOn(console, method).mockImplementation((...args: unknown[]) => {
+      (method === "log" || method === "info" ? stdout : stderr).push(`${format(...args)}\n`);
+    }),
+  );
+  const captureWrite = (output: string[]): typeof process.stdout.write => (
+    chunk: string | Uint8Array,
+    encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+    callback?: (error?: Error | null) => void,
+  ) => {
+    output.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+    const done = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+    if (done) queueMicrotask(() => done());
+    return true;
+  };
+  const stdoutSpy = spyOn(process.stdout, "write").mockImplementation(captureWrite(stdout));
+  const stderrSpy = spyOn(process.stderr, "write").mockImplementation(captureWrite(stderr));
+  const syntheticExit = Symbol("runCreate exit");
   let exitCode: number | undefined;
   const exitSpy = spyOn(process, "exit").mockImplementation(((code?: number): never => {
     exitCode = code;
-    throw new Error(`exit:${code}`);
+    throw syntheticExit;
   }) as never);
-  let error: string | null = null;
+  let error: unknown = null;
+  let hasError = false;
   try {
-    await runAgent({ action: "create", id, name: id, flairUrl: url, noSeed: flags.noSeed });
+    await create({ action: "create", id, name: id, flairUrl: url, noSeed: flags.noSeed });
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    if (!message.includes("exit:")) error = message;
+    if (err !== syntheticExit) {
+      if (!flags.inspectError) throw err;
+      error = err;
+      hasError = true;
+    }
   } finally {
     exitSpy.mockRestore();
-    logSpy.mockRestore();
-    errSpy.mockRestore();
+    for (const spy of consoleSpies) spy.mockRestore();
+    stdoutSpy.mockRestore();
+    stderrSpy.mockRestore();
     if (savedHome === undefined) delete process.env.HOME; else process.env.HOME = savedHome;
     if (savedCredential === undefined) delete process.env.FLAIR_ADMIN_AUTH; else process.env.FLAIR_ADMIN_AUTH = savedCredential;
     rmSync(home, { recursive: true, force: true });
   }
-  return { exitCode, stdout: stdout.join("\n"), stderr: stderr.join("\n"), error };
+  return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), error, hasError };
 }
 
 test("refused write and no Agent row: exits non-zero, prints no success, names agent, URL and remedy", async () => {
@@ -287,17 +310,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   30_000,
 );
 
-/**
- * cli#593 — create uses one operator credential (FLAIR_ADMIN_AUTH, sent as a
- * Basic Authorization header on the Agent PUT and the read-back GET). Each create
- * refusal path and the success path below runs with a unique marker embedded in
- * that credential, and the marker is asserted absent from stdout, stderr and any
- * thrown error. Paths: the missing-id usage refusal; a refused write over no Agent
- * row; a refused write with --no-seed; a failed read-back (row existence unknown);
- * a row holding no public key; a row holding a different key; the success path
- * (the key reads back equal).
- */
-test("every create refusal path and the success path keep the operator credential out of stdout, stderr and thrown errors", async () => {
+test("selected create cases omit the credential marker and Basic encoding from captured output and errors", async () => {
   const marker = `credential-593-${randomUUID()}-${"z".repeat(40)}`;
   const credential = `operator:${marker}`;
   const wire = Buffer.from(credential).toString("base64");
@@ -348,26 +361,76 @@ test("every create refusal path and the success path keep the operator credentia
     return undefined;
   });
 
-  const paths: Array<[string, () => Promise<{ exitCode: number | undefined; stdout: string; stderr: string; error: string | null }>]> = [
-    ["missing id", () => runCreate("http://127.0.0.1:1", "", { credential })],
-    ["refused write over no row", () => runCreate(noRow.url, noRowId, { credential })],
-    ["refused write, --no-seed", () => runCreate(noSeed.url, noSeedId, { credential, noSeed: true })],
-    ["failed read-back", () => runCreate(readFail.url, readFailId, { credential })],
-    ["row holds no key", () => runCreate(noKey.url, noKeyId, { credential })],
-    ["row holds a different key", () => runCreate(differ.url, differId, { credential })],
-    ["success", () => runCreate(ok.url, okId, { credential })],
+  const paths = [
+    { name: "missing id", url: "http://127.0.0.1:1", id: "", exitCode: 1, message: "Usage: tps agent create" },
+    { name: "refused write over no row", fake: noRow, id: noRowId, exitCode: 1, message: "no Agent row exists", seed: true },
+    { name: "refused write, --no-seed", fake: noSeed, id: noSeedId, noSeed: true, exitCode: 1, message: "no Agent row exists", seed: false },
+    { name: "failed read-back", fake: readFail, id: readFailId, exitCode: 1, message: "the read-back failed", seed: true },
+    { name: "row holds no key", fake: noKey, id: noKeyId, exitCode: 1, message: "the row has no public key", seed: true },
+    { name: "row holds a different key", fake: differ, id: differId, exitCode: 1, message: "not the generated key", seed: true },
+    { name: "success", fake: ok, id: okId, exitCode: undefined, message: "registered in Flair (no seed", seed: true },
   ];
 
   try {
-    expect(paths.length).toBe(7);
-    for (const [name, run] of paths) {
-      const res = await run();
-      for (const stream of [res.stdout, res.stderr, res.error ?? ""]) {
-        expect(`${name}: ${stream}`).not.toContain(marker);
-        expect(`${name}: ${stream}`).not.toContain(wire);
+    for (const path of paths) {
+      const res = await runCreate(path.fake?.url ?? path.url!, path.id, { credential, noSeed: path.noSeed, inspectError: true });
+      for (const stream of [res.stdout, res.stderr, format(res.error)]) {
+        expect(`${path.name}: ${stream}`).not.toContain(marker);
+        expect(`${path.name}: ${stream}`).not.toContain(wire);
+      }
+      expect(res.hasError).toBe(false);
+      expect(res.error).toBeNull();
+      expect(res.exitCode).toBe(path.exitCode);
+      expect(path.exitCode === 1 ? res.stderr : res.stdout).toContain(path.message);
+      if (path.exitCode === 1) expect(res.stdout).not.toContain("registered in Flair");
+      else {
+        expect(res.stderr).toBe("");
+        expect(res.stdout).toContain("Config written to");
+        expect(okStored).toMatch(/^[a-f0-9]{64}$/);
+      }
+      if (path.fake) {
+        const basic = path.fake.requests.filter((req) => req.auth.startsWith("Basic "));
+        expect(basic).toEqual([
+          { method: "PUT", path: `/Agent/${path.id}`, auth: `Basic ${wire}` },
+          { method: "GET", path: `/Agent/${path.id}`, auth: `Basic ${wire}` },
+        ]);
+        expect(path.fake.requests.some((req) => req.method === "POST" && req.path === "/AgentSeed/")).toBe(path.seed);
       }
     }
   } finally {
     for (const fake of fakes) fake.stop();
   }
+});
+
+test("runCreate captures console methods and direct stream writes", async () => {
+  const res = await runCreate("", "", {}, async () => {
+    console.log("log");
+    console.info("info");
+    console.warn("warn");
+    console.error("error");
+    await new Promise<void>((resolve) => process.stdout.write(Buffer.from("stdout"), resolve));
+    await new Promise<void>((resolve) => process.stderr.write("stderr", "utf8", resolve));
+  });
+  expect(res.stdout).toBe("log\ninfo\nstdout");
+  expect(res.stderr).toBe("warn\nerror\nstderr");
+  expect(res.exitCode).toBeUndefined();
+  expect(res.error).toBeNull();
+});
+
+test("runCreate retains non-exit thrown values by identity when inspected", async () => {
+  for (const error of [new Error("credential exit:1"), new Error("early failure"), null, undefined]) {
+    const res = await runCreate("", "", { inspectError: true }, async () => { throw error; });
+    expect(res.hasError).toBe(true);
+    expect(res.error).toBe(error);
+    expect(res.exitCode).toBeUndefined();
+  }
+});
+
+test("runCreate rejects unexpected errors for callers without inspection", async () => {
+  for (const error of [new Error("credential exit:1"), new Error("early failure"), null, undefined]) {
+    await expect(runCreate("", "", {}, async () => { throw error; })).rejects.toBe(error);
+  }
+  const res = await runCreate("", "", {}, async () => { process.exit(1); });
+  expect(res.exitCode).toBe(1);
+  expect(res.error).toBeNull();
 });
