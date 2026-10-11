@@ -385,8 +385,7 @@ type RelayAcceptReceipt = z.infer<typeof RelayAcceptReceiptSchema>;
 
 /**
  * The pre-digest receipt shape, which stored the accepted payload as `body`.
- * A receipt may still carry it from before the change; it is read for
- * comparison and left as written.
+ * Schema-valid pre-digest receipts are compared and left as written.
  */
 const LegacyRelayAcceptReceiptSchema = z.object({
   from: MailDeliverBodySchema.shape.from,
@@ -535,8 +534,7 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
 
 /**
  * Whether a readable receipt matches the payload; legacy empty markers cannot be
- * compared, and a pre-digest receipt is compared by the digest of the payload it
- * holds.
+ * compared; schema-valid pre-digest receipts are compared by payload digest.
  */
 function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
   const raw = readFileSync(path, "utf-8");
