@@ -379,7 +379,7 @@ function globError(pattern) {
     pathSegments(inner, pattern.startsWith("!"));
     const expanded = expandBraces(inner);
     if (expanded === null) return null;
-    for (const candidate of expanded) for (const segment of pathSegments(candidate)) segmentRegex(segment);
+    for (const candidate of expanded) for (const segment of pathSegments(candidate, pattern.startsWith("!"))) segmentRegex(segment);
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }

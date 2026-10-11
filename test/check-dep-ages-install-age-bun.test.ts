@@ -461,6 +461,36 @@ it.each([
 );
 
 it.each([
+  "!packages/{,}/*",
+  "!packages/{.,x}/*",
+])("negated brace spelling: %s", async (pattern) => {
+  const root = mkdtempSync(join(tmpdir(), "age-negated-brace-"));
+  try {
+    const packageJsons = [
+      { path: "package.json", json: { name: "fixture", workspaces: [pattern] } },
+      { path: "packages/a/package.json", json: { name: "w-packages" } },
+      { path: "plugins/t/package.json", json: { name: "w-plugin", dependencies: { [NAME]: AGED } } },
+    ];
+    const project = writeProject(root, Object.fromEntries(packageJsons.map(({ path, json }) => [path, json])), "http://127.0.0.1:1");
+    expect([...new Bun.Glob(pattern).scanSync({ cwd: project, onlyFiles: false })]).toEqual([]);
+    const install = await bunInstall(project, ["--no-cache"]);
+    expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+    const lockPath = join(project, "bun.lock");
+    const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
+    expect(Object.keys(lock.workspaces).filter((key) => key !== "")).toEqual([]);
+    const resolved = appliedManifestPaths(packageJsons);
+    expect(resolved.error).toContain("unsupported negated spelling");
+    expect(resolved.pattern).toBe(pattern);
+    expect(resolved.applied.has("plugins/t/package.json")).toBe(false);
+    expect(auditExcludes({
+      excludes: [NAME], exceptionEntries: new Map([[`${NAME}@${AGED}`, {}]]), exceptionErrors: [], packageJsons,
+    })).toEqual([{ kind: "workspaces", message: resolved.error, pattern }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+it.each([
   ["!./packages/*", []],
   ["!/packages/*", []],
   ["!packages\\*", ["bunfig.toml", "package.json", "packages", "tools"]],
