@@ -7,7 +7,8 @@
  * request() sends the path its caller supplies, without encoding ids itself.
  *
  * Caught transport failures use
- * `Flair <entry> <method> <pathname> transport error: <reason>`.
+ * `Flair <entry> <method> <pathname> transport error: <reason>` with only a fixed
+ * reason class and no message text, including when inspecting the failure throws.
  * Failed successful-response JSON parses use
  * `Flair <entry> <method> <pathname> → <status>: malformed response body`;
  * request() and registerAgent() accept 204 without parsing.

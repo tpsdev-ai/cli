@@ -162,7 +162,8 @@ export class FlairRequestError extends Error {
  * echoing response text.)
  *
  * Caught transport failures use `Flair <entry> <method> <pathname> transport
- * error: <reason>`. A failed successful-response JSON parse uses
+ * error: <reason>` with only a fixed reason class and no message text, including
+ * when inspecting the failure throws. A failed successful-response JSON parse uses
  * `Flair <entry> <method> <pathname> → <status>: malformed response body`;
  * request() and registerAgent() accept 204 without parsing.
  * Local checks interpolate ids (promotion refusals, invalid principal records,
@@ -286,11 +287,15 @@ function responseError(entry: string, method: string, path: string, status: numb
 
 /** The `code` of a thrown value, from the value or its `cause` (Node's fetch). */
 function errorCode(err: unknown): string {
-  for (const candidate of [err, (err as { cause?: unknown } | null)?.cause]) {
-    if (candidate && typeof candidate === "object") {
-      const code = (candidate as { code?: unknown }).code;
-      if (typeof code === "string") return code;
+  try {
+    for (const candidate of [err, (err as { cause?: unknown } | null)?.cause]) {
+      if (candidate && typeof candidate === "object") {
+        const code = (candidate as { code?: unknown }).code;
+        if (typeof code === "string") return code;
+      }
     }
+  } catch {
+    return "";
   }
   return "";
 }
@@ -298,7 +303,8 @@ function errorCode(err: unknown): string {
 /**
  * The reason class of a transport failure, derived from the error's `code`
  * (Node carries it on `cause`), never from its message — a message can quote
- * the request, including its credential. An unknown code is `network failure`.
+ * the request, including its credential. An unknown code or a throw during
+ * inspection is `network failure`.
  */
 function transportReason(err: unknown): string {
   switch (errorCode(err)) {
@@ -331,7 +337,7 @@ function transportReason(err: unknown): string {
   }
 }
 
-/** A caught transport failure: entry, method, pathname and a fixed reason class, without an HTTP status. */
+/** A caught transport failure: entry, method, pathname and only a fixed reason class, no message text even if inspection throws. */
 function transportError(entry: string, method: string, path: string, err: unknown): string {
   return `Flair ${entry} ${method} ${path} transport error: ${transportReason(err)}`;
 }

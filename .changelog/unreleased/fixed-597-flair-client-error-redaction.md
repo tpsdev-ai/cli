@@ -7,7 +7,8 @@
   fragment; encoded parameters stay encoded when the wrapper or caller encodes
   them. Wrapper methods encode ids; `request()` sends its caller's path.
   Caught transport failures use `Flair <entry> <method> <pathname> transport
-  error: <reason>`, without the original transport message. Failed
+  error: <reason>` with only a fixed reason class and no message text, including
+  when inspecting the failure throws. Failed
   successful-response JSON parses use `Flair <entry> <method> <pathname> →
   <status>: malformed response body`; `request()` and `registerAgent()` accept
   204 without parsing. Local checks interpolate ids (promotion refusals,
