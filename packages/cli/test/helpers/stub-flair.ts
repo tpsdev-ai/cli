@@ -151,6 +151,40 @@ export function installStubFlairFetch(
   return { url: "http://flair.test", stop: () => { globalThis.fetch = previous; } };
 }
 
+/**
+ * Flair's `GET /OrgEventCatchup/<participant>` for a stub route, shaped as
+ * resources/OrgEventCatchup.ts answers it: HTTP 400 for a `since` that does
+ * not parse as a date, otherwise the success envelope
+ * `{ events, watermark, after, nextAfter, hasMore, pageSize }`. `pages` are
+ * served in order: a request without `after` gets the first, and each page's
+ * `nextAfter` is the position (`<createdAt>\t<id>`) of its last event, which
+ * selects the page after it. With `endless`, the last page repeats with
+ * `hasMore: true`, so the feed never drains.
+ */
+export function orgEventCatchupRoute(
+  pages: ReadonlyArray<ReadonlyArray<Record<string, unknown>>>,
+  opts: { endless?: boolean } = {},
+): (url: URL) => Response {
+  const byAfter = new Map<string, number>();
+  return (url) => {
+    const since = url.searchParams.get("since");
+    if (since !== null && Number.isNaN(new Date(since).getTime()))
+      return Response.json({ error: "invalid since timestamp" }, { status: 400 });
+    const after = url.searchParams.get("after");
+    const index = after === null ? 0 : byAfter.get(after);
+    if (index === undefined) return Response.json({ error: "unknown after cursor" }, { status: 400 });
+    const last = index >= pages.length - 1;
+    const events = (pages[Math.min(index, pages.length - 1)] ?? []).map((e) => ({
+      ...e,
+      position: `${String(e.createdAt)}\t${String(e.id)}`,
+    }));
+    const hasMore = !last || opts.endless === true;
+    const nextAfter = events[events.length - 1]?.position ?? after ?? "";
+    if (hasMore) byAfter.set(nextAfter, index + 1);
+    return Response.json({ events, watermark: null, after: after ?? "", nextAfter, hasMore, pageSize: events.length });
+  };
+}
+
 /** Write a raw 32-byte key file usable for both request signing and FLAIR_KEY_PATH. */
 export function writeKeyFile(dir: string, agent: string, seed: Buffer): string {
   mkdirSync(dir, { recursive: true });

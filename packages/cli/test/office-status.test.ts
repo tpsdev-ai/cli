@@ -11,7 +11,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPatchShared } from "./helpers/patch-shared.js";
 import { runOfficeStatus } from "../src/commands/office-status.js";
-import { installStubFlairFetch, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
+import { ORG_EVENT_MAX_PAGES } from "../src/utils/org-event-read.js";
+import { installStubFlairFetch, orgEventCatchupRoute, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
 const patchShared = createPatchShared();
 
@@ -24,13 +25,13 @@ const AGENTS = [
 
 const EVENTS = [
   { id: "e1", kind: "task.completed", authorId: "ember", summary: "Implemented ops-71", createdAt: new Date().toISOString() },
-  { id: "e2", kind: "agent.heartbeat", authorId: "anvil", createdAt: new Date().toISOString() },
+  { id: "e2", kind: "agent.heartbeat", authorId: "anvil", summary: "heartbeat", createdAt: new Date().toISOString() },
 ];
 
 /** Flair routes the stub serves once it has verified the caller. */
 function routes(req: Request, url: URL): Response | undefined {
   if (url.pathname === "/Agent/") return Response.json(AGENTS);
-  if (url.pathname.startsWith("/OrgEventCatchup/")) return Response.json(EVENTS);
+  if (url.pathname.startsWith("/OrgEventCatchup/")) return orgEventCatchupRoute([EVENTS])(url);
   return undefined;
 }
 
@@ -54,6 +55,8 @@ beforeEach(() => {
   savedLog = console.log;
   savedError = console.error;
   savedExit = process.exit;
+  // A refused Agent read exits the command; here it throws, so it fails the test instead of ending the run.
+  patchShared(process, "exit", ((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit);
   patchShared(console, "log", (...args: unknown[]) => { output.push(args.join(" ")); });
   patchShared(console, "error", (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); });
 });
@@ -102,7 +105,7 @@ describe("tps office status", () => {
     stub.stop();
     const blocker = [{ id: "b1", kind: "blocker", authorId: "ember", summary: "Missing Ember PAT", createdAt: new Date().toISOString() }];
     stub = installStubFlairFetch({ anvil: SEED }, (req, url) =>
-      url.pathname === "/Agent/" ? Response.json(AGENTS) : url.pathname.startsWith("/OrgEventCatchup/") ? Response.json(blocker) : undefined,
+      url.pathname === "/Agent/" ? Response.json(AGENTS) : url.pathname.startsWith("/OrgEventCatchup/") ? orgEventCatchupRoute([blocker])(url) : undefined,
     );
     await runOfficeStatus(baseOpts());
     expect(output.join("\n")).toContain("BLOCKER: Missing Ember PAT");
@@ -112,5 +115,108 @@ describe("tps office status", () => {
     patchShared(process, "exit", mock(((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit));
     await expect(runOfficeStatus({ ...baseOpts(), keyPath: "/nonexistent" })).rejects.toThrow("exit:1");
     expect(output.join("\n")).toContain(`Flair unreachable at ${stub.url} (HTTP 403)`);
+  });
+});
+
+/**
+ * cli#620 — office status reads the viewer's OrgEvent catch-up feed through
+ * `readOrgEvents`. The stub answers the catch-up route as Flair does
+ * (`orgEventCatchupRoute`: HTTP 400 for an unparseable `since`, the paged
+ * envelope otherwise). It registers its own viewer, so the fixtures here name
+ * no production agent.
+ */
+describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
+  const VIEWER = "viewer-a";
+  const AGENT_LIST = [
+    { id: "agent-a", name: "Agent A", role: "engineer", status: "active" },
+    { id: "agent-b", name: "Agent B", role: "reviewer", status: "active" },
+  ];
+  const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  const OLDER = { id: "e1", kind: "task.completed", authorId: "agent-a", summary: "older task", createdAt: at(50) };
+  const NEWER = { id: "e2", kind: "task.completed", authorId: "agent-a", summary: "newer task", createdAt: at(5) };
+
+  /** Run office status against a viewer whose OrgEvent read is answered by `answer`; return the output. */
+  async function status(answer: (url: URL) => Response, json = false): Promise<string> {
+    stub.stop();
+    const key = writeKeyFile(root, VIEWER, SEED);
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url) =>
+      url.pathname === "/Agent/"
+        ? Response.json(AGENT_LIST)
+        : url.pathname.startsWith("/OrgEventCatchup/")
+          ? answer(url)
+          : undefined,
+    );
+    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true, json });
+    return output.join("\n");
+  }
+  const row = (out: string, name: string) => out.split("\n").find((line) => line.includes(` ${name} `)) ?? "";
+  const jsonAgents = () =>
+    (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
+
+  test("a nonempty read shows each agent's newest task", async () => {
+    const out = await status(orgEventCatchupRoute([[OLDER, NEWER]]));
+    expect(out).not.toContain("Cannot read OrgEvents");
+    expect(row(out, "Agent A")).toContain("newer task");
+    expect(row(out, "Agent A")).not.toContain("older task");
+    expect(row(out, "Agent B")).toContain("idle");
+  });
+
+  test("a feed of several pages is read to the end", async () => {
+    const out = await status(orgEventCatchupRoute([[OLDER], [NEWER]]));
+    expect(out).not.toContain("incomplete");
+    expect(row(out, "Agent A")).toContain("newer task");
+  });
+
+  test("a refused read (HTTP 403) is reported, and the task column reads unavailable", async () => {
+    const out = await status(() => new Response(null, { status: 403 }));
+    expect(out).toContain(`Cannot read OrgEvents from ${stub.url} (HTTP 403); activity is unavailable.`);
+    expect(row(out, "Agent A")).toContain("unavailable");
+    expect(row(out, "Agent B")).toContain("unavailable");
+    expect(out).not.toContain("idle");
+  });
+
+  test("a rejected request is reported with its code, never its message", async () => {
+    const out = await status(() => {
+      throw Object.assign(new TypeError("message-text-not-printed"), { code: "ECONNREFUSED" });
+    });
+    expect(out).toContain(`Cannot read OrgEvents from ${stub.url} (request failed (ECONNREFUSED)); activity is unavailable.`);
+    expect(out).not.toContain("message-text-not-printed");
+    expect(row(out, "Agent A")).toContain("unavailable");
+  });
+
+  test.each([
+    ["an array body", () => Response.json([NEWER]), "not an object"],
+    ["an event missing a field", () => Response.json({ events: [{ ...NEWER, authorId: 7 }], hasMore: false }), "an event lacks a field the command reads"],
+    ["a page with no cursor", () => Response.json({ events: [NEWER], hasMore: true }), "nextAfter is missing"],
+  ])("a malformed response (%s) is reported, and the task column reads unavailable", async (_label, answer, note) => {
+    const out = await status(answer);
+    expect(out).toContain(`Cannot read OrgEvents from ${stub.url} (malformed response (${note})); activity is unavailable.`);
+    expect(out).not.toContain("newer task");
+    expect(row(out, "Agent A")).toContain("unavailable");
+  });
+
+  test("a feed past the page bound is read up to the bound and marked incomplete", async () => {
+    let pages = 0;
+    const route = orgEventCatchupRoute([[OLDER]], { endless: true });
+    const out = await status((url) => {
+      pages++;
+      return route(url);
+    });
+    expect(pages).toBe(ORG_EVENT_MAX_PAGES);
+    expect(out).toContain(`OrgEvents from ${stub.url} exceed the ${ORG_EVENT_MAX_PAGES}-page read bound; newer events were not read and activity is incomplete.`);
+    expect(row(out, "Agent A")).toContain("(incomplete)");
+    expect(row(out, "Agent B")).toContain("incomplete");
+    expect(out).not.toContain("idle");
+  });
+
+  test.each([
+    ["ok", () => orgEventCatchupRoute([[OLDER, NEWER]]), "newer task"],
+    ["unavailable", () => () => new Response(null, { status: 403 }), undefined],
+    ["incomplete", () => orgEventCatchupRoute([[NEWER]], { endless: true }), "newer task"],
+  ])("JSON output gives each agent the activity state %s", async (state, answer, summary) => {
+    await status(answer(), true);
+    const agents = jsonAgents();
+    expect(agents.map((a) => a.activity)).toEqual([state, state]);
+    expect(agents[0]!.lastTask?.summary).toBe(summary);
   });
 });

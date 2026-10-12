@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { requireLocalAgentId } from "../utils/local-agent.js";
+import { activityState, orgEventReadNotice, readOrgEvents, type OrgEventRecord } from "../utils/org-event-read.js";
 
 interface FlairAgent {
   id?: string;
@@ -25,16 +26,6 @@ interface FlairAgent {
   workspace?: string;
   status?: string;
   lastHeartbeat?: string;
-}
-
-interface OrgEvent {
-  id: string;
-  kind: string;
-  authorId: string;
-  summary: string;
-  detail?: string;
-  refId?: string;
-  createdAt?: string;
 }
 
 interface PrInfo {
@@ -140,26 +131,23 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     else { console.error(`Flair unreachable at ${flairUrl} (HTTP ${res.status})`); process.exit(1); }
   } catch { console.error(`Flair unreachable at ${flairUrl}. Is it running?`); process.exit(1); }
 
-  // Fetch recent OrgEvents (last 6h) for task + heartbeat status
-  const since = new Date(Date.now() - 6 * 3_600_000).toISOString().replace(/Z$/, ".000Z");
-  const evPath = `/OrgEventCatchup/${viewerId}?since=${since}`;
-  let events: OrgEvent[] = [];
-  try {
-    const auth = a("GET", evPath);
-    const res = await fetch(`${flairUrl}${evPath}`, auth ? { headers: { Authorization: auth } } : {});
-    if (res.ok) events = await res.json() as OrgEvent[];
-  } catch { /* non-fatal */ }
+  // Recent OrgEvents for task + heartbeat status: the viewer's catch-up feed
+  // over the last 6h (see utils/org-event-read.ts). A read that does not return
+  // the events is reported, and the task column says "unavailable", not "idle".
+  const read = await readOrgEvents({ flairUrl, viewerId, since: new Date(Date.now() - 6 * 3_600_000), sign: a });
+  const notice = orgEventReadNotice(flairUrl, read);
+  if (notice) console.error(notice);
+  const activity = activityState(read);
+  const events = read.status === "ok" ? read.events : [];
 
-  const lastTask   = new Map<string, OrgEvent>();
+  // Per-agent newest task and heartbeat. The feed is oldest first, so a later
+  // event replaces an earlier one.
+  const lastTask   = new Map<string, OrgEventRecord>();
   const lastHbTime = new Map<string, string>();
   for (const ev of events) {
     const id = ev.authorId;
-    if (!lastTask.has(id) && ["task.assigned","task.completed","task.started"].includes(ev.kind)) {
-      lastTask.set(id, ev);
-    }
-    if (ev.kind === "agent.heartbeat" && !lastHbTime.has(id) && ev.createdAt) {
-      lastHbTime.set(id, ev.createdAt);
-    }
+    if (["task.assigned","task.completed","task.started"].includes(ev.kind)) lastTask.set(id, ev);
+    if (ev.kind === "agent.heartbeat") lastHbTime.set(id, ev.createdAt);
   }
 
   // Fetch open PRs
@@ -173,6 +161,7 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
         id, name: ag.name, role: ag.role, model: ag.model, status: ag.status,
         lastHeartbeat: ag.lastHeartbeat ?? lastHbTime.get(id),
         lastTask: lastTask.get(id),
+        activity,
         cursorSince: loadCursorIso(id),
         git: gitBranchStatus(ag.workspace),
       };
@@ -197,14 +186,17 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     const role = (ag.role ?? "?").padEnd(26);
     const model= ((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
     const hbIso= ag.lastHeartbeat ?? lastHbTime.get(id);
-    const hb   = relTime(hbIso).padEnd(12);
+    const hb   = (!hbIso && activity === "unavailable" ? "unavailable" : relTime(hbIso)).padEnd(12);
     const dot  = ag.status === "active" ? green("●", nc) : yellow("○", nc);
     const task = lastTask.get(id);
-    const taskStr = task
-      ? (task.kind === "task.completed"
-          ? green("✓ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)
-          : yellow("→ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc))
-      : dim("idle", nc);
+    const partial = activity === "incomplete" ? dim(" (incomplete)", nc) : "";
+    const taskStr = activity === "unavailable"
+      ? dim("unavailable", nc)
+      : task
+        ? (task.kind === "task.completed"
+            ? green("✓ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)
+            : yellow("→ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)) + partial
+        : dim(activity === "incomplete" ? "incomplete" : "idle", nc);
 
     console.log(`${dot} ${cyan(name, nc)} ${role} ${dim(model, nc)} ${hb} ${taskStr}`);
 
@@ -232,8 +224,9 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     }
   }
 
-  // Blockers
-  const blocker = events.find(e => e.kind === "blocker");
+  // Blockers: the newest one read.
+  let blocker: OrgEventRecord | undefined;
+  for (const e of events) if (e.kind === "blocker") blocker = e;
   if (blocker) console.log(`  ${red(`⚠ BLOCKER: ${blocker.summary}`, nc)}`);
 
   console.log();
