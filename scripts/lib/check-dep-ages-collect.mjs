@@ -410,10 +410,9 @@ function hasBraceGroupAndClass(pattern) {
  * A `workspaces` pattern whose Bun resolution the audit does not compute: a
  * backslash escape (`packages/\*`), and a brace group mixed with a character
  * class (`{a,[bc]}`, `[a-c]{x,y}`). Real `bun install` resolves both differently
- * from the audit's walk (`packages/\*` installs nothing, and `{a,[b}c]` installs
- * `a` where the audit reads `b` and `c`), and neither is simple to mirror, so the
- * gate refuses the pattern rather than credit a pin from a manifest Bun does not
- * apply.
+ * from the audit's walk: `packages/\*` installs nothing, and `{a,[b}c]` installs
+ * `a` alone. Neither is simple to mirror, so the gate refuses the pattern rather
+ * than credit a pin from a manifest Bun does not apply.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
  */
