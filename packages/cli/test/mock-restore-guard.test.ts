@@ -1,11 +1,16 @@
 /** Static guard fixtures and cli test-tree scan. */
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { guardedGlobalFiles } from "./helpers/global-leak-preload.js";
 import { type Finding, analyzeSource, discoverCliTestFiles } from "./helpers/mock-restore-guard-scan.js";
 
 const TEST_ROOT = import.meta.dir;
+/** The cli package root: the directory bun runs the cli suite from, and so the root
+ * whose test files a suite discovers. */
+const CLI_ROOT = join(TEST_ROOT, "..");
 const FIXTURES = join(TEST_ROOT, "fixtures", "mock-restore-guard");
 
 function findingsFor(name: string): Finding[] {
@@ -16,13 +21,46 @@ function kindsFor(name: string): string[] {
   return findingsFor(name).map((finding) => finding.kind);
 }
 
+function detailsFor(name: string): string[] {
+  return findingsFor(name).map((finding) => finding.detail);
+}
+
 describe("mock restore guard (cli#555)", () => {
   test("discovered cli test files satisfy the static guard", () => {
-    const offenders = discoverCliTestFiles(TEST_ROOT)
+    const offenders = discoverCliTestFiles(CLI_ROOT)
       .map((file) => ({ file, findings: analyzeSource(readFileSync(file, "utf8")) }))
       .filter((entry) => entry.findings.length > 0)
-      .map((entry) => `${relative(TEST_ROOT, entry.file)}: ${JSON.stringify(entry.findings)}`);
+      .map((entry) => `${relative(CLI_ROOT, entry.file)}: ${JSON.stringify(entry.findings)}`);
     expect(offenders).toEqual([]);
+  });
+
+  test("the scan discovers the forms bun discovers, over the cli package", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli603-discovery-"));
+    try {
+      const write = (rel: string) => {
+        const path = join(dir, rel);
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(path, "// fixture\n");
+      };
+      const discovered = [
+        "a.test.ts", "b_test.ts", "c.spec.ts", "d_spec.js", "e.test.mts", "f.test.cts",
+        "g.test.tsx", "h.test.mjs", "i.test.cjs", "j.test.jsx", "sub/i.test.js", "dist/j.test.js",
+        ".dotfile.test.ts",
+      ];
+      const missed = ["foo.test.helper.ts", "foo-spec.ts", "plain.ts", "node_modules/k.test.ts", ".dotdir/l.test.ts"];
+      for (const file of [...discovered, ...missed]) write(file);
+      expect(discoverCliTestFiles(dir)).toEqual(discovered.map((file) => join(dir, file)).sort());
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("every cli test file this run loaded through the guard is in the scanned set", () => {
+    const scanned = new Set(discoverCliTestFiles(CLI_ROOT));
+    const loaded = guardedGlobalFiles()
+      .filter((path) => path.startsWith(`${CLI_ROOT}/`) && !path.includes("/node_modules/"));
+    expect(loaded.length).toBeGreaterThan(0);
+    expect(loaded.filter((path) => !scanned.has(path))).toEqual([]);
   });
 
   for (const name of [
@@ -56,7 +94,8 @@ describe("mock restore guard (cli#555)", () => {
     "shadow-in-other-scope-leaked.fixture.ts",
     "global-alias-leaked.fixture.ts",
     "process-alias-leaked.fixture.ts",
-    "global-member-alias-leaked.fixture.ts",
+    "destructured-root-alias-leaked.fixture.ts",
+    "module-alias-outer-scope-leaked.fixture.ts",
     "dynamic-import-module-patched.fixture.ts",
     "nested-destructured-module-patched.fixture.ts",
     "process-cast-non-env-leaked.fixture.ts",
@@ -92,8 +131,10 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     "direct-module-restored.fixture.ts",
     "mock-helper-restored.fixture.ts",
     "local-shadow-cleared.fixture.ts",
-    "shadow-nested-scope-cleared.fixture.ts",
     "intermediate-const-local.fixture.ts",
+    "destructured-env-exempt.fixture.ts",
+    "module-shadow-param-cleared.fixture.ts",
+    "module-alias-shadow-cleared.fixture.ts",
     "process-env-cast-exempt.fixture.ts",
     "process-env-computed-exempt.fixture.ts",
   ]) {
@@ -101,6 +142,19 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
       expect(findingsFor(name)).toEqual([]);
     });
   }
+
+  test("reports each write in global-member-alias-leaked.fixture.ts (red fixture)", () => {
+    const details = detailsFor("global-member-alias-leaked.fixture.ts");
+    expect(details).toContain("assignment to 'process.exit' requires patchShared; inline restoration is refused");
+    expect(details).toContain("assignment to 'D.now' requires patchShared; inline restoration is refused");
+  });
+
+  test("clears each write in shadow-nested-scope-cleared.fixture.ts (green fixture)", () => {
+    const details = detailsFor("shadow-nested-scope-cleared.fixture.ts");
+    for (const target of ["process.exit", "console.log", "globalThis.fetch"]) {
+      expect(details.some((detail) => detail.includes(target))).toBe(false);
+    }
+  });
 
   test("rejects a shared-process file that calls mock.module() (red fixture)", () => {
     expect(kindsFor("module-mock.fixture.ts")).toContain("module-mock-needs-child-process");
@@ -151,10 +205,13 @@ test("x", () => { globalThis.fetch = (async () => new Response("")) as typeof gl
     });
   }
 
-  test("refuses a mock identifier bound by a logical assignment", () => {
-    expect(analyzeSource(`import { mock, afterEach } from "bun:test"; afterEach(() => mock.restore());
-      let replacement; replacement ||= mock(() => {}); object.m = replacement;`).filter(finding => finding.kind === "direct-assignment-needs-restore"))
-      .toHaveLength(2);
+  test("refuses a mock identifier bound by a logical assignment, each write on its own", () => {
+    const details = analyzeSource(`import { mock, afterEach } from "bun:test"; afterEach(() => mock.restore());
+      let replacement; replacement ||= mock(() => {}); object.m = replacement;`)
+      .filter((finding) => finding.kind === "direct-assignment-needs-restore")
+      .map((finding) => finding.detail);
+    expect(details).toContain("assignment to 'replacement' requires patchShared; inline restoration is refused");
+    expect(details).toContain("assignment to 'object.m' requires patchShared; inline restoration is refused");
   });
 
   test("mock.restore() does not undo mock.module(): a later consumer still receives the replacement", () => {

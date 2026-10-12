@@ -3,13 +3,12 @@ const patchShared = createPatchShared();
 /**
  * ops-31.3 — tps agent create onboarding seed tests
  */
-import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { describe, test, expect, beforeAll } from "bun:test";
 import { generateKeyPairSync } from "node:crypto";
 import { writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 
-let _savedFetch: typeof globalThis.fetch;
 const TEST_AGENT_ID = `test-seed-agent-${process.pid}`;
 const TEST_IDENTITY_DIR = join(tmpdir(), `tps-test-identity-${process.pid}`);
 
@@ -25,7 +24,6 @@ const SEED_RESPONSE = {
 };
 
 beforeAll(() => {
-  _savedFetch = globalThis.fetch;
   mkdirSync(TEST_IDENTITY_DIR, { recursive: true });
   // Pre-generate test Ed25519 key so createAgent doesn't try to write to real identity dir
   const { privateKey, publicKey } = generateKeyPairSync("ed25519", {
@@ -34,10 +32,6 @@ beforeAll(() => {
   });
   writeFileSync(join(TEST_IDENTITY_DIR, `${TEST_AGENT_ID}.key`), privateKey, { mode: 0o600 });
   writeFileSync(join(TEST_IDENTITY_DIR, `${TEST_AGENT_ID}.pub`), publicKey);
-});
-
-afterAll(() => {
-  patchShared(globalThis, "fetch", _savedFetch);
 });
 
 describe("ops-31.3: FlairClient.seedAgent()", () => {

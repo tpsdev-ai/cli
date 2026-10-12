@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { createPatchShared } from "./helpers/patch-shared.js";
+import { afterAll, describe, expect, test } from "bun:test";
+import { PatchAfterCleanupError, createPatchRegistry, createPatchShared } from "./helpers/patch-shared.js";
 
 const patch = createPatchShared();
 
@@ -63,4 +63,47 @@ test("unwinds nested patches to an absent property", () => {
   expect(Object.hasOwn(target, "value")).toBe(false);
   restoreSecond();
   expect(Object.hasOwn(target, "value")).toBe(false);
+});
+
+describe("patch factory refuses a patch after its cleanup ran (cli#603)", () => {
+  test("restores patches made before cleanup, then refuses a later patch", () => {
+    let cleanup: (() => void) | undefined;
+    const registry = createPatchRegistry((hook) => { cleanup = hook; });
+    const target: Record<string, number> = { m: 1 };
+
+    registry(target, "m", 2);
+    expect(target.m).toBe(2);
+    expect(typeof cleanup).toBe("function");
+
+    cleanup!();
+    expect(target.m).toBe(1);
+
+    expect(() => registry(target, "m", 3)).toThrow(PatchAfterCleanupError);
+    expect(() => registry(target, "m", 3)).toThrow("a patch cannot outlive cleanup");
+  });
+
+  test("names the refusal", () => {
+    let cleanup: (() => void) | undefined;
+    const registry = createPatchRegistry((hook) => { cleanup = hook; });
+    cleanup!();
+    const refusal = (() => {
+      try {
+        registry({} as Record<string, number>, "m", 1);
+      } catch (err) {
+        return err;
+      }
+      return undefined;
+    })();
+    expect(refusal).toBeInstanceOf(PatchAfterCleanupError);
+    expect((refusal as Error).name).toBe("PatchAfterCleanupError");
+  });
+});
+
+// The real factory driven through bun's own afterAll: the factory registers its
+// cleanup when this line runs, and the hook below registers after it, so bun —
+// which runs afterAll hooks in registration order — has cleaned up by the time
+// it runs. A patch requested then must be refused.
+const realPatch = createPatchShared();
+afterAll(() => {
+  expect(() => realPatch({} as Record<string, number>, "m", 1)).toThrow(PatchAfterCleanupError);
 });

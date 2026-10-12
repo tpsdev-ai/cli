@@ -9,11 +9,9 @@ import { writeFileSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-let _savedFetch: typeof globalThis.fetch;
 const TEST_KEY_PATH = join(tmpdir(), `tps-test-learn-${process.pid}.pem`);
 
 beforeAll(() => {
-  _savedFetch = globalThis.fetch;
   const { privateKey } = generateKeyPairSync("ed25519", {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
@@ -21,7 +19,6 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  patchShared(globalThis, "fetch", _savedFetch);
   if (existsSync(TEST_KEY_PATH)) unlinkSync(TEST_KEY_PATH);
 });
 
