@@ -261,6 +261,44 @@ export function mailboxReplayStore(root: string): ReplayStore {
   };
 }
 
+/**
+ * The pending placement intents in this mailbox, as `{ messageId, file }`.
+ *
+ * A recovery pass for an interrupted first delivery enumerates these to find a
+ * record whose only copy is in `cur/` under a pending intent: the `new/` scan
+ * cannot see it, and gc and archive skip whatever a pending intent names. A
+ * malformed intent is quarantined and left out. Call while holding the mailbox
+ * lock, and re-read the intent for each named record before acting on it.
+ */
+export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string }> {
+  const entries: Array<{ messageId: string; file: string }> = [];
+  let names: string[];
+  try {
+    names = readdirSync(root);
+  } catch (err) {
+    if (isMissing(err)) return entries;
+    throw err;
+  }
+  for (const name of names) {
+    if (!/^\.placement-[a-f0-9]{64}\.json$/.test(name)) continue;
+    const path = join(root, name);
+    let raw: string;
+    try {
+      raw = readFileSync(path, "utf8");
+    } catch (err) {
+      if (isMissing(err)) continue; // removed after the listing
+      throw err;
+    }
+    const intent = parsePlacement(raw, path);
+    if (!intent) {
+      quarantinePlacement(path);
+      continue;
+    }
+    entries.push({ messageId: intent.messageId, file: intent.file });
+  }
+  return entries;
+}
+
 function placementIntentPath(root: string, file: string): string {
   return join(root, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
 }

@@ -1,0 +1,1 @@
+- **MailClient completes a first delivery a killed process interrupted (Closes #600).** A kill after the record is linked into `cur/` and its `new/` entry is removed, but before the consumed id is committed, leaves the record's only copy in `cur/` under a pending intent. A later check now verifies that copy, commits the consumed id, finishes the intent, and returns the message.

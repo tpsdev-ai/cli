@@ -1,0 +1,79 @@
+// mail-kill-child.mjs — test helper for cli#600.
+//
+// Runs a REAL MailClient.checkNewMail() in a child process that a test can
+// SIGKILL at an injected pause point BEFORE a named filesystem operation, so an
+// interrupted first delivery is simulated with a KILLED process (never an
+// injected error).
+//
+// The pause point is injected by wrapping node:fs BEFORE the mail module is
+// loaded, so the mail module's `import { … } from "node:fs"` bindings resolve to
+// the wrappers.
+//
+// argv:  <mailDir> <agentId>
+// env:   TPS_MAIL_MODULE  file:// URL of the mail module
+//        TPS_KILL_AT      symbolic step boundary (see BOUNDARIES below)
+//        TPS_KILL_MARKER  marker file written just before blocking
+//        TPS_MAIL_ROOT    the mailbox root (<mailDir>/<agentId>)
+//        TPS_SRC, TPS_CUR the new/<file> source and its cur/<file> sibling
+//        TPS_FROM         the sender id the verifier resolves
+//        TPS_SEED         base64 Ed25519 seed for the sender
+import { createRequire } from "node:module";
+import { basename, join } from "node:path";
+
+const require = createRequire(import.meta.url);
+const fs = require("node:fs");
+const origWrite = fs.writeFileSync;
+
+const KILL_AT = process.env.TPS_KILL_AT ?? "";
+const MARKER = process.env.TPS_KILL_MARKER;
+const ROOT = process.env.TPS_MAIL_ROOT ?? "";
+const SRC = process.env.TPS_SRC ?? "";
+const CUR = process.env.TPS_CUR ?? "";
+const LEDGER = join(ROOT, "consumed.jsonl");
+
+const isIntent = (p) => typeof p === "string" && basename(p).startsWith(".placement-") && p.endsWith(".json");
+
+// fn -> predicate over the call's arguments: true means "pause HERE".
+const BOUNDARIES = {
+  "intent-write": (name, args) => name === "renameSync" && isIntent(args[1]),
+  "link-to-cur": (name, args) => name === "linkSync" && args[1] === CUR,
+  "source-removal": (name, args) => name === "unlinkSync" && args[0] === SRC,
+  "ledger-commit": (name, args) => name === "appendFileSync" && args[0] === LEDGER,
+  "intent-finish": (name, args) => name === "unlinkSync" && isIntent(args[0]),
+};
+const matches = BOUNDARIES[KILL_AT];
+if (!matches) {
+  process.stderr.write(`mail-kill-child: unknown TPS_KILL_AT=${JSON.stringify(KILL_AT)}\n`);
+  process.exit(2);
+}
+
+let paused = false;
+for (const name of ["writeFileSync", "openSync", "linkSync", "appendFileSync", "rmSync", "unlinkSync", "renameSync"]) {
+  const orig = fs[name];
+  fs[name] = function (...args) {
+    if (!paused && matches(name, args)) {
+      paused = true;
+      if (MARKER) origWrite.call(fs, MARKER, "paused");
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        /* spin until killed */
+      }
+      process.exit(3);
+    }
+    return orig.apply(this, args);
+  };
+}
+
+const [mailDir, agentId] = process.argv.slice(2);
+const ed = await import("@noble/ed25519");
+const seed = Buffer.from(process.env.TPS_SEED, "base64");
+const from = process.env.TPS_FROM;
+const mod = await import(process.env.TPS_MAIL_MODULE);
+const client = new mod.MailClient(mailDir, undefined, agentId, {
+  async getAgent(name) {
+    return name === from ? { publicKey: Buffer.from(ed.getPublicKey(seed)) } : null;
+  },
+});
+const messages = await client.checkNewMail();
+process.stdout.write(JSON.stringify({ count: messages.length }));
+process.exit(0);
