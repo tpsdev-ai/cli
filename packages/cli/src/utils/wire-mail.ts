@@ -9,6 +9,14 @@ export const MSG_HTTP_RESPONSE = 0x21;
 
 const SAFE_ID = /^[a-zA-Z0-9._-]{1,64}$/;
 
+const IsoInstantSchema = z.union([
+  z.string().datetime({ offset: true }).refine((value) => Number.isFinite(Date.parse(value))),
+  z.string().regex(/^[+-]\d{6}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/).refine((value) => {
+    const time = Date.parse(value);
+    return Number.isFinite(time) && new Date(time).toISOString() === value;
+  }),
+]);
+
 /** A relayed delivery id: a UUID, or the 64-hex id of a GitHub-webhook outbox record (outbox.ts). */
 const DeliveryIdSchema = z.union([z.string().uuid(), z.string().regex(/^[a-f0-9]{64}$/)]);
 
@@ -17,7 +25,7 @@ export const MailDeliverBodySchema = z.object({
   from: z.string().regex(SAFE_ID, "Invalid sender identifier"),
   to: z.string().regex(SAFE_ID, "Invalid recipient identifier"),
   content: z.string(),
-  timestamp: z.string().min(1),
+  timestamp: z.string().max(35, "Invalid relay timestamp").refine((value) => IsoInstantSchema.safeParse(value).success, "Invalid relay timestamp"),
 });
 export type MailDeliverBody = z.infer<typeof MailDeliverBodySchema>;
 

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { checkMessages, getInbox, listMessages, promote, sendMessage } from "../src/utils/mail.js";
@@ -102,8 +102,9 @@ describe("relay review regressions", () => {
     expect(JSON.parse(fs.readFileSync(relayAcceptanceReceiptPath("remote", message.id), "utf8"))).toEqual({
       from: message.from,
       to: message.to,
-      body: message.content,
       timestamp: message.timestamp,
+      bodySha256: createHash("sha256").update(message.content, "utf8").digest("hex"),
+      bodyLength: Buffer.byteLength(message.content, "utf8"),
     });
   });
 

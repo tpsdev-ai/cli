@@ -369,20 +369,37 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
 }
 
 /**
- * The payload an acceptance receipt binds to its branch+id: the relay payload
- * of the delivery that was accepted, so a later resend can be judged against it
- * after the inbox record is gone.
+ * What an acceptance receipt binds to its branch+id: the digest of the relay
+ * payload of the delivery that was accepted and its byte length, so a later
+ * resend can be judged against it after the inbox record is gone without the
+ * receipt holding the payload.
  */
 const RelayAcceptReceiptSchema = z.object({
   from: MailDeliverBodySchema.shape.from,
   to: MailDeliverBodySchema.shape.to,
-  body: z.string(),
   timestamp: MailDeliverBodySchema.shape.timestamp,
+  bodySha256: z.string().regex(/^[0-9a-f]{64}$/),
+  bodyLength: z.number().int().min(0),
 });
 type RelayAcceptReceipt = z.infer<typeof RelayAcceptReceiptSchema>;
 
+/**
+ * The pre-digest receipt shape, which stored the accepted payload as `body`.
+ * Schema-valid pre-digest receipts are compared and left as written.
+ */
+const LegacyRelayAcceptReceiptSchema = z.object({
+  from: MailDeliverBodySchema.shape.from,
+  to: MailDeliverBodySchema.shape.to,
+  timestamp: MailDeliverBodySchema.shape.timestamp,
+  body: z.string(),
+});
+
+function receiptDigest(content: string): { bodySha256: string; bodyLength: number } {
+  return { bodySha256: createHash("sha256").update(content, "utf8").digest("hex"), bodyLength: Buffer.byteLength(content, "utf8") };
+}
+
 function acceptReceipt(body: MailDeliverBody): RelayAcceptReceipt {
-  return { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp };
+  return { from: body.from, to: body.to, timestamp: body.timestamp, ...receiptDigest(body.content) };
 }
 
 function refusalText(error: unknown, content: string): string {
@@ -516,7 +533,8 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
 }
 
 /**
- * Whether a readable receipt matches the payload; legacy empty markers cannot be compared.
+ * Whether a readable receipt matches the payload; legacy empty markers cannot be
+ * compared; schema-valid pre-digest receipts are compared by payload digest.
  */
 function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
   const raw = readFileSync(path, "utf-8");
@@ -527,9 +545,15 @@ function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): b
     return false;
   }
   const receipt = RelayAcceptReceiptSchema.safeParse(parsed);
-  if (!receipt.success) return false;
-  const r = receipt.data;
-  return r.from === expected.from && r.to === expected.to && r.body === expected.body && r.timestamp === expected.timestamp;
+  if (receipt.success) {
+    const r = receipt.data;
+    return r.from === expected.from && r.to === expected.to && r.bodySha256 === expected.bodySha256 && r.bodyLength === expected.bodyLength && r.timestamp === expected.timestamp;
+  }
+  const legacy = LegacyRelayAcceptReceiptSchema.safeParse(parsed);
+  if (!legacy.success) return false;
+  const l = legacy.data;
+  const digest = receiptDigest(l.body);
+  return l.from === expected.from && l.to === expected.to && digest.bodySha256 === expected.bodySha256 && digest.bodyLength === expected.bodyLength && l.timestamp === expected.timestamp;
 }
 
 function undoNewRelayRecord(root: string, delivery: { branchId: string; id: string }): void {
@@ -580,7 +604,7 @@ export function setRelayAcceptTestHook(hook?: (root: string) => void): void {
 }
 
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
-  MailDeliverBodySchema.shape.id.parse(body.id);
+  body = MailDeliverBodySchema.parse(body);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
   const deadline = Date.now() + relayAcceptLockTimeoutMs();
   const acquireLock = (root: string) => {
