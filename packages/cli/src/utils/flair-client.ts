@@ -384,6 +384,17 @@ export function loadFlairSigningKey(keyPath: string, agentId: string): ReturnTyp
   }
   // Support PEM, raw 32-byte binary seed, and base64 DER/PKCS8
   const rawBuf = readFileSync(keyPath);
+  if (rawBuf.length === 32) {
+    // Raw Ed25519 seed — wrap in PKCS8 envelope. Checked before the PEM prefix:
+    // any 32 bytes are a valid seed, including bytes that begin with "-----",
+    // and no PEM private key or base64 PKCS8 Ed25519 key is 32 bytes long.
+    const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+    return createPrivateKey({
+      key: Buffer.concat([pkcs8Header, rawBuf]),
+      format: "der",
+      type: "pkcs8",
+    });
+  }
   if (raw.startsWith("-----")) {
     // Refused before createPrivateKey: under Bun (measured on 1.3.10), a failed
     // createPrivateKey on an encrypted PEM made later createPrivateKey calls in
@@ -392,15 +403,6 @@ export function loadFlairSigningKey(keyPath: string, agentId: string): ReturnTyp
       throw new Error(`Flair private key at ${keyPath} is an encrypted PEM key; the Flair client loads keys without a passphrase.`);
     }
     return createPrivateKey(raw);
-  }
-  if (rawBuf.length === 32) {
-    // Raw Ed25519 seed — wrap in PKCS8 envelope
-    const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
-    return createPrivateKey({
-      key: Buffer.concat([pkcs8Header, rawBuf]),
-      format: "der",
-      type: "pkcs8",
-    });
   }
   return createPrivateKey({
     key: Buffer.from(raw, "base64"),

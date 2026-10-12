@@ -12,7 +12,7 @@ const patchShared = createPatchShared();
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
-import { createHash, createPrivateKey, randomUUID } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { format } from "node:util";
@@ -418,6 +418,41 @@ test("an identity's .meta.json is not JSON: a named refusal before any Flair req
     // the parser's message, which can quote the file, is not printed
     expect(res.stderr).not.toContain(marker);
     expect(fake.requests).toEqual([]);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("a raw 32-byte seed whose bytes begin with \"-----\", matching the .pub, with a row in Flair that holds the key: read as a seed, not as PEM, and create reports registered", async () => {
+  // Any 32 bytes are a valid Ed25519 seed. The loader reads a 32-byte file as a
+  // seed before it looks for a PEM prefix, so this one is not sent to the PEM parser.
+  const id = `${AGENT}-dash-seed`;
+  const seed = Buffer.concat([Buffer.alloc(5, 0x2d), randomBytes(27)]);
+  const der = Buffer.concat([PKCS8_ED25519_PREFIX, seed]);
+  const spki = createPublicKey(createPrivateKey({ key: der, format: "der", type: "pkcs8" })).export({ format: "der", type: "spki" });
+  const pub = Buffer.from(spki.subarray(spki.length - 32));
+  const publicKey = pub.toString("base64url");
+  const row = { id, name: id, publicKey, createdAt: new Date().toISOString() };
+  const fake = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
+    return undefined;
+  }, { [id]: publicKey });
+  const identityDir = join(homedir(), ".tps", "identity");
+  mkdirSync(identityDir, { recursive: true });
+  writeFileSync(join(identityDir, `${id}.key`), seed);
+  writeFileSync(join(identityDir, `${id}.pub`), pub);
+  try {
+    const res = await runCreate(fake.url, id, { inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.stderr).toBe("");
+    expect(res.exitCode).toBeUndefined();
+    expect(res.stdout).toContain("already registered in Flair");
+    expect(fake.requests.map(({ method, auth }) => ({ method, signed: auth.startsWith(`TPS-Ed25519 ${id}:`) }))).toEqual([
+      { method: "GET", signed: true },
+      { method: "GET", signed: false },
+      { method: "GET", signed: true },
+    ]);
   } finally {
     fake.stop();
   }
