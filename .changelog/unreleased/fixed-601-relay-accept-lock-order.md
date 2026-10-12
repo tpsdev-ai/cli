@@ -1,0 +1,1 @@
+- **Relay acceptance acquires mailbox locks in one canonical order.** Two acceptances of different message ids to different recipients no longer stall each other to the lock timeout.

@@ -506,14 +506,24 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
   // record out of the recipient's own mailbox (cli#560): a record in any other
   // mailbox that is not this delivery's is left exactly where it is.
   const recipientRoot = root;
-  for (const root of roots) {
+  // A caller that already holds a mailbox (relay acceptance holds the
+  // recipient's across check, publication and marker) acquires the rest in one
+  // canonical order — ascending by path. A mailbox that sorts BEFORE the one it
+  // holds is read without its lock: reading is safe because a record for this
+  // delivery id can only be written under the stripe the caller holds, so any
+  // such record is already durable and visible; it is also never rewritten. Two
+  // acceptances of independent deliveries to different recipients therefore
+  // never wait on each other.
+  const heldRoot = options.heldRoot;
+  for (const root of [...roots].sort()) {
     mkdirMailDirectory(root);
-    // A caller that already holds this mailbox's lock (relay acceptance holds
-    // the recipient's across check, publication and marker) passes it here so
-    // the scan does not re-acquire it — a nested acquisition is a hard error.
+    // A caller that already holds this mailbox's lock passes it here so the scan
+    // does not re-acquire it — a nested acquisition is a hard error.
     const held = root === options.heldRoot || root === options.heldAcceptanceRoot;
-    const lock = held ? null : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
-    if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    const readOnly = !held && heldRoot !== undefined && root < heldRoot;
+    const lock = held || readOnly ? null : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
+    if (!held && !readOnly && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    const owned = held || lock !== null;
     try {
       for (const dir of ["new", "cur", "dlq"]) {
         const path = join(root, dir);
@@ -568,14 +578,19 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
               throw new Error(`relayed delivery conflict for branch ${delivery.branchId} message ${delivery.id}`);
             }
             const target = join(path, file);
-            record.receivedAt = new Date().toISOString();
-            const tmpDir = join(root, "tmp");
-            mkdirMailDirectory(tmpDir);
-            const tmp = join(tmpDir, `${randomUUID()}.json`);
-            writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
-            publishRelayedRecord(tmp, target);
-            if (dir === "dlq") syncMailFile(`${target}.reason`);
-            syncMailDirectory(path);
+            // A mailbox read without its lock is not rewritten; only the
+            // recipient's own (held) mailbox, or one whose lock this scan holds,
+            // is republished in place.
+            if (owned) {
+              record.receivedAt = new Date().toISOString();
+              const tmpDir = join(root, "tmp");
+              mkdirMailDirectory(tmpDir);
+              const tmp = join(tmpDir, `${randomUUID()}.json`);
+              writeFileSync(tmp, JSON.stringify(record, null, 2), { encoding: "utf-8", flag: "wx" });
+              publishRelayedRecord(tmp, target);
+              if (dir === "dlq") syncMailFile(`${target}.reason`);
+              syncMailDirectory(path);
+            }
             return target;
           }
         }
