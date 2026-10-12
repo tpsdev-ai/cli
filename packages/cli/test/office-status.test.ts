@@ -11,8 +11,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPatchShared } from "./helpers/patch-shared.js";
 import { runOfficeStatus } from "../src/commands/office-status.js";
-import { ORG_EVENT_MAX_PAGES } from "../src/utils/org-event-read.js";
-import { installStubFlairFetch, orgEventCatchupRoute, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
+import { ORG_EVENT_MAX_PAGES, ORG_EVENT_PAGE_SIZE } from "../src/utils/org-event-read.js";
+import {
+  type FlairRoutes,
+  installStubFlairFetch,
+  orgEventCatchupRoute,
+  writeKeyFile,
+  type StubFlair,
+} from "./helpers/stub-flair.js";
 
 const patchShared = createPatchShared();
 
@@ -29,9 +35,9 @@ const EVENTS = [
 ];
 
 /** Flair routes the stub serves once it has verified the caller. */
-function routes(req: Request, url: URL): Response | undefined {
+function routes(req: Request, url: URL, caller: string): Response | undefined {
   if (url.pathname === "/Agent/") return Response.json(AGENTS);
-  if (url.pathname.startsWith("/OrgEventCatchup/")) return orgEventCatchupRoute([EVENTS])(url);
+  if (url.pathname.startsWith("/OrgEventCatchup/")) return orgEventCatchupRoute({ events: EVENTS })(req, url, caller);
   return undefined;
 }
 
@@ -104,8 +110,8 @@ describe("tps office status", () => {
   test("shows blocker from OrgEvents", async () => {
     stub.stop();
     const blocker = [{ id: "b1", kind: "blocker", authorId: "ember", summary: "Missing Ember PAT", createdAt: new Date().toISOString() }];
-    stub = installStubFlairFetch({ anvil: SEED }, (req, url) =>
-      url.pathname === "/Agent/" ? Response.json(AGENTS) : url.pathname.startsWith("/OrgEventCatchup/") ? orgEventCatchupRoute([blocker])(url) : undefined,
+    stub = installStubFlairFetch({ anvil: SEED }, (req, url, caller) =>
+      url.pathname === "/Agent/" ? Response.json(AGENTS) : url.pathname.startsWith("/OrgEventCatchup/") ? orgEventCatchupRoute({ events: blocker })(req, url, caller) : undefined,
     );
     await runOfficeStatus(baseOpts());
     expect(output.join("\n")).toContain("BLOCKER: Missing Ember PAT");
@@ -120,10 +126,10 @@ describe("tps office status", () => {
 
 /**
  * cli#620 — office status reads the viewer's OrgEvent catch-up feed through
- * `readOrgEvents`. The stub answers the catch-up route as Flair does
- * (`orgEventCatchupRoute`: HTTP 400 for an unparseable `since`, the paged
- * envelope otherwise). It registers its own viewer, so the fixtures here name
- * no production agent.
+ * `readOrgEvents`. The catch-up route is `orgEventCatchupRoute`, a fake
+ * modelled on Flair's coded catch-up contract (see its doc; the real resource
+ * is not exercised). It registers its own viewer, so the fixtures here name no
+ * production agent.
  */
 describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   const VIEWER = "viewer-a";
@@ -134,16 +140,27 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
   const OLDER = { id: "e1", kind: "task.completed", authorId: "agent-a", summary: "older task", createdAt: at(50) };
   const NEWER = { id: "e2", kind: "task.completed", authorId: "agent-a", summary: "newer task", createdAt: at(5) };
+  /** `count` distinct events by `authorId`, one millisecond apart from `minutesAgo`, ids `<prefix><n>`. */
+  const rows = (count: number, authorId: string, minutesAgo: number, prefix: string) =>
+    Array.from({ length: count }, (_, n) => ({
+      id: `${prefix}${String(n).padStart(5, "0")}`,
+      kind: "task.completed",
+      authorId,
+      summary: `${prefix} task ${n}`,
+      createdAt: new Date(Date.now() - minutesAgo * 60_000 + n).toISOString(),
+    }));
+  /** More distinct events than the read bound holds: the bound's pages, plus one. */
+  const PAST_BOUND = ORG_EVENT_MAX_PAGES * ORG_EVENT_PAGE_SIZE + 1;
 
   /** Run office status against a viewer whose OrgEvent read is answered by `answer`; return the output. */
-  async function status(answer: (url: URL) => Response, json = false): Promise<string> {
+  async function status(answer: FlairRoutes, json = false): Promise<string> {
     stub.stop();
     const key = writeKeyFile(root, VIEWER, SEED);
-    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url) =>
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url, caller) =>
       url.pathname === "/Agent/"
         ? Response.json(AGENT_LIST)
         : url.pathname.startsWith("/OrgEventCatchup/")
-          ? answer(url)
+          ? answer(req, url, caller)
           : undefined,
     );
     await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true, json });
@@ -153,16 +170,35 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   const jsonAgents = () =>
     (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
 
-  test("a nonempty read shows each agent's newest task", async () => {
-    const out = await status(orgEventCatchupRoute([[OLDER, NEWER]]));
+  test("a nonempty read shows each agent's newest task and newest heartbeat", async () => {
+    const beats = [
+      { id: "h1", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(50) },
+      { id: "h2", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(3) },
+    ];
+    const out = await status(orgEventCatchupRoute({ events: [OLDER, NEWER, ...beats] }));
     expect(out).not.toContain("Cannot read OrgEvents");
     expect(row(out, "Agent A")).toContain("newer task");
     expect(row(out, "Agent A")).not.toContain("older task");
+    expect(row(out, "Agent B")).toContain("3m ago");
     expect(row(out, "Agent B")).toContain("idle");
   });
 
-  test("a feed of several pages is read to the end", async () => {
-    const out = await status(orgEventCatchupRoute([[OLDER], [NEWER]]));
+  test("the blocker line shows the newest blocker read, not the first", async () => {
+    const blockers = [
+      { id: "b1", kind: "blocker", authorId: "agent-a", summary: "older blocker", createdAt: at(40) },
+      { id: "b2", kind: "blocker", authorId: "agent-b", summary: "newer blocker", createdAt: at(4) },
+    ];
+    const out = await status(orgEventCatchupRoute({ events: blockers }));
+    expect(out).toContain("BLOCKER: newer blocker");
+    expect(out).not.toContain("older blocker");
+  });
+
+  test("a feed of several pages is read to the end, each page after the last", async () => {
+    const route = orgEventCatchupRoute({ events: [OLDER, ...rows(ORG_EVENT_PAGE_SIZE, "agent-c", 40, "f"), NEWER] });
+    const out = await status(route);
+    expect(route.afters).toHaveLength(2);
+    expect(route.afters[1]! > route.afters[0]!).toBe(true);
+    expect(new Set(route.served).size).toBe(ORG_EVENT_PAGE_SIZE + 2);
     expect(out).not.toContain("incomplete");
     expect(row(out, "Agent A")).toContain("newer task");
   });
@@ -195,14 +231,13 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
     expect(row(out, "Agent A")).toContain("unavailable");
   });
 
-  test("a feed past the page bound is read up to the bound and marked incomplete", async () => {
-    let pages = 0;
-    const route = orgEventCatchupRoute([[OLDER]], { endless: true });
-    const out = await status((url) => {
-      pages++;
-      return route(url);
-    });
-    expect(pages).toBe(ORG_EVENT_MAX_PAGES);
+  test("a feed past the page bound is read up to the bound, with advancing cursors over distinct events, and marked incomplete", async () => {
+    const route = orgEventCatchupRoute({ events: rows(PAST_BOUND, "agent-a", 60, "b") });
+    const out = await status(route);
+    expect(route.afters).toHaveLength(ORG_EVENT_MAX_PAGES);
+    for (let i = 1; i < route.afters.length; i++) expect(route.afters[i]! > route.afters[i - 1]!).toBe(true);
+    expect(route.served).toHaveLength(ORG_EVENT_MAX_PAGES * ORG_EVENT_PAGE_SIZE);
+    expect(new Set(route.served).size).toBe(route.served.length);
     expect(out).toContain(`OrgEvents from ${stub.url} exceed the ${ORG_EVENT_MAX_PAGES}-page read bound; newer events were not read and activity is incomplete.`);
     expect(row(out, "Agent A")).toContain("(incomplete)");
     expect(row(out, "Agent B")).toContain("incomplete");
@@ -210,9 +245,9 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   });
 
   test.each([
-    ["ok", () => orgEventCatchupRoute([[OLDER, NEWER]]), "newer task"],
+    ["ok", () => orgEventCatchupRoute({ events: [OLDER, NEWER] }), "newer task"],
     ["unavailable", () => () => new Response(null, { status: 403 }), undefined],
-    ["incomplete", () => orgEventCatchupRoute([[NEWER]], { endless: true }), "newer task"],
+    ["incomplete", () => orgEventCatchupRoute({ events: rows(PAST_BOUND, "agent-a", 60, "b") }), `b task ${PAST_BOUND - 2}`],
   ])("JSON output gives each agent the activity state %s", async (state, answer, summary) => {
     await status(answer(), true);
     const agents = jsonAgents();

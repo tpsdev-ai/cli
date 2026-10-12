@@ -10,7 +10,9 @@
  * cli#606: each signer's mapping also names the runtime entry point through
  * which its test reaches it (`roster.ts#makeAuth` is nested in `runDashboard`),
  * and the mapped test must call that entry point, through a value import,
- * inside a test Bun runs (`signerDrivingProblem`; its doc states the limit).
+ * inside a `test`/`it` callback that Bun runs, where `test`/`it`/`describe`
+ * must be bound to Bun's API (a `bun:test` import or Bun's unshadowed global).
+ * The check is lexical; `signerDrivingProblem`'s doc states its limit.
  */
 import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
@@ -290,6 +292,28 @@ describe("cli#606 — a mapped test must call its signer's entry point (mutation
     ["in it inside describe", 'describe("s", () => { it("x", async () => { await runDashboard({}); }); });'],
     ["in test.skipIf(false)", 'test.skipIf(false)("x", () => runDashboard({}));'],
   ])("a call %s through a value import is accepted", (_label, body) => {
+    expect(check(DASHBOARD, `${ROSTER}\n${body}`)).toBeNull();
+  });
+
+  test.each([
+    ["a local function named test", 'function test(name: string, fn: () => unknown) { void name; void fn; }\ntest("x", () => runDashboard({}));'],
+    ["a local arrow named it", 'const it = (name: string, fn: () => unknown) => { void name; void fn; };\nit("x", () => runDashboard({}));'],
+    ["a parameter named test", 'export function wrap(test: (name: string, fn: () => unknown) => void) { test("x", () => runDashboard({})); }'],
+    ["a test imported from another module", 'import { test } from "./helpers/not-bun.js";\ntest("x", () => runDashboard({}));'],
+    ["a bun:test test shadowed by a parameter", 'import { test } from "bun:test";\nexport function wrap(test: (name: string, fn: () => unknown) => void) { test("x", () => runDashboard({})); }'],
+    ["an aliased bun:test test.skip", 'import { test as check } from "bun:test";\ncheck.skip("x", () => runDashboard({}));'],
+    ["a namespace bun:test test.skip", 'import * as bun from "bun:test";\nbun.test.skip("x", () => runDashboard({}));'],
+  ])("a call inside %s is not inside a Bun test, and fails", (_label, body) => {
+    const problem = check(DASHBOARD, `${ROSTER}\n${body}`);
+    expect(problem).not.toBeNull();
+    expect(problem).toContain("never calls packages/cli/src/commands/roster.ts#runDashboard inside a running test");
+  });
+
+  test.each([
+    ["a named bun:test import", 'import { test } from "bun:test";\ntest("x", () => runDashboard({}));'],
+    ["an aliased bun:test import", 'import { test as check } from "bun:test";\ncheck("x", () => runDashboard({}));'],
+    ["a namespace bun:test import", 'import * as bun from "bun:test";\nbun.it("x", () => runDashboard({}));'],
+  ])("a call inside a test bound through %s is accepted", (_label, body) => {
     expect(check(DASHBOARD, `${ROSTER}\n${body}`)).toBeNull();
   });
 

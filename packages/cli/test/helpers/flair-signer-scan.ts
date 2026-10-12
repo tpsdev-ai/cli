@@ -536,18 +536,84 @@ function typeOnlyImport(decl: ts.Declaration): boolean {
   return false;
 }
 
+/** Bun's test-registration functions: what `bun:test` exports under these names, and Bun's globals of the same names. */
+const BUN_TEST_API = new Set(["test", "it", "describe", "xtest", "xit", "xdescribe"]);
+
+/** A call to Bun's test API: the function called, and the modifier chain after it. */
+interface BunTestCall {
+  api: string;
+  names: string[];
+  mods: ts.CallExpression[];
+}
+
+/** The module specifier of the import declaration an import binding belongs to. */
+function importSpecifierOf(decl: ts.Declaration): string | undefined {
+  for (let n: ts.Node | undefined = decl; n; n = n.parent)
+    if (ts.isImportDeclaration(n)) return ts.isStringLiteral(n.moduleSpecifier) ? n.moduleSpecifier.text : undefined;
+  return undefined;
+}
+
 /**
- * True when `node` sits in the callback of a `test`/`it` call Bun runs, with no
- * skipped, todo or unclassifiable `test`/`it`/`describe` call around it.
+ * The Bun test-API call that `call` makes, or null when its callee is not
+ * Bun's. The root of the callee chain must be bound to Bun's API: a value
+ * import from `"bun:test"` (named, aliased, or a namespace whose first property
+ * is the API name), or an identifier no declaration in scope binds, which is
+ * Bun's global. A local function, variable or parameter of the same name, or an
+ * import from any other module, is not Bun's.
  */
-function inRunningTest(node: ts.Node): boolean {
+function bunTestCall(call: ts.CallExpression, checker: ts.TypeChecker): BunTestCall | null {
+  const names: string[] = [];
+  const mods: ts.CallExpression[] = [];
+  let e: ts.Expression = call.expression;
+  while (ts.isPropertyAccessExpression(e) || ts.isCallExpression(e)) {
+    if (ts.isPropertyAccessExpression(e)) names.unshift(e.name.text);
+    else mods.unshift(e);
+    e = e.expression;
+  }
+  if (!ts.isIdentifier(e)) return null;
+  const sym = checker.getSymbolAtLocation(e);
+  if (!sym) return BUN_TEST_API.has(e.text) ? { api: e.text, names, mods } : null;
+  const decl = sym.flags & ts.SymbolFlags.Alias ? sym.declarations?.[0] : undefined;
+  if (!decl || typeOnlyImport(decl) || importSpecifierOf(decl) !== "bun:test") return null;
+  if (ts.isImportSpecifier(decl)) {
+    const api = (decl.propertyName ?? decl.name).text;
+    return BUN_TEST_API.has(api) ? { api, names, mods } : null;
+  }
+  if (ts.isNamespaceImport(decl)) {
+    const [api, ...rest] = names;
+    return api && BUN_TEST_API.has(api) ? { api, names: rest, mods } : null;
+  }
+  return null;
+}
+
+/** True when Bun runs the test or describe a call registers: not x-prefixed, skipped, todo, false-conditioned or unrecognised. */
+function bunCallRuns({ api, names, mods }: BunTestCall): boolean {
+  if (api.startsWith("x")) return false;
+  let cond = 0;
+  for (const name of names) {
+    if (RUNNING_MODIFIERS.has(name)) continue;
+    const arg = name === "skipIf" || name === "if" ? mods[cond++]?.arguments[0] : undefined;
+    const runs = (name === "skipIf" && arg?.kind === ts.SyntaxKind.FalseKeyword) || (name === "if" && arg?.kind === ts.SyntaxKind.TrueKeyword);
+    if (!runs) return false;
+  }
+  return true;
+}
+
+/**
+ * True when `node` sits in the callback of a Bun `test`/`it` call that Bun runs,
+ * with no Bun `test`/`it`/`describe` around it that Bun skips. Calls whose
+ * callee is not bound to Bun's API (see `bunTestCall`) neither register a test
+ * nor skip one.
+ */
+function inRunningTest(node: ts.Node, checker: ts.TypeChecker): boolean {
   let inTest = false;
   for (let n: ts.Node = node; n.parent; n = n.parent) {
     const parent = n.parent;
     if (!ts.isCallExpression(parent)) continue;
-    if (notRun(parent)) return false;
-    const { root } = chainOf(parent.expression);
-    if ((root === "test" || root === "it") && ts.isFunctionLike(n) && parent.arguments.includes(n as ts.Expression))
+    const bun = bunTestCall(parent, checker);
+    if (!bun) continue;
+    if (!bunCallRuns(bun)) return false;
+    if ((bun.api === "test" || bun.api === "it") && ts.isFunctionLike(n) && parent.arguments.includes(n as ts.Expression))
       inTest = true;
   }
   return inTest;
@@ -563,9 +629,14 @@ function inRunningTest(node: ts.Node): boolean {
  *     as a VALUE: a type-only import (`import type`, or an inline `type`
  *     specifier) is erased at runtime and does not count;
  *   - for a method entry, construct the class (`new`) through that import; and
- *   - call the entry inside a `test`/`it` callback that Bun runs: a call outside
- *     any test, or inside a skipped, todo, x-prefixed or false-conditioned
- *     `test`/`it`/`describe`, does not count.
+ *   - call the entry inside the callback of a `test`/`it` that Bun runs. The
+ *     `test`/`it`/`describe` are resolved to their bindings: each must be a
+ *     value import from `"bun:test"` (named, aliased or namespace) or Bun's
+ *     global with no declaration in scope shadowing it. A local function,
+ *     variable or parameter named `test` or `it`, or an import of that name
+ *     from another module, registers no test, so a call inside it does not
+ *     count. A call outside any test, or inside a skipped, todo, x-prefixed or
+ *     false-conditioned Bun `test`/`it`/`describe`, does not count either.
  *
  * A call matches by symbol, through the type checker: `runDashboard(...)` must
  * resolve to the entry function itself (another export of the same module does
@@ -652,7 +723,7 @@ export function signerDrivingProblem(
         ? ts.isPropertyAccessExpression(callee) && isTargetMethod(callee.name)
         : viaValueImport(callee);
       if (hit) {
-        if (inRunningTest(node)) called = true;
+        if (inRunningTest(node, checker)) called = true;
         else calledOutside = true;
       }
     }
