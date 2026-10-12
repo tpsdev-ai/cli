@@ -296,8 +296,9 @@ function refuseRegistration(
 }
 
 /**
- * cli#607 — a signature made with the private key does not verify under the
- * public key file, so the file is not the private key's public half. Registering
+ * cli#607 — a probe signed with the private key does not verify under the
+ * public key file (or the key cannot make an Ed25519 signature at all), so the
+ * file is not the private key's public half. Registering
  * it would register a key this identity's signatures never verify against, so
  * refuse before reaching Flair.
  */
@@ -318,6 +319,35 @@ function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, 
   );
   console.error(
     `   Remedy: if this agent's identity must be kept, write its private key to ${keyPath} in one of those formats; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+  );
+  process.exit(1);
+}
+
+/**
+ * cli#607 — the identity files exist but cannot be loaded: a file `loadKeyPair`
+ * reads (`.key`, `.pub`, `.meta.json`, `.seed`, `.x25519.pub`) cannot be read,
+ * or the optional `.meta.json` is not JSON. The refusal names the unreadable
+ * file and its fs error code, or the invalid `.meta.json`; it never prints an
+ * error message or file contents.
+ */
+function refuseUnloadableIdentity(id: string, identityDir: string, err: unknown): never {
+  const metaPath = join(identityDir, `${id}.meta.json`);
+  const fsError = err as { code?: unknown; path?: unknown } | null;
+  let state: string;
+  let repair: string;
+  if (fsError && typeof fsError.code === "string" && typeof fsError.path === "string") {
+    state = `${fsError.path} cannot be read (${fsError.code})`;
+    repair = "make that file readable by the user running tps";
+  } else if (err instanceof SyntaxError) {
+    state = `${metaPath} is not valid JSON`;
+    repair = `repair ${metaPath} or move it aside (create reads it only when present)`;
+  } else {
+    state = "loading the identity files failed";
+    repair = `check the files in ${identityDir}`;
+  }
+  console.error(`❌ Agent '${id}' cannot load its identity at ${identityDir} — ${state}.`);
+  console.error(
+    `   Remedy: ${repair}, then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
   );
   process.exit(1);
 }
@@ -353,10 +383,16 @@ async function createAgent(args: AgentArgs): Promise<void> {
   // with it and require the `.pub` on disk to verify that signature. cli#512
   // registered the stored `.pub` bytes verbatim, so a `.pub` that is not the
   // private key's public half could still be reported "registered" when Flair
-  // already held that `.pub`. The probe loads the key exactly as the Flair
-  // client below signs with it, so every format the client accepts is checked,
-  // and only a file the client cannot load is refused as unusable.
-  const kp = loadKeyPair(identityDir, keyPrefix);
+  // already held that `.pub`. Identity files that cannot be loaded are refused
+  // by name. The probe loads the key exactly as the Flair client below signs
+  // with it, so every format the client accepts is probed, and a readable key
+  // file the client cannot load is refused as unusable.
+  let kp: ReturnType<typeof loadKeyPair>;
+  try {
+    kp = loadKeyPair(identityDir, keyPrefix);
+  } catch (e) {
+    refuseUnloadableIdentity(id, identityDir, e);
+  }
   const probe = Buffer.from(`tps-agent-create:${id}`);
   let signingKey: ReturnType<typeof loadFlairSigningKey>;
   try {

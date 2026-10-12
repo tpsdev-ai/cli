@@ -11,7 +11,7 @@ const patchShared = createPatchShared();
  * stores `publicKey` (see `refusePut`).
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { createPrivateKey, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -257,10 +257,70 @@ test("the private key file is in no format the Flair client loads: a named refus
   }
 });
 
-test("a PEM or base64 PKCS8 private key matching the .pub: the probe accepts it and create reports registered", async () => {
+/** Write a matched key pair for `id` into the identity dir, plus any `extra` files; returns the paths. */
+function writeIdentity(id: string, keyPair: ReturnType<typeof generateKeyPair>, extra: Record<string, string> = {}) {
+  const identityDir = join(homedir(), ".tps", "identity");
+  mkdirSync(identityDir, { recursive: true });
+  const keyPath = join(identityDir, `${id}.key`);
+  writeFileSync(keyPath, Buffer.from(keyPair.signing.privateKey));
+  writeFileSync(join(identityDir, `${id}.pub`), Buffer.from(keyPair.signing.publicKey));
+  for (const [suffix, content] of Object.entries(extra)) writeFileSync(join(identityDir, `${id}${suffix}`), content);
+  return { identityDir, keyPath };
+}
+
+// chmod 000 does not stop root from reading, so the case cannot be built as root.
+test.skipIf(process.getuid?.() === 0)("an existing private key file that cannot be read: a named refusal before any Flair request, not a throw", async () => {
+  const id = `${AGENT}-unreadable-key`;
+  const keyPair = generateKeyPair();
+  const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+  const { keyPath } = writeIdentity(id, keyPair);
+  chmodSync(keyPath, 0o000);
+  try {
+    const res = await runCreate(fake.url, id, { inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.error).toBeNull();
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered");
+    expect(res.stderr).toContain(`Agent '${id}' cannot load its identity at`);
+    expect(res.stderr).toContain(`${keyPath} cannot be read (EACCES)`);
+    expect(res.stderr).toContain("make that file readable by the user running tps");
+    expect(res.stderr).toContain(`tps agent create --id ${id}`);
+    expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
+    expect(fake.requests).toEqual([]);
+  } finally {
+    chmodSync(keyPath, 0o600);
+    fake.stop();
+  }
+});
+
+test("an identity's .meta.json is not JSON: a named refusal before any Flair request, not a throw", async () => {
+  const id = `${AGENT}-bad-meta`;
+  const keyPair = generateKeyPair();
+  const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+  const marker = `not-json-${randomUUID()}`;
+  const { identityDir } = writeIdentity(id, keyPair, { ".meta.json": marker });
+  try {
+    const res = await runCreate(fake.url, id, { inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.error).toBeNull();
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered");
+    expect(res.stderr).toContain(`${join(identityDir, `${id}.meta.json`)} is not valid JSON`);
+    expect(res.stderr).toContain("move it aside");
+    // the parser's message, which can quote the file, is not printed
+    expect(res.stderr).not.toContain(marker);
+    expect(fake.requests).toEqual([]);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("a PEM or base64 PKCS8 private key matching the .pub, with a row in Flair that holds the key: the probe accepts it and create reports registered", async () => {
   // The Flair client signs with a PEM block, a raw 32-byte seed or base64 PKCS8
   // DER (loadFlairSigningKey); the key-pair probe loads the file the same way,
-  // so a matched pair in either non-raw format registers as it did on main.
+  // so a matched pair in either non-raw format passes the probe. The row already
+  // holds the matching key and Flair accepts the signed request, so create then
+  // reports registered, as main did for these files.
   const encodings = {
     pem: (der: Buffer) => createPrivateKey({ key: der, format: "der", type: "pkcs8" }).export({ format: "pem", type: "pkcs8" }).toString(),
     pkcs8: (der: Buffer) => `${der.toString("base64")}\n`,
