@@ -8,6 +8,7 @@ const patchShared = createPatchShared();
  * read-back GET, both Basic — reach a route this file controls.
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -180,6 +181,102 @@ test("the stored key differs from the generated one: exits non-zero", async () =
   }
 });
 
+test("the private key does not derive the public key file: exits non-zero, prints no success", async () => {
+  const id = `${AGENT}-keypair-mismatch`;
+  const priv = generateKeyPair();
+  const other = generateKeyPair();
+  let stored: string | null = null;
+  const fake = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT" && url.pathname === `/Agent/${id}`) {
+      const body = (await req.json()) as { publicKey?: string };
+      stored = body.publicKey ?? null;
+      return Response.json({ id, name: id, publicKey: stored });
+    }
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
+      return stored === null
+        ? new Response("not found", { status: 404 })
+        : Response.json({ id, name: id, publicKey: stored });
+    }
+    return undefined;
+  });
+  const identityDir = join(homedir(), ".tps", "identity");
+  mkdirSync(identityDir, { recursive: true });
+  writeFileSync(join(identityDir, `${id}.key`), Buffer.from(priv.signing.privateKey));
+  writeFileSync(join(identityDir, `${id}.pub`), Buffer.from(other.signing.publicKey));
+  try {
+    const res = await runCreate(fake.url, id);
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered");
+    expect(res.stderr).toContain(id);
+    expect(res.stderr).toContain("does not derive the public key");
+    expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
+    expect(res.stderr).toContain(join(".tps", "identity", `${id}.pub`));
+    // refused locally, before any Flair request
+    expect(fake.requests).toEqual([]);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("a request signed with the private key is refused: exits non-zero, prints no success", async () => {
+  const id = `${AGENT}-signed-refused`;
+  const keyPair = generateKeyPair();
+  let stored: string | null = null;
+  // No signers: the shared verifying stub refuses every TPS-Ed25519 request, so
+  // the operator PUT and the read-back (both Basic) succeed while the agent's own
+  // signed request cannot be verified.
+  const fake = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT" && url.pathname === `/Agent/${id}`) {
+      const body = (await req.json()) as { publicKey?: string };
+      stored = body.publicKey ?? null;
+      return Response.json({ id, name: id, publicKey: stored });
+    }
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
+      return stored === null
+        ? new Response("not found", { status: 404 })
+        : Response.json({ id, name: id, publicKey: stored });
+    }
+    return undefined;
+  });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair });
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stderr).toContain(id);
+    expect(res.stderr).toContain("signed with the private key was refused");
+  } finally {
+    fake.stop();
+  }
+});
+
+test("the signed request is accepted but its response does not carry the registered key: exits non-zero", async () => {
+  const id = `${AGENT}-signed-unconfirmed`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const otherKey = Buffer.from(generateKeyPair().signing.publicKey).toString("base64url");
+  const row = { id, name: id, publicKey, createdAt: keyPair.createdAt };
+  let signedGets = 0;
+  const fake = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
+      if ((req.headers.get("Authorization") ?? "").startsWith("Basic ")) return Response.json(row);
+      // The first signed GET finds the matching row; the verification GET answers
+      // with a different key, so the response does not confirm the registered one.
+      signedGets += 1;
+      return Response.json(signedGets === 1 ? row : { ...row, publicKey: otherKey });
+    }
+    return undefined;
+  }, { [id]: publicKey });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair });
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stderr).toContain("did not confirm the registered key");
+  } finally {
+    fake.stop();
+  }
+});
+
 test("the read-back fails: exits non-zero, never treating a failed read as absent, and names both remedy branches", async () => {
   const id = `${AGENT}-read-fail`;
   const fake = startFakeFlair(async (req, url) => {
@@ -223,8 +320,11 @@ test("an existing Agent with the local key: prints success without a seed or wri
     expect(fake.requests.map(({ method, path }) => ({ method, path }))).toEqual([
       { method: "GET", path: `/Agent/${id}` },
       { method: "GET", path: `/Agent/${id}` },
+      { method: "GET", path: `/Agent/${id}` },
     ]);
     expect(fake.requests[0]!.auth).toStartWith(`TPS-Ed25519 ${id}:`);
+    // the third request is the signed verification (cli#607), not another Basic read
+    expect(fake.requests[2]!.auth).toStartWith(`TPS-Ed25519 ${id}:`);
     expect(row.publicKey).toBe(publicKey);
   } finally {
     fake.stop();
@@ -435,8 +535,10 @@ test("selected create cases omit the credential marker and Basic encoding from c
         expect(ok.requests.map(({ method, path }) => ({ method, path }))).toEqual([
           { method: "GET", path: `/Agent/${okId}` },
           { method: "GET", path: `/Agent/${okId}` },
+          { method: "GET", path: `/Agent/${okId}` },
         ]);
         expect(ok.requests[0]!.auth).toStartWith(`TPS-Ed25519 ${okId}:`);
+        expect(ok.requests[2]!.auth).toStartWith(`TPS-Ed25519 ${okId}:`);
       }
       if (path.fake) {
         const basic = path.fake.requests.filter((req) => req.auth.startsWith("Basic "));

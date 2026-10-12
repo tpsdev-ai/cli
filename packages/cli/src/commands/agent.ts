@@ -12,7 +12,7 @@
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
-import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
+import { generateKeyPair, saveKeyPair, loadKeyPair, sign, verify } from "../utils/identity.js";
 import { createFlairClient } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
@@ -294,6 +294,17 @@ function refuseRegistration(
   process.exit(1);
 }
 
+/**
+ * cli#607 — the private key does not derive the public key file. Registering the
+ * file's public half would print "registered" for an identity whose signatures
+ * Flair can never verify, so refuse before reaching Flair.
+ */
+function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string, pubPath: string): never {
+  console.error(`❌ Agent '${id}' has no consistent key pair at ${identityDir} — the private key in ${keyPath} does not derive the public key in ${pubPath}.`);
+  console.error(`   Remedy: move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`);
+  process.exit(1);
+}
+
 async function createAgent(args: AgentArgs): Promise<void> {
   const id = args.id;
   if (!id) {
@@ -313,19 +324,24 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const keyPath = join(identityDir, `${keyPrefix}.key`);
   const pubPath = join(identityDir, `${keyPrefix}.pub`);
 
-  let pubKeyHex: string;
-
   if (existsSync(keyPath) && existsSync(pubPath)) {
     console.log(`  Keys already exist at ${keyPath}`);
-    const kp = loadKeyPair(identityDir, keyPrefix);
-    pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
   } else {
     console.log(`  Generating Ed25519 keys for ${id}...`);
-    const kp = generateKeyPair();
-    saveKeyPair(kp, identityDir, keyPrefix);
-    pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
+    saveKeyPair(generateKeyPair(), identityDir, keyPrefix);
     console.log(`  Keys saved to ${identityDir}/`);
   }
+
+  // cli#607 — the identity IS the private key: derive the public key from it and
+  // require the `.pub` on disk to match before registering. cli#512 registered the
+  // stored `.pub` bytes verbatim, so a `.pub` the private key does not derive let
+  // `create` print "registered" for a pair Flair could never verify.
+  const kp = loadKeyPair(identityDir, keyPrefix);
+  const probe = Buffer.from(`tps-agent-create:${id}`);
+  if (!verify(probe, sign(probe, kp.signing.privateKey), kp.signing.publicKey)) {
+    refuseKeyPairMismatch(id, identityDir, keyPath, pubPath);
+  }
+  const pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
 
   // 2. Register in Flair, then verify the key actually landed.
   //
@@ -396,6 +412,18 @@ async function createAgent(args: AgentArgs): Promise<void> {
       const found =
         stored.publicKey === null ? "the row has no public key" : `the stored public key is '${stored.publicKey}'`;
       refuseRegistration(id, flairUrl, identityDir, `${found}, not the generated key`, writeError, "exists");
+    }
+    // cli#607 — the read-back runs over the operator credential and only shows the
+    // bytes Flair stored. Send one request signed with this identity's private key:
+    // only its acceptance proves Flair's verifier holds this key. A refused
+    // signature, or a response that does not carry the registered key, refuses.
+    try {
+      const confirmed = await flair.request<{ publicKey?: string }>("GET", `/Agent/${encodeURIComponent(id)}`);
+      if (storedKeyAsHex(confirmed?.publicKey ?? "") !== pubKeyHex) {
+        refuseRegistration(id, flairUrl, identityDir, "the signed request was accepted but its response did not confirm the registered key", writeError, "exists");
+      }
+    } catch (e) {
+      refuseRegistration(id, flairUrl, identityDir, `a request signed with the private key was refused (${e instanceof Error ? e.message : String(e)})`, writeError, "exists");
     }
     console.log(successLine ?? `  Agent '${id}' registered in Flair.`);
   }
