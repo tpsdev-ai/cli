@@ -508,7 +508,9 @@ export function pruneRelayAcceptanceReceipts(acceptedDir: string, now = Date.now
 function startReceiptPrune(branchId?: string): () => void {
   if (branchId && !/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error("invalid branch id for receipt prune");
   const pass = () => {
-    // Each tree's failure names that tree: acceptance receipts, or (cli#602) announcement markers.
+    // A failure that escapes a tree's prune pass is logged with that tree's name (acceptance
+    // receipts, or cli#602 announcement markers); per-file removal and stat failures inside
+    // pruneRelayAcceptanceReceipts are skipped silently and retried on the next pass.
     for (const [tree, failure] of [[".relay-accepted", "[relay] acceptance receipt prune failed"], [".relay-announced", "[relay] announcement marker prune failed"]] as const) {
       const root = join(getMailDir(), tree, "by-branch");
       const prune = (dir: string) => {
