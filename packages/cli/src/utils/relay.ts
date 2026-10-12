@@ -693,6 +693,9 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody): RelayAc
     if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
     return lock;
   };
+  // Create the mail root through the mail directory helper, so its ancestors are
+  // recorded for sync as before; the canonical root is then a real path of it.
+  getMailDir();
   const acceptanceRoot = relayAcceptanceLockRoot(branchId, body.id);
   mkdirMailDirectory(acceptanceRoot);
   const acceptanceLock = acquireLock(acceptanceRoot);
