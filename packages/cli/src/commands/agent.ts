@@ -16,7 +16,7 @@ import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/iden
 import { createFlairClient, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
@@ -312,7 +312,8 @@ function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string,
  * cli#607 — the Flair client could not load the private key file. The client
  * loads an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64
  * PKCS8 DER, and passes no passphrase, so an encrypted PEM key is named as
- * such. The refusal names the file's length only, never its bytes.
+ * such. Neither branch prints the key's bytes; only the branch for any other
+ * unusable key names the file's length.
  */
 function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, keyBytes: Uint8Array): never {
   const encrypted = isEncryptedPrivateKeyPem(Buffer.from(keyBytes).toString("utf-8"));
@@ -328,16 +329,42 @@ function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, 
 }
 
 /**
- * cli#607 — some of this agent's identity files exist, but not both `.key` and
- * `.pub`. Generating a pair here would write over the files that exist, so
- * refuse before writing anything.
+ * Whether a directory entry exists at `path`, without following a final
+ * symlink: a dangling symlink is an entry (existsSync reports it absent). Only
+ * ENOENT and ENOTDIR read as absent; any other lstat error reads as present, so
+ * a path that cannot be checked is never written over.
  */
-function refusePartialIdentity(id: string, identityDir: string, present: string[], missing: string[]): never {
+function identityEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (e) {
+    const code = (e as { code?: unknown } | null)?.code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+}
+
+/**
+ * cli#607 — some of this agent's identity paths hold an entry (a file or a
+ * symlink, dangling or not), but `.key` and `.pub` do not both exist.
+ * Generating a pair here would write over those entries, or through a symlink,
+ * so refuse before writing anything.
+ */
+function refusePartialIdentity(id: string, identityDir: string, present: string[], keyPath: string, pubPath: string): never {
+  const missing = [keyPath, pubPath].filter((path) => !existsSync(path));
+  const gaps = missing.map((path) => {
+    try {
+      return lstatSync(path).isSymbolicLink() ? `${path} is a symlink to a missing target` : `${path} cannot be read`;
+    } catch (e) {
+      const code = (e as { code?: unknown } | null)?.code;
+      return code === "ENOENT" || code === "ENOTDIR" ? `${path} is missing` : `${path} cannot be checked (${String(code)})`;
+    }
+  });
   console.error(
-    `❌ Agent '${id}' has a partial identity at ${identityDir} — found ${present.join(", ")}, but ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} missing; create does not generate a new pair over existing identity files.`,
+    `❌ Agent '${id}' has a partial identity at ${identityDir} — found ${present.join(", ")}, but ${gaps.join(" and ")}; create does not generate a new pair over existing identity entries.`,
   );
   console.error(
-    `   Remedy: restore ${missing.join(" and ")} for this agent, then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
+    `   Remedy: restore ${missing.join(" and ")} (for a dangling symlink, its target), then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
   );
   process.exit(1);
 }
@@ -393,13 +420,14 @@ async function createAgent(args: AgentArgs): Promise<void> {
   if (existsSync(keyPath) && existsSync(pubPath)) {
     console.log(`  Keys already exist at ${keyPath}`);
   } else {
-    // cli#607 — every file saveKeyPair writes: if any exists, the identity is
-    // partial, and generating would overwrite it.
+    // cli#607 — every path saveKeyPair writes: if any holds an entry (a dangling
+    // symlink included), the identity is partial, and generating would write over
+    // it or through it.
     const present = [".seed", ".key", ".pub", ".x25519.key", ".x25519.pub", ".meta.json"]
       .map((suffix) => join(identityDir, `${keyPrefix}${suffix}`))
-      .filter((path) => existsSync(path));
+      .filter((path) => identityEntryExists(path));
     if (present.length > 0) {
-      refusePartialIdentity(id, identityDir, present, [keyPath, pubPath].filter((path) => !existsSync(path)));
+      refusePartialIdentity(id, identityDir, present, keyPath, pubPath);
     }
     console.log(`  Generating Ed25519 keys for ${id}...`);
     saveKeyPair(generateKeyPair(), identityDir, keyPrefix);
@@ -410,10 +438,10 @@ async function createAgent(args: AgentArgs): Promise<void> {
   // with it and require the `.pub` on disk to verify that signature. cli#512
   // registered the stored `.pub` bytes verbatim, so a `.pub` that is not the
   // private key's public half could still be reported "registered" when Flair
-  // already held that `.pub`. Identity files that cannot be loaded are refused
-  // by name. The probe loads the key exactly as the Flair client below signs
-  // with it, so every format the client accepts is probed, and a readable key
-  // file the client cannot load is refused as unusable.
+  // already held that `.pub`. An identity file loadKeyPair reads but cannot
+  // load is refused by name. The probe loads the key exactly as the Flair
+  // client below signs with it, so every format the client accepts is probed,
+  // and a readable key file the client cannot load is refused as unusable.
   let kp: ReturnType<typeof loadKeyPair>;
   try {
     kp = loadKeyPair(identityDir, keyPrefix);

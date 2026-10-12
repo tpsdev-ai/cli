@@ -11,7 +11,7 @@ const patchShared = createPatchShared();
  * stores `publicKey` (see `refusePut`).
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash, createPrivateKey, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -333,9 +333,42 @@ for (const partial of [
       expect(res.stdout).not.toContain("Generating");
       expect(res.stderr).toContain(`Agent '${id}' has a partial identity at ${identityDir}`);
       for (const suffix of partial.missing) expect(res.stderr).toContain(join(identityDir, `${id}${suffix}`));
-      expect(res.stderr).toContain("create does not generate a new pair over existing identity files");
+      expect(res.stderr).toContain("create does not generate a new pair over existing identity entries");
       expect(res.stderr).toContain(`tps agent create --id ${id}`);
       expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
+      expect(fake.requests).toEqual([]);
+    } finally {
+      fake.stop();
+    }
+  });
+}
+
+// A dangling symlink at an identity path is an entry: existsSync reports it
+// absent, so it must not let create generate a pair and write through the link.
+for (const suffix of [".seed", ".key"]) {
+  test(`a dangling symlink at the identity's ${suffix}: refused as a partial identity, the link unchanged and nothing written at its target`, async () => {
+    const id = `${AGENT}-dangling-${suffix.replace(/\W/g, "")}`;
+    const identityDir = join(homedir(), ".tps", "identity");
+    const targetDir = join(homedir(), "dangling-targets");
+    mkdirSync(identityDir, { recursive: true });
+    mkdirSync(targetDir, { recursive: true });
+    const linkPath = join(identityDir, `${id}${suffix}`);
+    const target = join(targetDir, `${id}${suffix}`);
+    symlinkSync(target, linkPath);
+    const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+    try {
+      const res = await runCreate(fake.url, id, { inspectError: true });
+      // first: nothing was written through the link, and the link is as it was
+      expect(existsSync(target)).toBe(false);
+      expect(lstatSync(linkPath).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(linkPath)).toBe(target);
+      expect(res.hasError).toBe(false);
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered");
+      expect(res.stdout).not.toContain("Generating");
+      expect(res.stderr).toContain(`Agent '${id}' has a partial identity at ${identityDir} — found ${linkPath}`);
+      if (suffix === ".key") expect(res.stderr).toContain(`${linkPath} is a symlink to a missing target`);
+      expect(res.stderr).toContain("create does not generate a new pair over existing identity entries");
       expect(fake.requests).toEqual([]);
     } finally {
       fake.stop();
