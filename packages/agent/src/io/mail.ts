@@ -7,6 +7,7 @@ import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "
 import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
+import { mailboxLockRoot } from "../lib/mail-lock-namespace.js";
 import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
 import {
   decideEnvelopeForMailbox,
@@ -88,6 +89,7 @@ function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
  */
 export class MailClient {
   private mailboxRoot: string;
+  private readonly mailboxLockRoot: string;
   private inboxNew: string;
   private inboxCur: string;
   private inboxDlq: string;
@@ -111,6 +113,10 @@ export class MailClient {
     }
     this.flairClient = flairClient;
     this.mailboxRoot = join(mailDir, agentId);
+    // cli#616: the mailbox lock is keyed off the resolved real path of the
+    // configured mail directory, so it shares one namespace with CLI relay
+    // acceptance when both reach the same physical store by different paths.
+    this.mailboxLockRoot = mailboxLockRoot(mailDir, agentId);
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");
     this.inboxDlq = join(mailDir, agentId, "dlq");
@@ -229,10 +235,10 @@ export class MailClient {
     body: string,
     envelope: Envelope,
   ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
-    const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
+    const lock: MailLock | null = await acquireMailLock(this.mailboxLockRoot);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
     let relayLock: MailLock | null;
-    try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body)); }
+    try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body), this.mailDir); }
     catch (error) { lock.release(); throw error; }
     if (!relayLock) { lock.release(); throw new Error("relay acceptance busy; not promoted"); }
     try {
@@ -407,7 +413,7 @@ export class MailClient {
     try {
       let record: unknown;
       try { record = JSON.parse(readFileSync(srcPath, "utf-8")); } catch {}
-      relayLock = tryAcquireRelayMoveLock(record);
+      relayLock = tryAcquireRelayMoveLock(record, this.mailDir);
       if (!relayLock) return;
       if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
       writeRejectSidecar(this.inboxDlq, file, rejected.class, rejected.reason);

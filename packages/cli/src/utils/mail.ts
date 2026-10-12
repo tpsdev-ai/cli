@@ -11,7 +11,7 @@ import {
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
-  placeCurRecord, relayAcceptanceLockRoot, tryAcquireRelayMoveLock,
+  placeCurRecord, relayAcceptanceLockRoot, tryAcquireRelayMoveLock, mailboxLockRoot,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -145,12 +145,14 @@ export function relayAcceptRoot(agent: string): string {
 }
 
 export function relayAcceptLockRoot(agent: string): string {
+  // cli#616: derive from the resolved real path of the mail store, so a store
+  // reached by a different path shares one mailbox-lock namespace.
   try {
     assertValidAgentId(agent);
-    return join(mailDirPath(), agent);
+    return mailboxLockRoot(mailDirPath(), agent);
   } catch (error) {
     if (!(error instanceof Error && error.message.startsWith("Invalid agent id"))) throw error;
-    return join(mailDirPath(), ".undeliverable");
+    return mailboxLockRoot(mailDirPath(), ".undeliverable");
   }
 }
 

@@ -1,0 +1,1 @@
+- **Relay acceptance and MailClient share one lock namespace from the mail store's resolved real path (Closes #616).**
