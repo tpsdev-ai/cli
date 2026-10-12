@@ -11,8 +11,8 @@ const patchShared = createPatchShared();
  * stores `publicKey` (see `refusePut`).
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { createPrivateKey, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash, createPrivateKey, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { format } from "node:util";
@@ -248,7 +248,7 @@ test("the private key file is in no format the Flair client loads: a named refus
     expect(res.stdout).not.toContain("registered");
     expect(res.stderr).toContain(`Agent '${id}' has no usable private key at`);
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
-    expect(res.stderr).toContain("the file holds 31 bytes and is not a PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER");
+    expect(res.stderr).toContain("the file holds 31 bytes and could not be loaded as an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER");
     expect(res.stderr).toContain(`tps agent create --id ${id}`);
     expectNoKeyBytes(res.stdout + res.stderr, truncated);
     expect(fake.requests).toEqual([]);
@@ -266,6 +266,81 @@ function writeIdentity(id: string, keyPair: ReturnType<typeof generateKeyPair>, 
   writeFileSync(join(identityDir, `${id}.pub`), Buffer.from(keyPair.signing.publicKey));
   for (const [suffix, content] of Object.entries(extra)) writeFileSync(join(identityDir, `${id}${suffix}`), content);
   return { identityDir, keyPath };
+}
+
+const PKCS8_ED25519_PREFIX = Buffer.from("302e020100300506032b657004220420", "hex");
+
+test("an encrypted PEM private key matching the .pub: named as encrypted and refused before any Flair request, not a throw", async () => {
+  const id = `${AGENT}-encrypted-pem`;
+  const keyPair = generateKeyPair();
+  const der = Buffer.concat([PKCS8_ED25519_PREFIX, Buffer.from(keyPair.signing.privateKey)]);
+  const encryptedPem = createPrivateKey({ key: der, format: "der", type: "pkcs8" })
+    .export({ format: "pem", type: "pkcs8", cipher: "aes-256-cbc", passphrase: `passphrase-${randomUUID()}` })
+    .toString();
+  const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+  const { keyPath } = writeIdentity(id, keyPair);
+  writeFileSync(keyPath, encryptedPem);
+  try {
+    const res = await runCreate(fake.url, id, { inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.error).toBeNull();
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered");
+    expect(res.stderr).toContain(`Agent '${id}' has no usable private key at ${keyPath}`);
+    expect(res.stderr).toContain("the file is an encrypted PEM private key, and encrypted keys are not supported");
+    expect(res.stderr).toContain(`write its key to ${keyPath} unencrypted`);
+    expect(res.stderr).not.toContain("could not be loaded as");
+    expect(res.stderr).not.toContain(encryptedPem.split("\n")[1]!);
+    expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
+    expect(fake.requests).toEqual([]);
+  } finally {
+    fake.stop();
+  }
+});
+
+// A partial identity: some of the files saveKeyPair writes exist, but not both
+// `.key` and `.pub`. create must refuse before generating, so each existing
+// file is byte-identical afterwards.
+for (const partial of [
+  { name: "only the .key", files: [".key"], missing: [".pub"] },
+  { name: "only the .pub", files: [".pub"], missing: [".key"] },
+  { name: "only the .meta.json", files: [".meta.json"], missing: [".key", ".pub"] },
+]) {
+  test(`a partial identity with ${partial.name}: refused by name, the existing file left byte-identical, before any Flair request`, async () => {
+    const id = `${AGENT}-partial-${partial.files[0]!.replace(/\W/g, "")}`;
+    const keyPair = generateKeyPair();
+    const identityDir = join(homedir(), ".tps", "identity");
+    mkdirSync(identityDir, { recursive: true });
+    const contents: Record<string, Buffer> = {
+      ".key": Buffer.from(keyPair.signing.privateKey),
+      ".pub": Buffer.from(keyPair.signing.publicKey),
+      ".meta.json": Buffer.from(JSON.stringify({ fingerprint: keyPair.fingerprint, createdAt: keyPair.createdAt })),
+    };
+    for (const suffix of partial.files) writeFileSync(join(identityDir, `${id}${suffix}`), contents[suffix]!);
+    const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+    try {
+      const res = await runCreate(fake.url, id, { inspectError: true });
+      // first: nothing was written over the existing identity file (compared by
+      // digest, so a failure prints no key bytes)
+      const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+      for (const suffix of partial.files) {
+        expect(`${suffix}: ${digest(readFileSync(join(identityDir, `${id}${suffix}`)))}`).toBe(`${suffix}: ${digest(contents[suffix]!)}`);
+      }
+      for (const suffix of partial.missing) expect(existsSync(join(identityDir, `${id}${suffix}`))).toBe(false);
+      expect(res.hasError).toBe(false);
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered");
+      expect(res.stdout).not.toContain("Generating");
+      expect(res.stderr).toContain(`Agent '${id}' has a partial identity at ${identityDir}`);
+      for (const suffix of partial.missing) expect(res.stderr).toContain(join(identityDir, `${id}${suffix}`));
+      expect(res.stderr).toContain("create does not generate a new pair over existing identity files");
+      expect(res.stderr).toContain(`tps agent create --id ${id}`);
+      expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
+      expect(fake.requests).toEqual([]);
+    } finally {
+      fake.stop();
+    }
+  });
 }
 
 // chmod 000 does not stop root from reading, so the case cannot be built as root.
@@ -315,9 +390,9 @@ test("an identity's .meta.json is not JSON: a named refusal before any Flair req
   }
 });
 
-test("a PEM or base64 PKCS8 private key matching the .pub, with a row in Flair that holds the key: the probe accepts it and create reports registered", async () => {
-  // The Flair client signs with a PEM block, a raw 32-byte seed or base64 PKCS8
-  // DER (loadFlairSigningKey); the key-pair probe loads the file the same way,
+test("an unencrypted PEM or base64 PKCS8 private key matching the .pub, with a row in Flair that holds the key: the probe accepts it and create reports registered", async () => {
+  // The Flair client signs with an unencrypted PEM block, a raw 32-byte seed or
+  // base64 PKCS8 DER (loadFlairSigningKey); the key-pair probe loads the file the same way,
   // so a matched pair in either non-raw format passes the probe. The row already
   // holds the matching key and Flair accepts the signed request, so create then
   // reports registered, as main did for these files.
@@ -335,7 +410,7 @@ test("a PEM or base64 PKCS8 private key matching the .pub, with a row in Flair t
       if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
       return undefined;
     }, { [id]: publicKey });
-    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(keyPair.signing.privateKey)]);
+    const der = Buffer.concat([PKCS8_ED25519_PREFIX, Buffer.from(keyPair.signing.privateKey)]);
     const identityDir = join(homedir(), ".tps", "identity");
     mkdirSync(identityDir, { recursive: true });
     writeFileSync(join(identityDir, `${id}.key`), encode(der));

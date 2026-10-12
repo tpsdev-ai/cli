@@ -13,7 +13,7 @@
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
-import { createFlairClient, loadFlairSigningKey } from "../utils/flair-client.js";
+import { createFlairClient, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
@@ -298,9 +298,9 @@ function refuseRegistration(
 /**
  * cli#607 — a probe signed with the private key does not verify under the
  * public key file (or the key cannot make an Ed25519 signature at all), so the
- * file is not the private key's public half. Registering
- * it would register a key this identity's signatures never verify against, so
- * refuse before reaching Flair.
+ * file is not the private key's public half. Registering it would register a
+ * key this identity's signatures never verify against, so refuse before
+ * reaching Flair.
  */
 function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string, pubPath: string): never {
   console.error(`❌ Agent '${id}' has no consistent key pair at ${identityDir} — the private key in ${keyPath} does not derive the public key in ${pubPath}.`);
@@ -309,16 +309,35 @@ function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string,
 }
 
 /**
- * cli#607 — the Flair client cannot load the private key file: it is not a PEM
- * private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER. The refusal
- * names the file's length only, never its bytes.
+ * cli#607 — the Flair client could not load the private key file. The client
+ * loads an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64
+ * PKCS8 DER, and passes no passphrase, so an encrypted PEM key is named as
+ * such. The refusal names the file's length only, never its bytes.
  */
-function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, byteLength: number): never {
+function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, keyBytes: Uint8Array): never {
+  const encrypted = isEncryptedPrivateKeyPem(Buffer.from(keyBytes).toString("utf-8"));
+  const formats = "an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER";
+  const state = encrypted
+    ? `the file is an encrypted PEM private key, and encrypted keys are not supported: the Flair client loads keys without a passphrase`
+    : `the file holds ${keyBytes.length} bytes and could not be loaded as ${formats}, the formats the Flair client signs with`;
+  console.error(`❌ Agent '${id}' has no usable private key at ${keyPath} — ${state}.`);
   console.error(
-    `❌ Agent '${id}' has no usable private key at ${keyPath} — the file holds ${byteLength} bytes and is not a PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER, the formats the Flair client signs with.`,
+    `   Remedy: if this agent's identity must be kept, write its key to ${keyPath} unencrypted, as ${formats}; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+  );
+  process.exit(1);
+}
+
+/**
+ * cli#607 — some of this agent's identity files exist, but not both `.key` and
+ * `.pub`. Generating a pair here would write over the files that exist, so
+ * refuse before writing anything.
+ */
+function refusePartialIdentity(id: string, identityDir: string, present: string[], missing: string[]): never {
+  console.error(
+    `❌ Agent '${id}' has a partial identity at ${identityDir} — found ${present.join(", ")}, but ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} missing; create does not generate a new pair over existing identity files.`,
   );
   console.error(
-    `   Remedy: if this agent's identity must be kept, write its private key to ${keyPath} in one of those formats; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+    `   Remedy: restore ${missing.join(" and ")} for this agent, then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
   );
   process.exit(1);
 }
@@ -374,6 +393,14 @@ async function createAgent(args: AgentArgs): Promise<void> {
   if (existsSync(keyPath) && existsSync(pubPath)) {
     console.log(`  Keys already exist at ${keyPath}`);
   } else {
+    // cli#607 — every file saveKeyPair writes: if any exists, the identity is
+    // partial, and generating would overwrite it.
+    const present = [".seed", ".key", ".pub", ".x25519.key", ".x25519.pub", ".meta.json"]
+      .map((suffix) => join(identityDir, `${keyPrefix}${suffix}`))
+      .filter((path) => existsSync(path));
+    if (present.length > 0) {
+      refusePartialIdentity(id, identityDir, present, [keyPath, pubPath].filter((path) => !existsSync(path)));
+    }
     console.log(`  Generating Ed25519 keys for ${id}...`);
     saveKeyPair(generateKeyPair(), identityDir, keyPrefix);
     console.log(`  Keys saved to ${identityDir}/`);
@@ -398,7 +425,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
   try {
     signingKey = loadFlairSigningKey(keyPath, id);
   } catch {
-    refuseUnusablePrivateKey(id, keyPath, pubPath, kp.signing.privateKey.length);
+    refuseUnusablePrivateKey(id, keyPath, pubPath, kp.signing.privateKey);
   }
   let probeSignature: Uint8Array | null;
   try {
