@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Print the Bun version in the ROOT package.json "packageManager" (e.g. 1.3.10),
-# read with a JSON parser. Fails if the root pin is missing, malformed, or not
-# exactly one complete bun@<x.y.z> value.
+# Print the Bun version from the root package.json packageManager.
 #
 # Usage: BUN_VERSION="$(scripts/docker-bun-version.sh)" docker compose build
 set -euo pipefail
@@ -20,18 +18,21 @@ let pkg;
 try { pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
 catch (e) { console.error("package.json is not valid JSON: " + e.message); process.exit(2); }
 const pm = pkg !== null && typeof pkg === "object" ? pkg.packageManager : undefined;
-process.stdout.write(typeof pm === "string" ? pm : "");
-' "$root/package.json" >"$pin_tmp" || fail "cannot read $root/package.json"
+if (typeof pm === "string" && /[\u0000-\u001f\u007f-\u009f]/.test(pm)) {
+  const shown = JSON.stringify(pm).replace(/[\u007f-\u009f]/g,
+    c => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+  console.error("docker-bun-version: root package.json packageManager must be exactly one bun@<x.y.z> (got: " + shown + ")");
+  process.exitCode = 2;
+} else {
+  process.stdout.write(typeof pm === "string" ? pm : "");
+}
+' "$root/package.json" >"$pin_tmp" || exit 1
 
-# read -d '' reads the value verbatim: $(...) would trim a trailing newline and
-# hide it from the check below (cli#605).
+# Node rejects control characters before Bash reads the value.
 pm=""
 IFS= read -r -d '' pm <"$pin_tmp" || true
 
-# Whole-value match, not a line-by-line grep. A packageManager holding two pins,
-# on two lines, passed the line-based check because its first line looked like a
-# pin; this admits exactly one complete bun@<x.y.z> — three numeric parts, no
-# range, tag, prerelease or extra text.
+# Match the whole value.
 if ! [[ "$pm" =~ ^bun@[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   shown="${pm//$'\n'/<newline>}"; shown="${shown//$'\r'/<cr>}"
   fail "root package.json packageManager must be exactly one bun@<x.y.z> (got: ${shown:-<missing>})"

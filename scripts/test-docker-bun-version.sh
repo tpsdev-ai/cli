@@ -17,7 +17,8 @@ check() { # name wanted-exit actual-exit
 }
 pin_of() { # fixture-name package.json-text; sets out, err and rc
   mkdir -p "$work/$1"; printf '%s' "$2" >"$work/$1/package.json"
-  out="$(DOCKER_BUN_VERSION_ROOT="$work/$1" bash "$helper" 2>"$work/$1/stderr")"; rc=$?
+  DOCKER_BUN_VERSION_ROOT="$work/$1" bash "$helper" >"$work/$1/stdout" 2>"$work/$1/stderr"; rc=$?
+  out="$(cat "$work/$1/stdout")"
   err="$(cat "$work/$1/stderr")"
 }
 
@@ -26,6 +27,7 @@ refused() { # name package.json-text, then needles the refusal must name
   name="$1"; text="$2"; shift 2
   pin_of "$name" "$text"
   if [ "$rc" = 0 ]; then printf 'FAIL  %s (accepted, exit 0)\n' "$name"; nfail=$((nfail + 1)); return; fi
+  if [ -s "$work/$name/stdout" ]; then printf 'FAIL  %s (refusal printed stdout: %s)\n' "$name" "$out"; nfail=$((nfail + 1)); return; fi
   case "$err" in
     *"$remedy"*) : ;;
     *) printf 'FAIL  %s (refusal lacks the remedy: %s)\n' "$name" "$err"; nfail=$((nfail + 1)); return ;;
@@ -55,9 +57,14 @@ check "non-bun manager fails" 1 "$rc"
 pin_of malformed '{"packageManager": "bun@1.3.10",'
 check "malformed JSON fails" 1 "$rc"
 
-refused "two pins are refused" '{"packageManager": "bun@1.3.10\nbun@1.3.11"}' 'bun@1.3.10<newline>bun@1.3.11'
-refused "a second line that is not a pin is refused" '{"packageManager": "bun@1.3.10\nbun@latest"}' 'bun@1.3.10<newline>bun@latest'
-refused "a trailing newline is refused" '{"packageManager": "bun@1.3.10\n"}' 'bun@1.3.10<newline>'
+refused "two pins are refused" '{"packageManager": "bun@1.3.10\nbun@1.3.11"}' '"bun@1.3.10\nbun@1.3.11"'
+refused "a second line that is not a pin is refused" '{"packageManager": "bun@1.3.10\nbun@latest"}' '"bun@1.3.10\nbun@latest"'
+refused "a trailing newline is refused" '{"packageManager": "bun@1.3.10\n"}' '"bun@1.3.10\n"'
+refused "a trailing NUL is refused" '{"packageManager": "bun@1.3.10\u0000"}' '"bun@1.3.10\u0000"'
+refused "NUL followed by a second pin is refused" '{"packageManager": "bun@1.3.10\u0000bun@1.3.11"}' '"bun@1.3.10\u0000bun@1.3.11"'
+refused "a control character is refused" '{"packageManager": "bun@1.3.10\u0001"}' '"bun@1.3.10\u0001"'
+refused "DEL is refused" '{"packageManager": "bun@1.3.10\u007f"}' '"bun@1.3.10\u007f"'
+refused "a C1 control character is refused" '{"packageManager": "bun@1.3.10\u0085"}' '"bun@1.3.10\u0085"'
 refused "a short pin is refused" '{"packageManager": "bun@1.3"}' 'bun@1.3'
 refused "a tag is refused" '{"packageManager": "bun@latest"}' 'bun@latest'
 refused "a range is refused" '{"packageManager": "bun@^1.3.10"}' 'bun@^1.3.10'
@@ -65,6 +72,13 @@ refused "a prerelease is refused" '{"packageManager": "bun@1.3.10-canary"}' 'bun
 refused "a four-part version is refused" '{"packageManager": "bun@1.3.10.5"}' 'bun@1.3.10.5'
 refused "trailing text is refused" '{"packageManager": "bun@1.3.10 "}' 'bun@1.3.10 '
 refused "a missing pin is refused" '{"name": "x"}' '<missing>'
+
+refused "an empty pin is reported as missing" '{"packageManager": ""}' '<missing>'
+refused "a numeric pin is reported as missing" '{"packageManager": 123}' '<missing>'
+refused "a boolean pin is reported as missing" '{"packageManager": true}' '<missing>'
+refused "an array pin is reported as missing" '{"packageManager": ["bun@1.3.10"]}' '<missing>'
+refused "an object pin is reported as missing" '{"packageManager": {"pin": "bun@1.3.10"}}' '<missing>'
+refused "a null pin is reported as missing" '{"packageManager": null}' '<missing>'
 
 bash "$assert" 1.3.10 1.3.10 svc >/dev/null 2>&1; check "comparison: match passes" 0 "$?"
 bash "$assert" 1.3.10 1.4.0 svc >/dev/null 2>&1; check "comparison: mismatch fails" 1 "$?"
