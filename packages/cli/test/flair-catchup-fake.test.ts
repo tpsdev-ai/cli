@@ -139,12 +139,23 @@ describe("cli#606 — the catch-up fake holds to Flair's coded catch-up contract
     expect(res.body.nextAfter).toBe(after);
   });
 
-  test("with no since and no watermark, a read creates the viewer's watermark 24h back and serves after it", async () => {
+  test("with no since and no watermark, a read creates the viewer's watermark the default 24h back and serves after it", async () => {
     const watermarks: Record<string, string> = {};
     serve({ events: [event("day-old", 25 * 60), event("recent", 10)], watermarks });
     const res = await getFeed({});
     expect(res.body.events.map((e: { id: string }) => e.id)).toEqual(["recent"]);
     expect(Object.keys(watermarks)).toEqual(["viewer-a"]);
+    expect(res.body.watermark).toBe(watermarks["viewer-a"]);
+  });
+
+  test("with a zero backfill, the created watermark starts at now and serves nothing earlier", async () => {
+    const watermarks: Record<string, string> = {};
+    serve({ events: [event("day-old", 25 * 60), event("recent", 10)], watermarks, backfillMs: 0 });
+    const before = new Date().toISOString();
+    const res = await getFeed({});
+    expect(res.body.events).toEqual([]);
+    expect(Object.keys(watermarks)).toEqual(["viewer-a"]);
+    expect(watermarks["viewer-a"]! >= `${before}\t`).toBe(true);
     expect(res.body.watermark).toBe(watermarks["viewer-a"]);
   });
 });

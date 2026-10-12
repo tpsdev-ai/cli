@@ -170,7 +170,7 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   const jsonAgents = () =>
     (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
 
-  test("a nonempty read shows each agent's newest task and newest heartbeat", async () => {
+  test("a nonempty read shows each agent's newest task and, with no record heartbeat, the newest feed heartbeat", async () => {
     const beats = [
       { id: "h1", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(50) },
       { id: "h2", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(3) },
@@ -181,6 +181,29 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
     expect(row(out, "Agent A")).not.toContain("older task");
     expect(row(out, "Agent B")).toContain("3m ago");
     expect(row(out, "Agent B")).toContain("idle");
+  });
+
+  test("the Agent record's heartbeat takes precedence over a newer feed heartbeat, in the table and JSON", async () => {
+    const recordBeat = at(30);
+    const agents = [{ ...AGENT_LIST[0]!, lastHeartbeat: recordBeat }, AGENT_LIST[1]!];
+    const feed = orgEventCatchupRoute({
+      events: [{ id: "h1", kind: "agent.heartbeat", authorId: "agent-a", summary: "heartbeat", createdAt: at(3) }],
+    });
+    const run = async (json: boolean) => {
+      stub.stop();
+      output.length = 0;
+      const key = writeKeyFile(root, VIEWER, SEED);
+      stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url, caller) =>
+        url.pathname === "/Agent/" ? Response.json(agents) : url.pathname.startsWith("/OrgEventCatchup/") ? feed(req, url, caller) : undefined,
+      );
+      await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true, json });
+      return output.join("\n");
+    };
+    const table = await run(false);
+    expect(row(table, "Agent A")).toContain("30m ago");
+    expect(row(table, "Agent A")).not.toContain("3m ago");
+    await run(true);
+    expect(jsonAgents()[0]!.lastHeartbeat).toBe(recordBeat);
   });
 
   test("the blocker line shows the newest blocker read, not the first", async () => {

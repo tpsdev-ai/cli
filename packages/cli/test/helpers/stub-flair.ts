@@ -184,7 +184,17 @@ export interface CatchupFeed {
   watermarks?: Record<string, string>;
   /** Callers treated as admins, who may read any participant's feed. */
   admins?: readonly string[];
+  /**
+   * How far back a first watermark starts, in ms: Flair's
+   * `FLAIR_CATCHUP_BACKFILL_MS`, whose default is 24h; `0` starts it at now.
+   * A negative or non-finite value falls back to the default, as Flair's
+   * parseBackfillMs does.
+   */
+  backfillMs?: number;
 }
+
+/** Flair's default first-watermark backfill (agent-read-position-lib.ts DEFAULT_CATCHUP_BACKFILL_MS). */
+export const DEFAULT_CATCHUP_BACKFILL_MS = 24 * 3_600_000;
 
 /** A catch-up route, plus a record of what it was asked for and what it served. */
 export interface CatchupRoute {
@@ -208,7 +218,8 @@ const positionOf = (e: Record<string, unknown>) => `${String(e.createdAt ?? "")}
  *   - a `since` that does not parse as a date gets 400;
  *   - the cursor is the `after` query when non-empty (an unknown value is used
  *     as a filter, not refused), else the participant's watermark, else just
- *     before `since`, else a new watermark 24h back (created and kept);
+ *     before `since`, else a new watermark `backfillMs` back (created and
+ *     kept; 24h by default, as Flair's default, and now when it is 0);
  *   - an event is served when it has `createdAt`, is not older than `since`,
  *     sorts after the cursor, is broadcast (no `targetIds`) or targets the
  *     participant, and has not expired;
@@ -240,7 +251,9 @@ export function orgEventCatchupRoute(feed: CatchupFeed): CatchupRoute {
     else if (watermark) after = watermark;
     else if (since) after = `${since}\t`;
     else {
-      after = `${new Date(Date.now() - 24 * 3_600_000).toISOString()}\t`;
+      const raw = feed.backfillMs;
+      const backfill = raw === undefined || !Number.isFinite(raw) || raw < 0 ? DEFAULT_CATCHUP_BACKFILL_MS : raw;
+      after = `${new Date(Math.max(0, Date.now() - backfill)).toISOString()}\t`;
       watermarks[participant] = after;
       watermark = after;
     }
