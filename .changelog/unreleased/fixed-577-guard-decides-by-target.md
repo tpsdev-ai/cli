@@ -6,7 +6,7 @@
   through `patchShared` however the value was computed. Object bindings with
   identifier or string-literal keys and property-derived aliases are tracked.
   Computed binding keys and array bindings of guarded roots are out of scope.
-  A name declared in an enclosing scope is not treated as the global.
+  A local binding that does not alias a guarded root is not treated as that global.
   An assignment whose member target is rooted in anything other than an
   identifier, `this`, or an object or array literal (for example
   `getG().fetch = ...`) fails whatever the value. Destructuring targets are not
