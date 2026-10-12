@@ -262,13 +262,8 @@ export function mailboxReplayStore(root: string): ReplayStore {
 }
 
 /**
- * The pending placement intents in this mailbox, as `{ messageId, file }`.
- *
- * A recovery pass for an interrupted first delivery enumerates these to find a
- * record whose only copy is in `cur/` under a pending intent: the `new/` scan
- * cannot see it, and gc and archive skip whatever a pending intent names. A
- * malformed intent is quarantined and left out. Call while holding the mailbox
- * lock, and re-read the intent for each named record before acting on it.
+ * List well-formed pending intents; quarantine malformed ones and omit them.
+ * Call under the mailbox lock and re-read each intent before acting on it.
  */
 export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string }> {
   const entries: Array<{ messageId: string; file: string }> = [];

@@ -233,19 +233,12 @@ export class MailClient {
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
+      if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
       const dstPath = join(this.inboxCur, file);
       if (sameFileByDeviceInode(srcPath, dstPath)) {
-        const pending = replay.hasPendingPlacement(envelope.messageId, file);
-        const consumed = replay.isConsumed(envelope.messageId, pending ? file : undefined);
-        if (!pending || consumed) {
-          unlinkSync(srcPath);
-          replay.finishPlacement(envelope.messageId, file);
-          return "already-delivered";
-        }
-        replay.recordConsumed(envelope.messageId);
+        replay.isConsumed(envelope.messageId);
         unlinkSync(srcPath);
-        replay.finishPlacement(envelope.messageId, file);
-        return null;
+        return "already-delivered";
       }
       const consumed = replay.isConsumed(envelope.messageId);
       if (consumed) {
@@ -284,24 +277,17 @@ export class MailClient {
   }
 
   /**
-   * Complete a first delivery a killed process interrupted (cli#600).
-   *
-   * The placement is: write an intent, link `new/<file>` into `cur/<file>`,
-   * unlink `new/<file>`, commit the consumed id, finish the intent. A process
-   * killed after the unlink and before the commit leaves the record's only copy
-   * in `cur/` under a pending intent: the `new/` scan never sees it, and gc and
-   * archive skip whatever the intent names. This pass completes each such
-   * placement — verify the cur copy, commit the consumed id, finish the intent —
-   * and returns the message once. An intent whose cur copy is absent is
-   * finished, so its new/ copy is retried by the scan below; one whose cur copy
-   * is present but is not the one the intent placed, or fails verification, is
-   * left for a later check.
+   * Recover verified cur copies matching the intent's recorded identity (cli#600).
+   * Verification or lock failure defers recovery. A present mismatched copy,
+   * including an older intent without identity, leaves the intent pending and
+   * withholds delivery; the new/ scan cannot replace that intent.
    */
   private async recoverInterruptedPlacements(messages: MailMessage[]): Promise<void> {
     let pending: Array<{ messageId: string; file: string }>;
-    const listing = await acquireMailLock(this.mailboxRoot);
-    if (!listing) return; // another check holds the mailbox; a later check recovers
+    let listing: MailLock | null = null;
     try {
+      listing = await acquireMailLock(this.mailboxRoot);
+      if (!listing) return; // lock unavailable; defer recovery
       pending = pendingPlacementEntries(this.mailboxRoot);
     } catch (err) {
       this.events?.emit({
@@ -314,40 +300,27 @@ export class MailClient {
       });
       return; // a later check retries
     } finally {
-      listing.release();
+      listing?.release();
     }
 
     for (const { messageId, file } of pending) {
       const curPath = join(this.inboxCur, file);
-      let body: string;
       try {
-        body = readFileSync(curPath, "utf-8");
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-          this.events?.emit({
-            type: "mail.receive",
-            agent: this.agentId,
-            status: "error",
-            from: "unknown",
-            durationMs: 0,
-            error: sanitizeError(err),
-          });
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(curPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          // Observed absent; re-check under the lock before finishing the intent.
+          await this.finishUnlinkedPlacement(messageId, file);
           continue;
         }
-        // The placement never linked: finish the intent so the new/ copy, if
-        // any, is retried by the scan below.
-        await this.finishUnlinkedPlacement(messageId, file);
-        continue;
-      }
-
-      try {
-        const outcome = await this.verifyMailBody(body);
+        const outcome = await this.verifyMailBody(bytes.toString("utf8"));
         if (!outcome.pass) continue; // withhold: the cur copy is not a verified message
         const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
-        const delivered = await this.completeInterruptedPlacement(messageId, file, body, outcome.envelope, trustTier);
+        const delivered = await this.completeInterruptedPlacement(messageId, file, bytes, outcome.envelope, trustTier);
         if (delivered) messages.push(delivered);
       } catch (err) {
-        // Withhold: Flair unavailable, an unreadable copy, or unreadable history.
         this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
@@ -360,14 +333,14 @@ export class MailClient {
     }
   }
 
-  /** Finish an intent whose cur copy is absent, under the lock, so a new/ copy is retried. */
+  /** Finish a still-pending intent only when cur/ is absent under the lock. */
   private async finishUnlinkedPlacement(messageId: string, file: string): Promise<void> {
     const lock = await acquireMailLock(this.mailboxRoot);
     if (!lock) return;
     try {
       const replay = mailboxReplayStore(this.mailboxRoot);
       if (!replay.hasPendingPlacement(messageId, file)) return;
-      if (replay.ownsPendingPlacement(messageId, file)) return; // a link appeared; leave it to recovery
+      if (lstatOrAbsent(join(this.inboxCur, file)) !== null) return;
       replay.finishPlacement(messageId, file);
     } finally {
       lock.release();
@@ -375,14 +348,12 @@ export class MailClient {
   }
 
   /**
-   * Complete one interrupted placement under the lock: re-check the intent and
-   * the cur copy, commit the consumed id, finish the intent, and return the
-   * message. Returns null when the state no longer matches the intent.
+   * Re-check the intent, recorded identity and raw bytes under the lock.
    */
   private async completeInterruptedPlacement(
     messageId: string,
     file: string,
-    body: string,
+    bytes: Buffer,
     envelope: Envelope,
     trustTier: MailMessage["trustTier"],
   ): Promise<MailMessage | null> {
@@ -390,25 +361,23 @@ export class MailClient {
     if (!lock) throw new Error("mailbox lock busy; interrupted placement recovery deferred");
     try {
       const replay = mailboxReplayStore(this.mailboxRoot);
-      // Re-check everything the decision used: the intent still names this
-      // message and file, the cur copy is the file the intent placed (same
-      // inode), the envelope is that message, and the bytes are unchanged.
+      // Match the intent, recorded device/inode and pre-verification raw bytes.
       if (!replay.hasPendingPlacement(messageId, file)) return null;
       if (envelope.messageId !== messageId) return null;
       if (!replay.ownsPendingPlacement(messageId, file)) return null;
-      let current: string;
+      let current: Buffer;
       try {
-        current = readFileSync(join(this.inboxCur, file), "utf-8");
+        current = readFileSync(join(this.inboxCur, file));
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw err;
       }
-      if (current !== body) return null;
+      if (!current.equals(bytes)) return null;
       if (!replay.isConsumed(messageId, file)) replay.recordConsumed(messageId);
       replay.finishPlacement(messageId, file);
       return {
         filename: file,
-        body,
+        body: bytes.toString("utf8"),
         receivedAt: new Date(),
         headers: {},
         from: envelope.from,

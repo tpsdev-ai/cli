@@ -1,29 +1,15 @@
-/**
- * mail-interrupted-recovery.test.ts — cli#600.
- *
- * MailClient's first delivery writes a placement intent, links `new/<file>`
- * into `cur/<file>`, unlinks `new/<file>`, commits the consumed id and finishes
- * the intent. A process killed after the `new/<file>` unlink and before the
- * consumed id is committed left the record's only copy in `cur/` under a
- * pending intent, which the `new/` scan never sees (gc and archive skip
- * whatever the intent names), so a later check never returned it.
- *
- * Each case runs a REAL checkNewMail() in a child process and SIGKILLs it at an
- * injected pause point BEFORE a named filesystem operation — a killed process,
- * never an injected error — then checks from a fresh client: the message is
- * returned exactly once, never duplicated. Every spawned process has a
- * deadline; roots are mkdtemp'd.
- */
+/** Real filesystem crash-boundary and unresolved-intent regressions (cli#600). */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
-import { hasCommittedMessageId } from "../src/lib/mailbox-policy.js";
+import { hasCommittedMessageId, mailboxReplayStore } from "../src/lib/mailbox-policy.js";
+import { acquireMailLock } from "../src/lib/mail-lock.js";
 import { signEnvelope, type FlairClient } from "../src/lib/signEnvelope.js";
 
 const AGENT = "agent-a";
@@ -54,7 +40,7 @@ beforeEach(() => {
 
 afterEach(() => rmSync(mailDir, { recursive: true, force: true }));
 
-/** Plant one verified record in new/ and return its path. */
+/** Plant one signed record in new/ and return its path. */
 function plant(messageId: string): string {
   const timestamp = new Date().toISOString();
   const envelope = signEnvelope(
@@ -144,7 +130,7 @@ function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promi
   });
 }
 
-/** A fresh client returns the message once and never again; no leftover intent. */
+/** Check consecutive calls from a fresh client and placement cleanup. */
 async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
   const client = new MailClient(mailDir, undefined, AGENT, verifier());
   const first = await client.checkNewMail();
@@ -163,7 +149,7 @@ async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
 
 const CASES = ["intent-write", "link-to-cur", "source-removal", "ledger-commit", "intent-finish"];
 
-describe("MailClient recovers a delivery interrupted at any placement step (cli#600)", () => {
+describe("MailClient recovery at the tested placement boundaries (cli#600)", () => {
   for (const at of CASES) {
     test(`a later check returns the message once after a kill before ${at}`, async () => {
       const messageId = `kill-${at}`;
@@ -174,4 +160,97 @@ describe("MailClient recovers a delivery interrupted at any placement step (cli#
       await assertDeliveredExactlyOnce(messageId);
     });
   }
+});
+
+describe("MailClient defers unresolved placements", () => {
+  test("a mismatched cur copy and same-id new copy leave the pending intent unchanged", async () => {
+    const messageId = "mismatched-copy";
+    const source = plant(messageId);
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
+    const original = readFileSync(source);
+    plant("unrelated-cur-copy");
+    copyFileSync(source, curPath());
+    writeFileSync(source, original);
+    const intentPath = join(mailboxRoot, readdirSync(mailboxRoot).find((n) => n.startsWith(".placement-") && n.endsWith(".json"))!);
+    const intent = readFileSync(intentPath);
+
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(readFileSync(intentPath).equals(intent)).toBe(true);
+    expect(existsSync(source)).toBe(true);
+    expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
+  });
+
+  test("different invalid UTF-8 bytes with equal decoded text defer recovery", async () => {
+    const messageId = "changed-raw-bytes";
+    const source = plant(messageId);
+    const record = readFileSync(source);
+    const bytes = (byte: number) => Buffer.concat([
+      Buffer.from('{"transport":"'), Buffer.from([byte]), Buffer.from('",'), record.subarray(1),
+    ]);
+    const original = bytes(0x80);
+    const replacement = bytes(0x81);
+    expect(original.equals(replacement)).toBe(false);
+    expect(original.toString("utf8")).toBe(replacement.toString("utf8"));
+    writeFileSync(source, original);
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
+    mkdirSync(join(mailboxRoot, "cur"));
+    renameSync(source, curPath());
+    const normal = verifier();
+    let changed = false;
+    const client = new MailClient(mailDir, undefined, AGENT, {
+      async getAgent(name: string) {
+        if (!changed) {
+          changed = true;
+          writeFileSync(curPath(), replacement);
+        }
+        return normal.getAgent(name);
+      },
+    });
+
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
+    expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
+    await assertDeliveredExactlyOnce(messageId);
+  });
+
+  test("an older intent without identity with only a cur copy is withheld", async () => {
+    const messageId = "older-intent";
+    const source = plant(messageId);
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json");
+    renameSync(source, curPath());
+    expect(await client.checkNewMail()).toEqual([]);
+    expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
+    expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
+  });
+
+  test("absent-copy cleanup preserves an intent while a mismatched cur copy exists", async () => {
+    const messageId = "appeared-copy";
+    const source = plant(messageId);
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
+    copyFileSync(source, curPath());
+    await (client as unknown as { finishUnlinkedPlacement(id: string, file: string): Promise<void> })
+      .finishUnlinkedPlacement(messageId, "m1.json");
+    expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
+  });
+
+  test("lock-acquisition failure leaves a cur-only placement pending", async () => {
+    const messageId = "lock-failure";
+    const source = plant(messageId);
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
+    renameSync(source, curPath());
+    const lock = await acquireMailLock(mailboxRoot);
+    expect(lock).not.toBeNull();
+    try {
+      expect(await client.checkNewMail()).toEqual([]);
+      expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
+    } finally {
+      lock?.release();
+    }
+    await assertDeliveredExactlyOnce(messageId);
+  });
 });
