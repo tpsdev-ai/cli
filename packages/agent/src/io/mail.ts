@@ -292,8 +292,10 @@ export class MailClient {
    * in `cur/` under a pending intent: the `new/` scan never sees it, and gc and
    * archive skip whatever the intent names. This pass completes each such
    * placement — verify the cur copy, commit the consumed id, finish the intent —
-   * and returns the message once. An intent whose cur copy is absent, is not the
-   * one the intent placed, or fails verification is left for a later check.
+   * and returns the message once. An intent whose cur copy is absent is
+   * finished, so its new/ copy is retried by the scan below; one whose cur copy
+   * is present but is not the one the intent placed, or fails verification, is
+   * left for a later check.
    */
   private async recoverInterruptedPlacements(messages: MailMessage[]): Promise<void> {
     let pending: Array<{ messageId: string; file: string }>;
