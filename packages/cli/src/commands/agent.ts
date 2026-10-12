@@ -12,11 +12,12 @@
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
-import { generateKeyPair, saveKeyPair, loadKeyPair, sign, verify } from "../utils/identity.js";
-import { createFlairClient } from "../utils/flair-client.js";
+import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
+import { createFlairClient, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
 import {
@@ -307,15 +308,16 @@ function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string,
 }
 
 /**
- * cli#607 — the private key file cannot sign: `create` reads it as a raw
- * 32-byte Ed25519 seed, and it is not one. The refusal names the file's length
- * only, never its bytes.
+ * cli#607 — the Flair client cannot load the private key file: it is not a PEM
+ * private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER. The refusal
+ * names the file's length only, never its bytes.
  */
 function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, byteLength: number): never {
-  const state = byteLength === 32 ? "signing with it failed" : `the file holds ${byteLength} bytes, not a raw 32-byte Ed25519 seed`;
-  console.error(`❌ Agent '${id}' has no usable private key at ${keyPath} — ${state}.`);
   console.error(
-    `   Remedy: if this agent's identity must be kept, write its raw 32-byte Ed25519 seed to ${keyPath}; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+    `❌ Agent '${id}' has no usable private key at ${keyPath} — the file holds ${byteLength} bytes and is not a PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER, the formats the Flair client signs with.`,
+  );
+  console.error(
+    `   Remedy: if this agent's identity must be kept, write its private key to ${keyPath} in one of those formats; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
   );
   process.exit(1);
 }
@@ -351,16 +353,25 @@ async function createAgent(args: AgentArgs): Promise<void> {
   // with it and require the `.pub` on disk to verify that signature. cli#512
   // registered the stored `.pub` bytes verbatim, so a `.pub` that is not the
   // private key's public half could still be reported "registered" when Flair
-  // already held that `.pub`. A private key that cannot sign is refused by name.
+  // already held that `.pub`. The probe loads the key exactly as the Flair
+  // client below signs with it, so every format the client accepts is checked,
+  // and only a file the client cannot load is refused as unusable.
   const kp = loadKeyPair(identityDir, keyPrefix);
   const probe = Buffer.from(`tps-agent-create:${id}`);
-  let probeSignature: Uint8Array;
+  let signingKey: ReturnType<typeof loadFlairSigningKey>;
   try {
-    probeSignature = sign(probe, kp.signing.privateKey);
+    signingKey = loadFlairSigningKey(keyPath, id);
   } catch {
     refuseUnusablePrivateKey(id, keyPath, pubPath, kp.signing.privateKey.length);
   }
-  if (!verify(probe, probeSignature, kp.signing.publicKey)) {
+  let probeSignature: Uint8Array | null;
+  try {
+    probeSignature = cryptoSign(null, probe, signingKey);
+  } catch {
+    // A loadable key that cannot make an Ed25519 signature is not this `.pub`'s pair.
+    probeSignature = null;
+  }
+  if (probeSignature === null || !verify(probe, probeSignature, kp.signing.publicKey)) {
     refuseKeyPairMismatch(id, identityDir, keyPath, pubPath);
   }
   const pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");

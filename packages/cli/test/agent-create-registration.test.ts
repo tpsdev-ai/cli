@@ -12,7 +12,7 @@ const patchShared = createPatchShared();
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createPrivateKey, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { format } from "node:util";
@@ -231,7 +231,7 @@ test("the private key does not derive the public key file: exits non-zero before
   }
 });
 
-test("the private key file is not a 32-byte Ed25519 seed: a named refusal before any Flair request, not a throw", async () => {
+test("the private key file is in no format the Flair client loads: a named refusal before any Flair request, not a throw", async () => {
   const id = `${AGENT}-malformed-key`;
   const keyPair = generateKeyPair();
   const truncated = Buffer.from(keyPair.signing.privateKey).subarray(0, 31);
@@ -248,12 +248,53 @@ test("the private key file is not a 32-byte Ed25519 seed: a named refusal before
     expect(res.stdout).not.toContain("registered");
     expect(res.stderr).toContain(`Agent '${id}' has no usable private key at`);
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
-    expect(res.stderr).toContain("the file holds 31 bytes, not a raw 32-byte Ed25519 seed");
+    expect(res.stderr).toContain("the file holds 31 bytes and is not a PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER");
     expect(res.stderr).toContain(`tps agent create --id ${id}`);
     expectNoKeyBytes(res.stdout + res.stderr, truncated);
     expect(fake.requests).toEqual([]);
   } finally {
     fake.stop();
+  }
+});
+
+test("a PEM or base64 PKCS8 private key matching the .pub: the probe accepts it and create reports registered", async () => {
+  // The Flair client signs with a PEM block, a raw 32-byte seed or base64 PKCS8
+  // DER (loadFlairSigningKey); the key-pair probe loads the file the same way,
+  // so a matched pair in either non-raw format registers as it did on main.
+  const encodings = {
+    pem: (der: Buffer) => createPrivateKey({ key: der, format: "der", type: "pkcs8" }).export({ format: "pem", type: "pkcs8" }).toString(),
+    pkcs8: (der: Buffer) => `${der.toString("base64")}\n`,
+  };
+  for (const [encoding, encode] of Object.entries(encodings)) {
+    const id = `${AGENT}-${encoding}-key`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const row = { id, name: id, publicKey, createdAt: keyPair.createdAt };
+    const fake = startFakeFlair(async (req, url) => {
+      if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+      if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
+      return undefined;
+    }, { [id]: publicKey });
+    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.from(keyPair.signing.privateKey)]);
+    const identityDir = join(homedir(), ".tps", "identity");
+    mkdirSync(identityDir, { recursive: true });
+    writeFileSync(join(identityDir, `${id}.key`), encode(der));
+    writeFileSync(join(identityDir, `${id}.pub`), Buffer.from(keyPair.signing.publicKey));
+    try {
+      const res = await runCreate(fake.url, id, { inspectError: true });
+      expect(`${encoding}: ${String(res.hasError)}`).toBe(`${encoding}: false`);
+      expect(res.exitCode).toBeUndefined();
+      expect(res.stdout).toContain("already registered in Flair");
+      expect(res.stderr).toBe("");
+      // the third request is the signed verification, made with the same key file
+      expect(fake.requests.map(({ method, path, auth }) => ({ method, path, signed: auth.startsWith(`TPS-Ed25519 ${id}:`) }))).toEqual([
+        { method: "GET", path: `/Agent/${id}`, signed: true },
+        { method: "GET", path: `/Agent/${id}`, signed: false },
+        { method: "GET", path: `/Agent/${id}`, signed: true },
+      ]);
+    } finally {
+      fake.stop();
+    }
   }
 });
 

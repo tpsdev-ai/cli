@@ -360,6 +360,43 @@ function promotionUnsupported(action: "approve" | "reject", id: string): Error {
   );
 }
 
+/**
+ * The private key a FlairClient signs with, read from `keyPath`: a PEM block, a
+ * raw 32-byte Ed25519 seed, or base64 PKCS8 DER. Throws when the file cannot be
+ * read or parsed as one of those. Exported so a caller can check a key file
+ * exactly as the client will load it (cli#607).
+ */
+export function loadFlairSigningKey(keyPath: string, agentId: string): ReturnType<typeof createPrivateKey> {
+  let raw: string;
+  try {
+    raw = readFileSync(keyPath, "utf-8").trim();
+  } catch {
+    throw new Error(
+      `Cannot read Flair private key at ${keyPath}. ` +
+        `Run 'tps agent create --id ${agentId}' first.`,
+    );
+  }
+  // Support PEM, raw 32-byte binary seed, and base64 DER/PKCS8
+  const rawBuf = readFileSync(keyPath);
+  if (raw.startsWith("-----")) {
+    return createPrivateKey(raw);
+  }
+  if (rawBuf.length === 32) {
+    // Raw Ed25519 seed — wrap in PKCS8 envelope
+    const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
+    return createPrivateKey({
+      key: Buffer.concat([pkcs8Header, rawBuf]),
+      format: "der",
+      type: "pkcs8",
+    });
+  }
+  return createPrivateKey({
+    key: Buffer.from(raw, "base64"),
+    format: "der",
+    type: "pkcs8",
+  });
+}
+
 export class FlairClient {
   private readonly baseUrl: string;
   private readonly agentId: string;
@@ -373,35 +410,7 @@ export class FlairClient {
   }
 
   private loadKey(): ReturnType<typeof createPrivateKey> {
-    if (this._privateKey) return this._privateKey;
-    let raw: string;
-    try {
-      raw = readFileSync(this.keyPath, "utf-8").trim();
-    } catch {
-      throw new Error(
-        `Cannot read Flair private key at ${this.keyPath}. ` +
-          `Run 'tps agent create --id ${this.agentId}' first.`,
-      );
-    }
-    // Support PEM, raw 32-byte binary seed, and base64 DER/PKCS8
-    const rawBuf = readFileSync(this.keyPath);
-    if (raw.startsWith("-----")) {
-      this._privateKey = createPrivateKey(raw);
-    } else if (rawBuf.length === 32) {
-      // Raw Ed25519 seed — wrap in PKCS8 envelope
-      const pkcs8Header = Buffer.from("302e020100300506032b657004220420", "hex");
-      this._privateKey = createPrivateKey({
-        key: Buffer.concat([pkcs8Header, rawBuf]),
-        format: "der",
-        type: "pkcs8",
-      });
-    } else {
-      this._privateKey = createPrivateKey({
-        key: Buffer.from(raw, "base64"),
-        format: "der",
-        type: "pkcs8",
-      });
-    }
+    if (!this._privateKey) this._privateKey = loadFlairSigningKey(this.keyPath, this.agentId);
     return this._privateKey;
   }
 
