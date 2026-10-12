@@ -19,6 +19,7 @@ const rejections: Array<{ name: string; value: () => unknown }> = [
   { name: "known code with throwing cause getter", value: () => ({ code: "ECONNREFUSED", get cause() { return throwsCredential(); } }) },
   { name: "string rejection", value: () => credential },
   { name: "null rejection", value: () => null },
+  { name: "callable rejection with ECONNREFUSED code", value: () => Object.assign(() => {}, { code: "ECONNREFUSED" }) },
 ];
 
 let workDir: string;

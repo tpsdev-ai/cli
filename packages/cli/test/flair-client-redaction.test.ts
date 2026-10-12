@@ -90,6 +90,7 @@ interface SeenRequest {
   method: string;
   route: string;
   auth: string;
+  body: string;
 }
 
 interface Echo {
@@ -155,7 +156,7 @@ function echoResponse(shape: EchoShape, auth: string): Response {
     case "malformed": {
       // A successful response with malformed JSON exercises the client's fixed
       // parse-error format.
-      const body = `{"echo":"${secret.fragment}`;
+      const body = `{"echo":"${secret.whole}`;
       return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
     }
   }
@@ -170,12 +171,13 @@ function echoResponse(shape: EchoShape, auth: string): Response {
  */
 function startEchoFlair(shape: EchoShape): Echo {
   const seen: SeenRequest[] = [];
-  const record = (method: string, route: string, auth: string) => {
-    seen.push({ method, route, auth });
+  const answer = async (method: string, route: string, auth: string) => {
+    const response = echoResponse(shape, auth);
+    seen.push({ method, route, auth, body: await response.clone().text() });
+    return response;
   };
   const signed = stubFlairHandler({ [AGENT]: SEED }, (req, url) => {
-    record(req.method, url.pathname, req.headers.get("Authorization") ?? "");
-    return echoResponse(shape, req.headers.get("Authorization") ?? "");
+    return answer(req.method, url.pathname, req.headers.get("Authorization") ?? "");
   });
   const server = Bun.serve({
     port: 0,
@@ -185,8 +187,7 @@ function startEchoFlair(shape: EchoShape): Echo {
       const auth = req.headers.get("Authorization") ?? "";
       if (auth.startsWith("Basic ")) {
         if (auth !== `Basic ${OPERATOR_B64}`) return new Response("forbidden", { status: 403 });
-        record(req.method, url.pathname, auth);
-        return echoResponse(shape, auth);
+        return answer(req.method, url.pathname, auth);
       }
       return signed(req);
     },
@@ -359,7 +360,7 @@ for (const runtime of ["bun", "node"] as const) {
     `cli#597 — a non-OK response error contains only the entry point, method and requested path, status, and an allow-listed error code (else unrecognized_error); raw bodies, unlisted response text and transport messages are excluded (${runtime})`,
     () => {
     for (const shape of ["text", "json", "malformed"] as const) {
-      test(`${runtime}: a ${shape} body echoing the credential never reaches the error (signed + Basic)`, async () => {
+      test(`${runtime}: a ${shape} body contains the full Authorization value and the error excludes it (signed + Basic)`, async () => {
         const echo = startEchoFlair(shape);
         try {
           const observations = await runChild(runtime, { ECHO_URL: echo.url, DEAD_URL: deadUrl(), KEY_PATH: keyPath });
@@ -369,8 +370,10 @@ for (const runtime of ["bun", "node"] as const) {
             expect(observed, `${entry.name} ran`).toBeDefined();
             expect(observed!.threw, `${entry.name} threw`).toBe(true);
 
-            const auth = echo.seen.find((s) => s.method === entry.method && s.route === entry.route)?.auth ?? "";
+            const served = echo.seen.find((s) => s.method === entry.method && s.route === entry.route);
+            const auth = served?.auth ?? "";
             expect(auth, `${entry.name} reached the echo`).not.toBeEmpty();
+            expect(served?.body, `${entry.name} fixture body contains the full Authorization value`).toContain(auth);
             expectNoLeak(observed!, secretsFor(auth));
 
             // The WHOLE message is asserted by exact equality, so appending any

@@ -285,7 +285,7 @@ function responseError(entry: string, method: string, path: string, status: numb
   return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
 }
 
-/** The `code` of a thrown value, from the value or its `cause` (Node's fetch). */
+/** The `code` of an object-valued failure or cause; other candidates, including callables, are ignored. */
 function errorCode(err: unknown): string {
   try {
     for (const candidate of [err, (err as { cause?: unknown } | null)?.cause]) {
@@ -301,10 +301,9 @@ function errorCode(err: unknown): string {
 }
 
 /**
- * The reason class of a transport failure, derived from the error's `code`
- * (Node carries it on `cause`), never from its message — a message can quote
- * the request, including its credential. An unknown code or a throw during
- * inspection is `network failure`.
+ * An object-valued failure's or cause's `code` selects the reason class;
+ * any other candidate (including a callable), an unknown code or a throw
+ * during inspection uses the fixed `network failure` fallback.
  */
 function transportReason(err: unknown): string {
   switch (errorCode(err)) {
