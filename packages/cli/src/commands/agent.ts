@@ -12,11 +12,12 @@
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
-import { generateKeyPair, saveKeyPair, loadKeyPair } from "../utils/identity.js";
-import { createFlairClient } from "../utils/flair-client.js";
+import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
+import { createFlairClient, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
 import {
@@ -294,6 +295,109 @@ function refuseRegistration(
   process.exit(1);
 }
 
+/**
+ * cli#607 — a probe signed with the private key does not verify under the
+ * public key file (or the key cannot make an Ed25519 signature at all), so the
+ * file is not the private key's public half. Registering it would register a
+ * key this identity's signatures never verify against, so refuse before
+ * reaching Flair.
+ */
+function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string, pubPath: string): never {
+  console.error(`❌ Agent '${id}' has no consistent key pair at ${identityDir} — the private key in ${keyPath} does not derive the public key in ${pubPath}.`);
+  console.error(`   Remedy: move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`);
+  process.exit(1);
+}
+
+/**
+ * cli#607 — the Flair client could not load the private key file. The client
+ * loads an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64
+ * PKCS8 DER, and passes no passphrase, so an encrypted PEM key is named as
+ * such. Neither branch prints the key's bytes; only the branch for any other
+ * unusable key names the file's length.
+ */
+function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, keyBytes: Uint8Array): never {
+  const encrypted = isEncryptedPrivateKeyPem(Buffer.from(keyBytes).toString("utf-8"));
+  const formats = "an unencrypted PEM private key, a raw 32-byte Ed25519 seed or base64 PKCS8 DER";
+  const state = encrypted
+    ? `the file is an encrypted PEM private key, and encrypted keys are not supported: the Flair client loads keys without a passphrase`
+    : `the file holds ${keyBytes.length} bytes and could not be loaded as ${formats}, the formats the Flair client signs with`;
+  console.error(`❌ Agent '${id}' has no usable private key at ${keyPath} — ${state}.`);
+  console.error(
+    `   Remedy: if this agent's identity must be kept, write its key to ${keyPath} unencrypted, as ${formats}; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+  );
+  process.exit(1);
+}
+
+/**
+ * Whether a directory entry exists at `path`, without following a final
+ * symlink: a dangling symlink is an entry (existsSync reports it absent). Only
+ * ENOENT and ENOTDIR read as absent; any other lstat error reads as present, so
+ * a path that cannot be checked is never written over.
+ */
+function identityEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (e) {
+    const code = (e as { code?: unknown } | null)?.code;
+    return code !== "ENOENT" && code !== "ENOTDIR";
+  }
+}
+
+/**
+ * cli#607 — some of this agent's identity paths hold an entry (a file or a
+ * symlink, dangling or not), but `.key` and `.pub` do not both exist.
+ * Generating a pair here would write over those entries, or through a symlink,
+ * so refuse before writing anything.
+ */
+function refusePartialIdentity(id: string, identityDir: string, present: string[], keyPath: string, pubPath: string): never {
+  const missing = [keyPath, pubPath].filter((path) => !existsSync(path));
+  const gaps = missing.map((path) => {
+    try {
+      return lstatSync(path).isSymbolicLink() ? `${path} is a symlink to a missing target` : `${path} cannot be read`;
+    } catch (e) {
+      const code = (e as { code?: unknown } | null)?.code;
+      return code === "ENOENT" || code === "ENOTDIR" ? `${path} is missing` : `${path} cannot be checked (${String(code)})`;
+    }
+  });
+  console.error(
+    `❌ Agent '${id}' has a partial identity at ${identityDir} — found ${present.join(", ")}, but ${gaps.join(" and ")}; create does not generate a new pair over existing identity entries.`,
+  );
+  console.error(
+    `   Remedy: restore ${missing.join(" and ")} (for a dangling symlink, its target), then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
+  );
+  process.exit(1);
+}
+
+/**
+ * cli#607 — the identity files exist but cannot be loaded: a file `loadKeyPair`
+ * reads (`.key`, `.pub`, `.meta.json`, `.seed`, `.x25519.pub`) cannot be read,
+ * or the optional `.meta.json` is not JSON. The refusal names the unreadable
+ * file and its fs error code, or the invalid `.meta.json`; it never prints an
+ * error message or file contents.
+ */
+function refuseUnloadableIdentity(id: string, identityDir: string, err: unknown): never {
+  const metaPath = join(identityDir, `${id}.meta.json`);
+  const fsError = err as { code?: unknown; path?: unknown } | null;
+  let state: string;
+  let repair: string;
+  if (fsError && typeof fsError.code === "string" && typeof fsError.path === "string") {
+    state = `${fsError.path} cannot be read (${fsError.code})`;
+    repair = "make that file readable by the user running tps";
+  } else if (err instanceof SyntaxError) {
+    state = `${metaPath} is not valid JSON`;
+    repair = `repair ${metaPath} or move it aside (create reads it only when present)`;
+  } else {
+    state = "loading the identity files failed";
+    repair = `check the files in ${identityDir}`;
+  }
+  console.error(`❌ Agent '${id}' cannot load its identity at ${identityDir} — ${state}.`);
+  console.error(
+    `   Remedy: ${repair}, then re-run \`tps agent create --id ${id}\`; or, to replace this identity, move ${join(identityDir, `${id}.*`)} aside and re-run it to generate a matched pair.`,
+  );
+  process.exit(1);
+}
+
 async function createAgent(args: AgentArgs): Promise<void> {
   const id = args.id;
   if (!id) {
@@ -313,19 +417,55 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const keyPath = join(identityDir, `${keyPrefix}.key`);
   const pubPath = join(identityDir, `${keyPrefix}.pub`);
 
-  let pubKeyHex: string;
-
   if (existsSync(keyPath) && existsSync(pubPath)) {
     console.log(`  Keys already exist at ${keyPath}`);
-    const kp = loadKeyPair(identityDir, keyPrefix);
-    pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
   } else {
+    // cli#607 — every path saveKeyPair writes: if any holds an entry (a dangling
+    // symlink included), the identity is partial, and generating would write over
+    // it or through it.
+    const present = [".seed", ".key", ".pub", ".x25519.key", ".x25519.pub", ".meta.json"]
+      .map((suffix) => join(identityDir, `${keyPrefix}${suffix}`))
+      .filter((path) => identityEntryExists(path));
+    if (present.length > 0) {
+      refusePartialIdentity(id, identityDir, present, keyPath, pubPath);
+    }
     console.log(`  Generating Ed25519 keys for ${id}...`);
-    const kp = generateKeyPair();
-    saveKeyPair(kp, identityDir, keyPrefix);
-    pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
+    saveKeyPair(generateKeyPair(), identityDir, keyPrefix);
     console.log(`  Keys saved to ${identityDir}/`);
   }
+
+  // cli#607 — the identity IS the private key: before registering, sign a probe
+  // with it and require the `.pub` on disk to verify that signature. cli#512
+  // registered the stored `.pub` bytes verbatim, so a `.pub` that is not the
+  // private key's public half could still be reported "registered" when Flair
+  // already held that `.pub`. An identity file loadKeyPair reads but cannot
+  // load is refused by name. The probe loads the key exactly as the Flair
+  // client below signs with it, so every format the client accepts is probed,
+  // and a readable key file the client cannot load is refused as unusable.
+  let kp: ReturnType<typeof loadKeyPair>;
+  try {
+    kp = loadKeyPair(identityDir, keyPrefix);
+  } catch (e) {
+    refuseUnloadableIdentity(id, identityDir, e);
+  }
+  const probe = Buffer.from(`tps-agent-create:${id}`);
+  let signingKey: ReturnType<typeof loadFlairSigningKey>;
+  try {
+    signingKey = loadFlairSigningKey(keyPath, id);
+  } catch {
+    refuseUnusablePrivateKey(id, keyPath, pubPath, kp.signing.privateKey);
+  }
+  let probeSignature: Uint8Array | null;
+  try {
+    probeSignature = cryptoSign(null, probe, signingKey);
+  } catch {
+    // A loadable key that cannot make an Ed25519 signature is not this `.pub`'s pair.
+    probeSignature = null;
+  }
+  if (probeSignature === null || !verify(probe, probeSignature, kp.signing.publicKey)) {
+    refuseKeyPairMismatch(id, identityDir, keyPath, pubPath);
+  }
+  const pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
 
   // 2. Register in Flair, then verify the key actually landed.
   //
@@ -396,6 +536,20 @@ async function createAgent(args: AgentArgs): Promise<void> {
       const found =
         stored.publicKey === null ? "the row has no public key" : `the stored public key is '${stored.publicKey}'`;
       refuseRegistration(id, flairUrl, identityDir, `${found}, not the generated key`, writeError, "exists");
+    }
+    // cli#607 — the read-back runs over the operator credential and only shows the
+    // bytes Flair stored. Send one request signed with this identity's private key:
+    // only its acceptance shows Flair authenticates this agent by this key. A
+    // refused signed request, or a response that does not carry the registered
+    // key, refuses.
+    let confirmed: { publicKey?: string } | undefined;
+    try {
+      confirmed = await flair.request<{ publicKey?: string }>("GET", `/Agent/${encodeURIComponent(id)}`);
+    } catch (e) {
+      refuseRegistration(id, flairUrl, identityDir, `a request signed with the private key was refused (${e instanceof Error ? e.message : String(e)})`, writeError, "exists");
+    }
+    if (storedKeyAsHex(confirmed?.publicKey ?? "") !== pubKeyHex) {
+      refuseRegistration(id, flairUrl, identityDir, "the signed request was accepted but its response did not confirm the registered key", writeError, "exists");
     }
     console.log(successLine ?? `  Agent '${id}' registered in Flair.`);
   }
