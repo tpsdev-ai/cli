@@ -301,8 +301,9 @@ function errorCode(err: unknown): string {
 }
 
 /**
- * An object-valued failure's or cause's `code` selects the reason class;
- * any other candidate (including a callable), an unknown code or a throw
+ * An object-valued failure's or cause's `code` selects the reason class.
+ * A callable's own `code` is ignored, though an object-valued `cause` on it
+ * can still select a reason; any other candidate, an unknown code or a throw
  * during inspection uses the fixed `network failure` fallback.
  */
 function transportReason(err: unknown): string {

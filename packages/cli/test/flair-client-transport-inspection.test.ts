@@ -66,3 +66,25 @@ for (const entry of entries) {
     }
   });
 }
+
+for (const entry of entries) {
+  test(`${entry.name}: a callable's own code is ignored, but its object-valued cause can select the reason`, async () => {
+    const rejection = Object.assign(() => {}, { code: "ETIMEDOUT", cause: { code: "ECONNREFUSED" } });
+    const restore = patchShared(globalThis, "fetch", (async () => {
+      throw rejection;
+    }) as typeof fetch);
+    try {
+      let caught: unknown;
+      try {
+        await entry.call();
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe(`Flair ${entry.name} ${entry.method} ${entry.path} transport error: connection refused`);
+      expect((caught as Error).cause).toBeUndefined();
+    } finally {
+      restore();
+    }
+  });
+}
