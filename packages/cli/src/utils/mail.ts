@@ -509,11 +509,11 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
   // A caller that already holds a mailbox (relay acceptance holds the
   // recipient's across check, publication and marker) acquires the rest in one
   // canonical order — ascending by path. A mailbox that sorts BEFORE the one it
-  // holds is read without its lock: reading is safe because a record for this
-  // delivery id can only be written under the stripe the caller holds, so any
-  // such record is already durable and visible; it is also never rewritten. Two
-  // acceptances of independent deliveries to different recipients therefore
-  // never wait on each other.
+  // holds is read without its lock: a record for this delivery id is written
+  // under the acceptance stripe the caller holds, so any such record is already
+  // durable and visible; that mailbox is also never rewritten. Two acceptances
+  // of independent deliveries to different recipients therefore cannot wait on
+  // each other in a cycle.
   const heldRoot = options.heldRoot;
   for (const root of [...roots].sort()) {
     mkdirMailDirectory(root);

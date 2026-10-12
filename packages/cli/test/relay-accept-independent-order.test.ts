@@ -2,11 +2,11 @@
  * relay-accept-independent-order.test.ts — cli#601.
  *
  * Two acceptances of different message ids to different recipients are
- * independent: they share no per-delivery lock, so neither may wait for the
- * other to release a mailbox lock. The relay accept path used to hold its
- * recipient's mailbox lock across a scan that also locked every other mailbox,
- * so two such acceptances could each hold one mailbox and wait for the other's
- * — a lock-order cycle that ended only at the acceptance lock timeout.
+ * independent: no per-delivery lock is shared, so neither can wait on the other
+ * in a cycle. The relay accept path used to hold its recipient's mailbox lock
+ * across a scan that also locked every other mailbox, so two such acceptances
+ * could each hold one mailbox and wait for the other's — a lock-order cycle that
+ * ended only at the acceptance lock timeout.
  *
  * The interleaving is made deterministic with the injected acceptance pause
  * point (a real cross-process hook), not with timing.
@@ -124,8 +124,8 @@ async function waitForFile(path: string): Promise<void> {
   }
 }
 
-describe("independent relay acceptances share no lock (cli#601)", () => {
-  test("two acceptances of different ids to different recipients both succeed without a lock-timeout wait", async () => {
+describe("relay acceptance lock order (cli#601)", () => {
+  test("two acceptances of different ids to different recipients both complete without waiting for the lock timeout", async () => {
     const idA = randomUUID();
     const idB = randomUUID();
     const pauseA = join(root, "pause-a");
