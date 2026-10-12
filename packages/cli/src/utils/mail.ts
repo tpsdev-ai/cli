@@ -487,9 +487,8 @@ function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   return /"relayDelivery"\s*:/.test(raw);
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; heldAcceptanceRoot?: string; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
-  const root = options.heldRoot ?? relayAcceptRoot(agent);
-  const roots = new Set([root]);
+export function relayScanRoots(recipientRoot: string): string[] {
+  const roots = new Set([recipientRoot]);
   for (const parent of [mailDirPath(), join(process.env.HOME || homedir(), ".tps", "branch-office")]) {
     if (!existsSync(parent)) continue;
     for (const entry of readdirSync(parent, { withFileTypes: true })) {
@@ -501,43 +500,37 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
       }
     }
   }
-  // The scan reads the discovered roots' new/, dlq/ and cur/. A same-id resend
-  // may name a different recipient, and its conflict must still be found. It may only MOVE a
-  // record out of the recipient's own mailbox (cli#560): a record in any other
-  // mailbox that is not this delivery's is left exactly where it is.
+  return [...roots].sort();
+}
+
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; heldAcceptanceRoot?: string; heldRoots?: ReadonlySet<string>; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
+  const root = options.heldRoot ?? relayAcceptRoot(agent);
+  // Same-id records in discovered mailboxes are checked under their mailbox locks.
+  // Only the recipient's malformed relay records are quarantined (cli#560).
   const recipientRoot = root;
-  // Acceptance holds the recipient mailbox before this scan. Scan locks are
-  // acquired in ascending path order only after that root; earlier roots are
-  // read without mailbox locks and their records are never rewritten.
-  // These scan acquisitions cannot form a mailbox lock cycle.
+  // Acceptance holds discovered roots in ascending order through publication and
+  // receipt writing. Promotion into cur/ and permanent NACK use these locks,
+  // so neither move can cross a directory read. A caller already holding a later
+  // root only tries earlier locks without waiting: contention refuses the scan,
+  // rather than introducing a mailbox lock-order cycle or accepting a missed record.
   const heldRoot = options.heldRoot;
-  for (const root of [...roots].sort()) {
+  for (const root of options.heldRoots ?? relayScanRoots(recipientRoot)) {
     mkdirMailDirectory(root);
     // A caller that already holds this mailbox's lock passes it here so the scan
     // does not re-acquire it — a nested acquisition is a hard error.
-    const held = root === options.heldRoot || root === options.heldAcceptanceRoot;
-    const readOnly = !held && heldRoot !== undefined && root < heldRoot;
-    const lock = held || readOnly ? null : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
-    if (!held && !readOnly && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
-    const owned = held || lock !== null;
+    const held = root === options.heldRoot || root === options.heldAcceptanceRoot || options.heldRoots?.has(root) === true;
+    const readOnly = heldRoot !== undefined && root < heldRoot;
+    const lock = held ? null : readOnly ? acquireMailLockSync(root, { timeoutMs: 0 }) : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
+    if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    const owned = !readOnly && (held || lock !== null);
     try {
-      // Promotion publishes cur/ before removing its new/ or dlq/ source.
-      // Scanning sources before cur/ therefore sees either the source or the
-      // published copy at every promotion interleaving. If a listed source
-      // disappears before the read, re-check its cur/ copy; absence refuses.
       for (const dir of ["new", "dlq", "cur"]) {
         const path = join(root, dir);
         for (const file of listMessageFiles(path)) {
-          let source = join(path, file);
+          const source = join(path, file);
           let raw: string;
           try {
-            try {
-              raw = readFileSync(source, "utf-8");
-            } catch (error) {
-              if (!readOnly || dir === "cur" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-              source = join(root, "cur", file);
-              raw = readFileSync(source, "utf-8");
-            }
+            raw = readFileSync(source, "utf-8");
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             const message = `relayed record read failed: ${source}: ${reason}`;
@@ -584,9 +577,6 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
               throw new Error(`relayed delivery conflict for branch ${delivery.branchId} message ${delivery.id}`);
             }
             const target = source;
-            // A mailbox read without its lock is not rewritten; only the
-            // recipient's own (held) mailbox, or one whose lock this scan holds,
-            // is republished in place.
             if (owned) {
               record.receivedAt = new Date().toISOString();
               const tmpDir = join(root, "tmp");

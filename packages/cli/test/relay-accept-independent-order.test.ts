@@ -2,9 +2,9 @@
  * relay-accept-independent-order.test.ts — cli#601.
  *
  * Children with distinct acceptance stripes hold distinct recipient locks
- * before scanning. The scan lock order removes their mailbox lock cycle;
+ * at the pause hook, then release them before acquiring scan locks in order;
  * contention can still cause waits and timeout refusals.
- * The pause hook places both children before their scans, holding those locks.
+ * The pause hook places both children before the ordered scan acquisitions.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";

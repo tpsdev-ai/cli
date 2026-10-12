@@ -3,7 +3,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, relayScanRoots, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
@@ -617,13 +617,21 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
   const acceptanceRoot = relayAcceptanceLockRoot(branchId, body.id);
   mkdirMailDirectory(acceptanceRoot);
   const acceptanceLock = acquireLock(acceptanceRoot);
-  let mailboxLock: ReturnType<typeof acquireLock> | undefined;
+  const mailboxLocks: ReturnType<typeof acquireLock>[] = [];
   try {
     // Hold the stripe before each mailbox lock; release mailbox locks before the stripe.
     const recipientRoot = relayAcceptRoot(body.to);
     mkdirMailDirectory(recipientRoot);
-    if (recipientRoot !== acceptanceRoot) mailboxLock = acquireLock(recipientRoot);
-    relayAcceptTestHook?.(recipientRoot);
+    if (relayAcceptTestHook) {
+      const initialLock = acquireLock(recipientRoot);
+      try { relayAcceptTestHook(recipientRoot); }
+      finally { initialLock.release(); }
+    }
+    const heldRoots = new Set(relayScanRoots(recipientRoot));
+    for (const root of heldRoots) {
+      mkdirMailDirectory(root);
+      mailboxLocks.push(acquireLock(root));
+    }
     // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
     const marker = relayAcceptanceReceiptPath(branchId, body.id);
@@ -632,7 +640,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     const receipt = acceptReceipt(body);
     const existingMarker = existingAcceptanceMarker(acceptedDir, body.id, legacyMarker);
     const delivery = { branchId, id: body.id };
-    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, acquireLock });
+    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, heldRoots, acquireLock });
     if (existingRecord) {
       if (existingMarker && existingMarker !== legacyMarker && existingMarker !== flatMarker && !acceptanceReceiptMatches(existingMarker, receipt)) {
         throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}`);
@@ -699,7 +707,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     }
     return delivered;
   } finally {
-    mailboxLock?.release();
+    for (const lock of mailboxLocks.reverse()) lock.release();
     acceptanceLock.release();
   }
 }
