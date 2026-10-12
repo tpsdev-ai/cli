@@ -1,0 +1,1 @@
+- **The Docker Bun pin check accepts exactly one complete `bun@<x.y.z>` value (Closes #605).** A root `packageManager` holding a second pin on another line used to pass, because the check matched line by line; it is now refused, naming the field, the value found and the remedy.
