@@ -126,4 +126,23 @@ describe("cli#554 — runDashboard signs its Flair reads", () => {
       restoreExit();
     }
   });
+
+  test("an OrgEvent read refused is reported, not swallowed", async () => {
+    const stub = startStubFlair({ "viewer-a": SEED }, (req, url) =>
+      url.pathname === "/Agent/"
+        ? Response.json([{ id: "ember", name: "Ember" }])
+        : url.pathname.startsWith("/OrgEventCatchup/")
+          ? new Response(null, { status: 403 })
+          : undefined,
+    );
+    try {
+      const keyPath = join(root, "viewer-a.key");
+      writeFileSync(keyPath, SEED);
+      await runDashboard({ flairUrl: stub.url, agentId: "viewer-a", keyPath });
+      expect(logs.join("\n")).toContain(`Cannot read OrgEvents from ${stub.url} (HTTP 403)`);
+      expect(logs.join("\n")).toContain("ember");
+    } finally {
+      stub.stop();
+    }
+  });
 });

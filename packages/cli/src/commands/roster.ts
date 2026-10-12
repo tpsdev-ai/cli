@@ -268,14 +268,19 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
     return;
   }
 
-  // Fetch recent OrgEvents for activity
+  // Fetch recent OrgEvents for activity. A refusal or a failed read here is
+  // reported: the activity column would otherwise read as "no activity" when
+  // the request did not return the events.
   const recentEvents: OrgEventRecord[] = [];
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace(/Z$/, ".000Z");
+  const evAuth = makeAuth("GET", `/OrgEventCatchup/${viewerId}?since=${since}`);
   try {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace(/Z$/, ".000Z");
-    const auth = makeAuth("GET", `/OrgEventCatchup/${viewerId}?since=${since}`);
-    const res = await fetch(`${flairUrl}/OrgEventCatchup/${viewerId}?since=${since}`, auth ? { headers: { Authorization: auth } } : {});
+    const res = await fetch(`${flairUrl}/OrgEventCatchup/${viewerId}?since=${since}`, evAuth ? { headers: { Authorization: evAuth } } : {});
     if (res.ok) recentEvents.push(...(await res.json() as OrgEventRecord[]));
-  } catch { /* non-fatal */ }
+    else console.error(`Cannot read OrgEvents from ${flairUrl} (HTTP ${res.status}); activity is incomplete.`);
+  } catch {
+    console.error(`Cannot read OrgEvents from ${flairUrl}; activity is incomplete.`);
+  }
 
   // Build per-agent last event map
   const lastEvent = new Map<string, OrgEventRecord>();

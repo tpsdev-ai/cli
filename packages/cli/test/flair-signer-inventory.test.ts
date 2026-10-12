@@ -16,6 +16,7 @@ import {
   readSources,
   type SignerExclusion,
   scanSources,
+  signerDrivingProblem,
   verifyingStubProblem,
 } from "./helpers/flair-signer-scan.js";
 
@@ -72,6 +73,13 @@ describe("cli#554 — every TPS-Ed25519 site is classified", () => {
     for (const [signer, testFile] of Object.entries(INVENTORY)) {
       const source = readFileSync(join(REPO, testFile), "utf8");
       expect(verifyingStubProblem(testFile, source), signer).toBeNull();
+    }
+  });
+
+  test("each mapped signer names a test that drives it", () => {
+    for (const [signer, testFile] of Object.entries(INVENTORY)) {
+      const source = readFileSync(join(REPO, testFile), "utf8");
+      expect(signerDrivingProblem(signer, testFile, source), signer).toBeNull();
     }
   });
 
@@ -204,5 +212,40 @@ describe("cli#554 — a mapped test must drive the verifying stub (mutation on a
   test("a negated status assertion is not a refusal", () => {
     const source = `${IMPORT}\ntest("x", async () => { startStubFlair(); expect(res.status).not.toBe(403); });`;
     expect(verifyingStubProblem(FILE, source)).toContain("no refusal assertion");
+  });
+});
+
+describe("cli#606 — a mapped test must drive the signer it is mapped to (mutation)", () => {
+  const ROSTER = "packages/cli/src/commands/roster.ts#makeAuth";
+  const OTHER = "packages/cli/test/office-status.test.ts";
+
+  test("a signer mapped to a test that drives another signer fails", () => {
+    const source = readFileSync(join(REPO, OTHER), "utf8");
+    expect(signerDrivingProblem(ROSTER, OTHER, source)).toContain("imports nothing from");
+  });
+
+  test("a test that imports the signer's module but never calls it fails", () => {
+    const source = 'import { runDashboard } from "../src/commands/roster.js";';
+    expect(signerDrivingProblem(ROSTER, "packages/cli/test/x.test.ts", source)).toContain("never calls it");
+  });
+
+  test("a test that calls a binding from the signer's module is accepted", () => {
+    const source = 'import { runDashboard } from "../src/commands/roster.js";\ntest("x", () => runDashboard({}));';
+    expect(signerDrivingProblem(ROSTER, "packages/cli/test/x.test.ts", source)).toBeNull();
+  });
+});
+
+describe("cli#606 — the scan reads the packages' .tsx sources", () => {
+  test("the source walk reads the repo's .tsx files", () => {
+    for (const file of ["packages/cli/src/cli/hire.tsx", "packages/cli/src/cli/roster.tsx"])
+      expect(Object.keys(readSources(REPO)), file).toContain(file);
+  });
+
+  test("a signer in a .tsx source file is listed", () => {
+    const scan = scanSources({
+      ...readSources(REPO),
+      "packages/cli/src/cli/extra.tsx": "export function extraSign(a: string) { return <p>{`TPS-Ed25519 ${a}`}</p>; }",
+    });
+    expect(scan.sites.map((s) => s.key)).toContain("packages/cli/src/cli/extra.tsx#extraSign");
   });
 });

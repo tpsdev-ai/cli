@@ -24,7 +24,7 @@
  */
 
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { extname, join, relative, sep } from "node:path";
 import ts from "typescript";
 
 /** The scheme literal whose every occurrence is enumerated. */
@@ -32,6 +32,53 @@ const SCHEME = "TPS-Ed25519";
 
 /** Virtual root the in-memory program is built under. */
 const ROOT = "/repo";
+
+/**
+ * The source extensions these packages compile, each mapped to the ScriptKind
+ * that parses it. `.js`/`.jsx`/`.mjs`/`.cjs` compile only in a package whose
+ * tsconfig sets `allowJs`.
+ */
+const SOURCE_KINDS: Record<string, ts.ScriptKind> = {
+  ".ts": ts.ScriptKind.TS,
+  ".mts": ts.ScriptKind.TS,
+  ".cts": ts.ScriptKind.TS,
+  ".tsx": ts.ScriptKind.TSX,
+  ".js": ts.ScriptKind.JS,
+  ".mjs": ts.ScriptKind.JS,
+  ".cjs": ts.ScriptKind.JS,
+  ".jsx": ts.ScriptKind.JSX,
+};
+
+/** Extensions only an `allowJs: true` package compiles. */
+const JS_KINDS = new Set([".js", ".jsx", ".mjs", ".cjs"]);
+
+/** The ScriptKind for a path's extension; `TS` for anything unrecognised. */
+function scriptKindOf(path: string): ts.ScriptKind {
+  return SOURCE_KINDS[extname(path).toLowerCase()] ?? ts.ScriptKind.TS;
+}
+
+/** True when the package's tsconfig compiles JavaScript sources. */
+function allowsJs(pkgDir: string): boolean {
+  try {
+    const config = ts.readConfigFile(join(pkgDir, "tsconfig.json"), ts.sys.readFile);
+    return config.config?.compilerOptions?.allowJs === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve a test file's import specifier against `testDir` to a repo-relative
+ * path, mapping the emitted `.js` extension back to its source extension.
+ */
+function resolveSpecifier(testDir: readonly string[], spec: string): string {
+  const parts = spec.startsWith(".") ? [...testDir] : [];
+  for (const part of spec.replace(/\.js$/, ".ts").split("/")) {
+    if (part === "..") parts.pop();
+    else if (part !== ".") parts.push(part);
+  }
+  return parts.join("/");
+}
 
 export interface SignerSite {
   /** `<repo-relative path>#<Class.>function` — the stable identity of a site. */
@@ -112,7 +159,7 @@ export function scanSources(sources: Readonly<Record<string, string>>): SignerSc
   const files = new Map<string, ts.SourceFile>();
   for (const [rel, text] of Object.entries(sources)) {
     const abs = `${ROOT}/${rel}`;
-    files.set(abs, ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS));
+    files.set(abs, ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true, scriptKindOf(rel)));
   }
   const options: ts.CompilerOptions = {
     noLib: true,
@@ -237,21 +284,24 @@ export function scanSources(sources: Readonly<Record<string, string>>): SignerSc
   };
 }
 
-function walkTypeScript(dir: string): string[] {
+function walkSources(dir: string, allowJs: boolean): string[] {
   const found: string[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name);
     if (entry.isDirectory()) {
       if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
-      found.push(...walkTypeScript(full));
-    } else if (entry.isFile() && entry.name.endsWith(".ts") && !entry.name.endsWith(".d.ts")) {
+      found.push(...walkSources(full, allowJs));
+    } else if (entry.isFile() && !entry.name.endsWith(".d.ts")) {
+      const ext = extname(entry.name).toLowerCase();
+      if (!(ext in SOURCE_KINDS)) continue;
+      if (JS_KINDS.has(ext) && !allowJs) continue;
       found.push(full);
     }
   }
   return found;
 }
 
-/** The source text of every `packages/*\/src` TypeScript file under `repoRoot`. */
+/** The source text of the files under each `packages/*\/src` whose extension its package compiles. */
 export function readSources(repoRoot: string): Record<string, string> {
   const out: Record<string, string> = {};
   const packagesDir = join(repoRoot, "packages");
@@ -262,13 +312,14 @@ export function readSources(repoRoot: string): Record<string, string> {
     return out;
   }
   for (const pkg of packages) {
-    const srcDir = join(packagesDir, pkg, "src");
+    const pkgDir = join(packagesDir, pkg);
+    const srcDir = join(pkgDir, "src");
     try {
       if (!statSync(srcDir).isDirectory()) continue;
     } catch {
       continue;
     }
-    for (const file of walkTypeScript(srcDir)) {
+    for (const file of walkSources(srcDir, allowsJs(pkgDir))) {
       out[relative(repoRoot, file).split(sep).join("/")] = readFileSync(file, "utf8");
     }
   }
@@ -329,18 +380,10 @@ const RUNNING_MODIFIERS = new Set(["only", "concurrent", "serial"]);
 export function verifyingStubProblem(testFile: string, source: string): string | null {
   const sf = ts.createSourceFile(testFile, source, ts.ScriptTarget.Latest, true);
   const dir = testFile.split("/").slice(0, -1);
-  const resolveSpecifier = (spec: string): string => {
-    const parts = spec.startsWith(".") ? [...dir] : [];
-    for (const part of spec.replace(/\.js$/, ".ts").split("/")) {
-      if (part === "..") parts.pop();
-      else if (part !== ".") parts.push(part);
-    }
-    return parts.join("/");
-  };
   const locals = new Set<string>();
   for (const stmt of sf.statements) {
     if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
-    if (resolveSpecifier(stmt.moduleSpecifier.text) !== STUB_FLAIR) continue;
+    if (resolveSpecifier(dir, stmt.moduleSpecifier.text) !== STUB_FLAIR) continue;
     const bindings = stmt.importClause?.namedBindings;
     if (!bindings || !ts.isNamedImports(bindings)) continue;
     for (const el of bindings.elements) {
@@ -410,5 +453,53 @@ export function verifyingStubProblem(testFile: string, source: string): string |
   const why = skipped ? " outside skipped or unclassifiable tests" : "";
   if (!called) return `${testFile} imports a verifying helper but never calls it${why}`;
   if (!refusal) return `${testFile} has no refusal assertion (an expect naming 401, 403 or AccessViolation)${why}`;
+  return null;
+}
+
+/** The declaring module of a site key, without its source extension. */
+function signerModule(signer: string): string {
+  return signer.split("#")[0]!.replace(/\.(ts|tsx|mts|cts|js|jsx|mjs|cjs)$/, "");
+}
+
+/** The identifier a callee names: `fn` or the `ns` of `ns.fn`. */
+function calleeRoot(expr: ts.Expression): string | undefined {
+  let e: ts.Expression = expr;
+  while (ts.isPropertyAccessExpression(e)) e = e.expression;
+  return ts.isIdentifier(e) ? e.text : undefined;
+}
+
+/**
+ * Why the test at `testFile` does not drive the signer site `signer`
+ * (`<module>#<symbol>`), or `null`. The test must import the signer's declaring
+ * module — its specifier resolved against the test's directory — and call a
+ * binding it imports from it, so a mapped test drives the module that declares
+ * the signer.
+ */
+export function signerDrivingProblem(signer: string, testFile: string, source: string): string | null {
+  const module = signerModule(signer);
+  const sf = ts.createSourceFile(testFile, source, ts.ScriptTarget.Latest, true, scriptKindOf(testFile));
+  const testDir = testFile.split("/").slice(0, -1);
+  const locals = new Set<string>();
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt) || !ts.isStringLiteral(stmt.moduleSpecifier)) continue;
+    if (signerModule(resolveSpecifier(testDir, stmt.moduleSpecifier.text)) !== module) continue;
+    const clause = stmt.importClause;
+    if (!clause) continue;
+    if (clause.name) locals.add(clause.name.text);
+    const bindings = clause.namedBindings;
+    if (bindings && ts.isNamedImports(bindings)) for (const el of bindings.elements) locals.add(el.name.text);
+    else if (bindings && ts.isNamespaceImport(bindings)) locals.add(bindings.name.text);
+  }
+  if (locals.size === 0) return `${testFile} imports nothing from ${module}`;
+  let called = false;
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
+      const root = calleeRoot(node.expression);
+      if (root && locals.has(root)) called = true;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sf);
+  if (!called) return `${testFile} imports ${module} but never calls it`;
   return null;
 }
