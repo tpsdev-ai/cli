@@ -15,7 +15,7 @@ import { join } from "node:path";
 import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
 import { relayAcceptanceLockRoot } from "../src/lib/relay-lock.js";
-import { mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
+import { canonicalMailRoot, mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
 
 const AGENT = "mailbox";
 const BRANCH = "remote";
@@ -126,4 +126,11 @@ test("the same path in the environment and the configured mailDir still shares t
 test("both derivations name one lock namespace for the store, whatever path reaches it", () => {
   expect(relayAcceptanceLockRoot(BRANCH, ID, alias)).toBe(relayAcceptanceLockRoot(BRANCH, ID, store));
   expect(mailboxLockRoot(alias, AGENT)).toBe(mailboxLockRoot(store, AGENT));
+});
+
+test("a mail root that does not exist yet is created, then resolved", () => {
+  const pending = join(alias, "pending", "store");
+  expect(existsSync(pending)).toBe(false);
+  expect(canonicalMailRoot(pending)).toBe(join(store, "pending", "store"));
+  expect(existsSync(pending)).toBe(true);
 });
