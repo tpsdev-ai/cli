@@ -1,14 +1,19 @@
 /**
- * cli#602: `office connect` announces an accepted delivery once when the attempt
- * that published its inbox record was interrupted before announcing it.
+ * cli#602: `office connect` announces an accepted delivery when the attempt
+ * that published its inbox record was killed before announcing it.
  *
  * The command runs as its own process against a REAL local relay built on the
  * branch-side WebSocket/Noise listener (`listenForHostWs`). A `bun --preload`
- * hook (test/helpers/office-kill-hook.mjs) blocks the command at a named step
- * boundary, and the test SIGKILLs it there; a second command then reconnects and
- * the sender resends the same delivery. The test counts the "Mail received"
- * lines the two commands printed: the recovered delivery is announced once, and
- * the inbox holds one record.
+ * hook (test/helpers/office-kill-hook.mjs) blocks the command at one of two
+ * step boundaries, both after the inbox record is published and before the
+ * announcement is printed: `accept-marker`, the write of the acceptance
+ * receipt's temp file, and `announce`, the `console.log` of the "Mail received"
+ * line. The test SIGKILLs it there; a second command then reconnects and the
+ * sender resends the same delivery. The test counts the "Mail received" lines
+ * the two commands printed: at either boundary the delivery is announced
+ * exactly once across both commands, and the inbox holds one record. A kill
+ * after the line is printed and before its announcement marker is written is
+ * not tested here; the delivery can then be announced again.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
@@ -29,9 +34,9 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 /** The preload that blocks the command at a named acceptance step boundary. */
 const KILL_HOOK = fileURLToPath(new URL("./helpers/office-kill-hook.mjs", import.meta.url));
-/** Prefix for successful announcements of newly accepted deliveries. */
+/** The text of the line `office connect` prints to announce a delivery. */
 const ANNOUNCEMENT = "Mail received";
-/** The acceptance steps between publishing the inbox record and announcing it. */
+/** The hook's step boundaries, both after the inbox record is published and before the announcement is printed. */
 const BOUNDARIES = ["accept-marker", "announce"] as const;
 
 const ENV_KEYS = ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"];
@@ -108,7 +113,7 @@ interface Command {
   stop(): Promise<void>;
 }
 
-describe("tps office connect announces an interrupted delivery once", () => {
+describe("tps office connect announces a delivery whose first attempt was killed before announcing it", () => {
   let root: string | undefined;
   let savedEnv: Record<string, string | undefined> = {};
   let relay: TransportServer | undefined;

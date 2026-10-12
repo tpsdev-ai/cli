@@ -429,38 +429,53 @@ function relayAnnouncedDir(branchId: string): string {
 }
 
 /**
- * cli#602: the marker that records a relayed delivery's announcement against its
- * branch and delivery id (a 64-hex id is deterministic, so two branches can send
- * the same one). It is read before announcing: a delivery recovered from an
- * earlier attempt that published but did not announce it is announced by the
- * recovering attempt, and a resend of an announced delivery is not announced
- * again.
+ * cli#602: the marker that records a confirmed announcement of a relayed
+ * delivery, keyed by its branch and delivery id (a 64-hex id is deterministic,
+ * so two branches can send the same one). It is written only after the
+ * announcement callback has returned, or its returned promise has resolved, and
+ * it holds the acceptance receipt of the payload that was announced.
  */
 function relayAnnouncedMarkerPath(branchId: string, id: string): string {
   return join(relayAnnouncedDir(branchId), id);
 }
 
-/** True when this delivery's announcement has already been recorded within the receipt TTL. */
-function announcedMarkerExists(branchId: string, id: string, now = Date.now()): boolean {
-  const path = relayAnnouncedMarkerPath(branchId, id);
+/**
+ * True only when a marker records a confirmed announcement of this payload
+ * within the receipt TTL. Markers and acceptance receipts expire independently,
+ * so a marker left by an earlier payload under the same branch and id does not
+ * count, nor does an expired marker or one that cannot be read and compared:
+ * each of those leaves the delivery to be announced.
+ */
+function announcementRecorded(branchId: string, body: MailDeliverBody, now = Date.now()): boolean {
+  const path = relayAnnouncedMarkerPath(branchId, body.id);
   if (!receiptMayExist(path)) return false;
-  try { return now - statSync(path).mtimeMs <= relayAcceptReceiptTtlMs(); }
-  catch { return receiptMayExist(path); }
+  try {
+    if (now - statSync(path).mtimeMs > relayAcceptReceiptTtlMs()) return false;
+    return acceptanceReceiptMatches(path, acceptReceipt(body));
+  } catch {
+    return false;
+  }
 }
 
-/** Record, atomically, that this delivery's announcement has been emitted. */
-function recordAnnouncement(branchId: string, id: string): void {
-  const marker = relayAnnouncedMarkerPath(branchId, id);
+/**
+ * Record a confirmed announcement of this payload: write the marker (the
+ * payload's acceptance receipt and the time) to a temp file, sync it, rename it
+ * into place and sync the directory. A failure at any step throws, so the
+ * caller withholds the ACK; the sender's retry may then announce the delivery
+ * again.
+ */
+function recordAnnouncement(branchId: string, body: MailDeliverBody): void {
+  const marker = relayAnnouncedMarkerPath(branchId, body.id);
   mkdirMailDirectory(dirname(marker));
   const tmp = `${marker}.tmp`;
   try {
-    writeFileSync(tmp, JSON.stringify({ announcedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
+    writeFileSync(tmp, JSON.stringify({ ...acceptReceipt(body), announcedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
     syncMailFile(tmp);
     renameSync(tmp, marker);
     syncMailDirectory(dirname(marker));
   } catch {
     try { removeMailFileConfirmed(tmp); } catch {}
-    console.error(`[relay] announcement marker write failed for message ${id}`);
+    throw new Error(`relay announcement marker write failed for message ${body.id}; retry delivery`);
   }
 }
 
@@ -647,32 +662,22 @@ export function setRelayAcceptTestHook(hook?: (root: string) => void): void {
 }
 
 /**
- * cli#602: `onAccepted` is invoked once for a delivery that is accepted and
- * whose announcement is not yet recorded — a delivery published on this call, or
- * one recovered from an earlier attempt that published but did not announce it.
- * The announcement is recorded against the delivery id, so the recovering
- * attempt announces a delivery the interrupted one did not, and a resend of an
- * announced delivery is not announced again.
+ * The outcome of accepting one relayed delivery under its acceptance locks.
+ * `delivered`: this call published a live inbox record. `announce` (cli#602):
+ * the delivery is due an announcement, because this call published its live
+ * inbox record, or found a record of it outside the dead-letter queue published
+ * by an earlier attempt that may have stopped before announcing it. `body` is
+ * the parsed payload.
  */
-function acceptRelayedDelivery(branchId: string, body: MailDeliverBody, onAccepted?: () => void): boolean {
+interface RelayAcceptance {
+  delivered: boolean;
+  announce: boolean;
+  body: MailDeliverBody;
+}
+
+function acceptRelayedDelivery(branchId: string, body: MailDeliverBody): RelayAcceptance {
   body = MailDeliverBodySchema.parse(body);
   if (!/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error(`invalid branch id for relayed message ${body.id}`);
-  const announce = () => {
-    if (!onAccepted) return;
-    if (announcedMarkerExists(branchId, body.id)) return;
-    const reportError = () => {
-      console.error(`[relay] onAccepted failed for message ${body.id} to ${body.to}`);
-    };
-    try {
-      const result: unknown = onAccepted();
-      if (result != null && typeof (result as { then?: unknown }).then === "function") {
-        void Promise.resolve(result).catch(reportError);
-      }
-    } catch {
-      reportError();
-    }
-    recordAnnouncement(branchId, body.id);
-  };
   const deadline = Date.now() + relayAcceptLockTimeoutMs();
   const acquireLock = (root: string) => {
     const remaining = deadline - Date.now();
@@ -711,17 +716,17 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody, onAccept
         try { recordAcceptance(acceptedDir, marker, receipt); }
         catch { throw new Error(`relay receipt recovery incomplete for message ${body.id}; retry may duplicate`); }
       }
-      // A recovered record is announced unless it is dead-lettered: the earlier
-      // attempt that published it may have been interrupted before announcing.
-      if (basename(dirname(existingRecord)) !== "dlq") announce();
-      return false;
+      // A recovered record outside the dead-letter queue is due an
+      // announcement: the earlier attempt that published it may have stopped
+      // before announcing it.
+      return { delivered: false, announce: basename(dirname(existingRecord)) !== "dlq", body };
     }
     if (existingMarker) {
       // A marker without a record blocks publication unless its receipt matches.
       if (acceptanceReceiptMatches(existingMarker, receipt)) {
         syncMailFile(existingMarker);
         syncMailDirectory(dirname(existingMarker));
-        return false;
+        return { delivered: false, announce: false, body };
       }
       if (existingMarker === flatMarker || existingMarker === legacyMarker) {
         throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}: accepted before receipts existed; payload cannot be compared; sender must not retry`);
@@ -767,8 +772,7 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody, onAccept
       catch { throw new Error(`relay record recovery incomplete for message ${body.id}; retry may duplicate`); }
       throw new Error("relay acceptance receipt write failed; retry delivery");
     }
-    if (delivered) announce();
-    return delivered;
+    return { delivered, announce: delivered, body };
   } finally {
     mailboxLock?.release();
     acceptanceLock.release();
@@ -777,20 +781,40 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody, onAccept
 
 /**
  * The relay acceptance outcome for one delivery: whether it published a live
- * inbox record on this call. This entry point never announces (see
- * `deliverRelayedToLocalOnce`).
+ * inbox record on this call. This entry point never announces.
  */
 export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): boolean {
-  return acceptRelayedDelivery(branchId, body);
+  return acceptRelayedDelivery(branchId, body).delivered;
 }
 
 /**
- * As `deliverRelayedToLocal`, invoking `onAccepted` for a delivery that is
- * accepted and not yet announced — including one recovered from an earlier
- * attempt that published but did not announce it (cli#602).
+ * cli#602: announce an accepted delivery that is due an announcement. It is
+ * skipped only when a marker records a confirmed announcement of this same
+ * payload within the receipt TTL. Otherwise `onAccepted` is invoked and a
+ * returned promise is awaited; the marker is written only after the callback
+ * returns or its promise resolves. The callback runs after the acceptance locks
+ * are released, so a pending announcement holds no lock another acceptance
+ * needs; the marker is written under the delivery's acceptance lock. A callback
+ * that throws or rejects, or a marker that cannot be written and synced,
+ * rejects this call and the caller withholds the ACK, so a resend that finds
+ * the record announces it. An announcement can therefore repeat: after a crash
+ * between the callback and the marker, after a marker failure, once the marker
+ * has expired, or when two acceptances of the same delivery run at once.
  */
-export function deliverRelayedToLocalOnce(branchId: string, body: MailDeliverBody, onAccepted: () => void): boolean {
-  return acceptRelayedDelivery(branchId, body, onAccepted);
+async function announceRelayedDelivery(branchId: string, body: MailDeliverBody, onAccepted: () => void): Promise<void> {
+  if (announcementRecorded(branchId, body)) return;
+  try {
+    const result: unknown = onAccepted();
+    if (result != null && typeof (result as { then?: unknown }).then === "function") await (result as PromiseLike<unknown>);
+  } catch {
+    throw new Error(`relay announcement failed for message ${body.id}; retry delivery`);
+  }
+  const root = relayAcceptanceLockRoot(branchId, body.id);
+  mkdirMailDirectory(root);
+  const lock = acquireMailLockSync(root, { timeoutMs: relayAcceptLockTimeoutMs() });
+  if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
+  try { recordAnnouncement(branchId, body); }
+  finally { lock.release(); }
 }
 
 async function acceptRelayedMail(
@@ -800,12 +824,12 @@ async function acceptRelayedMail(
   body: MailDeliverBody,
   onAccepted?: () => void,
 ): Promise<boolean> {
-  const delivered = onAccepted === undefined
-    ? deliverRelayedToLocal(branchId, body)
-    : deliverRelayedToLocalOnce(branchId, body, onAccepted);
-  // A delivery with delivered=false (dead-lettered or receipt-backed duplicate) is still ACKed below.
+  const accepted = acceptRelayedDelivery(branchId, body);
+  // An announcement failure rejects here and the delivery is not ACKed.
+  if (onAccepted && accepted.announce) await announceRelayedDelivery(branchId, accepted.body, onAccepted);
+  // A delivery with delivered=false (recovered, dead-lettered or receipt-backed duplicate) is still ACKed below.
   await channel.send({ type: MSG_MAIL_ACK, seq: msg.seq, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
-  return delivered;
+  return accepted.delivered;
 }
 
 /** Logs a MAIL_DELIVER the schema refused, naming the branch and the failing fields, never their values. */

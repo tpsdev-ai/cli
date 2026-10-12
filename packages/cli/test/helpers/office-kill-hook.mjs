@@ -24,7 +24,9 @@ const MARKER = process.env.TPS_KILL_MARKER ?? "";
 // record and finishing the delivery.
 const isAcceptanceReceiptTemp = (path) =>
   typeof path === "string" && path.includes("/.relay-accepted/") && path.endsWith(".tmp");
-// `office connect` announces a delivery with a single `console.log` naming it.
+// `office connect` announces a delivery with a single `console.log` of a
+// "Mail received" line; the line does not name the delivery. Blocking here is
+// before the line is printed.
 const announcesMail = (args) => typeof args[0] === "string" && args[0].includes("Mail received");
 
 // kind -> predicate over the call's arguments; true means "block HERE".
