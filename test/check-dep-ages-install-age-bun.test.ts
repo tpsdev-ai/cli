@@ -38,6 +38,13 @@ const BLOCKED = `blocked by minimum-release-age: ${WINDOW_SECONDS} seconds`;
 type Published = Record<string, Record<string, { ageDays: number; dependencies?: Record<string, string> }>>;
 const AGE_FIXTURE: Published = { [NAME]: { [AGED]: { ageDays: 90 }, [FRESH]: { ageDays: 1 } } };
 
+/**
+ * A valid bun.lock resolving the fixture's aged version, so a refusal test's gate
+ * is not stopped by an unparseable lockfile: an audit that skips the workspace
+ * check or exits early then reaches the release-age phase and fails the test.
+ */
+const VALID_LOCK = `{"lockfileVersion":1,"workspaces":{"":{"name":"fixture"}},"packages":{"${NAME}":["${NAME}@${AGED}","",{}]}}`;
+
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
 function startRegistry(root: string, published: Published = AGE_FIXTURE) {
   const tarballs = new Map<string, Buffer>();
@@ -471,7 +478,7 @@ it.each([
       { path: "packages/a/package.json", json: { name: "w-packages" } },
       { path: "plugins/t/package.json", json: { name: "w-plugin", dependencies: { [NAME]: AGED } } },
     ];
-    const project = writeProject(root, Object.fromEntries(packageJsons.map(({ path, json }) => [path, json])), "http://127.0.0.1:1");
+    const project = writeProject(root, Object.fromEntries(packageJsons.map(({ path, json }) => [path, json])), "http://127.0.0.1:1", { excludes: [NAME] });
     expect([...new Bun.Glob(pattern).scanSync({ cwd: project, onlyFiles: false })]).toEqual([]);
     const install = await bunInstall(project, ["--no-cache"]);
     expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
@@ -485,6 +492,19 @@ it.each([
     expect(auditExcludes({
       excludes: [NAME], exceptionEntries: new Map([[`${NAME}@${AGED}`, {}]]), exceptionErrors: [], packageJsons,
     })).toEqual([{ kind: "workspaces", message: resolved.error, pattern }]);
+
+    // The real gate, with a valid lockfile and a root pin for the excluded name: the
+    // workspace audit must refuse here, not exit early or skip, so the assertion
+    // fails if it does either.
+    writeFileSync(join(project, "bun.lock"), VALID_LOCK);
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", workspaces: [pattern], dependencies: { [NAME]: AGED } }),
+    );
+    const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
+    expect(gate.exit).toBe(2);
+    expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
+    expect(gate.output).not.toContain("Checking");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -498,7 +518,7 @@ it.each([
   ["!packages/*/", ["tools/t"]],
   ["!packages/./*", ["tools/./t"]],
   ["!", ["bunfig.toml", "package.json", "packages", "tools"]],
-] as const)("negated spelling: %s", (pattern, expected) => {
+] as const)("negated spelling: %s", async (pattern, expected) => {
   const root = mkdtempSync(join(tmpdir(), "age-negated-spelling-"));
   try {
     const packageJsons = [
@@ -506,7 +526,9 @@ it.each([
       { path: "packages/a/package.json", json: { name: "w-packages" } },
       { path: "tools/t/package.json", json: { name: "w-tools", dependencies: { [NAME]: AGED } } },
     ];
-    const project = writeProject(root, Object.fromEntries(packageJsons.map(({ path, json }) => [path, json])), "http://127.0.0.1:1");
+    const project = writeProject(root, Object.fromEntries(packageJsons.map(({ path, json }) => [path, json])), "http://127.0.0.1:1", {
+      excludes: [NAME],
+    });
     expect([...new Bun.Glob(pattern).scanSync({ cwd: project, onlyFiles: false })].sort()).toEqual([...expected].sort());
     const resolved = appliedManifestPaths(packageJsons);
     expect(auditExcludes({
@@ -514,7 +536,100 @@ it.each([
     })).toEqual([{ kind: "workspaces", message: resolved.error, pattern }]);
     expect(resolved.error).toContain("unsupported negated spelling");
     expect(resolved.pattern).toBe(pattern);
+
+    // The real gate, with a valid lockfile and a root pin for the excluded name: the
+    // workspace audit must refuse here, not exit early or skip, so the assertion
+    // fails if it does either.
+    writeFileSync(join(project, "bun.lock"), VALID_LOCK);
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", workspaces: [pattern], dependencies: { [NAME]: AGED } }),
+    );
+    const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
+    expect(gate.exit).toBe(2);
+    expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
+    expect(gate.output).not.toContain("Checking");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30000);
+
+/**
+ * The real-Bun parity row for a refused `workspaces` pattern: build the project,
+ * run real Bun's install and record the workspaces it resolves (`bunApplied`, or
+ * `null` when Bun refuses the whole install with "Workspace not found"), then run
+ * the gate over a valid lockfile and assert it refuses the pattern by name with
+ * `reason`, without reaching the release-age phase. The valid lockfile means an
+ * audit that exits early or skips the workspace check fails the assertions here.
+ */
+async function refusalParity(pattern: string, dirs: string[], bunApplied: string[] | null, reason: string) {
+  const root = mkdtempSync(join(tmpdir(), "age-refusal-"));
+  try {
+    const manifests: Record<string, unknown> = { "package.json": { name: "fixture", workspaces: [pattern] } };
+    for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll(/[^a-z0-9]/gi, "-")}` };
+    const project = writeProject(root, manifests, "http://127.0.0.1:1", { excludes: [NAME], lock: VALID_LOCK });
+    const install = await bunInstall(project, ["--no-cache"]);
+    if (bunApplied === null) {
+      expect(install.exit).not.toBe(0);
+      expect(install.output).toContain(`Workspace not found "${pattern}"`);
+    } else {
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      expect(Object.keys(lock.workspaces).filter((key) => key !== "").sort()).toEqual(bunApplied);
+    }
+    writeFileSync(join(project, "bun.lock"), VALID_LOCK);
+    // Pin the excluded name exactly in the root manifest, which Bun always applies,
+    // so the only reason left to refuse is the pattern: the gate must reach its
+    // workspace audit and stop there, never the "Checking" release-age phase.
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", workspaces: [pattern], dependencies: { [NAME]: AGED } }),
+    );
+    const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
+    expect(gate.exit).toBe(2);
+    expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
+    expect(gate.output).toContain(reason);
+    expect(gate.output).not.toContain("Checking");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+it.each([
+  ["a glob escape", "packages/\\*", ["packages/a"], null],
+  ["an escaped bracket", "packages/\\[", ["packages/[", "packages/a"], ["packages/["]],
+  ["an escaped brace", "packages/\\{a,b}", ["packages/{a,b}", "packages/a"], ["packages/{a,b}"]],
+] as const)(
+  "refuses a workspaces pattern with %s",
+  async (_label, pattern, dirs, bunApplied) => {
+    await refusalParity(pattern, dirs, bunApplied as string[] | null, "contains a backslash, which Bun reads as an escape");
+  },
+  60000,
+);
+
+it.each([
+  [
+    "a class inside a brace group",
+    "packages/{a,[bc]}",
+    ["packages/a", "packages/b", "packages/c", "packages/d"],
+    ["packages/a", "packages/b", "packages/c"],
+  ],
+  [
+    "a brace group after a class",
+    "packages/[a-c]{x,y}",
+    ["packages/ax", "packages/ay", "packages/by", "packages/cz"],
+    ["packages/ax", "packages/ay", "packages/by"],
+  ],
+  [
+    "an unbalanced class inside a brace group",
+    "packages/{a,[b}c]",
+    ["packages/a", "packages/b", "packages/c"],
+    ["packages/a"],
+  ],
+] as const)(
+  "refuses a workspaces pattern with %s",
+  async (_label, pattern, dirs, bunApplied) => {
+    await refusalParity(pattern, dirs, bunApplied, "mixes a `{...}` brace group with a `[...]` character class");
+  },
+  60000,
+);

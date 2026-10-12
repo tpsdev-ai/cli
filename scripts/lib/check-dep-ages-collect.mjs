@@ -386,6 +386,47 @@ function globError(pattern) {
   return null;
 }
 
+/**
+ * Whether an unescaped `{` brace group and an unescaped `[...]` character class
+ * both appear outside a class body.
+ */
+function hasBraceGroupAndClass(pattern) {
+  let brace = false;
+  let klass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "[") {
+      klass = true;
+      i++;
+      while (i < pattern.length && pattern[i] !== "]") i++;
+    } else if (ch === "{") {
+      brace = true;
+    }
+  }
+  return brace && klass;
+}
+
+/**
+ * A `workspaces` pattern whose Bun resolution the audit does not compute: a
+ * backslash escape (`packages/\*`), and a brace group mixed with a character
+ * class (`{a,[bc]}`, `[a-c]{x,y}`). Real `bun install` resolves both differently
+ * from the audit's walk (`packages/\*` installs nothing, and `{a,[b}c]` installs
+ * `a` where the audit reads `b` and `c`), and neither is simple to mirror, so the
+ * gate refuses the pattern rather than credit a pin from a manifest Bun does not
+ * apply.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function unsupportedWorkspacePattern(pattern) {
+  if (pattern.includes("\\")) {
+    return "it contains a backslash, which Bun reads as an escape of the next character; name the directory without the escape";
+  }
+  if (hasBraceGroupAndClass(pattern)) {
+    return "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
+  }
+  return null;
+}
+
 /** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
 function matchSegments(value, glob) {
   function match(i, j) {
@@ -473,6 +514,10 @@ export function appliedManifestPaths(manifests) {
   const globs = [];
   for (const raw of patterns) {
     if (raw === "" || raw === "." || raw === "./" || raw === ".\\") continue;
+    const reason = globError(raw) ?? unsupportedWorkspacePattern(raw);
+    if (reason !== null) {
+      return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
+    }
     if (isGlobPattern(raw)) globs.push(raw);
     else literals.push(raw);
   }
@@ -484,12 +529,6 @@ export function appliedManifestPaths(manifests) {
   for (const literal of literals) {
     const path = byDir.get(pathSegments(literal).join("/"));
     if (path !== undefined) applied.add(path);
-  }
-  for (const glob of globs) {
-    const reason = globError(glob);
-    if (reason !== null) {
-      return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}`, pattern: glob };
-    }
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);
