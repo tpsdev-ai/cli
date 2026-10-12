@@ -22,6 +22,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+// These reservation cases align TPS_MAIL_DIR with MailClient.mailDir.
 for (const valid of [true, false]) {
   test(`MailClient ${valid ? "promotion" : "dead-lettering"} leaves a same-id source in place while its stripe is reserved`, async () => {
     const client = new MailClient(root, undefined, "mailbox", {

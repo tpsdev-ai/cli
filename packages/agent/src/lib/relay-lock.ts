@@ -6,6 +6,7 @@ import { acquireMailLockSync, type MailLock } from "./mail-lock.js";
 
 export const RELAY_ACCEPT_LOCK_STRIPES = 64;
 
+// Lock sharing requires matching process mail directories; MailClient.mailDir does not select this namespace.
 export function relayAcceptanceLockRoot(branchId: string, id: string): string {
   const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
   const mailDir = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
