@@ -174,6 +174,6 @@ for (const failure of ["malformed", "unreachable"] as const) {
     expect(readdirSync(fresh)).toEqual([]);
     const reason = readFileSync(join(inbox, "dlq", "message.json.reason"), "utf8");
     expect(reason).toContain(`class: ${result.class}`);
-    expect(reason).toContain(failure === "malformed" ? "malformed public key for flint" : "Flair unreachable");
+    expect(reason).toContain(failure === "malformed" ? "malformed public key for flint" : "transport error: network failure");
   });
 }

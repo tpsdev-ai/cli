@@ -138,6 +138,216 @@ export class FlairRequestError extends Error {
 }
 
 /**
+ * A fixed list of error-code strings. When a response has an `error` field,
+ * the client reads an allow-listed string from it; other values become
+ * `unrecognized_error`. The list is not claimed complete;
+ * no entry is claimed reachable from a particular route.
+ *
+ * Membership is a MODULE-PRIVATE Set; the list is exported as a FROZEN ARRAY,
+ * for inspection only. A `ReadonlySet` is a type-only guarantee, and a live
+ * exported Set is mutable at runtime — a consumer (or a probe) could add a code
+ * and change how a non-OK response is formatted. With the set private and the
+ * exported view frozen, neither an add nor a write can do so.
+ *
+ * A shape test (a regex for "a short lower-case token") is not a control: a
+ * credential fragment — a slice of a base64 Basic credential, a nonce, a
+ * signature component — can itself be regex-shaped, so a shape test would pass
+ * it straight through. Naming only an enumerated constant bounds the damage:
+ * arbitrary response text cannot enter a non-OK response error. An error from a
+ * NON-OK HTTP RESPONSE contains the entry point, method, requested pathname,
+ * status, and an allow-listed code selected from the response's `error` field
+ * (else `unrecognized_error`); raw bodies, other response text and transport
+ * messages are never included. (A fixed list cannot rule out a coincidence with
+ * a listed code, but the client names a constant it already holds rather than
+ * echoing response text.)
+ *
+ * Caught transport failures use `Flair <entry> <method> <pathname> transport
+ * error: <reason>` with only a fixed reason class and no message text, including
+ * when inspecting the failure throws. A failed successful-response JSON parse uses
+ * `Flair <entry> <method> <pathname> → <status>: malformed response body`;
+ * request() and registerAgent() accept 204 without parsing.
+ * Local checks interpolate ids (promotion refusals, invalid principal records,
+ * governance read refusals and missing agents); the private-key read failure
+ * interpolates the key path and agent id. A governance read failure also embeds
+ * the caught error's message. These local messages are outside the response bound.
+ */
+const FLAIR_ERROR_CODE_LIST: readonly string[] = [
+  "invalid_authorization_header",
+  "method_not_allowed",
+  "timestamp_out_of_window",
+  "nonce_replay_detected",
+  "unknown_agent",
+  "principal_deactivated",
+  "invalid_signature",
+  "signature_verification_failed",
+  "ambiguous_memory_id",
+  "replay_store_unavailable",
+  "rate_limit_exceeded",
+  "invalid_agent_id",
+  "agent_lookup_failed",
+  "skill_assignment_not_seedable",
+  "invalid_durability",
+  "invalid_visibility",
+  "invalid_visibility_for_durability",
+  "invalid_expiry",
+  "content_safety_violation",
+  "reembed_no_text",
+  "reembed_row_changed",
+  "embedding_unavailable",
+  "reindex_admin_only",
+  "reindex_row_not_found",
+  "reindex_would_change_row",
+  "host_source_persist_failed",
+  "host_source_delete_failed",
+  "memory_id_content_suffix",
+  "supersedes_target_unreadable",
+  "supersedes_target_missing",
+  "stored_row_changed",
+  "stored_row_read_failed",
+  "id_target_mismatch",
+  "stored_row_lookup_failed",
+  "skill_durability",
+  "skill_write_path",
+  "skill_scan_rejected",
+  "skill_source_not_durable",
+  "skill_opt_out_not_boolean",
+  "skill_lineage_tag_removed",
+  "skill_state_requires_delete",
+  "skill_self_supersede",
+  "skill_predecessor_missing",
+  "skill_target_changed",
+  "skill_head_missing",
+  "skill_predecessor_stale",
+  "skill_target_stale",
+  "soul_write_requires_one_record",
+  "soul_delete_requires_one_record",
+  "soul_subject_occupied",
+  "instruction_version_head_mismatch",
+  "instruction_version_append_failed",
+  "instruction_version_busy",
+  "instruction_version_lock_unavailable",
+  "invalid_activity",
+  "presence_write_failed",
+  "rem_aborted",
+  "distillation_failed",
+  "workspace_state_query_failed",
+  "no_workspace_state_found",
+];
+
+/**
+ * The allow-list as a FROZEN ARRAY, for inspection only; the membership test
+ * is the module-private set below. Freezing the view means a consumer cannot
+ * add or remove a code and change how a non-OK response is formatted.
+ */
+export const FLAIR_ERROR_CODES: readonly string[] = Object.freeze(FLAIR_ERROR_CODE_LIST);
+
+/** Membership — module-private, so the exported view cannot change formatting. */
+const FLAIR_ERROR_CODE_SET: ReadonlySet<string> = new Set(FLAIR_ERROR_CODE_LIST);
+
+/** The code an error carries when the server named a value not on the list. */
+const UNRECOGNIZED_ERROR = "unrecognized_error";
+
+/**
+ * The path an error names: the `pathname` of the URL the request was actually
+ * sent with — never a query and never a fragment. A query string can carry an
+ * agent id, a `since` timestamp, a filter, and a fragment is not sent at all,
+ * so an error's pathname omits query and fragment; a path parameter that was
+ * percent-encoded (an agent id carrying a separator, say) stays encoded in the
+ * name, exactly as on the wire. Deriving the name from the URL the transport
+ * carried — not from the uncanonicalized string a caller supplied — keeps the
+ * reported path equal to the path the request sent.
+ */
+function requestedPath(url: string): string {
+  return new URL(url).pathname;
+}
+
+/**
+ * The allow-listed string from a response's `error` field, or `unrecognized_error`.
+ * The body itself is excluded from the non-OK response error message.
+ * Only a code that is one of the module's own fixed strings is named; every
+ * other value — including a regex-shaped credential fragment — is
+ * `UNRECOGNIZED_ERROR`.
+ */
+function responseErrorCode(body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return UNRECOGNIZED_ERROR;
+  }
+  const code = (parsed as { error?: unknown } | null)?.error;
+  return typeof code === "string" && FLAIR_ERROR_CODE_SET.has(code) ? code : UNRECOGNIZED_ERROR;
+}
+
+/** A non-OK response error: entry, method, pathname, status and an allow-listed code (else `unrecognized_error`). */
+function responseError(entry: string, method: string, path: string, status: number, body: string): string {
+  const code = responseErrorCode(body);
+  return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
+}
+
+/** The `code` of an object-valued failure or cause; other candidates, including callables, are ignored. */
+function errorCode(err: unknown): string {
+  try {
+    for (const candidate of [err, (err as { cause?: unknown } | null)?.cause]) {
+      if (candidate && typeof candidate === "object") {
+        const code = (candidate as { code?: unknown }).code;
+        if (typeof code === "string") return code;
+      }
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+/**
+ * An object-valued failure's or cause's `code` selects the reason class.
+ * A callable's own `code` is ignored, though an object-valued `cause` on it
+ * can still select a reason; any other candidate, an unknown code or a throw
+ * during inspection uses the fixed `network failure` fallback.
+ */
+function transportReason(err: unknown): string {
+  switch (errorCode(err)) {
+    case "ECONNREFUSED":
+    case "ConnectionRefused":
+      return "connection refused";
+    case "ETIMEDOUT":
+    case "ESOCKETTIMEDOUT":
+    case "UND_ERR_CONNECT_TIMEOUT":
+    case "UND_ERR_HEADERS_TIMEOUT":
+    case "UND_ERR_BODY_TIMEOUT":
+    case "ConnectionTimedOut":
+      return "timeout";
+    case "ECONNRESET":
+    case "ConnectionClosed":
+    case "UND_ERR_SOCKET":
+      return "connection reset";
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+    case "DNSResolutionFailed":
+      return "dns failure";
+    case "CERT_HAS_EXPIRED":
+    case "DEPTH_ZERO_SELF_SIGNED_CERT":
+    case "SELF_SIGNED_CERT_IN_CHAIN":
+    case "UNABLE_TO_VERIFY_LEAF_SIGNATURE":
+    case "ERR_TLS_CERT_ALTNAME_INVALID":
+      return "TLS failure";
+    default:
+      return "network failure";
+  }
+}
+
+/** A caught transport failure: entry, method, pathname and only a fixed reason class, no message text even if inspection throws. */
+function transportError(entry: string, method: string, path: string, err: unknown): string {
+  return `Flair ${entry} ${method} ${path} transport error: ${transportReason(err)}`;
+}
+
+/** A successful-response JSON parse failure; request() and registerAgent() skip parsing on 204. */
+function parseError(entry: string, method: string, path: string, status: number): string {
+  return `Flair ${entry} ${method} ${path} → ${status}: malformed response body`;
+}
+
+/**
  * Flair exposes no operation that promotes or rejects a Memory by id: the
  * promotion operation `POST /PromoteMemoryCandidate` acts on a `MemoryCandidate`
  * id. Refuse by name rather than send a write Flair rejects.
@@ -204,22 +414,41 @@ export class FlairClient {
     return `TPS-Ed25519 ${this.agentId}:${ts}:${nonce}:${sig.toString("base64")}`;
   }
 
+  /**
+   * Send a signed request. The client's wrapper methods encode their ids;
+   * request() sends the path its caller supplies and does not encode ids.
+   * Callers should encode id parameters with `encodeURIComponent` before
+   * building paths.
+   */
   async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const url = `${this.baseUrl}${path}`;
+    // The name an error carries is the pathname of the URL actually requested — the
+    // same string the transport sent — never the caller-supplied `path` verbatim and
+    // never a query or fragment.
+    const route = requestedPath(url);
     const authHeader = this.sign(method, path);
     const headers: Record<string, string> = { Authorization: authHeader };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+      });
+    } catch (err) {
+      throw new FlairRequestError(transportError("request", method, route, err), 0);
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(`Flair ${method} ${path} → ${res.status}: ${text}`, res.status);
+      throw new FlairRequestError(responseError("request", method, route, res.status, text), res.status);
     }
     if (res.status === 204) return undefined as T;
-    return res.json() as Promise<T>;
+    try {
+      return (await res.json()) as T;
+    } catch {
+      throw new FlairRequestError(parseError("request", method, route, res.status), res.status);
+    }
   }
 
   /**
@@ -243,32 +472,47 @@ export class FlairClient {
     publicKey: string,
     adminAuth?: string,
   ): Promise<FlairAgent> {
-    const url = `${this.baseUrl}/Agent/${this.agentId}`;
+    // The agent id is a path parameter: encode it so the URL — and the path an
+    // error names — carries it as one encoded segment. An id containing `#` or
+    // `?` would otherwise be dropped as a fragment or read as a query, and the
+    // error would name text the request never sent.
+    const route = `/Agent/${encodeURIComponent(this.agentId)}`;
+    const url = `${this.baseUrl}${route}`;
+    const requestedRoute = requestedPath(url);
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const res = await fetch(url, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
-      },
-      body: JSON.stringify({
-        id: this.agentId,
-        name,
-        publicKey,
-        createdAt: new Date().toISOString(),
-      }),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
+        },
+        body: JSON.stringify({
+          id: this.agentId,
+          name,
+          publicKey,
+          createdAt: new Date().toISOString(),
+        }),
+      });
+    } catch (err) {
+      throw new Error(transportError("registerAgent", "PUT", requestedRoute, err));
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`Flair agent registration failed: ${res.status}: ${text}`);
+      throw new Error(responseError("registerAgent", "PUT", requestedRoute, res.status, text));
     }
     if (res.status === 204) return { id: this.agentId, name, publicKey } as FlairAgent;
-    return res.json() as Promise<FlairAgent>;
+    try {
+      return (await res.json()) as FlairAgent;
+    } catch {
+      throw new Error(parseError("registerAgent", "PUT", requestedRoute, res.status));
+    }
   }
 
   async getAgent(id?: string): Promise<FlairAgent | null> {
     try {
-      return await this.request<FlairAgent>("GET", `/Agent/${id ?? this.agentId}`);
+      return await this.request<FlairAgent>("GET", `/Agent/${encodeURIComponent(id ?? this.agentId)}`);
     } catch {
       return null;
     }
@@ -300,15 +544,34 @@ export class FlairClient {
     adminAuth?: string,
   ): Promise<{ found: boolean; publicKey: string | null }> {
     const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
-    const res = await fetch(`${this.baseUrl}/Agent/${encodeURIComponent(agentId)}`, {
-      headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
-    });
+    // The name an error carries is the pathname of this same URL — the string the
+    // request is sent with — so an id that needs encoding (`agent/sub`) is named
+    // `agent%2Fsub`, as on the wire, never decoded and never a query or fragment.
+    const route = `/Agent/${encodeURIComponent(agentId)}`;
+    const url = `${this.baseUrl}${route}`;
+    const requestedRoute = requestedPath(url);
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Basic ${Buffer.from(auth).toString("base64")}` },
+      });
+    } catch (err) {
+      throw new FlairRequestError(transportError("readStoredPublicKey", "GET", requestedRoute, err), 0);
+    }
     if (res.status === 404) return { found: false, publicKey: null };
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new FlairRequestError(`Flair GET /Agent/${agentId} → ${res.status}: ${text}`, res.status);
+      throw new FlairRequestError(
+        responseError("readStoredPublicKey", "GET", requestedRoute, res.status, text),
+        res.status,
+      );
     }
-    const record = (await res.json()) as FlairAgent | null;
+    let record: FlairAgent | null;
+    try {
+      record = (await res.json()) as FlairAgent | null;
+    } catch {
+      throw new FlairRequestError(parseError("readStoredPublicKey", "GET", requestedRoute, res.status), res.status);
+    }
     return { found: true, publicKey: typeof record?.publicKey === "string" ? record.publicKey : null };
   }
 
@@ -336,7 +599,7 @@ export class FlairClient {
       tags?: string[];
     } = {},
   ): Promise<void> {
-    await this.request("PUT", `/Memory/${id}`, {
+    await this.request("PUT", `/Memory/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       content,
@@ -348,7 +611,7 @@ export class FlairClient {
   }
 
   async getMemory(id: string): Promise<Memory> {
-    return this.request<Memory>("GET", `/Memory/${id}`);
+    return this.request<Memory>("GET", `/Memory/${encodeURIComponent(id)}`);
   }
 
   async getSoul(): Promise<SoulEntry[]> {
@@ -360,7 +623,7 @@ export class FlairClient {
 
   async setSoul(key: string, value: string): Promise<void> {
     const id = `${this.agentId}-${key}`;
-    await this.request("PUT", `/Soul/${id}`, {
+    await this.request("PUT", `/Soul/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       key,
@@ -505,11 +768,11 @@ export class FlairClient {
   }
 
   async purgeMemory(id: string): Promise<void> {
-    await this.request("DELETE", `/Memory/${id}`);
+    await this.request("DELETE", `/Memory/${encodeURIComponent(id)}`);
   }
 
   async proposeMemory(id: string, content: string, tags?: string[]): Promise<void> {
-    await this.request("PUT", `/Memory/${id}`, {
+    await this.request("PUT", `/Memory/${encodeURIComponent(id)}`, {
       id,
       agentId: this.agentId,
       content,
@@ -529,7 +792,7 @@ export class FlairClient {
 
   async setSoulEntry(agentId: string, key: string, value: string): Promise<void> {
     const id = `${agentId}-${key}`;
-    await this.request("PUT", `/Soul/${id}`, {
+    await this.request("PUT", `/Soul/${encodeURIComponent(id)}`, {
       id,
       agentId,
       key,
@@ -541,7 +804,7 @@ export class FlairClient {
 
   async deleteSoulEntry(agentId: string, key: string): Promise<void> {
     const id = `${agentId}-${key}`;
-    await this.request("DELETE", `/Soul/${id}`);
+    await this.request("DELETE", `/Soul/${encodeURIComponent(id)}`);
   }
 
 
@@ -549,7 +812,7 @@ export class FlairClient {
   async updateAgent(agentId: string, patch: Partial<FlairAgent>): Promise<void> {
     const existing = await this.getAgent(agentId);
     if (!existing) throw new Error(`Agent ${agentId} not found`);
-    await this.request("PUT", `/Agent/${agentId}`, { ...existing, ...patch });
+    await this.request("PUT", `/Agent/${encodeURIComponent(agentId)}`, { ...existing, ...patch });
   }
 
   async seedAgent(opts: {

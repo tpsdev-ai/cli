@@ -79,7 +79,7 @@ export function startTaskLoop(
       try {
         const events: OrgEvent[] = await (flair as any).request(
           "GET",
-          `/OrgEventCatchup/${agentId}?since=${since}`,
+          `/OrgEventCatchup/${encodeURIComponent(agentId)}?since=${since}`,
         );
 
         consecutiveErrors = 0; // reset backoff on success

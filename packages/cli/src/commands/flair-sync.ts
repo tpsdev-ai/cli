@@ -179,7 +179,7 @@ export async function runFlairSync(opts: {
             pushed++;
           } else {
             debug(`[flair-sync] PUSH ${m.id}`);
-            await remote.request("PUT", `/Memory/${m.id}`, {
+            await remote.request("PUT", `/Memory/${encodeURIComponent(m.id)}`, {
               ...m,
               // Preserve all fields; don't change agentId or createdAt
             });

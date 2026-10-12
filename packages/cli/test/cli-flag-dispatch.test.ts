@@ -175,8 +175,8 @@ test("real runMail watch withholds a record with a damaged signature from the ho
   } finally { f.cleanup(); }
 }, 15_000);
 
-for (const [auth, status, error] of [
-  ["missing", 403, "AccessViolation"],
+for (const [auth, status, code] of [
+  ["missing", 403, null],
   ["invalid", 401, "invalid_signature"],
   ["unknown", 401, "unknown_agent"],
 ] as const) {
@@ -192,8 +192,12 @@ for (const [auth, status, error] of [
       const hook = join(f.root, "hook.mjs");
       writeFileSync(hook, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(sentinel)}, "ran");`);
       const output = await watchUntil(f, ["mail", "watch", "demo", "--sandbox-required", "--exec", "node", hook, "--version"], "verification error");
-      expect(output).toContain(`→ ${status}:`);
-      expect(output).toContain(error);
+      // cli#597: a non-OK response error names the entry point, the requested path
+      // and the status, and a code from a fixed list (else `unrecognized_error`)
+      // — without the response body; route reachability is not asserted.
+      expect(output).toContain("Flair request GET /Agent/");
+      expect(output).toContain(`→ ${status}`);
+      if (code) expect(output).toContain(code);
       expect(existsSync(sentinel)).toBe(false);
       expect(existsSync(record)).toBe(true);
       expect(existsSync(join(f.root, "mail", "demo", "cur", "mail.json"))).toBe(false);

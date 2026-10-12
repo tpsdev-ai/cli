@@ -119,7 +119,7 @@ export async function runFlairHealth(opts: {
 
   // 5. Cleanup
   try {
-    await client.request("DELETE", `/Memory/${testId}`);
+    await client.request("DELETE", `/Memory/${encodeURIComponent(testId)}`);
     ok("memory cleanup");
   } catch {
     skip("memory cleanup", "(non-fatal)");

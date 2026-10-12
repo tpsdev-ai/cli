@@ -79,7 +79,12 @@ describe("memory CLI entry", () => {
         { env: { ...process.env, HOME: home, TPS_AGENT_ID: "operator" }, encoding: "utf8", timeout: 10_000 },
       );
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("forbidden: agentId must match authenticated agent");
+      // cli#597: a non-OK response error names the entry point, the requested path
+      // and the status, and a code from a fixed list (else `unrecognized_error`)
+      // — without the response body; route reachability is not asserted.
+      expect(result.stderr).toContain("SemanticSearch");
+      expect(result.stderr).toContain("→ 403");
+      expect(result.stderr).not.toContain("agentId must match");
       expect(result.stdout.trim()).toBe("");
     } finally {
       rmSync(home, { recursive: true, force: true });
