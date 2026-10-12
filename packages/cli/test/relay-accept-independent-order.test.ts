@@ -8,8 +8,8 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getInbox } from "../src/utils/mail.js";
-import { relayAcceptanceLockRoot } from "../src/utils/relay.js";
+import { getInbox, sendMessage } from "../src/utils/mail.js";
+import { relayAcceptanceLockRoot, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 
 const BRANCH = "remote";
 const FROM = "remote";
@@ -17,11 +17,40 @@ const TIMESTAMP = "2000-01-01T00:00:00.000Z";
 const LOCK_TIMEOUT_MS = 5000;
 const PAUSE_TIMEOUT_MS = 10000;
 
+const LOCK_URL = new URL("../src/utils/mail-lock.js", import.meta.url).href;
 const RELAY_URL = new URL("../src/utils/relay.js", import.meta.url).href;
 
 const CHILD_SOURCE = `
-const { deliverRelayedToLocal, setRelayAcceptTestHook } = await import(${JSON.stringify(RELAY_URL)});
 const pause = process.env.RELAY_CHILD_PAUSE;
+const crossed = process.env.RELAY_CHILD_CROSSED === "1";
+let pastRecipientPause = false;
+if (crossed) {
+  const { mock } = await import("bun:test");
+  const real = await import(${JSON.stringify(LOCK_URL)});
+  const acquire = real.acquireMailLockSync;
+  const { existsSync, writeFileSync } = await import("node:fs");
+  let first = true;
+  mock.module(${JSON.stringify(LOCK_URL)}, () => ({
+    ...real,
+    acquireMailLockSync(root, options) {
+      if (!pastRecipientPause || !first) return acquire(root, options);
+      first = false;
+      writeFileSync(pause + ".attempt", root);
+      const lock = acquire(root, options);
+      if (lock) {
+        writeFileSync(pause + ".acquired", root);
+        const deadline = Date.now() + ${PAUSE_TIMEOUT_MS};
+        const wait = new Int32Array(new SharedArrayBuffer(4));
+        while (!existsSync(pause + ".next")) {
+          if (Date.now() >= deadline) { lock.release(); throw new Error("first-lock pause timed out"); }
+          Atomics.wait(wait, 0, 0, 5);
+        }
+      }
+      return lock;
+    },
+  }));
+}
+const { deliverRelayedToLocal, setRelayAcceptTestHook } = await import(${JSON.stringify(RELAY_URL)});
 if (pause) {
   const { existsSync, writeFileSync } = await import("node:fs");
   setRelayAcceptTestHook((root) => {
@@ -32,6 +61,7 @@ if (pause) {
       if (Date.now() >= deadline) throw new Error("test pause timed out");
       Atomics.wait(wait, 0, 0, 5);
     }
+    pastRecipientPause = true;
   });
 }
 const started = Date.now();
@@ -44,12 +74,12 @@ try {
     timestamp: ${JSON.stringify(TIMESTAMP)},
   });
   process.stdout.write(JSON.stringify({ delivered: ok ? 1 : 0, refused: 0, ms: Date.now() - started }));
-} catch {
-  process.stdout.write(JSON.stringify({ delivered: 0, refused: 1, ms: Date.now() - started }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ delivered: 0, refused: 1, ms: Date.now() - started, error: error.message, errorName: error.name }));
 }
 `;
 
-interface Result { delivered: number; refused: number; ms: number; }
+interface Result { delivered: number; refused: number; ms: number; error?: string; errorName?: string; }
 
 let root: string;
 let mail: string;
@@ -81,7 +111,7 @@ function jsonFiles(dir: string): string[] {
   return existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".json")) : [];
 }
 
-function acceptChild(id: string, to: string, pause?: string): Promise<Result> {
+function acceptChild(id: string, to: string, pause?: string, crossed = false): Promise<Result> {
   const child = spawn("bun", [childScript], {
     env: {
       ...process.env,
@@ -90,6 +120,7 @@ function acceptChild(id: string, to: string, pause?: string): Promise<Result> {
       RELAY_CHILD_ID: id,
       RELAY_CHILD_TO: to,
       ...(pause ? { RELAY_CHILD_PAUSE: pause } : {}),
+      ...(crossed ? { RELAY_CHILD_CROSSED: "1" } : {}),
     },
     stdio: ["ignore", "pipe", "inherit"],
   });
@@ -113,8 +144,8 @@ async function waitForFile(path: string): Promise<void> {
   }
 }
 
-describe("relay acceptance lock order (cli#601)", () => {
-  test("distinct-stripe acceptances to different recipients complete before the timeout", async () => {
+describe("relay acceptance mailbox lock sets (cli#601)", () => {
+  test("distinct-stripe acceptances with disjoint recipient-only lock sets publish before half the timeout", async () => {
     const idA = randomUUID();
     let idB = randomUUID();
     while (relayAcceptanceLockRoot(BRANCH, idA) === relayAcceptanceLockRoot(BRANCH, idB)) idB = randomUUID();
@@ -149,5 +180,64 @@ describe("relay acceptance lock order (cli#601)", () => {
       const record = JSON.parse(readFileSync(join(getInbox(agent).fresh, files[0]!), "utf8")) as { relayDelivery?: { id?: string } };
       expect(record.relayDelivery?.id).toBe(id);
     }
+  }, 60_000);
+
+  test("distinct-stripe acceptances with crossed same-ID candidate roots refuse conflicts before half the timeout", async () => {
+    const idA = randomUUID();
+    let idB = randomUUID();
+    while (relayAcceptanceLockRoot(BRANCH, idA) === relayAcceptanceLockRoot(BRANCH, idB)) idB = randomUUID();
+    expect(relayAcceptanceLockRoot(BRANCH, idA)).not.toBe(relayAcceptanceLockRoot(BRANCH, idB));
+    sendMessage("agent-b", `c-${idA}`, FROM, { branchId: BRANCH, id: idA }, TIMESTAMP);
+    sendMessage("agent-a", `c-${idB}`, FROM, { branchId: BRANCH, id: idB }, TIMESTAMP);
+    const roots = [getInbox("agent-a").root, getInbox("agent-b").root];
+    const seeded = roots.map((mailbox) => jsonFiles(join(mailbox, "new")).map((file) => [file, readFileSync(join(mailbox, "new", file), "utf8")]));
+    const pauseA = join(root, "cross-a");
+    const pauseB = join(root, "cross-b");
+    const children: Promise<Result>[] = [];
+    let results: Result[];
+    try {
+      children.push(acceptChild(idA, "agent-a", pauseA, true));
+      await waitForFile(`${pauseA}.ready`);
+      children.push(acceptChild(idB, "agent-b", pauseB, true));
+      await waitForFile(`${pauseB}.ready`);
+      // Both processes hold their preliminary recipient locks at the injected pause.
+      for (const [pause, mailbox] of [[pauseA, roots[0]], [pauseB, roots[1]]] as const) {
+        expect(readFileSync(`${pause}.ready`, "utf8")).toBe(mailbox!);
+        expect(existsSync(join(mailbox!, ".mail-lock"))).toBe(true);
+      }
+      writeFileSync(`${pauseA}.release`, "");
+      writeFileSync(`${pauseB}.release`, "");
+      await Promise.all([waitForFile(`${pauseA}.attempt`), waitForFile(`${pauseB}.attempt`)]);
+      const firstA = readFileSync(`${pauseA}.attempt`, "utf8");
+      const firstB = readFileSync(`${pauseB}.attempt`, "utf8");
+      // The wrapper delegates to the real lock API. Sorted sets serialize on one first root;
+      // without sorting, both hold opposite first roots before either takes its second lock.
+      if (firstA !== firstB) {
+        await Promise.all([waitForFile(`${pauseA}.acquired`), waitForFile(`${pauseB}.acquired`)]);
+        for (const mailbox of roots) expect(existsSync(join(mailbox, ".mail-lock"))).toBe(true);
+      } else {
+        const deadline = Date.now() + PAUSE_TIMEOUT_MS;
+        while (!existsSync(`${pauseA}.acquired`) && !existsSync(`${pauseB}.acquired`)) {
+          if (Date.now() >= deadline) throw new Error("neither child acquired its first candidate-set lock");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+      }
+      writeFileSync(`${pauseA}.next`, "");
+      writeFileSync(`${pauseB}.next`, "");
+      results = await Promise.all(children);
+    } finally {
+      for (const pause of [pauseA, pauseB]) {
+        writeFileSync(`${pause}.release`, "");
+        writeFileSync(`${pause}.next`, "");
+      }
+      await Promise.allSettled(children);
+    }
+    expect(results).toEqual([idA, idB].map((id) => ({
+      delivered: 0, refused: 1, ms: expect.any(Number), errorName: "Error",
+      error: `relayed delivery conflict for branch ${BRANCH} message ${id}`,
+    })));
+    for (const result of results) expect(result.ms).toBeLessThan(LOCK_TIMEOUT_MS / 2);
+    expect(roots.map((mailbox) => jsonFiles(join(mailbox, "new")).map((file) => [file, readFileSync(join(mailbox, "new", file), "utf8")]))).toEqual(seeded);
+    for (const id of [idA, idB]) expect(existsSync(relayAcceptanceReceiptPath(BRANCH, id))).toBe(false);
   }, 60_000);
 });
