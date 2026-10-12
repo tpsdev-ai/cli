@@ -38,11 +38,7 @@ const BLOCKED = `blocked by minimum-release-age: ${WINDOW_SECONDS} seconds`;
 type Published = Record<string, Record<string, { ageDays: number; dependencies?: Record<string, string> }>>;
 const AGE_FIXTURE: Published = { [NAME]: { [AGED]: { ageDays: 90 }, [FRESH]: { ageDays: 1 } } };
 
-/**
- * A valid bun.lock resolving the fixture's aged version, so a refusal test's gate
- * is not stopped by an unparseable lockfile: an audit that skips the workspace
- * check or exits early then reaches the release-age phase and fails the test.
- */
+/** A parseable lockfile with an external resolution for workspace refusal gate tests. */
 const VALID_LOCK = `{"lockfileVersion":1,"workspaces":{"":{"name":"fixture"}},"packages":{"${NAME}":["${NAME}@${AGED}","",{}]}}`;
 
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
@@ -289,6 +285,7 @@ it(
         `${workspace}: \`${CHILD}\` is in overrides, which Bun applies from the root package.json, not from this file.`,
       );
       expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
     } finally {
       try {
         registry?.stop();
@@ -328,6 +325,7 @@ it.each([
       expect(gate.exit).toBe(2);
       expect(gate.output).toContain(`package.json: \`${CHILD}\` is in resolutions (key \`${key}\`)`);
       expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
     } finally {
       try {
         registry?.stop();
@@ -493,9 +491,7 @@ it.each([
       excludes: [NAME], exceptionEntries: new Map([[`${NAME}@${AGED}`, {}]]), exceptionErrors: [], packageJsons,
     })).toEqual([{ kind: "workspaces", message: resolved.error, pattern }]);
 
-    // The real gate, with a valid lockfile and a root pin for the excluded name: the
-    // workspace audit must refuse here, not exit early or skip, so the assertion
-    // fails if it does either.
+    // A valid lockfile and root pin isolate the workspace refusal.
     writeFileSync(join(project, "bun.lock"), VALID_LOCK);
     writeFileSync(
       join(project, "package.json"),
@@ -505,6 +501,7 @@ it.each([
     expect(gate.exit).toBe(2);
     expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
     expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -537,9 +534,7 @@ it.each([
     expect(resolved.error).toContain("unsupported negated spelling");
     expect(resolved.pattern).toBe(pattern);
 
-    // The real gate, with a valid lockfile and a root pin for the excluded name: the
-    // workspace audit must refuse here, not exit early or skip, so the assertion
-    // fails if it does either.
+    // A valid lockfile and root pin isolate the workspace refusal.
     writeFileSync(join(project, "bun.lock"), VALID_LOCK);
     writeFileSync(
       join(project, "package.json"),
@@ -549,19 +544,13 @@ it.each([
     expect(gate.exit).toBe(2);
     expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
     expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 }, 30000);
 
-/**
- * The real-Bun parity row for a refused `workspaces` pattern: build the project,
- * run real Bun's install and record the workspaces it resolves (`bunApplied`, or
- * `null` when Bun refuses the whole install with "Workspace not found"), then run
- * the gate over a valid lockfile and assert it refuses the pattern by name with
- * `reason`, without reaching the release-age phase. The valid lockfile means an
- * audit that exits early or skips the workspace check fails the assertions here.
- */
+/** Compare real Bun's install result with the gate's named workspace refusal. */
 async function refusalParity(pattern: string, dirs: string[], bunApplied: string[] | null, reason: string) {
   const root = mkdtempSync(join(tmpdir(), "age-refusal-"));
   try {
@@ -574,13 +563,12 @@ async function refusalParity(pattern: string, dirs: string[], bunApplied: string
       expect(install.output).toContain(`Workspace not found "${pattern}"`);
     } else {
       expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
-      const lock = parseBunLock(readFileSync(join(project, "bun.lock"), "utf8"));
+      const lockPath = join(project, "bun.lock");
+      const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
       expect(Object.keys(lock.workspaces).filter((key) => key !== "").sort()).toEqual(bunApplied);
     }
     writeFileSync(join(project, "bun.lock"), VALID_LOCK);
-    // Pin the excluded name exactly in the root manifest, which Bun always applies,
-    // so the only reason left to refuse is the pattern: the gate must reach its
-    // workspace audit and stop there, never the "Checking" release-age phase.
+    // A valid lockfile and root pin isolate the workspace refusal.
     writeFileSync(
       join(project, "package.json"),
       JSON.stringify({ name: "fixture", workspaces: [pattern], dependencies: { [NAME]: AGED } }),
@@ -589,7 +577,9 @@ async function refusalParity(pattern: string, dirs: string[], bunApplied: string
     expect(gate.exit).toBe(2);
     expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
     expect(gate.output).toContain(reason);
+    expect(gate.output).toContain(`Remedy: fix or remove the \`workspaces\` pattern \`${pattern}\`.`);
     expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -608,6 +598,18 @@ it.each([
 );
 
 it.each([
+  [
+    "a brace group inside a !-negated class",
+    "packages/[!{c,x}]li",
+    ["packages/cli", "packages/xli"],
+    [],
+  ],
+  [
+    "a brace group inside a ^-negated class",
+    "packages/[^{c,x}]li",
+    ["packages/cli", "packages/xli"],
+    [],
+  ],
   [
     "a class inside a brace group",
     "packages/{a,[bc]}",
