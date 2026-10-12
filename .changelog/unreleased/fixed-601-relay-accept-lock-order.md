@@ -1,1 +1,1 @@
-- **Relay acceptance acquires mailbox locks in one canonical order.** Two acceptances of different message ids to different recipients no longer stall each other to the lock timeout.
+- **Relay acceptance removes the mailbox scan lock-order cycle.** Contention can still cause waits and timeout refusals.

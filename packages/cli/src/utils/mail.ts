@@ -501,17 +501,15 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
       }
     }
   }
-  // The scan reads every mailbox — a same-id resend may name a different
-  // recipient, and its conflict must still be found. But it may only MOVE a
+  // The scan reads the discovered roots' new/, dlq/ and cur/. A same-id resend
+  // may name a different recipient, and its conflict must still be found. It may only MOVE a
   // record out of the recipient's own mailbox (cli#560): a record in any other
   // mailbox that is not this delivery's is left exactly where it is.
   const recipientRoot = root;
-  // A caller that already holds a mailbox (relay acceptance holds the
-  // recipient's across check, publication and marker) acquires the rest in one
-  // canonical order — ascending by path. A mailbox that sorts BEFORE the one it
-  // holds is read without its lock and is never rewritten; the ordering is what
-  // keeps two acceptances of independent deliveries to different recipients from
-  // waiting on each other in a cycle.
+  // Acceptance holds the recipient mailbox before this scan. Scan locks are
+  // acquired in ascending path order only after that root; earlier roots are
+  // read without mailbox locks and their records are never rewritten.
+  // These scan acquisitions cannot form a mailbox lock cycle.
   const heldRoot = options.heldRoot;
   for (const root of [...roots].sort()) {
     mkdirMailDirectory(root);
@@ -523,13 +521,23 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     if (!held && !readOnly && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
     const owned = held || lock !== null;
     try {
-      for (const dir of ["new", "cur", "dlq"]) {
+      // Promotion publishes cur/ before removing its new/ or dlq/ source.
+      // Scanning sources before cur/ therefore sees either the source or the
+      // published copy at every promotion interleaving. If a listed source
+      // disappears before the read, re-check its cur/ copy; absence refuses.
+      for (const dir of ["new", "dlq", "cur"]) {
         const path = join(root, dir);
         for (const file of listMessageFiles(path)) {
-          const source = join(path, file);
+          let source = join(path, file);
           let raw: string;
           try {
-            raw = readFileSync(source, "utf-8");
+            try {
+              raw = readFileSync(source, "utf-8");
+            } catch (error) {
+              if (!readOnly || dir === "cur" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+              source = join(root, "cur", file);
+              raw = readFileSync(source, "utf-8");
+            }
           } catch (error) {
             const reason = error instanceof Error ? error.message : String(error);
             const message = `relayed record read failed: ${source}: ${reason}`;
@@ -575,7 +583,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
             if (projectionChanged || (record.relayWireTo ?? stored.to) !== wireRecipient || stored.from !== payload.from || stored.to !== payload.to || stored.body !== payload.body || stored.timestamp !== payload.timestamp) {
               throw new Error(`relayed delivery conflict for branch ${delivery.branchId} message ${delivery.id}`);
             }
-            const target = join(path, file);
+            const target = source;
             // A mailbox read without its lock is not rewritten; only the
             // recipient's own (held) mailbox, or one whose lock this scan holds,
             // is republished in place.

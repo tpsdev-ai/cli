@@ -1,15 +1,10 @@
 /**
  * relay-accept-independent-order.test.ts — cli#601.
  *
- * Two acceptances of different message ids to different recipients are
- * independent: no per-delivery lock is shared, so neither can wait on the other
- * in a cycle. The relay accept path used to hold its recipient's mailbox lock
- * across a scan that also locked every other mailbox, so two such acceptances
- * could each hold one mailbox and wait for the other's — a lock-order cycle that
- * ended only at the acceptance lock timeout.
- *
- * The interleaving is made deterministic with the injected acceptance pause
- * point (a real cross-process hook), not with timing.
+ * Children with distinct acceptance stripes hold distinct recipient locks
+ * before scanning. The scan lock order removes their mailbox lock cycle;
+ * contention can still cause waits and timeout refusals.
+ * The pause hook places both children before their scans, holding those locks.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -18,17 +13,16 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getInbox } from "../src/utils/mail.js";
+import { relayAcceptanceLockRoot } from "../src/utils/relay.js";
 
 const BRANCH = "remote";
 const FROM = "remote";
 const TIMESTAMP = "2000-01-01T00:00:00.000Z";
-/** A budget well above what a correct acceptance needs, so a wait is visible. */
 const LOCK_TIMEOUT_MS = 5000;
 const PAUSE_TIMEOUT_MS = 10000;
 
 const RELAY_URL = new URL("../src/utils/relay.js", import.meta.url).href;
 
-/** A real child process that accepts one relayed delivery, optionally pausing before its scan. */
 const CHILD_SOURCE = `
 const { deliverRelayedToLocal, setRelayAcceptTestHook } = await import(${JSON.stringify(RELAY_URL)});
 const pause = process.env.RELAY_CHILD_PAUSE;
@@ -91,7 +85,6 @@ function jsonFiles(dir: string): string[] {
   return existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".json")) : [];
 }
 
-/** Start a delivering child and resolve with its result when it exits. */
 function acceptChild(id: string, to: string, pause?: string): Promise<Result> {
   const child = spawn("bun", [childScript], {
     env: {
@@ -125,24 +118,32 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 describe("relay acceptance lock order (cli#601)", () => {
-  test("two acceptances of different ids to different recipients both complete without waiting for the lock timeout", async () => {
+  test("distinct-stripe acceptances to different recipients complete before the timeout", async () => {
     const idA = randomUUID();
-    const idB = randomUUID();
+    let idB = randomUUID();
+    while (relayAcceptanceLockRoot(BRANCH, idA) === relayAcceptanceLockRoot(BRANCH, idB)) idB = randomUUID();
+    expect(relayAcceptanceLockRoot(BRANCH, idA)).not.toBe(relayAcceptanceLockRoot(BRANCH, idB));
     const pauseA = join(root, "pause-a");
     const pauseB = join(root, "pause-b");
-    // Each child holds its own delivery stripe and recipient mailbox lock, paused
-    // just before it scans the mail root — the interleaving that used to wait.
-    const a = acceptChild(idA, "agent-a", pauseA);
-    await waitForFile(`${pauseA}.ready`);
-    const b = acceptChild(idB, "agent-b", pauseB);
-    await waitForFile(`${pauseB}.ready`);
-    writeFileSync(`${pauseA}.release`, "");
-    writeFileSync(`${pauseB}.release`, "");
-    const [ra, rb] = await Promise.all([a, b]);
+    const children: Promise<Result>[] = [];
+    let results: Result[];
+    try {
+      children.push(acceptChild(idA, "agent-a", pauseA));
+      await waitForFile(`${pauseA}.ready`);
+      children.push(acceptChild(idB, "agent-b", pauseB));
+      await waitForFile(`${pauseB}.ready`);
+      writeFileSync(`${pauseA}.release`, "");
+      writeFileSync(`${pauseB}.release`, "");
+      results = await Promise.all(children);
+    } finally {
+      writeFileSync(`${pauseA}.release`, "");
+      writeFileSync(`${pauseB}.release`, "");
+      await Promise.allSettled(children);
+    }
+    const [ra, rb] = results as [Result, Result];
 
     expect({ delivered: ra.delivered, refused: ra.refused }).toEqual({ delivered: 1, refused: 0 });
     expect({ delivered: rb.delivered, refused: rb.refused }).toEqual({ delivered: 1, refused: 0 });
-    // Neither waited for the lock timeout: a correct acceptance completes at once.
     expect(ra.ms).toBeLessThan(LOCK_TIMEOUT_MS / 2);
     expect(rb.ms).toBeLessThan(LOCK_TIMEOUT_MS / 2);
 
