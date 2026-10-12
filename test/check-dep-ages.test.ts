@@ -60,10 +60,10 @@ describe("thresholdFromInstallTable", () => {
 describe("excludesFromInstallTable", () => {
   const read = (text: string) => excludesFromInstallTable(Bun.TOML.parse(text).install);
 
-  it("reads this repo's install-time exclude list", () => {
+  it("reads this repo's install-time exclude list, which is empty", () => {
     const { names, error } = read(readFileSync(join(REPO, "bunfig.toml"), "utf8"));
     expect(error).toBeNull();
-    expect(names).toEqual(["handlebars"]);
+    expect(names).toEqual([]);
   });
 
   it("reads an empty list, and an absent key, as no excludes", () => {
