@@ -242,8 +242,10 @@ function exceptionName(key) {
 
 const DEP_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "overrides"];
 
-/** Split a relative path into its non-empty, non-`.` segments. */
-function pathSegments(path) {
+function pathSegments(path, negated = false) {
+  if (negated && (path.includes("\\") || path.split("/").some((segment) => segment === "" || segment === "."))) {
+    throw new Error("unsupported negated spelling: empty or `.` path segment, or backslash");
+  }
   return String(path)
     .split(/[\\/]/)
     .filter((segment) => segment !== "" && segment !== ".");
@@ -371,12 +373,13 @@ function matchGlobSegment(value, pattern) {
   return segmentRegex(pattern).test(value);
 }
 
-/** The message of the error a glob's segments raise when compiled, or `null` when they all compile. */
 function globError(pattern) {
-  const expanded = expandBraces(stripNegation(pattern).inner);
-  if (expanded === null) return null;
   try {
-    for (const candidate of expanded) for (const segment of pathSegments(candidate)) segmentRegex(segment);
+    const { inner } = stripNegation(pattern);
+    pathSegments(inner, pattern.startsWith("!"));
+    const expanded = expandBraces(inner);
+    if (expanded === null) return null;
+    for (const candidate of expanded) for (const segment of pathSegments(candidate, pattern.startsWith("!"))) segmentRegex(segment);
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
@@ -396,17 +399,30 @@ function matchSegments(value, glob) {
   return match(0, 0);
 }
 
-/** Whether a workspace glob matches a manifest's directory. */
-function matchGlobDir(dir, pattern) {
-  const expanded = expandBraces(pattern);
-  if (expanded === null) return false;
+/** Whether a supported workspace glob matches a manifest's directory. */
+function matchGlobDir(dir, pattern, negated = false) {
   const value = pathSegments(dir);
   // Bun's glob walk skips dot-directories; only a pattern without glob syntax reaches one.
-  if (isGlobPattern(pattern) && value.some((segment) => segment.startsWith("."))) return false;
-  for (const candidate of expanded) {
-    if (matchSegments(value, pathSegments(candidate))) return true;
+  if ((negated || isGlobPattern(pattern)) && value.some((segment) => segment.startsWith("."))) return false;
+  const expanded = expandBraces(pattern);
+  if (expanded === null) return false;
+  if (!negated) {
+    for (const candidate of expanded) {
+      if (matchSegments(value, pathSegments(candidate))) return true;
+    }
+    return false;
   }
-  return false;
+  const segments = pathSegments(pattern, true);
+  if (segments.length === 0 || value.length === 0) return false;
+  const first = expandBraces(segments[0]);
+  if (first === null || first.some((alternative) => matchGlobSegment(value[0], alternative))) {
+    return false;
+  }
+  const rest = segments.slice(1);
+  if (rest.length === 0) return value.length === 1;
+  const alternatives = expandBraces(rest.join("/"));
+  if (alternatives === null) return false;
+  return alternatives.some((alternative) => matchSegments(value.slice(1), pathSegments(alternative)));
 }
 
 /**
@@ -442,11 +458,7 @@ export function workspacePatterns(workspaces) {
 }
 
 /**
- * The manifests Bun applies when it installs: the root manifest, and the
- * manifests of the directories the root manifest's `workspaces` patterns name.
- * A pattern without glob syntax is a literal directory; a glob one is walked with
- * `*`, `?`, `**`, `[...]` and `{a,b}`. A `!`-negated pattern removes an earlier
- * glob match it matches; a literal directory is never removed.
+ * Resolve supported workspace patterns; refuse unreadable shapes and spellings.
  *
  * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
  *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
@@ -481,9 +493,8 @@ export function appliedManifestPaths(manifests) {
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);
-    if (negated) continue; // a negated pattern removes an earlier glob match, and adds none of its own
     for (const [dir, path] of byDir) {
-      if (!matchGlobDir(dir, inner)) continue;
+      if (!matchGlobDir(dir, inner, negated)) continue;
       const excluded = globs.slice(i + 1).some((later) => {
         const removed = stripNegation(later);
         return removed.negated && matchGlobDir(dir, removed.inner);
