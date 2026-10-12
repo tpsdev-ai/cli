@@ -114,3 +114,54 @@ describe("tps office status", () => {
     expect(output.join("\n")).toContain(`Flair unreachable at ${stub.url} (HTTP 403)`);
   });
 });
+
+/**
+ * cli#620 — the recent-events read no longer swallows a refusal or a failed
+ * request. The stub registers its own viewer, so the fixtures here name no
+ * production agent.
+ */
+describe("cli#620 — office status reports a refused or failed OrgEvent read", () => {
+  const VIEWER = "viewer-a";
+  const AGENT = { id: "agent-a", name: "Agent A", role: "engineer", status: "active" };
+  const TASK = [
+    { id: "e1", kind: "task.completed", authorId: "agent-a", summary: "Shipped a change", createdAt: new Date().toISOString() },
+  ];
+
+  /** Point the shared stub at a viewer whose OrgEvent read answers with `answer`; return its key path. */
+  function install(answer: (url: URL) => Response): string {
+    stub.stop();
+    const key = writeKeyFile(root, VIEWER, SEED);
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url) =>
+      url.pathname === "/Agent/"
+        ? Response.json([AGENT])
+        : url.pathname.startsWith("/OrgEventCatchup/")
+          ? answer(url)
+          : undefined,
+    );
+    return key;
+  }
+
+  test("a refused read is reported, and the table still renders", async () => {
+    const key = install(() => new Response(null, { status: 403 }));
+    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true });
+    const joined = output.join("\n");
+    expect(joined).toContain(`Cannot read OrgEvents from ${stub.url} (HTTP 403); activity is incomplete.`);
+    expect(joined).toContain("Agent A");
+  });
+
+  test("a failed request is reported", async () => {
+    const key = install(() => { throw new TypeError("fetch failed"); });
+    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true });
+    const joined = output.join("\n");
+    expect(joined).toContain(`Cannot read OrgEvents from ${stub.url}; activity is incomplete.`);
+    expect(joined).toContain("Agent A");
+  });
+
+  test("an OK read is unchanged", async () => {
+    const key = install(() => Response.json(TASK));
+    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true });
+    const joined = output.join("\n");
+    expect(joined).toContain("Shipped a change");
+    expect(joined).not.toContain("Cannot read OrgEvents");
+  });
+});

@@ -140,7 +140,9 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     else { console.error(`Flair unreachable at ${flairUrl} (HTTP ${res.status})`); process.exit(1); }
   } catch { console.error(`Flair unreachable at ${flairUrl}. Is it running?`); process.exit(1); }
 
-  // Fetch recent OrgEvents (last 6h) for task + heartbeat status
+  // Fetch recent OrgEvents (last 6h) for task + heartbeat status. A refusal or
+  // a failed read here is reported: the task column would otherwise read as
+  // "idle" when the request did not return the events.
   const since = new Date(Date.now() - 6 * 3_600_000).toISOString().replace(/Z$/, ".000Z");
   const evPath = `/OrgEventCatchup/${viewerId}?since=${since}`;
   let events: OrgEvent[] = [];
@@ -148,7 +150,10 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     const auth = a("GET", evPath);
     const res = await fetch(`${flairUrl}${evPath}`, auth ? { headers: { Authorization: auth } } : {});
     if (res.ok) events = await res.json() as OrgEvent[];
-  } catch { /* non-fatal */ }
+    else console.error(`Cannot read OrgEvents from ${flairUrl} (HTTP ${res.status}); activity is incomplete.`);
+  } catch {
+    console.error(`Cannot read OrgEvents from ${flairUrl}; activity is incomplete.`);
+  }
 
   const lastTask   = new Map<string, OrgEvent>();
   const lastHbTime = new Map<string, string>();
