@@ -6,6 +6,7 @@ import { sanitizeError } from "../telemetry/events.js";
 import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "../lib/signEnvelope.js";
 import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
+import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
 import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
 import {
   decideEnvelopeForMailbox,
@@ -230,6 +231,10 @@ export class MailClient {
   ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
     const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
+    let relayLock: MailLock | null;
+    try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body)); }
+    catch (error) { lock.release(); throw error; }
+    if (!relayLock) { lock.release(); throw new Error("relay acceptance busy; not promoted"); }
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
@@ -272,6 +277,7 @@ export class MailClient {
       replay.finishPlacement(envelope.messageId, file);
       return null;
     } finally {
+      relayLock.release();
       lock.release();
     }
   }
@@ -397,12 +403,17 @@ export class MailClient {
     started: number,
   ): void {
     const dlqPath = join(this.inboxDlq, file);
+    let relayLock: MailLock | null = null;
     try {
+      let record: unknown;
+      try { record = JSON.parse(readFileSync(srcPath, "utf-8")); } catch {}
+      relayLock = tryAcquireRelayMoveLock(record);
+      if (!relayLock) return;
       if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
       writeRejectSidecar(this.inboxDlq, file, rejected.class, rejected.reason);
     } catch (err) {
       console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`);
-    }
+    } finally { relayLock?.release(); }
     this.events?.emit({
       type: "mail.receive",
       agent: this.agentId,
