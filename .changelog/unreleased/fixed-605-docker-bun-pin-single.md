@@ -1,0 +1,1 @@
+- **The Docker Bun pin check rejects multiline pins (Closes #605).**
