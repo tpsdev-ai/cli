@@ -45,9 +45,7 @@ export class PatchAfterCleanupError extends Error {
 }
 
 /**
- * A file-scope patch factory whose patches are restored in reverse by ONE
- * cleanup hook. After that hook runs, a later patch would never be restored, so
- * the factory refuses it with `PatchAfterCleanupError` instead of leaking it.
+ * A file-scope patch factory whose patches are restored in reverse by one cleanup hook.
  */
 export function createPatchRegistry(registerCleanup: (cleanup: () => void) => void): typeof patchShared {
   const restores: Array<() => void> = [];

@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { guardedGlobalFiles } from "./helpers/global-leak-preload.js";
 import { type Finding, analyzeSource, discoverCliTestFiles } from "./helpers/mock-restore-guard-scan.js";
 
@@ -14,7 +14,7 @@ const CLI_ROOT = join(TEST_ROOT, "..");
 const FIXTURES = join(TEST_ROOT, "fixtures", "mock-restore-guard");
 
 function findingsFor(name: string): Finding[] {
-  return analyzeSource(readFileSync(join(FIXTURES, name), "utf8"));
+  return analyzeSource(readFileSync(join(FIXTURES, name), "utf8"), name);
 }
 
 function kindsFor(name: string): string[] {
@@ -28,7 +28,7 @@ function detailsFor(name: string): string[] {
 describe("mock restore guard (cli#555)", () => {
   test("discovered cli test files satisfy the static guard", () => {
     const offenders = discoverCliTestFiles(CLI_ROOT)
-      .map((file) => ({ file, findings: analyzeSource(readFileSync(file, "utf8")) }))
+      .map((file) => ({ file, findings: analyzeSource(readFileSync(file, "utf8"), file) }))
       .filter((entry) => entry.findings.length > 0)
       .map((entry) => `${relative(CLI_ROOT, entry.file)}: ${JSON.stringify(entry.findings)}`);
     expect(offenders).toEqual([]);
@@ -55,7 +55,7 @@ describe("mock restore guard (cli#555)", () => {
     }
   });
 
-  test("every cli test file this run loaded through the guard is in the scanned set", () => {
+  test("cli files recorded by the preload when this assertion runs are in the scanned set", () => {
     const scanned = new Set(discoverCliTestFiles(CLI_ROOT));
     const loaded = guardedGlobalFiles()
       .filter((path) => path.startsWith(`${CLI_ROOT}/`) && !path.includes("/node_modules/"));
@@ -104,6 +104,39 @@ describe("mock restore guard (cli#555)", () => {
       expect(kindsFor(name)).toContain("direct-assignment-needs-restore");
     });
   }
+
+  for (const name of ["loop-var-after-leaked.fixture.ts", "loop-var-nested-leaked.fixture.ts"]) {
+    test(`reports the write in ${name}`, () => {
+      expect(detailsFor(name)).toEqual([
+        "assignment to 'alias.method' requires patchShared; inline restoration is refused",
+      ]);
+    });
+  }
+
+  test("clears values destructured directly from process.env", () => {
+    expect(findingsFor("direct-env-destructured-exempt.fixture.ts")).toEqual([]);
+  });
+
+  for (const name of ["selected-process-alias.fixture.ts", "nested-selected-process-alias.fixture.ts"]) {
+    test(`reports p.exit and clears environment writes in ${name}`, () => {
+      expect(detailsFor(name)).toEqual([
+        "assignment to 'p.exit' requires patchShared; inline restoration is refused",
+      ]);
+    });
+  }
+
+  for (const name of ["jsx-global-leaked.fixture.tsx", "jsx-global-leaked.fixture.jsx"]) {
+    test(`reports the global write after JSX in ${name}`, () => {
+      expect(detailsFor(name)).toEqual([
+        "assignment to 'globalThis.fetch' requires patchShared; inline restoration is refused",
+      ]);
+    });
+  }
+
+  test("discovery resolves a relative root to absolute file paths", () => {
+    const root = relative(process.cwd(), TEST_ROOT);
+    expect(discoverCliTestFiles(root)).toEqual(discoverCliTestFiles(resolve(root)));
+  });
 
   test("reports call-rooted-global-leaked.fixture.ts (red fixture)", () => {
     expect(kindsFor("call-rooted-global-leaked.fixture.ts")).toContain("unclassified-assignment-target");

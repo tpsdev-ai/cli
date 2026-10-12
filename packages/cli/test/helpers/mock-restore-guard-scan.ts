@@ -1,6 +1,6 @@
 /** Static mock-assignment and teardown checks for cli test files. */
 
-import { join } from "node:path";
+import { extname, join, resolve } from "node:path";
 import ts from "typescript";
 import { discoverTestFiles } from "../../../../scripts/check-test-reports.mjs";
 
@@ -195,7 +195,7 @@ function scopeNames(node: ts.Node): Set<string> {
     if (node.variableDeclaration) bindingNames(node.variableDeclaration.name, out);
   } else if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
     const initializer = node.initializer;
-    if (initializer && ts.isVariableDeclarationList(initializer)) {
+    if (initializer && ts.isVariableDeclarationList(initializer) && initializer.flags & ts.NodeFlags.BlockScoped) {
       for (const declaration of initializer.declarations) bindingNames(declaration.name, out);
     }
   } else if (ts.isClassExpression(node) && node.name) {
@@ -251,11 +251,10 @@ function guardedRootOf(id: ts.Identifier, aliases: GuardedAliases): string | und
 }
 
 /**
- * Variables initialised or assigned from a guarded global root, or from another
- * such alias, including a name a root (or a root alias) is destructured into:
- * `const { process } = globalThis` binds `process` to the guarded root. A name
- * destructured from `process.env` is the env-leak preload's object, not a
- * guarded root, so it is not tracked.
+ * Guarded-root aliases from plain assignments and object bindings with identifier
+ * or string-literal keys, including nested bindings. Computed keys and array
+ * bindings are out of scope. Values extracted from process.env are not
+ * guarded-root aliases.
  */
 function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
   const aliases: GuardedAliases = new Map();
@@ -269,14 +268,23 @@ function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
       if (!names) aliases.set(scope, (names = new Map()));
       if (!names.has(target.text)) { names.set(target.text, root); changed = true; }
     };
-    const add = (name: ts.BindingName, value: ts.Expression): void => {
-      const source = rootIdentifier(value);
-      if (!source) return;
-      const root = guardedRootOf(source, aliases);
-      if (!root) return;
+    const selectedRoot = (root: string, property: string): string | undefined => {
+      if (root === "process" && property === "env") return undefined;
+      if ((root === "globalThis" || root === "global") && GUARDED_GLOBAL_ROOTS.has(property)) return property;
+      return root;
+    };
+    const valueRoot = (value: ts.Expression): string | undefined => {
+      value = unwrap(value);
+      if (ts.isIdentifier(value)) return guardedRootOf(value, aliases);
+      if (!ts.isPropertyAccessExpression(value) && !ts.isElementAccessExpression(value)) return undefined;
+      const root = valueRoot(value.expression);
+      if (!root) return undefined;
+      const property = ts.isPropertyAccessExpression(value) ? value.name.text :
+        ts.isStringLiteralLike(value.argumentExpression) ? value.argumentExpression.text : undefined;
+      return property === undefined ? root : selectedRoot(root, property);
+    };
+    const addBinding = (name: ts.BindingName, root: string): void => {
       if (ts.isIdentifier(name)) {
-        // process.env is the env-leak preload's object, not a guarded global.
-        if (root === "process" && isEnvMemberOf(value, source)) return;
         bind(name, root);
         return;
       }
@@ -286,12 +294,14 @@ function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
         const property = element.propertyName;
         if (property && !ts.isIdentifier(property) && !ts.isStringLiteralLike(property)) continue;
         const propertyName = property ? property.text : ts.isIdentifier(element.name) ? element.name.text : undefined;
-        // Destructuring process.env yields the env-leak preload's object.
-        if (root === "process" && propertyName === "env") continue;
-        const bound = new Set<ts.Identifier>();
-        bindingIdentifiers(element.name, bound);
-        for (const id of bound) bind(id, root);
+        if (propertyName === undefined) continue;
+        const selected = selectedRoot(root, propertyName);
+        if (selected) addBinding(element.name, selected);
       }
+    };
+    const add = (name: ts.BindingName, value: ts.Expression): void => {
+      const root = valueRoot(value);
+      if (root) addBinding(name, root);
     };
     const walk = (node: ts.Node): void => {
       if (ts.isVariableDeclaration(node) && node.initializer) add(node.name, node.initializer);
@@ -306,14 +316,7 @@ function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
   return aliases;
 }
 
-/**
- * Every identifier that names an imported module object or derives from one, by
- * plain alias, destructuring or a property read, keyed by the scope that declares
- * it. A member assignment on such an identifier is reported as a member
- * assignment on the module object, so an alias no longer hides it; resolving the
- * name by scope means a local that shadows an import or an alias is not the
- * module object, while an alias an outer scope declares is.
- */
+/** Module-object aliases from assignments, binding patterns and property reads, keyed by declaring scope. */
 function moduleObjectNames(file: ts.SourceFile): ModuleObjects {
   const scopes: ModuleObjects = new Map();
   const scopeFor = (node: ts.Node): Map<string, string> => {
@@ -443,8 +446,11 @@ class BunTestBindings {
 }
 
 /** Every finding this check reports for one file's source. */
-export function analyzeSource(source: string): Finding[] {
-  const file = ts.createSourceFile("guarded.test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+export function analyzeSource(source: string, fileName = "guarded.test.ts"): Finding[] {
+  const extension = extname(fileName).toLowerCase();
+  const scriptKind = extension === ".tsx" ? ts.ScriptKind.TSX : extension === ".jsx" ? ts.ScriptKind.JSX :
+    [".js", ".mjs", ".cjs"].includes(extension) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, scriptKind);
   const bindings = new BunTestBindings(file);
   const moduleObjects = moduleObjectNames(file);
   const aliases = guardedAliasNames(file);
@@ -518,15 +524,8 @@ export function analyzeSource(source: string): Finding[] {
   return findings;
 }
 
-/**
- * Every test file bun discovers under `rootDir`, as absolute paths, sorted. The
- * set and its skip rules are bun's own: the shared `discoverTestFiles` in
- * `scripts/check-test-reports.mjs` owns the rule measured against the pinned bun
- * (1.3.10) for this repo's config, so the guard scans what a suite runs —
- * `.test`/`_test`/`.spec`/`_spec` before a js-ish extension, `node_modules` and
- * dot-directories skipped, `dist/` walked. A directory the walk cannot read
- * throws, so a partial discovery never reads as a covered set.
- */
+/** Shared discovery under the resolved root, as sorted absolute paths; filesystem errors propagate. */
 export function discoverCliTestFiles(rootDir: string): string[] {
-  return discoverTestFiles(rootDir).map((relativePath) => join(rootDir, relativePath)).sort();
+  const root = resolve(rootDir);
+  return discoverTestFiles(root).map((relativePath) => join(root, relativePath)).sort();
 }
