@@ -13,15 +13,16 @@ const patchShared = createPatchShared();
  *   wiring fails it.
  * - The acceptance path: `connectAndKeepAlive` with its transport replaced by
  *   an in-memory channel, observed through the `onAccepted` callback: the
- *   callback runs after the inbox record is published, a resend is ACKed
- *   without it, and the refusals (a same-id conflict, an injected inbox write
- *   failure) never reach it. cli#602: the ACK waits for the announcement and
- *   its marker; an announcement that throws or rejects, or whose marker cannot
- *   be written or synced (its temp file or, after the rename, its directory),
- *   withholds the ACK, and a resend that finds the record announces the
- *   delivery again; a marker whose directory sync failed is not trusted until
- *   it syncs; and a marker left by an earlier payload under the same id does
- *   not silence a new payload.
+ *   callback runs after the inbox record is published; a resend whose matching,
+ *   unexpired marker syncs its file and directory is ACKed without it. The
+ *   refusals (a same-id conflict, an injected inbox write failure) never reach
+ *   it. cli#602: callback errors and marker write or sync failures withhold the
+ *   ACK. Cleanup attempts removal; a retained marker that later counts permits
+ *   the ACK without another callback. Otherwise a resend that recovers the
+ *   matching record outside the dead-letter queue and successfully writes or
+ *   syncs its receipt attempts the callback again; it records an announcement
+ *   only if the callback completes and the marker write and sync succeed.
+ *   A marker left by an earlier payload does not count for a new payload.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
@@ -44,7 +45,7 @@ afterEach(() => {
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
-/** Prefix for successful announcements of newly published inbox records. */
+/** The line `office connect` prints to announce a delivery. */
 const ANNOUNCEMENT = "Mail received";
 
 const ENV_KEYS = ["HOME", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_RELAY_ACCEPT_RECEIPT_TTL_MS"];
@@ -396,7 +397,7 @@ describe("office connect announcement follows local acceptance", () => {
     }
   });
 
-  test("a resend after a failed announcement announces the delivery and is ACKed", async () => {
+  test("a resend after a failed announcement is ACKed when the callback and marker write succeed", async () => {
     const accepted = body("announced on the resend");
     onAcceptedError = new Error("announcement failed");
     const errors = spyOn(console, "error").mockImplementation(() => {});
@@ -459,7 +460,7 @@ describe("office connect announcement follows local acceptance", () => {
       expect(announced).toEqual([1]);
     });
 
-    test(`an onAccepted whose ${kind === "async" ? "promise" : "thenable"} rejects withholds the ACK without an unhandled rejection; a resend announces it`, async () => {
+    test(`an onAccepted whose ${kind === "async" ? "promise" : "thenable"} rejects withholds the ACK without an unhandled rejection; a resend with a successful callback announces it`, async () => {
       const accepted = body("private async message content");
       let reject: (reason: Error) => void = () => {};
       const pending = new Promise<void>((_resolve, fail) => { reject = fail; });
@@ -505,7 +506,7 @@ describe("office connect announcement follows local acceptance", () => {
     });
   }
 
-  test.skipIf(process.getuid?.() === 0)("an announcement marker that cannot be written withholds the ACK; the resend announces again", async () => {
+  test.skipIf(process.getuid?.() === 0)("a read-only marker directory withholds the ACK; restoring write access permits the resend's announcement", async () => {
     const accepted = body("marker directory read-only");
     // A real permission fault: the marker directory exists and cannot be written.
     const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
@@ -536,7 +537,7 @@ describe("office connect announcement follows local acceptance", () => {
     }
   });
 
-  test("an announcement marker fsync failure withholds the ACK; the resend announces again", async () => {
+  test("a one-shot marker temp-file fsync failure withholds the ACK; the resend announces again", async () => {
     const accepted = body("marker fsync fault");
     const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
     const open = fs.openSync;
@@ -613,7 +614,7 @@ describe("office connect announcement follows local acceptance", () => {
     return { faults, restore };
   }
 
-  test("a marker whose directory sync fails after the rename is removed: the ACK is withheld and the resend announces again", async () => {
+  test("a one-shot marker directory sync failure with successful removal withholds the ACK; the resend announces again", async () => {
     const accepted = body("marker directory fsync fault");
     const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
     const { faults, restore } = markerDirectoryFaults(markers);
@@ -640,7 +641,7 @@ describe("office connect announcement follows local acceptance", () => {
     }
   });
 
-  test("a marker left after a failed directory sync is not trusted until it syncs: the resend announces and is not ACKed on it", async () => {
+  test("a retained marker cannot authorize an ACK while its directory sync fails; once it syncs, the resend is ACKed without another announcement", async () => {
     const accepted = body("unconfirmed marker");
     const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
     const marker = announcementMarker(accepted.id);

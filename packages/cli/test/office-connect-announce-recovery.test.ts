@@ -1,6 +1,6 @@
 /**
- * cli#602: `office connect` announces an accepted delivery when the attempt
- * that published its inbox record was killed before announcing it.
+ * cli#602: recovery tests kill `office connect` before its announcement and
+ * resend the delivery after reconnecting.
  *
  * The command runs as its own process against a REAL local relay built on the
  * branch-side WebSocket/Noise listener (`listenForHostWs`). A `bun --preload`
@@ -113,7 +113,7 @@ interface Command {
   stop(): Promise<void>;
 }
 
-describe("tps office connect announces a delivery whose first attempt was killed before announcing it", () => {
+describe("tps office connect recovery after kills at the tested pre-announcement boundaries", () => {
   let root: string | undefined;
   let savedEnv: Record<string, string | undefined> = {};
   let relay: TransportServer | undefined;
