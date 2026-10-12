@@ -441,17 +441,23 @@ function relayAnnouncedMarkerPath(branchId: string, id: string): string {
 
 /**
  * True only when a marker records a confirmed announcement of this payload
- * within the receipt TTL. Markers and acceptance receipts expire independently,
- * so a marker left by an earlier payload under the same branch and id does not
- * count, nor does an expired marker or one that cannot be read and compared:
- * each of those leaves the delivery to be announced.
+ * within the receipt TTL, and syncing the marker's file and directory succeeds
+ * when it is checked. Markers and acceptance receipts expire independently, so
+ * a marker left by an earlier payload under the same branch and id does not
+ * count, nor does an expired marker, one that cannot be read and compared, or
+ * one whose file or directory sync fails (so a marker left by a write whose
+ * directory sync failed is not trusted until those syncs succeed): each of
+ * those leaves the delivery to be announced.
  */
 function announcementRecorded(branchId: string, body: MailDeliverBody, now = Date.now()): boolean {
   const path = relayAnnouncedMarkerPath(branchId, body.id);
   if (!receiptMayExist(path)) return false;
   try {
     if (now - statSync(path).mtimeMs > relayAcceptReceiptTtlMs()) return false;
-    return acceptanceReceiptMatches(path, acceptReceipt(body));
+    if (!acceptanceReceiptMatches(path, acceptReceipt(body))) return false;
+    syncMailFile(path);
+    syncMailDirectory(dirname(path));
+    return true;
   } catch {
     return false;
   }
@@ -462,19 +468,25 @@ function announcementRecorded(branchId: string, body: MailDeliverBody, now = Dat
  * payload's acceptance receipt and the time) to a temp file, sync it, rename it
  * into place and sync the directory. A failure at any step throws, so the
  * caller withholds the ACK; the sender's retry may then announce the delivery
- * again.
+ * again. A failure before the rename removes the temp file; a failure after it
+ * removes the renamed marker, so a marker whose directory sync failed is not
+ * left to stand for the announcement. If that removal fails too,
+ * `announcementRecorded` trusts the marker only once syncing its file and
+ * directory succeeds.
  */
 function recordAnnouncement(branchId: string, body: MailDeliverBody): void {
   const marker = relayAnnouncedMarkerPath(branchId, body.id);
   mkdirMailDirectory(dirname(marker));
   const tmp = `${marker}.tmp`;
+  let renamed = false;
   try {
     writeFileSync(tmp, JSON.stringify({ ...acceptReceipt(body), announcedAt: new Date().toISOString() }), { mode: 0o600, flag: "wx" });
     syncMailFile(tmp);
     renameSync(tmp, marker);
+    renamed = true;
     syncMailDirectory(dirname(marker));
   } catch {
-    try { removeMailFileConfirmed(tmp); } catch {}
+    try { removeMailFileConfirmed(renamed ? marker : tmp); } catch {}
     throw new Error(`relay announcement marker write failed for message ${body.id}; retry delivery`);
   }
 }
@@ -504,11 +516,12 @@ export function pruneRelayAcceptanceReceipts(acceptedDir: string, now = Date.now
 function startReceiptPrune(branchId?: string): () => void {
   if (branchId && !/^[a-zA-Z0-9_-]+$/.test(branchId)) throw new Error("invalid branch id for receipt prune");
   const pass = () => {
-    for (const tree of [".relay-accepted", ".relay-announced"]) {
+    // Each tree's failure names that tree: acceptance receipts, or (cli#602) announcement markers.
+    for (const [tree, failure] of [[".relay-accepted", "[relay] acceptance receipt prune failed"], [".relay-announced", "[relay] announcement marker prune failed"]] as const) {
       const root = join(getMailDir(), tree, "by-branch");
       const prune = (dir: string) => {
         try { pruneRelayAcceptanceReceipts(dir); }
-        catch { console.error("[relay] acceptance receipt prune failed"); }
+        catch { console.error(failure); }
       };
       try {
         if (branchId) prune(join(root, branchId));
@@ -517,7 +530,7 @@ function startReceiptPrune(branchId?: string): () => void {
             if (entry.isDirectory()) prune(join(root, entry.name));
           }
         }
-      } catch { console.error("[relay] acceptance receipt prune failed"); }
+      } catch { console.error(failure); }
     }
   };
   pass();
@@ -665,9 +678,9 @@ export function setRelayAcceptTestHook(hook?: (root: string) => void): void {
  * The outcome of accepting one relayed delivery under its acceptance locks.
  * `delivered`: this call published a live inbox record. `announce` (cli#602):
  * the delivery is due an announcement, because this call published its live
- * inbox record, or found a record of it outside the dead-letter queue published
- * by an earlier attempt that may have stopped before announcing it. `body` is
- * the parsed payload.
+ * inbox record, or found a matching record of it outside the dead-letter queue,
+ * published by an earlier attempt that may have stopped before announcing it.
+ * `body` is the parsed payload.
  */
 interface RelayAcceptance {
   delivered: boolean;
@@ -790,16 +803,18 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
 /**
  * cli#602: announce an accepted delivery that is due an announcement. It is
  * skipped only when a marker records a confirmed announcement of this same
- * payload within the receipt TTL. Otherwise `onAccepted` is invoked and a
- * returned promise is awaited; the marker is written only after the callback
- * returns or its promise resolves. The callback runs after the acceptance locks
- * are released, so a pending announcement holds no lock another acceptance
- * needs; the marker is written under the delivery's acceptance lock. A callback
- * that throws or rejects, or a marker that cannot be written and synced,
- * rejects this call and the caller withholds the ACK, so a resend that finds
- * the record announces it. An announcement can therefore repeat: after a crash
- * between the callback and the marker, after a marker failure, once the marker
- * has expired, or when two acceptances of the same delivery run at once.
+ * payload within the receipt TTL and the marker's file and directory sync.
+ * Otherwise `onAccepted` is invoked and a returned promise is awaited; the
+ * marker is written only after the callback returns or its promise resolves.
+ * The callback runs after the acceptance locks are released, so a pending
+ * announcement holds no lock another acceptance needs; the marker is written
+ * under the delivery's acceptance lock. A callback that throws or rejects, or a
+ * marker that cannot be written and synced, rejects this call and the caller
+ * withholds the ACK; a resend that still finds the delivery's matching record
+ * outside the dead-letter queue is due an announcement again. An announcement
+ * can therefore repeat: after a crash between the callback and the marker,
+ * after a marker failure, once the marker has expired, or when two acceptances
+ * of the same delivery run at once.
  */
 async function announceRelayedDelivery(branchId: string, body: MailDeliverBody, onAccepted: () => void): Promise<void> {
   if (announcementRecorded(branchId, body)) return;
@@ -817,6 +832,13 @@ async function announceRelayedDelivery(branchId: string, body: MailDeliverBody, 
   finally { lock.release(); }
 }
 
+/**
+ * Accept one relayed delivery and ACK it. Only a caller that passes
+ * `onAccepted` announces: `connectAndKeepAlive` passes one when its own caller
+ * does (`office connect`), and then a delivery due an announcement is ACKed
+ * only after `announceRelayedDelivery` succeeds. `syncRemoteBranch` passes
+ * none, so its ACK follows acceptance alone and writes no marker.
+ */
 async function acceptRelayedMail(
   channel: TransportChannel,
   branchId: string,

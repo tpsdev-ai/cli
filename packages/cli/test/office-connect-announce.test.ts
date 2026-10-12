@@ -17,9 +17,11 @@ const patchShared = createPatchShared();
  *   without it, and the refusals (a same-id conflict, an injected inbox write
  *   failure) never reach it. cli#602: the ACK waits for the announcement and
  *   its marker; an announcement that throws or rejects, or whose marker cannot
- *   be written or synced, withholds the ACK and a resend announces the delivery
- *   again; and a marker left by an earlier payload under the same id does not
- *   silence a new payload.
+ *   be written or synced (its temp file or, after the rename, its directory),
+ *   withholds the ACK, and a resend that finds the record announces the
+ *   delivery again; a marker whose directory sync failed is not trusted until
+ *   it syncs; and a marker left by an earlier payload under the same id does
+ *   not silence a new payload.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
@@ -573,6 +575,107 @@ describe("office connect announcement follows local acceptance", () => {
     } finally {
       opens.mockRestore();
       syncs.mockRestore();
+      errors.mockRestore();
+    }
+  });
+
+  /**
+   * Fail fsync on the announcement-marker DIRECTORY (fds opened on that path)
+   * while `faults.dirSync` holds, and unlink of `faults.unlinkPath` while set.
+   */
+  function markerDirectoryFaults(markers: string) {
+    const open = fs.openSync;
+    const sync = fs.fsyncSync;
+    const unlink = fs.unlinkSync;
+    // Every open is recorded, so a descriptor number reused for another file is not mistaken for the directory.
+    const opened = new Map<number, string>();
+    const faults = { dirSync: "once" as "once" | "always" | "off", fired: 0, unlinkPath: undefined as string | undefined };
+    const opens = spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+      const fd = open(path, flags, mode);
+      opened.set(fd, String(path));
+      return fd;
+    });
+    const syncs = spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      if (faults.dirSync !== "off" && opened.get(fd) === markers) {
+        faults.fired++;
+        if (faults.dirSync === "once") faults.dirSync = "off";
+        throw Object.assign(new Error("injected marker directory fsync failure"), { code: "EIO" });
+      }
+      return sync(fd);
+    });
+    const unlinks = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+      if (faults.unlinkPath !== undefined && String(path) === faults.unlinkPath) {
+        throw Object.assign(new Error("injected marker unlink failure"), { code: "EACCES" });
+      }
+      return unlink(path);
+    });
+    const restore = () => { opens.mockRestore(); syncs.mockRestore(); unlinks.mockRestore(); };
+    return { faults, restore };
+  }
+
+  test("a marker whose directory sync fails after the rename is removed: the ACK is withheld and the resend announces again", async () => {
+    const accepted = body("marker directory fsync fault");
+    const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
+    const { faults, restore } = markerDirectoryFaults(markers);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      deliver(accepted);
+      await waitFor("the refusal to be logged", () => errors.mock.calls.length > 0, 2000);
+      await Bun.sleep(20);
+      expect(faults.fired).toBe(1);
+      expect(acks).toEqual([]);
+      expect(announced).toEqual([1]);
+      expect(fs.readdirSync(markers)).toEqual([]);
+      expect(errors.mock.calls).toEqual([[refusal(accepted, `relay announcement marker write failed for message ${accepted.id}; retry delivery`)]]);
+
+      // No marker stands for the failed write: the resend announces, then is ACKed.
+      deliver(accepted);
+      await settled();
+      expect(acks.length).toBe(1);
+      expect(announced).toEqual([1, 1]);
+      expect(fs.existsSync(announcementMarker(accepted.id))).toBe(true);
+    } finally {
+      restore();
+      errors.mockRestore();
+    }
+  });
+
+  test("a marker left after a failed directory sync is not trusted until it syncs: the resend announces and is not ACKed on it", async () => {
+    const accepted = body("unconfirmed marker");
+    const markers = join(process.env.TPS_MAIL_DIR!, ".relay-announced", "by-branch", "remote");
+    const marker = announcementMarker(accepted.id);
+    const { faults, restore } = markerDirectoryFaults(markers);
+    // The directory sync keeps failing, and the renamed marker cannot be removed.
+    faults.dirSync = "always";
+    faults.unlinkPath = marker;
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      deliver(accepted);
+      await waitFor("the first refusal to be logged", () => errors.mock.calls.length > 0, 2000);
+      await Bun.sleep(20);
+      expect(acks).toEqual([]);
+      expect(announced).toEqual([1]);
+      expect(fs.existsSync(marker)).toBe(true);
+
+      // The resend finds the unconfirmed marker, cannot sync its directory, and
+      // announces again rather than ACKing on it.
+      deliver(accepted);
+      await waitFor("the resend to be refused or ACKed", () => errors.mock.calls.length > 1 || acks.length > 0, 2000);
+      await Bun.sleep(20);
+      expect(acks).toEqual([]);
+      expect(announced).toEqual([1, 1]);
+      const refused = refusal(accepted, `relay announcement marker write failed for message ${accepted.id}; retry delivery`);
+      expect(errors.mock.calls).toEqual([[refused], [refused]]);
+
+      // Once the marker and its directory sync, it stands for the announcement.
+      faults.dirSync = "off";
+      faults.unlinkPath = undefined;
+      deliver(accepted);
+      await settled();
+      expect(acks.length).toBe(1);
+      expect(announced).toEqual([1, 1]);
+    } finally {
+      restore();
       errors.mockRestore();
     }
   });
