@@ -12,6 +12,7 @@ import {
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
   parseSignedEnvelope,
+  pendingPlacementEntries,
   placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
@@ -119,10 +120,11 @@ export class MailClient {
   }
 
   async checkNewMail(): Promise<MailMessage[]> {
-    if (!existsSync(this.inboxNew)) return [];
+    const messages: MailMessage[] = [];
+    await this.recoverInterruptedPlacements(messages);
+    if (!existsSync(this.inboxNew)) return messages;
 
     const files = readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
-    const messages: MailMessage[] = [];
 
     for (const file of files) {
       const started = Date.now();
@@ -231,25 +233,18 @@ export class MailClient {
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
+      if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
       const dstPath = join(this.inboxCur, file);
       if (sameFileByDeviceInode(srcPath, dstPath)) {
-        const pending = replay.hasPendingPlacement(envelope.messageId, file);
-        const consumed = replay.isConsumed(envelope.messageId, pending ? file : undefined);
-        if (!pending || consumed) {
-          unlinkSync(srcPath);
-          replay.finishPlacement(envelope.messageId, file);
-          return "already-delivered";
-        }
-        replay.recordConsumed(envelope.messageId);
+        replay.isConsumed(envelope.messageId);
         unlinkSync(srcPath);
-        replay.finishPlacement(envelope.messageId, file);
-        return null;
+        return "already-delivered";
       }
       const consumed = replay.isConsumed(envelope.messageId);
       if (consumed) {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
-      replay.beginPlacement(envelope.messageId, file);
+      replay.beginPlacement(envelope.messageId, file, srcPath);
       const placement = placeCurRecord(srcPath, dstPath);
       if (placement.status === "exists") {
         replay.finishPlacement(envelope.messageId, file);
@@ -276,6 +271,119 @@ export class MailClient {
       }
       replay.finishPlacement(envelope.messageId, file);
       return null;
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Recover verified cur copies matching the intent's recorded identity (cli#600).
+   * Verification or lock failure defers recovery. A present mismatched copy,
+   * including an older intent without identity, leaves the intent pending and
+   * withholds delivery; the new/ scan cannot replace that intent.
+   */
+  private async recoverInterruptedPlacements(messages: MailMessage[]): Promise<void> {
+    let pending: Array<{ messageId: string; file: string }>;
+    let listing: MailLock | null = null;
+    try {
+      listing = await acquireMailLock(this.mailboxRoot);
+      if (!listing) return; // lock unavailable; defer recovery
+      pending = pendingPlacementEntries(this.mailboxRoot);
+    } catch (err) {
+      this.events?.emit({
+        type: "mail.receive",
+        agent: this.agentId,
+        status: "error",
+        from: "unknown",
+        durationMs: 0,
+        error: sanitizeError(err),
+      });
+      return; // a later check retries
+    } finally {
+      listing?.release();
+    }
+
+    for (const { messageId, file } of pending) {
+      const curPath = join(this.inboxCur, file);
+      try {
+        let bytes: Buffer;
+        try {
+          bytes = readFileSync(curPath);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          // Observed absent; re-check under the lock before finishing the intent.
+          await this.finishUnlinkedPlacement(messageId, file);
+          continue;
+        }
+        const outcome = await this.verifyMailBody(bytes.toString("utf8"));
+        if (!outcome.pass) continue; // withhold: the cur copy is not a verified message
+        const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
+        const delivered = await this.completeInterruptedPlacement(messageId, file, bytes, outcome.envelope, trustTier);
+        if (delivered) messages.push(delivered);
+      } catch (err) {
+        this.events?.emit({
+          type: "mail.receive",
+          agent: this.agentId,
+          status: "error",
+          from: "unknown",
+          durationMs: 0,
+          error: sanitizeError(err),
+        });
+      }
+    }
+  }
+
+  /** Finish a still-pending intent only when cur/ is absent under the lock. */
+  private async finishUnlinkedPlacement(messageId: string, file: string): Promise<void> {
+    const lock = await acquireMailLock(this.mailboxRoot);
+    if (!lock) return;
+    try {
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      if (!replay.hasPendingPlacement(messageId, file)) return;
+      if (lstatOrAbsent(join(this.inboxCur, file)) !== null) return;
+      replay.finishPlacement(messageId, file);
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Re-check the intent, recorded identity and raw bytes under the lock.
+   */
+  private async completeInterruptedPlacement(
+    messageId: string,
+    file: string,
+    bytes: Buffer,
+    envelope: Envelope,
+    trustTier: MailMessage["trustTier"],
+  ): Promise<MailMessage | null> {
+    const lock = await acquireMailLock(this.mailboxRoot);
+    if (!lock) throw new Error("mailbox lock busy; interrupted placement recovery deferred");
+    try {
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      // Match the intent, recorded device/inode and pre-verification raw bytes.
+      if (!replay.hasPendingPlacement(messageId, file)) return null;
+      if (envelope.messageId !== messageId) return null;
+      if (!replay.ownsPendingPlacement(messageId, file)) return null;
+      let current: Buffer;
+      try {
+        current = readFileSync(join(this.inboxCur, file));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+      if (!current.equals(bytes)) return null;
+      if (!replay.isConsumed(messageId, file)) replay.recordConsumed(messageId);
+      replay.finishPlacement(messageId, file);
+      return {
+        filename: file,
+        body: bytes.toString("utf8"),
+        receivedAt: new Date(),
+        headers: {},
+        from: envelope.from,
+        verifiedEnvelope: envelope,
+        trustTier,
+      };
     } finally {
       lock.release();
     }

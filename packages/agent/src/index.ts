@@ -52,6 +52,7 @@ export { parseFlairPublicKey, PublicKeyFormatError } from "./lib/public-key.js";
 export {
   ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId, tryParseEnvelope, parseSignedEnvelope,
   decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
+  pendingPlacementEntries,
   placeCurRecord,
 } from "./lib/mailbox-policy.js";
 export type { MailboxPolicyRejectClass, MailboxPolicyResult, ReplayStore, FirstDelivery } from "./lib/mailbox-policy.js";

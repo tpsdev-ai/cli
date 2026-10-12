@@ -65,7 +65,7 @@ function pendingPlacement(id = messageId): void {
   const mailbox = join(root, "mailbox");
   const lock = acquireMailLockSync(mailbox);
   if (!lock) throw new Error("lock unavailable");
-  try { mailboxReplayStore(mailbox).beginPlacement(id, "m1.json"); }
+  try { mailboxReplayStore(mailbox).beginPlacement(id, "m1.json", path("new")); }
   finally { lock.release(); }
   linkSync(path("new"), path("cur"));
 }
@@ -101,7 +101,8 @@ test("a placement interrupted after linking is recovered by a restarted client",
 test("an intent for another ID does not authorize delivery", async () => {
   pendingPlacement("other-id");
   expect(await client.checkNewMail()).toEqual([]);
-  expect(() => readFileSync(path("new"))).toThrow();
+  expect(readFileSync(path("new"))).toEqual(readFileSync(path("cur")));
+  expect(mailboxReplayStore(join(root, "mailbox")).hasPendingPlacement("other-id", "m1.json")).toBe(true);
 });
 
 for (const pending of [false, true]) {

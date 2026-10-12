@@ -129,7 +129,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     const lock = acquireMailLockSync(join(tmpDir, AGENT));
     if (!lock) throw new Error("lock unavailable");
     try {
-      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json", join(inbox("new"), "m1.json"));
       fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
     } finally { lock.release(); }
 
@@ -162,7 +162,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     const lock = acquireMailLockSync(join(tmpDir, AGENT));
     if (!lock) throw new Error("lock unavailable");
     try {
-      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json");
+      mailboxReplayStore(join(tmpDir, AGENT)).beginPlacement(env.messageId, "m1.json", join(inbox("new"), "m1.json"));
       fs.linkSync(join(inbox("new"), "m1.json"), join(inbox("cur"), "m1.json"));
     } finally { lock.release(); }
 
