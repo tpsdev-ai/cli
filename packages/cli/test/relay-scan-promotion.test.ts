@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { findRelayedRecord, getInbox, sendMessage } from "../src/utils/mail.js";
-import { deliverRelayedToLocal } from "../src/utils/relay.js";
+import { deliverRelayedToLocal, relayAcceptanceLockRoot } from "../src/utils/relay.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { buildSignedEnvelope, writeKeyFile } from "./helpers/stub-flair.js";
 
@@ -58,8 +58,9 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+for (const protection of ["mailbox", "stripe"] as const) {
 for (const phase of ["before", "after"] as const) {
-  test(`scan finds the record while promotion is attempted ${phase} the dlq directory read without a receipt`, () => {
+  test(`${protection} reservation finds the record while promotion is attempted ${phase} the dlq read without a receipt`, () => {
     const envelope = buildSignedEnvelope("sender", "agent-a", "payload", { sender: Buffer.alloc(32, 1) });
     const delivery = { branchId: "remote", id: randomUUID() };
     const payload = { from: "sender", to: "agent-a", body: JSON.stringify(envelope), timestamp: envelope.timestamp };
@@ -85,6 +86,8 @@ for (const phase of ["before", "after"] as const) {
       promoted = result.stdout !== "blocked";
       expect(fs.existsSync(source)).toBe(!promoted);
     };
+    const stripeRoot = relayAcceptanceLockRoot(delivery.branchId, delivery.id);
+    const stripe = protection === "stripe" ? acquireMailLockSync(stripeRoot) : null;
     const held = acquireMailLockSync(heldRoot);
     expect(held).not.toBeNull();
     const scan = spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof readDirectory>) => {
@@ -95,12 +98,14 @@ for (const phase of ["before", "after"] as const) {
       return entries;
     }) as typeof readDirectory);
     try {
-      expect(findRelayedRecord("agent-z", delivery, payload, "agent-a", { heldRoot }))
+      expect(findRelayedRecord("agent-z", delivery, payload, "agent-a", { heldRoot, ...(protection === "stripe" ? { heldAcceptanceRoot: stripeRoot } : {}) }))
         .toBe(promoted ? join(inbox.cur, basename(source)) : source);
       expect(attempted).toBe(true);
+      if (protection === "stripe") expect(promoted).toBe(false);
     } finally {
       scan.mockRestore();
       held?.release();
+      stripe?.release();
     }
     if (!promoted) {
       move();
@@ -109,8 +114,41 @@ for (const phase of ["before", "after"] as const) {
     }
   });
 }
+}
 
-test("permanent NACK attempted between dlq and cur reads refuses a conflicting resend without a receipt", () => {
+test("acceptance completes when an unrelated promotion removes a listed source before its read", () => {
+  const envelope = buildSignedEnvelope("sender", "agent-a", "payload", { sender: Buffer.alloc(32, 1) });
+  const delivery = { branchId: "remote", id: randomUUID() };
+  const record = sendMessage("agent-a", JSON.stringify(envelope), "sender", delivery, envelope.timestamp);
+  const inbox = getInbox("agent-a");
+  const source = join(inbox.dlq, basename(record.filePath));
+  fs.renameSync(record.filePath, source);
+  let id = randomUUID();
+  while (relayAcceptanceLockRoot("remote", id) === relayAcceptanceLockRoot(delivery.branchId, delivery.id)) id = randomUUID();
+  const script = join(root, "promote-unrelated.ts");
+  fs.writeFileSync(script, PROMOTE_CHILD);
+  const read = fs.readFileSync;
+  let reads = 0;
+  let moved = false;
+  const fault = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof read>) => {
+    if (args[0] === source && ++reads === 3) {
+      const result = spawnSync("bun", [script], { env: { ...process.env, PROMOTE_SOURCE: source }, encoding: "utf8", timeout: 10_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).not.toBe("blocked");
+      moved = fs.existsSync(join(inbox.cur, basename(source)));
+    }
+    return read(...args);
+  }) as typeof read);
+  try {
+    expect(deliverRelayedToLocal("remote", { id, from: "sender", to: "agent-z", content: "independent", timestamp: envelope.timestamp })).toBe(true);
+    expect(moved).toBe(true);
+    expect(fs.readdirSync(getInbox("agent-z").fresh)).toHaveLength(1);
+  } finally { fault.mockRestore(); }
+});
+
+for (const protection of ["acceptance", "stripe-scan"] as const) {
+test(`${protection} refuses a conflicting resend while permanent NACK is attempted between dlq and cur reads`, () => {
   const delivery = { branchId: "remote", id: randomUUID() };
   const payload = { from: "sender", to: "agent-a", body: "payload", timestamp: new Date().toISOString() };
   const record = sendMessage(payload.to, payload.body, payload.from, delivery, payload.timestamp);
@@ -126,6 +164,9 @@ test("permanent NACK attempted between dlq and cur reads refuses a conflicting r
   let moved = false;
   let refused = false;
   let accepted = false;
+  const stripeRoot = relayAcceptanceLockRoot(delivery.branchId, delivery.id);
+  const stripe = protection === "stripe-scan" ? acquireMailLockSync(stripeRoot) : null;
+  const recipientLock = protection === "stripe-scan" ? acquireMailLockSync(heldRoot) : null;
   const scan = spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof readDirectory>) => {
     const entries = readDirectory(...args);
     if (args[0] === inbox.dlq && !attempted) {
@@ -141,18 +182,24 @@ test("permanent NACK attempted between dlq and cur reads refuses a conflicting r
     return entries;
   }) as typeof readDirectory);
   try {
-    try { accepted = deliverRelayedToLocal(delivery.branchId, { id: delivery.id, from: payload.from, to: "agent-z", content: payload.body, timestamp: payload.timestamp }); }
+    try {
+      if (protection === "stripe-scan") findRelayedRecord("agent-z", delivery, { ...payload, to: "agent-z" }, "agent-z", { heldRoot, heldAcceptanceRoot: stripeRoot });
+      else accepted = deliverRelayedToLocal(delivery.branchId, { id: delivery.id, from: payload.from, to: "agent-z", content: payload.body, timestamp: payload.timestamp });
+    }
     catch (error) {
       expect(String(error)).toContain("relayed delivery conflict");
       refused = true;
     }
     expect(attempted).toBe(true);
     expect(refused).toBe(true);
+    expect(moved).toBe(false);
     expect(accepted).toBe(false);
     expect(fs.readdirSync(getInbox("agent-z").fresh)).toHaveLength(0);
     expect(fs.readdirSync(inbox.cur).length + fs.readdirSync(inbox.dlq).filter((file) => file.endsWith(".json")).length).toBe(1);
   } finally {
     scan.mockRestore();
+    recipientLock?.release();
+    stripe?.release();
   }
   if (!moved) {
     const result = spawnSync("bun", [childScript], {
@@ -165,3 +212,5 @@ test("permanent NACK attempted between dlq and cur reads refuses a conflicting r
   expect(fs.existsSync(join(inbox.dlq, basename(record.filePath)))).toBe(true);
   expect(() => deliverRelayedToLocal(delivery.branchId, { id: delivery.id, from: payload.from, to: "agent-z", content: payload.body, timestamp: payload.timestamp })).toThrow("relayed delivery conflict");
 });
+
+}

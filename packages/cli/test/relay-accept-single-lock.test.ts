@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ackMessageAtPath, getInbox } from "../src/utils/mail.js";
+import { ackMessageAtPath, getInbox, sendMessage } from "../src/utils/mail.js";
 import { RELAY_ACCEPT_LOCK_STRIPES, RelayAcceptLockTimeoutError, deliverRelayedToLocal, relayAcceptanceLockRoot, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 
 const BRANCH = "remote";
@@ -377,20 +377,31 @@ describe("relay acceptance (cli#561)", () => {
     }
   }, 60_000);
 
-  test("a different mailbox's lock uses the acceptance deadline and refuses by name, publishing no mail record or acceptance marker", async () => {
+  test("an unrelated mailbox holder does not delay acceptance until the lock timeout", async () => {
     const holder = await holdLock(join(mail, "other"));
     try {
       process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
-      const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "timed out", timestamp: TIMESTAMP };
-      const started = Date.now();
-      expect(() => deliverRelayedToLocal(BRANCH, body)).toThrow(RelayAcceptLockTimeoutError);
-      expect(Date.now() - started).toBeLessThan(1000);
-      for (const agent of [RECIPIENT, "other"]) {
-        for (const dir of ["new", "cur", "dlq"]) expect(jsonFiles(join(mail, agent, dir))).toEqual([]);
-      }
-      expect(existsSync(join(mail, ".relay-accepted"))).toBe(false);
+      const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "independent", timestamp: TIMESTAMP };
+      expect(deliverRelayedToLocal(BRANCH, body)).toBe(true);
+      expect(jsonFiles(getInbox(RECIPIENT).fresh)).toHaveLength(1);
+      expect(existsSync(relayAcceptanceReceiptPath(BRANCH, body.id))).toBe(true);
     } finally {
       await holder.release();
     }
   }, 60_000);
+
+  test("a same-id candidate mailbox holder exhausts the shared deadline without publication", async () => {
+    const id = randomUUID();
+    sendMessage("other", "conflict", FROM, { branchId: BRANCH, id }, TIMESTAMP);
+    const holder = await holdLock(join(mail, "other"));
+    try {
+      process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "75";
+      expect(() => deliverRelayedToLocal(BRANCH, { id, from: FROM, to: RECIPIENT, content: "conflict", timestamp: TIMESTAMP })).toThrow(RelayAcceptLockTimeoutError);
+      expect(jsonFiles(getInbox(RECIPIENT).fresh)).toEqual([]);
+      expect(existsSync(relayAcceptanceReceiptPath(BRANCH, id))).toBe(false);
+    } finally {
+      await holder.release();
+    }
+  }, 60_000);
+
 });

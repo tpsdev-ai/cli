@@ -11,7 +11,7 @@ import {
   mailboxReplayStore, hasCommittedMessageId,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
-  placeCurRecord,
+  placeCurRecord, relayAcceptanceLockRoot, tryAcquireRelayMoveLock,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -233,7 +233,7 @@ export type UpdateExistingResult<T> = { status: "updated"; record: T } | { statu
 export function updateExistingRecord<T extends object>(
   path: string,
   mutate: (record: T) => T | null,
-  options: { snapshot?: T; afterWrite?: (record: T) => void; nonBlocking?: boolean } = {},
+  options: { snapshot?: T; afterWrite?: (record: T) => void; nonBlocking?: boolean; reserveRelayMove?: boolean } = {},
 ): UpdateExistingResult<T> {
   const root = dirname(dirname(path));
   let lock: MailLock | null;
@@ -249,9 +249,17 @@ export function updateExistingRecord<T extends object>(
   const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
+  let relayLock: MailLock | null = null;
   try {
     statSync(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
+    if (options.reserveRelayMove) {
+      relayLock = tryAcquireRelayMoveLock(fresh);
+      if (!relayLock) {
+        if (options.nonBlocking) return { status: "busy" };
+        throw new Error(`mail lock contention timeout for ${path}`);
+      }
+    }
     if (options.snapshot && JSON.stringify(fresh) !== JSON.stringify(options.snapshot)) return { status: "changed" };
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
@@ -272,6 +280,7 @@ export function updateExistingRecord<T extends object>(
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch {} }
     try { rmSync(scratchPath, { force: true }); } catch {}
+    relayLock?.release();
     lock.release();
   }
 }
@@ -503,25 +512,42 @@ export function relayScanRoots(recipientRoot: string): string[] {
   return [...roots].sort();
 }
 
-export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; heldAcceptanceRoot?: string; heldRoots?: ReadonlySet<string>; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
+export function relayConflictRoots(roots: readonly string[], delivery: { branchId: string; id: string }): string[] {
+  return roots.filter((root) => {
+    for (const dir of ["new", "dlq", "cur", "tmp"]) {
+      for (const file of listMessageFiles(join(root, dir))) {
+        let raw: string;
+        try { raw = readFileSync(join(root, dir, file), "utf-8"); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+          const source = join(root, dir, file);
+          const reason = error instanceof Error ? error.message : String(error);
+          const message = `relayed record read failed: ${source}: ${reason}`;
+          console.error(`[mail] ${message}`);
+          throw new Error(message, { cause: error });
+        }
+        let record: MailMessage;
+        try { record = JSON.parse(raw) as MailMessage; } catch { continue; }
+        if (record?.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) return true;
+      }
+    }
+    return false;
+  });
+}
+
+export function findRelayedRecord(agent: string, delivery: { branchId: string; id: string }, payload: z.infer<typeof RelayPayloadSchema>, wireRecipient = payload.to, options: { heldRoot?: string; heldAcceptanceRoot?: string; heldRoots?: ReadonlySet<string>; scanRoots?: readonly string[]; acquireLock?: (root: string) => MailLock } = {}): string | undefined {
   const root = options.heldRoot ?? relayAcceptRoot(agent);
-  // Same-id records in discovered mailboxes are checked under their mailbox locks.
-  // Only the recipient's malformed relay records are quarantined (cli#560).
   const recipientRoot = root;
-  // Acceptance holds discovered roots in ascending order through publication and
-  // receipt writing. Promotion into cur/ and permanent NACK use these locks,
-  // so neither move can cross a directory read. A caller already holding a later
-  // root only tries earlier locks without waiting: contention refuses the scan,
-  // rather than introducing a mailbox lock-order cycle or accepting a missed record.
   const heldRoot = options.heldRoot;
-  for (const root of options.heldRoots ?? relayScanRoots(recipientRoot)) {
+  const reserved = options.heldAcceptanceRoot === relayAcceptanceLockRoot(delivery.branchId, delivery.id);
+  for (const root of options.scanRoots ?? options.heldRoots ?? relayScanRoots(recipientRoot)) {
     mkdirMailDirectory(root);
     // A caller that already holds this mailbox's lock passes it here so the scan
     // does not re-acquire it — a nested acquisition is a hard error.
     const held = root === options.heldRoot || root === options.heldAcceptanceRoot || options.heldRoots?.has(root) === true;
     const readOnly = heldRoot !== undefined && root < heldRoot;
-    const lock = held ? null : readOnly ? acquireMailLockSync(root, { timeoutMs: 0 }) : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
-    if (!held && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
+    const lock = held || reserved ? null : readOnly ? acquireMailLockSync(root, { timeoutMs: 0 }) : options.acquireLock ? options.acquireLock(root) : acquireMailLockSync(root);
+    if (!held && !reserved && !lock) throw new Error(`mailbox busy for relayed message ${delivery.id}`);
     const owned = !readOnly && (held || lock !== null);
     try {
       for (const dir of ["new", "dlq", "cur"]) {
@@ -532,6 +558,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
           try {
             raw = readFileSync(source, "utf-8");
           } catch (error) {
+            if (reserved && (error as NodeJS.ErrnoException).code === "ENOENT" && isConfirmedAbsent(source)) continue;
             const reason = error instanceof Error ? error.message : String(error);
             const message = `relayed record read failed: ${source}: ${reason}`;
             console.error(`[mail] ${message}`);
@@ -793,15 +820,23 @@ function rejectToDlq(
   sourcePath: string,
   cls: PromoteRejectClass,
   reason: string,
+  heldRelayStripe = false,
 ): void {
+  let relayLock: MailLock | null = null;
   try {
+    if (!heldRelayStripe) {
+      let record: unknown;
+      try { record = readMessageFile(sourcePath); } catch {}
+      relayLock = tryAcquireRelayMoveLock(record);
+      if (!relayLock) return;
+    }
     mkdirSync(dirs.dlq, { recursive: true });
     const target = join(dirs.dlq, filename);
     if (sourcePath !== target && existsSync(sourcePath)) renameSync(sourcePath, target);
     writeReasonSidecar(dirs.dlq, filename, cls, reason);
   } catch (err: any) {
     console.error(`[mail] failed to dead-letter ${filename}: ${err?.message ?? err}`);
-  }
+  } finally { relayLock?.release(); }
 }
 
 export function mailRootForRecordPath(filePath: string): string {
@@ -1085,6 +1120,14 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
   }
 
+  let relayLock: MailLock | null;
+  try { relayLock = tryAcquireRelayMoveLock(msg); }
+  catch (error) { lock.release(); throw error; }
+  if (!relayLock) {
+    lock.release();
+    return { ok: false, class: "busy", reason: "relay acceptance busy; not delivered" };
+  }
+
   try {
     // Revalidate the source under the lock: a concurrent checker may have
     // promoted or replaced it between our verification and our acquisition.
@@ -1128,7 +1171,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     } catch (err) {
       const reason = `placement history unavailable: ${err instanceof Error ? err.message : String(err)}`;
       const cls = err instanceof Error && err.name === "MalformedPlacementIntentError" ? "unverified" : "storage-unavailable";
-      rejectToDlq(dirs, filename, filePath, cls, reason);
+      rejectToDlq(dirs, filename, filePath, cls, reason, true);
       return { ok: false, class: cls, reason };
     }
     if (pendingPlacement) {
@@ -1136,7 +1179,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       const replayReason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
       const refuseCollision = (): PromoteReject => {
         const reason = `destination already exists: ${filename}`;
-        rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+        rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason, true);
         return { ok: false, class: "storage-unavailable", reason };
       };
       const rejectMismatch = (): PromoteReject => {
@@ -1209,12 +1252,12 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       consumed = replay.isConsumed(envelope.messageId);
     } catch (err: any) {
       const reason = `replay history unavailable: ${err?.message ?? String(err)}`;
-      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason, true);
       return { ok: false, class: "storage-unavailable", reason };
     }
     if (consumed) {
       const reason = `replay (envelope messageId ${envelope.messageId} already consumed)`;
-      rejectToDlq(dirs, filename, filePath, "replay", reason);
+      rejectToDlq(dirs, filename, filePath, "replay", reason, true);
       return { ok: false, class: "replay", reason };
     }
 
@@ -1258,7 +1301,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
         try { replay.finishPlacement(envelope.messageId, filename); } catch {}
       }
       const reason = `storage failure during promote: ${err?.message ?? String(err)}`;
-      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason);
+      rejectToDlq(dirs, filename, filePath, "storage-unavailable", reason, true);
       return { ok: false, class: "storage-unavailable", reason };
     }
 
@@ -1282,6 +1325,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     logEvent({ event: "read", from: promoted.from, to: agent, messageId: promoted.id, replyToId: promoted.replyToId }, promoted.body);
     return { ok: true, message: promoted, path: curPath };
   } finally {
+    relayLock.release();
     lock.release();
   }
 }
@@ -1648,7 +1692,7 @@ export function nackMessage(agent: string, id: string, reason: string, type: "tr
       delete msg.retryAfter;
     }
     return msg;
-  }, { afterWrite: () => {
+  }, { reserveRelayMove: type === "permanent", afterWrite: () => {
     if (type === "permanent") {
       const target = join(getInbox(agent).dlq, path.split("/").pop()!);
       renameSync(path, target);

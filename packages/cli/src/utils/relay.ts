@@ -3,7 +3,9 @@ import { dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, relayScanRoots, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, relayScanRoots, relayConflictRoots, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
+import { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES } from "@tpsdev-ai/agent";
+export { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES };
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
 import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
@@ -576,13 +578,6 @@ function undoNewRelayRecord(root: string, delivery: { branchId: string; id: stri
 
 /** Wait budget for relay acceptance locks. */
 const RELAY_ACCEPT_LOCK_TIMEOUT_MS = 2000;
-export const RELAY_ACCEPT_LOCK_STRIPES = 64;
-
-export function relayAcceptanceLockRoot(branchId: string, id: string): string {
-  const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
-  return join(getMailDir(), ".relay-accept-locks", String(stripe));
-}
-
 function relayAcceptLockTimeoutMs(): number {
   const raw = Number(process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : RELAY_ACCEPT_LOCK_TIMEOUT_MS;
@@ -627,10 +622,21 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
       try { relayAcceptTestHook(recipientRoot); }
       finally { initialLock.release(); }
     }
-    const heldRoots = new Set(relayScanRoots(recipientRoot));
-    for (const root of heldRoots) {
-      mkdirMailDirectory(root);
-      mailboxLocks.push(acquireLock(root));
+    const delivery = { branchId, id: body.id };
+    let scanRoots = relayScanRoots(recipientRoot);
+    let heldRoots = new Set<string>();
+    for (let attempt = 0; ; attempt++) {
+      heldRoots = new Set([recipientRoot, ...relayConflictRoots(scanRoots, delivery)].sort());
+      for (const root of heldRoots) {
+        mkdirMailDirectory(root);
+        mailboxLocks.push(acquireLock(root));
+      }
+      const refreshed = relayScanRoots(recipientRoot);
+      const required = new Set([recipientRoot, ...relayConflictRoots(refreshed, delivery)]);
+      if (refreshed.length === scanRoots.length && refreshed.every((root, i) => root === scanRoots[i]) && [...required].every((root) => heldRoots.has(root))) break;
+      for (const lock of mailboxLocks.splice(0).reverse()) lock.release();
+      if (attempt >= 7) throw new RelayAcceptLockTimeoutError(body.to);
+      scanRoots = refreshed;
     }
     // The marker path includes the branch: a 64-hex id is deterministic, so two branches can send the same one.
     const acceptedDir = join(getMailDir(), ".relay-accepted", "by-branch", branchId);
@@ -639,8 +645,7 @@ export function deliverRelayedToLocal(branchId: string, body: MailDeliverBody): 
     const legacyMarker = join(getMailDir(), ".relay-accepted", body.id);
     const receipt = acceptReceipt(body);
     const existingMarker = existingAcceptanceMarker(acceptedDir, body.id, legacyMarker);
-    const delivery = { branchId, id: body.id };
-    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, heldRoots, acquireLock });
+    const existingRecord = findRelayedRecord(body.to, delivery, { from: body.from, to: body.to, body: body.content, timestamp: body.timestamp }, body.to, { heldRoot: recipientRoot, heldAcceptanceRoot: acceptanceRoot, heldRoots, scanRoots, acquireLock });
     if (existingRecord) {
       if (existingMarker && existingMarker !== legacyMarker && existingMarker !== flatMarker && !acceptanceReceiptMatches(existingMarker, receipt)) {
         throw new Error(`relayed delivery conflict for branch ${branchId} message ${body.id}`);

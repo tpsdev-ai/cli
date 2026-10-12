@@ -65,3 +65,5 @@ export {
 
 export { decodeRegistryPublicKey } from "./lib/registry-key.js";
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId, configureBridgeIdentity, bridgePrincipalIds, verifiedMailTier } from "./lib/bridge-identity.js";
+
+export { RELAY_ACCEPT_LOCK_STRIPES, relayAcceptanceLockRoot, tryAcquireRelayMoveLock } from "./lib/relay-lock.js";

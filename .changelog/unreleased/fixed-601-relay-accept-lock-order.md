@@ -1,1 +1,1 @@
-- **Relay acceptance removes the mailbox scan lock-order cycle.** Contention can still cause waits and timeout refusals.
+- **Relay acceptance skips unrelated mailbox-lock waits.** Same-id moves use the acceptance stripe; recipient and conflict-candidate mailbox locks stay held in path order. Root changes while waiting trigger bounded discovery retries.
