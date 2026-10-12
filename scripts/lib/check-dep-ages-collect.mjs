@@ -386,6 +386,36 @@ function globError(pattern) {
   return null;
 }
 
+/** Whether `{` and `[` appear, including braces inside a class body. */
+function hasBraceGroupAndClass(pattern) {
+  let brace = false;
+  let klass = false;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "[") {
+      klass = true;
+    } else if (ch === "{") {
+      brace = true;
+    }
+  }
+  return brace && klass;
+}
+
+/**
+ * Conservatively refuse backslash escapes and patterns mixing braces and classes.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function unsupportedWorkspacePattern(pattern) {
+  if (pattern.includes("\\")) {
+    return "it contains a backslash, which Bun reads as an escape of the next character; name the directory without the escape";
+  }
+  if (hasBraceGroupAndClass(pattern)) {
+    return "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
+  }
+  return null;
+}
+
 /** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
 function matchSegments(value, glob) {
   function match(i, j) {
@@ -473,6 +503,10 @@ export function appliedManifestPaths(manifests) {
   const globs = [];
   for (const raw of patterns) {
     if (raw === "" || raw === "." || raw === "./" || raw === ".\\") continue;
+    const reason = (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ?? unsupportedWorkspacePattern(raw);
+    if (reason !== null) {
+      return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
+    }
     if (isGlobPattern(raw)) globs.push(raw);
     else literals.push(raw);
   }
@@ -484,12 +518,6 @@ export function appliedManifestPaths(manifests) {
   for (const literal of literals) {
     const path = byDir.get(pathSegments(literal).join("/"));
     if (path !== undefined) applied.add(path);
-  }
-  for (const glob of globs) {
-    const reason = globError(glob);
-    if (reason !== null) {
-      return { applied, error: `workspaces pattern \`${glob}\` cannot be read: ${reason}`, pattern: glob };
-    }
   }
   for (let i = 0; i < globs.length; i++) {
     const { inner, negated } = stripNegation(globs[i]);

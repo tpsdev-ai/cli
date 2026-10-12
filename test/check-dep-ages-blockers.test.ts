@@ -215,12 +215,15 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
         name: "w",
         dependencies: { "dep-a": "1.0.0" },
       });
+      writeFileSync(join(root, "bun.lock"),
+        '{"lockfileVersion":1,"workspaces":{"":{"name":"fixture"}},"packages":{"dep-a":["dep-a@1.0.0","",{}]}}');
       const output = runGate(root);
       expect(output).toContain(
         "`workspaces` is neither an array of strings nor an object with a `packages` array",
       );
       expect(output).toContain("Remedy: declare `workspaces` as an array of strings");
       expect(output).not.toContain("Checking");
+      expect(output).not.toContain("bun.lock");
     });
   });
 
@@ -231,11 +234,14 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
         name: "a",
         dependencies: { "dep-a": "1.0.0" },
       });
+      writeFileSync(join(root, "bun.lock"),
+        '{"lockfileVersion":1,"workspaces":{"":{"name":"fixture"}},"packages":{"dep-a":["dep-a@1.0.0","",{}]}}');
       const output = runGate(root);
       expect(output).toContain("workspaces pattern `packages/[z-a]` cannot be read:");
       expect(output).toContain("Remedy: fix or remove the `workspaces` pattern `packages/[z-a]`.");
       expect(output).not.toContain("declare `workspaces` as an array of strings");
       expect(output).not.toContain("Checking");
+      expect(output).not.toContain("bun.lock");
       expect(output).not.toMatch(/\n\s+at /);
     });
   });
