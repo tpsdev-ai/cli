@@ -2,10 +2,13 @@ import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 /**
  * cli#512 — `tps agent create` reports registration only when Flair reads the
- * local key back equal. These tests drive the create path against a fake
- * Flair: signed calls reach the shared verifying stub (cli#554), and the
- * operator-credentialed calls the create flow makes — the Agent PUT and the
- * read-back GET, both Basic — reach a route this file controls.
+ * local key back equal. cli#607 — and only when the local key pair is
+ * consistent and Flair accepts a request signed with the private key. These
+ * tests drive the create path against a fake Flair: signed calls reach the
+ * shared verifying stub (cli#554), and the operator-credentialed calls the
+ * create flow makes — the Agent PUT and the read-back GET, both Basic — reach a
+ * route this file controls. Every fixture's Agent PUT obeys Flair: it never
+ * stores `publicKey` (see `refusePut`).
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -58,7 +61,12 @@ function startFakeFlair(
   return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true), requests };
 }
 
-/** A Basic `PUT /Agent/<id>` that Flair refuses (it drops `publicKey`, so the write cannot complete). */
+/**
+ * A Basic `PUT /Agent/<id>`, as Flair answers it: Flair's Agent.put deletes
+ * `publicKey` and `createdAt` from the body (flair resources/Agent.ts), both of
+ * which its Agent schema requires, so the write is refused and the stored row,
+ * if any, is unchanged.
+ */
 function refusePut(url: URL, id: string): Response | undefined {
   if (url.pathname === `/Agent/${id}`) return Response.json({ type: "error:ValidationError", code: "ValidationError", status: 400 }, { status: 400 });
   return undefined;
@@ -118,6 +126,13 @@ async function runCreate(
     if (savedCredential === undefined) delete process.env.FLAIR_ADMIN_AUTH; else process.env.FLAIR_ADMIN_AUTH = savedCredential;
   }
   return { exitCode, stdout: stdout.join(""), stderr: stderr.join(""), error, hasError };
+}
+
+/** `output` carries none of `bytes` in hex, base64 or base64url. */
+function expectNoKeyBytes(output: string, bytes: Uint8Array): void {
+  for (const encoding of ["hex", "base64", "base64url"] as const) {
+    expect(output).not.toContain(Buffer.from(bytes).toString(encoding));
+  }
 }
 
 test("refused write and no Agent row: exits non-zero, prints no success, names agent, URL and remedy", async () => {
@@ -181,24 +196,21 @@ test("the stored key differs from the generated one: exits non-zero", async () =
   }
 });
 
-test("the private key does not derive the public key file: exits non-zero, prints no success", async () => {
+test("the private key does not derive the public key file: exits non-zero before any Flair request, prints no success", async () => {
   const id = `${AGENT}-keypair-mismatch`;
   const priv = generateKeyPair();
   const other = generateKeyPair();
-  let stored: string | null = null;
+  // The reachable false success (cli#607): an Agent row already holds the `.pub`
+  // file's key, so the operator read-back matches the `.pub`. As in Flair, the
+  // Basic PUT stores nothing (refusePut) and a signed request is verified against
+  // the stored key, which the private key's signatures do not verify under.
+  const otherPublicKey = Buffer.from(other.signing.publicKey).toString("base64url");
+  const row = { id, name: id, publicKey: otherPublicKey, createdAt: other.createdAt };
   const fake = startFakeFlair(async (req, url) => {
-    if (req.method === "PUT" && url.pathname === `/Agent/${id}`) {
-      const body = (await req.json()) as { publicKey?: string };
-      stored = body.publicKey ?? null;
-      return Response.json({ id, name: id, publicKey: stored });
-    }
-    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
-      return stored === null
-        ? new Response("not found", { status: 404 })
-        : Response.json({ id, name: id, publicKey: stored });
-    }
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
     return undefined;
-  });
+  }, { [id]: otherPublicKey });
   const identityDir = join(homedir(), ".tps", "identity");
   mkdirSync(identityDir, { recursive: true });
   writeFileSync(join(identityDir, `${id}.key`), Buffer.from(priv.signing.privateKey));
@@ -211,6 +223,7 @@ test("the private key does not derive the public key file: exits non-zero, print
     expect(res.stderr).toContain("does not derive the public key");
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
     expect(res.stderr).toContain(join(".tps", "identity", `${id}.pub`));
+    expectNoKeyBytes(res.stdout + res.stderr, priv.signing.privateKey);
     // refused locally, before any Flair request
     expect(fake.requests).toEqual([]);
   } finally {
@@ -218,32 +231,69 @@ test("the private key does not derive the public key file: exits non-zero, print
   }
 });
 
-test("a request signed with the private key is refused: exits non-zero, prints no success", async () => {
+test("the private key file is not a 32-byte Ed25519 seed: a named refusal before any Flair request, not a throw", async () => {
+  const id = `${AGENT}-malformed-key`;
+  const keyPair = generateKeyPair();
+  const truncated = Buffer.from(keyPair.signing.privateKey).subarray(0, 31);
+  const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+  const identityDir = join(homedir(), ".tps", "identity");
+  mkdirSync(identityDir, { recursive: true });
+  writeFileSync(join(identityDir, `${id}.key`), truncated);
+  writeFileSync(join(identityDir, `${id}.pub`), Buffer.from(keyPair.signing.publicKey));
+  try {
+    const res = await runCreate(fake.url, id, { inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.error).toBeNull();
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered");
+    expect(res.stderr).toContain(`Agent '${id}' has no usable private key at`);
+    expect(res.stderr).toContain(join(".tps", "identity", `${id}.key`));
+    expect(res.stderr).toContain("the file holds 31 bytes, not a raw 32-byte Ed25519 seed");
+    expect(res.stderr).toContain(`tps agent create --id ${id}`);
+    expectNoKeyBytes(res.stdout + res.stderr, truncated);
+    expect(fake.requests).toEqual([]);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("an existing row holds the matching key but Flair refuses the agent's signed request: exits non-zero, prints no success", async () => {
   const id = `${AGENT}-signed-refused`;
   const keyPair = generateKeyPair();
-  let stored: string | null = null;
-  // No signers: the shared verifying stub refuses every TPS-Ed25519 request, so
-  // the operator PUT and the read-back (both Basic) succeed while the agent's own
-  // signed request cannot be verified.
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  // A row that holds the matching key, for a principal Flair no longer
+  // authenticates: Flair answers every signed request from a principal whose
+  // `status` is set and is not "active" with 401 `principal_deactivated` (flair
+  // resources/auth-middleware.ts), while the operator's Basic read-back still
+  // reads the row and its matching key. As in Flair, the Basic PUT stores nothing
+  // (refusePut). The shared stub verifies each signature before this route runs,
+  // so the 401 here answers only a correctly signed request.
+  const row = { id, name: id, publicKey, createdAt: keyPair.createdAt, status: "deactivated" };
   const fake = startFakeFlair(async (req, url) => {
-    if (req.method === "PUT" && url.pathname === `/Agent/${id}`) {
-      const body = (await req.json()) as { publicKey?: string };
-      stored = body.publicKey ?? null;
-      return Response.json({ id, name: id, publicKey: stored });
+    if (!(req.headers.get("Authorization") ?? "").startsWith("Basic ")) {
+      return Response.json({ error: "principal_deactivated" }, { status: 401 });
     }
-    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
-      return stored === null
-        ? new Response("not found", { status: 404 })
-        : Response.json({ id, name: id, publicKey: stored });
-    }
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) return Response.json(row);
     return undefined;
-  });
+  }, { [id]: publicKey });
   try {
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
-    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stdout).not.toContain("registered");
     expect(res.stderr).toContain(id);
     expect(res.stderr).toContain("signed with the private key was refused");
+    expect(res.stderr).toContain("401: principal_deactivated");
+    expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
+    // The read-back matched the generated key; the refusal is the signed
+    // verification request that follows it.
+    expect(fake.requests.map(({ method, path, auth }) => ({ method, path, signed: auth.startsWith("TPS-Ed25519 ") }))).toEqual([
+      { method: "GET", path: `/Agent/${id}`, signed: true },
+      { method: "POST", path: "/AgentSeed/", signed: true },
+      { method: "PUT", path: `/Agent/${id}`, signed: false },
+      { method: "GET", path: `/Agent/${id}`, signed: false },
+      { method: "GET", path: `/Agent/${id}`, signed: true },
+    ]);
   } finally {
     fake.stop();
   }
@@ -272,6 +322,8 @@ test("the signed request is accepted but its response does not carry the registe
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
     expect(res.stderr).toContain("did not confirm the registered key");
+    // one refusal: the accepted request is not also reported as refused
+    expect(res.stderr).not.toContain("was refused");
   } finally {
     fake.stop();
   }

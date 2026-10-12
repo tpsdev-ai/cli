@@ -295,13 +295,28 @@ function refuseRegistration(
 }
 
 /**
- * cli#607 — the private key does not derive the public key file. Registering the
- * file's public half would print "registered" for an identity whose signatures
- * Flair can never verify, so refuse before reaching Flair.
+ * cli#607 — a signature made with the private key does not verify under the
+ * public key file, so the file is not the private key's public half. Registering
+ * it would register a key this identity's signatures never verify against, so
+ * refuse before reaching Flair.
  */
 function refuseKeyPairMismatch(id: string, identityDir: string, keyPath: string, pubPath: string): never {
   console.error(`❌ Agent '${id}' has no consistent key pair at ${identityDir} — the private key in ${keyPath} does not derive the public key in ${pubPath}.`);
   console.error(`   Remedy: move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`);
+  process.exit(1);
+}
+
+/**
+ * cli#607 — the private key file cannot sign: `create` reads it as a raw
+ * 32-byte Ed25519 seed, and it is not one. The refusal names the file's length
+ * only, never its bytes.
+ */
+function refuseUnusablePrivateKey(id: string, keyPath: string, pubPath: string, byteLength: number): never {
+  const state = byteLength === 32 ? "signing with it failed" : `the file holds ${byteLength} bytes, not a raw 32-byte Ed25519 seed`;
+  console.error(`❌ Agent '${id}' has no usable private key at ${keyPath} — ${state}.`);
+  console.error(
+    `   Remedy: if this agent's identity must be kept, write its raw 32-byte Ed25519 seed to ${keyPath}; otherwise move ${keyPath} and ${pubPath} aside, then re-run \`tps agent create --id ${id}\` to generate a matched pair.`,
+  );
   process.exit(1);
 }
 
@@ -332,13 +347,20 @@ async function createAgent(args: AgentArgs): Promise<void> {
     console.log(`  Keys saved to ${identityDir}/`);
   }
 
-  // cli#607 — the identity IS the private key: derive the public key from it and
-  // require the `.pub` on disk to match before registering. cli#512 registered the
-  // stored `.pub` bytes verbatim, so a `.pub` the private key does not derive let
-  // `create` print "registered" for a pair Flair could never verify.
+  // cli#607 — the identity IS the private key: before registering, sign a probe
+  // with it and require the `.pub` on disk to verify that signature. cli#512
+  // registered the stored `.pub` bytes verbatim, so a `.pub` that is not the
+  // private key's public half could still be reported "registered" when Flair
+  // already held that `.pub`. A private key that cannot sign is refused by name.
   const kp = loadKeyPair(identityDir, keyPrefix);
   const probe = Buffer.from(`tps-agent-create:${id}`);
-  if (!verify(probe, sign(probe, kp.signing.privateKey), kp.signing.publicKey)) {
+  let probeSignature: Uint8Array;
+  try {
+    probeSignature = sign(probe, kp.signing.privateKey);
+  } catch {
+    refuseUnusablePrivateKey(id, keyPath, pubPath, kp.signing.privateKey.length);
+  }
+  if (!verify(probe, probeSignature, kp.signing.publicKey)) {
     refuseKeyPairMismatch(id, identityDir, keyPath, pubPath);
   }
   const pubKeyHex = Buffer.from(kp.signing.publicKey).toString("hex");
@@ -415,15 +437,17 @@ async function createAgent(args: AgentArgs): Promise<void> {
     }
     // cli#607 — the read-back runs over the operator credential and only shows the
     // bytes Flair stored. Send one request signed with this identity's private key:
-    // only its acceptance proves Flair's verifier holds this key. A refused
-    // signature, or a response that does not carry the registered key, refuses.
+    // only its acceptance shows Flair authenticates this agent by this key. A
+    // refused signed request, or a response that does not carry the registered
+    // key, refuses.
+    let confirmed: { publicKey?: string } | undefined;
     try {
-      const confirmed = await flair.request<{ publicKey?: string }>("GET", `/Agent/${encodeURIComponent(id)}`);
-      if (storedKeyAsHex(confirmed?.publicKey ?? "") !== pubKeyHex) {
-        refuseRegistration(id, flairUrl, identityDir, "the signed request was accepted but its response did not confirm the registered key", writeError, "exists");
-      }
+      confirmed = await flair.request<{ publicKey?: string }>("GET", `/Agent/${encodeURIComponent(id)}`);
     } catch (e) {
       refuseRegistration(id, flairUrl, identityDir, `a request signed with the private key was refused (${e instanceof Error ? e.message : String(e)})`, writeError, "exists");
+    }
+    if (storedKeyAsHex(confirmed?.publicKey ?? "") !== pubKeyHex) {
+      refuseRegistration(id, flairUrl, identityDir, "the signed request was accepted but its response did not confirm the registered key", writeError, "exists");
     }
     console.log(successLine ?? `  Agent '${id}' registered in Flair.`);
   }
