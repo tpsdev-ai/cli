@@ -128,10 +128,14 @@ export async function runAgentLogs(args: AgentLogsArgs): Promise<void> {
 
   const keyPath = args.keyPath ?? join(homedir(), ".tps", "identity", `${viewerId}.key`);
   const flair = createFlairClient(viewerId, flairUrl, keyPath);
-  const [events, mail] = await Promise.all([
+  const [read, mail] = await Promise.all([
     flair.getEventsSince(agentId, since),
     Promise.resolve(readMailTimeline(mailDir, agentId)),
   ]);
+  if (read.status === "unavailable") {
+    console.error(`Cannot read OrgEvents from ${flairUrl} (${read.reason}); showing mail only.`);
+  }
+  const events = read.status === "ok" ? read.events : [];
 
   const combined = [...filterRelevantEvents(events, agentId), ...mail]
     .sort(compareDesc)

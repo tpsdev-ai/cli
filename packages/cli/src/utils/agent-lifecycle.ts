@@ -365,9 +365,14 @@ export async function onBoot(
   let recentEvents: OrgEvent[] = [];
   try {
     const since = lastBootAt ? new Date(lastBootAt) : new Date(Date.now() - 24 * 3600_000);
-    recentEvents = await flair.getEventsSince(agentId, since);
-    if (recentEvents.length > 0) {
-      slog(`[${agentId}] ${recentEvents.length} org events since last boot`);
+    const read = await flair.getEventsSince(agentId, since);
+    if (read.status === "unavailable") {
+      swarn(`[${agentId}] OrgEvent catchup unavailable (${read.reason}); continuing without recent events`);
+    } else {
+      recentEvents = read.events;
+      if (recentEvents.length > 0) {
+        slog(`[${agentId}] ${recentEvents.length} org events since last boot`);
+      }
     }
   } catch (err: any) {
     swarn(`[${agentId}] OrgEvent catchup failed (non-fatal): ${err.message}`);
