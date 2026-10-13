@@ -1,23 +1,31 @@
 /**
  * relay-inbox-idempotent.test.ts — cli#513.
  *
- * Relay delivery into the local inbox is idempotent by authenticated branch and
- * delivery id: the same id from the same branch twice yields exactly one inbox
- * record, even when the acceptance marker was not written, and the same id from
- * a different branch is still delivered. The record is named by a key derived
- * from the AUTHENTICATED branch id and the wire delivery id (never from a field
- * of the record), so a resend is recognised by that key.
+ * A relayed inbox record is named by a key derived from the AUTHENTICATED branch
+ * id and the wire delivery id, so a resend of the same id from the same branch is
+ * matched to that record by its name rather than by the record's relay fields,
+ * even when the acceptance receipt was not written. The same id from a different
+ * branch has a different key and is still delivered.
  *
- * These tests exercise the real relay acceptance path, not a fake store:
- * `syncRemoteBranch` receives MAIL_DELIVER frames over a channel and ACKs them,
- * and `deliverRelayedToLocal` is the acceptance entry point the receiver uses.
+ * The guarantee is bounded by retention: a resend is recognised while its record
+ * is in the mailbox (new, cur or the dead-letter queue) or its acceptance receipt
+ * is unexpired. Once the record has left the mailbox (acknowledged, archived or
+ * garbage-collected) and the receipt has expired, a resend is delivered again.
+ *
+ * A keyed record that does not parse as a mail record is refused: no ACK, no
+ * quarantine, no replacement. The lost-ACK case (the ACK is sent and never
+ * reaches the sender, which resends) is in relay-delivery-loss.test.ts, where
+ * the branch's real outbox does the resend.
+ *
+ * `syncRemoteBranch` receives MAIL_DELIVER frames over a stubbed channel and ACKs
+ * them; `deliverRelayedToLocal` is the acceptance entry point the receiver uses.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, mock, test } from "bun:test";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
-import { getInbox, sendMessage } from "../src/utils/mail.js";
+import { ackMessageAtPath, getInbox, RelayedRecordInvalidError, relayRecordFileName, sendMessage } from "../src/utils/mail.js";
 import { syncRemoteBranch, deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 import { generateKeyPair, initHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
@@ -96,7 +104,7 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
     await done;
   }
 
-  test("a marker write failure, a lost ACK and a resend of the same id yield one record and an ACK", async () => {
+  test("a marker write failure withholds the ACK and removes the record; the resend of the same id yields one record and an ACK", async () => {
     const body = mailBody();
     const marker = relayAcceptanceReceiptPath("remote", body.id);
     const errors = spyOn(console, "error").mockImplementation(() => {});
@@ -135,7 +143,7 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
     expect(newRecords()).toHaveLength(1);
   });
 
-  test("a resend is recognised by the record's (branch, id) key, not by a field on the record", () => {
+  test("a resend is matched to the keyed record by its name, not by the record's relay fields", () => {
     const body = mailBody();
     const placed = sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
     // Strip the record's relay fields: the record is identified by its keyed name.
@@ -147,5 +155,55 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
     fs.writeFileSync(placed.filePath, JSON.stringify(record));
     expect(deliverRelayedToLocal("remote", body)).toBe(false);
     expect(newRecords()).toHaveLength(1);
+  });
+  for (const location of ["new", "cur", "dlq"] as const) {
+    test(`a keyed ${location} record that does not parse refuses the resend: no ACK, no quarantine, no replacement`, async () => {
+      const body = mailBody();
+      const placed = sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
+      const inbox = getInbox("local");
+      const dir = location === "new" ? inbox.fresh : inbox[location];
+      const keyed = join(dir, relayRecordFileName("remote", body.id));
+      const malformed = JSON.stringify({ ...JSON.parse(fs.readFileSync(placed.filePath, "utf8")), relayDelivery: null });
+      fs.rmSync(placed.filePath);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(keyed, malformed);
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      await receive(body);
+      expect(acks).toEqual([]);
+      expect(() => deliverRelayedToLocal("remote", body)).toThrow(RelayedRecordInvalidError);
+      expect(fs.readFileSync(keyed, "utf8")).toBe(malformed);
+      for (const other of [inbox.fresh, inbox.cur, inbox.dlq, join(inbox.root, "quarantine")]) {
+        const files = fs.existsSync(other) ? fs.readdirSync(other).filter((f) => f.endsWith(".json")) : [];
+        expect(files).toEqual(other === dir ? [basename(keyed)] : []);
+      }
+      expect(fs.existsSync(relayAcceptanceReceiptPath("remote", body.id))).toBe(false);
+      expect(errors.mock.calls.flat().join("\n")).toContain(`relayed record ${keyed} for branch remote message ${body.id} does not parse as a mail record; delivery refused without ACK`);
+    }, 20_000);
+  }
+
+  test("the window: the record holds it past receipt expiry; once the record is acknowledged and the receipt expired, a resend is delivered again", () => {
+    const body = mailBody();
+    expect(deliverRelayedToLocal("remote", body)).toBe(true);
+    const keyed = relayRecordFileName("remote", body.id);
+    const marker = relayAcceptanceReceiptPath("remote", body.id);
+    const expireReceipt = () => {
+      const old = new Date(Date.now() - 5000);
+      fs.utimesSync(marker, old, old);
+    };
+    process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = "1000";
+    try {
+      // Receipt expired, record still in the mailbox: inside the window.
+      expireReceipt();
+      expect(deliverRelayedToLocal("remote", body)).toBe(false);
+      expect(newRecords()).toEqual([keyed]);
+      // Record acknowledged (removed) and receipt expired: the window has closed.
+      ackMessageAtPath(join(getInbox("local").fresh, keyed));
+      expect(newRecords()).toEqual([]);
+      expireReceipt();
+      expect(deliverRelayedToLocal("remote", body)).toBe(true);
+      expect(newRecords()).toEqual([keyed]);
+    } finally {
+      delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+    }
   });
 });

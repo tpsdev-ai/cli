@@ -1,9 +1,16 @@
-- **Relay delivery is idempotent by branch and delivery id, so a resend after a lost ACK writes one inbox record (Closes #513).**
+- **A relayed delivery resent within its retention window writes one inbox record, matched by authenticated branch and delivery id (Closes #513).**
 
   A relayed inbox record is now named by a key derived from the authenticated
-  branch id and the delivery id. An acceptance resend recognises the record by
-  that key without reading any other record, so a delivery whose inbox write
-  succeeded but whose acceptance marker was not written (a crash between the two)
-  is not written a second time. The key is computed from the branch the relay
-  channel authenticated and the id the branch sent, not from any field of the
-  record; the same id from a different branch is still delivered.
+  branch id and the delivery id. A resend of the same id from the same branch is
+  matched to that record by its name, so a delivery whose inbox write succeeded
+  but whose acceptance receipt was not written (a crash between the two) is not
+  written a second time. The same id from a different branch is still delivered.
+
+  A resend is recognised while the record is in the mailbox (new, cur or the
+  dead-letter queue) or its acceptance receipt is unexpired (seven days by
+  default). Once the record has been acknowledged, archived or garbage-collected
+  and the receipt has expired, a resend is delivered again.
+
+  A record under the keyed name that does not parse as a mail record refuses the
+  delivery, with no ACK and no replacement. Repair or move it aside so a retry
+  can be accepted.

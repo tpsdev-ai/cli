@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath } from "../src/utils/mail.js";
+import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath, relayRecordFileName } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
 import { runMail } from "../src/commands/mail.js";
 import { RELAY_ACCEPT_LOCK_STRIPES, syncRemoteBranch, connectAndKeepAlive, deliverRelayedToLocal, relayAcceptanceReceiptPath, pruneRelayAcceptanceReceipts } from "../src/utils/relay.js";
@@ -496,6 +496,40 @@ for (const entry of ["sync", "connect"] as const) {
       expect(acks.length).toBe(1);
       expect(drainOutbox(false)).toEqual([]);
     });
+
+    for (const receipt of ["kept", "removed"] as const) {
+      test(`a lost ACK and the sender's resend keep one keyed inbox record (receipt ${receipt}) (cli#513)`, async () => {
+        const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", `lost ACK ${receipt}`, SEEDS)));
+        const inbox = getInbox("local");
+        const keyed = relayRecordFileName("remote", body.id);
+        await start();
+        const send = channel.send;
+        let lost = 0;
+        // The receiver sends the ACK and the send succeeds, but the ACK never reaches the branch.
+        channel.send = async (ack) => {
+          if (ack.type === MSG_MAIL_ACK && lost === 0) { lost++; return; }
+          return send(ack);
+        };
+        await emit();
+        expect(lost).toBe(1);
+        expect(acks).toEqual([]);
+        expect(jsonFiles(inbox.fresh)).toEqual([keyed]);
+        const recordId = JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8")).id;
+        // The branch saw no ACK, so its outbox still holds the delivery.
+        expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
+        // Without the receipt, only the inbox record can recognise the resend.
+        if (receipt === "removed") fs.rmSync(relayAcceptanceReceiptPath("remote", body.id));
+        const later = Date.now() + OUTBOX_RESEND_BASE_MS;
+        const clock = spyOn(Date, "now").mockReturnValue(later);
+        try { await emit(); } finally { clock.mockRestore(); }
+        expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+        expect(jsonFiles(inbox.fresh)).toEqual([keyed]);
+        // The resend was recognised, not written again over the same name.
+        expect(JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8")).id).toBe(recordId);
+        expect(jsonFiles(inbox.cur)).toEqual([]);
+        expect(drainOutbox(false)).toEqual([]);
+      });
+    }
 
     async function ackOnlyRecord(): Promise<void> {
       const inbox = getInbox("local");

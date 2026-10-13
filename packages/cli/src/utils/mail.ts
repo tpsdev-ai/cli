@@ -80,21 +80,34 @@ export function validateMessageId(id: string): void {
 
 /**
  * The store key for one relayed delivery: the sha-256 of the AUTHENTICATED
- * branch id and the wire delivery id (cli#513). It is derived from what the
- * relay channel authenticated and the id the branch sent — never from a field
- * of the delivered record.
+ * branch id and the wire delivery id (cli#513). Callers pass the branch the
+ * relay channel authenticated and the id the branch sent; the key never comes
+ * from a field of the delivered record.
  */
 export function relayDeliveryKey(branchId: string, deliveryId: string): string {
   return createHash("sha256").update(branchId).update("\0").update(deliveryId).digest("hex");
 }
 
 /**
- * The file name of a relayed inbox record, keyed by (branch, delivery id): the
- * record's own name answers "has this delivery already been written?" in O(1),
- * independent of any field on the record.
+ * The file name of a relayed inbox record, keyed by (branch, delivery id), so a
+ * resend can be matched to the record by its name rather than by the record's
+ * relay fields. The record must still parse as a mail record: a keyed record
+ * that does not is refused (`RelayedRecordInvalidError`), never replaced.
  */
 export function relayRecordFileName(branchId: string, deliveryId: string): string {
   return `${relayDeliveryKey(branchId, deliveryId)}.json`;
+}
+
+/**
+ * cli#513: the record under a delivery's keyed name does not parse as a mail
+ * record, so the resend cannot be compared with it. Acceptance refuses the
+ * delivery: no ACK, and no replacement record is published.
+ */
+export class RelayedRecordInvalidError extends Error {
+  constructor(source: string, delivery: { branchId: string; id: string }) {
+    super(`relayed record ${source} for branch ${delivery.branchId} message ${delivery.id} does not parse as a mail record; delivery refused without ACK. Repair or move the record aside so a retry can be accepted`);
+    this.name = "RelayedRecordInvalidError";
+  }
 }
 
 function assertValidAgentId(agent: string): void {
@@ -510,7 +523,8 @@ const MailRecordSchema = RelayPayloadSchema.extend({
 /**
  * Records without a `relayDelivery` property stay in place (cli#560).
  * Malformed records with it are quarantined only in the recipient's mailbox,
- * even when its value is invalid (e.g. null).
+ * even when its value is invalid (e.g. null). A malformed record under the
+ * delivery's keyed name is refused instead (cli#513).
  */
 function carriesRelayDelivery(parsed: unknown, raw: string): boolean {
   if (parsed !== null && typeof parsed === "object") return (parsed as Record<string, unknown>).relayDelivery !== undefined;
@@ -573,13 +587,11 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     try {
       for (const dir of ["new", "dlq", "cur"]) {
         const path = join(root, dir);
-        // cli#513: a relayed record is named by its (branch, id) key, so the record
-        // for the delivery is found by an O(1) existence check on that name; the
-        // full listing is kept for records written before the key existed.
+        // cli#513: a relayed record is named by its (branch, id) key. The directory
+        // is still listed; when the listing holds the keyed name, only that record
+        // is read in this directory. Otherwise every listed record is read, as
+        // before, which covers records written before the key existed.
         const keyedFile = relayRecordFileName(delivery.branchId, delivery.id);
-        // cli#513: a relayed record is named by its (branch, id) key, so when that
-        // name is present only it is read (O(1) record reads, not a scan of every
-        // record); the full listing is kept for records written before the key.
         const listed = listMessageFiles(path);
         const files = listed.includes(keyedFile) ? [keyedFile] : listed;
         for (const file of files) {
@@ -606,6 +618,13 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
             parseError = error;
           }
           if (!record) {
+            // cli#513: the keyed record of this delivery is never quarantined and
+            // replaced: the resend cannot be compared with it, so it is refused.
+            if (keyed) {
+              const reason = parseError instanceof Error ? parseError.message : String(parseError);
+              console.error(`[mail] unreadable record ${source}: ${reason}`);
+              throw new RelayedRecordInvalidError(source, delivery);
+            }
             // cli#560: records without a relayDelivery property stay in place.
             // Malformed records with it are quarantined only in the recipient's
             // own mailbox, even when its value is invalid (e.g. null).
