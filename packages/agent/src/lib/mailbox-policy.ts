@@ -281,7 +281,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
 
 /**
  * List well-formed pending intents with their phase; quarantine malformed ones
- * and omit them. A terminal `failed` intent is not pending and is omitted.
+ * and omit them. An intent declaring `failed` is not pending and is omitted.
  * Call under the mailbox lock and re-read each intent before acting on it.
  */
 export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string; phase: PlacementPhase }> {
@@ -337,18 +337,22 @@ function quarantinePlacement(path: string): void {
  * the declaration; it does not prove the state behind it.
  *
  * - `placing`: declares a commit in flight. An intent without a `phase` is
- *   `placing`, so every intent written before phases existed reads as before.
+ *   `placing`, so an otherwise-valid intent written before phases existed, whose
+ *   `file` is a plain basename, reads as before. The one exception: an older
+ *   intent whose `file` is not a plain basename, which the old parser accepted
+ *   when its hashed name matched, is now malformed and quarantined.
  * - `in_progress`: declares a committed message whose handler has not completed.
  * - `failed`: declares a terminal message (its liveness bound was reached). It
- *   is not pending: it never closes the per-file gate and is never listed for
- *   recovery. When a different message needs the same basename and the old
+ *   is not pending: it never closes the per-file (filename) gate and is never
+ *   listed for recovery, while its message ID stays refused by the consumed-ID
+ *   (replay) gate. When a different message needs the same basename and the old
  *   payload has left cur/, the marker moves to its tombstone name
  *   (failedTombstonePath) and the new placement proceeds; otherwise it stays.
  *   Either way it is kept until an operator removes it.
  * - `unknown`: a phase, schema version or phase field this reader does not
  *   understand. The store never finishes or replaces it, MailClient recovery,
  *   the CLI lease sweep and CLI promotion never present it, and it is not
- *   quarantined solely for that field. It keeps its own file's gate closed.
+ *   quarantined solely for that field. It keeps its own per-file gate closed.
  *
  * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
  */
@@ -392,7 +396,7 @@ function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   return "unknown";
 }
 
-/** A pending intent: any phase but the terminal `failed`. */
+/** A pending intent: any declared phase but `failed`. */
 function isLivePlacement(intent: PlacementIntent | null): boolean {
   return intent !== null && intent.phase !== "failed";
 }
@@ -439,10 +443,11 @@ function readPlacementIntent(root: string, file: string): PlacementIntent | null
 
 /**
  * Where a retired `failed` marker for `file` is kept (cli#617):
- * `.placement-<sha256(file)>.failed-<messageId>.json`. A tombstone never gates
- * delivery and is never listed for recovery; it keeps its message ID retained
- * in the consumed ledger (pendingPlacementIds) and stays until an operator
- * removes it.
+ * `.placement-<sha256(file)>.failed-<messageId>.json`. A tombstone leaves the
+ * per-file (filename) gate open and is never listed for recovery. It keeps its
+ * message ID retained in the consumed ledger (pendingPlacementIds), so the
+ * consumed-ID (replay) gate still refuses that message. It stays until an
+ * operator removes it.
  */
 function failedTombstonePath(root: string, file: string, messageId: string): string {
   return `${placementIntentPath(root, file).slice(0, -".json".length)}.failed-${messageId}.json`;
