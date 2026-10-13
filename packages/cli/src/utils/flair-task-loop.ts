@@ -9,9 +9,11 @@
  * `~/.tps/cursors/<agentId>-task-loop.json` as `{ position, updatedAt }` and
  * replaced atomically (a temporary file in the same directory, fsynced, then
  * renamed over it). With no usable cursor file, the loop sets the position to
- * FIRST_BOOT_LOOKBACK_MS before now, once, and persists it before the first
- * read. A legacy `{ since }` file resumes just before that timestamp; a file
- * that cannot be read or parsed is logged and treated as no cursor.
+ * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
+ * that position is saved: a failed save is logged by name and retried with
+ * backoff, with the same position, and `stop()` ends the retrying. A legacy
+ * `{ since }` file resumes just before that timestamp; a file that cannot be
+ * read or parsed is logged and treated as no cursor.
  *
  * ADVANCING. Events are handled in feed order, and an event is marked seen only
  * after its handler succeeds. The persisted position advances only over events
@@ -27,15 +29,19 @@
  * An unavailable read, including a page that fails validation, is logged with
  * its bounded reason and backs off without handling or persisting anything.
  *
- * DELIVERY is at least once, not exactly once, under these conditions: the
- * cursor file can be written and stays intact; the feed's pages pass
+ * The position is saved after a read's handlers run, when it advances. A
+ * failed save there is logged and the loop goes on from the position in
+ * memory; the saved position stays behind it, so a restart replays events
+ * rather than skipping them.
+ *
+ * DELIVERY is at least once, not exactly once, under these conditions: once
+ * saved, the cursor file is not removed or corrupted; the feed's pages pass
  * validation; the feed only appends (a new event sorts after those already
  * served), with positions within MAX_POSITION_SKEW_MS of the server's time; and
  * an event does not expire before its handler succeeds. Then a task event's
- * handler succeeds before the persisted position passes the event. The cursor
- * is written once per read, after its handlers run, so a crash between a
- * handler returning and that write replays the event. Handlers must be
- * idempotent.
+ * handler succeeds before the saved position passes the event. A crash between
+ * a handler returning and the save that follows it replays the event. Handlers
+ * must be idempotent.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
@@ -130,8 +136,12 @@ function loadCursor(agentId: string): string | undefined {
   return position;
 }
 
-/** Replace the cursor file atomically: write a temporary file beside it, fsync it, rename it over the cursor. */
-function saveCursor(agentId: string, position: string): void {
+/**
+ * Replace the cursor file atomically: write a temporary file beside it, fsync
+ * it, rename it over the cursor. Returns undefined on success, or the failure's
+ * name (its code, such as EACCES, or its class) for the caller to log.
+ */
+function saveCursor(agentId: string, position: string): string | undefined {
   const path = taskLoopCursorPath(agentId);
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
@@ -144,10 +154,10 @@ function saveCursor(agentId: string, position: string): void {
       closeSync(fd);
     }
     renameSync(tmp, path);
+    return undefined;
   } catch (e) {
-    const err = e as Error;
-    swarn(`[${agentId}] Failed to persist cursor: ${err.message}`);
     try { rmSync(tmp, { force: true }); } catch {}
+    return (e as NodeJS.ErrnoException).code ?? (e as Error).name;
   }
 }
 
@@ -177,17 +187,41 @@ export function startTaskLoop(
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
   const loaded = loadCursor(agentId);
+  // A new initial position is computed once, here; saving it is retried with
+  // this same value until it succeeds, and the feed is not read before then.
   let position: string = loaded ?? initialPosition();
-  // A new initial position is set once and persisted before the first read, so
-  // neither a later poll nor a restart recomputes it.
-  if (loaded === undefined) saveCursor(agentId, position);
   let running = true;
   let wake: (() => void) | undefined;
   let heldAt: string | undefined;
   let consecutiveErrors = 0;
   const seen = new Set<string>();
 
+  /** Wait `delay` ms, or until `stop` is called. */
+  async function sleep(delay: number): Promise<void> {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, delay);
+      wake = () => { clearTimeout(timer); resolve(); };
+    });
+    wake = undefined;
+  }
+
+  /** Save the initial position, retrying with backoff; false when stopped first. */
+  async function saveInitialPosition(): Promise<boolean> {
+    for (let attempt = 1; running; attempt++) {
+      const failure = saveCursor(agentId, position);
+      if (failure === undefined) return true;
+      const delay = Math.min(basePollMs * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+      swarn(
+        `[${agentId}] Task loop cannot save its initial position to ${taskLoopCursorPath(agentId)} (${failure}); ` +
+          `the feed is not read until it is saved; retrying in ${delay} ms`,
+      );
+      await sleep(delay);
+    }
+    return false;
+  }
+
   async function poll() {
+    if (loaded === undefined && !(await saveInitialPosition())) return;
     while (running) {
       try {
         const read = await flair.getEventsSince(agentId, cursorSince(position), position);
@@ -245,7 +279,11 @@ export function startTaskLoop(
 
           if (resumeAt !== position) {
             position = resumeAt;
-            saveCursor(agentId, position);
+            // A failed save is logged and the loop goes on from the position in
+            // memory. The saved position is then behind it, so a restart replays
+            // events rather than skipping them.
+            const failure = saveCursor(agentId, position);
+            if (failure !== undefined) swarn(`[${agentId}] Failed to persist cursor to ${taskLoopCursorPath(agentId)} (${failure})`);
           }
 
           // Cap seen set
@@ -267,11 +305,7 @@ export function startTaskLoop(
         ? Math.min(basePollMs * 2 ** (consecutiveErrors - 1), MAX_BACKOFF_MS)
         : basePollMs;
       if (!running) break;
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, delay);
-        wake = () => { clearTimeout(timer); resolve(); };
-      });
-      wake = undefined;
+      await sleep(delay);
     }
   }
 

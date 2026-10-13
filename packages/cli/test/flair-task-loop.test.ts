@@ -10,7 +10,7 @@
  * the signing and parsing seams are exercised; only the HTTP endpoint is faked.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -503,6 +503,85 @@ describe("cli#624 — the initial position is set once and always sent", () => {
     } finally {
       clock.restore();
     }
+  });
+});
+
+describe("cli#624 — the initial position is saved before the first read", () => {
+  // A real write failure: the cursor directory is made unwritable, then restored.
+  const cursors = () => join(home, ".tps", "cursors");
+  const lockCursors = () => {
+    mkdirSync(cursors(), { recursive: true });
+    chmodSync(cursors(), 0o500);
+  };
+  const unlockCursors = () => chmodSync(cursors(), 0o700);
+  const saveFailures = () => warnings.split("cannot save its initial position").length - 1;
+
+  test.skipIf(process.getuid?.() === 0)(
+    "while the initial position cannot be saved nothing is read; after recovery the saved position is the one fixed at start, and a restart retries the first task",
+    async () => {
+      const startNow = Date.now();
+      const e1 = assigned("e1", 45);
+      const catchup = serveFeed({ events: [e1] });
+      const realNow = Date.now.bind(Date);
+      let offset = 0;
+      const restoreClock = patchShared(Date, "now", () => realNow() + offset);
+      lockCursors();
+      let locked = true;
+      try {
+        const first: string[] = [];
+        const loop1 = startTaskLoop(client(), AGENT, async (e) => {
+          first.push(e.id);
+          throw new Error("handler down");
+        }, { pollIntervalMs: 20 });
+        try {
+          expect(await waitFor(() => saveFailures() >= 3)).toBe(true);
+          expect(warnings).toContain(`cannot save its initial position to ${cursorFile()} (EACCES)`);
+          expect(catchup.afters).toEqual([]);
+          // Half an hour passes before the directory is writable again: an initial
+          // position recomputed now would start after e1.
+          offset = 30 * 60_000;
+          unlockCursors();
+          locked = false;
+          expect(await waitFor(() => first.includes("e1"))).toBe(true);
+        } finally {
+          if (locked) unlockCursors();
+          await loop1.stop();
+        }
+        const initial = cursorPosition();
+        expect(isInitialPosition(initial, startNow)).toBe(true);
+        expect(catchup.afters[0]).toBe(initial);
+
+        const second: string[] = [];
+        const loop2 = startTaskLoop(client(), AGENT, async (e) => { second.push(e.id); }, { pollIntervalMs: 5_000 });
+        try {
+          await waitFor(() => second.length > 0);
+        } finally {
+          await loop2.stop();
+        }
+        expect(second).toEqual(["e1"]);
+        expect(catchup.afters.at(-1)).toBe(initial);
+        expect(cursorPosition()).toBe(positionOf(e1));
+      } finally {
+        restoreClock();
+      }
+    },
+  );
+
+  test.skipIf(process.getuid?.() === 0)("stop ends the retrying of the initial save promptly, and nothing is read", async () => {
+    const catchup = serveFeed({ events: [assigned("e1", 5)] });
+    lockCursors();
+    try {
+      const loop = startTaskLoop(client(), AGENT, async () => {}, { pollIntervalMs: 60_000 });
+      expect(await waitFor(() => saveFailures() >= 1)).toBe(true);
+      const t0 = performance.now();
+      await loop.stop();
+      expect(performance.now() - t0).toBeLessThan(1_000);
+    } finally {
+      unlockCursors();
+    }
+    await Bun.sleep(50);
+    expect(catchup.afters).toEqual([]);
+    expect(cursorPosition()).toBeUndefined();
   });
 });
 
