@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
@@ -76,6 +76,25 @@ const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 const VALID_ID = /^[a-zA-Z0-9._-]+$/;
 export function validateMessageId(id: string): void {
   if (!VALID_ID.test(id)) throw new Error(`Invalid message ID: ${id}`);
+}
+
+/**
+ * The store key for one relayed delivery: the sha-256 of the AUTHENTICATED
+ * branch id and the wire delivery id (cli#513). It is derived from what the
+ * relay channel authenticated and the id the branch sent — never from a field
+ * of the delivered record.
+ */
+export function relayDeliveryKey(branchId: string, deliveryId: string): string {
+  return createHash("sha256").update(branchId).update("\0").update(deliveryId).digest("hex");
+}
+
+/**
+ * The file name of a relayed inbox record, keyed by (branch, delivery id): the
+ * record's own name answers "has this delivery already been written?" in O(1),
+ * independent of any field on the record.
+ */
+export function relayRecordFileName(branchId: string, deliveryId: string): string {
+  return `${relayDeliveryKey(branchId, deliveryId)}.json`;
 }
 
 function assertValidAgentId(agent: string): void {
@@ -554,7 +573,17 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
     try {
       for (const dir of ["new", "dlq", "cur"]) {
         const path = join(root, dir);
-        for (const file of listMessageFiles(path)) {
+        // cli#513: a relayed record is named by its (branch, id) key, so the record
+        // for the delivery is found by an O(1) existence check on that name; the
+        // full listing is kept for records written before the key existed.
+        const keyedFile = relayRecordFileName(delivery.branchId, delivery.id);
+        // cli#513: a relayed record is named by its (branch, id) key, so when that
+        // name is present only it is read (O(1) record reads, not a scan of every
+        // record); the full listing is kept for records written before the key.
+        const listed = listMessageFiles(path);
+        const files = listed.includes(keyedFile) ? [keyedFile] : listed;
+        for (const file of files) {
+          const keyed = file === keyedFile;
           const source = join(path, file);
           let raw: string;
           try {
@@ -594,7 +623,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
             syncMailDirectory(path);
             continue;
           }
-          if (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id) {
+          if (keyed || (record.relayDelivery?.branchId === delivery.branchId && record.relayDelivery.id === delivery.id)) {
             const stored = record.envelope ? record.relayPayload ?? record : record;
             const originalEnvelope = record.envelope && record.relayPayload ? parseSignedEnvelope(record.relayPayload.body) : undefined;
             const projectionChanged = record.envelope && record.relayPayload && (
@@ -667,7 +696,9 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
   };
 
   const safeTs = timestamp.replace(/[:.]/g, "-");
-  const filename = `${safeTs}-${id}.json`;
+  // cli#513: a relayed record is named by its (branch, id) key; an ordinary send
+  // keeps the timestamp+uuid name.
+  const filename = relayDelivery ? relayRecordFileName(relayDelivery.branchId, relayDelivery.id) : `${safeTs}-${id}.json`;
   const tmpPath = join(inbox.tmp, filename);
   const newPath = join(inbox.fresh, filename);
   writeFileSync(tmpPath, JSON.stringify(message, null, 2), { encoding: "utf-8", flag: "wx" });
@@ -790,7 +821,8 @@ export function deadLetterUndelivered(
     mkdirMailDirectory(inbox.dlq);
   }
   const safeTs = record.timestamp.replace(/[^0-9A-Za-z_-]/g, "-");
-  const filename = `${safeTs}-${record.id}-${randomUUID()}.json`;
+  // cli#513: a relayed dead-letter is named by its (branch, id) key, like its inbox record.
+  const filename = relayDelivery ? relayRecordFileName(relayDelivery.branchId, relayDelivery.id) : `${safeTs}-${record.id}-${randomUUID()}.json`;
   const tmpPath = join(inbox.tmp, filename);
   writeFileSync(tmpPath, JSON.stringify({ ...record, read: false, ...(relayDelivery ? { relayDelivery, relayPayload: { from: record.from, to: record.to, body: record.body, timestamp: record.timestamp }, receivedAt: new Date().toISOString() } : {}) }, null, 2), "utf-8");
   const sidecar = join(inbox.dlq, `${filename}.reason`);
