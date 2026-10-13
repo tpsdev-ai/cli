@@ -113,7 +113,7 @@ describe("CLI lease sweep withholds a record whose intent is not placing (utils/
   }
 });
 
-describe("CLI promote leaves an intent it does not own as it is (utils/mail.ts promote)", () => {
+describe("CLI promote leaves a same-message in_progress, unknown-phase or future-version intent as it is, and refuses a failed one's duplicate as replay (utils/mail.ts promote)", () => {
   for (const [name, fields] of Object.entries(NOT_OURS)) {
     test(`${name}: busy, with the source, cur copy and intent untouched`, async () => {
       const f = committed(fields);
@@ -164,7 +164,7 @@ describe("retention: a failed intent is kept; its payload follows ordinary cur/ 
     });
   }
 
-  test("failed: once archiveOldCur archives the payload, a different message at the same name is delivered and the marker moves to a tombstone", async () => {
+  test("failed: once archiveOldCur archives the payload and the tombstone name is unoccupied, a different message at the same name is delivered and the marker moves to that tombstone", async () => {
     const f = committed(FAILED);
     fs.rmSync(f.source);
     const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);

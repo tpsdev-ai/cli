@@ -104,7 +104,7 @@ const PRESERVED: Record<string, Record<string, unknown>> = {
   "a phase field it cannot read": { version: 1, phase: "in_progress", presentations: -1 },
 };
 
-describe("agent recovery keeps an intent it does not own (io/mail.ts recoverInterruptedPlacements)", () => {
+describe("agent recovery keeps an in_progress or unknown intent (io/mail.ts recoverInterruptedPlacements)", () => {
   for (const [name, fields] of Object.entries(PRESERVED)) {
     for (const copy of ["present", "absent"] as const) {
       test(`${name}, cur copy ${copy}: skipped at listing, not presented, finished or quarantined; other mail flows`, async () => {
@@ -160,7 +160,7 @@ describe("the quarantine path keeps an unknown phase (mailbox-policy.ts readPlac
   }
 });
 
-describe("a failed intent is terminal and does not close the gate", () => {
+describe("a failed intent does not close the per-file gate", () => {
   test("not presented, a same-name duplicate is refused as replay, other mail flows, intent and payload kept", async () => {
     const bytes = committed("poisoned", { version: 1, phase: "failed", presentations: 5, firstPresentedAt: now() });
     const payload = textOf(cur());
@@ -183,7 +183,7 @@ describe("a failed intent is terminal and does not close the gate", () => {
   const FAILED = { version: 1, phase: "failed", presentations: 5, firstPresentedAt: now() };
   const tombstone = (id: string) => intentPath().replace(/\.json$/, `.failed-${id}.json`);
 
-  test("once the failed payload is archived, a different message at the same name is delivered; the marker moves to a tombstone that keeps its consumed ID", async () => {
+  test("once the failed payload is archived and its tombstone name is unoccupied, a different message at the same name is delivered; the marker moves to that tombstone, which keeps its consumed ID", async () => {
     const bytes = committed("poisoned", FAILED);
     const archived = join(root, "archive", "2026-01");
     mkdirSync(archived, { recursive: true });
@@ -241,7 +241,7 @@ describe("a failed intent is terminal and does not close the gate", () => {
     expect(textOf(tombstone("poisoned"))).toBe(retained);
   });
 
-  test("a tombstone that is the marker's own inode (an interrupted move) is finished, and the reuse proceeds", async () => {
+  test("a tombstone that is the marker's own inode is treated as an interrupted move and finished, and the reuse proceeds", async () => {
     const marker = archivedFailedWithReuse();
     linkSync(intentPath(), tombstone("poisoned"));
 
@@ -265,7 +265,7 @@ describe("a failed intent is terminal and does not close the gate", () => {
   });
 });
 
-describe("the store never finishes or replaces an intent in another phase", () => {
+describe("the store never finishes or replaces a same-message intent in another phase", () => {
   const OTHER = { ...PRESERVED, failed: { version: 1, phase: "failed", presentations: 5, firstPresentedAt: now() } };
   for (const [name, fields] of Object.entries(OTHER)) {
     test(`${name}: finishPlacement and beginPlacement leave it byte-identical`, () => {

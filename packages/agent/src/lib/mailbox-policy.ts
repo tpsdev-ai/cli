@@ -224,8 +224,10 @@ export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
   /**
    * Write a `placing` intent. Refuses to replace an intent in any other phase,
-   * except that a `failed` marker for a different message moves to its
-   * tombstone once its payload has left cur/ (cli#617).
+   * with one exception (cli#617). A `failed` marker for a different message,
+   * whose payload has left cur/, moves to its tombstone when that name is
+   * unoccupied, or is the marker's own inode (treated as an interrupted move).
+   * An occupied tombstone refuses the placement by name.
    */
   beginPlacement(messageId: string, file: string, sourcePath?: string): void;
   ownsPendingPlacement(messageId: string, file: string): boolean;
@@ -345,12 +347,16 @@ function quarantinePlacement(path: string): void {
  * - `failed`: declares a terminal message (its liveness bound was reached). It
  *   is not pending: it never closes the per-file (filename) gate and is never
  *   listed for recovery, while its message ID stays refused by the consumed-ID
- *   (replay) gate. When a different message needs the same basename and the old
- *   payload has left cur/, the marker moves to its tombstone name
- *   (failedTombstonePath) and the new placement proceeds; otherwise it stays.
- *   Either way it is kept until an operator removes it.
- * - `unknown`: a phase, schema version or phase field this reader does not
- *   understand. The store never finishes or replaces it, MailClient recovery,
+ *   (replay) gate. A different message may need the same basename once the
+ *   old payload has left cur/. If the tombstone name (failedTombstonePath) is
+ *   unoccupied, or is the marker's own inode (treated as an interrupted move),
+ *   the marker moves there and the new placement proceeds. An occupied
+ *   tombstone refuses the placement by name. While the payload is in cur/, the
+ *   marker stays and the new placement is refused. The record is kept until an
+ *   operator removes it.
+ * - `unknown`: an unsupported value in a recognized field (`phase`, `version`,
+ *   `presentations` or `firstPresentedAt`); other extra fields are ignored. The
+ *   store never finishes or replaces it, MailClient recovery,
  *   the CLI lease sweep and CLI promotion never present it, and it is not
  *   quarantined solely for that field. It keeps its own per-file gate closed.
  *
@@ -378,9 +384,10 @@ function isPlainBasename(file: string): boolean {
 }
 
 /**
- * Read the declared phase from a parsed intent. An unfamiliar phase, version or
- * liveness field reads as `unknown`, not as malformed; a malformed identity or
- * basename is still malformed (parsePlacement).
+ * Read the declared phase from a parsed intent. An unsupported value in
+ * `phase`, `version` or a liveness field reads as `unknown`, not as malformed;
+ * other extra fields are ignored. A malformed identity or basename is still
+ * malformed (parsePlacement).
  */
 function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   if (intent.version !== undefined && intent.version !== PLACEMENT_INTENT_VERSION) return "unknown";
@@ -403,8 +410,8 @@ function isLivePlacement(intent: PlacementIntent | null): boolean {
 
 /**
  * Parse an intent, or null when it is malformed: the name, messageId and
- * identity must hold. An unfamiliar phase, version or liveness field alone
- * never makes an intent malformed (see phaseOf).
+ * identity must hold. An unsupported value in `phase`, `version` or a liveness
+ * field alone never makes an intent malformed (see phaseOf).
  */
 function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
@@ -458,8 +465,9 @@ const FAILED_TOMBSTONE_NAME = /^\.placement-[a-f0-9]{64}\.failed-(.+)\.json$/;
 /**
  * Move a `failed` marker to its tombstone without ever replacing one: the link
  * fails if the tombstone name is taken. A tombstone that is the marker's own
- * inode is an interrupted earlier move, which this finishes. Any other
- * occupant is refused by name, and the marker and the tombstone are both kept.
+ * inode is treated as an interrupted earlier move, which this finishes. Any
+ * other occupant is refused by name, and the marker and the tombstone are both
+ * kept.
  */
 function retireFailedMarker(root: string, path: string, file: string, messageId: string): void {
   const tombstone = failedTombstonePath(root, file, messageId);
@@ -500,9 +508,11 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
   const path = placementIntentPath(root, file);
   const existing = readPlacementIntent(root, file);
   if (existing && existing.messageId !== messageId) {
-    // cli#617: a `failed` marker yields its basename to a different message once
-    // its payload has left cur/. The marker moves to its tombstone, keeping the
+    // cli#617: once its payload has left cur/, a `failed` marker yields its
+    // basename to a different message. It moves to its tombstone, keeping the
     // operator's record and the old consumed ID, and this placement proceeds.
+    // The exception is an occupied tombstone, which refuses by name
+    // (retireFailedMarker).
     if (existing.phase !== "failed" || !isAbsent(join(root, "cur", file))) {
       throw new Error(`placement intent for ${file} names another message`);
     }
