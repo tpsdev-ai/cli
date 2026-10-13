@@ -5,6 +5,7 @@ import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js
 import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
+import { activityState, orgEventReadNotice, readOrgEvents, type OrgEventRecord } from "../utils/org-event-read.js";
 
 interface RosterArgs {
   action: "list" | "show" | "find" | "invite";
@@ -216,15 +217,6 @@ interface FlairIdentity {
   status?: string;
 }
 
-interface OrgEventRecord {
-  id: string;
-  kind: string;
-  authorId: string;
-  summary: string;
-  createdAt: string;
-  refId?: string;
-}
-
 export async function runDashboard(opts: { flairUrl?: string; json?: boolean; keyPath?: string; agentId?: string }): Promise<void> {
   const flairUrl = opts.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
   const { join } = await import("node:path");
@@ -268,23 +260,28 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
     return;
   }
 
-  // Fetch recent OrgEvents for activity
-  const recentEvents: OrgEventRecord[] = [];
-  try {
-    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().replace(/Z$/, ".000Z");
-    const auth = makeAuth("GET", `/OrgEventCatchup/${viewerId}?since=${since}`);
-    const res = await fetch(`${flairUrl}/OrgEventCatchup/${viewerId}?since=${since}`, auth ? { headers: { Authorization: auth } } : {});
-    if (res.ok) recentEvents.push(...(await res.json() as OrgEventRecord[]));
-  } catch { /* non-fatal */ }
+  // Recent OrgEvents for the activity column: the viewer's catch-up feed over
+  // the last 24h (see utils/org-event-read.ts). A read that does not return the
+  // events is reported, and the column says "unavailable", not "no activity".
+  const read = await readOrgEvents({
+    flairUrl,
+    viewerId,
+    since: new Date(Date.now() - 24 * 60 * 60 * 1000),
+    sign: makeAuth,
+  });
+  const notice = orgEventReadNotice(flairUrl, read);
+  if (notice) console.error(notice);
+  const activity = activityState(read);
 
-  // Build per-agent last event map
+  // Per-agent newest event of any kind, and newest task event of the kinds
+  // task.assigned and task.completed (other task kinds, such as task.failed,
+  // are not considered). The feed is oldest first, so a later event replaces an
+  // earlier one.
   const lastEvent = new Map<string, OrgEventRecord>();
   const lastTask = new Map<string, OrgEventRecord>();
-  for (const ev of recentEvents) {
-    if (!lastEvent.has(ev.authorId)) lastEvent.set(ev.authorId, ev);
-    if ((ev.kind === "task.assigned" || ev.kind === "task.completed") && !lastTask.has(ev.authorId)) {
-      lastTask.set(ev.authorId, ev);
-    }
+  for (const ev of read.status === "ok" ? read.events : []) {
+    lastEvent.set(ev.authorId, ev);
+    if (ev.kind === "task.assigned" || ev.kind === "task.completed") lastTask.set(ev.authorId, ev);
   }
 
   if (opts.json) {
@@ -292,6 +289,7 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
       ...a,
       lastEvent: lastEvent.get(a.id ?? a.agentId ?? ""),
       lastTask: lastTask.get(a.id ?? a.agentId ?? ""),
+      activity,
     })), null, 2));
     return;
   }
@@ -305,14 +303,17 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
   for (const agent of agents) {
     const agId = agent.id ?? agent.agentId ?? "?"; const last = lastEvent.get(agId);
     const task = lastTask.get(agId);
-    const ago = last
-      ? (() => {
-          const ms = now - new Date(last.createdAt).getTime();
-          if (ms < 60000) return `${Math.round(ms / 1000)}s ago`;
-          if (ms < 3600000) return `${Math.round(ms / 60000)}m ago`;
-          return `${Math.round(ms / 3600000)}h ago`;
-        })()
-      : "no activity";
+    const ago = activity === "unavailable"
+      ? "unavailable"
+      : last
+        ? (() => {
+            const ms = now - new Date(last.createdAt).getTime();
+            const when = ms < 60000 ? `${Math.round(ms / 1000)}s ago`
+              : ms < 3600000 ? `${Math.round(ms / 60000)}m ago`
+              : `${Math.round(ms / 3600000)}h ago`;
+            return activity === "incomplete" ? `${when} (incomplete)` : when;
+          })()
+        : activity === "incomplete" ? "incomplete" : "no activity";
     const taskInfo = task ? ` [${task.kind}: ${(task.refId ?? task.summary).slice(0, 30)}]` : "";
     const status = agent.status ?? "unknown";
     console.log(
