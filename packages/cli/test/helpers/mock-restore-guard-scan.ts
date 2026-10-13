@@ -1,8 +1,8 @@
 /** Static mock-assignment and teardown checks for cli test files. */
 
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { extname, join, resolve } from "node:path";
 import ts from "typescript";
+import { discoverTestFiles } from "../../../../scripts/check-test-reports.mjs";
 
 export type Finding =
   | { kind: "module-mock-needs-child-process"; detail: string }
@@ -36,14 +36,14 @@ const GUARDED_BARE_GLOBALS = new Set(["fetch", "setTimeout", "clearTimeout", "se
   "clearInterval", "setImmediate", "clearImmediate", "queueMicrotask"]);
 
 /** True when the target is a guarded global or a member of an imported module object. */
-function guardedTarget(lhs: ts.Expression, moduleObjects: Map<string, string>, aliases: GuardedAliases): boolean {
+function guardedTarget(lhs: ts.Expression, moduleObjects: ModuleObjects, aliases: GuardedAliases): boolean {
   const node = unwrap(lhs);
   if (ts.isIdentifier(node)) return GUARDED_BARE_GLOBALS.has(node.text) && !resolveScope(node);
   if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) {
     if (isImportCall(rootExpression(node))) return true;
     const rootNode = rootIdentifier(node);
     if (rootNode === undefined) return false;
-    if (moduleObjects.has(rootNode.text)) return true;
+    if (moduleObjectAt(rootNode, moduleObjects)) return true;
     const root = guardedRootOf(rootNode, aliases);
     if (root === undefined) return false;
     // process.env is the env-leak preload's object, not a guarded global.
@@ -63,7 +63,7 @@ function isEnvMemberOf(node: ts.Expression, rootNode: ts.Identifier): boolean {
   return isEnvMemberOf(node.expression, rootNode);
 }
 
-function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: Map<string, string>,
+function directAssignmentFinding(assignment: ts.BinaryExpression, moduleObjects: ModuleObjects,
   aliases: GuardedAliases, mockValue: (node: ts.Expression) => boolean): Finding | undefined {
   const detail = `assignment to '${assignment.left.getText()}' requires patchShared; inline restoration is refused`;
   if (guardedTarget(assignment.left, moduleObjects, aliases)) {
@@ -136,6 +136,12 @@ function bindingNames(name: ts.BindingName, out: Set<string>): void {
   else for (const element of name.elements) if (ts.isBindingElement(element)) bindingNames(element.name, out);
 }
 
+/** Like `bindingNames`, but keeps the identifier nodes (for scope resolution). */
+function bindingIdentifiers(name: ts.BindingName, out: Set<ts.Identifier>): void {
+  if (ts.isIdentifier(name)) out.add(name);
+  else for (const element of name.elements) if (ts.isBindingElement(element)) bindingIdentifiers(element.name, out);
+}
+
 function isFunctionLike(node: ts.Node): node is ts.FunctionLikeDeclaration {
   return ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node) ||
     ts.isMethodDeclaration(node) || ts.isConstructorDeclaration(node) || ts.isGetAccessorDeclaration(node) ||
@@ -189,7 +195,7 @@ function scopeNames(node: ts.Node): Set<string> {
     if (node.variableDeclaration) bindingNames(node.variableDeclaration.name, out);
   } else if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
     const initializer = node.initializer;
-    if (initializer && ts.isVariableDeclarationList(initializer)) {
+    if (initializer && ts.isVariableDeclarationList(initializer) && initializer.flags & ts.NodeFlags.BlockScoped) {
       for (const declaration of initializer.declarations) bindingNames(declaration.name, out);
     }
   } else if (ts.isClassExpression(node) && node.name) {
@@ -228,6 +234,15 @@ function rootIdentifier(node: ts.Expression): ts.Identifier | undefined {
 
 type GuardedAliases = Map<ts.Node, Map<string, string>>;
 
+/** Module-object names, keyed by the scope that declares them (lexical resolution). */
+type ModuleObjects = Map<ts.Node, Map<string, string>>;
+
+/** True when the identifier names an imported module object, resolving the name by scope. */
+function moduleObjectAt(id: ts.Identifier, moduleObjects: ModuleObjects): boolean {
+  const scope = resolveScope(id);
+  return scope !== undefined && moduleObjects.get(scope)?.has(id.text) === true;
+}
+
 /** The guarded global root an identifier names, directly or through an alias of one. */
 function guardedRootOf(id: ts.Identifier, aliases: GuardedAliases): string | undefined {
   const scope = resolveScope(id);
@@ -235,26 +250,61 @@ function guardedRootOf(id: ts.Identifier, aliases: GuardedAliases): string | und
   return aliases.get(scope)?.get(id.text);
 }
 
-/** Variables initialised or assigned from a guarded global root, or from another such alias. */
+/**
+ * Guarded-root aliases from plain assignments and object bindings with identifier
+ * or string-literal keys, including nested bindings. Computed keys and array
+ * bindings are out of scope. Values extracted from process.env are not
+ * guarded-root aliases.
+ */
 function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
   const aliases: GuardedAliases = new Map();
   let changed = true;
   while (changed) {
     changed = false;
-    const add = (target: ts.Identifier, value: ts.Expression): void => {
-      const source = rootIdentifier(value);
-      if (!source) return;
-      const root = guardedRootOf(source, aliases);
-      // process.env is the env-leak preload's object, not a guarded global.
-      if (root === "process" && isEnvMemberOf(value, source)) return;
+    const bind = (target: ts.Identifier, root: string): void => {
       const scope = resolveScope(target);
-      if (!root || !scope) return;
+      if (!scope) return;
       let names = aliases.get(scope);
       if (!names) aliases.set(scope, (names = new Map()));
       if (!names.has(target.text)) { names.set(target.text, root); changed = true; }
     };
+    const selectedRoot = (root: string, property: string): string | undefined => {
+      if (root === "process" && property === "env") return undefined;
+      if ((root === "globalThis" || root === "global") && GUARDED_GLOBAL_ROOTS.has(property)) return property;
+      return root;
+    };
+    const valueRoot = (value: ts.Expression): string | undefined => {
+      value = unwrap(value);
+      if (ts.isIdentifier(value)) return guardedRootOf(value, aliases);
+      if (!ts.isPropertyAccessExpression(value) && !ts.isElementAccessExpression(value)) return undefined;
+      const root = valueRoot(value.expression);
+      if (!root) return undefined;
+      const property = ts.isPropertyAccessExpression(value) ? value.name.text :
+        ts.isStringLiteralLike(value.argumentExpression) ? value.argumentExpression.text : undefined;
+      return property === undefined ? root : selectedRoot(root, property);
+    };
+    const addBinding = (name: ts.BindingName, root: string): void => {
+      if (ts.isIdentifier(name)) {
+        bind(name, root);
+        return;
+      }
+      if (!ts.isObjectBindingPattern(name)) return;
+      for (const element of name.elements) {
+        if (element.dotDotDotToken) continue;
+        const property = element.propertyName;
+        if (property && !ts.isIdentifier(property) && !ts.isStringLiteralLike(property)) continue;
+        const propertyName = property ? property.text : ts.isIdentifier(element.name) ? element.name.text : undefined;
+        if (propertyName === undefined) continue;
+        const selected = selectedRoot(root, propertyName);
+        if (selected) addBinding(element.name, selected);
+      }
+    };
+    const add = (name: ts.BindingName, value: ts.Expression): void => {
+      const root = valueRoot(value);
+      if (root) addBinding(name, root);
+    };
     const walk = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) add(node.name, node.initializer);
+      if (ts.isVariableDeclaration(node) && node.initializer) add(node.name, node.initializer);
       else if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
         const left = unwrap(node.left);
         if (ts.isIdentifier(left)) add(left, node.right);
@@ -266,26 +316,31 @@ function guardedAliasNames(file: ts.SourceFile): GuardedAliases {
   return aliases;
 }
 
-/**
- * Every identifier that names an imported module object or derives from one, by
- * plain alias, destructuring or a property read. A member assignment on such an
- * identifier is reported as a member assignment on the module object, so an
- * alias no longer hides it.
- */
-function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
-  const names = new Map<string, string>();
+/** Module-object aliases from assignments, binding patterns and property reads, keyed by declaring scope. */
+function moduleObjectNames(file: ts.SourceFile): ModuleObjects {
+  const scopes: ModuleObjects = new Map();
+  const scopeFor = (node: ts.Node): Map<string, string> => {
+    let names = scopes.get(node);
+    if (!names) scopes.set(node, (names = new Map()));
+    return names;
+  };
+  const has = (id: ts.Identifier): boolean => {
+    const scope = resolveScope(id);
+    return scope !== undefined && scopes.get(scope)?.has(id.text) === true;
+  };
+  const sourceScope = scopeFor(file);
   for (const statement of file.statements) {
     if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) continue;
     const clause = statement.importClause;
     if (!clause || clause.isTypeOnly) continue;
-    if (clause.name) names.set(clause.name.text, statement.moduleSpecifier.text);
+    if (clause.name) sourceScope.set(clause.name.text, statement.moduleSpecifier.text);
     const namedBindings = clause.namedBindings;
     if (!namedBindings) continue;
     if (ts.isNamespaceImport(namedBindings)) {
-      names.set(namedBindings.name.text, statement.moduleSpecifier.text);
+      sourceScope.set(namedBindings.name.text, statement.moduleSpecifier.text);
     } else {
       for (const element of namedBindings.elements) {
-        if (!element.isTypeOnly) names.set(element.name.text, statement.moduleSpecifier.text);
+        if (!element.isTypeOnly) sourceScope.set(element.name.text, statement.moduleSpecifier.text);
       }
     }
   }
@@ -295,33 +350,31 @@ function moduleObjectNames(file: ts.SourceFile): Map<string, string> {
     const derived = (node: ts.Expression): boolean => {
       node = unwrap(node);
       if (isImportCall(node)) return true;
-      if (ts.isIdentifier(node)) return names.has(node.text);
+      if (ts.isIdentifier(node)) return has(node);
       if (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) return derived(node.expression);
       return false;
     };
-    const add = (name: string): void => {
-      if (!names.has(name)) { names.set(name, "<alias>"); changed = true; }
+    const add = (name: ts.Identifier): void => {
+      const scope = resolveScope(name);
+      if (!scope) return;
+      const names = scopeFor(scope);
+      if (!names.has(name.text)) { names.set(name.text, "<alias>"); changed = true; }
     };
     const walk = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && node.initializer) {
-        if (ts.isIdentifier(node.name)) {
-          if (derived(node.initializer)) add(node.name.text);
-        } else if ((ts.isObjectBindingPattern(node.name) || ts.isArrayBindingPattern(node.name)) &&
-          derived(node.initializer)) {
-          const bound = new Set<string>();
-          bindingNames(node.name, bound);
-          for (const name of bound) add(name);
-        }
+      if (ts.isVariableDeclaration(node) && node.initializer && derived(node.initializer)) {
+        const bound = new Set<ts.Identifier>();
+        bindingIdentifiers(node.name, bound);
+        for (const id of bound) add(id);
       } else if (ts.isBinaryExpression(node) && node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
         node.operatorToken.kind <= ts.SyntaxKind.LastAssignment) {
         const left = unwrap(node.left);
-        if (ts.isIdentifier(left) && derived(node.right)) add(left.text);
+        if (ts.isIdentifier(left) && derived(node.right)) add(left);
       }
       ts.forEachChild(node, walk);
     };
     walk(file);
   }
-  return names;
+  return scopes;
 }
 
 /** The identifiers that make a file need the teardown. */
@@ -393,8 +446,11 @@ class BunTestBindings {
 }
 
 /** Every finding this check reports for one file's source. */
-export function analyzeSource(source: string): Finding[] {
-  const file = ts.createSourceFile("guarded.test.ts", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+export function analyzeSource(source: string, fileName = "guarded.test.ts"): Finding[] {
+  const extension = extname(fileName).toLowerCase();
+  const scriptKind = extension === ".tsx" ? ts.ScriptKind.TSX : extension === ".jsx" ? ts.ScriptKind.JSX :
+    [".js", ".mjs", ".cjs"].includes(extension) ? ts.ScriptKind.JS : ts.ScriptKind.TS;
+  const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true, scriptKind);
   const bindings = new BunTestBindings(file);
   const moduleObjects = moduleObjectNames(file);
   const aliases = guardedAliasNames(file);
@@ -468,23 +524,8 @@ export function analyzeSource(source: string): Finding[] {
   return findings;
 }
 
-/**
- * Every `*.test.ts` file under `rootDir`, recursively, sorted. Dot-directories
- * and `node_modules` are skipped (bun does not descend into them, and neither
- * does this walk); other directories, including `dist/`, are walked.
- */
+/** Shared discovery under the resolved root, as sorted absolute paths; filesystem errors propagate. */
 export function discoverCliTestFiles(rootDir: string): string[] {
-  const found: string[] = [];
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.isDirectory()) {
-        if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
-        walk(join(dir, entry.name));
-      } else if (/\.test\.ts$/.test(entry.name)) {
-        found.push(join(dir, entry.name));
-      }
-    }
-  };
-  walk(rootDir);
-  return found.sort();
+  const root = resolve(rootDir);
+  return discoverTestFiles(root).map((relativePath) => join(root, relativePath)).sort();
 }

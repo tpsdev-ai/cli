@@ -36,15 +36,33 @@ export function patchShared<T extends object, K extends keyof T>(target: T, prop
   return restore;
 }
 
-/** Call at file scope before patches made in hooks or tests. */
-export function createPatchShared(): typeof patchShared {
+/** A patch was requested after the factory's cleanup hook had already run. */
+export class PatchAfterCleanupError extends Error {
+  constructor() {
+    super("createPatchShared: a patch was requested after the factory's cleanup ran; a patch cannot outlive cleanup");
+    this.name = "PatchAfterCleanupError";
+  }
+}
+
+/**
+ * A file-scope patch factory whose patches are restored in reverse by one cleanup hook.
+ */
+export function createPatchRegistry(registerCleanup: (cleanup: () => void) => void): typeof patchShared {
   const restores: Array<() => void> = [];
-  afterAll(() => {
+  let cleanedUp = false;
+  registerCleanup(() => {
+    cleanedUp = true;
     while (restores.length > 0) restores.pop()!();
   });
-  return (target, property, value) => {
+  return <T extends object, K extends keyof T>(target: T, property: K, value: T[K]): () => void => {
+    if (cleanedUp) throw new PatchAfterCleanupError();
     const restore = savePatch(target, property, value);
     restores.push(restore);
     return restore;
   };
+}
+
+/** Call at file scope before patches made in hooks or tests. */
+export function createPatchShared(): typeof patchShared {
+  return createPatchRegistry(afterAll);
 }
