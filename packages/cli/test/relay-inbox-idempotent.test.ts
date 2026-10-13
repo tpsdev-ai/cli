@@ -10,10 +10,13 @@
  * The guarantee is bounded by retention: while the record is in the mailbox (new,
  * cur or the dead-letter queue) or its acceptance receipt is unexpired, a resend
  * creates no additional inbox record. A recognised resend keeps the record's file
- * name and id and refreshes its receivedAt; after a local ACK has removed the
- * record, a matching receipt means no record is written at all. Once both the
- * record and the receipt are gone, a resend is eligible for a new delivery
- * attempt, and the ordinary inbox and dead-letter paths apply to it.
+ * name and id; when the match is in a mailbox root that acceptance holds for
+ * writing (the recipient's own always is), its receivedAt is refreshed, and a
+ * match in a root scanned read-only is returned without that rewrite. After a
+ * local ACK has removed the record, a matching receipt means no record is
+ * written at all. Once both the record and the receipt are gone, a resend is
+ * eligible for a new delivery attempt, and the ordinary inbox and dead-letter
+ * paths apply to it.
  *
  * A keyed record that does not parse as a mail record is refused: no ACK, no
  * quarantine, no replacement. The lost-ACK case (the ACK is sent and never

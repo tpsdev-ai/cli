@@ -4,9 +4,11 @@
   branch id and the delivery id. A resend of the same id from the same branch is
   matched to that record by its name, including when the inbox write succeeded
   but the acceptance receipt was not written (a crash between the two). A
-  recognised resend creates no additional record: the record keeps its file name
-  and id, and its `receivedAt` is refreshed. The same id from a different branch
-  is still delivered.
+  recognised resend creates no additional record, and the record keeps its file
+  name and id. When the match is in a mailbox root that acceptance holds for
+  writing (the recipient's own always is), its `receivedAt` is refreshed; a match
+  in a root scanned read-only is returned without that rewrite. The same id from
+  a different branch is still delivered.
 
   The retention window lasts while the record is in the mailbox (new, cur or the
   dead-letter queue) or its acceptance receipt is unexpired (seven days by
