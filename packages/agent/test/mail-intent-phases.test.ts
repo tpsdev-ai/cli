@@ -13,6 +13,7 @@ import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
 import { hasCommittedMessageId, mailboxReplayStore, pendingPlacementEntries } from "../src/lib/mailbox-policy.js";
 import { signEnvelope, type FlairClient } from "../src/lib/signEnvelope.js";
+import type { EventLogger } from "../src/telemetry/events.js";
 
 const AGENT = "agent-a";
 const FROM = "agent-b";
@@ -206,6 +207,48 @@ describe("a failed intent is terminal and does not close the gate", () => {
     ].join("\n")}\n`);
     expect(mailboxReplayStore(root).isConsumed("absent-id")).toBe(false);
     expect(hasCommittedMessageId(root, "poisoned")).toBe(true);
+  });
+
+  /** A failed marker whose payload has been archived, plus a different message waiting under its name. */
+  function archivedFailedWithReuse(): Buffer {
+    const bytes = committed("poisoned", FAILED);
+    const archived = join(root, "archive", "2026-01");
+    mkdirSync(archived, { recursive: true });
+    renameSync(cur(), join(archived, "m1.json"));
+    signedRecord(fresh(), "reused-name");
+    return bytes;
+  }
+
+  test("an occupied tombstone refuses the reuse by name: marker and tombstone stay byte-identical, nothing is presented", async () => {
+    const marker = archivedFailedWithReuse();
+    const retained = JSON.stringify({ messageId: "poisoned", file: "m1.json", phase: "failed", note: "an operator's retained record" });
+    writeFileSync(tombstone("poisoned"), retained);
+    const errors: string[] = [];
+    const events = { emit: (e: { status?: string; error?: string }) => { if (e.status === "error") errors.push(e.error ?? ""); } };
+    const c = new MailClient(mailDir, events as unknown as EventLogger, AGENT, verifier());
+
+    expect(await c.checkNewMail()).toEqual([]);
+    expect(await c.checkNewMail()).toEqual([]);
+
+    expect(errors.some((e) => e.includes("failed tombstone occupied for m1.json"))).toBe(true);
+    expect(existsSync(fresh())).toBe(true);
+    expect(existsSync(cur())).toBe(false);
+    expect(intentText()).toBe(marker.toString("utf8"));
+    expect(textOf(tombstone("poisoned"))).toBe(retained);
+    expect(hasCommittedMessageId(root, "reused-name")).toBe(false);
+    expect(() => mailboxReplayStore(root).beginPlacement("reused-name", "m1.json", fresh())).toThrow("failed tombstone occupied for m1.json");
+    expect(intentText()).toBe(marker.toString("utf8"));
+    expect(textOf(tombstone("poisoned"))).toBe(retained);
+  });
+
+  test("a tombstone that is the marker's own inode (an interrupted move) is finished, and the reuse proceeds", async () => {
+    const marker = archivedFailedWithReuse();
+    linkSync(intentPath(), tombstone("poisoned"));
+
+    expect(ids(await client().checkNewMail())).toEqual(["reused-name"]);
+
+    expect(textOf(tombstone("poisoned"))).toBe(marker.toString("utf8"));
+    expect(intentText()).toBeNull();
   });
 
   test("while the failed payload is still in cur/, a different message at the same name waits and the marker stays", async () => {

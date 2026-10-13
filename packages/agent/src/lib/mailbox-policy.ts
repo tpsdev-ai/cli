@@ -455,6 +455,30 @@ function failedTombstonePath(root: string, file: string, messageId: string): str
 
 const FAILED_TOMBSTONE_NAME = /^\.placement-[a-f0-9]{64}\.failed-(.+)\.json$/;
 
+/**
+ * Move a `failed` marker to its tombstone without ever replacing one: the link
+ * fails if the tombstone name is taken. A tombstone that is the marker's own
+ * inode is an interrupted earlier move, which this finishes. Any other
+ * occupant is refused by name, and the marker and the tombstone are both kept.
+ */
+function retireFailedMarker(root: string, path: string, file: string, messageId: string): void {
+  const tombstone = failedTombstonePath(root, file, messageId);
+  try {
+    linkSync(path, tombstone);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    const marker = lstatSync(path, { bigint: true });
+    const kept = lstatSync(tombstone, { bigint: true });
+    if (marker.dev !== kept.dev || marker.ino !== kept.ino) {
+      const refusal = new Error(`failed tombstone occupied for ${file} (message ${messageId}); marker and tombstone kept`);
+      refusal.name = "FailedTombstoneOccupiedError";
+      throw refusal;
+    }
+  }
+  unlinkSync(path);
+  syncDirectory(root);
+}
+
 function isAbsent(path: string): boolean {
   try {
     lstatSync(path);
@@ -482,8 +506,7 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
     if (existing.phase !== "failed" || !isAbsent(join(root, "cur", file))) {
       throw new Error(`placement intent for ${file} names another message`);
     }
-    renameSync(path, failedTombstonePath(root, file, existing.messageId));
-    syncDirectory(root);
+    retireFailedMarker(root, path, file, existing.messageId);
   } else if (existing && existing.phase !== "placing") {
     // cli#617: only a `placing` intent is rewritten; any other phase is kept.
     throw new Error(`placement intent for ${file} is ${existing.phase}; not replaced`);

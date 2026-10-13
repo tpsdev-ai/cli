@@ -183,4 +183,29 @@ describe("retention: a failed intent is kept; its payload follows ordinary cur/ 
     expect(hasCommittedMessageId(f.inbox.root, f.envelope.messageId)).toBe(true);
     expect(hasCommittedMessageId(f.inbox.root, "reused-name-id")).toBe(true);
   });
+
+  test("failed: an occupied tombstone refuses the reuse by name; marker and tombstone stay byte-identical, nothing is presented", async () => {
+    const f = committed(FAILED);
+    fs.rmSync(f.source);
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(f.cur, old, old);
+    expect(mail.archiveOldCur(agent)).toBe(1);
+    const tombstone = f.intent.replace(/\.json$/, `.failed-${f.envelope.messageId}.json`);
+    const retained = JSON.stringify({ messageId: f.envelope.messageId, file: "record.json", phase: "failed", note: "an operator's retained record" });
+    fs.writeFileSync(tombstone, retained);
+    const other = buildSignedEnvelope("kern", agent, "reused", { kern: seed }, { messageId: "reused-name-id" });
+    fs.writeFileSync(f.source, JSON.stringify({
+      id: "reused-record", from: "kern", to: agent, body: JSON.stringify(other), timestamp: other.timestamp,
+    }));
+
+    expect(await mail.checkMessages(agent)).toEqual([]);
+    expect(await mail.checkMessages(agent)).toEqual([]);
+
+    expect(textOf(join(f.inbox.dlq, "record.json.reason")) ?? "").toContain("failed tombstone occupied for record.json");
+    expect(textOf(join(f.inbox.dlq, "record.json.reason")) ?? "").toContain("class: storage-unavailable");
+    expect(fs.existsSync(f.cur)).toBe(false);
+    expect(f.intentNow()).toBe(f.intentBytes);
+    expect(textOf(tombstone)).toBe(retained);
+    expect(hasCommittedMessageId(f.inbox.root, "reused-name-id")).toBe(false);
+  });
 });
