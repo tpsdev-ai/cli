@@ -23,8 +23,9 @@ describe("sandboxHomeBase", () => {
     const dir = mkdtempSync(join(tmpdir(), "lg-link-"));
     try {
       const link = join(dir, "link");
+      const target = realpathSync("/var/tmp");
       try {
-        symlinkSync(realpathSync("/var/tmp"), link);
+        symlinkSync(target, link);
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code ?? "unknown";
         throw new Error(`cannot set up this case: symlinkSync(${link}) refused with ${code}`);
