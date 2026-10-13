@@ -217,6 +217,14 @@ const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
 /**
+ * cli#617 slice (b): the delivery liveness bound. After this many presentations
+ * of one committed message without completion, or this long after the first
+ * presentation, the intent goes terminal `failed`.
+ */
+export const MAX_DELIVERY_PRESENTATIONS = 5;
+export const DELIVERY_PRESENTATION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
  * The replay gate and placement intents for one mailbox. Call while holding
  * that mailbox's lock (acquireMailLock on the same root).
  */
@@ -247,7 +255,29 @@ export interface ReplayStore {
    * on failure, and the caller must then roll the move back.
    */
   recordConsumed(messageId: string): void;
+  /**
+   * cli#617 slice (b): advance a live (`placing` or `in_progress`) intent for
+   * this message to its next presentation. A `placing` intent becomes
+   * `in_progress` at presentation 1; an `in_progress` intent's count increments.
+   * Returns `absent` when no live intent for this message is present (missing,
+   * another message, or a `failed`/`unknown` phase), `presented` with the new
+   * count, or `failed` when the liveness bound (MAX_DELIVERY_PRESENTATIONS or
+   * DELIVERY_PRESENTATION_TTL_MS) is reached — the intent is then terminal
+   * `failed` and the caller must not present. Call under the mailbox lock.
+   */
+  advancePresentation(messageId: string, file: string, nowIso: string): PresentationAdvance;
+  /**
+   * cli#617 slice (b): completion-only finalize. Deletes only an `in_progress`
+   * intent for this message; returns whether an intent was removed.
+   */
+  completePlacement(messageId: string, file: string): boolean;
 }
+
+/** The result of advancing a placement intent to its next presentation (cli#617 slice b). */
+export type PresentationAdvance =
+  | { status: "absent" }
+  | { status: "presented"; presentations: number }
+  | { status: "failed"; presentations: number };
 
 /** The durable ReplayStore for the mailbox rooted at `root` (`<mailDir>/<agent>`). */
 export function mailboxReplayStore(root: string): ReplayStore {
@@ -278,6 +308,8 @@ export function mailboxReplayStore(root: string): ReplayStore {
       syncDirectory(root);
     },
     recordConsumed: (messageId) => recordConsumedMessageId(root, messageId),
+    advancePresentation: (messageId, file, nowIso) => advancePlacementPresentation(root, messageId, file, nowIso),
+    completePlacement: (messageId, file) => completeInProgressPlacement(root, messageId, file),
   };
 }
 
@@ -552,6 +584,83 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
   } finally {
     rmSync(tmp, { force: true });
   }
+}
+
+/**
+ * cli#617 slice (b): rewrite the live intent for `file` in place, keeping its
+ * messageId and recorded identity. Refuses (returns false) unless a `placing`
+ * or `in_progress` intent for this message is present; a `failed` or `unknown`
+ * intent, or another message's intent, is never replaced. The write is the
+ * temp-file, fsync, rename, directory-fsync sequence used everywhere else. A
+ * `.phase.tmp` suffix marks the phase transition for the crash-boundary
+ * fixture (mail-kill-child).
+ */
+function writePlacementPhase(root: string, messageId: string, file: string, fields: Record<string, unknown>): boolean {
+  const path = placementIntentPath(root, file);
+  const existing = readPlacementIntent(root, file);
+  if (!existing || existing.messageId !== messageId) return false;
+  if (existing.phase !== "placing" && existing.phase !== "in_progress") return false;
+  const next: Record<string, unknown> = {
+    messageId,
+    file,
+    ...(existing.identity ? { identity: existing.identity } : {}),
+    ...fields,
+  };
+  const tmp = `${path}.${randomUUID()}.phase.tmp`;
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify(next));
+      fsyncSync(fd);
+    } finally { closeSync(fd); }
+    renameSync(tmp, path);
+    syncDirectory(root);
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+  return true;
+}
+
+/**
+ * cli#617 slice (b): advance a live intent to its next presentation, or to the
+ * terminal `failed` phase when the liveness bound is reached. A `placing`
+ * intent becomes `in_progress` at presentation 1 (the first hand-over, counted
+ * before it); an `in_progress` intent's count increments. `failed` and
+ * `unknown` are not live, so they advance to `absent`.
+ */
+function advancePlacementPresentation(root: string, messageId: string, file: string, nowIso: string): PresentationAdvance {
+  const intent = readPlacementIntent(root, file);
+  if (!intent || intent.messageId !== messageId) return { status: "absent" };
+  if (intent.phase === "placing") {
+    const written = writePlacementPhase(root, messageId, file, {
+      version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: 1, firstPresentedAt: nowIso,
+    });
+    return written ? { status: "presented", presentations: 1 } : { status: "absent" };
+  }
+  if (intent.phase !== "in_progress") return { status: "absent" };
+  const previous = intent.presentations ?? 0;
+  const firstPresentedAt = intent.firstPresentedAt ?? nowIso;
+  const next = previous + 1;
+  const tooOld = Date.parse(nowIso) - Date.parse(firstPresentedAt) > DELIVERY_PRESENTATION_TTL_MS;
+  if (next > MAX_DELIVERY_PRESENTATIONS || tooOld) {
+    writePlacementPhase(root, messageId, file, {
+      version: PLACEMENT_INTENT_VERSION, phase: "failed", presentations: previous, firstPresentedAt,
+    });
+    return { status: "failed", presentations: previous };
+  }
+  writePlacementPhase(root, messageId, file, {
+    version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: next, firstPresentedAt,
+  });
+  return { status: "presented", presentations: next };
+}
+
+/** cli#617 slice (b): completion-only finalize — delete only an `in_progress` intent for this message. */
+function completeInProgressPlacement(root: string, messageId: string, file: string): boolean {
+  const intent = readPlacementIntent(root, file);
+  if (!intent || intent.messageId !== messageId || intent.phase !== "in_progress") return false;
+  unlinkSync(placementIntentPath(root, file));
+  syncDirectory(root);
+  return true;
 }
 
 function pendingPlacementIds(root: string, quarantine = false): { ids: Set<string>; blocked: Set<string>; retainAll: boolean } {

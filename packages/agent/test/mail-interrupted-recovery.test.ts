@@ -1,4 +1,11 @@
-/** Real filesystem crash-boundary and unresolved-intent regressions (cli#600). */
+/**
+ * Real filesystem crash-boundary and unresolved-intent regressions (cli#600).
+ *
+ * cli#617 slice (b): the recovery these tests exercise is the per-message
+ * delivery API's completion-gated path. A message delivered by deliverNext()
+ * stays re-presentable until completeDelivery() finalizes it, so the old
+ * at-most-once assertions become "until completed".
+ */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -76,15 +83,17 @@ interface KillRun {
   stderr: string;
 }
 
-/** Run checkNewMail() in a child and SIGKILL it at `killAt`; resolve on exit. */
-function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promise<KillRun> {
+/** Run deliverNext() in a child and SIGKILL it at `killAt`; resolve on exit. */
+function runAndKillAt(killAt: string, source: string, after = false, timeoutMs = 20_000): Promise<KillRun> {
   const marker = join(mailDir, `paused.${killAt}`);
   const child = spawn(process.execPath, [CHILD, mailDir, AGENT], {
     env: {
       HOME: mailDir,
       PATH: process.env.PATH,
       TPS_MAIL_MODULE: MODULE,
+      TPS_DRIVE: "deliverNext",
       TPS_KILL_AT: killAt,
+      ...(after ? { TPS_KILL_AFTER: "1" } : {}),
       TPS_KILL_MARKER: marker,
       TPS_MAIL_ROOT: mailboxRoot,
       TPS_SRC: source,
@@ -130,14 +139,19 @@ function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promi
   });
 }
 
-/** Check consecutive calls from a fresh client and placement cleanup. */
-async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
+/**
+ * The cli#617 slice (b) contract: a delivered message is re-presented on the
+ * next call until it is completed, then never again; placement cleanup is done.
+ */
+async function assertDeliveredUntilCompleted(messageId: string): Promise<void> {
   const client = new MailClient(mailDir, undefined, AGENT, verifier());
-  const first = await client.checkNewMail();
-  const second = await client.checkNewMail();
+  const first = await client.deliverNext();
+  const second = await client.deliverNext();
 
-  expect(first.map((m) => m.verifiedEnvelope?.messageId)).toEqual([messageId]);
-  expect(second).toEqual([]);
+  expect(first?.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(second?.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(await client.completeDelivery(second!)).toBe(true);
+  expect(await client.deliverNext()).toBeNull();
   expect(existsSync(newPath())).toBe(false);
   expect(jsonFiles(join(mailboxRoot, "cur"))).toEqual(["m1.json"]);
   expect(jsonFiles(join(mailboxRoot, "dlq"))).toEqual([]);
@@ -147,17 +161,23 @@ async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
   ).toBe(false);
 }
 
-const CASES = ["intent-write", "link-to-cur", "source-removal", "ledger-commit", "intent-finish"];
+const CASES: Array<{ at: string; after?: boolean }> = [
+  { at: "intent-write" },
+  { at: "link-to-cur" },
+  { at: "source-removal" },
+  { at: "ledger-commit" },
+  { at: "phase-write", after: true },
+];
 
 describe("MailClient recovery at the tested placement boundaries (cli#600)", () => {
-  for (const at of CASES) {
-    test(`a later check returns the message once after a kill before ${at}`, async () => {
+  for (const { at, after } of CASES) {
+    test(`a later call re-presents the message until completed after a kill at ${at}`, async () => {
       const messageId = `kill-${at}`;
       const source = plant(messageId);
-      const run = await runAndKillAt(at, source);
+      const run = await runAndKillAt(at, source, after);
       expect(run.reached, `child never reached ${at}; stderr=${run.stderr}`).toBe(true);
       expect(run.signal).toBe("SIGKILL");
-      await assertDeliveredExactlyOnce(messageId);
+      await assertDeliveredUntilCompleted(messageId);
     });
   }
 });
@@ -175,8 +195,8 @@ describe("MailClient defers unresolved placements", () => {
     const intentPath = join(mailboxRoot, readdirSync(mailboxRoot).find((n) => n.startsWith(".placement-") && n.endsWith(".json"))!);
     const intent = readFileSync(intentPath);
 
-    expect(await client.checkNewMail()).toEqual([]);
-    expect(await client.checkNewMail()).toEqual([]);
+    expect(await client.deliverNext()).toBeNull();
+    expect(await client.deliverNext()).toBeNull();
     expect(readFileSync(intentPath).equals(intent)).toBe(true);
     expect(existsSync(source)).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
@@ -209,10 +229,10 @@ describe("MailClient defers unresolved placements", () => {
       },
     });
 
-    expect(await client.checkNewMail()).toEqual([]);
+    expect(await client.deliverNext()).toBeNull();
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
-    await assertDeliveredExactlyOnce(messageId);
+    await assertDeliveredUntilCompleted(messageId);
   });
 
   test("an older intent without identity with only a cur copy is withheld", async () => {
@@ -221,7 +241,7 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json");
     renameSync(source, curPath());
-    expect(await client.checkNewMail()).toEqual([]);
+    expect(await client.deliverNext()).toBeNull();
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
   });
@@ -246,11 +266,11 @@ describe("MailClient defers unresolved placements", () => {
     const lock = await acquireMailLock(mailboxRoot);
     expect(lock).not.toBeNull();
     try {
-      expect(await client.checkNewMail()).toEqual([]);
+      expect(await client.deliverNext()).toBeNull();
       expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     } finally {
       lock?.release();
     }
-    await assertDeliveredExactlyOnce(messageId);
+    await assertDeliveredUntilCompleted(messageId);
   });
 });

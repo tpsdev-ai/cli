@@ -1481,6 +1481,23 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
   // includes the recipient binding, so a record carrying another mailbox's
   // genuine envelope cannot be presented here. (The first-delivery-only replay
   // gate is unnecessary: this id is already consumed.)
+  // cli#617 slice (b): a record whose placement intent declares a phase other
+  // than `placing` — `in_progress` (a delivery in flight), `failed` (terminal)
+  // or `unknown` — is withheld. This presenter does not present what another
+  // consumer has declared in flight, and the same bar now covers every direct
+  // recoverPromoted caller (the bridge and plugin startup sweeps, verifyMailAction
+  // and the plugin's internalInbound). A malformed intent withholds too, rather
+  // than presenting (a failed read never reads as absent).
+  let placementPhase: PlacementPhase | null;
+  try {
+    placementPhase = mailboxReplayStore(dirs.root).placementPhase(filename);
+  } catch (err) {
+    return { ok: false, class: "busy", reason: `placement history unavailable for ${filename}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (placementPhase !== null && placementPhase !== "placing") {
+    return { ok: false, class: "busy", reason: `placement intent for ${filename} is ${placementPhase}; not presented` };
+  }
+
   const decision = await checkPromotedRecord(agent, msg, mailRoot, verify, dirs.root);
   if (!decision.ok) {
     const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
@@ -1516,10 +1533,11 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
  * phase that resolves to `in_progress` (another consumer's delivery in
  * flight), `failed` (terminal), or `unknown` (an unsupported value in a
  * recognized field) makes the sweep skip the record entirely, so this sweep
- * does not present what another consumer has declared in flight. Four direct recoverPromoted callers do not
- * read phases yet (slice b): the bridge and OpenClaw plugin startup sweeps,
- * verifyMailAction, and the plugin's internalInbound. Throws on a malformed
- * intent; the caller skips.
+ * does not present what another consumer has declared in flight. Slice (b)
+ * applies the same check inside recoverPromoted, so the four direct callers
+ * (the bridge and plugin startup sweeps, verifyMailAction, and the plugin's
+ * internalInbound) withhold it too. Throws on a malformed intent; the caller
+ * skips.
  */
 function withheldByPlacementPhase(replay: ReplayStore, file: string): boolean {
   const phase = replay.placementPhase(file);

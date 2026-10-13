@@ -79,8 +79,12 @@ function sameFileByDeviceInode(a: string, b: string): boolean {
  * `unknown`: an unsupported value in a recognized field) is never presented or
  * finished. A phase seen in the listing skips the record before its payload
  * is read, and the under-lock recheck catches a phase that changed after the
- * payload was read and verified. Slice (b) defines the re-presentation of
- * `in_progress`.
+ * payload was read and verified.
+ *
+ * This is the BATCH reader (`checkNewMail`), which stays at-most-once until
+ * slice (c) wires the per-message delivery API. Slice (b)'s `deliverNext`
+ * re-presents an `in_progress` intent through its own completion-gated path
+ * (`recoverDelivery`), not this one.
  */
 function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";
@@ -242,12 +246,221 @@ export class MailClient {
     return messages;
   }
 
+  /**
+   * cli#617 slice (b): the per-message delivery API, inert until slice (c)
+   * wires the event loop. It returns at most ONE message:
+   *
+   *  1. a committed message whose placement intent is live — a `placing`
+   *     intent finished to `in_progress`, or an `in_progress` re-presentation.
+   *     Recovery is completion-gated, and the liveness bound turns a message
+   *     that is never completed into a terminal `failed` intent;
+   *  2. otherwise the next verified `new/` message, committed to `cur/` with
+   *     its intent left in the `in_progress` phase. Later messages stay in
+   *     `new/`.
+   *
+   * The caller finalizes with completeDelivery() after the handler
+   * completes; a crash or stop before that re-presents the same message on the
+   * next call. The delivery key is mailbox + messageId.
+   */
+  async deliverNext(): Promise<MailMessage | null> {
+    const recovered = await this.recoverDelivery();
+    if (recovered) return recovered;
+    return this.commitNextForDelivery();
+  }
+
+  /**
+   * cli#617 slice (b): the completion-only finalize for a message handed over
+   * by deliverNext(). Deletes the message's `in_progress` intent in its own
+   * synchronous mailbox-lock section; returns whether an intent was removed.
+   * Idempotent: a message already finalized leaves nothing to delete.
+   */
+  async completeDelivery(message: MailMessage): Promise<boolean> {
+    const messageId = message.verifiedEnvelope?.messageId;
+    if (typeof messageId !== "string" || messageId === "") {
+      throw new Error("completeDelivery requires a delivered message carrying its verified envelope");
+    }
+    const lock = await acquireMailLock(this.mailboxRoot);
+    if (!lock) throw new Error("mailbox lock busy; delivery not finalized");
+    try {
+      return mailboxReplayStore(this.mailboxRoot).completePlacement(messageId, message.filename);
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * cli#617 slice (b): completion-gated recovery for deliverNext(). A `placing`
+   * intent is finished and moved to `in_progress`; an `in_progress` intent is
+   * re-presented; `unknown` is skipped (never presented or finished). Returns
+   * the first message presented, or null.
+   */
+  private async recoverDelivery(): Promise<MailMessage | null> {
+    let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
+    let listing: MailLock | null = null;
+    try {
+      listing = await acquireMailLock(this.mailboxRoot);
+      if (!listing) return null;
+      pending = pendingPlacementEntries(this.mailboxRoot);
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return null;
+    } finally {
+      listing?.release();
+    }
+    for (const { messageId, file, phase } of pending) {
+      if (phase === "unknown") continue;
+      try {
+        const presented = await this.presentPendingDelivery(messageId, file);
+        if (presented) return presented;
+      } catch (err) {
+        this.emitRecoveryError(err);
+      }
+    }
+    return null;
+  }
+
+  /** Re-verify a pending cur/ copy and present it under the lock, honoring the liveness bound. */
+  private async presentPendingDelivery(messageId: string, file: string): Promise<MailMessage | null> {
+    const curPath = join(this.inboxCur, file);
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(curPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      // Same unlinked-placement cleanup as slice (a): finish only a `placing`
+      // intent whose cur/ copy is absent.
+      await this.finishUnlinkedPlacement(messageId, file);
+      return null;
+    }
+    const outcome = await this.verifyMailBody(bytes.toString("utf8"));
+    if (!outcome.pass || outcome.envelope.messageId !== messageId) return null;
+    const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
+    return this.presentUnderLock(messageId, file, bytes, outcome.envelope, trustTier);
+  }
+
+  /**
+   * Re-read the intent, identity and raw bytes under the lock (the phase may
+   * have changed since the listing), advance the presentation and return the
+   * message. A bound hit writes the terminal `failed` phase and the named log
+   * line, and presents nothing.
+   */
+  private async presentUnderLock(
+    messageId: string,
+    file: string,
+    bytes: Buffer,
+    envelope: Envelope,
+    trustTier: MailMessage["trustTier"],
+  ): Promise<MailMessage | null> {
+    const lock = await acquireMailLock(this.mailboxRoot);
+    if (!lock) throw new Error("mailbox lock busy; delivery recovery deferred");
+    try {
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      if (!replay.hasPendingPlacement(messageId, file)) return null;
+      const phase = replay.placementPhase(file);
+      if (phase === null || phase === "unknown") return null;
+      if (envelope.messageId !== messageId) return null;
+      if (!replay.ownsPendingPlacement(messageId, file)) return null;
+      let current: Buffer;
+      try {
+        current = readFileSync(join(this.inboxCur, file));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw err;
+      }
+      if (!current.equals(bytes)) return null;
+      if (!replay.isConsumed(messageId, file)) replay.recordConsumed(messageId);
+      const advance = replay.advancePresentation(messageId, file, new Date().toISOString());
+      if (advance.status === "absent") return null;
+      if (advance.status === "failed") {
+        console.warn(
+          `[MailClient] placement quarantined for mailbox ${this.agentId}: message ${messageId} not completed ` +
+            `after ${advance.presentations} presentation(s); payload retained for the operator`,
+        );
+        return null;
+      }
+      return {
+        filename: file,
+        body: bytes.toString("utf8"),
+        receivedAt: new Date(),
+        headers: {},
+        from: envelope.from,
+        verifiedEnvelope: envelope,
+        trustTier,
+      };
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Commit the next verifiable new/ message to cur/ with a live `in_progress` intent, or null. */
+  private async commitNextForDelivery(): Promise<MailMessage | null> {
+    if (!existsSync(this.inboxNew)) return null;
+    const files = readdirSync(this.inboxNew)
+      .filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"))
+      .sort();
+    for (const file of files) {
+      const started = Date.now();
+      const srcPath = join(this.inboxNew, file);
+      let body: string;
+      try {
+        body = readFileSync(srcPath, "utf-8");
+      } catch (err) {
+        this.emitRecoveryError(err);
+        continue;
+      }
+      let verifyResult: VerifyOutcome;
+      try {
+        verifyResult = await this.verifyMailBody(body);
+      } catch (err) {
+        this.emitRecoveryError(err); // leave in new/ for a later call
+        continue;
+      }
+      if (!verifyResult.pass) {
+        this.deadLetter(file, srcPath, verifyResult, started);
+        continue;
+      }
+      let trustTier: MailMessage["trustTier"];
+      try {
+        trustTier = verifiedMailTier(verifyResult.envelope, this.mailDir);
+      } catch (err) {
+        this.emitRecoveryError(err);
+        continue;
+      }
+      try {
+        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope, true);
+        if (committed === "already-delivered") continue;
+        if (committed) {
+          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
+          continue;
+        }
+        const from = verifyResult.envelope.from;
+        this.events?.emit({
+          type: "mail.receive", agent: this.agentId, status: "ok", from, durationMs: Date.now() - started,
+        });
+        return {
+          filename: file, body, receivedAt: new Date(), headers: {}, from,
+          verifiedEnvelope: verifyResult.envelope, trustTier,
+        };
+      } catch (err) {
+        this.emitRecoveryError(err);
+      }
+    }
+    return null;
+  }
+
+  private emitRecoveryError(err: unknown): void {
+    this.events?.emit({
+      type: "mail.receive", agent: this.agentId, status: "error", from: "unknown", durationMs: 0, error: sanitizeError(err),
+    });
+  }
+
   /** Commit under the mailbox lock; attempt placement rollback on append failure. */
   private async commitToCur(
     file: string,
     srcPath: string,
     body: string,
     envelope: Envelope,
+    keepInProgress = false,
   ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
     const lock: MailLock | null = await acquireMailLock(this.mailboxLockRoot);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
@@ -294,7 +507,15 @@ export class MailClient {
         }
         throw err;
       }
-      replay.finishPlacement(envelope.messageId, file);
+      if (keepInProgress) {
+        // cli#617 slice (b): the delivery API leaves the intent live, in the
+        // `in_progress` phase (presentation 1), for the caller to finalize on
+        // completion. The batch checkNewMail() path finalizes as before.
+        const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString());
+        if (advance.status !== "presented") throw new Error(`placement not advanced after commit: ${advance.status}`);
+      } else {
+        replay.finishPlacement(envelope.messageId, file);
+      }
       return null;
     } finally {
       relayLock.release();

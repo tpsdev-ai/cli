@@ -54,8 +54,9 @@ export {
   decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
   pendingPlacementEntries,
   placeCurRecord,
+  MAX_DELIVERY_PRESENTATIONS, DELIVERY_PRESENTATION_TTL_MS,
 } from "./lib/mailbox-policy.js";
-export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery } from "./lib/mailbox-policy.js";
+export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery, PresentationAdvance } from "./lib/mailbox-policy.js";
 export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
 export type { MailLock } from "./lib/mail-lock.js";
 export {
