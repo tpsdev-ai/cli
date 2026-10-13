@@ -222,10 +222,19 @@ const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
  */
 export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
+  /** Write a `placing` intent. Refuses to replace an intent in any other phase. */
   beginPlacement(messageId: string, file: string, sourcePath?: string): void;
   ownsPendingPlacement(messageId: string, file: string): boolean;
+  /** A live (not `failed`) intent for this messageId names `file`. */
   hasPendingPlacement(messageId: string, file: string): boolean;
+  /** The per-file gate: a quarantined or live (not `failed`) intent names `file`. */
   hasPendingFile(file: string): boolean;
+  /**
+   * The phase of `file`'s placement intent, or null when it has none (cli#617).
+   * Throws MalformedPlacementIntentError on a quarantined or malformed intent.
+   */
+  placementPhase(file: string): PlacementPhase | null;
+  /** Delete a `placing` intent for this messageId. An intent in any other phase is kept. */
   finishPlacement(messageId: string, file: string): void;
   /**
    * Record a consumed messageId. Call ONLY after the record is in cur/; THROWS
@@ -250,10 +259,15 @@ export function mailboxReplayStore(root: string): ReplayStore {
         throw err;
       }
     },
-    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || readPlacementIntent(root, file) !== null,
-    hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
+    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || isLivePlacement(readPlacementIntent(root, file)),
+    hasPendingPlacement: (messageId, file) => {
+      const intent = readPlacementIntent(root, file);
+      return intent?.messageId === messageId && isLivePlacement(intent);
+    },
+    placementPhase: (file) => readPlacementIntent(root, file)?.phase ?? null,
     finishPlacement: (messageId, file) => {
-      if (readPlacementIntent(root, file)?.messageId !== messageId) return;
+      const intent = readPlacementIntent(root, file);
+      if (intent?.messageId !== messageId || intent.phase !== "placing") return;
       unlinkSync(placementIntentPath(root, file));
       syncDirectory(root);
     },
@@ -262,11 +276,12 @@ export function mailboxReplayStore(root: string): ReplayStore {
 }
 
 /**
- * List well-formed pending intents; quarantine malformed ones and omit them.
+ * List well-formed pending intents with their phase; quarantine malformed ones
+ * and omit them. A terminal `failed` intent is not pending and is omitted.
  * Call under the mailbox lock and re-read each intent before acting on it.
  */
-export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string }> {
-  const entries: Array<{ messageId: string; file: string }> = [];
+export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string; phase: PlacementPhase }> {
+  const entries: Array<{ messageId: string; file: string; phase: PlacementPhase }> = [];
   let names: string[];
   try {
     names = readdirSync(root);
@@ -289,7 +304,8 @@ export function pendingPlacementEntries(root: string): Array<{ messageId: string
       quarantinePlacement(path);
       continue;
     }
-    entries.push({ messageId: intent.messageId, file: intent.file });
+    if (!isLivePlacement(intent)) continue;
+    entries.push({ messageId: intent.messageId, file: intent.file, phase: intent.phase });
   }
   return entries;
 }
@@ -312,20 +328,81 @@ function quarantinePlacement(path: string): void {
   console.warn(`${err.name}: ${err.message}`);
 }
 
+/**
+ * The phase of a placement intent (cli#617 design rev 2).
+ *
+ * - `placing`: a commit in flight. An intent without a `phase` is `placing`, so
+ *   every intent written before phases existed reads exactly as before.
+ * - `in_progress`: committed, and its handler has not completed.
+ * - `failed`: terminal (the liveness bound was reached). It is not pending: it
+ *   never closes the per-file gate and is never listed for recovery. The intent
+ *   file is kept until an operator removes it.
+ * - `unknown`: a phase, schema version or phase field this reader does not
+ *   understand. It is preserved: never finished, replaced, presented or
+ *   quarantined, and it keeps its file's gate closed.
+ *
+ * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
+ */
+export type PlacementPhase = "placing" | "in_progress" | "failed" | "unknown";
+
+/** The placement intent schema version this reader understands; an intent without one is this version. */
+const PLACEMENT_INTENT_VERSION = 1;
+
 interface PlacementIntent {
   messageId: string;
   file: string;
   identity?: { dev: string; ino: string };
+  phase: PlacementPhase;
+  /** Hand-overs so far (rev 2 liveness bound); read, not yet written. */
+  presentations?: number;
+  /** When the first hand-over happened (rev 2 liveness bound); read, not yet written. */
+  firstPresentedAt?: string;
 }
 
+/** A plain basename: non-empty, not `.` or `..`, with no path separator or NUL. */
+function isPlainBasename(file: string): boolean {
+  return file !== "" && file !== "." && file !== ".." && !/[/\\\0]/.test(file);
+}
+
+/** Read the phase from a parsed intent. Anything not understood is `unknown`, never malformed. */
+function phaseOf(intent: Record<string, unknown>): PlacementPhase {
+  if (intent.version !== undefined && intent.version !== PLACEMENT_INTENT_VERSION) return "unknown";
+  const presentations = intent.presentations;
+  if (presentations !== undefined && !(Number.isSafeInteger(presentations) && (presentations as number) >= 0)) return "unknown";
+  const firstPresentedAt = intent.firstPresentedAt;
+  if (firstPresentedAt !== undefined && (typeof firstPresentedAt !== "string" || Number.isNaN(Date.parse(firstPresentedAt)))) {
+    return "unknown";
+  }
+  const phase = intent.phase;
+  if (phase === undefined || phase === "placing") return "placing";
+  if (phase === "in_progress" || phase === "failed") return phase;
+  return "unknown";
+}
+
+/** A pending intent: any phase but the terminal `failed`. */
+function isLivePlacement(intent: PlacementIntent | null): boolean {
+  return intent !== null && intent.phase !== "failed";
+}
+
+/**
+ * Parse an intent, or null when it is malformed: the name, messageId and
+ * identity must hold. The phase never makes an intent malformed (see phaseOf).
+ */
 function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
     const intent = JSON.parse(raw);
-    if (typeof intent?.file === "string" && placementIntentPath(join(path, ".."), intent.file) === path
+    if (typeof intent?.file === "string" && isPlainBasename(intent.file)
+      && placementIntentPath(join(path, ".."), intent.file) === path
       && isValidEnvelopeId(intent?.messageId)
       && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
         && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
-        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) return intent;
+        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) {
+      const phase = phaseOf(intent);
+      return {
+        messageId: intent.messageId, file: intent.file, identity: intent.identity, phase,
+        ...(phase === "unknown" ? {} : { presentations: intent.presentations, firstPresentedAt: intent.firstPresentedAt }),
+      };
+    }
   } catch {}
   return null;
 }
@@ -353,9 +430,12 @@ function syncDirectory(root: string): void {
 
 function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
+  if (!isPlainBasename(file)) throw new Error("placement file is not a plain basename");
   const path = placementIntentPath(root, file);
   const existing = readPlacementIntent(root, file);
   if (existing && existing.messageId !== messageId) throw new Error(`placement intent for ${file} names another message`);
+  // cli#617: only a `placing` intent is rewritten; any other phase is kept.
+  if (existing && existing.phase !== "placing") throw new Error(`placement intent for ${file} is ${existing.phase}; not replaced`);
   let identity: PlacementIntent["identity"];
   if (sourcePath !== undefined) {
     const stat = lstatSync(sourcePath, { bigint: true });
