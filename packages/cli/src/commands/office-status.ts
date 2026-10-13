@@ -2,8 +2,8 @@
  * office-status.ts — `tps office status`
  *
  * Full office state at a glance:
- *   - All agents: role, model, status, last heartbeat
- *   - Current task (from recent OrgEvents)
+ *   - All agents: role, model, status, and when Flair Presence last saw them
+ *   - Current activity (Presence's currentTask, else its activity)
  *   - Open PRs (via gh-as)
  *   - Task loop cursor age per agent
  *   - Git branch + dirty status for known workspaces
