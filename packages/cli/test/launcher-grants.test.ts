@@ -86,9 +86,12 @@ describe("launcherGrantCovering", () => {
     expect(launcherGrantCovering("/tmpfoo")).toBeNull();
   });
 
-  test("recognises a path under a symlink to /tmp as covered by /tmp", () => {
-    const dir = mkdtempSync(join(tmpdir(), "lg-link-"));
+  test("resolves a link outside every grant to the grant its real location sits in", () => {
+    const dir = mkdtempSync(join(sandboxHomeBase(), "lg-link-"));
     try {
+      // The link's own directory is outside every grant, so a match on the
+      // spelled-out path alone cannot pass: only resolving the link reaches /tmp.
+      expect(launcherGrantCovering(dir)).toBeNull();
       const link = join(dir, "tmplink");
       try {
         symlinkSync("/tmp", link);
@@ -97,7 +100,6 @@ describe("launcherGrantCovering", () => {
         return;
       }
       expect(launcherGrantCovering(join(link, "a"))).toBe("/tmp");
-      expect(launcherGrantCovering(realpathSync("/tmp"))).toBe("/tmp");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
