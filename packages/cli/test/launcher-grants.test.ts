@@ -1,26 +1,41 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 /**
- * Whether chmod removing write permission is honoured on this host. Root, and a
- * filesystem that ignores the mode, can still write into a 0o500 directory, so
- * the non-writable-candidate case cannot exercise its premise there; it
- * registers an explicit skip naming why rather than return without its
- * assertion and pass (cli#637).
+ * Whether a write into the directory under test is refused for want of
+ * permission. Only a permission refusal (EACCES/EPERM) on the write attempt
+ * counts as enforcement; any other error is rethrown, so an unrelated failure
+ * cannot read as evidence that the mode is honoured. A successful attempt's own
+ * directory is removed after the decision, not as part of it.
+ */
+function writeRefusedForPermission(create: () => string): boolean {
+  let probe: string;
+  try {
+    probe = create();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EACCES" || code === "EPERM") return true;
+    throw err;
+  }
+  rmSync(probe, { recursive: true, force: true });
+  return false;
+}
+
+/**
+ * Whether chmod removing write permission is honoured under the same base a
+ * sandbox HOME uses (sandboxHomeBase()). Root, and a filesystem that ignores
+ * the mode, can still write into a 0o500 directory, so the
+ * non-writable-candidate case cannot exercise its premise there; it registers
+ * an explicit skip rather than return without its assertion and pass (cli#637).
  */
 function modeRestrictionEnforced(): boolean {
-  const dir = mkdtempSync(join(tmpdir(), "lg-mode-"));
+  const dir = mkdtempSync(join(sandboxHomeBase(), "lg-mode-"));
   try {
     chmodSync(dir, 0o500);
-    try {
-      rmSync(mkdtempSync(join(dir, "lg-probe-")), { recursive: true });
-      return false;
-    } catch {
-      return true;
-    }
+    return writeRefusedForPermission(() => mkdtempSync(join(dir, "lg-probe-")));
   } finally {
     chmodSync(dir, 0o700);
     rmSync(dir, { recursive: true, force: true });
@@ -62,7 +77,9 @@ describe("sandboxHomeBase", () => {
   });
 
   // Where chmod does not take effect (root, or a filesystem that ignores the
-  // mode) the premise does not hold, so the case skips explicitly (cli#637).
+  // mode) the premise does not hold, so the case skips explicitly. The probe
+  // above creates its directory under the same base this case uses, so it sees
+  // the same mode enforcement (cli#637).
   test.skipIf(!modeRestrictionEnforcedHere)("skips a non-writable directory candidate and returns the next writable uncovered one", () => {
     const parent = mkdtempSync(join(sandboxHomeBase(), "lg-skip-"));
     const dir = join(parent, "ro");
@@ -119,6 +136,34 @@ describe("launcherGrantCovering", () => {
         throw new Error(`cannot set up this case: symlinkSync(${link}) refused with ${code}`);
       }
       expect(launcherGrantCovering(join(link, "a"))).toBe("/tmp");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("writeRefusedForPermission", () => {
+  test("reports enforcement when the write attempt is refused for want of permission", () => {
+    expect(
+      writeRefusedForPermission(() => {
+        throw Object.assign(new Error("denied"), { code: "EACCES" });
+      }),
+    ).toBe(true);
+  });
+
+  test("rethrows any other error instead of reporting it as enforcement", () => {
+    expect(() =>
+      writeRefusedForPermission(() => {
+        throw Object.assign(new Error("injected write fault"), { code: "EIO" });
+      }),
+    ).toThrow(/injected write fault/);
+  });
+
+  test("reports no enforcement and removes the created directory when the write succeeds", () => {
+    const dir = mkdtempSync(join(sandboxHomeBase(), "lg-ok-"));
+    try {
+      expect(writeRefusedForPermission(() => mkdtempSync(join(dir, "lg-probe-")))).toBe(false);
+      expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
