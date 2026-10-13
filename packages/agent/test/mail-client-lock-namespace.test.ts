@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MailClient } from "../src/io/mail.js";
@@ -149,6 +149,7 @@ test("the stripe and mailbox lock root strings are equal for the store, whatever
 test("a mail root that does not exist yet is created, then resolved", () => {
   const pending = join(alias, "pending", "store");
   expect(existsSync(pending)).toBe(false);
-  expect(canonicalMailRoot(pending)).toBe(join(store, "pending", "store"));
+  // The temp directory may itself sit behind a symlink (macOS /var -> /private/var).
+  expect(canonicalMailRoot(pending)).toBe(join(realpathSync(store), "pending", "store"));
   expect(existsSync(pending)).toBe(true);
 });

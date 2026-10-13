@@ -1,6 +1,7 @@
 /**
  * signed-relay-record.ts — a relayed mail record carrying a validly signed
- * envelope, and the Flair stub that verifies it, for MailClient promotion tests.
+ * envelope, and a Flair stub that resolves the sender's public key, which
+ * MailClient uses to verify it, for MailClient promotion tests.
  */
 import * as ed from "@noble/ed25519";
 import { signEnvelope } from "../../src/lib/signEnvelope.js";
