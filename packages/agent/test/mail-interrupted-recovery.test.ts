@@ -10,6 +10,7 @@ import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
 import { hasCommittedMessageId, mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 import { acquireMailLock } from "../src/lib/mail-lock.js";
+import { mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
 import { signEnvelope, type FlairClient } from "../src/lib/signEnvelope.js";
 
 const AGENT = "agent-a";
@@ -232,8 +233,8 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     copyFileSync(source, curPath());
-    await (client as unknown as { finishUnlinkedPlacement(id: string, file: string): Promise<void> })
-      .finishUnlinkedPlacement(messageId, "m1.json");
+    await (client as unknown as { finishUnlinkedPlacement(id: string, file: string, root: string): Promise<void> })
+      .finishUnlinkedPlacement(messageId, "m1.json", mailboxLockRoot(mailDir, AGENT));
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
   });
 

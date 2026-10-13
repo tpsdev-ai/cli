@@ -1,0 +1,1 @@
+- **MailClient derives its promotion lock, mailbox paths and replay state from one root resolved per operation.** A mail root re-pointed or moved while a client is alive now moves all three together: the promotion lock is taken under the root in force, not one resolved at construction.
