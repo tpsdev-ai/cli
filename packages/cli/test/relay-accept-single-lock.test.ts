@@ -380,14 +380,14 @@ describe("relay acceptance (cli#561)", () => {
   test("an unrelated mailbox holder does not delay acceptance until the lock timeout", async () => {
     const holder = await holdLock(join(mail, "other"));
     try {
-      // The timeout is generous so a slow CI runner cannot fail an acceptance that is
-      // merely slow (75 ms flaked under load); "not delayed until the timeout" is
-      // asserted on the elapsed time instead: well under the timeout, never at it.
+      // Give loaded CI runners more headroom. Acceptance must finish in under
+      // 5 s with a 10 s lock budget, so waiting for the held unrelated mailbox
+      // lock would still fail this case.
       process.env.TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS = "10000";
       const body = { id: randomUUID(), from: FROM, to: RECIPIENT, content: "independent", timestamp: TIMESTAMP };
-      const started = Date.now();
+      const started = performance.now();
       expect(deliverRelayedToLocal(BRANCH, body)).toBe(true);
-      expect(Date.now() - started).toBeLessThan(5000);
+      expect(performance.now() - started).toBeLessThan(5000);
       expect(jsonFiles(getInbox(RECIPIENT).fresh)).toHaveLength(1);
       expect(existsSync(relayAcceptanceReceiptPath(BRANCH, body.id))).toBe(true);
     } finally {
