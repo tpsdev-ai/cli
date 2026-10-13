@@ -99,12 +99,14 @@ const optionalString = (v: unknown) => v === undefined || v === null || typeof v
 
 /**
  * Whether `value` is an event whose consumed fields are well-formed: the
- * required `id`, `kind`, `authorId`, `summary` and `createdAt` (a parseable
- * date) and `position` (a string; `parsePage` checks its value); and, when
- * present, `targetIds` (an array of strings), `refId`, `detail`, `scope` and
- * `expiresAt` (strings). These are the fields the dashboard, office status,
- * `tps agent logs`, the task loop and its handlers read. Any other field is
- * passed through unchecked.
+ * required `id` (a non-empty string), `kind`, `authorId` and `summary`
+ * (strings), `createdAt` (a parseable date) and `position` (a string;
+ * `parsePage` checks its value); and the optional `targetIds`, which may be
+ * absent or null and is otherwise an array of strings, and `refId`, `detail`,
+ * `scope` and `expiresAt`, which may be absent or null and are otherwise
+ * strings. These are the fields the dashboard, office status, `tps agent logs`,
+ * the task loop and its handlers read. Any other field is passed through
+ * unchecked.
  */
 function isEvent(value: unknown): value is OrgEventRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;

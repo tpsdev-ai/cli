@@ -15,9 +15,10 @@
  * `{ since }` file resumes just before that timestamp; a file that cannot be
  * read or parsed is logged and treated as no cursor.
  *
- * ADVANCING. Events are handled in feed order, and an event is marked seen only
- * after its handler succeeds. The persisted position advances only over events
- * that are done, and stops:
+ * ADVANCING. Events are handled in feed order. A task passed to the handler is
+ * marked seen only after the handler succeeds; an event that is not a task for
+ * this agent is marked seen without one. The persisted position advances only
+ * over events that are done, and stops:
  *   - at a handler failure: the next poll, in this process or after a restart
  *     that finds the cursor file intact, retries the failed event before any
  *     later one;
@@ -31,17 +32,21 @@
  *
  * The position is saved after a read's handlers run, when it advances. A
  * failed save there is logged and the loop goes on from the position in
- * memory; the saved position stays behind it, so a restart replays events
- * rather than skipping them.
+ * memory, so the saved position stays behind it until a later save succeeds; a
+ * restart before that replays the events in between rather than skipping them.
  *
- * DELIVERY is at least once, not exactly once, under these conditions: once
- * saved, the cursor file is not removed or corrupted; the feed's pages pass
- * validation; the feed only appends (a new event sorts after those already
- * served), with positions within MAX_POSITION_SKEW_MS of the server's time; and
- * an event does not expire before its handler succeeds. Then a task event's
- * handler succeeds before the saved position passes the event. A crash between
- * a handler returning and the save that follows it replays the event. Handlers
- * must be idempotent.
+ * SAFETY. The saved position never passes a task before its handler succeeds,
+ * provided that once saved, the cursor file is not removed or corrupted; the
+ * feed only appends (a new event sorts after those already served), with
+ * positions within MAX_POSITION_SKEW_MS of the server's time; and an event does
+ * not expire before its handler succeeds.
+ *
+ * DELIVERY (liveness) also needs the loop to keep running, and its reads (pages
+ * that pass validation) and the initial save to succeed eventually. Under all
+ * of these, each task after the starting position is handled at least once,
+ * not exactly once: a crash between a handler returning and the save that
+ * follows replays that task, as does a restart after a failed save if it
+ * occurs before a later successful save. Handlers must be idempotent.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
