@@ -2,7 +2,9 @@
  * mail-lock-namespace.ts — the derivation of the relay lock roots that CLI relay
  * acceptance and the agent MailClient coordinate on (cli#616).
  *
- * CLI relay acceptance takes its mail root from the process (`TPS_MAIL_DIR`).
+ * CLI relay acceptance takes its acceptance stripe from the process mail root
+ * (`TPS_MAIL_DIR`); its recipient mailbox locks come from the selected mailbox
+ * and scan roots, which can be branch-office mailboxes outside that root.
  * MailClient took its acceptance stripe from the process environment too, not
  * from its configured `mailDir`, so a MailClient whose environment selected a
  * different root locked a stripe under that root, and acceptance's stripe did
@@ -14,7 +16,9 @@
  * resolved), so callers that reach one mail root by different paths derive equal
  * stripe root STRINGS. Equal strings are not what makes two processes exclude
  * each other: the lock is a directory created inside the locked directory, so a
- * symlinked path and its target already reach one filesystem lock. Mailbox lock
+ * symlinked path and its target already reach one filesystem lock. Within one
+ * process the strings do matter, because the lock's re-entrancy check compares
+ * lock path strings. Mailbox lock
  * roots come from here only for acceptance and MailClient promotion; MailClient
  * placement recovery and the CLI's other mailbox lock sites lock the mailbox
  * root path as given.

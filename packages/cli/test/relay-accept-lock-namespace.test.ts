@@ -1,16 +1,19 @@
 /**
  * relay-accept-lock-namespace.test.ts — cli#616.
  *
- * CLI relay acceptance takes its mail root from TPS_MAIL_DIR; the agent
- * MailClient must take its acceptance stripe from its configured mailDir, not
- * from its process environment. The MailClient runs in a child process from the
+ * CLI relay acceptance takes its acceptance stripe from TPS_MAIL_DIR; its
+ * recipient mailbox locks come from the selected mailbox and scan roots, which
+ * can be branch-office mailboxes outside it. The agent MailClient must take its
+ * acceptance stripe from its configured mailDir, not from its process
+ * environment. The MailClient runs in a child process from the
  * real agent config, with a TPS_MAIL_DIR naming a different root: before cli#616
  * that root selected MailClient's stripe, and acceptance's stripe did not cover
  * MailClient's dead-letter move. Acceptance reaches the store through a symlink.
- * That alone never separated the locks, because a symlink and its target are
- * one directory to the filesystem lock; unresolved, it would only make the lock
- * root strings differ, and the agent package's namespace test checks that they
- * are equal.
+ * That alone never separated the locks between processes, because a symlink
+ * and its target are one directory to the filesystem lock. Unresolved, it would
+ * make the lock root strings differ, which matters within one process, where
+ * the lock's re-entrancy check compares lock path strings; the agent package's
+ * namespace test checks that the strings are equal.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
