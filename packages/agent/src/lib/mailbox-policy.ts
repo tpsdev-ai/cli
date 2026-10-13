@@ -222,10 +222,25 @@ const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
  */
 export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
+  /**
+   * Write a `placing` intent. Refuses to replace an intent in any other phase,
+   * with one exception (cli#617). A `failed` marker for a different message,
+   * whose payload has left cur/, moves to its tombstone when that name is
+   * unoccupied, or is the marker's own inode (treated as an interrupted move).
+   * An occupied tombstone refuses the placement by name.
+   */
   beginPlacement(messageId: string, file: string, sourcePath?: string): void;
   ownsPendingPlacement(messageId: string, file: string): boolean;
+  /** A live (not `failed`) intent for this messageId names `file`. */
   hasPendingPlacement(messageId: string, file: string): boolean;
+  /** The per-file gate: a quarantined or live (not `failed`) intent names `file`. */
   hasPendingFile(file: string): boolean;
+  /**
+   * The phase of `file`'s placement intent, or null when it has none (cli#617).
+   * Throws MalformedPlacementIntentError on a quarantined or malformed intent.
+   */
+  placementPhase(file: string): PlacementPhase | null;
+  /** Delete a `placing` intent for this messageId. An intent in any other phase is kept. */
   finishPlacement(messageId: string, file: string): void;
   /**
    * Record a consumed messageId. Call ONLY after the record is in cur/; THROWS
@@ -250,10 +265,15 @@ export function mailboxReplayStore(root: string): ReplayStore {
         throw err;
       }
     },
-    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || readPlacementIntent(root, file) !== null,
-    hasPendingPlacement: (messageId, file) => readPlacementIntent(root, file)?.messageId === messageId,
+    hasPendingFile: (file) => existsSync(`${placementIntentPath(root, file)}.quarantined`) || isLivePlacement(readPlacementIntent(root, file)),
+    hasPendingPlacement: (messageId, file) => {
+      const intent = readPlacementIntent(root, file);
+      return intent?.messageId === messageId && isLivePlacement(intent);
+    },
+    placementPhase: (file) => readPlacementIntent(root, file)?.phase ?? null,
     finishPlacement: (messageId, file) => {
-      if (readPlacementIntent(root, file)?.messageId !== messageId) return;
+      const intent = readPlacementIntent(root, file);
+      if (intent?.messageId !== messageId || intent.phase !== "placing") return;
       unlinkSync(placementIntentPath(root, file));
       syncDirectory(root);
     },
@@ -262,11 +282,13 @@ export function mailboxReplayStore(root: string): ReplayStore {
 }
 
 /**
- * List well-formed pending intents; quarantine malformed ones and omit them.
+ * List well-formed pending intents with their phase; quarantine malformed ones
+ * and omit them. An intent whose phase resolves to `failed` is not pending and
+ * is omitted.
  * Call under the mailbox lock and re-read each intent before acting on it.
  */
-export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string }> {
-  const entries: Array<{ messageId: string; file: string }> = [];
+export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string; phase: PlacementPhase }> {
+  const entries: Array<{ messageId: string; file: string; phase: PlacementPhase }> = [];
   let names: string[];
   try {
     names = readdirSync(root);
@@ -289,7 +311,8 @@ export function pendingPlacementEntries(root: string): Array<{ messageId: string
       quarantinePlacement(path);
       continue;
     }
-    entries.push({ messageId: intent.messageId, file: intent.file });
+    if (!isLivePlacement(intent)) continue;
+    entries.push({ messageId: intent.messageId, file: intent.file, phase: intent.phase });
   }
   return entries;
 }
@@ -312,20 +335,112 @@ function quarantinePlacement(path: string): void {
   console.warn(`${err.name}: ${err.message}`);
 }
 
+/**
+ * The phase phaseOf RESOLVES for a placement intent (cli#617 design rev 2).
+ * Every rule keys on this resolved result, not on the raw `phase` field.
+ * phaseOf checks `version`, `presentations` and `firstPresentedAt` before
+ * `phase`. An unsupported value in any of them resolves to `unknown` whatever
+ * `phase` says: `version: 2` with no `phase`, and `version: 2` with
+ * `phase: "failed"`, both resolve to `unknown`. The result reflects what the
+ * intent declares; it does not prove the state behind it.
+ *
+ * - `placing`: a commit in flight. An intent resolves to `placing` when it has
+ *   no `phase` (or `phase: "placing"`), a recognized `version` (absent or 1) and
+ *   valid liveness values (absent or well-formed). So an otherwise-valid intent
+ *   written before phases existed, whose `file` is a plain basename, reads as
+ *   before. The one exception: an older intent whose `file` is not a plain
+ *   basename, which the old parser accepted when its hashed name matched, is
+ *   now malformed and quarantined.
+ * - `in_progress`: `phase: "in_progress"` under the same `version` and liveness
+ *   conditions; it declares a committed message whose handler has not completed.
+ * - `failed`: `phase: "failed"` under the same conditions; it declares a
+ *   terminal message (its liveness bound was reached). It is not pending: it
+ *   never closes the per-file (filename) gate and is never listed for
+ *   recovery, while its message ID stays refused by the consumed-ID (replay)
+ *   gate. A different message may need the same basename once the old payload
+ *   has left cur/. If the tombstone name (failedTombstonePath) is unoccupied,
+ *   or is the marker's own inode (treated as an interrupted move), the marker
+ *   moves there and the new placement proceeds. An occupied tombstone refuses
+ *   the placement by name. While the payload is in cur/, the marker stays and
+ *   the new placement is refused. The record is kept until an operator
+ *   removes it.
+ * - `unknown`: an unsupported value in a recognized field (`phase`, `version`,
+ *   `presentations` or `firstPresentedAt`, where `presentations` must be a
+ *   non-negative safe integer); other extra fields are ignored. The store
+ *   never finishes or replaces it; MailClient recovery, the CLI lease sweep and
+ *   CLI promotion never present it; and it is not quarantined solely for that
+ *   value. It keeps its own per-file gate closed.
+ *
+ * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
+ */
+export type PlacementPhase = "placing" | "in_progress" | "failed" | "unknown";
+
+/** The placement intent schema version this reader understands; an intent without one is this version. */
+const PLACEMENT_INTENT_VERSION = 1;
+
 interface PlacementIntent {
   messageId: string;
   file: string;
   identity?: { dev: string; ino: string };
+  phase: PlacementPhase;
+  /** Hand-overs so far (rev 2 liveness bound); read, not yet written. */
+  presentations?: number;
+  /** When the first hand-over happened (rev 2 liveness bound); read, not yet written. */
+  firstPresentedAt?: string;
 }
 
+/** A plain basename: non-empty, not `.` or `..`, with no path separator or NUL. */
+function isPlainBasename(file: string): boolean {
+  return file !== "" && file !== "." && file !== ".." && !/[/\\\0]/.test(file);
+}
+
+/**
+ * Resolve the phase of a parsed intent. `version`, `presentations` and
+ * `firstPresentedAt` are checked first, and an unsupported value in any of them
+ * resolves to `unknown` whatever `phase` says. Then `phase` resolves: absent or
+ * `placing`, `in_progress`, `failed`, and anything else is `unknown`. `unknown`
+ * is not malformed, and other extra fields are ignored. A malformed identity or
+ * basename is still malformed (parsePlacement).
+ */
+function phaseOf(intent: Record<string, unknown>): PlacementPhase {
+  if (intent.version !== undefined && intent.version !== PLACEMENT_INTENT_VERSION) return "unknown";
+  const presentations = intent.presentations;
+  if (presentations !== undefined && !(Number.isSafeInteger(presentations) && (presentations as number) >= 0)) return "unknown";
+  const firstPresentedAt = intent.firstPresentedAt;
+  if (firstPresentedAt !== undefined && (typeof firstPresentedAt !== "string" || Number.isNaN(Date.parse(firstPresentedAt)))) {
+    return "unknown";
+  }
+  const phase = intent.phase;
+  if (phase === undefined || phase === "placing") return "placing";
+  if (phase === "in_progress" || phase === "failed") return phase;
+  return "unknown";
+}
+
+/** A pending intent: any resolved phase but `failed`. */
+function isLivePlacement(intent: PlacementIntent | null): boolean {
+  return intent !== null && intent.phase !== "failed";
+}
+
+/**
+ * Parse an intent, or null when it is malformed: the name, messageId and
+ * identity must hold. An unsupported value in `phase`, `version` or a liveness
+ * field alone never makes an intent malformed (see phaseOf).
+ */
 function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
     const intent = JSON.parse(raw);
-    if (typeof intent?.file === "string" && placementIntentPath(join(path, ".."), intent.file) === path
+    if (typeof intent?.file === "string" && isPlainBasename(intent.file)
+      && placementIntentPath(join(path, ".."), intent.file) === path
       && isValidEnvelopeId(intent?.messageId)
       && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
         && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
-        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) return intent;
+        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) {
+      const phase = phaseOf(intent);
+      return {
+        messageId: intent.messageId, file: intent.file, identity: intent.identity, phase,
+        ...(phase === "unknown" ? {} : { presentations: intent.presentations, firstPresentedAt: intent.firstPresentedAt }),
+      };
+    }
   } catch {}
   return null;
 }
@@ -346,6 +461,55 @@ function readPlacementIntent(root: string, file: string): PlacementIntent | null
   return intent;
 }
 
+/**
+ * Where a retired `failed` marker for `file` is kept (cli#617):
+ * `.placement-<sha256(file)>.failed-<messageId>.json`. A tombstone leaves the
+ * per-file (filename) gate open and is never listed for recovery. It keeps its
+ * message ID retained in the consumed ledger (pendingPlacementIds), so the
+ * consumed-ID (replay) gate still refuses that message. It stays until an
+ * operator removes it.
+ */
+function failedTombstonePath(root: string, file: string, messageId: string): string {
+  return `${placementIntentPath(root, file).slice(0, -".json".length)}.failed-${messageId}.json`;
+}
+
+const FAILED_TOMBSTONE_NAME = /^\.placement-[a-f0-9]{64}\.failed-(.+)\.json$/;
+
+/**
+ * Move a `failed` marker to its tombstone without ever replacing one: the link
+ * fails if the tombstone name is taken. A tombstone that is the marker's own
+ * inode is treated as an interrupted earlier move, which this finishes. Any
+ * other occupant is refused by name, and the marker and the tombstone are both
+ * kept.
+ */
+function retireFailedMarker(root: string, path: string, file: string, messageId: string): void {
+  const tombstone = failedTombstonePath(root, file, messageId);
+  try {
+    linkSync(path, tombstone);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    const marker = lstatSync(path, { bigint: true });
+    const kept = lstatSync(tombstone, { bigint: true });
+    if (marker.dev !== kept.dev || marker.ino !== kept.ino) {
+      const refusal = new Error(`failed tombstone occupied for ${file} (message ${messageId}); marker and tombstone kept`);
+      refusal.name = "FailedTombstoneOccupiedError";
+      throw refusal;
+    }
+  }
+  unlinkSync(path);
+  syncDirectory(root);
+}
+
+function isAbsent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (err) {
+    if (isMissing(err)) return true;
+    throw err;
+  }
+}
+
 function syncDirectory(root: string): void {
   const fd = openSync(root, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -353,9 +517,23 @@ function syncDirectory(root: string): void {
 
 function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
+  if (!isPlainBasename(file)) throw new Error("placement file is not a plain basename");
   const path = placementIntentPath(root, file);
   const existing = readPlacementIntent(root, file);
-  if (existing && existing.messageId !== messageId) throw new Error(`placement intent for ${file} names another message`);
+  if (existing && existing.messageId !== messageId) {
+    // cli#617: once its payload has left cur/, a `failed` marker yields its
+    // basename to a different message. It moves to its tombstone, keeping the
+    // operator's record and the old consumed ID, and this placement proceeds.
+    // The exception is an occupied tombstone, which refuses by name
+    // (retireFailedMarker).
+    if (existing.phase !== "failed" || !isAbsent(join(root, "cur", file))) {
+      throw new Error(`placement intent for ${file} names another message`);
+    }
+    retireFailedMarker(root, path, file, existing.messageId);
+  } else if (existing && existing.phase !== "placing") {
+    // cli#617: only a `placing` intent is rewritten; any other phase is kept.
+    throw new Error(`placement intent for ${file} is ${existing.phase}; not replaced`);
+  }
   let identity: PlacementIntent["identity"];
   if (sourcePath !== undefined) {
     const stat = lstatSync(sourcePath, { bigint: true });
@@ -381,6 +559,12 @@ function pendingPlacementIds(root: string, quarantine = false): { ids: Set<strin
   const blocked = new Set<string>();
   let retainAll = false;
   for (const name of readdirSync(root)) {
+    // A retired `failed` marker keeps its message ID retained, by its name alone.
+    const tombstone = FAILED_TOMBSTONE_NAME.exec(name);
+    if (tombstone) {
+      if (isValidEnvelopeId(tombstone[1])) ids.add(tombstone[1]);
+      continue;
+    }
     if (!/^\.placement-[a-f0-9]{64}\.json(?:\.quarantined)?$/.test(name)) continue;
     const path = join(root, name.replace(/\.quarantined$/, ""));
     const raw = readFileSync(join(root, name), "utf8");

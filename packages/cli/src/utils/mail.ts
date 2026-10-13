@@ -8,7 +8,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import {
   decideEnvelopeForMailbox as decideEnvelope,
   type Envelope, PublicKeyFormatError, verifiedMailTier, bridgePrincipalIds,
-  mailboxReplayStore, hasCommittedMessageId,
+  mailboxReplayStore, hasCommittedMessageId, type PlacementPhase, type ReplayStore,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
   placeCurRecord, relayAcceptanceLockRoot, tryAcquireRelayMoveLock, mailboxLockRoot,
@@ -1168,13 +1168,23 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
     };
 
     let pendingPlacement: boolean;
+    let pendingPhase: PlacementPhase | null = null;
     try {
       pendingPlacement = replay.hasPendingPlacement(envelope.messageId, filename);
+      if (pendingPlacement) pendingPhase = replay.placementPhase(filename);
     } catch (err) {
       const reason = `placement history unavailable: ${err instanceof Error ? err.message : String(err)}`;
       const cls = err instanceof Error && err.name === "MalformedPlacementIntentError" ? "unverified" : "storage-unavailable";
       rejectToDlq(dirs, filename, filePath, cls, reason, true);
       return { ok: false, class: cls, reason };
+    }
+    // cli#617 slice (a): only a `placing` intent is finished or rolled back here.
+    // An intent whose phase resolves to `in_progress` (a delivery another
+    // consumer has declared in flight) or `unknown` (an unsupported value in a
+    // recognized field) is left as it is, with its cur/ copy and this source in
+    // place; a later check retries.
+    if (pendingPlacement && pendingPhase !== "placing") {
+      return { ok: false, class: "busy", reason: `placement intent for ${filename} is ${pendingPhase}; not delivered` };
     }
     if (pendingPlacement) {
       let interrupted: MailMessage | undefined;
@@ -1501,6 +1511,22 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
 }
 
 /**
+ * cli#617 slice (a): the lease sweep presents, checks out and finishes only a
+ * record with no placement intent or one whose phase resolves to `placing`. A
+ * phase that resolves to `in_progress` (another consumer's delivery in
+ * flight), `failed` (terminal), or `unknown` (an unsupported value in a
+ * recognized field) makes the sweep skip the record entirely, so this sweep
+ * does not present what another consumer has declared in flight. Four direct recoverPromoted callers do not
+ * read phases yet (slice b): the bridge and OpenClaw plugin startup sweeps,
+ * verifyMailAction, and the plugin's internalInbound. Throws on a malformed
+ * intent; the caller skips.
+ */
+function withheldByPlacementPhase(replay: ReplayStore, file: string): boolean {
+  const phase = replay.placementPhase(file);
+  return phase !== null && phase !== "placing";
+}
+
+/**
  * Check inbox: promote every new/ message through promote() (the one
  * enforcement point), re-drive quarantined verify-unavailable entries so an
  * outage self-heals, then lease-sweep cur/.
@@ -1557,6 +1583,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
     try {
       msg = readMessageFile(full);
       const replay = mailboxReplayStore(inbox.root);
+      if (withheldByPlacementPhase(replay, f)) continue;
       if (replay.hasPendingFile(f) && (
         !msg.envelopeId || !replay.hasPendingPlacement(msg.envelopeId, f) ||
         !hasCommittedMessageId(inbox.root, msg.envelopeId) ||
@@ -1580,6 +1607,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
         if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
         if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
         const replay = mailboxReplayStore(inbox.root);
+        if (withheldByPlacementPhase(replay, f)) return null;
         if (replay.hasPendingFile(f)) {
           if (!fresh.envelopeId || !replay.hasPendingPlacement(fresh.envelopeId, f) ||
             !hasCommittedMessageId(inbox.root, fresh.envelopeId) ||
