@@ -8,7 +8,7 @@ import { createPrivateKey, sign as ed25519Sign, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readOrgEvents } from "./org-event-read.js";
+import { type OrgEventRecord, readOrgEvents } from "./org-event-read.js";
 
 export interface FlairConfig {
   baseUrl?: string;
@@ -93,6 +93,8 @@ export interface OrgEvent {
   refId?: string;
   createdAt: string;
   expiresAt?: string;
+  /** The event's feed position (`<createdAt>\t<id>`), set on an event read from the catch-up feed. */
+  position?: string;
 }
 
 /**
@@ -387,10 +389,12 @@ export function loadFlairSigningKey(keyPath: string, agentId: string): ReturnTyp
   let raw: string;
   try {
     raw = readFileSync(keyPath, "utf-8").trim();
-  } catch {
+  } catch (err) {
+    // The cause carries the read's code (ENOENT, EACCES), which a bounded reason can name.
     throw new Error(
       `Cannot read Flair private key at ${keyPath}. ` +
         `Run 'tps agent create --id ${agentId}' first.`,
+      { cause: err },
     );
   }
   // Support PEM, raw 32-byte binary seed, and base64 DER/PKCS8
@@ -420,6 +424,20 @@ export function loadFlairSigningKey(keyPath: string, agentId: string): ReturnTyp
     format: "der",
     type: "pkcs8",
   });
+}
+
+/** OrgEvent optional fields Flair may send as null; `toOrgEvent` omits them. */
+const NULLABLE_EVENT_FIELDS = ["scope", "detail", "targetIds", "refId", "expiresAt"] as const;
+
+/**
+ * An OrgEvent from a record `readOrgEvents` validated. The validator checks every
+ * field OrgEvent declares (each optional one is absent, null, or of its declared
+ * type), so dropping the null ones leaves an OrgEvent.
+ */
+function toOrgEvent(record: OrgEventRecord): OrgEvent {
+  const event: Record<string, unknown> = { ...record };
+  for (const field of NULLABLE_EVENT_FIELDS) if (event[field] === null) delete event[field];
+  return event as unknown as OrgEvent;
 }
 
 export class FlairClient {
@@ -911,6 +929,12 @@ export class FlairClient {
     });
   }
 
+  /**
+   * Read `participantId`'s catch-up feed since `since` (after `after`, when
+   * given) through `readOrgEvents`. It never throws for a failed read: a
+   * refused or failed request, a malformed page, a signing failure (an
+   * unreadable key) and an invalid `since` are all `unavailable`.
+   */
   async getEventsSince(participantId: string, since: Date, after?: string): Promise<EventsSinceRead> {
     const read = await readOrgEvents({
       flairUrl: this.baseUrl,
@@ -920,10 +944,7 @@ export class FlairClient {
       sign: (method, path) => this.sign(method, path),
     });
     if (read.status !== "ok") return read;
-    // The helper validated the envelope and every event's core fields; the
-    // events carry the additional fields Flair sends on the wire (id, targetIds,
-    // detail, scope, expiresAt).
-    return { ...read, events: read.events as unknown as OrgEvent[] };
+    return { ...read, events: read.events.map(toOrgEvent) };
   }
 
   // ─── Workspace state (OPS-47 Phase 2) ────────────────────────────────────

@@ -11,26 +11,38 @@
  *
  * `readOrgEvents` sends `since` as a plain ISO timestamp (and the `after`
  * resume cursor when the caller has one), signs each page request with the
- * caller's signer, validates the envelope and every event in it, and follows
- * `nextAfter` while `hasMore`, for at most `maxPages` pages. The result is
- * either
+ * caller's signer, validates the envelope and, in each event, the fields its
+ * readers consume (`isEvent` below names them; other fields are passed through
+ * unchecked), and follows `nextAfter` while `hasMore`, for at most `maxPages`
+ * pages. The result is either
  *
  *   - `ok`, with the events in feed order, the `nextAfter` position to resume
  *     from, and `complete: false` when the page bound stopped the read before
  *     the feed was drained (the newest events are the ones not read), or
  *   - `unavailable`, with a bounded reason: the HTTP status, a fixed note
- *     naming the malformed part of the response, or the code or class of the
- *     error a rejected request raised. The reason never includes the response
- *     body or an error message.
+ *     naming the malformed part of the response, a fixed note for a `since`
+ *     that is not a valid date, or the code or class of the error a rejected
+ *     request or a failed signing raised. The reason never includes the
+ *     response body or an error message.
+ *
+ * `readOrgEvents` does not throw for any of those failures: a signer that
+ * throws (an unreadable key, say) is reported as `unavailable`.
  */
 
-/** An OrgEvent as the dashboard and office status read it. */
+/** An OrgEvent as the readers consume it; `isEvent` validates these fields. */
 export interface OrgEventRecord {
+  id: string;
   kind: string;
   authorId: string;
   summary: string;
   createdAt: string;
+  targetIds?: string[] | null;
   refId?: string | null;
+  detail?: string | null;
+  scope?: string | null;
+  expiresAt?: string | null;
+  /** The event's feed position (`<createdAt>\t<id>`), as Flair sends it. */
+  position?: string;
   [field: string]: unknown;
 }
 
@@ -72,16 +84,36 @@ function errorTag(err: unknown): string {
   return "unknown error";
 }
 
+/** Absent, null, or a string. */
+const optionalString = (v: unknown) => v === undefined || v === null || typeof v === "string";
+
+/**
+ * Whether `value` is an event whose consumed fields are well-formed: the
+ * required `id`, `kind`, `authorId`, `summary` and `createdAt` (a parseable
+ * date); and, when present, `targetIds` (an array of strings), `refId`,
+ * `detail`, `scope`, `expiresAt` and `position` (strings). These are the
+ * fields the dashboard, office status, `tps agent logs`, the task loop and its
+ * handlers read. Any other field is passed through unchecked.
+ */
 function isEvent(value: unknown): value is OrgEventRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const e = value as Record<string, unknown>;
   return (
+    typeof e.id === "string" &&
+    e.id !== "" &&
     typeof e.kind === "string" &&
     typeof e.authorId === "string" &&
     typeof e.summary === "string" &&
     typeof e.createdAt === "string" &&
     !Number.isNaN(Date.parse(e.createdAt)) &&
-    (e.refId === undefined || e.refId === null || typeof e.refId === "string")
+    (e.targetIds === undefined ||
+      e.targetIds === null ||
+      (Array.isArray(e.targetIds) && e.targetIds.every((t) => typeof t === "string"))) &&
+    optionalString(e.refId) &&
+    optionalString(e.detail) &&
+    optionalString(e.scope) &&
+    optionalString(e.expiresAt) &&
+    (e.position === undefined || typeof e.position === "string")
   );
 }
 
@@ -101,6 +133,8 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
   const pageSize = opts.pageSize ?? ORG_EVENT_PAGE_SIZE;
   const maxPages = opts.maxPages ?? ORG_EVENT_MAX_PAGES;
   const base = `/OrgEventCatchup/${encodeURIComponent(opts.viewerId)}`;
+  if (!(opts.since instanceof Date) || Number.isNaN(opts.since.getTime()))
+    return { status: "unavailable", reason: "invalid since (not a valid date)" };
   const since = opts.since.toISOString();
   const events: OrgEventRecord[] = [];
   let after: string | undefined = opts.after;
@@ -108,7 +142,13 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
     const params = new URLSearchParams({ since, limit: String(pageSize) });
     if (after !== undefined) params.set("after", after);
     const path = `${base}?${params.toString()}`;
-    const auth = opts.sign("GET", path);
+    let auth: string | undefined;
+    try {
+      auth = opts.sign("GET", path);
+    } catch (err) {
+      // The signer's message can name a key path; only its code or class is reported.
+      return { status: "unavailable", reason: `request not signed (${errorTag(err)})` };
+    }
     let res: Response;
     try {
       res = await fetch(`${opts.flairUrl}${path}`, auth ? { headers: { Authorization: auth } } : {});

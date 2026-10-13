@@ -7,7 +7,21 @@
  * advances its cursor from the feed's position (Flair's `after` cursor), not
  * from an event timestamp, and persists that position in
  * `~/.tps/cursors/<agentId>-task-loop.json` as `{ position, updatedAt }`,
- * resuming from it on restart.
+ * resuming from it on restart. The file is replaced atomically (a temporary
+ * file in the same directory, fsynced, then renamed over it). A legacy
+ * `{ since }` file resumes from that timestamp; a file that cannot be read or
+ * parsed is logged and treated as no cursor, so the first read looks back
+ * FIRST_BOOT_LOOKBACK_MS.
+ *
+ * Events are handled in feed order. When a handler throws, the loop stops at
+ * that event: the event stays eligible (it is not marked seen), the cursor is
+ * persisted no further than the event before it, and the next poll, in this
+ * process or after a restart, retries it before any later event.
+ *
+ * DELIVERY IS AT LEAST ONCE, not exactly once. The cursor is written once per
+ * read, after its handlers run, so a crash after a handler returns and before
+ * that write replays the event (and any other handled in the same read) on
+ * restart. Handlers must be idempotent.
  *
  * An unavailable feed is logged with its bounded reason and the loop backs
  * off without advancing the cursor; it is not read as an empty feed.
@@ -20,7 +34,7 @@
  */
 
 import type { FlairClient } from "./flair-client.js";
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
@@ -38,6 +52,8 @@ export interface OrgEvent {
   scope?: string;
   createdAt: string;
   expiresAt?: string;
+  /** The event's feed position (`<createdAt>\t<id>`). */
+  position?: string;
 }
 
 export type TaskHandler = (event: OrgEvent) => Promise<void>;
@@ -46,40 +62,86 @@ const DEFAULT_POLL_MS = 10_000;
 const MAX_BACKOFF_MS = 60_000;
 /** How far back the first read looks when no cursor has been persisted yet. */
 const FIRST_BOOT_LOOKBACK_MS = 3_600_000;
+const LOOKBACK_NOTE = `the first read looks back ${FIRST_BOOT_LOOKBACK_MS / 60_000} minutes`;
+
 function cursorDir(): string {
   return join(homeDir(), ".tps", "cursors");
 }
 
-function cursorPath(agentId: string): string {
+/** The task loop's cursor file for `agentId`. */
+export function taskLoopCursorPath(agentId: string): string {
   return join(cursorDir(), `${agentId}-task-loop.json`);
 }
 
-/** The persisted feed position (Flair's `after` cursor), or undefined before the first read. */
-function loadCursor(agentId: string): string | undefined {
-  try {
-    const data = JSON.parse(readFileSync(cursorPath(agentId), "utf-8"));
-    if (typeof data.position === "string" && data.position !== "") return data.position;
-  } catch {}
+/**
+ * The createdAt a feed position starts with (`<createdAt>\t<id>`; a position
+ * with no tab is all timestamp, as Flair reads it), or null when that is not a
+ * parseable date.
+ */
+export function positionTimestamp(position: string): string | null {
+  const sep = position.indexOf("\t");
+  const ts = sep === -1 ? position : position.slice(0, sep);
+  return ts !== "" && !Number.isNaN(Date.parse(ts)) ? ts : null;
+}
+
+/**
+ * The resume position a cursor file holds: its `position`, or, for a legacy
+ * `{ since }` file, the position just before that timestamp. Undefined when the
+ * file holds neither.
+ */
+export function cursorFilePosition(data: unknown): string | undefined {
+  if (typeof data !== "object" || data === null) return undefined;
+  const { position, since } = data as { position?: unknown; since?: unknown };
+  if (typeof position === "string" && position !== "") return position;
+  if (typeof since === "string" && !Number.isNaN(Date.parse(since))) return `${since}\t`;
   return undefined;
 }
 
+/** The persisted feed position (Flair's `after` cursor), or undefined when there is none to resume from. */
+function loadCursor(agentId: string): string | undefined {
+  const path = taskLoopCursorPath(agentId);
+  if (!existsSync(path)) {
+    slog(`[${agentId}] No task loop cursor at ${path}; ${LOOKBACK_NOTE}`);
+    return undefined;
+  }
+  let position: string | undefined;
+  let problem = "it holds no position";
+  try {
+    position = cursorFilePosition(JSON.parse(readFileSync(path, "utf-8")));
+  } catch (e) {
+    problem = e instanceof SyntaxError ? "it is not JSON" : `it cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).name})`;
+  }
+  if (position === undefined) {
+    swarn(`[${agentId}] Task loop cursor at ${path} is unusable (${problem}); treating it as no cursor, so ${LOOKBACK_NOTE}`);
+  }
+  return position;
+}
+
+/** Replace the cursor file atomically: write a temporary file beside it, fsync it, rename it over the cursor. */
 function saveCursor(agentId: string, position: string): void {
+  const path = taskLoopCursorPath(agentId);
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     mkdirSync(cursorDir(), { recursive: true });
-    writeFileSync(cursorPath(agentId), JSON.stringify({ position, updatedAt: new Date().toISOString() }));
+    const fd = openSync(tmp, "w", 0o600);
+    try {
+      writeSync(fd, JSON.stringify({ position, updatedAt: new Date().toISOString() }));
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, path);
   } catch (e) {
     const err = e as Error;
     swarn(`[${agentId}] Failed to persist cursor: ${err.message}`);
+    try { rmSync(tmp, { force: true }); } catch {}
   }
 }
 
 /** The `since` floor for a read resuming at `position`: its createdAt, or the first-boot lookback. */
 function cursorSince(position: string | undefined): Date {
-  if (position) {
-    const ts = position.slice(0, position.indexOf("\t"));
-    if (Number.isFinite(Date.parse(ts))) return new Date(ts);
-  }
-  return new Date(Date.now() - FIRST_BOOT_LOOKBACK_MS);
+  const ts = position ? positionTimestamp(position) : null;
+  return ts ? new Date(ts) : new Date(Date.now() - FIRST_BOOT_LOOKBACK_MS);
 }
 
 export function startTaskLoop(
@@ -105,29 +167,38 @@ export function startTaskLoop(
           consecutiveErrors++;
           swarn(`[${agentId}] Task loop catch-up read unavailable (${read.reason})`);
         } else {
-          consecutiveErrors = 0; // reset backoff on a successful read
-
+          // Walk the read in feed order. `resumeAt` is the furthest position up to
+          // which every event is done (handled, already seen, or not a task for
+          // this agent); a handler failure stops the walk there.
+          let resumeAt = position;
+          let failed = false;
           for (const event of read.events) {
-            if (seen.has(event.id)) continue;
-            seen.add(event.id);
-
-            if (!kinds.has(event.kind)) continue;
-
-            const targets = event.targetIds ?? [];
-            if (targets.length > 0 && !targets.includes(agentId)) continue;
-
-            slog(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
-            try {
-              await handler(event);
-            } catch (e) {
-              const err = e as Error;
-              serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}`);
+            if (!seen.has(event.id)) {
+              const targets = event.targetIds ?? [];
+              if (kinds.has(event.kind) && (targets.length === 0 || targets.includes(agentId))) {
+                slog(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
+                try {
+                  await handler(event);
+                } catch (e) {
+                  const err = e as Error;
+                  serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}; it will be retried`);
+                  failed = true;
+                  break;
+                }
+              }
+              // Marked seen only once done, so a failed event stays eligible.
+              seen.add(event.id);
             }
+            if (event.position) resumeAt = event.position;
           }
+          // A drained read resumes at the feed's position; a failed one, no later
+          // than the event before the failure.
+          if (!failed && read.nextAfter) resumeAt = read.nextAfter;
+          // A handler failure backs off like a failed read; a clean pass resets it.
+          consecutiveErrors = failed ? consecutiveErrors + 1 : 0;
 
-          // Advance the cursor from the feed's position, not from event timestamps.
-          if (read.nextAfter && read.nextAfter !== position) {
-            position = read.nextAfter;
+          if (resumeAt && resumeAt !== position) {
+            position = resumeAt;
             saveCursor(agentId, position);
           }
 

@@ -10,7 +10,7 @@
  * the signing and parsing seams are exercised; only the HTTP endpoint is faked.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
@@ -57,14 +57,26 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
+/** The task loop's cursor file under the test HOME. */
+const cursorFile = () => join(home, ".tps", "cursors", `${AGENT}-task-loop.json`);
+
 /** The cursor position the loop persisted, or undefined when it wrote none. */
 function cursorPosition(): string | undefined {
   try {
-    return JSON.parse(readFileSync(join(home, ".tps", "cursors", `${AGENT}-task-loop.json`), "utf-8")).position;
+    return JSON.parse(readFileSync(cursorFile(), "utf-8")).position;
   } catch {
     return undefined;
   }
 }
+
+/** Write the cursor file with `content` (an object is written as JSON). */
+function writeCursor(content: string | Record<string, unknown>): void {
+  mkdirSync(join(home, ".tps", "cursors"), { recursive: true });
+  writeFileSync(cursorFile(), typeof content === "string" ? content : JSON.stringify(content));
+}
+
+/** The feed position Flair gives an event: `<createdAt>\t<id>`. */
+const positionOf = (e: { createdAt: string; id: string }) => `${e.createdAt}\t${e.id}`;
 
 /** Serve `feed` for `AGENT` through the verifying stub; return the route the requests are recorded on. */
 function serveFeed(feed: CatchupFeed): CatchupRoute {
@@ -131,6 +143,44 @@ describe("cli#624 — FlairClient.getEventsSince reads the envelope", () => {
     const read = await client().getEventsSince(AGENT, LOOKBACK);
     expect(read.status).toBe("ok");
     if (read.status === "ok") expect(read.events.map((e) => e.id)).toEqual(["e1", "e2"]);
+  });
+
+  test("a signing failure and an invalid since are unavailable with a bounded reason, never thrown, and send no request", async () => {
+    const catchup = serveFeed({ events: [assigned("e1", 5)] });
+    const missingKey = join(home, "no-such.key");
+    const unsigned = await createFlairClient(AGENT, stub!.url, missingKey).getEventsSince(AGENT, LOOKBACK);
+    expect(unsigned).toEqual({ status: "unavailable", reason: "request not signed (ENOENT)" });
+    // The reason names the error's code, never its message (which names the key path).
+    expect(JSON.stringify(unsigned)).not.toContain(missingKey);
+
+    const garbled = join(home, "garbled.key");
+    writeFileSync(garbled, "not a key");
+    const badKey = await createFlairClient(AGENT, stub!.url, garbled).getEventsSince(AGENT, LOOKBACK);
+    expect(badKey.status).toBe("unavailable");
+    if (badKey.status === "unavailable") expect(badKey.reason).toMatch(/^request not signed \([A-Za-z][A-Za-z0-9_]*\)$/);
+
+    expect(await client().getEventsSince(AGENT, new Date("not a date"))).toEqual({
+      status: "unavailable",
+      reason: "invalid since (not a valid date)",
+    });
+    expect(catchup.afters).toEqual([]);
+  });
+
+  test.each([
+    ["a missing id", { id: undefined }],
+    ["a non-string id", { id: 42 }],
+    ["an empty id", { id: "" }],
+    ["targetIds that is a string", { targetIds: AGENT }],
+    ["targetIds holding a non-string", { targetIds: [AGENT, 7] }],
+    ["a non-string detail", { detail: { text: "x" } }],
+  ])("a page with an event with %s is unavailable (malformed), not ok", async (_label, change) => {
+    serveAnswer(() =>
+      Response.json({ events: [{ ...assigned("e1", 5), ...change }], hasMore: false, nextAfter: "x" }),
+    );
+    expect(await client().getEventsSince(AGENT, LOOKBACK)).toEqual({
+      status: "unavailable",
+      reason: "malformed response (an event lacks a field the command reads)",
+    });
   });
 });
 
@@ -216,5 +266,137 @@ describe("cli#624 — the task loop reads the catch-up envelope", () => {
     }
     expect(second).toEqual([]);
     expect(catchup.afters.at(-1)).toBe(`${e1.createdAt}\te1`);
+  });
+
+  test("a handler failure leaves the event eligible: the same process retries it before any later event, and the cursor never passes it", async () => {
+    const [e0, e1, e2] = [assigned("e0", 30), assigned("e1", 20), assigned("e2", 10)];
+    const catchup = serveFeed({ events: [e0, e1, e2] });
+    const calls: string[] = [];
+    let cursorAtRetry: string | undefined;
+    let failedOnce = false;
+    const loop = startTaskLoop(client(), AGENT, async (e) => {
+      calls.push(e.id);
+      if (e.id !== "e1") return;
+      if (!failedOnce) {
+        failedOnce = true;
+        throw new Error("transient failure");
+      }
+      cursorAtRetry = cursorPosition();
+    }, { pollIntervalMs: 30 });
+    try {
+      await waitFor(() => calls.includes("e2"));
+    } finally {
+      loop.stop();
+    }
+    // e1 failed, then was handled again before e2 was handled at all.
+    expect(calls).toEqual(["e0", "e1", "e1", "e2"]);
+    // The read after the failure resumed after e0, the last event done before it;
+    // when e1 was retried, the persisted cursor had not passed it.
+    expect(catchup.afters[1]).toBe(positionOf(e0));
+    expect(cursorAtRetry).toBe(positionOf(e0));
+    expect(cursorPosition()).toBe(positionOf(e2));
+    expect(warnings).toContain("Task handler error for e1: transient failure");
+  });
+
+  test("after a handler failure, a restart retries the failed event: the persisted cursor stops before it", async () => {
+    const [e0, e1, e2] = [assigned("e0", 30), assigned("e1", 20), assigned("e2", 10)];
+    const catchup = serveFeed({ events: [e0, e1, e2] });
+    const first: string[] = [];
+    const loop1 = startTaskLoop(client(), AGENT, async (e) => {
+      first.push(e.id);
+      if (e.id === "e1") throw new Error("handler down");
+    }, { pollIntervalMs: 5_000 });
+    try {
+      await waitFor(() => first.includes("e1"));
+      await Bun.sleep(50);
+    } finally {
+      loop1.stop();
+    }
+    expect(first).toEqual(["e0", "e1"]);
+    expect(cursorPosition()).toBe(positionOf(e0));
+
+    const second: string[] = [];
+    const loop2 = startTaskLoop(client(), AGENT, async (e) => { second.push(e.id); }, { pollIntervalMs: 5_000 });
+    try {
+      await waitFor(() => second.length >= 2);
+    } finally {
+      loop2.stop();
+    }
+    expect(second).toEqual(["e1", "e2"]);
+    expect(catchup.afters.at(-1)).toBe(positionOf(e0));
+    expect(cursorPosition()).toBe(positionOf(e2));
+  });
+
+  test("a page whose targetIds is not an array never reaches the handler", async () => {
+    // A string targetIds would pass a substring test: "agent-a-2".includes("agent-a").
+    serveAnswer(() =>
+      Response.json({ events: [{ ...assigned("e1", 5), targetIds: `${AGENT}-2` }], hasMore: false, nextAfter: "x" }),
+    );
+    const handled: string[] = [];
+    const loop = startTaskLoop(client(), AGENT, async (e) => { handled.push(e.id); }, { pollIntervalMs: 30 });
+    try {
+      expect(await waitFor(() => warnings.includes("malformed response"), 3_000)).toBe(true);
+    } finally {
+      loop.stop();
+    }
+    expect(handled).toEqual([]);
+    expect(cursorPosition()).toBeUndefined();
+  });
+});
+
+describe("cli#624 — the task loop's cursor file", () => {
+  test("an unreadable cursor file is logged and treated as no cursor; the first read looks back an hour", async () => {
+    writeCursor("{not json");
+    const [old, recent] = [assigned("old", 90), assigned("recent", 30)];
+    const catchup = serveFeed({ events: [old, recent] });
+    const handled: string[] = [];
+    const loop = startTaskLoop(client(), AGENT, async (e) => { handled.push(e.id); }, { pollIntervalMs: 5_000 });
+    try {
+      await waitFor(() => handled.length > 0);
+    } finally {
+      loop.stop();
+    }
+    expect(warnings).toContain(
+      `Task loop cursor at ${cursorFile()} is unusable (it is not JSON); treating it as no cursor, so the first read looks back 60 minutes`,
+    );
+    expect(catchup.afters[0]).toBe("");
+    expect(handled).toEqual(["recent"]);
+    expect(cursorPosition()).toBe(positionOf(recent));
+  });
+
+  test("a legacy { since } cursor resumes from that timestamp", async () => {
+    const since = new Date(Date.now() - 20 * 60_000).toISOString();
+    writeCursor({ since });
+    const [before, after] = [assigned("before", 30), assigned("after", 10)];
+    const catchup = serveFeed({ events: [before, after] });
+    const handled: string[] = [];
+    const loop = startTaskLoop(client(), AGENT, async (e) => { handled.push(e.id); }, { pollIntervalMs: 5_000 });
+    try {
+      await waitFor(() => handled.length > 0);
+      await Bun.sleep(50);
+    } finally {
+      loop.stop();
+    }
+    expect(catchup.afters[0]).toBe(`${since}\t`);
+    expect(handled).toEqual(["after"]);
+    expect(cursorPosition()).toBe(positionOf(after));
+  });
+
+  test("the cursor is replaced by a rename, never rewritten in place, and no temporary file is left beside it", async () => {
+    const [e0, e1] = [assigned("e0", 30), assigned("e1", 10)];
+    writeCursor({ position: positionOf(e0), updatedAt: new Date().toISOString() });
+    const inodeBefore = statSync(cursorFile()).ino;
+    serveFeed({ events: [e0, e1] });
+    const handled: string[] = [];
+    const loop = startTaskLoop(client(), AGENT, async (e) => { handled.push(e.id); }, { pollIntervalMs: 5_000 });
+    try {
+      await waitFor(() => cursorPosition() === positionOf(e1));
+    } finally {
+      loop.stop();
+    }
+    expect(handled).toEqual(["e1"]);
+    // A rename puts a new file (a new inode) at the path; an in-place write keeps the old one.
+    expect(statSync(cursorFile()).ino).not.toBe(inodeBefore);
+    expect(readdirSync(join(home, ".tps", "cursors"))).toEqual([`${AGENT}-task-loop.json`]);
   });
 });
