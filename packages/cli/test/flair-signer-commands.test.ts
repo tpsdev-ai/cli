@@ -46,7 +46,8 @@ beforeEach(() => {
   savedError = console.error;
   savedStdout = process.stdout.write;
   savedExit = process.exit;
-  // A refused Agent read exits the command; here it throws, so it fails the test instead of ending the run.
+  // A refused Agent read exits the command. Here an exit throws instead of ending the run: an unexpected
+  // exit fails its test, and the refusal tests expect it and assert the rejection (`rejects.toThrow`).
   patchShared(process, "exit", ((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit);
   patchShared(console, "log", ((...args: unknown[]) => { logs.push(args.join(" ")); }) as typeof console.log);
   patchShared(console, "error", ((...args: unknown[]) => { logs.push("[ERR] " + args.join(" ")); }) as typeof console.error);

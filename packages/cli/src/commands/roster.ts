@@ -273,8 +273,10 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
   if (notice) console.error(notice);
   const activity = activityState(read);
 
-  // Per-agent newest event and newest task event. The feed is oldest first, so
-  // a later event replaces an earlier one.
+  // Per-agent newest event of any kind, and newest task event of the kinds
+  // task.assigned and task.completed (other task kinds, such as task.failed,
+  // are not considered). The feed is oldest first, so a later event replaces an
+  // earlier one.
   const lastEvent = new Map<string, OrgEventRecord>();
   const lastTask = new Map<string, OrgEventRecord>();
   for (const ev of read.status === "ok" ? read.events : []) {

@@ -61,7 +61,8 @@ beforeEach(() => {
   savedLog = console.log;
   savedError = console.error;
   savedExit = process.exit;
-  // A refused Agent read exits the command; here it throws, so it fails the test instead of ending the run.
+  // A refused Agent read exits the command. Here an exit throws instead of ending the run: an unexpected
+  // exit fails its test, and the refusal tests expect it and assert the rejection (`rejects.toThrow`).
   patchShared(process, "exit", ((code?: number) => { throw new Error(`exit:${code ?? 0}`); }) as typeof process.exit);
   patchShared(console, "log", (...args: unknown[]) => { output.push(args.join(" ")); });
   patchShared(console, "error", (...args: unknown[]) => { output.push("[ERR] " + args.join(" ")); });
@@ -170,7 +171,7 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   const jsonAgents = () =>
     (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
 
-  test("a nonempty read shows each agent's newest task and, with no record heartbeat, the newest feed heartbeat", async () => {
+  test("a nonempty read shows each agent's newest selected task event and, with no record heartbeat, the newest feed heartbeat", async () => {
     const beats = [
       { id: "h1", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(50) },
       { id: "h2", kind: "agent.heartbeat", authorId: "agent-b", summary: "heartbeat", createdAt: at(3) },

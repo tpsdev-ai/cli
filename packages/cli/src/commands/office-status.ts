@@ -140,8 +140,10 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   const activity = activityState(read);
   const events = read.status === "ok" ? read.events : [];
 
-  // Per-agent newest task and heartbeat. The feed is oldest first, so a later
-  // event replaces an earlier one.
+  // Per-agent newest task event of the kinds task.assigned, task.started and
+  // task.completed (other task kinds, such as task.failed, are not considered),
+  // and newest heartbeat event. The feed is oldest first, so a later event
+  // replaces an earlier one.
   const lastTask   = new Map<string, OrgEventRecord>();
   const lastHbTime = new Map<string, string>();
   for (const ev of events) {
