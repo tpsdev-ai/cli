@@ -51,11 +51,14 @@ describe("tps agent logs", () => {
     patchShared(globalThis, "fetch", mock(async (input: string | URL, init?: RequestInit) => {
       const headers = (init?.headers ?? {}) as Record<string, string>;
       requests.push({ url: String(input), auth: String(headers.Authorization ?? "") });
-      return new Response(JSON.stringify([
-        { id: "e1", authorId: "ember", kind: "task.completed", summary: "Completed ops-72", createdAt: "2026-03-07T10:02:00.000Z", targetIds: ["host"] },
-        { id: "e2", authorId: "host", kind: "task.assigned", summary: "Assigned follow-up", createdAt: "2026-03-07T10:04:00.000Z", targetIds: ["ember"] },
-        { id: "e3", authorId: "host", kind: "org.note", summary: "Ignore me", createdAt: "2026-03-07T10:06:00.000Z", targetIds: ["someone-else"] },
-      ]), { status: 200, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({
+        events: [
+          { id: "e1", authorId: "ember", kind: "task.completed", summary: "Completed ops-72", createdAt: "2026-03-07T10:02:00.000Z", targetIds: ["host"] },
+          { id: "e2", authorId: "host", kind: "task.assigned", summary: "Assigned follow-up", createdAt: "2026-03-07T10:04:00.000Z", targetIds: ["ember"] },
+          { id: "e3", authorId: "host", kind: "org.note", summary: "Ignore me", createdAt: "2026-03-07T10:06:00.000Z", targetIds: ["someone-else"] },
+        ],
+        hasMore: false,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
     }) as typeof globalThis.fetch);
 
     const mailDir = join(tempHome, ".tps", "mail");
@@ -87,9 +90,12 @@ describe("tps agent logs", () => {
     const errors: string[] = [];
     patchShared(console, "log", mock((value?: unknown) => out.push(String(value ?? ""))) as typeof console.log);
     patchShared(console, "error", mock((value?: unknown) => errors.push(String(value ?? ""))) as typeof console.error);
-    patchShared(globalThis, "fetch", mock(async () => new Response(JSON.stringify([
-      { id: "e1", authorId: "ember", kind: "task.completed", summary: "Completed ops-72", createdAt: "2026-03-07T10:02:00.000Z", targetIds: [] },
-    ]), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof globalThis.fetch);
+    patchShared(globalThis, "fetch", mock(async () => new Response(JSON.stringify({
+      events: [
+        { id: "e1", authorId: "ember", kind: "task.completed", summary: "Completed ops-72", createdAt: "2026-03-07T10:02:00.000Z", targetIds: [] },
+      ],
+      hasMore: false,
+    }), { status: 200, headers: { "Content-Type": "application/json" } })) as typeof globalThis.fetch);
 
     const mailDir = join(tempHome, ".tps", "mail");
     mkdirSync(join(mailDir, "ember", "new"), { recursive: true });

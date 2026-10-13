@@ -1,0 +1,1 @@
+- **The task loop and `tps agent logs` read Flair's catch-up envelope rather than a list (Closes #624).** A `task.assigned` event now reaches the task handler, the loop resumes from the feed position it persisted, and `FlairClient.getEventsSince` returns the read's outcome, so a caller can tell an empty feed from an unreadable one.

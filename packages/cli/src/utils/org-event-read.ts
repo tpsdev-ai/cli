@@ -9,14 +9,15 @@
  * `{ events, nextAfter, hasMore, ... }`, and refuses a `since` it cannot parse
  * with HTTP 400. A GET acknowledges nothing.
  *
- * `readOrgEvents` sends `since` as a plain ISO timestamp, signs each page
- * request with the caller's signer, validates the envelope and every event in
- * it, and follows `nextAfter` while `hasMore`, for at most `maxPages` pages.
- * The result is either
+ * `readOrgEvents` sends `since` as a plain ISO timestamp (and the `after`
+ * resume cursor when the caller has one), signs each page request with the
+ * caller's signer, validates the envelope and every event in it, and follows
+ * `nextAfter` while `hasMore`, for at most `maxPages` pages. The result is
+ * either
  *
- *   - `ok`, with the events in feed order and `complete: false` when the page
- *     bound stopped the read before the feed was drained (the newest events
- *     are the ones not read), or
+ *   - `ok`, with the events in feed order, the `nextAfter` position to resume
+ *     from, and `complete: false` when the page bound stopped the read before
+ *     the feed was drained (the newest events are the ones not read), or
  *   - `unavailable`, with a bounded reason: the HTTP status, a fixed note
  *     naming the malformed part of the response, or the code or class of the
  *     error a rejected request raised. The reason never includes the response
@@ -34,7 +35,7 @@ export interface OrgEventRecord {
 }
 
 export type OrgEventRead =
-  | { status: "ok"; events: OrgEventRecord[]; complete: boolean }
+  | { status: "ok"; events: OrgEventRecord[]; complete: boolean; nextAfter: string }
   | { status: "unavailable"; reason: string };
 
 /** Signs a Flair request: the Authorization header value, or undefined to send none. */
@@ -50,6 +51,8 @@ export interface OrgEventReadOpts {
   viewerId: string;
   /** The createdAt floor. */
   since: Date;
+  /** Resume cursor (Flair's `after` position); reads after it instead of the viewer's watermark. */
+  after?: string;
   sign: FlairRequestSigner;
   pageSize?: number;
   maxPages?: number;
@@ -100,7 +103,7 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
   const base = `/OrgEventCatchup/${encodeURIComponent(opts.viewerId)}`;
   const since = opts.since.toISOString();
   const events: OrgEventRecord[] = [];
-  let after: string | undefined;
+  let after: string | undefined = opts.after;
   for (let page = 0; page < maxPages; page++) {
     const params = new URLSearchParams({ since, limit: String(pageSize) });
     if (after !== undefined) params.set("after", after);
@@ -122,10 +125,10 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
     const parsed = parsePage(body);
     if (typeof parsed === "string") return { status: "unavailable", reason: `malformed response (${parsed})` };
     events.push(...parsed.events);
-    if (!parsed.hasMore) return { status: "ok", events, complete: true };
     after = parsed.nextAfter;
+    if (!parsed.hasMore) return { status: "ok", events, complete: true, nextAfter: parsed.nextAfter };
   }
-  return { status: "ok", events, complete: false };
+  return { status: "ok", events, complete: false, nextAfter: after ?? "" };
 }
 
 /** The per-agent activity state both commands print and emit as JSON. */

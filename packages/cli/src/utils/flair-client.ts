@@ -8,6 +8,7 @@ import { createPrivateKey, sign as ed25519Sign, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readOrgEvents } from "./org-event-read.js";
 
 export interface FlairConfig {
   baseUrl?: string;
@@ -93,6 +94,16 @@ export interface OrgEvent {
   createdAt: string;
   expiresAt?: string;
 }
+
+/**
+ * The result of an OrgEvent catch-up read: the discriminated shape
+ * `readOrgEvents` returns (see org-event-read.ts). `ok` carries the events in
+ * feed order and the `nextAfter` position to resume from; `unavailable`
+ * carries a bounded reason. An empty feed is `ok` with no events.
+ */
+export type EventsSinceRead =
+  | { status: "ok"; events: OrgEvent[]; complete: boolean; nextAfter: string }
+  | { status: "unavailable"; reason: string };
 
 export interface FlairAgent {
   id: string;
@@ -900,16 +911,19 @@ export class FlairClient {
     });
   }
 
-  async getEventsSince(participantId: string, since: Date): Promise<OrgEvent[]> {
-    try {
-      return await this.request<OrgEvent[]>(
-        "GET",
-        // Harper requires full ISO with milliseconds (.000Z) and no encoding of colons.
-        `/OrgEventCatchup/${encodeURIComponent(participantId)}?since=${since.toISOString()}`,
-      );
-    } catch {
-      return [];
-    }
+  async getEventsSince(participantId: string, since: Date, after?: string): Promise<EventsSinceRead> {
+    const read = await readOrgEvents({
+      flairUrl: this.baseUrl,
+      viewerId: participantId,
+      since,
+      after,
+      sign: (method, path) => this.sign(method, path),
+    });
+    if (read.status !== "ok") return read;
+    // The helper validated the envelope and every event's core fields; the
+    // events carry the additional fields Flair sends on the wire (id, targetIds,
+    // detail, scope, expiresAt).
+    return { ...read, events: read.events as unknown as OrgEvent[] };
   }
 
   // ─── Workspace state (OPS-47 Phase 2) ────────────────────────────────────

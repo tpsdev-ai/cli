@@ -100,21 +100,20 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     const cursorDir = join(homeB, ".tps", "cursors");
     const cursorFile = join(cursorDir, "anvil-task-loop.json");
     mkdirSync(cursorDir, { recursive: true });
-    writeFileSync(cursorFile, JSON.stringify({ since: "2026-01-01T00:00:00.000Z" }));
+    writeFileSync(cursorFile, JSON.stringify({ position: "2026-01-01T00:00:00.000Z\te0" }));
 
-    const requested: string[] = [];
+    const reads: Array<{ since: string; after?: string }> = [];
     const flair = {
-      request: async (_method: string, path: string) => {
-        requested.push(path);
-        return [
-          {
-            id: "e1",
-            kind: "task.assigned",
-            summary: "s",
-            createdAt: "2026-01-02T00:00:00.000Z",
-            targetIds: ["anvil"],
-          },
-        ];
+      getEventsSince: async (_agentId: string, since: Date, after?: string) => {
+        reads.push({ since: since.toISOString(), after });
+        return {
+          status: "ok" as const,
+          events: [
+            { id: "e1", kind: "task.assigned", authorId: "agent-a", summary: "s", createdAt: "2026-01-02T00:00:00.000Z", targetIds: ["anvil"] },
+          ],
+          complete: true,
+          nextAfter: "2026-01-02T00:00:00.000Z\te1",
+        };
       },
     };
 
@@ -122,15 +121,16 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     const deadline = Date.now() + 5_000; // bounded: the poll runs on its own
     try {
       while (Date.now() < deadline) {
-        if (JSON.parse(readFileSync(cursorFile, "utf-8")).since === "2026-01-02T00:00:00.000Z") break;
+        if (JSON.parse(readFileSync(cursorFile, "utf-8")).position === "2026-01-02T00:00:00.000Z\te1") break;
         await Bun.sleep(10);
       }
     } finally {
       loop.stop();
     }
 
-    expect(requested[0]).toContain("since=2026-01-01T00:00:00.000Z"); // the read followed homeB
-    expect(JSON.parse(readFileSync(cursorFile, "utf-8")).since).toBe("2026-01-02T00:00:00.000Z"); // so did the write
+    expect(reads[0]?.since).toBe("2026-01-01T00:00:00.000Z"); // the read followed homeB's cursor
+    expect(reads[0]?.after).toBe("2026-01-01T00:00:00.000Z\te0");
+    expect(JSON.parse(readFileSync(cursorFile, "utf-8")).position).toBe("2026-01-02T00:00:00.000Z\te1"); // so did the write
     expect(existsSync(join(homeA, ".tps", "cursors", "anvil-task-loop.json"))).toBe(false);
   }, 20_000);
 
