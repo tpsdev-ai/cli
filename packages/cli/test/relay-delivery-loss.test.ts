@@ -498,7 +498,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const receipt of ["kept", "removed"] as const) {
-      test(`a lost ACK and the sender's resend keep one keyed inbox record (receipt ${receipt}) (cli#513)`, async () => {
+      test(`a lost ACK and the sender's resend leave one keyed inbox record and one ACK at the branch (receipt ${receipt}) (cli#513)`, async () => {
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", `lost ACK ${receipt}`, SEEDS)));
         const inbox = getInbox("local");
         const keyed = relayRecordFileName("remote", body.id);
@@ -514,18 +514,23 @@ for (const entry of ["sync", "connect"] as const) {
         expect(lost).toBe(1);
         expect(acks).toEqual([]);
         expect(jsonFiles(inbox.fresh)).toEqual([keyed]);
-        const recordId = JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8")).id;
+        const first = JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8"));
         // The branch saw no ACK, so its outbox still holds the delivery.
         expect(drainOutbox(false).map((m) => m.id)).toEqual([body.id]);
         // Without the receipt, only the inbox record can recognise the resend.
         if (receipt === "removed") fs.rmSync(relayAcceptanceReceiptPath("remote", body.id));
+        await Bun.sleep(5);
         const later = Date.now() + OUTBOX_RESEND_BASE_MS;
         const clock = spyOn(Date, "now").mockReturnValue(later);
         try { await emit(); } finally { clock.mockRestore(); }
+        // The receiver ACKed both attempts; only the second ACK reached the branch.
         expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }]);
+        // The resend was recognised: no additional record, the same file name and
+        // record id, and receivedAt refreshed by a rename over that record.
         expect(jsonFiles(inbox.fresh)).toEqual([keyed]);
-        // The resend was recognised, not written again over the same name.
-        expect(JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8")).id).toBe(recordId);
+        const second = JSON.parse(fs.readFileSync(join(inbox.fresh, keyed), "utf8"));
+        expect(second.id).toBe(first.id);
+        expect(Date.parse(second.receivedAt)).toBeGreaterThan(Date.parse(first.receivedAt));
         expect(jsonFiles(inbox.cur)).toEqual([]);
         expect(drainOutbox(false)).toEqual([]);
       });

@@ -7,10 +7,13 @@
  * even when the acceptance receipt was not written. The same id from a different
  * branch has a different key and is still delivered.
  *
- * The guarantee is bounded by retention: a resend is recognised while its record
- * is in the mailbox (new, cur or the dead-letter queue) or its acceptance receipt
- * is unexpired. Once the record has left the mailbox (acknowledged, archived or
- * garbage-collected) and the receipt has expired, a resend is delivered again.
+ * The guarantee is bounded by retention: while the record is in the mailbox (new,
+ * cur or the dead-letter queue) or its acceptance receipt is unexpired, a resend
+ * creates no additional inbox record. A recognised resend keeps the record's file
+ * name and id and refreshes its receivedAt; after a local ACK has removed the
+ * record, a matching receipt means no record is written at all. Once both the
+ * record and the receipt are gone, a resend is eligible for a new delivery
+ * attempt, and the ordinary inbox and dead-letter paths apply to it.
  *
  * A keyed record that does not parse as a mail record is refused: no ACK, no
  * quarantine, no replacement. The lost-ACK case (the ACK is sent and never
@@ -134,7 +137,7 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
     expect(newRecords()).toHaveLength(2);
   });
 
-  test("a crash between the inbox write and the marker write is not written a second time on the resend", () => {
+  test("after a crash between the inbox write and the marker write, the resend creates no additional inbox record", () => {
     const body = mailBody();
     // The inbox write happened (the real relay record), the marker write did not.
     sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
@@ -181,7 +184,7 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
     }, 20_000);
   }
 
-  test("the window: the record holds it past receipt expiry; once the record is acknowledged and the receipt expired, a resend is delivered again", () => {
+  test("the window: the record holds it past receipt expiry; once the record is acknowledged and the receipt expired, the resend is a new delivery attempt", () => {
     const body = mailBody();
     expect(deliverRelayedToLocal("remote", body)).toBe(true);
     const keyed = relayRecordFileName("remote", body.id);
