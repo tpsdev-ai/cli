@@ -283,7 +283,8 @@ export function mailboxReplayStore(root: string): ReplayStore {
 
 /**
  * List well-formed pending intents with their phase; quarantine malformed ones
- * and omit them. An intent declaring `failed` is not pending and is omitted.
+ * and omit them. An intent whose phase resolves to `failed` is not pending and
+ * is omitted.
  * Call under the mailbox lock and re-read each intent before acting on it.
  */
 export function pendingPlacementEntries(root: string): Array<{ messageId: string; file: string; phase: PlacementPhase }> {
@@ -335,30 +336,40 @@ function quarantinePlacement(path: string): void {
 }
 
 /**
- * The phase a placement intent DECLARES (cli#617 design rev 2). phaseOf reads
- * the declaration; it does not prove the state behind it.
+ * The phase phaseOf RESOLVES for a placement intent (cli#617 design rev 2).
+ * Every rule keys on this resolved result, not on the raw `phase` field.
+ * phaseOf checks `version`, `presentations` and `firstPresentedAt` before
+ * `phase`. An unsupported value in any of them resolves to `unknown` whatever
+ * `phase` says: `version: 2` with no `phase`, and `version: 2` with
+ * `phase: "failed"`, both resolve to `unknown`. The result reflects what the
+ * intent declares; it does not prove the state behind it.
  *
- * - `placing`: declares a commit in flight. An intent without a `phase` is
- *   `placing`, so an otherwise-valid intent written before phases existed, whose
- *   `file` is a plain basename, reads as before. The one exception: an older
- *   intent whose `file` is not a plain basename, which the old parser accepted
- *   when its hashed name matched, is now malformed and quarantined.
- * - `in_progress`: declares a committed message whose handler has not completed.
- * - `failed`: declares a terminal message (its liveness bound was reached). It
- *   is not pending: it never closes the per-file (filename) gate and is never
- *   listed for recovery, while its message ID stays refused by the consumed-ID
- *   (replay) gate. A different message may need the same basename once the
- *   old payload has left cur/. If the tombstone name (failedTombstonePath) is
- *   unoccupied, or is the marker's own inode (treated as an interrupted move),
- *   the marker moves there and the new placement proceeds. An occupied
- *   tombstone refuses the placement by name. While the payload is in cur/, the
- *   marker stays and the new placement is refused. The record is kept until an
- *   operator removes it.
+ * - `placing`: a commit in flight. An intent resolves to `placing` when it has
+ *   no `phase` (or `phase: "placing"`), a recognized `version` (absent or 1) and
+ *   valid liveness values (absent or well-formed). So an otherwise-valid intent
+ *   written before phases existed, whose `file` is a plain basename, reads as
+ *   before. The one exception: an older intent whose `file` is not a plain
+ *   basename, which the old parser accepted when its hashed name matched, is
+ *   now malformed and quarantined.
+ * - `in_progress`: `phase: "in_progress"` under the same `version` and liveness
+ *   conditions; it declares a committed message whose handler has not completed.
+ * - `failed`: `phase: "failed"` under the same conditions; it declares a
+ *   terminal message (its liveness bound was reached). It is not pending: it
+ *   never closes the per-file (filename) gate and is never listed for
+ *   recovery, while its message ID stays refused by the consumed-ID (replay)
+ *   gate. A different message may need the same basename once the old payload
+ *   has left cur/. If the tombstone name (failedTombstonePath) is unoccupied,
+ *   or is the marker's own inode (treated as an interrupted move), the marker
+ *   moves there and the new placement proceeds. An occupied tombstone refuses
+ *   the placement by name. While the payload is in cur/, the marker stays and
+ *   the new placement is refused. The record is kept until an operator
+ *   removes it.
  * - `unknown`: an unsupported value in a recognized field (`phase`, `version`,
- *   `presentations` or `firstPresentedAt`); other extra fields are ignored. The
- *   store never finishes or replaces it, MailClient recovery,
- *   the CLI lease sweep and CLI promotion never present it, and it is not
- *   quarantined solely for that field. It keeps its own per-file gate closed.
+ *   `presentations` or `firstPresentedAt`, where `presentations` must be a
+ *   non-negative safe integer); other extra fields are ignored. The store
+ *   never finishes or replaces it; MailClient recovery, the CLI lease sweep and
+ *   CLI promotion never present it; and it is not quarantined solely for that
+ *   value. It keeps its own per-file gate closed.
  *
  * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
  */
@@ -384,10 +395,12 @@ function isPlainBasename(file: string): boolean {
 }
 
 /**
- * Read the declared phase from a parsed intent. An unsupported value in
- * `phase`, `version` or a liveness field reads as `unknown`, not as malformed;
- * other extra fields are ignored. A malformed identity or basename is still
- * malformed (parsePlacement).
+ * Resolve the phase of a parsed intent. `version`, `presentations` and
+ * `firstPresentedAt` are checked first, and an unsupported value in any of them
+ * resolves to `unknown` whatever `phase` says. Then `phase` resolves: absent or
+ * `placing`, `in_progress`, `failed`, and anything else is `unknown`. `unknown`
+ * is not malformed, and other extra fields are ignored. A malformed identity or
+ * basename is still malformed (parsePlacement).
  */
 function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   if (intent.version !== undefined && intent.version !== PLACEMENT_INTENT_VERSION) return "unknown";
@@ -403,7 +416,7 @@ function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   return "unknown";
 }
 
-/** A pending intent: any declared phase but `failed`. */
+/** A pending intent: any resolved phase but `failed`. */
 function isLivePlacement(intent: PlacementIntent | null): boolean {
   return intent !== null && intent.phase !== "failed";
 }

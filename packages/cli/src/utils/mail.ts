@@ -1177,8 +1177,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       return { ok: false, class: cls, reason };
     }
     // cli#617 slice (a): only a `placing` intent is finished or rolled back here.
-    // An intent that declares `in_progress` (a delivery another consumer has
-    // declared in flight) or an `unknown` phase (an unsupported value in a
+    // An intent whose phase resolves to `in_progress` (a delivery another
+    // consumer has declared in flight) or `unknown` (an unsupported value in a
     // recognized field) is left as it is, with its cur/ copy and this source in
     // place; a later check retries.
     if (pendingPlacement && pendingPhase !== "placing") {
@@ -1510,11 +1510,11 @@ export async function recoverPromoted(agent: string, curPath: string, verify: Ma
 
 /**
  * cli#617 slice (a): the lease sweep presents, checks out and finishes only a
- * record with no placement intent or a `placing` one. An intent that declares
- * `in_progress` (another consumer's delivery in flight) or `failed` (terminal),
- * or an `unknown` phase (an unsupported value in a recognized field), makes the
- * sweep skip the record entirely, so this sweep does not present what another
- * consumer has declared in flight. Four direct recoverPromoted callers do not
+ * record with no placement intent or one whose phase resolves to `placing`. A
+ * phase that resolves to `in_progress` (another consumer's delivery in
+ * flight), `failed` (terminal), or `unknown` (an unsupported value in a
+ * recognized field) makes the sweep skip the record entirely, so this sweep
+ * does not present what another consumer has declared in flight. Four direct recoverPromoted callers do not
  * read phases yet (slice b): the bridge and OpenClaw plugin startup sweeps,
  * verifyMailAction, and the plugin's internalInbound. Throws on a malformed
  * intent; the caller skips.
