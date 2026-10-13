@@ -12,11 +12,9 @@ import { join } from "node:path";
 import { createPatchShared } from "./helpers/patch-shared.js";
 import { runInit } from "../src/commands/init.js";
 import { runDashboard } from "../src/commands/roster.js";
-import { ORG_EVENT_MAX_PAGES, ORG_EVENT_PAGE_SIZE } from "../src/utils/org-event-read.js";
 import {
   installStubFlairFetch,
   type FlairRoutes,
-  orgEventCatchupRoute,
   pubkeyFromSeed,
   startStubFlair,
   type StubFlair,
@@ -111,7 +109,7 @@ describe("cli#554 — runInit registers signed with Flair", () => {
 describe("cli#554 — runDashboard signs its Flair reads", () => {
   function routes(req: Request, url: URL, caller: string): Response | undefined {
     if (req.method === "GET" && url.pathname === "/Agent/") return Response.json([{ id: "ember", name: "Ember" }]);
-    if (req.method === "GET" && url.pathname.startsWith("/OrgEventCatchup/")) return orgEventCatchupRoute({ events: [] })(req, url, caller);
+    if (req.method === "GET" && url.pathname === "/Presence") return Response.json([]);
     return undefined;
   }
 
@@ -143,29 +141,23 @@ describe("cli#554 — runDashboard signs its Flair reads", () => {
 });
 
 /**
- * cli#606 — the dashboard's activity column reads the viewer's OrgEvent
- * catch-up feed through `readOrgEvents`. The catch-up route is
- * `orgEventCatchupRoute`, a fake modelled on Flair's coded catch-up contract
- * (see its doc; the real resource is not exercised). The fixtures name no
- * production agent.
+ * cli#622 — the dashboard's last-seen column reads Flair's office-wide Presence
+ * roster through `readPresence`. The /Presence fixture is served by the shared
+ * verifying stub (see its doc); the fixture names no production agent.
  */
-describe("cli#606 — runDashboard reads the OrgEvent catch-up feed", () => {
+describe("cli#622 — runDashboard reads the Presence roster", () => {
   const VIEWER = "viewer-a";
   const AGENTS = [{ id: "agent-a", name: "Agent A" }, { id: "agent-b", name: "Agent B" }];
-  const at = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
-  const OLDER = { id: "e1", kind: "task.completed", authorId: "agent-a", summary: "older task", createdAt: at(50) };
-  const NEWER = { id: "e2", kind: "task.completed", authorId: "agent-a", summary: "newer task", createdAt: at(5) };
-  /** `count` distinct events by `authorId`, one millisecond apart from `minutesAgo`, ids `<prefix><n>`. */
-  const rows = (count: number, authorId: string, minutesAgo: number, prefix: string) =>
-    Array.from({ length: count }, (_, n) => ({
-      id: `${prefix}${String(n).padStart(5, "0")}`,
-      kind: "task.completed",
-      authorId,
-      summary: `${prefix} task ${n}`,
-      createdAt: new Date(Date.now() - minutesAgo * 60_000 + n).toISOString(),
-    }));
-  /** More distinct events than the read bound holds: the bound's pages, plus one. */
-  const PAST_BOUND = ORG_EVENT_MAX_PAGES * ORG_EVENT_PAGE_SIZE + 1;
+  /** A Presence record for `id`, 5 minutes stale by default. */
+  const presence = (id: string, over: Record<string, unknown> = {}) => ({
+    id, displayName: id, role: "agent", runtime: "cli",
+    activity: "coding", lastActivity: "coding",
+    activityUpdatedAt: Date.now() - 5 * 60_000, activityAgeMs: 5 * 60_000, activityFresh: true,
+    presenceStatus: "active", currentTask: null,
+    lastHeartbeatAt: Date.now() - 5 * 60_000,
+    flairVersion: "1.2.3", harperVersion: "4.5.6",
+    ...over,
+  });
 
   let stub: StubFlair | undefined;
   afterEach(() => {
@@ -173,14 +165,14 @@ describe("cli#606 — runDashboard reads the OrgEvent catch-up feed", () => {
     stub = undefined;
   });
 
-  /** Run the dashboard against a viewer whose OrgEvent read is answered by `answer`; return the output. */
+  /** Run the dashboard against a viewer whose Presence read is answered by `answer`; return the output. */
   async function dashboard(answer: FlairRoutes, json = false): Promise<string> {
     const keyPath = join(root, `${VIEWER}.key`);
     writeFileSync(keyPath, SEED);
     stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url, caller) =>
       url.pathname === "/Agent/"
         ? Response.json(AGENTS)
-        : url.pathname.startsWith("/OrgEventCatchup/")
+        : url.pathname === "/Presence"
           ? answer(req, url, caller)
           : undefined,
     );
@@ -190,75 +182,55 @@ describe("cli#606 — runDashboard reads the OrgEvent catch-up feed", () => {
   const row = (out: string, id: string) => out.split("\n").find((line) => line.startsWith(`${id} `)) ?? "";
   const jsonRows = () => JSON.parse(logs.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as Array<Record<string, any>>;
 
-  test("a nonempty read shows each agent's newest activity", async () => {
-    const out = await dashboard(orgEventCatchupRoute({ events: [OLDER, NEWER] }));
-    expect(out).not.toContain("Cannot read OrgEvents");
-    expect(row(out, "agent-a")).toContain("5m ago");
-    expect(row(out, "agent-a")).toContain("newer task");
-    expect(row(out, "agent-a")).not.toContain("older task");
-    expect(row(out, "agent-b")).toContain("no activity");
+  test("shows each agent's presence status and last-seen time, and 'never seen' for an agent with no record", async () => {
+    const out = await dashboard(() => Response.json([presence("agent-a", { presenceStatus: "active", lastHeartbeatAt: Date.now() - 5 * 60_000 })]));
+    expect(out).not.toContain("Cannot read Presence");
+    expect(out).toContain("Last Seen");
+    expect(row(out, "agent-a")).toContain("active (5m ago)");
+    expect(row(out, "agent-b")).toContain("never seen");
   });
 
-  test("a feed of several pages is read to the end, each page after the last", async () => {
-    const route = orgEventCatchupRoute({ events: [OLDER, ...rows(ORG_EVENT_PAGE_SIZE, "agent-c", 40, "f"), NEWER] });
-    const out = await dashboard(route);
-    expect(route.afters).toHaveLength(2);
-    expect(route.afters[1]! > route.afters[0]!).toBe(true);
-    expect(new Set(route.served).size).toBe(ORG_EVENT_PAGE_SIZE + 2);
-    expect(out).not.toContain("incomplete");
-    expect(row(out, "agent-a")).toContain("newer task");
+  test("an agent whose record has gone stale shows the offline status and its heartbeat time", async () => {
+    const out = await dashboard(() => Response.json([presence("agent-a", { presenceStatus: "offline", lastHeartbeatAt: Date.now() - 3 * 86_400_000 })]));
+    expect(row(out, "agent-a")).toContain("offline (3d ago)");
+    expect(row(out, "agent-b")).toContain("never seen");
   });
 
-  test("a refused read (HTTP 403) is reported, and activity reads unavailable", async () => {
+  test("a refused read (HTTP 403) is reported, and the column reads unavailable, not never seen", async () => {
     const out = await dashboard(() => new Response(null, { status: 403 }));
-    expect(out).toContain(`Cannot read OrgEvents from ${stub!.url} (HTTP 403); activity is unavailable.`);
+    expect(out).toContain(`Cannot read Presence from ${stub!.url} (HTTP 403); presence is unavailable.`);
     expect(row(out, "agent-a")).toContain("unavailable");
     expect(row(out, "agent-b")).toContain("unavailable");
-    expect(out).not.toContain("no activity");
+    expect(out).not.toContain("never seen");
   });
 
   test("a rejected request is reported with its code, never its message", async () => {
     const out = await dashboard(() => {
       throw Object.assign(new TypeError("message-text-not-printed"), { code: "ECONNREFUSED" });
     });
-    expect(out).toContain(`Cannot read OrgEvents from ${stub!.url} (request failed (ECONNREFUSED)); activity is unavailable.`);
+    expect(out).toContain(`Cannot read Presence from ${stub!.url} (request failed (ECONNREFUSED)); presence is unavailable.`);
     expect(out).not.toContain("message-text-not-printed");
     expect(row(out, "agent-a")).toContain("unavailable");
   });
 
   test.each([
-    ["an array body", () => Response.json([NEWER]), "not an object"],
-    ["an event missing a field", () => Response.json({ events: [{ ...NEWER, summary: undefined }], hasMore: false }), "an event lacks a field the command reads"],
+    ["a body that is not an array", () => Response.json({ agents: [] }), "body is not an array"],
+    ["a record missing a field", () => Response.json([{ ...presence("agent-a"), lastHeartbeatAt: undefined }]), "a presence record lacks a field the command reads"],
     ["a body that is not JSON", () => new Response("not json"), "body is not JSON"],
-  ])("a malformed response (%s) is reported, and activity reads unavailable", async (_label, answer, note) => {
+  ])("a malformed response (%s) is reported, and the column reads unavailable", async (_label, answer, note) => {
     const out = await dashboard(answer);
-    expect(out).toContain(`Cannot read OrgEvents from ${stub!.url} (malformed response (${note})); activity is unavailable.`);
-    expect(out).not.toContain("newer task");
+    expect(out).toContain(`Cannot read Presence from ${stub!.url} (malformed response (${note})); presence is unavailable.`);
     expect(row(out, "agent-a")).toContain("unavailable");
+    expect(out).not.toContain("never seen");
   });
 
-  test("a feed past the page bound is read up to the bound, with advancing cursors over distinct events, and marked incomplete", async () => {
-    const route = orgEventCatchupRoute({ events: rows(PAST_BOUND, "agent-a", 60, "b") });
-    const out = await dashboard(route);
-    expect(route.afters).toHaveLength(ORG_EVENT_MAX_PAGES);
-    for (let i = 1; i < route.afters.length; i++) expect(route.afters[i]! > route.afters[i - 1]!).toBe(true);
-    expect(route.served).toHaveLength(ORG_EVENT_MAX_PAGES * ORG_EVENT_PAGE_SIZE);
-    expect(new Set(route.served).size).toBe(route.served.length);
-    expect(out).toContain(`OrgEvents from ${stub!.url} exceed the ${ORG_EVENT_MAX_PAGES}-page read bound; newer events were not read and activity is incomplete.`);
-    expect(row(out, "agent-a")).toContain("(incomplete)");
-    expect(row(out, "agent-a")).not.toContain(`b task ${PAST_BOUND - 1}`);
-    expect(row(out, "agent-b")).toContain("incomplete");
-    expect(out).not.toContain("no activity");
-  });
-
-  test.each([
-    ["ok", () => orgEventCatchupRoute({ events: [OLDER, NEWER] }), "newer task"],
-    ["unavailable", () => () => new Response(null, { status: 403 }), undefined],
-    ["incomplete", () => orgEventCatchupRoute({ events: rows(PAST_BOUND, "agent-a", 60, "b") }), `b task ${PAST_BOUND - 2}`],
-  ])("JSON output gives each agent the activity state %s", async (state, answer, summary) => {
-    await dashboard(answer(), true);
+  test("JSON output carries each agent's Presence record, last-seen text and presence state", async () => {
+    await dashboard(() => Response.json([presence("agent-a", { currentTask: "reviewing agent-b PR" })]), true);
     const out = jsonRows();
-    expect(out.map((r) => r.activity)).toEqual([state, state]);
-    expect(out[0]!.lastEvent?.summary).toBe(summary);
+    expect(out.map((r) => r.presenceState)).toEqual(["ok", "ok"]);
+    expect(out[0]!.presence.id).toBe("agent-a");
+    expect(out[0]!.lastSeen).toBe("active (5m ago)");
+    expect(out[1]!.presence).toBeNull();
+    expect(out[1]!.lastSeen).toBe("never seen");
   });
 });

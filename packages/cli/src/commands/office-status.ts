@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { activityState, orgEventReadNotice, readOrgEvents, type OrgEventRecord } from "../utils/org-event-read.js";
+import { presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
 
 interface FlairAgent {
   id?: string;
@@ -53,7 +53,6 @@ const green  = (t: string, nc: boolean) => esc(32, t, nc);
 const yellow = (t: string, nc: boolean) => esc(33, t, nc);
 const cyan   = (t: string, nc: boolean) => esc(36, t, nc);
 const dim    = (t: string, nc: boolean) => esc(2,  t, nc);
-const red    = (t: string, nc: boolean) => esc(31, t, nc);
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 function makeAuth(viewerId: string, keyPath: string, method: string, urlPath: string): string | undefined {
@@ -131,26 +130,31 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     else { console.error(`Flair unreachable at ${flairUrl} (HTTP ${res.status})`); process.exit(1); }
   } catch { console.error(`Flair unreachable at ${flairUrl}. Is it running?`); process.exit(1); }
 
-  // Recent OrgEvents for task + heartbeat status: the viewer's catch-up feed
-  // over the last 6h (see utils/org-event-read.ts). A read that does not return
-  // the events is reported, and the task column says "unavailable", not "idle".
-  const read = await readOrgEvents({ flairUrl, viewerId, since: new Date(Date.now() - 6 * 3_600_000), sign: a });
-  const notice = orgEventReadNotice(flairUrl, read);
+  // Per-agent presence for the last-seen and activity columns: Flair's
+  // office-wide Presence roster (see utils/presence-read.ts), each agent's own
+  // heartbeat. A read that does not return the roster is reported, and the
+  // columns say "unavailable", not "never seen" / "idle".
+  const read = await readPresence({ flairUrl, sign: a });
+  const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);
-  const activity = activityState(read);
-  const events = read.status === "ok" ? read.events : [];
+  const presenceByAgent = new Map<string, PresenceRecord>();
+  for (const rec of read.status === "ok" ? read.agents : []) presenceByAgent.set(rec.id, rec);
+  const state = presenceState(read);
 
-  // Per-agent newest task event of the kinds task.assigned, task.started and
-  // task.completed (other task kinds, such as task.failed, are not considered),
-  // and newest heartbeat event. The feed is oldest first, so a later event
-  // replaces an earlier one.
-  const lastTask   = new Map<string, OrgEventRecord>();
-  const lastHbTime = new Map<string, string>();
-  for (const ev of events) {
-    const id = ev.authorId;
-    if (["task.assigned","task.completed","task.started"].includes(ev.kind)) lastTask.set(id, ev);
-    if (ev.kind === "agent.heartbeat") lastHbTime.set(id, ev.createdAt);
-  }
+  const lastSeenText = (id: string): string => {
+    if (state === "unavailable") return "unavailable";
+    const rec = presenceByAgent.get(id);
+    return rec ? `${rec.presenceStatus} (${relativeAgo(rec.lastHeartbeatAt)})` : "never seen";
+  };
+  // What the agent is doing: its last asserted current task, else its activity
+  // (labelled "was: …" once the Presence record has gone stale).
+  const doingText = (id: string): string => {
+    if (state === "unavailable") return "unavailable";
+    const rec = presenceByAgent.get(id);
+    if (!rec) return "never seen";
+    if (rec.currentTask) return rec.currentTask;
+    return rec.activityFresh ? rec.activity : `was: ${rec.lastActivity ?? rec.activity}`;
+  };
 
   // Fetch open PRs
   const openPrs: PrInfo[] = repo ? fetchOpenPrs(ghAgent, repo) : [];
@@ -161,9 +165,10 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
       const id = ag.id ?? ag.agentId ?? "?";
       return {
         id, name: ag.name, role: ag.role, model: ag.model, status: ag.status,
-        lastHeartbeat: ag.lastHeartbeat ?? lastHbTime.get(id),
-        lastTask: lastTask.get(id),
-        activity,
+        presence: presenceByAgent.get(id) ?? null,
+        lastSeen: lastSeenText(id),
+        doing: doingText(id),
+        presenceState: state,
         cursorSince: loadCursorIso(id),
         git: gitBranchStatus(ag.workspace),
       };
@@ -178,7 +183,7 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   console.log(`${bold("⚒️  TPS Office", nc)}  ${dim(now, nc)}`);
   console.log(dim("─".repeat(74), nc));
   console.log(
-    dim(`  ${"AGENT".padEnd(12)} ${"ROLE".padEnd(26)} ${"MODEL".padEnd(18)} ${"HEARTBEAT".padEnd(12)} TASK`, nc)
+    dim(`  ${"AGENT".padEnd(12)} ${"ROLE".padEnd(26)} ${"MODEL".padEnd(18)} ${"LAST SEEN".padEnd(20)} ACTIVITY`, nc)
   );
   console.log(dim("─".repeat(74), nc));
 
@@ -187,20 +192,13 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     const name = (ag.name ?? id).padEnd(12);
     const role = (ag.role ?? "?").padEnd(26);
     const model= ((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
-    const hbIso= ag.lastHeartbeat ?? lastHbTime.get(id);
-    const hb   = (!hbIso && activity === "unavailable" ? "unavailable" : relTime(hbIso)).padEnd(12);
+    const rec  = presenceByAgent.get(id);
+    const lastSeen = lastSeenText(id);
+    const doing = doingText(id);
     const dot  = ag.status === "active" ? green("●", nc) : yellow("○", nc);
-    const task = lastTask.get(id);
-    const partial = activity === "incomplete" ? dim(" (incomplete)", nc) : "";
-    const taskStr = activity === "unavailable"
-      ? dim("unavailable", nc)
-      : task
-        ? (task.kind === "task.completed"
-            ? green("✓ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)
-            : yellow("→ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)) + partial
-        : dim(activity === "incomplete" ? "incomplete" : "idle", nc);
+    const doingColored = state !== "unavailable" && rec?.currentTask ? cyan(doing, nc) : dim(doing, nc);
 
-    console.log(`${dot} ${cyan(name, nc)} ${role} ${dim(model, nc)} ${hb} ${taskStr}`);
+    console.log(`${dot} ${cyan(name, nc)} ${role} ${dim(model, nc)} ${lastSeen.padEnd(20)} ${doingColored}`);
 
     // Sub-lines: git + cursor
     const git = gitBranchStatus(ag.workspace);
@@ -225,11 +223,6 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
       }
     }
   }
-
-  // Blockers: the newest one read.
-  let blocker: OrgEventRecord | undefined;
-  for (const e of events) if (e.kind === "blocker") blocker = e;
-  if (blocker) console.log(`  ${red(`⚠ BLOCKER: ${blocker.summary}`, nc)}`);
 
   console.log();
 }

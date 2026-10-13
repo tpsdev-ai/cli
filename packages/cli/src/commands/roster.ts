@@ -5,7 +5,7 @@ import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js
 import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { activityState, orgEventReadNotice, readOrgEvents, type OrgEventRecord } from "../utils/org-event-read.js";
+import { presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
 
 interface RosterArgs {
   action: "list" | "show" | "find" | "invite";
@@ -260,64 +260,46 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
     return;
   }
 
-  // Recent OrgEvents for the activity column: the viewer's catch-up feed over
-  // the last 24h (see utils/org-event-read.ts). A read that does not return the
-  // events is reported, and the column says "unavailable", not "no activity".
-  const read = await readOrgEvents({
-    flairUrl,
-    viewerId,
-    since: new Date(Date.now() - 24 * 60 * 60 * 1000),
-    sign: makeAuth,
-  });
-  const notice = orgEventReadNotice(flairUrl, read);
+  // Per-agent presence for the last-seen column: Flair's office-wide Presence
+  // roster (see utils/presence-read.ts). It holds each agent's own heartbeat —
+  // not the viewer's catch-up feed. A read that does not return the roster is
+  // reported, and the column says "unavailable", not "never seen".
+  const read = await readPresence({ flairUrl, sign: makeAuth });
+  const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);
-  const activity = activityState(read);
+  const presenceByAgent = new Map<string, PresenceRecord>();
+  for (const rec of read.status === "ok" ? read.agents : []) presenceByAgent.set(rec.id, rec);
+  const state = presenceState(read);
 
-  // Per-agent newest event of any kind, and newest task event of the kinds
-  // task.assigned and task.completed (other task kinds, such as task.failed,
-  // are not considered). The feed is oldest first, so a later event replaces an
-  // earlier one.
-  const lastEvent = new Map<string, OrgEventRecord>();
-  const lastTask = new Map<string, OrgEventRecord>();
-  for (const ev of read.status === "ok" ? read.events : []) {
-    lastEvent.set(ev.authorId, ev);
-    if (ev.kind === "task.assigned" || ev.kind === "task.completed") lastTask.set(ev.authorId, ev);
-  }
+  const lastSeenText = (agId: string): string => {
+    if (state === "unavailable") return "unavailable";
+    const rec = presenceByAgent.get(agId);
+    return rec ? `${rec.presenceStatus} (${relativeAgo(rec.lastHeartbeatAt)})` : "never seen";
+  };
 
   if (opts.json) {
-    console.log(JSON.stringify(agents.map(a => ({
-      ...a,
-      lastEvent: lastEvent.get(a.id ?? a.agentId ?? ""),
-      lastTask: lastTask.get(a.id ?? a.agentId ?? ""),
-      activity,
-    })), null, 2));
+    console.log(JSON.stringify(agents.map(a => {
+      const agId = a.id ?? a.agentId ?? "";
+      return {
+        ...a,
+        presence: presenceByAgent.get(agId) ?? null,
+        lastSeen: lastSeenText(agId),
+        presenceState: state,
+      };
+    }), null, 2));
     return;
   }
 
   // Pretty print
-  const now = Date.now();
   console.log(`\n⚒️  TPS Office Dashboard — ${agents.length} agents\n`);
-  console.log(`${"Agent".padEnd(16)} ${"Role".padEnd(12)} ${"Status".padEnd(10)} ${"Last Activity"}`);
+  console.log(`${"Agent".padEnd(16)} ${"Role".padEnd(12)} ${"Status".padEnd(10)} ${"Last Seen"}`);
   console.log("─".repeat(72));
 
   for (const agent of agents) {
-    const agId = agent.id ?? agent.agentId ?? "?"; const last = lastEvent.get(agId);
-    const task = lastTask.get(agId);
-    const ago = activity === "unavailable"
-      ? "unavailable"
-      : last
-        ? (() => {
-            const ms = now - new Date(last.createdAt).getTime();
-            const when = ms < 60000 ? `${Math.round(ms / 1000)}s ago`
-              : ms < 3600000 ? `${Math.round(ms / 60000)}m ago`
-              : `${Math.round(ms / 3600000)}h ago`;
-            return activity === "incomplete" ? `${when} (incomplete)` : when;
-          })()
-        : activity === "incomplete" ? "incomplete" : "no activity";
-    const taskInfo = task ? ` [${task.kind}: ${(task.refId ?? task.summary).slice(0, 30)}]` : "";
+    const agId = agent.id ?? agent.agentId ?? "?";
     const status = agent.status ?? "unknown";
     console.log(
-      `${agId.padEnd(16)} ${(agent.role ?? "agent").padEnd(12)} ${status.padEnd(10)} ${ago}${taskInfo}`
+      `${agId.padEnd(16)} ${(agent.role ?? "agent").padEnd(12)} ${status.padEnd(10)} ${lastSeenText(agId)}`
     );
   }
   console.log();

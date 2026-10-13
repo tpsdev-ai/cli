@@ -82,7 +82,7 @@ describe("cli#486 — configured identity, no anvil default", () => {
 
       process.env.TPS_AGENT_ID = "kern";
       await expect(runDashboard({ flairUrl: stub.url })).resolves.toBeUndefined();
-      expect(requests).toEqual(["/Agent/", "/OrgEventCatchup/kern"]);
+      expect(requests).toEqual(["/Agent/", "/Presence"]);
     } finally {
       fetchSpy.mockRestore();
       stub.stop();
