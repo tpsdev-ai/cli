@@ -247,7 +247,7 @@ describe("cli#620 — office status reads the OrgEvent catch-up feed", () => {
   test.each([
     ["an array body", () => Response.json([NEWER]), "not an object"],
     ["an event missing a field", () => Response.json({ events: [{ ...NEWER, authorId: 7 }], hasMore: false }), "an event lacks a field the command reads"],
-    ["a page with no cursor", () => Response.json({ events: [NEWER], hasMore: true }), "nextAfter is missing"],
+    ["a page with no cursor", () => Response.json({ events: [{ ...NEWER, position: `${NEWER.createdAt}\t${NEWER.id}` }], hasMore: true }), "nextAfter is missing"],
   ])("a malformed response (%s) is reported, and the task column reads unavailable", async (_label, answer, note) => {
     const out = await status(answer);
     expect(out).toContain(`Cannot read OrgEvents from ${stub.url} (malformed response (${note})); activity is unavailable.`);

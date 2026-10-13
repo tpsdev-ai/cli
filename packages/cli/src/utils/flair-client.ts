@@ -100,11 +100,12 @@ export interface OrgEvent {
 /**
  * The result of an OrgEvent catch-up read: the discriminated shape
  * `readOrgEvents` returns (see org-event-read.ts). `ok` carries the events in
- * feed order and the `nextAfter` position to resume from; `unavailable`
- * carries a bounded reason. An empty feed is `ok` with no events.
+ * feed order, the `nextAfter` position to resume from and, when the response
+ * had a valid `Date` header, the server's time; `unavailable` carries a
+ * bounded reason. An empty feed is `ok` with no events.
  */
 export type EventsSinceRead =
-  | { status: "ok"; events: OrgEvent[]; complete: boolean; nextAfter: string }
+  | { status: "ok"; events: OrgEvent[]; complete: boolean; nextAfter: string; serverTime?: string }
   | { status: "unavailable"; reason: string };
 
 export interface FlairAgent {
