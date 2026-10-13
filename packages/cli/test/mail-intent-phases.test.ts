@@ -1,7 +1,7 @@
 /**
- * cli#617 slice (a): the CLI's readers of placement intents keep any intent
- * whose phase is not `placing`. Nothing writes `in_progress` or `failed` yet, so
- * these fixtures write them directly over a committed placement.
+ * cli#617 slice (a): the CLI lease sweep and promotion keep any intent whose
+ * declared phase is not `placing`. Nothing writes `in_progress` or `failed` yet,
+ * so these fixtures write them directly over a committed placement.
  */
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
@@ -163,4 +163,24 @@ describe("retention: a failed intent is kept; its payload follows ordinary cur/ 
       expect(f.intentNow()).toBe(f.intentBytes);
     });
   }
+
+  test("failed: once archiveOldCur archives the payload, a different message at the same name is delivered and the marker moves to a tombstone", async () => {
+    const f = committed(FAILED);
+    fs.rmSync(f.source);
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    fs.utimesSync(f.cur, old, old);
+    expect(mail.archiveOldCur(agent)).toBe(1);
+    const other = buildSignedEnvelope("kern", agent, "reused", { kern: seed }, { messageId: "reused-name-id" });
+    fs.writeFileSync(f.source, JSON.stringify({
+      id: "reused-record", from: "kern", to: agent, body: JSON.stringify(other), timestamp: other.timestamp,
+    }));
+
+    expect((await mail.checkMessages(agent)).map((m) => m.body)).toEqual(["reused"]);
+
+    expect(fs.existsSync(f.source)).toBe(false);
+    expect(textOf(f.intent.replace(/\.json$/, `.failed-${f.envelope.messageId}.json`))).toBe(f.intentBytes);
+    expect(f.intentNow()).toBeNull();
+    expect(hasCommittedMessageId(f.inbox.root, f.envelope.messageId)).toBe(true);
+    expect(hasCommittedMessageId(f.inbox.root, "reused-name-id")).toBe(true);
+  });
 });

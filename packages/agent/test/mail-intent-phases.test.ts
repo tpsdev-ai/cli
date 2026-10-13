@@ -1,12 +1,12 @@
 /**
- * cli#617 slice (a): placement intents carry a phase, and every reader keeps an
- * intent whose phase is not `placing`. Nothing writes `in_progress` or `failed`
- * yet, so these fixtures write them directly.
+ * cli#617 slice (a): placement intents carry a phase, and MailClient recovery
+ * and the store keep an intent whose declared phase is not `placing`. Nothing
+ * writes `in_progress` or `failed` yet, so these fixtures write them directly.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ed from "@noble/ed25519";
@@ -106,7 +106,7 @@ const PRESERVED: Record<string, Record<string, unknown>> = {
 describe("agent recovery keeps an intent it does not own (io/mail.ts recoverInterruptedPlacements)", () => {
   for (const [name, fields] of Object.entries(PRESERVED)) {
     for (const copy of ["present", "absent"] as const) {
-      test(`${name}, cur copy ${copy}: not read, finished, presented or quarantined; other mail flows`, async () => {
+      test(`${name}, cur copy ${copy}: skipped at listing, not presented, finished or quarantined; other mail flows`, async () => {
         const bytes = committed(`phase-${copy}`, fields);
         if (copy === "absent") unlinkSync(cur());
         const payload = copy === "present" ? textOf(cur()) : null;
@@ -118,7 +118,7 @@ describe("agent recovery keeps an intent it does not own (io/mail.ts recoverInte
 
         expect(intentText()).toBe(bytes.toString("utf8"));
         expect(quarantined()).toBe(false);
-        expect(verifierCalls).toBe(1); // the unrelated message only: the kept payload is never verified
+        expect(verifierCalls).toBe(1); // the unrelated message only: a phase seen at listing skips the payload
         expect(textOf(cur())).toBe(payload);
         expect(jsonFiles(join(root, "dlq"))).toEqual([]);
       });
@@ -147,7 +147,7 @@ describe("agent recovery keeps an intent it does not own (io/mail.ts recoverInte
 
 describe("the quarantine path keeps an unknown phase (mailbox-policy.ts readPlacementIntent)", () => {
   for (const [name, fields] of Object.entries(PRESERVED).filter(([n]) => n !== "in_progress")) {
-    test(`${name} is listed as unknown, gates its own file and is never quarantined`, () => {
+    test(`${name} is listed as unknown, gates its own file and is not quarantined for its phase`, () => {
       const bytes = committed("kept-unknown", fields);
       const replay = mailboxReplayStore(root);
       expect(pendingPlacementEntries(root)).toEqual([{ messageId: "kept-unknown", file: "m1.json", phase: "unknown" }]);
@@ -177,6 +177,48 @@ describe("a failed intent is terminal and does not close the gate", () => {
     expect(textOf(cur())).toBe(payload);
     expect(intentText()).toBe(bytes.toString("utf8"));
     expect(hasCommittedMessageId(root, "poisoned")).toBe(true);
+  });
+
+  const FAILED = { version: 1, phase: "failed", presentations: 5, firstPresentedAt: now() };
+  const tombstone = (id: string) => intentPath().replace(/\.json$/, `.failed-${id}.json`);
+
+  test("once the failed payload is archived, a different message at the same name is delivered; the marker moves to a tombstone that keeps its consumed ID", async () => {
+    const bytes = committed("poisoned", FAILED);
+    const archived = join(root, "archive", "2026-01");
+    mkdirSync(archived, { recursive: true });
+    renameSync(cur(), join(archived, "m1.json")); // what archiveOldCur does with an aged cur/ record
+    signedRecord(fresh(), "reused-name");
+
+    const c = client();
+    expect(ids(await c.checkNewMail())).toEqual(["reused-name"]);
+    expect(await c.checkNewMail()).toEqual([]);
+
+    expect(existsSync(fresh())).toBe(false);
+    expect(textOf(tombstone("poisoned"))).toBe(bytes.toString("utf8"));
+    expect(intentText()).toBeNull();
+    expect(pendingPlacementEntries(root)).toEqual([]);
+    expect(hasCommittedMessageId(root, "reused-name")).toBe(true);
+
+    // The tombstone keeps the old consumed ID through a ledger prune.
+    const old = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString();
+    writeFileSync(join(root, "consumed.jsonl"), `${[
+      JSON.stringify({ id: "poisoned", at: old }), JSON.stringify({ id: "reused-name", at: now() }),
+    ].join("\n")}\n`);
+    expect(mailboxReplayStore(root).isConsumed("absent-id")).toBe(false);
+    expect(hasCommittedMessageId(root, "poisoned")).toBe(true);
+  });
+
+  test("while the failed payload is still in cur/, a different message at the same name waits and the marker stays", async () => {
+    const bytes = committed("poisoned", FAILED);
+    const payload = textOf(cur());
+    signedRecord(fresh(), "reused-too-soon");
+
+    expect(await client().checkNewMail()).toEqual([]);
+
+    expect(existsSync(fresh())).toBe(true);
+    expect(intentText()).toBe(bytes.toString("utf8"));
+    expect(textOf(cur())).toBe(payload);
+    expect(existsSync(tombstone("poisoned"))).toBe(false);
   });
 });
 

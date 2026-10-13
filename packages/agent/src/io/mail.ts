@@ -73,10 +73,12 @@ function sameFileByDeviceInode(a: string, b: string): boolean {
 }
 
 /**
- * cli#617 slice (a): recovery resumes only a `placing` intent. An intent in any
- * other phase (`in_progress`, or one this reader does not understand) is left
- * exactly as it is: its payload is not read, verified, presented or finished.
- * Slice (b) defines the re-presentation of `in_progress`.
+ * cli#617 slice (a): recovery resumes only a `placing` intent. An intent that
+ * declares any other phase (`in_progress`, or one this reader does not
+ * understand) is never presented or finished: a phase seen in the listing skips
+ * the record before its payload is read, and the under-lock recheck catches a
+ * phase that changed after the payload was read and verified. Slice (b) defines
+ * the re-presentation of `in_progress`.
  */
 function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";

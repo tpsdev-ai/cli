@@ -222,7 +222,11 @@ const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
  */
 export interface ReplayStore {
   isConsumed(messageId: string, pendingFile?: string): boolean;
-  /** Write a `placing` intent. Refuses to replace an intent in any other phase. */
+  /**
+   * Write a `placing` intent. Refuses to replace an intent in any other phase,
+   * except that a `failed` marker for a different message moves to its
+   * tombstone once its payload has left cur/ (cli#617).
+   */
   beginPlacement(messageId: string, file: string, sourcePath?: string): void;
   ownsPendingPlacement(messageId: string, file: string): boolean;
   /** A live (not `failed`) intent for this messageId names `file`. */
@@ -329,17 +333,22 @@ function quarantinePlacement(path: string): void {
 }
 
 /**
- * The phase of a placement intent (cli#617 design rev 2).
+ * The phase a placement intent DECLARES (cli#617 design rev 2). phaseOf reads
+ * the declaration; it does not prove the state behind it.
  *
- * - `placing`: a commit in flight. An intent without a `phase` is `placing`, so
- *   every intent written before phases existed reads exactly as before.
- * - `in_progress`: committed, and its handler has not completed.
- * - `failed`: terminal (the liveness bound was reached). It is not pending: it
- *   never closes the per-file gate and is never listed for recovery. The intent
- *   file is kept until an operator removes it.
+ * - `placing`: declares a commit in flight. An intent without a `phase` is
+ *   `placing`, so every intent written before phases existed reads as before.
+ * - `in_progress`: declares a committed message whose handler has not completed.
+ * - `failed`: declares a terminal message (its liveness bound was reached). It
+ *   is not pending: it never closes the per-file gate and is never listed for
+ *   recovery. When a different message needs the same basename and the old
+ *   payload has left cur/, the marker moves to its tombstone name
+ *   (failedTombstonePath) and the new placement proceeds; otherwise it stays.
+ *   Either way it is kept until an operator removes it.
  * - `unknown`: a phase, schema version or phase field this reader does not
- *   understand. It is preserved: never finished, replaced, presented or
- *   quarantined, and it keeps its file's gate closed.
+ *   understand. The store never finishes or replaces it, MailClient recovery,
+ *   the CLI lease sweep and CLI promotion never present it, and it is not
+ *   quarantined solely for that field. It keeps its own file's gate closed.
  *
  * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
  */
@@ -364,7 +373,11 @@ function isPlainBasename(file: string): boolean {
   return file !== "" && file !== "." && file !== ".." && !/[/\\\0]/.test(file);
 }
 
-/** Read the phase from a parsed intent. Anything not understood is `unknown`, never malformed. */
+/**
+ * Read the declared phase from a parsed intent. An unfamiliar phase, version or
+ * liveness field reads as `unknown`, not as malformed; a malformed identity or
+ * basename is still malformed (parsePlacement).
+ */
 function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   if (intent.version !== undefined && intent.version !== PLACEMENT_INTENT_VERSION) return "unknown";
   const presentations = intent.presentations;
@@ -386,7 +399,8 @@ function isLivePlacement(intent: PlacementIntent | null): boolean {
 
 /**
  * Parse an intent, or null when it is malformed: the name, messageId and
- * identity must hold. The phase never makes an intent malformed (see phaseOf).
+ * identity must hold. An unfamiliar phase, version or liveness field alone
+ * never makes an intent malformed (see phaseOf).
  */
 function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
@@ -423,6 +437,29 @@ function readPlacementIntent(root: string, file: string): PlacementIntent | null
   return intent;
 }
 
+/**
+ * Where a retired `failed` marker for `file` is kept (cli#617):
+ * `.placement-<sha256(file)>.failed-<messageId>.json`. A tombstone never gates
+ * delivery and is never listed for recovery; it keeps its message ID retained
+ * in the consumed ledger (pendingPlacementIds) and stays until an operator
+ * removes it.
+ */
+function failedTombstonePath(root: string, file: string, messageId: string): string {
+  return `${placementIntentPath(root, file).slice(0, -".json".length)}.failed-${messageId}.json`;
+}
+
+const FAILED_TOMBSTONE_NAME = /^\.placement-[a-f0-9]{64}\.failed-(.+)\.json$/;
+
+function isAbsent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (err) {
+    if (isMissing(err)) return true;
+    throw err;
+  }
+}
+
 function syncDirectory(root: string): void {
   const fd = openSync(root, "r");
   try { fsyncSync(fd); } finally { closeSync(fd); }
@@ -433,9 +470,19 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
   if (!isPlainBasename(file)) throw new Error("placement file is not a plain basename");
   const path = placementIntentPath(root, file);
   const existing = readPlacementIntent(root, file);
-  if (existing && existing.messageId !== messageId) throw new Error(`placement intent for ${file} names another message`);
-  // cli#617: only a `placing` intent is rewritten; any other phase is kept.
-  if (existing && existing.phase !== "placing") throw new Error(`placement intent for ${file} is ${existing.phase}; not replaced`);
+  if (existing && existing.messageId !== messageId) {
+    // cli#617: a `failed` marker yields its basename to a different message once
+    // its payload has left cur/. The marker moves to its tombstone, keeping the
+    // operator's record and the old consumed ID, and this placement proceeds.
+    if (existing.phase !== "failed" || !isAbsent(join(root, "cur", file))) {
+      throw new Error(`placement intent for ${file} names another message`);
+    }
+    renameSync(path, failedTombstonePath(root, file, existing.messageId));
+    syncDirectory(root);
+  } else if (existing && existing.phase !== "placing") {
+    // cli#617: only a `placing` intent is rewritten; any other phase is kept.
+    throw new Error(`placement intent for ${file} is ${existing.phase}; not replaced`);
+  }
   let identity: PlacementIntent["identity"];
   if (sourcePath !== undefined) {
     const stat = lstatSync(sourcePath, { bigint: true });
@@ -461,6 +508,12 @@ function pendingPlacementIds(root: string, quarantine = false): { ids: Set<strin
   const blocked = new Set<string>();
   let retainAll = false;
   for (const name of readdirSync(root)) {
+    // A retired `failed` marker keeps its message ID retained, by its name alone.
+    const tombstone = FAILED_TOMBSTONE_NAME.exec(name);
+    if (tombstone) {
+      if (isValidEnvelopeId(tombstone[1])) ids.add(tombstone[1]);
+      continue;
+    }
     if (!/^\.placement-[a-f0-9]{64}\.json(?:\.quarantined)?$/.test(name)) continue;
     const path = join(root, name.replace(/\.quarantined$/, ""));
     const raw = readFileSync(join(root, name), "utf8");
