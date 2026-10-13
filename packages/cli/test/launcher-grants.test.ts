@@ -26,8 +26,8 @@ describe("sandboxHomeBase", () => {
       try {
         symlinkSync(realpathSync("/var/tmp"), link);
       } catch (err) {
-        console.warn(`symlink creation refused, case skipped: ${err}`);
-        return;
+        const code = (err as NodeJS.ErrnoException).code ?? "unknown";
+        throw new Error(`cannot set up this case: symlinkSync(${link}) refused with ${code}`);
       }
       expect(sandboxHomeBase([link])).toBe(realpathSync("/var/tmp"));
     } finally {
@@ -93,8 +93,8 @@ describe("launcherGrantCovering", () => {
       try {
         symlinkSync("/tmp", link);
       } catch (err) {
-        console.warn(`symlink creation refused, case skipped: ${err}`);
-        return;
+        const code = (err as NodeJS.ErrnoException).code ?? "unknown";
+        throw new Error(`cannot set up this case: symlinkSync(${link}) refused with ${code}`);
       }
       expect(launcherGrantCovering(join(link, "a"))).toBe("/tmp");
       expect(launcherGrantCovering(realpathSync("/tmp"))).toBe("/tmp");
