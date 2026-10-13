@@ -15,6 +15,7 @@ import {
   mailboxReplayStore,
   parseSignedEnvelope,
   pendingPlacementEntries,
+  type PlacementPhase,
   placeCurRecord,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
@@ -70,6 +71,19 @@ function sameFileByDeviceInode(a: string, b: string): boolean {
   const sa = lstatOrAbsent(a);
   const sb = lstatOrAbsent(b);
   return sa !== null && sb !== null && sa.dev === sb.dev && sa.ino === sb.ino;
+}
+
+/**
+ * cli#617 slice (a): recovery resumes only an intent whose phase resolves to
+ * `placing` (phaseOf). One that resolves to any other phase (`in_progress`, or
+ * `unknown`: an unsupported value in a recognized field) is never presented or
+ * finished. A phase seen in the listing skips the record before its payload
+ * is read, and the under-lock recheck catches a phase that changed after the
+ * payload was read and verified. Slice (b) defines the re-presentation of
+ * `in_progress`.
+ */
+function resumableOnRecovery(phase: PlacementPhase | null): boolean {
+  return phase === "placing";
 }
 
 function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
@@ -295,7 +309,7 @@ export class MailClient {
    * withholds delivery; the new/ scan cannot replace that intent.
    */
   private async recoverInterruptedPlacements(messages: MailMessage[]): Promise<void> {
-    let pending: Array<{ messageId: string; file: string }>;
+    let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
     let listing: MailLock | null = null;
     try {
       listing = await acquireMailLock(this.mailboxRoot);
@@ -315,7 +329,8 @@ export class MailClient {
       listing?.release();
     }
 
-    for (const { messageId, file } of pending) {
+    for (const { messageId, file, phase } of pending) {
+      if (!resumableOnRecovery(phase)) continue;
       const curPath = join(this.inboxCur, file);
       try {
         let bytes: Buffer;
@@ -352,6 +367,7 @@ export class MailClient {
     try {
       const replay = mailboxReplayStore(this.mailboxRoot);
       if (!replay.hasPendingPlacement(messageId, file)) return;
+      if (!resumableOnRecovery(replay.placementPhase(file))) return;
       if (lstatOrAbsent(join(this.inboxCur, file)) !== null) return;
       replay.finishPlacement(messageId, file);
     } finally {
@@ -375,6 +391,7 @@ export class MailClient {
       const replay = mailboxReplayStore(this.mailboxRoot);
       // Match the intent, recorded device/inode and pre-verification raw bytes.
       if (!replay.hasPendingPlacement(messageId, file)) return null;
+      if (!resumableOnRecovery(replay.placementPhase(file))) return null;
       if (envelope.messageId !== messageId) return null;
       if (!replay.ownsPendingPlacement(messageId, file)) return null;
       let current: Buffer;

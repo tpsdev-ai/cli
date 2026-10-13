@@ -6,7 +6,7 @@
  * (HTTP 403) and how office-status reports it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createPatchShared } from "./helpers/patch-shared.js";
@@ -200,5 +200,59 @@ describe("cli#622 — office status reads the Presence roster", () => {
     expect(agents[0]!.doing).toBe("reviewing a PR");
     expect(agents[1]!.presence).toBeNull();
     expect(agents[1]!.lastSeen).toBe("never seen");
+  });
+});
+
+/**
+ * cli#624 — the task loop persists its cursor as `{ position, updatedAt }`;
+ * earlier releases wrote `{ since }`. Office status reads a real cursor file
+ * under the current HOME in either format and shows the cursor's timestamp:
+ * the position's createdAt, or the legacy since.
+ */
+describe("cli#624 — office status reads the task loop cursor in either format", () => {
+  const savedHome = process.env.HOME;
+  beforeEach(() => {
+    process.env.HOME = root;
+  });
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+  });
+
+  function writeCursor(agentId: string, content: string): void {
+    mkdirSync(join(root, ".tps", "cursors"), { recursive: true });
+    writeFileSync(join(root, ".tps", "cursors", `${agentId}-task-loop.json`), content);
+  }
+  const jsonAgents = () =>
+    (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
+
+  test.each([
+    ["the position format", (ts: string) => ({ position: `${ts}\te9`, updatedAt: new Date().toISOString() })],
+    ["the legacy since format", (ts: string) => ({ since: ts })],
+  ])("a cursor in %s gives its timestamp in JSON and its age in the table", async (_label, body) => {
+    const ts = new Date(Date.now() - 7 * 60_000).toISOString();
+    writeCursor("agent-a", JSON.stringify(body(ts)));
+
+    await runOfficeStatus({ ...baseOpts(), json: true });
+    const agents = jsonAgents();
+    expect(agents.find((a) => a.id === "agent-a")!.cursorSince).toBe(ts);
+    expect(agents.find((a) => a.id === "agent-b")!.cursorSince).toBeNull();
+
+    output.length = 0;
+    await runOfficeStatus(baseOpts());
+    expect(output.join("\n")).toContain("cursor: 7m ago");
+  });
+
+  test.each([
+    ["not JSON", "{not json"],
+    ["neither a position nor a since", JSON.stringify({ updatedAt: new Date().toISOString() })],
+    ["a position with no parseable timestamp", JSON.stringify({ position: "not-a-date\te9" })],
+  ])("a cursor file holding %s shows no cursor", async (_label, content) => {
+    writeCursor("agent-a", content);
+    await runOfficeStatus({ ...baseOpts(), json: true });
+    expect(jsonAgents().find((a) => a.id === "agent-a")!.cursorSince).toBeNull();
+    output.length = 0;
+    await runOfficeStatus(baseOpts());
+    expect(output.join("\n")).not.toContain("cursor:");
   });
 });

@@ -322,8 +322,9 @@ async function resolveModelFromHeartbeat(agentId: string): Promise<string | null
   try {
     const flair = createFlairClient(agentId, undefined, join(homeDir(), ".tps", "identity", `${agentId}.key`));
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const events = await flair.getEventsSince(agentId, since);
-    const heartbeat = events
+    const read = await flair.getEventsSince(agentId, since);
+    if (read.status !== "ok") return null;
+    const heartbeat = read.events
       .filter((event) => event.kind === "agent.heartbeat")
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     return heartbeat ? extractModelFromHeartbeatEvent(heartbeat) : null;

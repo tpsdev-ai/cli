@@ -55,7 +55,7 @@ export {
   pendingPlacementEntries,
   placeCurRecord,
 } from "./lib/mailbox-policy.js";
-export type { MailboxPolicyRejectClass, MailboxPolicyResult, ReplayStore, FirstDelivery } from "./lib/mailbox-policy.js";
+export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery } from "./lib/mailbox-policy.js";
 export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
 export type { MailLock } from "./lib/mail-lock.js";
 export {

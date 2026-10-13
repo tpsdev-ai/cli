@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { cursorFilePosition, positionTimestamp, taskLoopCursorPath } from "../utils/flair-task-loop.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 import { presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
 
@@ -80,10 +81,18 @@ function fetchOpenPrs(ghAgent: string, repo: string): PrInfo[] {
 }
 
 // ── Cursor age ────────────────────────────────────────────────────────────────
+/**
+ * The timestamp of the agent's task loop cursor: the createdAt of the feed
+ * position it persisted (`{ position }`), or a legacy `{ since }`. Null when
+ * there is no cursor file or it holds neither.
+ */
 function loadCursorIso(agentId: string): string | null {
-  const p = join(homedir(), ".tps", "cursors", `${agentId}-task-loop.json`);
+  const p = taskLoopCursorPath(agentId);
   if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, "utf-8")).since ?? null; } catch { return null; }
+  try {
+    const position = cursorFilePosition(JSON.parse(readFileSync(p, "utf-8")));
+    return position === undefined ? null : positionTimestamp(position);
+  } catch { return null; }
 }
 
 // ── Relative time ─────────────────────────────────────────────────────────────
