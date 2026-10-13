@@ -1,21 +1,21 @@
 /**
  * mail-client-lock-namespace.test.ts — cli#616.
  *
- * MailClient must derive its relay lock namespace from its configured `mailDir`,
- * resolved to a real path, so it shares one namespace with CLI relay acceptance
- * when both reach the same physical store by different paths (here a symlink vs
- * the store itself). The process environment is deliberately set to a different
- * path: it must not select the namespace.
+ * MailClient must take its acceptance stripe from its configured `mailDir`, not
+ * from the process environment, which is set here to a different root. The
+ * stripe holder reaches the store through a symlink and MailClient through the
+ * store itself; that pair reaches one filesystem lock either way. The namespace
+ * case checks that the derived lock root strings are equal as well.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
 import { relayAcceptanceLockRoot } from "../src/lib/relay-lock.js";
 import { canonicalMailRoot, mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
+import { senderKeyResolver, signedRelayRecord } from "./helpers/signed-relay-record.js";
 
 const AGENT = "mailbox";
 const BRANCH = "remote";
@@ -49,21 +49,21 @@ afterEach(() => {
 });
 
 function client(): MailClient {
-  const seed = Buffer.alloc(32, 1);
-  return new MailClient(store, undefined, AGENT, {
-    async getAgent() {
-      return { publicKey: Buffer.from(ed.getPublicKey(seed)) };
-    },
-  });
+  return new MailClient(store, undefined, AGENT, senderKeyResolver());
+}
+
+/** Write `raw` as a source record in the mailbox's new/ directory. */
+function seedSource(file: string, raw: string): string {
+  const dir = join(store, AGENT, "new");
+  mkdirSync(dir, { recursive: true });
+  const source = join(dir, file);
+  writeFileSync(source, raw);
+  return source;
 }
 
 /** A relayed, unverifiable source record in the mailbox's new/ directory. */
 function seedRelayedSource(): string {
-  const dir = join(store, AGENT, "new");
-  mkdirSync(dir, { recursive: true });
-  const source = join(dir, "dl.json");
-  writeFileSync(source, JSON.stringify({ from: "sender", body: "invalid", relayDelivery: { branchId: BRANCH, id: ID } }));
-  return source;
+  return seedSource("dl.json", JSON.stringify({ from: "sender", body: "invalid", relayDelivery: { branchId: BRANCH, id: ID } }));
 }
 
 /** Hold the acceptance stripe through `mailRoot`, as CLI relay acceptance does. */
@@ -111,6 +111,24 @@ test("MailClient leaves a relayed dead-letter source until acceptance releases t
   expect(existsSync(join(store, AGENT, "dlq", "dl.json"))).toBe(true);
 });
 
+test("MailClient leaves a valid relayed record in new/ until acceptance releases the stripe, then promotes it", async () => {
+  const raw = signedRelayRecord(AGENT, "promoted", { branchId: BRANCH, id: ID });
+  const source = seedSource("pr.json", raw);
+  const promoted = join(store, AGENT, "cur", "pr.json");
+  const mail = client();
+  const holder = await holdStripe(alias);
+  try {
+    expect(await mail.checkNewMail()).toEqual([]);
+    expect(readFileSync(source, "utf8")).toBe(raw);
+    expect(existsSync(promoted)).toBe(false);
+  } finally {
+    await holder.release();
+  }
+  expect((await mail.checkNewMail()).map((message) => message.filename)).toEqual(["pr.json"]);
+  expect(existsSync(source)).toBe(false);
+  expect(readFileSync(promoted, "utf8")).toBe(raw);
+});
+
 test("the same path in the environment and the configured mailDir still shares the stripe", async () => {
   const source = seedRelayedSource();
   const mail = client();
@@ -123,7 +141,7 @@ test("the same path in the environment and the configured mailDir still shares t
   }
 });
 
-test("both derivations name one lock namespace for the store, whatever path reaches it", () => {
+test("the stripe and mailbox lock root strings are equal for the store, whatever path reaches it", () => {
   expect(relayAcceptanceLockRoot(BRANCH, ID, alias)).toBe(relayAcceptanceLockRoot(BRANCH, ID, store));
   expect(mailboxLockRoot(alias, AGENT)).toBe(mailboxLockRoot(store, AGENT));
 });

@@ -3,14 +3,12 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as ed from "@noble/ed25519";
 import { MailClient } from "../src/io/mail.js";
-import { signEnvelope } from "../src/lib/signEnvelope.js";
 import { relayAcceptanceLockRoot } from "../src/lib/relay-lock.js";
+import { senderKeyResolver, signedRelayRecord } from "./helpers/signed-relay-record.js";
 
 let root: string;
 let savedMailDir: string | undefined;
-const seed = Buffer.alloc(32, 1);
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "mail-relay-reservation-"));
   savedMailDir = process.env.TPS_MAIL_DIR;
@@ -25,19 +23,12 @@ afterEach(() => {
 // These reservation cases align TPS_MAIL_DIR with MailClient.mailDir.
 for (const valid of [true, false]) {
   test(`MailClient ${valid ? "promotion" : "dead-lettering"} leaves a same-id source in place while its stripe is reserved`, async () => {
-    const client = new MailClient(root, undefined, "mailbox", {
-      async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
-    });
-    const timestamp = new Date().toISOString();
-    const envelope = signEnvelope({
-      v: 1, from: "sender", to: "mailbox", body: "hello", messageId: "reserved", timestamp,
-      delegationChain: [
-        { agent: "system", kind: "human", timestamp, rationale: "origin", signature: null },
-        { agent: "sender", kind: "agent", timestamp, rationale: "send", signature: null },
-      ],
-    }, { sender: seed });
+    const client = new MailClient(root, undefined, "mailbox", senderKeyResolver());
     const source = join(root, "mailbox", "new", "m1.json");
-    const raw = JSON.stringify({ from: "sender", body: valid ? JSON.stringify(envelope) : "invalid", relayDelivery: { branchId: "remote", id: "reserved" } });
+    const relayDelivery = { branchId: "remote", id: "reserved" };
+    const raw = valid
+      ? signedRelayRecord("mailbox", "reserved", relayDelivery)
+      : JSON.stringify({ from: "sender", body: "invalid", relayDelivery });
     writeFileSync(source, raw);
     const script = join(root, "holder.ts");
     writeFileSync(script, `

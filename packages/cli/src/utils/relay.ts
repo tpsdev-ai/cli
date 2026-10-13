@@ -693,8 +693,8 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody): RelayAc
     if (!lock) throw new RelayAcceptLockTimeoutError(body.to);
     return lock;
   };
-  // Create the mail root through the mail directory helper, so its ancestors are
-  // recorded for sync as before; the canonical root is then a real path of it.
+  // Create the mail root through the mail directory helper first, so a new mail
+  // root's parents are recorded for sync; resolving it then creates nothing.
   getMailDir();
   const acceptanceRoot = relayAcceptanceLockRoot(branchId, body.id);
   mkdirMailDirectory(acceptanceRoot);
@@ -702,11 +702,13 @@ function acceptRelayedDelivery(branchId: string, body: MailDeliverBody): RelayAc
   const mailboxLocks: ReturnType<typeof acquireLock>[] = [];
   try {
     // Hold the stripe before each mailbox lock; release mailbox locks before the stripe.
-    // cli#616: mailbox lock roots are keyed off their resolved real path, so a store
-    // reached here through one path and by MailClient through another shares one namespace.
+    // cli#616: each mailbox lock root is the mailbox's resolved real path, so the
+    // lock root strings do not depend on which path reached the store.
     const recipientRoot = relayAcceptRoot(body.to);
-    const lockRecipientRoot = canonicalMailboxRoot(recipientRoot);
+    // Create the mailbox through the mail directory helper first, so a new
+    // mailbox's parent is recorded for sync; resolving it then creates nothing.
     mkdirMailDirectory(recipientRoot);
+    const lockRecipientRoot = canonicalMailboxRoot(recipientRoot);
     if (relayAcceptTestHook) {
       const initialLock = acquireLock(lockRecipientRoot);
       try { relayAcceptTestHook(recipientRoot); }

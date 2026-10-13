@@ -6,8 +6,8 @@ export { RELAY_ACCEPT_LOCK_STRIPES };
 
 /**
  * The acceptance-stripe lock root for one relayed delivery. `mailRoot` defaults
- * to the process mail root; MailClient passes its configured `mailDir`, so both
- * derive the same namespace from the same resolved store.
+ * to the process mail root; MailClient passes its configured `mailDir`, so each
+ * side derives the stripe from the mail root it is configured with.
  */
 export function relayAcceptanceLockRoot(branchId: string, id: string, mailRoot = configuredMailRoot()): string {
   return acceptanceLockRoot(mailRoot, branchId, id);

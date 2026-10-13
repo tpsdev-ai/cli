@@ -113,9 +113,9 @@ export class MailClient {
     }
     this.flairClient = flairClient;
     this.mailboxRoot = join(mailDir, agentId);
-    // cli#616: the mailbox lock is keyed off the resolved real path of the
-    // configured mail directory, so it shares one namespace with CLI relay
-    // acceptance when both reach the same physical store by different paths.
+    // cli#616: promotion locks the mailbox under the resolved real path of the
+    // configured mail directory (see mail-lock-namespace.ts). Placement recovery
+    // locks `mailboxRoot` as given; both reach one filesystem lock.
     this.mailboxLockRoot = mailboxLockRoot(mailDir, agentId);
     this.inboxNew = join(mailDir, agentId, "new");
     this.inboxCur = join(mailDir, agentId, "cur");

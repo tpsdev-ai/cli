@@ -1,16 +1,23 @@
 /**
- * mail-lock-namespace.ts — the ONE derivation of the relay lock namespace for a
- * physical mail store (cli#616).
+ * mail-lock-namespace.ts — the derivation of the relay lock roots that CLI relay
+ * acceptance and the agent MailClient coordinate on (cli#616).
  *
- * The CLI relay acceptance path keys its locks off the process mail root
- * (`TPS_MAIL_DIR`), while the agent MailClient keys off its configured
- * `mailDir`. When the two point at the same physical store through different
- * settings — a symlinked directory, a relative segment — the two used to
- * derive different lock namespaces for it, so acceptance's stripe and the
- * same-ID move coordination did not cover MailClient promotion or dead-letter
- * moves. Deriving every lock from the store's RESOLVED REAL PATH (symlinks and
- * `.`/`..` resolved) makes the two agree by construction, in one module both
- * packages import, so the derivation cannot drift.
+ * CLI relay acceptance takes its mail root from the process (`TPS_MAIL_DIR`).
+ * MailClient took its acceptance stripe from the process environment too, not
+ * from its configured `mailDir`, so a MailClient whose environment selected a
+ * different root locked a stripe under that root, and acceptance's stripe did
+ * not exclude its promotion or dead-letter moves. Each side now derives the
+ * stripe from the mail root it is configured with, through this module, which
+ * both packages import.
+ *
+ * Each root derived here starts from a resolved real path (symlinks and `.`/`..`
+ * resolved), so callers that reach one mail root by different paths derive equal
+ * stripe root STRINGS. Equal strings are not what makes two processes exclude
+ * each other: the lock is a directory created inside the locked directory, so a
+ * symlinked path and its target already reach one filesystem lock. Mailbox lock
+ * roots come from here only for acceptance and MailClient promotion; MailClient
+ * placement recovery and the CLI's other mailbox lock sites lock the mailbox
+ * root path as given.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
@@ -46,7 +53,7 @@ export function mailboxLockRoot(mailRoot: string, agentId: string): string {
   return join(canonicalMailRoot(mailRoot), agentId);
 }
 
-/** The canonical root for a mailbox directory already resolved to a path. */
+/** The resolved real path of a mailbox directory, created first if absent. */
 export function canonicalMailboxRoot(mailboxRoot: string): string {
   mkdirSync(mailboxRoot, { recursive: true, mode: 0o700 });
   return realpathSync(mailboxRoot);

@@ -145,8 +145,8 @@ export function relayAcceptRoot(agent: string): string {
 }
 
 export function relayAcceptLockRoot(agent: string): string {
-  // cli#616: derive from the resolved real path of the mail store, so a store
-  // reached by a different path shares one mailbox-lock namespace.
+  // cli#616: the lock root is derived under the mail store's resolved real
+  // path, as MailClient promotion derives its mailbox lock root.
   try {
     assertValidAgentId(agent);
     return mailboxLockRoot(mailDirPath(), agent);

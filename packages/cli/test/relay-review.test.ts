@@ -4,7 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { checkMessages, getInbox, listMessages, promote, sendMessage } from "../src/utils/mail.js";
-import { deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
+import { deliverRelayedToLocal, RELAY_ACCEPT_LOCK_STRIPES, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 import { runMail } from "../src/commands/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
@@ -87,6 +87,20 @@ describe("relay review regressions", () => {
     const acceptedRoot = join(mail, ".relay-accepted");
     const directories = synced.filter((path) => !path.endsWith(".json") && !path.endsWith(message.id) && !path.endsWith(".tmp"));
     for (const path of [root, mail, inbox.root, inbox.tmp, inbox.fresh, join(acceptedRoot, "by-branch", "remote", new Date().toISOString().slice(0, 10))]) expect(directories).toContain(path);
+  });
+
+  test("relay publication syncs the mail root for a new recipient mailbox when the receipt directories exist", () => {
+    // cli#616: the recipient mailbox is the only new entry in the mail root here,
+    // so only its creation through mkdirMailDirectory can record the root for sync.
+    fs.mkdirSync(join(mail, ".relay-accepted", "by-branch", "remote"), { recursive: true });
+    for (let stripe = 0; stripe < RELAY_ACCEPT_LOCK_STRIPES; stripe++) {
+      fs.mkdirSync(join(mail, ".relay-accept-locks", String(stripe)), { recursive: true });
+    }
+    expect(fs.existsSync(join(mail, "local"))).toBe(false);
+    const synced = traceSync(root);
+    expect(deliverRelayedToLocal("remote", body())).toBe(true);
+    expect(fs.readdirSync(getInbox("local").fresh)).toHaveLength(1);
+    expect(synced).toContain(mail);
   });
 
   test("a retry syncs directory entries left pending by a creation sync failure", () => {

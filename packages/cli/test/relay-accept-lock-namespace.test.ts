@@ -1,12 +1,16 @@
 /**
  * relay-accept-lock-namespace.test.ts — cli#616.
  *
- * CLI relay acceptance keys its locks off TPS_MAIL_DIR, the agent MailClient off
- * its configured mailDir. When the two name the same physical store through
- * different paths (here a symlink vs the store itself) they must share one lock
- * namespace, or acceptance's stripe does not cover MailClient dead-letter moves.
- * The MailClient runs in a child process from the real agent config, with a
- * deliberately divergent TPS_MAIL_DIR that must not select the namespace.
+ * CLI relay acceptance takes its mail root from TPS_MAIL_DIR; the agent
+ * MailClient must take its acceptance stripe from its configured mailDir, not
+ * from its process environment. The MailClient runs in a child process from the
+ * real agent config, with a TPS_MAIL_DIR naming a different root: before cli#616
+ * that root selected MailClient's stripe, and acceptance's stripe did not cover
+ * MailClient's dead-letter move. Acceptance reaches the store through a symlink.
+ * That alone never separated the locks, because a symlink and its target are
+ * one directory to the filesystem lock; unresolved, it would only make the lock
+ * root strings differ, and the agent package's namespace test checks that they
+ * are equal.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
