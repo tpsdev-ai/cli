@@ -9,32 +9,55 @@
  * `{ events, nextAfter, hasMore, ... }`, and refuses a `since` it cannot parse
  * with HTTP 400. A GET acknowledges nothing.
  *
- * `readOrgEvents` sends `since` as a plain ISO timestamp, signs each page
- * request with the caller's signer, validates the envelope and every event in
- * it, and follows `nextAfter` while `hasMore`, for at most `maxPages` pages.
- * The result is either
+ * `readOrgEvents` sends `since` as a plain ISO timestamp (and the `after`
+ * resume cursor when the caller has one), signs each page request with the
+ * caller's signer, validates each page (`parsePage` below lists the checks;
+ * event fields other than the ones `isEvent` names pass through unchecked),
+ * and follows `nextAfter` while `hasMore`, for at most `maxPages` pages. A page
+ * that fails a check makes the whole read `unavailable`; no event from the read
+ * is returned. The result is either
  *
- *   - `ok`, with the events in feed order and `complete: false` when the page
- *     bound stopped the read before the feed was drained (the newest events
- *     are the ones not read), or
+ *   - `ok`, with the events in feed order, the `nextAfter` position to resume
+ *     from, the server's time from the last response's `Date` header when it
+ *     has a valid one, and `complete: false` when the page bound stopped the
+ *     read before the feed was drained (the newest events are the ones not
+ *     read), or
  *   - `unavailable`, with a bounded reason: the HTTP status, a fixed note
- *     naming the malformed part of the response, or the code or class of the
- *     error a rejected request raised. The reason never includes the response
- *     body or an error message.
+ *     naming the malformed part of the response, a fixed note for a `since`
+ *     that is not a valid date, or the code or class of the error a rejected
+ *     request or a failed signing raised. The reason never includes the
+ *     response body or an error message.
+ *
+ * `readOrgEvents` does not throw for any of those failures: a signer that
+ * throws (an unreadable key, say) is reported as `unavailable`.
  */
 
-/** An OrgEvent as the dashboard and office status read it. */
+/** An OrgEvent as the readers consume it; `isEvent` validates these fields. */
 export interface OrgEventRecord {
+  id: string;
   kind: string;
   authorId: string;
   summary: string;
   createdAt: string;
+  targetIds?: string[] | null;
   refId?: string | null;
+  detail?: string | null;
+  scope?: string | null;
+  expiresAt?: string | null;
+  /** The event's feed position, `<createdAt>\t<id>`, as Flair sends it. */
+  position: string;
   [field: string]: unknown;
 }
 
 export type OrgEventRead =
-  | { status: "ok"; events: OrgEventRecord[]; complete: boolean }
+  | {
+      status: "ok";
+      events: OrgEventRecord[];
+      complete: boolean;
+      nextAfter: string;
+      /** The server's time (ISO) from the last response's `Date` header, when it had a valid one. */
+      serverTime?: string;
+    }
   | { status: "unavailable"; reason: string };
 
 /** Signs a Flair request: the Authorization header value, or undefined to send none. */
@@ -50,6 +73,8 @@ export interface OrgEventReadOpts {
   viewerId: string;
   /** The createdAt floor. */
   since: Date;
+  /** Resume cursor (Flair's `after` position); reads after it instead of the viewer's watermark. */
+  after?: string;
   sign: FlairRequestSigner;
   pageSize?: number;
   maxPages?: number;
@@ -69,28 +94,85 @@ function errorTag(err: unknown): string {
   return "unknown error";
 }
 
+/** Absent, null, or a string. */
+const optionalString = (v: unknown) => v === undefined || v === null || typeof v === "string";
+
+/**
+ * Whether `value` is an event whose consumed fields are well-formed: the
+ * required `id` (a non-empty string), `kind`, `authorId` and `summary`
+ * (strings), `createdAt` (a parseable date) and `position` (a string;
+ * `parsePage` checks its value); and the optional `targetIds`, which may be
+ * absent or null and is otherwise an array of strings, and `refId`, `detail`,
+ * `scope` and `expiresAt`, which may be absent or null and are otherwise
+ * strings. These are the fields the dashboard, office status, `tps agent logs`,
+ * the task loop and its handlers read. Any other field is passed through
+ * unchecked.
+ */
 function isEvent(value: unknown): value is OrgEventRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const e = value as Record<string, unknown>;
   return (
+    typeof e.id === "string" &&
+    e.id !== "" &&
     typeof e.kind === "string" &&
     typeof e.authorId === "string" &&
     typeof e.summary === "string" &&
     typeof e.createdAt === "string" &&
     !Number.isNaN(Date.parse(e.createdAt)) &&
-    (e.refId === undefined || e.refId === null || typeof e.refId === "string")
+    (e.targetIds === undefined ||
+      e.targetIds === null ||
+      (Array.isArray(e.targetIds) && e.targetIds.every((t) => typeof t === "string"))) &&
+    optionalString(e.refId) &&
+    optionalString(e.detail) &&
+    optionalString(e.scope) &&
+    optionalString(e.expiresAt) &&
+    typeof e.position === "string"
   );
 }
 
-/** The page's events and cursor, or the fixed note naming what is malformed. */
-function parsePage(body: unknown): { events: OrgEventRecord[]; hasMore: boolean; nextAfter: string } | string {
+/**
+ * The page's events and cursor, or the fixed note naming what is malformed.
+ * `requestAfter` is the `after` cursor the page was requested with, if any.
+ * A page is well-formed when:
+ *   - it is an object whose `events` is an array of events (`isEvent`), whose
+ *     `hasMore` is a boolean, and whose `nextAfter` is a non-empty string;
+ *   - each event's `position` is `<createdAt>\t<id>`;
+ *   - the positions increase strictly, the first one after `requestAfter`;
+ *   - `nextAfter` is the last event's position or, on a page with no events,
+ *     `requestAfter` itself (Flair's paging; unchecked when no `after` was sent,
+ *     since the server then chose the cursor itself).
+ * Positions compare as strings, as Flair compares them.
+ */
+function parsePage(
+  body: unknown,
+  requestAfter: string | undefined,
+): { events: OrgEventRecord[]; hasMore: boolean; nextAfter: string } | string {
   if (typeof body !== "object" || body === null || Array.isArray(body)) return "not an object";
   const page = body as Record<string, unknown>;
   if (!Array.isArray(page.events)) return "events is not an array";
   if (!page.events.every(isEvent)) return "an event lacks a field the command reads";
+  const events = page.events as OrgEventRecord[];
   if (typeof page.hasMore !== "boolean") return "hasMore is not a boolean";
-  if (page.hasMore && (typeof page.nextAfter !== "string" || page.nextAfter === "")) return "nextAfter is missing";
-  return { events: page.events, hasMore: page.hasMore, nextAfter: typeof page.nextAfter === "string" ? page.nextAfter : "" };
+  if (typeof page.nextAfter !== "string" || page.nextAfter === "") return "nextAfter is missing";
+  const nextAfter = page.nextAfter;
+  let previous = requestAfter;
+  for (const event of events) {
+    if (event.position !== `${event.createdAt}\t${event.id}`) return "an event's position is not its createdAt and id";
+    if (previous !== undefined && !(event.position > previous)) return "events are not in position order after the cursor";
+    previous = event.position;
+  }
+  const last = events.at(-1);
+  if (last !== undefined && nextAfter !== last.position) return "nextAfter is not the last event's position";
+  if (last === undefined && requestAfter !== undefined && nextAfter !== requestAfter)
+    return "nextAfter of an empty page is not the request's cursor";
+  return { events, hasMore: page.hasMore, nextAfter };
+}
+
+/** The ISO time a response's `Date` header gives, or undefined when it has none or it does not parse. */
+function responseTime(res: Response): string | undefined {
+  const header = res.headers.get("date");
+  const ms = header ? Date.parse(header) : Number.NaN;
+  return Number.isNaN(ms) ? undefined : new Date(ms).toISOString();
 }
 
 /** Read the viewer's OrgEvent catch-up feed since `since`; see the module doc. */
@@ -98,14 +180,23 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
   const pageSize = opts.pageSize ?? ORG_EVENT_PAGE_SIZE;
   const maxPages = opts.maxPages ?? ORG_EVENT_MAX_PAGES;
   const base = `/OrgEventCatchup/${encodeURIComponent(opts.viewerId)}`;
+  if (!(opts.since instanceof Date) || Number.isNaN(opts.since.getTime()))
+    return { status: "unavailable", reason: "invalid since (not a valid date)" };
   const since = opts.since.toISOString();
   const events: OrgEventRecord[] = [];
-  let after: string | undefined;
+  let after: string | undefined = opts.after;
+  let serverTime: string | undefined;
   for (let page = 0; page < maxPages; page++) {
     const params = new URLSearchParams({ since, limit: String(pageSize) });
     if (after !== undefined) params.set("after", after);
     const path = `${base}?${params.toString()}`;
-    const auth = opts.sign("GET", path);
+    let auth: string | undefined;
+    try {
+      auth = opts.sign("GET", path);
+    } catch (err) {
+      // The signer's message can name a key path; only its code or class is reported.
+      return { status: "unavailable", reason: `request not signed (${errorTag(err)})` };
+    }
     let res: Response;
     try {
       res = await fetch(`${opts.flairUrl}${path}`, auth ? { headers: { Authorization: auth } } : {});
@@ -119,13 +210,20 @@ export async function readOrgEvents(opts: OrgEventReadOpts): Promise<OrgEventRea
     } catch {
       return { status: "unavailable", reason: "malformed response (body is not JSON)" };
     }
-    const parsed = parsePage(body);
+    const parsed = parsePage(body, after);
     if (typeof parsed === "string") return { status: "unavailable", reason: `malformed response (${parsed})` };
     events.push(...parsed.events);
-    if (!parsed.hasMore) return { status: "ok", events, complete: true };
     after = parsed.nextAfter;
+    serverTime = responseTime(res);
+    if (!parsed.hasMore) return ok(events, true, parsed.nextAfter, serverTime);
   }
-  return { status: "ok", events, complete: false };
+  return ok(events, false, after ?? "", serverTime);
+}
+
+function ok(events: OrgEventRecord[], complete: boolean, nextAfter: string, serverTime: string | undefined): OrgEventRead {
+  return serverTime === undefined
+    ? { status: "ok", events, complete, nextAfter }
+    : { status: "ok", events, complete, nextAfter, serverTime };
 }
 
 /** The per-agent activity state both commands print and emit as JSON. */
