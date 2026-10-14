@@ -28,7 +28,6 @@ import { parseFlairPublicKey } from "../src/lib/public-key.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { MailClient } from "../src/io/mail.js";
 import { acquireMailLockSync } from "../src/lib/mail-lock.js";
-import { mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
 import { mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 
 const AGENT = "mailbox";
@@ -547,7 +546,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
       return rename(...args);
     });
     try {
-      await expect(client["commitToCur"](mailboxLockRoot(tmpDir, AGENT), "m1.json", join(inbox("new"), "m1.json"),
+      await expect(client["commitToCur"](client["operationRoots"](), "m1.json", join(inbox("new"), "m1.json"),
         readFileSync(join(inbox("new"), "m1.json"), "utf-8"), env)).rejects.toThrow(/append fault.*rollback fault/);
       expect(readFileSync(join(tmpDir, AGENT, "consumed.jsonl"), "utf-8")).toBe("");
     } finally {

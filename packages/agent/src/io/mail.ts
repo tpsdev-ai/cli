@@ -7,7 +7,7 @@ import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "
 import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
-import { mailboxLockRoot } from "../lib/mail-lock-namespace.js";
+import { canonicalMailboxRoot, canonicalMailRoot } from "../lib/mail-lock-namespace.js";
 import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
 import {
   decideEnvelopeForMailbox,
@@ -86,6 +86,23 @@ function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";
 }
 
+/**
+ * cli#636: the roots one MailClient operation uses, resolved once when the
+ * operation starts and passed to every step of it. Each is the resolved real
+ * path (symlinks and `.`/`..` resolved) at that moment; paths beneath them
+ * (`new/`, `cur/`, a file) are joined to them, not resolved again. A later
+ * operation resolves them afresh, so when the symlink at the configured mail
+ * path or at the agent's mailbox directory is repointed, the new target is
+ * selected at the start of the next operation and an operation already running
+ * finishes against the target it started with.
+ */
+interface OperationRoots {
+  /** The configured mail directory: bridge-principal trust, acceptance stripes, recipient inboxes. */
+  readonly mailRoot: string;
+  /** This agent's mailbox directory: the mailbox lock, the maildir paths and the replay state. */
+  readonly mailbox: string;
+}
+
 function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
   try {
     const st = lstatSync(path);
@@ -120,31 +137,33 @@ export class MailClient {
       );
     }
     this.flairClient = flairClient;
-    // cli#636: create the maildir for the root configured now. Every operation
-    // derives its own root instead; dir creation is not a construction-time pin.
-    this.mailboxRoot();
+    // cli#636: create the maildir under the target configured now. Nothing is
+    // kept: every operation resolves its own roots (operationRoots).
+    this.operationRoots();
   }
 
   /**
-   * cli#636: the mailbox root for the current operation, resolved once from the
-   * configured `mailDir` and `agentId` (symlinks and `.`/`..` resolved) with its
-   * maildir subdirectories created. The promotion lock, the mailbox file paths
-   * and the replay-state path all derive from this one value, so a mail root
-   * re-pointed or moved while the client is alive moves all three together. It
-   * is never pinned at construction. cli#616: the resolved real path comes from
-   * mail-lock-namespace.ts so promotion and placement recovery reach one lock.
+   * cli#636: resolve the roots for one operation (see OperationRoots) and create
+   * the maildir subdirectories under the mailbox. The mail root is the resolved
+   * real path of the configured `mailDir`; the mailbox is the resolved real path
+   * of `<mail root>/<agentId>`, so a symlink at the mailbox directory itself is
+   * resolved too. Both are resolved through mail-lock-namespace.ts (cli#616).
    */
-  private mailboxRoot(): string {
-    const root = mailboxLockRoot(this.mailDir, this.agentId);
-    for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(root, dir), { recursive: true });
-    return root;
+  private operationRoots(): OperationRoots {
+    const mailRoot = canonicalMailRoot(this.mailDir);
+    // Create the mailbox with the default mode first (canonicalMailboxRoot
+    // would create it 0700); resolving it then creates nothing.
+    mkdirSync(join(mailRoot, this.agentId), { recursive: true });
+    const mailbox = canonicalMailboxRoot(join(mailRoot, this.agentId));
+    for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(mailbox, dir), { recursive: true });
+    return { mailRoot, mailbox };
   }
 
   async checkNewMail(): Promise<MailMessage[]> {
     const messages: MailMessage[] = [];
-    const root = this.mailboxRoot();
-    await this.recoverInterruptedPlacements(messages, root);
-    const inboxNew = join(root, "new");
+    const roots = this.operationRoots();
+    await this.recoverInterruptedPlacements(messages, roots);
+    const inboxNew = join(roots.mailbox, "new");
     if (!existsSync(inboxNew)) return messages;
 
     const files = readdirSync(inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
@@ -188,13 +207,13 @@ export class MailClient {
       }
 
       if (!verifyResult.pass) {
-        this.deadLetter(file, srcPath, verifyResult, started, root);
+        this.deadLetter(file, srcPath, verifyResult, started, roots);
         continue;
       }
 
       let trustTier: MailMessage["trustTier"];
       try {
-        trustTier = verifiedMailTier(verifyResult.envelope, this.mailDir);
+        trustTier = verifiedMailTier(verifyResult.envelope, roots.mailRoot);
       } catch (err) {
         const detail = sanitizeError(err);
         this.events?.emit({
@@ -210,10 +229,10 @@ export class MailClient {
       }
 
       try {
-        const committed = await this.commitToCur(root, file, srcPath, body, verifyResult.envelope);
+        const committed = await this.commitToCur(roots, file, srcPath, body, verifyResult.envelope);
         if (committed === "already-delivered") continue;
         if (committed) {
-          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started, root);
+          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started, roots);
           continue;
         }
         const from = verifyResult.envelope.from;
@@ -246,23 +265,23 @@ export class MailClient {
 
   /** Commit under the mailbox lock; attempt placement rollback on append failure. */
   private async commitToCur(
-    root: string,
+    roots: OperationRoots,
     file: string,
     srcPath: string,
     body: string,
     envelope: Envelope,
   ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
-    const lock: MailLock | null = await acquireMailLock(root);
+    const lock: MailLock | null = await acquireMailLock(roots.mailbox);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
     let relayLock: MailLock | null;
-    try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body), this.mailDir); }
+    try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body), roots.mailRoot); }
     catch (error) { lock.release(); throw error; }
     if (!relayLock) { lock.release(); throw new Error("relay acceptance busy; not promoted"); }
     try {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
-      const replay = mailboxReplayStore(root);
+      const replay = mailboxReplayStore(roots.mailbox);
       if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
-      const dstPath = join(root, "cur", file);
+      const dstPath = join(roots.mailbox, "cur", file);
       if (sameFileByDeviceInode(srcPath, dstPath)) {
         replay.isConsumed(envelope.messageId);
         unlinkSync(srcPath);
@@ -311,7 +330,8 @@ export class MailClient {
    * including an older intent without identity, leaves the intent pending and
    * withholds delivery; the new/ scan cannot replace that intent.
    */
-  private async recoverInterruptedPlacements(messages: MailMessage[], root: string): Promise<void> {
+  private async recoverInterruptedPlacements(messages: MailMessage[], roots: OperationRoots): Promise<void> {
+    const root = roots.mailbox;
     let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
     let listing: MailLock | null = null;
     try {
@@ -347,7 +367,7 @@ export class MailClient {
         }
         const outcome = await this.verifyMailBody(bytes.toString("utf8"));
         if (!outcome.pass) continue; // withhold: the cur copy is not a verified message
-        const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
+        const trustTier = verifiedMailTier(outcome.envelope, roots.mailRoot);
         const delivered = await this.completeInterruptedPlacement(messageId, file, root, bytes, outcome.envelope, trustTier);
         if (delivered) messages.push(delivered);
       } catch (err) {
@@ -428,15 +448,15 @@ export class MailClient {
     srcPath: string,
     rejected: { class: MailboxRejectClass; reason: string; from?: string },
     started: number,
-    root: string,
+    roots: OperationRoots,
   ): void {
-    const dlqDir = join(root, "dlq");
+    const dlqDir = join(roots.mailbox, "dlq");
     const dlqPath = join(dlqDir, file);
     let relayLock: MailLock | null = null;
     try {
       let record: unknown;
       try { record = JSON.parse(readFileSync(srcPath, "utf-8")); } catch {}
-      relayLock = tryAcquireRelayMoveLock(record, this.mailDir);
+      relayLock = tryAcquireRelayMoveLock(record, roots.mailRoot);
       if (!relayLock) return;
       if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
       writeRejectSidecar(dlqDir, file, rejected.class, rejected.reason);
@@ -457,7 +477,7 @@ export class MailClient {
   async sendMail(to: string, body: string): Promise<void> {
     const started = Date.now();
     try {
-      const root = this.mailboxRoot();
+      const { mailbox } = this.operationRoots();
       const { writeFileSync } = await import("node:fs");
       // Sign the body as this agent — the v1 envelope a promote() reader
       // verifies. signMailBody THROWS when no key exists, so an unsigned body
@@ -465,7 +485,7 @@ export class MailClient {
       const signed = this.signMailBody(to, body);
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2)}.json`;
       writeFileSync(
-        join(root, "outbox", filename),
+        join(mailbox, "outbox", filename),
         JSON.stringify({ from: this.agentId, to, body: signed, sentAt: new Date().toISOString() }, null, 2),
         "utf-8"
       );
@@ -520,7 +540,8 @@ export class MailClient {
 
   /** Deliver all messages in outbox to recipient inboxes (local relay). */
   deliverOutbox(): void {
-    const outboxNew = join(this.mailboxRoot(), "outbox");
+    const roots = this.operationRoots();
+    const outboxNew = join(roots.mailbox, "outbox");
     if (!existsSync(outboxNew)) return;
     const files = readdirSync(outboxNew).filter(f => !f.startsWith("."));
     for (const file of files) {
@@ -531,7 +552,7 @@ export class MailClient {
         if (!msg.to || !/^[a-zA-Z0-9_-]{1,64}$/.test(msg.to)) {
           continue; // skip invalid recipients
         }
-        const recipientInbox = join(this.mailDir, msg.to, "new");
+        const recipientInbox = join(roots.mailRoot, msg.to, "new");
         mkdirSync(recipientInbox, { recursive: true });
         const destFile = `${msg.sentAt.replace(/[:.]/g, "-")}-${file}`;
         renameSync(srcPath, join(recipientInbox, destFile));

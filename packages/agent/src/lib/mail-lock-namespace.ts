@@ -18,10 +18,13 @@
  * each other: the lock is a directory created inside the locked directory, so a
  * symlinked path and its target already reach one filesystem lock. Within one
  * process the strings do matter, because the lock's re-entrancy check compares
- * lock path strings. Mailbox lock
- * roots come from here only for acceptance and MailClient promotion; MailClient
- * placement recovery and the CLI's other mailbox lock sites lock the mailbox
- * root path as given.
+ * lock path strings. Mailbox lock roots come from here only for acceptance and
+ * MailClient: acceptance derives its recipient mailbox lock roots with
+ * canonicalMailboxRoot, and MailClient takes every mailbox lock (promotion and
+ * placement recovery) at the canonicalMailboxRoot of
+ * `<canonicalMailRoot(mailDir)>/<agentId>`, resolved once per operation
+ * (cli#636). The CLI's other mailbox lock sites lock the mailbox root path as
+ * given.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
