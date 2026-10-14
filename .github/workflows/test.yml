@@ -10,6 +10,12 @@ on:
 # what its steps use, and names the step beside each grant.
 permissions: {}
 
+# A superseded PR head's runs are cancelled (the group is the PR number); a push
+# to main keeps a group unique per run, so its runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build (TypeScript strict)

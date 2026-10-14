@@ -19,25 +19,26 @@ on:
 permissions:
   contents: read
 
+# A superseded PR head's runs are cancelled (the group is the PR number); a push
+# to main keeps a group unique per run, so its runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   smoke:
     name: Smoke ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: linux-x64
-            runs-on: ubuntu-latest
-          - target: linux-arm64
-            runs-on: ubuntu-24.04-arm
-          # GitHub retired Intel mac runners (macos-13 queues forever).
-          # This job runs on Apple Silicon under Rosetta 2 translation —
-          # bun-compiled x64 binaries auto-translate. Bare-metal Intel mac
-          # is untested and that is a documented gap, not a hidden one.
-          - target: darwin-x64
-            runs-on: macos-latest
-          - target: darwin-arm64
-            runs-on: macos-latest
+        # On a pull request only linux-x64 is smoked; push to main keeps the full
+        # matrix.
+        #
+        # GitHub retired Intel mac runners (macos-13 queues forever).
+        # This job runs on Apple Silicon under Rosetta 2 translation —
+        # bun-compiled x64 binaries auto-translate. Bare-metal Intel mac
+        # is untested and that is a documented gap, not a hidden one.
+        include: ${{ github.event_name == 'pull_request' && fromJSON('[{"target":"linux-x64","runs-on":"ubuntu-latest"}]') || fromJSON('[{"target":"linux-x64","runs-on":"ubuntu-latest"},{"target":"linux-arm64","runs-on":"ubuntu-24.04-arm"},{"target":"darwin-x64","runs-on":"macos-latest"},{"target":"darwin-arm64","runs-on":"macos-latest"}]') }}
     runs-on: ${{ matrix.runs-on }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
