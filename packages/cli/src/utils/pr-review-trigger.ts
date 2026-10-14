@@ -10,6 +10,8 @@
 
 import { spawnSync } from "node:child_process";
 import snooplogg from "snooplogg";
+import type { FlairClient } from "./flair-client.js";
+import { startTaskLoop } from "./flair-task-loop.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
 
 
@@ -84,4 +86,28 @@ export async function handlePrOpened(
   }
 
   requestReviews(prNumber, config);
+}
+
+/**
+ * Start the review-trigger loop: poll the agent's OWN catch-up feed for
+ * `pr.opened` events and request reviews. The feed read is `agentId`'s,
+ * so Flair serves it to the agent that signs the read (a read of another
+ * participant's feed is refused). Its cursor under
+ * `~/.tps/cursors/<agentId>-review-trigger-task-loop.json` is separate from the
+ * task loop's, so the two loops reading one agent's feed keep separate
+ * positions.
+ */
+export function startReviewTriggerLoop(
+  flair: FlairClient,
+  agentId: string,
+  config: { reviewers: string[]; repo: string },
+  opts: { pollIntervalMs?: number } = {},
+): { stop: () => Promise<void> } {
+  const triggerConfig: ReviewTriggerConfig = { reviewers: config.reviewers, agentId, repo: config.repo };
+  return startTaskLoop(
+    flair,
+    agentId,
+    async (event) => { await handlePrOpened(event, triggerConfig); },
+    { kinds: ["pr.opened"], loopId: `${agentId}-review-trigger`, pollIntervalMs: opts.pollIntervalMs },
+  );
 }

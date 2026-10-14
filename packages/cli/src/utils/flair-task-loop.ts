@@ -2,13 +2,15 @@
  * flair-task-loop.ts — Polls OrgEventCatchup for task.assigned events
  * targeting this agent. Runtime-agnostic: works without OpenClaw.
  *
- * CURSOR. The loop reads the catch-up feed through `FlairClient.getEventsSince`
- * (the validated reader in org-event-read.ts, cli#619), always sending its
- * position as Flair's `after` cursor, so Flair's own watermark for the agent
- * never chooses where reading starts. The position is persisted in
- * `~/.tps/cursors/<agentId>-task-loop.json` as `{ position, updatedAt }` and
- * replaced atomically (a temporary file in the same directory, fsynced, then
- * renamed over it). With no usable cursor file, the loop sets the position to
+ * CURSOR. The loop reads `agentId`'s catch-up feed through
+ * `FlairClient.getEventsSince` (the validated reader in org-event-read.ts,
+ * cli#619), always sending its position as Flair's `after` cursor, so Flair's
+ * own watermark for the agent never chooses where reading starts. The position
+ * is persisted in `~/.tps/cursors/<loopId>-task-loop.json` as
+ * `{ position, updatedAt }` and replaced atomically (a temporary file in the
+ * same directory, fsynced, then renamed over it). `loopId` names the cursor and
+ * is `agentId` unless the caller names another, so two loops reading one
+ * agent's feed keep separate positions. With no usable cursor file, the loop sets the position to
  * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
  * that position is saved: a failed save is logged by name and retried with
  * backoff, with the same position, and `stop()` ends the retrying. A legacy
@@ -95,9 +97,9 @@ function cursorDir(): string {
   return join(homeDir(), ".tps", "cursors");
 }
 
-/** The task loop's cursor file for `agentId`. */
-export function taskLoopCursorPath(agentId: string): string {
-  return join(cursorDir(), `${agentId}-task-loop.json`);
+/** The loop's cursor file for `loopId`. */
+export function taskLoopCursorPath(loopId: string): string {
+  return join(cursorDir(), `${loopId}-task-loop.json`);
 }
 
 /**
@@ -125,10 +127,10 @@ export function cursorFilePosition(data: unknown): string | undefined {
 }
 
 /** The persisted feed position (Flair's `after` cursor), or undefined when there is none to resume from. */
-function loadCursor(agentId: string): string | undefined {
-  const path = taskLoopCursorPath(agentId);
+function loadCursor(loopId: string): string | undefined {
+  const path = taskLoopCursorPath(loopId);
   if (!existsSync(path)) {
-    slog(`[${agentId}] No task loop cursor at ${path}; ${LOOKBACK_NOTE}`);
+    slog(`[${loopId}] No task loop cursor at ${path}; ${LOOKBACK_NOTE}`);
     return undefined;
   }
   let position: string | undefined;
@@ -139,7 +141,7 @@ function loadCursor(agentId: string): string | undefined {
     problem = e instanceof SyntaxError ? "it is not JSON" : `it cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).name})`;
   }
   if (position === undefined) {
-    swarn(`[${agentId}] Task loop cursor at ${path} is unusable (${problem}); treating it as no cursor, so ${LOOKBACK_NOTE}`);
+    swarn(`[${loopId}] Task loop cursor at ${path} is unusable (${problem}); treating it as no cursor, so ${LOOKBACK_NOTE}`);
   }
   return position;
 }
@@ -149,8 +151,8 @@ function loadCursor(agentId: string): string | undefined {
  * it, rename it over the cursor. Returns undefined on success, or the failure's
  * name (its code, such as EACCES, or its class) for the caller to log.
  */
-function saveCursor(agentId: string, position: string): string | undefined {
-  const path = taskLoopCursorPath(agentId);
+function saveCursor(loopId: string, position: string): string | undefined {
+  const path = taskLoopCursorPath(loopId);
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     mkdirSync(cursorDir(), { recursive: true });
@@ -190,11 +192,14 @@ export function startTaskLoop(
   flair: FlairClient,
   agentId: string,
   handler: TaskHandler,
-  opts: { pollIntervalMs?: number; kinds?: string[] } = {},
+  opts: { pollIntervalMs?: number; kinds?: string[]; loopId?: string } = {},
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  const loaded = loadCursor(agentId);
+  // The cursor is named for the loop, not the feed: two loops reading one
+  // agent's feed (`agentId`) keep separate positions.
+  const loopId = opts.loopId ?? agentId;
+  const loaded = loadCursor(loopId);
   // A new initial position is computed once, here; saving it is retried with
   // this same value until it succeeds, and the feed is not read before then.
   let position: string = loaded ?? initialPosition();
@@ -216,11 +221,11 @@ export function startTaskLoop(
   /** Save the initial position, retrying with backoff; false when stopped first. */
   async function saveInitialPosition(): Promise<boolean> {
     for (let attempt = 1; running; attempt++) {
-      const failure = saveCursor(agentId, position);
+      const failure = saveCursor(loopId, position);
       if (failure === undefined) return true;
       const delay = Math.min(basePollMs * 2 ** (attempt - 1), MAX_BACKOFF_MS);
       swarn(
-        `[${agentId}] Task loop cannot save its initial position to ${taskLoopCursorPath(agentId)} (${failure}); ` +
+        `[${loopId}] Task loop cannot save its initial position to ${taskLoopCursorPath(loopId)} (${failure}); ` +
           `the feed is not read until it is saved; retrying in ${delay} ms`,
       );
       await sleep(delay);
@@ -290,8 +295,8 @@ export function startTaskLoop(
             // A failed save is logged and the loop goes on from the position in
             // memory. The saved position is then behind it, so a restart replays
             // events rather than skipping them.
-            const failure = saveCursor(agentId, position);
-            if (failure !== undefined) swarn(`[${agentId}] Failed to persist cursor to ${taskLoopCursorPath(agentId)} (${failure})`);
+            const failure = saveCursor(loopId, position);
+            if (failure !== undefined) swarn(`[${loopId}] Failed to persist cursor to ${taskLoopCursorPath(loopId)} (${failure})`);
           }
 
           // Cap seen set
