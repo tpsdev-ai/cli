@@ -1,44 +1,75 @@
 /**
- * presence-read.ts — the office-wide per-agent presence read behind
- * `tps roster dashboard` and `tps office status` (cli#622).
+ * presence-read.ts — the per-agent presence read behind `tps roster dashboard`
+ * and `tps office status` (cli#622), from the Flair instance the command
+ * queries.
  *
- * `GET /Presence` is Flair's roster of per-agent presence: one record per
- * agent that has pushed presence, each carrying the liveness and activity the
- * agent last asserted. Unlike the viewer's OrgEvent catch-up feed
- * (events addressed to the viewer or broadcast, from the viewer's
- * acknowledged position), this is office-wide and per-agent — the source that
- * matches "what is each agent doing / when was it last active".
+ * `GET /Presence` is that instance's roster of per-agent presence: one record
+ * per agent that has sent a heartbeat to it. Agents push heartbeats, their
+ * activity and their current task; Flair derives each record's status
+ * (`active` / `idle` / `offline`) and whether its activity is still fresh when
+ * it serves the read (resources/Presence.ts). Unlike the viewer's OrgEvent
+ * catch-up feed (events addressed to the viewer or broadcast, from the viewer's
+ * acknowledged position), it is per-agent — the source that matches "what is
+ * each agent doing / when was it last seen".
  *
- * A verified reader (a registered agent's TPS-Ed25519 signature, which is what
- * both commands sign with) may read the roster. `readPresence` sends one signed
- * GET, validates the body is an array of records carrying the fields the
- * commands read, and returns it. The result is either
+ * SCOPE: the roster is per Flair instance. Flair federation replicates Agent
+ * records but not Presence, so an agent that heartbeats to a different instance
+ * has no record here, though it may be registered here. A missing record means
+ * "no presence on this instance", not that the agent was never seen.
  *
- *   - `ok`, with the presence records, or
+ * Flair serves the roster to a verified reader (a registered agent's
+ * TPS-Ed25519 signature, which is what both commands sign with); an unverified
+ * caller gets 401 by default. `readPresence` signs one GET and sends it. When
+ * the signer throws or returns no signature, it sends nothing: it never makes
+ * an unsigned read, which an instance with Flair's public-roster opt-in would
+ * answer. It validates the body and returns either
+ *
+ *   - `ok`, with one record per agent holding only the fields it validated
+ *     (`PresenceRecord`), or
  *   - `unavailable`, with a bounded reason: the HTTP status, a fixed note
- *     naming the malformed part of the response, or the code or class of the
- *     error a rejected request raised. The reason never includes the response
- *     body or an error message.
+ *     naming what is wrong with the request or the response, or the code or
+ *     class of the error a failed signer or a rejected request raised. The
+ *     reason never includes the response body or an error message.
+ *
+ * Validation covers every field the reader returns, and is all or nothing. The
+ * whole read is `unavailable` when one record has such a field missing or
+ * outside Flair's coded contract (a status or activity outside its
+ * vocabulary, a heartbeat time that is not a finite number, a current task
+ * that is neither null nor a trimmed string of 1 to 200 characters), when one
+ * record's fields contradict how Flair derives them (a stale record with a
+ * current task or an activity other than `idle`, a fresh record whose activity
+ * differs from its last activity, an offline record with fresh activity), or
+ * when two records share an id.
  */
 
-/** A Presence record as the commands read it. */
+/** Flair's derived presence status (resources/Presence.ts derivePresenceStatus). */
+export type PresenceStatus = "active" | "idle" | "offline";
+/** Flair's activity vocabulary (resources/Presence.ts VALID_ACTIVITIES). */
+export type PresenceActivity = "coding" | "reviewing" | "planning" | "debugging" | "idle";
+
+const PRESENCE_STATUSES: ReadonlySet<string> = new Set<PresenceStatus>(["active", "idle", "offline"]);
+const PRESENCE_ACTIVITIES: ReadonlySet<string> = new Set<PresenceActivity>(["coding", "reviewing", "planning", "debugging", "idle"]);
+/** Flair caps a current task at this many characters (CURRENT_TASK_MAX_LENGTH). */
+const CURRENT_TASK_MAX_LENGTH = 200;
+
+/**
+ * A Presence record as the commands read it: the validated fields only. The
+ * reader drops every other field Flair serves.
+ */
 export interface PresenceRecord {
   id: string;
-  /** "active" | "idle" | "offline" (Flair's derivePresenceStatus). */
-  presenceStatus: string;
+  /** Derived by Flair from the heartbeat's age. */
+  presenceStatus: PresenceStatus;
   /** Epoch ms of the agent's last heartbeat. */
   lastHeartbeatAt: number;
-  /** "coding" | "reviewing" | "planning" | "debugging" | "idle" once stale. */
-  activity: string;
-  lastActivity?: string | null;
-  activityUpdatedAt?: number | null;
-  activityAgeMs?: number | null;
-  activityFresh?: boolean;
-  currentTask?: string | null;
-  displayName?: string | null;
-  role?: string | null;
-  runtime?: string | null;
-  [field: string]: unknown;
+  /** The current activity; Flair serves "idle" once the activity is stale. */
+  activity: PresenceActivity;
+  /** The last activity the agent asserted, fresh or not; Flair serves "idle" when it asserted none. */
+  lastActivity: PresenceActivity;
+  /** Flair's verdict: is the activity still current? */
+  activityFresh: boolean;
+  /** The agent's current task; Flair serves null once the activity is stale. */
+  currentTask: string | null;
 }
 
 export type PresenceRead =
@@ -67,27 +98,59 @@ function errorTag(err: unknown): string {
   return "unknown error";
 }
 
-/** Does this record carry every field the commands read? */
-function isPresenceRecord(value: unknown): value is PresenceRecord {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+/**
+ * The validated record, or a fixed note saying what is wrong with it. Field
+ * names in the notes are fixed strings, so a note is safe to print.
+ */
+function toPresenceRecord(value: unknown): PresenceRecord | { invalid: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { invalid: "an entry is not an object" };
   const r = value as Record<string, unknown>;
-  return (
-    typeof r.id === "string" &&
-    r.id.length > 0 &&
-    typeof r.presenceStatus === "string" &&
-    typeof r.lastHeartbeatAt === "number" &&
-    Number.isFinite(r.lastHeartbeatAt) &&
-    typeof r.activity === "string"
-  );
+  const bad = (field: string) => ({ invalid: `a presence record has a missing or invalid ${field}` });
+  if (typeof r.id !== "string" || r.id.length === 0) return bad("id");
+  if (typeof r.presenceStatus !== "string" || !PRESENCE_STATUSES.has(r.presenceStatus)) return bad("presenceStatus");
+  if (typeof r.lastHeartbeatAt !== "number" || !Number.isFinite(r.lastHeartbeatAt)) return bad("lastHeartbeatAt");
+  if (typeof r.activity !== "string" || !PRESENCE_ACTIVITIES.has(r.activity)) return bad("activity");
+  if (typeof r.lastActivity !== "string" || !PRESENCE_ACTIVITIES.has(r.lastActivity)) return bad("lastActivity");
+  if (typeof r.activityFresh !== "boolean") return bad("activityFresh");
+  const task = r.currentTask;
+  // Flair trims a task and caps it at 200 characters, and serves null for an empty one.
+  if (task !== null && (typeof task !== "string" || task.length === 0 || task.length > CURRENT_TASK_MAX_LENGTH || task.trim() !== task))
+    return bad("currentTask");
+  // How Flair derives the record (resources/Presence.ts get()): a stale record
+  // serves "idle" as its activity and no current task; a fresh one serves the
+  // asserted activity as both activity and lastActivity; and the activity is
+  // stale by the time the heartbeat is offline (same threshold, and the
+  // activity stamp is never newer than the heartbeat).
+  if (!r.activityFresh && (task !== null || r.activity !== "idle"))
+    return { invalid: "a stale presence record carries a current task or an activity other than idle" };
+  if (r.activityFresh && r.activity !== r.lastActivity)
+    return { invalid: "a fresh presence record's activity differs from its last activity" };
+  if (r.activityFresh && r.presenceStatus === "offline")
+    return { invalid: "an offline presence record reports fresh activity" };
+  return {
+    id: r.id,
+    presenceStatus: r.presenceStatus as PresenceStatus,
+    lastHeartbeatAt: r.lastHeartbeatAt,
+    activity: r.activity as PresenceActivity,
+    lastActivity: r.lastActivity as PresenceActivity,
+    activityFresh: r.activityFresh,
+    currentTask: task,
+  };
 }
 
-/** Read the office-wide Presence roster; see the module doc. */
+/** Read the queried instance's Presence roster; see the module doc. */
 export async function readPresence(opts: PresenceReadOpts): Promise<PresenceRead> {
   const path = "/Presence";
-  const auth = opts.sign("GET", path);
+  let auth: string | undefined;
+  try {
+    auth = opts.sign("GET", path);
+  } catch (err) {
+    return { status: "unavailable", reason: `signing failed (${errorTag(err)})` };
+  }
+  if (!auth) return { status: "unavailable", reason: "not signed (no request sent)" };
   let res: Response;
   try {
-    res = await fetch(`${opts.flairUrl}${path}`, auth ? { headers: { Authorization: auth } } : {});
+    res = await fetch(`${opts.flairUrl}${path}`, { headers: { Authorization: auth } });
   } catch (err) {
     return { status: "unavailable", reason: `request failed (${errorTag(err)})` };
   }
@@ -99,16 +162,30 @@ export async function readPresence(opts: PresenceReadOpts): Promise<PresenceRead
     return { status: "unavailable", reason: "malformed response (body is not JSON)" };
   }
   if (!Array.isArray(body)) return { status: "unavailable", reason: "malformed response (body is not an array)" };
-  if (!body.every(isPresenceRecord)) return { status: "unavailable", reason: "malformed response (a presence record lacks a field the command reads)" };
-  return { status: "ok", agents: body };
+  const agents: PresenceRecord[] = [];
+  const ids = new Set<string>();
+  for (const value of body) {
+    const rec = toPresenceRecord(value);
+    if ("invalid" in rec) return { status: "unavailable", reason: `malformed response (${rec.invalid})` };
+    if (ids.has(rec.id)) return { status: "unavailable", reason: "malformed response (two presence records share an id)" };
+    ids.add(rec.id);
+    agents.push(rec);
+  }
+  return { status: "ok", agents };
 }
 
-/** The per-agent presence state both commands print and emit as JSON. */
+/**
+ * The read's state, which both commands emit per agent in their JSON
+ * (`presenceState`). Their tables print the derived status, or `unavailable`.
+ */
 export type PresenceState = "ok" | "unavailable";
 
 export function presenceState(read: PresenceRead): PresenceState {
   return read.status === "ok" ? "ok" : "unavailable";
 }
+
+/** What both commands print for an agent with no Presence record on the queried instance. */
+export const NO_PRESENCE_TEXT = "no presence on this instance";
 
 /**
  * The one line a command prints about the read, or null when it was ok. It

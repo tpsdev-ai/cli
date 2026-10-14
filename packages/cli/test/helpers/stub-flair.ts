@@ -8,7 +8,13 @@
  * Real Flair refuses an unverified caller, so a stub that ignores the
  * Authorization header lets a test keep passing after the client's signing
  * breaks (cli#554). `stubFlairHandler` verifies the caller before it answers:
- *   - no or malformed header        -> 403 { type: "error:AccessViolation", ... }
+ *   - a malformed TPS-Ed25519 header  -> 401 { error: "invalid_authorization_header" }
+ *     (Flair's auth middleware, on every path)
+ *   - no header, or another scheme  -> 403 { type: "error:AccessViolation", ... }
+ *     (except `GET /Presence`, which gets 401 { error: "authentication required" }:
+ *     Flair passes such a request to the resource as anonymous, and
+ *     Presence.get() refuses an anonymous reader with 401 by default —
+ *     resources/Presence.ts, flair#1880. The stub models no admin credential.)
  *   - timestamp outside the window  -> 401 { error: "timestamp_out_of_window" }
  *   - a nonce seen before           -> 401 { error: "nonce_replay_detected" }
  *   - a caller with no registered key -> 401 { error: "unknown_agent" }
@@ -64,6 +70,11 @@ function publicKeyBase64(caller: StubFlairCaller): string {
   return typeof caller === "string" ? caller : pubkeyFromSeed(caller).toString("base64");
 }
 
+/** The response Presence.get() returns to an anonymous reader (resources/Presence.ts, flair#1880). */
+function presenceAuthenticationRequired(): Response {
+  return Response.json({ error: "authentication required" }, { status: 401 });
+}
+
 /** The response Flair returns to an unauthenticated caller. */
 function accessViolation(url: URL): Response {
   return Response.json(
@@ -105,8 +116,13 @@ export function stubFlairHandler(
     const url = new URL(req.url);
     if (url.pathname === "/Health") return new Response("ok");
     const header = req.headers.get("Authorization") ?? "";
-    const auth = header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/.exec(header) : null;
-    if (!auth) return accessViolation(url);
+    const tpsScheme = /^TPS-Ed25519(?:\s|$)/i.test(header);
+    const auth = tpsScheme && header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/.exec(header) : null;
+    if (!auth) {
+      if (tpsScheme) return Response.json({ error: "invalid_authorization_header" }, { status: 401 });
+      if (req.method === "GET" && url.pathname === "/Presence") return presenceAuthenticationRequired();
+      return accessViolation(url);
+    }
     const [, caller, timestamp, nonce, signature] = auth;
     const refuse = (error: string) => Response.json({ error }, { status: 401 });
     const now = Date.now();
@@ -283,6 +299,84 @@ export function orgEventCatchupRoute(feed: CatchupFeed): CatchupRoute {
   route.afters = [];
   route.served = [];
   return route;
+}
+
+/** A Presence row as a heartbeat stores it (Flair's buildPresenceRecord). */
+export interface PresenceRow {
+  agentId: string;
+  /** Epoch ms of the agent's last heartbeat. */
+  lastHeartbeatAt: number;
+  /** The activity the agent last asserted; Flair reads a missing one as "idle". */
+  activity?: string;
+  /** Epoch ms the activity was last asserted; null falls back to lastHeartbeatAt. */
+  activityUpdatedAt?: number | null;
+  /** The current task the agent last asserted. */
+  currentTask?: string | null;
+}
+
+/** Flair's default presence thresholds (resources/Presence.ts idleThresholdMs / offlineThresholdMs). */
+export const PRESENCE_IDLE_THRESHOLD_MS = 90_000;
+export const PRESENCE_OFFLINE_THRESHOLD_MS = 600_000;
+
+/**
+ * The records Flair's `GET /Presence` serves a signature-verified reader for
+ * `rows`, derived as resources/Presence.ts get() derives them at `now`, with
+ * the default thresholds:
+ *
+ *   - `presenceStatus` from the heartbeat's age: `active` under 90 s (or in
+ *     the future), `idle` under 10 min, else `offline`;
+ *   - the activity is fresh while its stamp (`activityUpdatedAt`, else
+ *     `lastHeartbeatAt`) is under 10 min old (or in the future);
+ *   - `activity` is the asserted activity while fresh and `idle` once stale;
+ *     `lastActivity` is the asserted activity either way (`idle` when none);
+ *   - `currentTask` is the trimmed task capped at 200 characters while fresh,
+ *     else null (an empty task is null);
+ *   - `activityUpdatedAt` is the resolved stamp and `activityAgeMs` its age.
+ *
+ * It is a model of that code, not Flair itself; the real resource is not
+ * exercised here. Agent metadata and the version stamps are not modelled:
+ * `displayName` is the id, `role` is "agent", and `runtime`, `flairVersion` and
+ * `harperVersion` are null.
+ */
+export function presenceRecords(rows: ReadonlyArray<PresenceRow>, now = Date.now()): Record<string, unknown>[] {
+  return rows.map((row) => {
+    const freshnessAt =
+      typeof row.activityUpdatedAt === "number" && Number.isFinite(row.activityUpdatedAt)
+        ? row.activityUpdatedAt
+        : row.lastHeartbeatAt;
+    const sinceBeat = now - row.lastHeartbeatAt;
+    const presenceStatus =
+      sinceBeat < PRESENCE_IDLE_THRESHOLD_MS ? "active" : sinceBeat < PRESENCE_OFFLINE_THRESHOLD_MS ? "idle" : "offline";
+    const activityFresh = now - freshnessAt < PRESENCE_OFFLINE_THRESHOLD_MS;
+    const rawActivity = typeof row.activity === "string" && row.activity.length > 0 ? row.activity : "idle";
+    const task = typeof row.currentTask === "string" ? row.currentTask.trim().slice(0, 200) : "";
+    return {
+      id: row.agentId,
+      displayName: row.agentId,
+      role: "agent",
+      runtime: null,
+      activity: activityFresh ? rawActivity : "idle",
+      lastActivity: rawActivity,
+      activityUpdatedAt: freshnessAt,
+      activityAgeMs: Math.max(0, now - freshnessAt),
+      activityFresh,
+      presenceStatus,
+      currentTask: activityFresh && task.length > 0 ? task : null,
+      lastHeartbeatAt: row.lastHeartbeatAt,
+      flairVersion: null,
+      harperVersion: null,
+    };
+  });
+}
+
+/**
+ * A fake of Flair's `GET /Presence` for a verified caller: answers with
+ * `presenceRecords(rows)` at the time of the request. The shared stub has
+ * already refused an unverified caller with 401 (see `stubFlairHandler`).
+ */
+export function presenceRoute(rows: ReadonlyArray<PresenceRow>): FlairRoutes {
+  return (req, url) =>
+    req.method === "GET" && url.pathname === "/Presence" ? Response.json(presenceRecords(rows)) : undefined;
 }
 
 /** Write a raw 32-byte key file usable for both request signing and FLAIR_KEY_PATH. */

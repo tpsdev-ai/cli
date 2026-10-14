@@ -14,6 +14,9 @@ import { runOfficeStatus } from "../src/commands/office-status.js";
 import {
   type FlairRoutes,
   installStubFlairFetch,
+  type PresenceRow,
+  presenceRecords,
+  presenceRoute,
   writeKeyFile,
   type StubFlair,
 } from "./helpers/stub-flair.js";
@@ -21,29 +24,24 @@ import {
 const patchShared = createPatchShared();
 
 const SEED = Buffer.alloc(32, 0x71);
+/** A key the stub does not hold for the viewer. */
+const OTHER_SEED = Buffer.alloc(32, 0x72);
 
 const AGENTS = [
   { id: "agent-a", name: "Agent A", role: "engineer", model: "vendor/model-a", status: "active" },
   { id: "agent-b", name: "Agent B", role: "implementer", status: "idle" },
 ];
 
-/** A Presence record for `id`, 5 minutes stale by default. */
-const presence = (id: string, over: Record<string, unknown> = {}) => ({
-  id, displayName: id, role: "agent", runtime: "cli",
-  activity: "coding", lastActivity: "coding",
-  activityUpdatedAt: Date.now() - 5 * 60_000, activityAgeMs: 5 * 60_000, activityFresh: true,
-  presenceStatus: "active", currentTask: null,
-  lastHeartbeatAt: Date.now() - 5 * 60_000,
-  flairVersion: "1.2.3", harperVersion: "4.5.6",
-  ...over,
+/** A stored Presence row: `id`'s last heartbeat `minutesAgo` minutes ago, asserting `coding`. */
+const beat = (id: string, minutesAgo: number, over: Partial<PresenceRow> = {}): PresenceRow => ({
+  agentId: id, lastHeartbeatAt: Date.now() - minutesAgo * 60_000, activity: "coding", ...over,
 });
 
 /** Flair routes the stub serves once it has verified the caller. */
-function routes(req: Request, url: URL, caller: string): Response | undefined {
+const routes: FlairRoutes = (req, url, caller) => {
   if (url.pathname === "/Agent/") return Response.json(AGENTS);
-  if (url.pathname === "/Presence") return Response.json([presence("agent-a", { currentTask: "reviewing a PR" })]);
-  return undefined;
-}
+  return presenceRoute([beat("agent-a", 5, { currentTask: "reviewing a PR" })])(req, url, caller);
+};
 
 let root: string;
 let stub: StubFlair;
@@ -90,12 +88,12 @@ describe("tps office status", () => {
     expect(joined).toContain("engineer");
   });
 
-  test("shows each agent's last-seen presence and current activity", async () => {
+  test("shows each agent's presence status, heartbeat age and current task on this instance", async () => {
     await runOfficeStatus(baseOpts());
     const joined = output.join("\n");
     expect(joined).toContain("reviewing a PR");
-    expect(joined).toContain("active (5m ago)");
-    expect(joined).toContain("never seen");
+    expect(joined).toContain("idle (5m ago)");
+    expect(joined).toContain("no presence on this instance");
   });
 
   test("json output includes agents and openPrs arrays", async () => {
@@ -118,9 +116,12 @@ describe("tps office status", () => {
 });
 
 /**
- * cli#622 — office status reads Flair's office-wide Presence roster through
- * `readPresence`. The /Presence fixture is served by the shared verifying stub
- * (see its doc); the fixture names no production agent.
+ * cli#622 — office status reads the queried Flair instance's Presence roster
+ * through `readPresence`. `/Presence` is served by `presenceRoute`, the shared
+ * stub's fake of Flair's coded contract: it derives each record's status and
+ * activity freshness from stored heartbeat rows as resources/Presence.ts does,
+ * and the stub refuses an unsigned read with Flair's 401 (see their docs). The
+ * fixtures name no production agent.
  */
 describe("cli#622 — office status reads the Presence roster", () => {
   const VIEWER = "viewer-a";
@@ -129,46 +130,77 @@ describe("cli#622 — office status reads the Presence roster", () => {
     { id: "agent-b", name: "Agent B", role: "reviewer", status: "active" },
   ];
 
-  /** Run office status against a viewer whose Presence read is answered by `answer`; return the output. */
-  async function status(answer: FlairRoutes, json = false): Promise<string> {
+  /**
+   * Run office status against a viewer whose Presence read is answered by
+   * `answer`; return the output. `afterAgentRead` runs once the Agent list has
+   * been answered, before the Presence read.
+   */
+  async function status(answer: FlairRoutes, opts: { json?: boolean; afterAgentRead?: (keyPath: string) => void } = {}): Promise<string> {
     stub.stop();
     output.length = 0;
     const key = writeKeyFile(root, VIEWER, SEED);
-    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url, caller) =>
-      url.pathname === "/Agent/"
-        ? Response.json(AGENT_LIST)
-        : url.pathname === "/Presence"
-          ? answer(req, url, caller)
-          : undefined,
-    );
-    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true, json });
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, (req, url, caller) => {
+      if (url.pathname === "/Agent/") {
+        opts.afterAgentRead?.(key);
+        return Response.json(AGENT_LIST);
+      }
+      return url.pathname === "/Presence" ? answer(req, url, caller) : undefined;
+    });
+    await runOfficeStatus({ flairUrl: stub.url, agentId: VIEWER, keyPath: key, noColor: true, json: opts.json });
     return output.join("\n");
   }
   const row = (out: string, name: string) => out.split("\n").find((line) => line.includes(` ${name} `)) ?? "";
   const jsonAgents = () =>
     (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
+  /** Flair's records for `rows` with `over` applied to the first: a record outside Flair's contract. */
+  const corrupt = (rows: PresenceRow[], over: Record<string, unknown>): FlairRoutes => () =>
+    Response.json(presenceRecords(rows).map((r, i) => (i === 0 ? { ...r, ...over } : r)));
 
-  test("shows each agent's last-seen presence and current activity, and 'never seen' for an agent with no record", async () => {
-    const out = await status(() => Response.json([presence("agent-a", { presenceStatus: "active", lastHeartbeatAt: Date.now() - 3 * 60_000, currentTask: "reviewing a PR" })]));
+  test("shows each agent's presence status and current task, and 'no presence on this instance' for an agent with no record here", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 0.5, { currentTask: "reviewing a PR" })]));
     expect(out).not.toContain("Cannot read Presence");
     expect(out).toContain("LAST SEEN");
-    expect(row(out, "Agent A")).toContain("active (3m ago)");
+    expect(row(out, "Agent A")).toContain("active (just now)");
     expect(row(out, "Agent A")).toContain("reviewing a PR");
-    expect(row(out, "Agent B")).toContain("never seen");
+    expect(row(out, "Agent B")).toContain("no presence on this instance");
+    expect(row(out, "Agent B").trimEnd().endsWith(" —")).toBe(true);
+    expect(out).not.toContain("never seen");
   });
 
-  test("a stale record shows the offline status and its last-known activity", async () => {
-    const out = await status(() => Response.json([presence("agent-a", { presenceStatus: "offline", activityFresh: false, currentTask: null, lastActivity: "debugging", lastHeartbeatAt: Date.now() - 3 * 86_400_000 })]));
+  test("a heartbeat past Flair's idle threshold reads idle, and its still-fresh activity shows", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 5, { activity: "debugging" })]));
+    expect(row(out, "Agent A")).toContain("idle (5m ago)");
+    expect(row(out, "Agent A")).toContain("debugging");
+    expect(row(out, "Agent A")).not.toContain("was:");
+  });
+
+  test("a heartbeat past Flair's offline threshold reads offline with its last-known activity, and its stale task is not shown", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 3 * 1440, { activity: "debugging", currentTask: "a finished task" })]));
     expect(row(out, "Agent A")).toContain("offline (3d ago)");
     expect(row(out, "Agent A")).toContain("was: debugging");
+    expect(out).not.toContain("a finished task");
   });
 
-  test("a refused read (HTTP 403) is reported, and the columns read unavailable, not never seen", async () => {
-    const out = await status(() => new Response(null, { status: 403 }));
-    expect(out).toContain(`Cannot read Presence from ${stub.url} (HTTP 403); presence is unavailable.`);
+  test("an activity Flair reports stale reads was: <activity> while the heartbeat is live", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 0.5, { activity: "planning", activityUpdatedAt: Date.now() - 20 * 60_000 })]));
+    expect(row(out, "Agent A")).toContain("active (just now)");
+    expect(row(out, "Agent A")).toContain("was: planning");
+  });
+
+  test("a Presence read signed with a key Flair does not hold for the viewer gets Flair's 401, is reported, and the columns read unavailable", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 0.5)]), { afterAgentRead: (key) => writeFileSync(key, OTHER_SEED) });
+    expect(out).toContain(`Cannot read Presence from ${stub.url} (HTTP 401); presence is unavailable.`);
     expect(row(out, "Agent A")).toContain("unavailable");
     expect(row(out, "Agent B")).toContain("unavailable");
-    expect(out).not.toContain("never seen");
+    expect(out).not.toContain("no presence on this instance");
+  });
+
+  test("a Presence read the command cannot sign is not sent, is reported, and the columns read unavailable", async () => {
+    const out = await status(presenceRoute([beat("agent-a", 0.5)]), { afterAgentRead: (key) => rmSync(key) });
+    expect(out).toContain(`Cannot read Presence from ${stub.url} (not signed (no request sent)); presence is unavailable.`);
+    expect(row(out, "Agent A")).toContain("unavailable");
+    expect(row(out, "Agent B")).toContain("unavailable");
+    expect(out).not.toContain("no presence on this instance");
   });
 
   test("a rejected request is reported with its code, never its message", async () => {
@@ -182,24 +214,36 @@ describe("cli#622 — office status reads the Presence roster", () => {
 
   test.each([
     ["a body that is not an array", () => Response.json({ agents: [] }), "body is not an array"],
-    ["a record missing a field", () => Response.json([{ ...presence("agent-a"), presenceStatus: undefined }]), "a presence record lacks a field the command reads"],
     ["a body that is not JSON", () => new Response("not json"), "body is not JSON"],
+    ["a status outside Flair's vocabulary", corrupt([beat("agent-a", 0.5)], { presenceStatus: "busy" }), "a presence record has a missing or invalid presenceStatus"],
+    ["a current task that is not a string", corrupt([beat("agent-a", 0.5)], { currentTask: 42 }), "a presence record has a missing or invalid currentTask"],
+    ["an activityFresh that is not a boolean", corrupt([beat("agent-a", 0.5)], { activityFresh: "yes" }), "a presence record has a missing or invalid activityFresh"],
+    ["a record missing lastActivity", corrupt([beat("agent-a", 0.5)], { lastActivity: undefined }), "a presence record has a missing or invalid lastActivity"],
+    ["a current task of only whitespace", corrupt([beat("agent-a", 0.5)], { currentTask: "   " }), "a presence record has a missing or invalid currentTask"],
+    ["a stale record with a current task", corrupt([beat("agent-a", 60)], { currentTask: "a stale task" }), "a stale presence record carries a current task or an activity other than idle"],
+    ["two records for one agent", () => Response.json(presenceRecords([beat("agent-a", 0.5), beat("agent-a", 5)])), "two presence records share an id"],
   ])("a malformed response (%s) is reported, and the columns read unavailable", async (_label, answer, note) => {
     const out = await status(answer);
     expect(out).toContain(`Cannot read Presence from ${stub.url} (malformed response (${note})); presence is unavailable.`);
     expect(row(out, "Agent A")).toContain("unavailable");
-    expect(out).not.toContain("never seen");
+    expect(row(out, "Agent B")).toContain("unavailable");
+    expect(out).not.toContain("a stale task");
+    expect(out).not.toContain("no presence on this instance");
   });
 
-  test("JSON output carries each agent's Presence record, last-seen text and presence state", async () => {
-    await status(() => Response.json([presence("agent-a", { currentTask: "reviewing a PR" })]), true);
+  test("JSON output carries each agent's validated Presence fields, last-seen text, activity and presence state", async () => {
+    await status(presenceRoute([beat("agent-a", 5, { currentTask: "reviewing a PR" })]), { json: true });
     const agents = jsonAgents();
     expect(agents.map((a) => a.presenceState)).toEqual(["ok", "ok"]);
-    expect(agents[0]!.presence.id).toBe("agent-a");
-    expect(agents[0]!.lastSeen).toBe("active (5m ago)");
+    expect(Object.keys(agents[0]!.presence).sort()).toEqual(
+      ["activity", "activityFresh", "currentTask", "id", "lastActivity", "lastHeartbeatAt", "presenceStatus"],
+    );
+    expect(agents[0]!.presence.presenceStatus).toBe("idle");
+    expect(agents[0]!.lastSeen).toBe("idle (5m ago)");
     expect(agents[0]!.doing).toBe("reviewing a PR");
     expect(agents[1]!.presence).toBeNull();
-    expect(agents[1]!.lastSeen).toBe("never seen");
+    expect(agents[1]!.lastSeen).toBe("no presence on this instance");
+    expect(agents[1]!.doing).toBeNull();
   });
 });
 

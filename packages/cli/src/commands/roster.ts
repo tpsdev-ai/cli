@@ -5,7 +5,7 @@ import { createFlairClient, defaultFlairKeyPath } from "../utils/flair-client.js
 import { sendSignedMail } from "../utils/mail-producer.js";
 import { resolveCliSenderId } from "../utils/sender-id.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
+import { NO_PRESENCE_TEXT, presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
 
 interface RosterArgs {
   action: "list" | "show" | "find" | "invite";
@@ -260,10 +260,13 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
     return;
   }
 
-  // Per-agent presence for the last-seen column: Flair's office-wide Presence
-  // roster (see utils/presence-read.ts). It holds each agent's own heartbeat —
-  // not the viewer's catch-up feed. A read that does not return the roster is
-  // reported, and the column says "unavailable", not "never seen".
+  // Per-agent presence for the last-seen column: the Presence roster of the
+  // Flair instance at flairUrl (see utils/presence-read.ts), not the viewer's
+  // catch-up feed. Agents push heartbeats there; Flair derives the status.
+  // Presence is not federated, so an agent with no record here reads "no
+  // presence on this instance". A read that cannot be signed (it is then not
+  // sent) or fails, or that returns a roster the reader does not accept, is
+  // reported, and the column says "unavailable" instead.
   const read = await readPresence({ flairUrl, sign: makeAuth });
   const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);
@@ -274,7 +277,7 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
   const lastSeenText = (agId: string): string => {
     if (state === "unavailable") return "unavailable";
     const rec = presenceByAgent.get(agId);
-    return rec ? `${rec.presenceStatus} (${relativeAgo(rec.lastHeartbeatAt)})` : "never seen";
+    return rec ? `${rec.presenceStatus} (${relativeAgo(rec.lastHeartbeatAt)})` : NO_PRESENCE_TEXT;
   };
 
   if (opts.json) {
