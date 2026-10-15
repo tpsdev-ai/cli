@@ -90,7 +90,7 @@ export async function handlePrOpened(
 }
 
 /**
- * Poll the agent's own feed for `pr.opened`, with a distinct review cursor.
+ * Poll the agent's own feed for `pr.opened`, using a different cursor filename from the task loop.
  * The loop ID allows the CLI's 64-character agent ID plus `-review-trigger`.
  */
 export function startReviewTriggerLoop(

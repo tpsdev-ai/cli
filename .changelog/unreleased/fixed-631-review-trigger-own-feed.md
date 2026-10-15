@@ -1,1 +1,1 @@
-- **The codex runtime's review-trigger loop reads the agent's own catch-up feed (Closes #631).** It keeps a distinct review cursor and accepts loop IDs through 79 characters, including a 64-character agent ID plus `-review-trigger`.
+- **The codex runtime's review-trigger loop reads the agent's own catch-up feed (Closes #631).** It uses a different cursor filename from the task loop and accepts loop IDs through 79 characters, including a 64-character agent ID plus `-review-trigger`.

@@ -8,8 +8,8 @@
  * own watermark for the agent never chooses where reading starts. The position
  * is persisted in `~/.tps/cursors/<loopId>-task-loop.json` as
  * `{ position, updatedAt }` and replaced atomically (a temporary file in the
- * same directory, fsynced, then renamed over it). Distinct `loopId` values keep
- * separate positions; callers that omit it share the `agentId` cursor. It must
+ * same directory, fsynced, then renamed over it). The task and review loops use
+ * different cursor filenames; callers that omit `loopId` use the `agentId` cursor. It must
  * be a single safe filename component (see `LOOP_ID_PATTERN`); `startTaskLoop` refuses any other with
  * `InvalidLoopIdError` before reading or writing a cursor. With no usable cursor file, the loop sets the position to
  * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
@@ -219,7 +219,7 @@ export function startTaskLoop(
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  // Distinct loop IDs keep separate positions; omitted IDs share the agentId cursor.
+  // Omitted loop IDs use the agentId cursor.
   const loopId = opts.loopId ?? agentId;
   // Refuse an unsafe loopId before any cursor is read or written: it names the
   // cursor file, so one with a path separator or a traversal segment could

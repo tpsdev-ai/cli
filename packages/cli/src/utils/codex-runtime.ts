@@ -853,7 +853,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
   });
 
-  // Review trigger — polls the agent's own feed with a distinct review cursor.
+  // Review trigger — polls the agent's own feed using a different cursor filename from the task loop.
   if (config.reviewTrigger) {
     startReviewTriggerLoop(flair, agentId, config.reviewTrigger);
     console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);

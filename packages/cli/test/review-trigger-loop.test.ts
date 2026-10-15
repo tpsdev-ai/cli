@@ -1,13 +1,12 @@
 /**
  * cli#631 — the review-trigger loop reads only feeds the agent may read: it
  * reads the agent's OWN catch-up feed (`agentId`), the feed Flair serves an
- * event addressed to that agent to. Before this change the loop read the feed of
- * `<agentId>-review-trigger` while signing as `agentId`, which Flair refuses
- * with 403, so it never received its events.
+ * event addressed to that agent to. Flair refuses a non-admin agent's read of
+ * `<agentId>-review-trigger` with 403.
  *
  * The catch-up route is `orgEventCatchupRoute`, the shared signed stub modelled
  * on Flair's coded catch-up contract; it refuses a non-admin read of another
- * participant's feed with 403, so a loop that reads a foreign feed gets nothing.
+ * participant's feed with 403, so a non-admin agent gets nothing from a foreign feed.
  * The loop runs through the real FlairClient, signer and envelope reader; the
  * HTTP catch-up endpoint is faked, and the case that drives the review request
  * fakes the `gh-as` process call too (`spawnSyncImpl`).
@@ -154,7 +153,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
       agentId, "api", "--method", "POST", `repos/${REPO}/pulls/1/requested_reviewers`, "--input", "-",
     ]);
     expect(ghCalls[0]?.input).toBe(JSON.stringify({ reviewers: ["reviewer-1"] }));
-    // Every request named the agent's own feed. A foreign feed (…-review-trigger) would 403 and deliver nothing.
+    // Every request named the agent's own feed. A non-admin agent's foreign-feed read would get 403.
     expect(asked.length).toBeGreaterThan(0);
     expect(new Set(asked)).toEqual(new Set([agentId]));
     expect(route.served).toEqual(["e1"]);
