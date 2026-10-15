@@ -18,6 +18,7 @@ import { join } from "node:path";
 import { format } from "node:util";
 import { runAgent } from "../src/commands/agent.js";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { flairTarget } from "./helpers/scratch-flair.js";
 import { stubFlairHandler } from "./helpers/stub-flair.js";
 
 const AGENT = "create-registration-agent";
@@ -673,18 +674,16 @@ test("the row holds a value that decodes to the wrong length: exits non-zero", a
 });
 
 /**
- * The seam through the REAL component: a real Harper running Flair. Skips
- * everywhere one is not reachable (CI has no Flair lane); run it with
- * TPS_TEST_REAL_FLAIR=1 and TPS_TEST_FLAIR_URL pointing at an instance whose
- * admin credential is TPS_TEST_FLAIR_ADMIN (default admin:test123). Current
- * Flair drops `publicKey` on Agent PUT/PATCH, so a fresh `create` cannot
- * register: it must exit non-zero and print no success line.
+ * The seam through the REAL component: a real Harper running Flair. Skipped
+ * unless TPS_TEST_REAL_FLAIR=1 (cli#591), in which case `getScratchFlair()`
+ * boots the scratch instance this file runs against. Current Flair drops
+ * `publicKey` on Agent PUT/PATCH, so a fresh `create` cannot register: it must
+ * exit non-zero and print no success line.
  */
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   "against a real Flair, create refuses when the generated key cannot be registered",
   async () => {
-    const baseUrl = process.env.TPS_TEST_FLAIR_URL ?? "http://127.0.0.1:9926";
-    const admin = process.env.TPS_TEST_FLAIR_ADMIN ?? "admin:test123";
+    const { baseUrl, admin } = flairTarget();
     const id = `create-refusal-${randomUUID()}`;
     const savedAdmin = process.env.FLAIR_ADMIN_AUTH;
     process.env.FLAIR_ADMIN_AUTH = admin;
@@ -705,15 +704,13 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
       if (savedAdmin === undefined) delete process.env.FLAIR_ADMIN_AUTH; else process.env.FLAIR_ADMIN_AUTH = savedAdmin;
     }
   },
-  30_000,
+  240_000,
 );
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   "against a real Flair, create succeeds with an existing Agent and matching local key",
   async () => {
-    const baseUrl = process.env.TPS_TEST_FLAIR_URL ?? "http://127.0.0.1:9926";
-    const opsUrl = process.env.TPS_TEST_FLAIR_OPS_URL ?? "http://127.0.0.1:9925";
-    const admin = process.env.TPS_TEST_FLAIR_ADMIN ?? "admin:test123";
+    const { baseUrl, opsUrl, admin } = flairTarget();
     const id = `create-existing-${randomUUID()}`;
     const keyPair = generateKeyPair();
     const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
@@ -749,7 +746,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
       expect(deleted.ok).toBe(true);
     }
   },
-  30_000,
+  240_000,
 );
 
 test("selected create cases omit the credential marker and Basic encoding from captured output and errors", async () => {

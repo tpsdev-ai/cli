@@ -1,0 +1,54 @@
+name: Real-Flair integration lane
+
+# cli#520 — run the tests that cross the Flair seam against a REAL Flair (a
+# scratch Harper served by the published @tpsdev-ai/flair). On `main` it runs on
+# every push; on a pull request it runs only when a Flair-facing file changes, so
+# an unrelated PR does not pay to install and boot Flair.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'packages/cli/src/utils/flair-client*'
+      - 'packages/cli/src/commands/flair*.ts'
+      - 'packages/cli/src/commands/memory*.ts'
+      - 'packages/cli/src/commands/agent.ts'
+      - 'packages/cli/src/commands/office-flair-spoke.ts'
+      - 'packages/cli/src/commands/skill.ts'
+      - 'packages/cli/test/real-flair.test.ts'
+      - 'packages/cli/test/agent-create-registration.test.ts'
+      - 'packages/cli/test/mail-flair-read-auth.test.ts'
+      - 'packages/cli/test/helpers/scratch-flair.ts'
+      - 'scripts/real-flair-lane.ts'
+      - 'scripts/test-suite.mjs'
+      - 'scripts/test-home-guard.mjs'
+      - '.github/workflows/real-flair.yml'
+
+permissions: {}
+
+jobs:
+  real-flair:
+    name: Real-Flair integration lane
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      - name: Real-Flair lane (scratch Flair on a local Harper)
+        # Starts the scratch Flair, runs the marked tests through the isolated
+        # launcher, and stops the instance in a finally.
+        run: bun scripts/real-flair-lane.ts

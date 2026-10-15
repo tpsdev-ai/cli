@@ -71,6 +71,8 @@ import { basename, dirname, join, resolve, sep } from "node:path";
  */
 export const PASSED_ENV = {
   TPS_TEST_REAL_FLAIR: "opts into the real-Flair test, which uses a Flair server already listening on 127.0.0.1:9925 and :9926",
+  TPS_TEST_FLAIR_HTTP_PORT: "the real-Flair lane's scratch instance HTTP port — a number, so the tests build the loopback URL themselves and no path crosses",
+  TPS_TEST_FLAIR_OPS_PORT: "the real-Flair lane's scratch instance operator-API port — a number, for the same reason",
   PATH: "bun, node, git and the other tools the tests spawn are found through it",
   LANG: "locale: the language and encoding of the tools the tests spawn",
   LANGUAGE: "locale: message-language preference of the tools the tests spawn",
