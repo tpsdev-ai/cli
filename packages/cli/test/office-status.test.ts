@@ -152,7 +152,7 @@ describe("cli#622 — office status reads the Presence roster", () => {
   const row = (out: string, name: string) => out.split("\n").find((line) => line.includes(` ${name} `)) ?? "";
   const jsonAgents = () =>
     (JSON.parse(output.filter((l) => !l.startsWith("[ERR] ")).join("\n")) as { agents: Array<Record<string, any>> }).agents;
-  /** Flair's records for `rows` with `over` applied to the first: a record outside Flair's contract. */
+  /** Flair's records for `rows` with `over` applied to the first. */
   const corrupt = (rows: PresenceRow[], over: Record<string, unknown>): FlairRoutes => () =>
     Response.json(presenceRecords(rows).map((r, i) => (i === 0 ? { ...r, ...over } : r)));
 
@@ -165,6 +165,17 @@ describe("cli#622 — office status reads the Presence roster", () => {
     expect(row(out, "Agent B")).toContain("no presence on this instance");
     expect(row(out, "Agent B").trimEnd().endsWith(" —")).toBe(true);
     expect(out).not.toContain("never seen");
+  });
+
+  test("accepts a task whose trim-then-slice output ends in a space", async () => {
+    const task = "x".repeat(199) + " ";
+    const route = presenceRoute([beat("agent-a", 0.5, { currentTask: `  ${task}tail  ` })]);
+    const out = await status(route);
+    expect(out).not.toContain("Cannot read Presence");
+    expect(row(out, "Agent A")).toContain(task);
+    await status(route, { json: true });
+    expect(jsonAgents()[0]!.presence.currentTask).toBe(task);
+    expect(jsonAgents()[0]!.doing).toBe(task);
   });
 
   test("a heartbeat past Flair's idle threshold reads idle, and its still-fresh activity shows", async () => {

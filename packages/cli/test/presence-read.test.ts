@@ -12,6 +12,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { readPresence } from "../src/utils/presence-read.js";
 import {
   type FlairRoutes,
+  installStubFlairFetch,
   type PresenceRow,
   presenceRecords,
   presenceRoute,
@@ -72,6 +73,26 @@ describe("cli#622 — readPresence", () => {
   });
 
   test.each([
+    ["short", "  reviewing a PR  ", "reviewing a PR"],
+    ["at the cap", "  " + "x".repeat(200) + "tail  ", "x".repeat(200)],
+    ["ending in a space", "  " + "x".repeat(199) + " tail  ", "x".repeat(199) + " "],
+    ["ending in whitespace", "  " + "x".repeat(198) + " \ttail  ", "x".repeat(198) + " \t"],
+  ])("accepts Flair's trim-then-slice task output %s", async (_label, input, expected) => {
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, presenceRoute([beat("agent-a", 0.5, { currentTask: input })]));
+    const read = await readPresence({ flairUrl: stub.url, sign: requestSigner(VIEWER, SEED) });
+    expect(read.status).toBe("ok");
+    if (read.status === "ok") expect(read.agents[0]!.currentTask).toBe(expected);
+  });
+
+  test("accepts a lowercase TPS-Ed25519 scheme with a valid signature", async () => {
+    stub = installStubFlairFetch({ [VIEWER]: SEED }, presenceRoute(ROWS));
+    const signer = requestSigner(VIEWER, SEED);
+    const read = await readPresence({ flairUrl: stub.url, sign: (method, path) => signer(method, path).replace("TPS-Ed25519", "tps-ed25519") });
+    expect(read.status).toBe("ok");
+    if (read.status === "ok") expect(read.agents).toHaveLength(ROWS.length);
+  });
+
+  test.each([
     ["with a code", () => { throw Object.assign(new Error("signer-message-not-printed"), { code: "EACCES" }); }, "EACCES"],
     ["with only a class", () => { throw new RangeError("signer-message-not-printed"); }, "RangeError"],
     ["a non-error value", () => { throw "signer-message-not-printed"; }, "unknown error"],
@@ -123,7 +144,10 @@ describe("cli#622 — readPresence", () => {
     ["an empty current task", corrupt(0, { currentTask: "" }), invalid("currentTask")],
     ["a current task over Flair's 200-character cap", corrupt(0, { currentTask: "x".repeat(201) }), invalid("currentTask")],
     ["a current task of only whitespace", corrupt(0, { currentTask: "   " }), invalid("currentTask")],
-    ["a current task Flair would have trimmed", corrupt(0, { currentTask: " reviewing a PR" }), invalid("currentTask")],
+    ["a current task with leading whitespace", corrupt(0, { currentTask: " reviewing a PR" }), invalid("currentTask")],
+    ["a short current task with trailing whitespace", corrupt(0, { currentTask: "reviewing a PR " }), invalid("currentTask")],
+    ["a capped current task with leading whitespace", corrupt(0, { currentTask: " " + "x".repeat(199) }), invalid("currentTask")],
+    ["a capped current task of only whitespace", corrupt(0, { currentTask: " ".repeat(200) }), invalid("currentTask")],
     ["a missing current task", corrupt(0, { currentTask: undefined }), invalid("currentTask")],
     ["a valid first record and an invalid second", corrupt(1, { presenceStatus: "busy" }), invalid("presenceStatus")],
     ["a stale record with a current task", corrupt(0, { activityFresh: false }), "malformed response (a stale presence record carries a current task or an activity other than idle)"],

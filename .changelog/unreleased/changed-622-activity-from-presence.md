@@ -11,6 +11,6 @@
   federation does not replicate it), so an agent with no record on the queried
   instance reads `no presence on this instance`. The presence columns read
   `unavailable`, not an empty column, when the read cannot be signed (it is then
-  not sent) or fails, or when the roster has a field the views read missing or
-  outside Flair's contract, fields that contradict how Flair derives them, or
+  not sent) or fails, or when the roster has a missing or invalid field the
+  views read, fields that contradict how Flair derives them, or
   two records for one agent. Office status prints no blocker line.

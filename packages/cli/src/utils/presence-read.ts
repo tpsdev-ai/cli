@@ -33,9 +33,9 @@
  *
  * Validation covers every field the reader returns, and is all or nothing. The
  * whole read is `unavailable` when one record has such a field missing or
- * outside Flair's coded contract (a status or activity outside its
- * vocabulary, a heartbeat time that is not a finite number, a current task
- * that is neither null nor a trimmed string of 1 to 200 characters), when one
+ * invalid (a status or activity outside Flair's vocabulary, a heartbeat time
+ * that is not a finite number, or a current task other than null or the output
+ * of slicing a non-empty trimmed string to 200 characters), when one
  * record's fields contradict how Flair derives them (a stale record with a
  * current task or an activity other than `idle`, a fresh record whose activity
  * differs from its last activity, an offline record with fresh activity), or
@@ -113,8 +113,11 @@ function toPresenceRecord(value: unknown): PresenceRecord | { invalid: string } 
   if (typeof r.lastActivity !== "string" || !PRESENCE_ACTIVITIES.has(r.lastActivity)) return bad("lastActivity");
   if (typeof r.activityFresh !== "boolean") return bad("activityFresh");
   const task = r.currentTask;
-  // Flair trims a task and caps it at 200 characters, and serves null for an empty one.
-  if (task !== null && (typeof task !== "string" || task.length === 0 || task.length > CURRENT_TASK_MAX_LENGTH || task.trim() !== task))
+  // Flair trims, then slices to the cap; the slice can end in whitespace.
+  if (task !== null && (
+    typeof task !== "string" || task.length === 0 || task.length > CURRENT_TASK_MAX_LENGTH ||
+    task.trimStart() !== task || (task.length < CURRENT_TASK_MAX_LENGTH && task.trimEnd() !== task)
+  ))
     return bad("currentTask");
   // How Flair derives the record (resources/Presence.ts get()): a stale record
   // serves "idle" as its activity and no current task; a fresh one serves the

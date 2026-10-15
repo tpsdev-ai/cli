@@ -9,7 +9,7 @@
  * Authorization header lets a test keep passing after the client's signing
  * breaks (cli#554). `stubFlairHandler` verifies the caller before it answers:
  *   - a malformed TPS-Ed25519 header  -> 401 { error: "invalid_authorization_header" }
- *     (Flair's auth middleware, on every path)
+ *     (Flair's auth middleware)
  *   - no header, or another scheme  -> 403 { type: "error:AccessViolation", ... }
  *     (except `GET /Presence`, which gets 401 { error: "authentication required" }:
  *     Flair passes such a request to the resource as anonymous, and
@@ -117,7 +117,7 @@ export function stubFlairHandler(
     if (url.pathname === "/Health") return new Response("ok");
     const header = req.headers.get("Authorization") ?? "";
     const tpsScheme = /^TPS-Ed25519(?:\s|$)/i.test(header);
-    const auth = tpsScheme && header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/.exec(header) : null;
+    const auth = tpsScheme && header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/i.exec(header) : null;
     if (!auth) {
       if (tpsScheme) return Response.json({ error: "invalid_authorization_header" }, { status: 401 });
       if (req.method === "GET" && url.pathname === "/Presence") return presenceAuthenticationRequired();
@@ -329,7 +329,7 @@ export const PRESENCE_OFFLINE_THRESHOLD_MS = 600_000;
  *     `lastHeartbeatAt`) is under 10 min old (or in the future);
  *   - `activity` is the asserted activity while fresh and `idle` once stale;
  *     `lastActivity` is the asserted activity either way (`idle` when none);
- *   - `currentTask` is the trimmed task capped at 200 characters while fresh,
+ *   - `currentTask` is trimmed, then sliced to 200 characters while fresh,
  *     else null (an empty task is null);
  *   - `activityUpdatedAt` is the resolved stamp and `activityAgeMs` its age.
  *

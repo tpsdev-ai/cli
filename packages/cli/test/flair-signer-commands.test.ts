@@ -199,6 +199,19 @@ describe("cli#622 — runDashboard reads the Presence roster", () => {
     expect(out).not.toContain("never seen");
   });
 
+  test("accepts a task whose trim-then-slice output ends in a space", async () => {
+    const task = "x".repeat(199) + " ";
+    const route = presenceRoute([beat("agent-a", 0.5, { currentTask: `  ${task}tail  ` })]);
+    const out = await dashboard(route);
+    expect(out).not.toContain("Cannot read Presence");
+    expect(row(out, "agent-a")).toContain("active (just now)");
+    stub?.stop();
+    logs.length = 0;
+    await dashboard(route, { json: true });
+    expect(jsonRows()[0]!.presence.currentTask).toBe(task);
+    expect(jsonRows()[0]!.presenceState).toBe("ok");
+  });
+
   test("a Presence read signed with a key Flair does not hold for the viewer gets Flair's 401, is reported, and the column reads unavailable", async () => {
     const out = await dashboard(presenceRoute([beat("agent-a", 0.5)]), { afterAgentRead: (keyPath) => writeFileSync(keyPath, Buffer.alloc(32, 0x52)) });
     expect(out).toContain(`Cannot read Presence from ${stub!.url} (HTTP 401); presence is unavailable.`);
