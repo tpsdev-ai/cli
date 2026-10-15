@@ -1047,12 +1047,6 @@ async function internalInbound(ctx: YieldContext): Promise<boolean> {
   try {
     const record = readMailFile(ctx.curPath);
     if (!record) return false;
-    // cli#617 slice (b): a record carrying its stored envelope goes through
-    // recoverPromoted(), which decides its placement intent under the mailbox
-    // lock after verification. A record WITHOUT one (the raw signed-wrapper
-    // format MailClient writes) does not, so it is checked here, under the
-    // lock, before and again after verification. An intent present at either
-    // check withholds the record.
     if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     const recovered = record.envelope
       ? await recoverPromoted(ctx.agent, ctx.curPath, {}, { waitForLock: true })

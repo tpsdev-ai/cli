@@ -382,7 +382,7 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     try { await startPromise; } catch { /* expected on abort */ }
   });
 
-  it("cli#617: does not re-dispatch (or quarantine) an unacked cur/ record a MailClient delivery holds in_progress", async () => {
+  it("cli#617: does not re-dispatch or quarantine a promoted cur/ record with a synthetic in_progress intent", async () => {
     const agentId = "test-agent";
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
