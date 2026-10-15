@@ -41,14 +41,14 @@ beforeEach(() => {
 afterEach(() => rmSync(mailDir, { recursive: true, force: true }));
 
 /** Plant one signed record in new/ and return its path. */
-function plant(messageId: string): string {
+function plant(messageId: string, body = "recovery-body"): string {
   const timestamp = new Date().toISOString();
   const envelope = signEnvelope(
     {
       v: 1,
       from: FROM,
       to: AGENT,
-      body: "recovery-body",
+      body,
       messageId,
       timestamp,
       delegationChain: [
@@ -174,6 +174,101 @@ describe("MailClient recovery at the tested placement boundaries (cli#600)", () 
       await assertDeliveredUntilCompleted(messageId);
     });
   }
+});
+
+describe("pending record classification", () => {
+  function plantLater(): void {
+    renameSync(plant("later-mail"), join(mailboxRoot, "new", "z-later.json"));
+  }
+
+  async function deliverLater(client: MailClient): Promise<void> {
+    const later = await client.deliverNext();
+    expect(later.status).toBe("delivered");
+    if (later.status !== "delivered") throw new Error(JSON.stringify(later));
+    expect(later.delivery.message.verifiedEnvelope?.messageId).toBe("later-mail");
+    expect(await client.completeDelivery(later.delivery)).toEqual({ status: "completed" });
+  }
+
+  test("a raw wrapper with an extra envelope object recovers after a kill before the phase write", async () => {
+    plantLater();
+    const source = plant("raw-extra-envelope");
+    const raw = { ...JSON.parse(readFileSync(source, "utf8")), envelope: { extra: true } };
+    writeFileSync(source, JSON.stringify(raw));
+    const run = await runAndKillAt("phase-write", source);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    expect(mailboxReplayStore(mailboxRoot).placementPhase("m1.json")).toBe("placing");
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    const recovered = await client.deliverNext();
+    expect(recovered.status).toBe("delivered");
+    if (recovered.status !== "delivered") throw new Error(JSON.stringify(recovered));
+    expect(recovered.delivery.message.verifiedEnvelope?.messageId).toBe("raw-extra-envelope");
+    expect(JSON.parse(recovered.delivery.message.body)).toEqual(raw);
+    expect(await client.completeDelivery(recovered.delivery)).toEqual({ status: "completed" });
+    expect(mailboxReplayStore(mailboxRoot).placementPhase("m1.json")).toBeNull();
+    await deliverLater(client);
+  });
+
+  test.each([null, {}, { envelope: {} }, { body: "plain text", envelopeId: "self-asserted" }])(
+    "a record matching neither kind is quarantined and its intent cleared: %j", async (record) => {
+      plantLater();
+      const source = plant("invalid-pending");
+      writeFileSync(source, JSON.stringify(record));
+      const client = new MailClient(mailDir, undefined, AGENT, verifier());
+      const replay = mailboxReplayStore(mailboxRoot);
+      replay.beginPlacement("invalid-pending", "m1.json", source);
+      renameSync(source, curPath());
+      expect(await client.deliverNext()).toMatchObject({ status: "deferred", reason: "pending-record-invalid" });
+      expect(replay.placementPhase("m1.json")).toBeNull();
+      expect(existsSync(curPath())).toBe(false);
+      expect(JSON.parse(readFileSync(join(mailboxRoot, "dlq", "m1.json"), "utf8"))).toEqual(record);
+      expect(readFileSync(join(mailboxRoot, "dlq", "m1.json.reason"), "utf8")).toContain("Reason: pending-record-invalid");
+      await deliverLater(client);
+    },
+  );
+
+  test.each(["both", "raw", "cli"])("overlapping shapes select by verification: %s", async (verified) => {
+    plantLater();
+    const source = plant("raw-inner");
+    const raw = JSON.parse(readFileSync(source, "utf8"));
+    plant("cli-outer", raw.body);
+    const envelope = JSON.parse(JSON.parse(readFileSync(source, "utf8")).body);
+    const record = {
+      id: "record-id", from: FROM, to: AGENT, body: raw.body, timestamp: envelope.timestamp,
+      read: false, envelopeId: envelope.messageId, envelope,
+      trustTier: "internal", checkedOutAt: new Date().toISOString(), checkedOutBy: AGENT, deliveryAttempts: 1,
+    };
+    if (verified === "raw") record.envelope.signature = "invalid";
+    if (verified === "cli") {
+      const inner = JSON.parse(record.body);
+      inner.signature = "invalid";
+      record.body = JSON.stringify(inner);
+      plant("cli-outer", record.body);
+      record.envelope = JSON.parse(JSON.parse(readFileSync(source, "utf8")).body);
+      record.timestamp = record.envelope.timestamp;
+    }
+    writeFileSync(source, JSON.stringify(record));
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    const replay = mailboxReplayStore(mailboxRoot);
+    replay.beginPlacement(verified === "cli" ? "cli-outer" : "raw-inner", "m1.json", source);
+    renameSync(source, curPath());
+    const result = await client.deliverNext();
+    if (verified === "both") {
+      expect(result).toMatchObject({ status: "deferred", reason: "pending-record-ambiguous" });
+      expect(replay.placementPhase("m1.json")).toBeNull();
+      expect(readFileSync(join(mailboxRoot, "dlq", "m1.json.reason"), "utf8")).toContain("Reason: pending-record-ambiguous");
+      await deliverLater(client);
+    } else if (verified === "raw") {
+      expect(result.status).toBe("delivered");
+      if (result.status !== "delivered") throw new Error(JSON.stringify(result));
+      expect(result.delivery.message.verifiedEnvelope?.messageId).toBe("raw-inner");
+      expect(await client.completeDelivery(result.delivery)).toEqual({ status: "completed" });
+      await deliverLater(client);
+    } else {
+      expect(result).toMatchObject({ status: "deferred", reason: "cli-record" });
+      expect(replay.placementPhase("m1.json")).toBe("placing");
+    }
+  });
 });
 
 describe("MailClient defers unresolved placements", () => {

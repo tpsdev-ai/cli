@@ -60,15 +60,15 @@ export interface MailDelivery {
  * - `active`: this process holds the token, or a foreign claiming process is
  *   not provably gone. Release failed handoffs before retrying in the same process. No presentation
  *   is counted.
- * - `cli-record`: a `placing` intent names a CLI-promoted cur/ record (a
- *   plaintext body with the signed envelope stored beside it). MailClient does
- *   not present that format; CLI recovery requires an expired or absent checkout
- *   and successful verification.
+ * - `cli-record`: a `placing` record verifies only as CLI-promoted; CLI recovery
+ *   requires an expired or absent checkout and successful verification.
+ * - `pending-record-invalid` / `pending-record-ambiguous`: a `placing` record
+ *   verifies as neither format or both; quarantine clears its intent.
  * - `verification-failed` / `verification-unavailable`: the pending cur/ copy
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
- * - `record-changed`: the pending cur/ copy is missing, is not the file the
- *   intent recorded, or changed during re-verification.
- * - `storage-error`: the placement history or new/ could not be read.
+ * - `record-changed`: the pending cur/ copy is missing, its recorded identity
+ *   is absent or mismatched, or its bytes changed during re-verification.
+ * - `storage-error`: a history, cur/, new/, quarantine or placement-state operation threw.
  * - `new-mail-deferred`: a new/ commit was deferred, including when a
  *   placement appeared before its commit lock.
  */
@@ -76,6 +76,8 @@ export type DeliveryDeferral =
   | "lock-busy"
   | "active"
   | "cli-record"
+  | "pending-record-invalid"
+  | "pending-record-ambiguous"
   | "verification-failed"
   | "verification-unavailable"
   | "record-changed"
@@ -102,7 +104,7 @@ export type DeliveryCompletion =
    * Not this hand-over's to finalize; nothing changed. `foreign`: not a
    * delivery this MailClient issued. `stale`: the message was presented again
    * since (another claim), finalized, or moved to another phase. `identity`:
-   * cur/ no longer holds the file the intent recorded.
+   * recorded cur/ identity is absent or mismatched.
    */
   | { status: "refused"; reason: "foreign" | "stale" | "identity"; detail: string };
 
@@ -136,14 +138,23 @@ function claimIsLive(claim: PresentationClaim | undefined): boolean {
   return !processIsGone(claim.pid, claim.start);
 }
 
-/** A CLI-promoted cur/ record stores the signed envelope as an object beside a plaintext body. */
-function isCliPromotedRecord(bytes: Buffer): boolean {
-  try {
-    const record = JSON.parse(bytes.toString("utf8"));
-    return record !== null && typeof record === "object" && record.envelope !== null && typeof record.envelope === "object";
-  } catch {
-    return false;
-  }
+function isCliPromotedRecord(record: unknown): record is {
+  id: string; from: string; to: string; body: string; timestamp: string; read: boolean;
+  envelopeId: string; envelope: Envelope; trustTier?: string;
+  checkedOutAt: string; checkedOutBy: string; deliveryAttempts: number; replyToId?: string;
+} {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+  const r = record as Record<string, unknown>;
+  return typeof r.id === "string" && r.id.length > 0 &&
+    typeof r.from === "string" && typeof r.to === "string" && typeof r.body === "string" &&
+    typeof r.timestamp === "string" && typeof r.read === "boolean" &&
+    typeof r.envelopeId === "string" && r.envelopeId.length > 0 &&
+    r.envelope !== null && typeof r.envelope === "object" && !Array.isArray(r.envelope) &&
+    parseSignedEnvelope(JSON.stringify(r.envelope)).ok &&
+    (r.trustTier === undefined || r.trustTier === "user" || r.trustTier === "internal" || r.trustTier === "external") &&
+    typeof r.checkedOutAt === "string" && typeof r.checkedOutBy === "string" &&
+    Number.isInteger(r.deliveryAttempts) && (r.deliveryAttempts as number) >= 1 &&
+    (r.replyToId === undefined || typeof r.replyToId === "string");
 }
 
 function isMissing(err: unknown): boolean {
@@ -414,7 +425,7 @@ export class MailClient {
     }
     issued.state = "released";
     if (result === "identity") {
-      return { status: "refused", reason: "identity", detail: `cur/${issued.file} is not the file the intent recorded; not finalized` };
+      return { status: "refused", reason: "identity", detail: `cur/${issued.file} recorded identity is absent or mismatched; not finalized` };
     }
     return {
       status: "refused",
@@ -448,7 +459,16 @@ export class MailClient {
     if (inspected.status !== "read") return inspected;
     let outcome: VerifyOutcome;
     try {
-      outcome = await this.verifyMailBody(inspected.bytes.toString("utf8"));
+      if (inspected.phase === "placing") {
+        const classified = await this.classifyPending(inspected.bytes);
+        if (classified.kind === "cli") return deferred("cli-record", `cur/${file} verifies only as CLI-promoted; awaiting CLI recovery`, file);
+        if (classified.kind === "pending-record-invalid" || classified.kind === "pending-record-ambiguous") {
+          return this.quarantinePending(messageId, file, inspected.bytes, classified.kind);
+        }
+        outcome = classified.outcome;
+      } else {
+        outcome = await this.verifyMailBody(inspected.bytes.toString("utf8"));
+      }
     } catch (err) {
       return deferred("verification-unavailable", `re-verification could not run: ${sanitizeError(err)}`, file);
     }
@@ -465,7 +485,54 @@ export class MailClient {
     return this.presentUnderLock(messageId, file, inspected.bytes, outcome.envelope, trustTier);
   }
 
-  private async inspectPending(messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer }> {
+  private async classifyPending(bytes: Buffer): Promise<
+    | { kind: "raw"; outcome: Extract<VerifyOutcome, { pass: true }> }
+    | { kind: "cli" }
+    | { kind: "pending-record-invalid" }
+    | { kind: "pending-record-ambiguous" }
+  > {
+    const body = bytes.toString("utf8");
+    const raw = await this.verifyMailBody(body);
+    let record: unknown;
+    try { record = JSON.parse(body); } catch { record = null; }
+    let cli: VerifyOutcome | undefined;
+    if (isCliPromotedRecord(record)) {
+      const env = record.envelope;
+      if (record.from === env.from && record.to === env.to && record.body === env.body &&
+        record.timestamp === env.timestamp && record.envelopeId === env.messageId && record.replyToId === env.replyToId) {
+        cli = await this.verifyMailBody(JSON.stringify({ from: record.from, body: JSON.stringify(env) }));
+      }
+    }
+    if (raw.pass && cli?.pass) return { kind: "pending-record-ambiguous" };
+    if (raw.pass) return { kind: "raw", outcome: raw };
+    if (cli?.pass) return { kind: "cli" };
+    return { kind: "pending-record-invalid" };
+  }
+
+  private async quarantinePending(
+    messageId: string, file: string, bytes: Buffer,
+    reason: "pending-record-invalid" | "pending-record-ambiguous",
+  ): Promise<PendingOutcome> {
+    const lock = await this.lockOrDefer("pending record not quarantined", file);
+    if ("status" in lock) return lock;
+    try {
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      const state = replay.placementState(file);
+      if (!state || state.messageId !== messageId || state.phase !== "placing") return RESOLVED;
+      if (!replay.ownsPendingPlacement(messageId, file) || !readFileSync(join(this.inboxCur, file)).equals(bytes)) {
+        return deferred("record-changed", `cur/${file} identity absent or mismatched, or bytes changed; not quarantined`, file);
+      }
+      mkdirSync(this.inboxDlq, { recursive: true });
+      writeRejectSidecar(this.inboxDlq, file, "invalid", reason);
+      renameSync(join(this.inboxCur, file), join(this.inboxDlq, file));
+      replay.finishPlacement(messageId, file);
+      return deferred(reason, `cur/${file} quarantined: ${reason}; intent cleared`, file);
+    } finally {
+      lock.release();
+    }
+  }
+
+  private async inspectPending(messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer; phase: PlacementPhase }> {
     const lock = await this.lockOrDefer("pending placement not inspected", file);
     if ("status" in lock) return lock;
     try {
@@ -495,14 +562,7 @@ export class MailClient {
         }
         return deferred("record-changed", `cur/${file} is missing for a ${state.phase} intent`, file);
       }
-      if (state.phase === "placing" && isCliPromotedRecord(bytes)) {
-        return deferred(
-          "cli-record",
-          `cur/${file} is a CLI-promoted record (plaintext body, signed envelope stored beside it); MailClient does not present it; CLI recovery requires an expired or absent checkout and successful verification`,
-          file,
-        );
-      }
-      return { status: "read", bytes };
+      return { status: "read", bytes, phase: state.phase };
     } finally {
       lock.release();
     }
@@ -531,7 +591,7 @@ export class MailClient {
         return deferred("active", `message ${messageId} has an active claim (local token held or foreign process not provably gone)`, file);
       }
       if (!replay.ownsPendingPlacement(messageId, file)) {
-        return deferred("record-changed", `cur/${file} is not the file the intent recorded`, file);
+        return deferred("record-changed", `cur/${file} recorded identity is absent or mismatched`, file);
       }
       let current: Buffer;
       try {
@@ -790,8 +850,13 @@ export class MailClient {
           await this.finishUnlinkedPlacement(messageId, file);
           continue;
         }
-        const outcome = await this.verifyMailBody(bytes.toString("utf8"));
-        if (!outcome.pass) continue; // withhold: the cur copy is not a verified message
+        const classified = await this.classifyPending(bytes);
+        if (classified.kind === "cli") continue;
+        if (classified.kind === "pending-record-invalid" || classified.kind === "pending-record-ambiguous") {
+          await this.quarantinePending(messageId, file, bytes, classified.kind);
+          continue;
+        }
+        const outcome = classified.outcome;
         const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
         const delivered = await this.completeInterruptedPlacement(messageId, file, bytes, outcome.envelope, trustTier);
         if (delivered) messages.push(delivered);
@@ -991,6 +1056,9 @@ export class MailClient {
     let mailMsg: { from?: string; body: string };
     try {
       mailMsg = JSON.parse(body);
+      if (mailMsg === null || typeof mailMsg !== "object" || Array.isArray(mailMsg) || typeof mailMsg.body !== "string") {
+        return { pass: false, class: "invalid", reason: "invalid raw mail wrapper" };
+      }
     } catch {
       return { pass: false, class: "invalid", reason: "json parse error: invalid JSON" };
     }

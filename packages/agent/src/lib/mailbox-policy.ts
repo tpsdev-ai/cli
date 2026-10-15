@@ -288,11 +288,10 @@ export interface ReplayStore {
    * `placing` intent becomes `in_progress` at presentation 1; an `in_progress`
    * intent's count increments. Returns `absent` when no live intent for this
    * message is present (missing, another message, or a `failed`/`unknown`
-   * phase), `presented` with the new count, or `failed` when the liveness bound
-   * (MAX_DELIVERY_PRESENTATIONS or DELIVERY_PRESENTATION_TTL_MS) is reached —
-   * the intent is then terminal `failed` and the caller must not present. The
-   * caller first checks for a held local token or a foreign process not provably
-   * gone. Call under the mailbox lock.
+   * phase), `presented` with the new count, or terminal `failed` before a sixth
+   * presentation or when the deadline is exceeded. The count check permits the fifth.
+   * The caller must not present a failed intent and first checks for a held
+   * local token or a foreign process not provably gone. Call under the mailbox lock.
    */
   advancePresentation(messageId: string, file: string, nowIso: string, claim: PresentationClaim): PresentationAdvance;
   /**
@@ -310,7 +309,7 @@ export interface ReplayStore {
    * claim carries `token`, and `cur/<file>` is still the file the intent
    * recorded (device and inode). Otherwise nothing changes: `absent` (no intent
    * for this message), `stale` (another phase or another presentation's claim),
-   * or `identity` (the cur/ copy is not the recorded file).
+   * or `identity` (recorded cur/ identity absent or mismatched).
    */
   completePlacement(messageId: string, file: string, token: string): PlacementCompletion;
 }
@@ -715,7 +714,8 @@ function failPlacement(root: string, messageId: string, file: string, presentati
 
 /**
  * cli#617 slice (b): advance a live intent to its next presentation, or to the
- * terminal `failed` phase when the liveness bound is reached. A `placing`
+ * terminal `failed` phase before a sixth presentation or when the deadline is
+ * exceeded. The count check permits the fifth. A `placing`
  * intent becomes `in_progress` at presentation 1 (the first hand-over, counted
  * before it); an `in_progress` intent's count increments. Either way the new
  * presentation's claim replaces any earlier one, so an earlier presentation can

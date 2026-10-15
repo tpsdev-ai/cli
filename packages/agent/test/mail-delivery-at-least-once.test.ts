@@ -361,10 +361,13 @@ describe("deliverNext defers pending cur-copy failures before committing new mai
 
   test("a placing intent naming a CLI-promoted record defers by name and is left untouched", async () => {
     plant("m1.json", "cli-shaped");
-    // The CLI promote() shape: a plaintext body with the signed envelope stored beside it.
     const wrapper = JSON.parse(readFileSync(fresh("m1.json"), "utf8"));
     const envelope = JSON.parse(wrapper.body);
-    writeFileSync(fresh("m1.json"), JSON.stringify({ id: "rec-1", from: FROM, to: AGENT, body: envelope.body, envelopeId: "cli-shaped", envelope }));
+    writeFileSync(fresh("m1.json"), JSON.stringify({
+      id: "rec-1", from: FROM, to: AGENT, body: envelope.body, timestamp: envelope.timestamp, read: false,
+      envelopeId: "cli-shaped", envelope, trustTier: "internal", checkedOutAt: new Date().toISOString(),
+      checkedOutBy: AGENT, deliveryAttempts: 1,
+    }));
     const replay = mailboxReplayStore(root);
     replay.beginPlacement("cli-shaped", "m1.json", fresh("m1.json"));
     linkSync(fresh("m1.json"), cur("m1.json"));
@@ -405,7 +408,7 @@ describe("deliverNext defers pending cur-copy failures before committing new mai
 describe("liveness-bound transitions for unclaimed in_progress work", () => {
   const FAILED_AT = `not completed after ${MAX_DELIVERY_PRESENTATIONS} presentation(s)`;
 
-  test("after the presentation count the intent goes terminal, a line is logged, and other mail flows", async () => {
+  test("a request for a sixth presentation fails the intent, logs, and leaves other mail flowing", async () => {
     plant("m1.json", "poison");
     plant("m2.json", "healthy");
     const warnings: string[] = [];
@@ -447,7 +450,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
     expect(warnings.some((w) => w.includes("stale") && w.includes("deadline"))).toBe(true);
   });
 
-  test("the deadline is reached even when the pending copy no longer re-verifies", async () => {
+  test("the exceeded deadline fails the intent even when the pending copy no longer re-verifies", async () => {
     const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     committed("stale-unverifiable", { version: 1, phase: "in_progress", presentations: 2, firstPresentedAt: stale });
     plant("m2.json", "healthy", OTHER);
