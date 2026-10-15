@@ -69,9 +69,10 @@ export interface MailDelivery {
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
  * - `record-changed`: the pending cur/ copy is missing, its recorded identity
  *   is absent or mismatched, or its bytes changed during re-verification.
- * - `storage-error`: a history, cur/, new/, quarantine or placement-state operation threw.
- * - `new-mail-deferred`: a new/ commit was deferred, including when a
- *   placement appeared before its commit lock.
+ * - `storage-error`: listing new/, or a history, cur/, quarantine or
+ *   placement-state operation, threw.
+ * - `new-mail-deferred`: reading one new/ file or committing it failed or was
+ *   deferred, including when a placement appeared before its commit lock.
  */
 export type DeliveryDeferral =
   | "lock-busy"
@@ -88,7 +89,7 @@ export type DeliveryDeferral =
 /** What MailClient.deliverNext() returns (cli#617 slice b). */
 export type DeliverNextResult =
   | { status: "delivered"; delivery: MailDelivery }
-  /** No work found during this scan. */
+  /** No deliverable mail found during this scan; rejected mail may have been moved to `dlq/`. */
   | { status: "idle" }
   /** Work may be waiting; nothing was handed over. */
   | { status: "deferred"; reason: DeliveryDeferral; detail: string; file?: string };
