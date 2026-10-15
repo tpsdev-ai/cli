@@ -1,10 +1,10 @@
-/** cli#636: operation root snapshots across symlink changes. */
+/** cli#636: canonical operation path strings across symlink changes. */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import * as ed from "@noble/ed25519";
 import { MailClient, type MailMessage } from "../src/io/mail.js";
 import { bridgePrincipalIds } from "../src/lib/bridge-identity.js";
@@ -178,7 +178,7 @@ test("a live client does not promote under the old root's lock, delivers the env
   expect(readFileSync(join(storeNew, AGENT, "dlq", "r-again.json.reason"), "utf8").split("\n")[0]).toBe("class: replay");
 }, 20_000);
 
-test("a mail-root repoint during verification keeps the promotion's acceptance stripe on the root the operation started with", async () => {
+test("a configured mail-root repoint during verification derives the promotion stripe from the initial canonical string", async () => {
   const verifier = pausedVerifier();
   const mail = new MailClient(alias, undefined, AGENT, verifier.client);
   const source = seed(storeOld, "r.json", signedRelayRecord(AGENT, "stripe", { branchId: BRANCH, id: ID }));
@@ -203,7 +203,7 @@ test("a mail-root repoint during verification keeps the promotion's acceptance s
 }, 20_000);
 
 for (const rejected of [false, true]) {
-  test(`retargeting the resolved mail root preserves the snapped ${rejected ? "rejection" : "promotion"} stripe and mailbox paths`, async () => {
+  test(`retargeting the resolved mail root keeps ${rejected ? "rejection" : "promotion"} filesystem path arguments derived from the canonical strings`, async () => {
     const box = join(root, "box");
     mkdirSync(box);
     symlinkSync(box, join(storeOld, AGENT), "dir");
@@ -212,23 +212,29 @@ for (const rejected of [false, true]) {
     const raw = signedRelayRecord(AGENT, "resolved-target", { branchId: BRANCH, id: ID });
     seed(storeOld, "r.json", raw);
     const stripe = acceptanceLockRoot(storeOld, BRANCH, ID);
+    const movedStore = join(root, "moved-store");
     const mkdir = fs.mkdirSync;
     const realpath = fs.realpathSync;
-    const created: string[] = [];
-    const resolved: string[] = [];
+    const mkdirPaths: string[] = [];
+    const realpathInputs: string[] = [];
+    const physicalClaims: string[] = [];
     let retargeted = false;
     const mkdirSpy = spyOn(fs, "mkdirSync").mockImplementation(((...args: Parameters<typeof mkdir>) => {
-      if (retargeted) created.push(String(args[0]));
-      return mkdir(...args);
+      if (retargeted) mkdirPaths.push(String(args[0]));
+      const result = mkdir(...args);
+      if (retargeted && String(args[0]) === join(stripe, ".mail-lock.claim")) {
+        physicalClaims.push(realpath(String(args[0])));
+      }
+      return result;
     }) as typeof mkdir);
     const realpathSpy = spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
-      if (retargeted) resolved.push(String(args[0]));
+      if (retargeted) realpathInputs.push(String(args[0]));
       return realpath(...args);
     }) as typeof realpath);
     let delivered: MailMessage[];
     try {
       delivered = await checkWithChangeDuringVerification(mail, verifier, () => {
-        renameSync(storeOld, join(root, "moved-store"));
+        renameSync(storeOld, movedStore);
         symlinkSync(storeNew, storeOld, "dir");
         retargeted = true;
       });
@@ -236,10 +242,13 @@ for (const rejected of [false, true]) {
       mkdirSpy.mockRestore();
       realpathSpy.mockRestore();
     }
-    expect(resolved).toEqual([]);
-    expect(created).toContain(stripe);
-    expect(created).toContain(join(stripe, ".mail-lock.claim"));
-    expect(created.some((path) => path.startsWith(join(storeNew, ".relay-accept-locks")))).toBe(false);
+    expect(realpathInputs).toEqual([]);
+    expect(mkdirPaths).toContain(stripe);
+    expect(mkdirPaths).toContain(join(stripe, ".mail-lock.claim"));
+    expect(mkdirPaths.some((path) => path.startsWith(join(storeNew, ".relay-accept-locks")))).toBe(false);
+    // The OS follows the replacement symlink when creating the lock claim.
+    expect(physicalClaims).toEqual([join(storeNew, ".relay-accept-locks", basename(stripe), ".mail-lock.claim")]);
+    expect(existsSync(join(movedStore, ".relay-accept-locks"))).toBe(false);
     expect(delivered.map((message) => message.filename)).toEqual(rejected ? [] : ["r.json"]);
     expect(existsSync(join(box, "new", "r.json"))).toBe(false);
     expect(readFileSync(join(box, rejected ? "dlq" : "cur", "r.json"), "utf8")).toBe(raw);
@@ -247,13 +256,13 @@ for (const rejected of [false, true]) {
     if (rejected) {
       expect(readFileSync(join(box, "dlq", "r.json.reason"), "utf8").split("\n")[0]).toBe("class: invalid");
     } else {
-      expect(created).toContain(join(box, ".mail-lock.claim"));
+      expect(mkdirPaths).toContain(join(box, ".mail-lock.claim"));
       expect(hasCommittedMessageId(box, "resolved-target")).toBe(true);
     }
   });
 }
 
-test("a mail-root repoint during verification keeps trust classification on the root the operation started with", async () => {
+test("a configured mail-root repoint during verification reads trust through the initial canonical string", async () => {
   expect(bridgePrincipalIds(storeOld).has("sender")).toBe(true);
   expect(bridgePrincipalIds(storeNew).has("sender")).toBe(false);
   const verifier = pausedVerifier();
@@ -267,7 +276,7 @@ test("a mail-root repoint during verification keeps trust classification on the 
   expect(existsSync(join(storeNew, AGENT, "cur", "r.json"))).toBe(false);
 });
 
-test("a mail-root repoint during verification keeps the rejection's acceptance stripe on the root the operation started with", async () => {
+test("a configured mail-root repoint during verification derives the rejection stripe from the initial canonical string", async () => {
   const verifier = pausedVerifier({ wrongKey: true });
   const mail = new MailClient(alias, undefined, AGENT, verifier.client);
   const raw = signedRelayRecord(AGENT, "rejected", { branchId: BRANCH, id: ID });
@@ -292,7 +301,7 @@ test("a mail-root repoint during verification keeps the rejection's acceptance s
   expect(readFileSync(join(storeOld, AGENT, "dlq", "r.json.reason"), "utf8").split("\n")[0]).toBe("class: invalid");
 }, 20_000);
 
-test("interrupted-placement recovery classifies trust on the root the operation started with", async () => {
+test("interrupted-placement recovery reads trust through the initial canonical string after a configured mail-root repoint", async () => {
   const verifier = pausedVerifier();
   const mail = new MailClient(alias, undefined, AGENT, verifier.client);
   const mailbox = join(storeOld, AGENT);
@@ -307,7 +316,7 @@ test("interrupted-placement recovery classifies trust on the root the operation 
   expect(hasCommittedMessageId(mailbox, "recovered")).toBe(true);
 });
 
-test("a mailbox-directory repoint during verification keeps the operation on the directory it started with", async () => {
+test("a mailbox-directory repoint during verification derives maildir and replay paths from the initial canonical string", async () => {
   const store = join(root, "store");
   const boxOld = join(root, "box-old");
   const boxNew = join(root, "box-new");
@@ -331,7 +340,7 @@ test("a mailbox-directory repoint during verification keeps the operation on the
   expect(hasCommittedMessageId(boxNew, "box")).toBe(false);
 });
 
-test("deliverOutbox moves a record into the recipient inbox under the root the operation started with", async () => {
+test("deliverOutbox derives the recipient path from the initial canonical mail-root string after a configured symlink repoint", async () => {
   const mail = new MailClient(alias, undefined, AGENT, senderKeyResolver());
   const sentAt = "2026-10-13T00:00:00.000Z";
   writeFileSync(join(storeOld, AGENT, "outbox", "o.json"), JSON.stringify({ to: "peer", body: "x", sentAt }));

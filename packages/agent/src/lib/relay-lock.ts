@@ -9,8 +9,8 @@ export function relayAcceptanceLockRoot(branchId: string, id: string, mailRoot =
   return acceptanceLockRoot(mailRoot, branchId, id);
 }
 
-// MailClient supplies its canonical snapshot. CLI updateExistingRecord,
-// rejectToDlq and promote omit it and still resolve the process mail root here.
+// When a relay stripe is required, MailClient supplies its canonical path string;
+// CLI callers without it resolve the process mail root here.
 export function tryAcquireRelayMoveLock(record: unknown, mailRootSnapshot?: string): MailLock | null {
   const delivery = (record as { relayDelivery?: { branchId?: unknown; id?: unknown } } | null)?.relayDelivery;
   if (typeof delivery?.branchId !== "string" || typeof delivery.id !== "string") return { release() {} };

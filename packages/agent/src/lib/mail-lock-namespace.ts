@@ -19,12 +19,10 @@
  * symlinked path and its target already reach one filesystem lock. Within one
  * process the strings do matter, because the lock's re-entrancy check compares
  * lock path strings. Mailbox lock roots come from here only for acceptance and
- * MailClient: acceptance derives its recipient mailbox lock roots with
- * canonicalMailboxRoot, and MailClient takes every mailbox lock (promotion and
- * placement recovery) at the canonicalMailboxRoot of
- * `<canonicalMailRoot(mailDir)>/<agentId>`, resolved once per operation
- * (cli#636). The CLI's other mailbox lock sites lock the mailbox root path as
- * given.
+ * MailClient: acceptance uses canonicalMailboxRoot; MailClient derives its
+ * promotion and recovery lock paths from the canonical mailbox string resolved
+ * once per operation (cli#636). The CLI's other mailbox lock sites use the
+ * mailbox root path as given.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
@@ -54,7 +52,7 @@ export function acceptanceLockRoot(mailRoot: string, branchId: string, id: strin
   return acceptanceLockRootFromSnapshot(canonicalMailRoot(mailRoot), branchId, id);
 }
 
-/** Derive a stripe from an already canonical mail-root snapshot without resolving it. */
+/** Derive a stripe path from a canonical mail-root string without resolving again. */
 export function acceptanceLockRootFromSnapshot(mailRoot: string, branchId: string, id: string): string {
   const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
   return join(mailRoot, ".relay-accept-locks", String(stripe));

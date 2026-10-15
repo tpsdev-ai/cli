@@ -87,12 +87,13 @@ function resumableOnRecovery(phase: PlacementPhase | null): boolean {
 }
 
 /**
- * cli#636: resolve both roots once per operation; derive subsequent paths by joining.
+ * cli#636: resolve both roots to canonical path strings once per operation;
+ * derive subsequent paths, including locks, by joining those strings.
  */
 interface OperationRoots {
-  /** The configured mail directory: bridge-principal trust, acceptance stripes, recipient inboxes. */
+  /** Canonical mail-root string: bridge-principal trust, acceptance stripes, recipient inboxes. */
   readonly mailRoot: string;
-  /** This agent's mailbox directory: the mailbox lock, the maildir paths and the replay state. */
+  /** Canonical mailbox string: the mailbox lock, maildir paths and replay state. */
   readonly mailbox: string;
 }
 
@@ -136,11 +137,8 @@ export class MailClient {
   }
 
   /**
-   * cli#636: resolve the roots for one operation (see OperationRoots) and create
-   * the maildir subdirectories under the mailbox. The mail root is the resolved
-   * real path of the configured `mailDir`; the mailbox is the resolved real path
-   * of `<mail root>/<agentId>`, so a symlink at the mailbox directory itself is
-   * resolved too. Both are resolved through mail-lock-namespace.ts (cli#616).
+   * Resolve `mailDir` and `<mail root>/<agentId>` to canonical path strings;
+   * create maildir subdirectories beneath the mailbox string.
    */
   private operationRoots(): OperationRoots {
     const mailRoot = canonicalMailRoot(this.mailDir);
