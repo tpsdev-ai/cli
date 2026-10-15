@@ -69,10 +69,13 @@ export interface MailDelivery {
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
  * - `record-changed`: the pending cur/ copy is missing, its recorded identity
  *   is absent or mismatched, or its bytes changed during re-verification.
- * - `storage-error`: listing new/, or a history, cur/, quarantine or
- *   placement-state operation, threw.
- * - `new-mail-deferred`: reading one new/ file or committing it failed or was
- *   deferred, including when a placement appeared before its commit lock.
+ * - `storage-error`: listing new/ threw, or a history, cur/, quarantine or
+ *   placement-state operation threw while pending placements were processed.
+ * - `new-mail-deferred`: one new/ file's attempt did not complete: reading it,
+ *   verifying it (including the verifier or trust-tier read not answering), a
+ *   history read, or its commit failed or was deferred, including when a
+ *   placement appeared before its commit lock. A listed file that disappears
+ *   before it is read is skipped, and the scan continues.
  */
 export type DeliveryDeferral =
   | "lock-busy"
