@@ -5,20 +5,14 @@
  * CLI relay acceptance takes its acceptance stripe from the process mail root
  * (`TPS_MAIL_DIR`); its recipient mailbox locks come from the selected mailbox
  * and scan roots, which can be branch-office mailboxes outside that root.
- * MailClient took its acceptance stripe from the process environment too, not
- * from its configured `mailDir`, so a MailClient whose environment selected a
- * different root locked a stripe under that root, and acceptance's stripe did
- * not exclude its promotion or dead-letter moves. Each side now derives the
- * stripe from the mail root it is configured with, through this module, which
- * both packages import.
+ * MailClient derives its stripe and mailbox paths from one resolved mail-root
+ * string per operation, also resolving the mailbox directory beneath it.
  *
- * Each root derived here starts from a resolved real path (symlinks and `.`/`..`
- * resolved), so callers that reach one mail root by different paths derive equal
- * stripe root STRINGS. Equal strings are not what makes two processes exclude
- * each other: the lock is a directory created inside the locked directory, so a
- * symlinked path and its target already reach one filesystem lock. Within one
- * process the strings do matter, because the lock's re-entrancy check compares
- * lock path strings. Mailbox lock roots come from here only for acceptance and
+ * The relay stripe is a cooperative lock among MailClients that resolve the
+ * same canonical path. The OS follows same-user filesystem changes to that
+ * path during an operation; the stripe does not exclude them.
+ *
+ * Mailbox lock roots come from here only for acceptance and
  * MailClient: acceptance uses canonicalMailboxRoot; MailClient derives its
  * promotion and recovery lock paths from the canonical mailbox string resolved
  * once per operation (cli#636). The CLI's other mailbox lock sites use the

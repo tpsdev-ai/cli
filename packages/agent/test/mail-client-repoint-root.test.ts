@@ -203,7 +203,7 @@ test("a configured mail-root repoint during verification derives the promotion s
 }, 20_000);
 
 for (const rejected of [false, true]) {
-  test(`retargeting the resolved mail root keeps ${rejected ? "rejection" : "promotion"} filesystem path arguments derived from the canonical strings`, async () => {
+  test(`canonical-root replacement redirects the ${rejected ? "dead-letter" : "promotion"} lock claim to the replacement target`, async () => {
     const box = join(root, "box");
     mkdirSync(box);
     symlinkSync(box, join(storeOld, AGENT), "dir");
@@ -246,7 +246,7 @@ for (const rejected of [false, true]) {
     expect(mkdirPaths).toContain(stripe);
     expect(mkdirPaths).toContain(join(stripe, ".mail-lock.claim"));
     expect(mkdirPaths.some((path) => path.startsWith(join(storeNew, ".relay-accept-locks")))).toBe(false);
-    // The OS follows the replacement symlink when creating the lock claim.
+    // Documents where the OS places the claim, not exclusion of root replacement.
     expect(physicalClaims).toEqual([join(storeNew, ".relay-accept-locks", basename(stripe), ".mail-lock.claim")]);
     expect(existsSync(join(movedStore, ".relay-accept-locks"))).toBe(false);
     expect(delivered.map((message) => message.filename)).toEqual(rejected ? [] : ["r.json"]);

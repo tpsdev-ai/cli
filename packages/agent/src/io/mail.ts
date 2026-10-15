@@ -131,8 +131,8 @@ export class MailClient {
       );
     }
     this.flairClient = flairClient;
-    // cli#636: create the maildir under the target configured now. Nothing is
-    // kept: every operation resolves its own roots (operationRoots).
+    // cli#636: no resolved canonical root is cached at construction.
+    // Every operation resolves its own roots (operationRoots).
     this.operationRoots();
   }
 
