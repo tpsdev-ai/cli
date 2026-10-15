@@ -29,6 +29,14 @@ const TIMESTAMP = "2000-01-01T00:00:00.000Z";
 const AGENT_DIST = new URL("../../agent/dist/index.js", import.meta.url).href;
 const RELAY_URL = new URL("../src/utils/relay.js", import.meta.url).href;
 
+// The acceptance's lock budget (relay.ts) is fixed before the pause hook and the
+// pause spends it: while paused this test runs the MailClient child, whose runtime
+// the runner's load sets, not the test. That pause outlasts the 2s production
+// default on a slow runner, and the acceptance then refuses the recipient's lock
+// after release. The test sets the budget for its own child; the production default
+// is unchanged.
+const ACCEPT_LOCK_TIMEOUT_MS = 30_000;
+
 const ACCEPT_CHILD = `
 const { deliverRelayedToLocal, setRelayAcceptTestHook } = await import(${JSON.stringify(RELAY_URL)});
 const pause = process.env.ACCEPT_PAUSE;
@@ -109,6 +117,7 @@ function spawnAccept(id: string, pause: string, mailDir: string): Promise<{ chil
       ACCEPT_ID: id,
       ACCEPT_TO: "candidate",
       ACCEPT_PAUSE: pause,
+      TPS_RELAY_ACCEPT_LOCK_TIMEOUT_MS: String(ACCEPT_LOCK_TIMEOUT_MS),
     },
     stdio: ["ignore", "pipe", "inherit"],
   });
