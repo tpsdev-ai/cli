@@ -265,7 +265,7 @@ function readMessageFile(path: string): MailMessage {
 export type UpdateExistingResult<T> =
   | { status: "updated"; record: T }
   | { status: "gone" | "changed" | "busy" }
-  /** cli#617 slice (b): `withholdPlacement` refused the mutation under the lock; `reason` names the intent. */
+  /** `withholdPlacement` refused the mutation under the lock; `reason` explains why, including unavailable history. */
   | { status: "withheld"; reason: string };
 
 /**
@@ -1617,8 +1617,6 @@ export async function recoverPromoted(
     const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
     if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
     try {
-      // An intent written during the verification withholds: another
-      // consumer's in-flight record is never quarantined from here.
       const refusal = placementRefusal(mailboxReplayStore(dirs.root), filename, msg.envelopeId);
       if (refusal !== null) return { ok: false, class: "busy", reason: `${refusal}; not presented` };
       try {
@@ -1867,8 +1865,6 @@ export function ackMessageAtPath(path: string): MailMessage {
     // trail we do not have.)
     try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
   }, withholdPlacement: true });
-  // cli#617 slice (b): the placement check runs under the ack's own lock, so a
-  // phase written after the caller's verification still refuses the ack.
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;

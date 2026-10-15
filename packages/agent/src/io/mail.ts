@@ -60,10 +60,11 @@ export interface MailDelivery {
  * - `active`: this process holds the token, or a foreign claiming process is
  *   not provably gone. Release failed handoffs before retrying in the same process. No presentation
  *   is counted.
- * - `cli-record`: a `placing` record verifies only as CLI-promoted; CLI recovery
- *   requires an expired or absent checkout and successful verification.
+ * - `cli-record`: a `placing` record verifies only as CLI-promoted.
+ *   The CLI lease sweep requires an expired or absent checkout; direct bridge
+ *   and plugin startup recovery does not check lease expiry.
  * - `pending-record-invalid` / `pending-record-ambiguous`: a `placing` record
- *   verifies as neither format or both; quarantine clears its intent.
+ *   verified as neither format or both, was quarantined and its intent cleared.
  * - `verification-failed` / `verification-unavailable`: the pending cur/ copy
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
  * - `record-changed`: the pending cur/ copy is missing, its recorded identity
@@ -89,7 +90,7 @@ export type DeliverNextResult =
   | { status: "delivered"; delivery: MailDelivery }
   /** No placing/in_progress work is pending and new/ holds nothing committable. */
   | { status: "idle" }
-  /** Work may be waiting; nothing was handed over and no new mail was committed. */
+  /** Work may be waiting; nothing was handed over. */
   | { status: "deferred"; reason: DeliveryDeferral; detail: string; file?: string };
 
 /** What MailClient.completeDelivery() returns (cli#617 slice b). */
@@ -434,7 +435,11 @@ export class MailClient {
     };
   }
 
-  /** Release this process's active claim for retry; completion remains possible until it is presented again. */
+  /**
+   * Release this process's active claim for retry. Completion requires the same
+   * live intent, claim and recorded file identity. The next deliverNext() can
+   * fail an overdue released intent, making completion stale.
+   */
   releaseDelivery(delivery: MailDelivery): boolean {
     const issued = this.issued.get(delivery);
     if (!issued || issued.state !== "active") return false;

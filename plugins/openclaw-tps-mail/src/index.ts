@@ -643,8 +643,6 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
       return Object.assign(current, patch);
     }, { withholdPlacement: true });
     if (r.status === "changed" && alreadyStamped) return { ok: true };
-    // cli#617 slice (b): a placement intent on the record (a MailClient delivery
-    // or commit) refused the stamp under the same lock; nothing was written.
     if (r.status === "withheld") return { ok: false, reason: "write-failed", path, code: "PLACEMENT_WITHHELD" };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
