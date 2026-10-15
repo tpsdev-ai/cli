@@ -19,8 +19,10 @@ on:
 permissions:
   contents: read
 
-# A superseded PR head's runs are cancelled (the group is the PR number); a push
-# to main keeps a group unique per run, so its runs are never cancelled.
+# A newer push to the same pull request cancels that PR's pending or in-progress
+# run of this workflow, once the newer push starts a run here — a PR run starts
+# only when this workflow's path filter matches. A push to main gets a group
+# unique per run (`run_id`), so this rule does not cancel a main run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -31,8 +33,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # On a pull request only linux-x64 is smoked; push to main keeps the full
-        # matrix.
+        # On a pull request that this workflow's path filter matches, linux-x64
+        # is the only target; a push to main keeps all four targets.
         #
         # GitHub retired Intel mac runners (macos-13 queues forever).
         # This job runs on Apple Silicon under Rosetta 2 translation —
