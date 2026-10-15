@@ -1,24 +1,20 @@
 import { mkdirSync } from "node:fs";
 import { acquireMailLockSync, type MailLock } from "./mail-lock.js";
-import { acceptanceLockRoot, configuredMailRoot, RELAY_ACCEPT_LOCK_STRIPES } from "./mail-lock-namespace.js";
+import { acceptanceLockRoot, acceptanceLockRootFromSnapshot, canonicalMailRoot, configuredMailRoot, RELAY_ACCEPT_LOCK_STRIPES } from "./mail-lock-namespace.js";
 
 export { RELAY_ACCEPT_LOCK_STRIPES };
 
-/**
- * The acceptance-stripe lock root for one relayed delivery. `mailRoot` defaults
- * to the process mail root; MailClient passes `tryAcquireRelayMoveLock` the mail
- * root it resolved from its configured `mailDir` at the start of the operation
- * (cli#636), which derives the same root, so each side derives the stripe from
- * the mail root it is configured with.
- */
+/** Resolve the mail root for CLI relay acceptance and reservation checks. */
 export function relayAcceptanceLockRoot(branchId: string, id: string, mailRoot = configuredMailRoot()): string {
   return acceptanceLockRoot(mailRoot, branchId, id);
 }
 
-export function tryAcquireRelayMoveLock(record: unknown, mailRoot = configuredMailRoot()): MailLock | null {
+// MailClient supplies its canonical snapshot. CLI updateExistingRecord,
+// rejectToDlq and promote omit it and still resolve the process mail root here.
+export function tryAcquireRelayMoveLock(record: unknown, mailRootSnapshot?: string): MailLock | null {
   const delivery = (record as { relayDelivery?: { branchId?: unknown; id?: unknown } } | null)?.relayDelivery;
   if (typeof delivery?.branchId !== "string" || typeof delivery.id !== "string") return { release() {} };
-  const root = acceptanceLockRoot(mailRoot, delivery.branchId, delivery.id);
+  const root = acceptanceLockRootFromSnapshot(mailRootSnapshot ?? canonicalMailRoot(configuredMailRoot()), delivery.branchId, delivery.id);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   return acquireMailLockSync(root, { timeoutMs: 0 });
 }

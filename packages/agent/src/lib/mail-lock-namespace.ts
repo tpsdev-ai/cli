@@ -51,8 +51,13 @@ export function canonicalMailRoot(mailRoot: string): string {
 
 /** The acceptance-stripe lock root for one relayed delivery, under `mailRoot`. */
 export function acceptanceLockRoot(mailRoot: string, branchId: string, id: string): string {
+  return acceptanceLockRootFromSnapshot(canonicalMailRoot(mailRoot), branchId, id);
+}
+
+/** Derive a stripe from an already canonical mail-root snapshot without resolving it. */
+export function acceptanceLockRootFromSnapshot(mailRoot: string, branchId: string, id: string): string {
   const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
-  return join(canonicalMailRoot(mailRoot), ".relay-accept-locks", String(stripe));
+  return join(mailRoot, ".relay-accept-locks", String(stripe));
 }
 
 /** The mailbox lock root for `agentId`, under `mailRoot`. */

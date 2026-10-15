@@ -1,20 +1,4 @@
-/**
- * mail-client-repoint-root.test.ts — cli#636.
- *
- * MailClient resolves its mail root and its mailbox directory once at the start
- * of each operation and uses that one snapshot for the whole operation: the
- * mailbox lock, the maildir paths and the replay state derive from the mailbox,
- * and bridge-principal trust, the acceptance stripes of promotion and rejection,
- * and outbox recipient inboxes derive from the mail root. Nothing is pinned at
- * construction.
- *
- * The first case repoints the configured mail root between operations and
- * checks that the next operation uses the new target. The remaining cases
- * repoint a symlink while an operation is in progress (paused in signature
- * verification, or immediately before the underlying outbox read) and check
- * that the operation finishes against the target it started with. Where a
- * lock must exclude the client, a real second process holds it.
- */
+/** cli#636: operation root snapshots across symlink changes. */
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
@@ -217,6 +201,57 @@ test("a mail-root repoint during verification keeps the promotion's acceptance s
   expect((await mail.checkNewMail()).map((message) => message.filename)).toEqual(["r.json"]);
   expect(existsSync(join(storeOld, AGENT, "cur", "r.json"))).toBe(true);
 }, 20_000);
+
+for (const rejected of [false, true]) {
+  test(`retargeting the resolved mail root preserves the snapped ${rejected ? "rejection" : "promotion"} stripe and mailbox paths`, async () => {
+    const box = join(root, "box");
+    mkdirSync(box);
+    symlinkSync(box, join(storeOld, AGENT), "dir");
+    const verifier = pausedVerifier({ wrongKey: rejected });
+    const mail = new MailClient(alias, undefined, AGENT, verifier.client);
+    const raw = signedRelayRecord(AGENT, "resolved-target", { branchId: BRANCH, id: ID });
+    seed(storeOld, "r.json", raw);
+    const stripe = acceptanceLockRoot(storeOld, BRANCH, ID);
+    const mkdir = fs.mkdirSync;
+    const realpath = fs.realpathSync;
+    const created: string[] = [];
+    const resolved: string[] = [];
+    let retargeted = false;
+    const mkdirSpy = spyOn(fs, "mkdirSync").mockImplementation(((...args: Parameters<typeof mkdir>) => {
+      if (retargeted) created.push(String(args[0]));
+      return mkdir(...args);
+    }) as typeof mkdir);
+    const realpathSpy = spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
+      if (retargeted) resolved.push(String(args[0]));
+      return realpath(...args);
+    }) as typeof realpath);
+    let delivered: MailMessage[];
+    try {
+      delivered = await checkWithChangeDuringVerification(mail, verifier, () => {
+        renameSync(storeOld, join(root, "moved-store"));
+        symlinkSync(storeNew, storeOld, "dir");
+        retargeted = true;
+      });
+    } finally {
+      mkdirSpy.mockRestore();
+      realpathSpy.mockRestore();
+    }
+    expect(resolved).toEqual([]);
+    expect(created).toContain(stripe);
+    expect(created).toContain(join(stripe, ".mail-lock.claim"));
+    expect(created.some((path) => path.startsWith(join(storeNew, ".relay-accept-locks")))).toBe(false);
+    expect(delivered.map((message) => message.filename)).toEqual(rejected ? [] : ["r.json"]);
+    expect(existsSync(join(box, "new", "r.json"))).toBe(false);
+    expect(readFileSync(join(box, rejected ? "dlq" : "cur", "r.json"), "utf8")).toBe(raw);
+    expect(existsSync(join(storeNew, AGENT))).toBe(false);
+    if (rejected) {
+      expect(readFileSync(join(box, "dlq", "r.json.reason"), "utf8").split("\n")[0]).toBe("class: invalid");
+    } else {
+      expect(created).toContain(join(box, ".mail-lock.claim"));
+      expect(hasCommittedMessageId(box, "resolved-target")).toBe(true);
+    }
+  });
+}
 
 test("a mail-root repoint during verification keeps trust classification on the root the operation started with", async () => {
   expect(bridgePrincipalIds(storeOld).has("sender")).toBe(true);

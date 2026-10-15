@@ -87,14 +87,7 @@ function resumableOnRecovery(phase: PlacementPhase | null): boolean {
 }
 
 /**
- * cli#636: the roots one MailClient operation uses, resolved once when the
- * operation starts and passed to every step of it. Each is the resolved real
- * path (symlinks and `.`/`..` resolved) at that moment; paths beneath them
- * (`new/`, `cur/`, a file) are joined to them, not resolved again. A later
- * operation resolves them afresh, so when the symlink at the configured mail
- * path or at the agent's mailbox directory is repointed, the new target is
- * selected at the start of the next operation and an operation already running
- * finishes against the target it started with.
+ * cli#636: resolve both roots once per operation; derive subsequent paths by joining.
  */
 interface OperationRoots {
   /** The configured mail directory: bridge-principal trust, acceptance stripes, recipient inboxes. */

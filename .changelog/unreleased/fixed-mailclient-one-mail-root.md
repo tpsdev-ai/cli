@@ -6,7 +6,6 @@
   that `deliverOutbox()` moves records into derive from the resolved mail root.
   No root is kept from construction. When the symlink at the configured mail
   path, or at the agent's mailbox directory, is repointed while a client is
-  alive, the new target is selected at the start of the next operation; an
-  operation already running finishes against the target it started with. A
+  alive, the new target is selected at the start of the next operation. A
   plain rename of the configured directory is not followed: the next operation
   creates the configured path again and uses that, not the renamed directory.
