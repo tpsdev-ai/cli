@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -17,7 +17,7 @@ import {
   parseSignedEnvelope,
   pendingPlacementEntries,
   type PlacementPhase,
-  placeCurRecord,
+  placeCurRecord, fileIdentity, matchesFileIdentity,
   type PresentationClaim,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
@@ -193,10 +193,10 @@ function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxReject
   );
 }
 
-function sameFileByDeviceInode(a: string, b: string): boolean {
+function sameFileIdentity(a: string, b: string): boolean {
   const sa = lstatOrAbsent(a);
   const sb = lstatOrAbsent(b);
-  return sa !== null && sb !== null && sa.dev === sb.dev && sa.ino === sb.ino;
+  return sa !== null && sb !== null && matchesFileIdentity(sa, fileIdentity(sb));
 }
 
 /**
@@ -216,10 +216,9 @@ function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";
 }
 
-function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
+function lstatOrAbsent(path: string): import("node:fs").BigIntStats | null {
   try {
-    const st = lstatSync(path);
-    return { dev: st.dev, ino: st.ino };
+    return lstatSync(path, { bigint: true });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
@@ -776,7 +775,7 @@ export class MailClient {
         return "live-placement";
       }
       const dstPath = join(this.inboxCur, file);
-      if (sameFileByDeviceInode(srcPath, dstPath)) {
+      if (sameFileIdentity(srcPath, dstPath)) {
         replay.isConsumed(envelope.messageId);
         unlinkSync(srcPath);
         return "already-delivered";
@@ -785,38 +784,44 @@ export class MailClient {
       if (consumed) {
         return { pass: false, class: "replay", reason: `replay (envelope messageId ${envelope.messageId} already consumed)` };
       }
-      replay.beginPlacement(envelope.messageId, file, srcPath);
-      const placement = placeCurRecord(srcPath, dstPath);
-      if (placement.status === "exists") {
-        replay.finishPlacement(envelope.messageId, file);
-        throw new Error(`destination already exists: ${file}`);
-      }
+      const sourceFd = openSync(srcPath, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
-        unlinkSync(srcPath);
-      } catch (err) {
-        unlinkSync(dstPath);
-        replay.finishPlacement(envelope.messageId, file);
-        throw err;
-      }
-      try {
-        replay.recordConsumed(envelope.messageId);
-      } catch (err) {
-        try {
-          renameSync(dstPath, srcPath);
+        replay.beginPlacement(envelope.messageId, file, sourceFd);
+        const placement = placeCurRecord(srcPath, dstPath);
+        if (placement.status === "exists") {
           replay.finishPlacement(envelope.messageId, file);
-        } catch (rollbackErr) {
-          throw new AggregateError([err, rollbackErr],
-            `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
+          throw new Error(`destination already exists: ${file}`);
         }
-        throw err;
-      }
-      if (claim) {
-        const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString(), claim);
-        if (advance.status !== "presented") throw new Error(`placement not advanced after commit: ${advance.status}`);
-      } else {
-        replay.finishPlacement(envelope.messageId, file);
-      }
-      return null;
+        replay.beginPlacement(envelope.messageId, file, sourceFd);
+        try {
+          unlinkSync(srcPath);
+        } catch (err) {
+          unlinkSync(dstPath);
+          replay.finishPlacement(envelope.messageId, file);
+          throw err;
+        }
+        try {
+          replay.beginPlacement(envelope.messageId, file, sourceFd);
+          if (!replay.ownsPendingPlacement(envelope.messageId, file)) throw new Error("placement identity changed");
+          replay.recordConsumed(envelope.messageId);
+        } catch (err) {
+          try {
+            renameSync(dstPath, srcPath);
+            replay.finishPlacement(envelope.messageId, file);
+          } catch (rollbackErr) {
+            throw new AggregateError([err, rollbackErr],
+              `mail commit failed: ${sanitizeError(err)}; rollback failed: ${sanitizeError(rollbackErr)}`);
+          }
+          throw err;
+        }
+        if (claim) {
+          const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString(), claim);
+          if (advance.status !== "presented") throw new Error(`placement not advanced after commit: ${advance.status}`);
+        } else {
+          replay.finishPlacement(envelope.messageId, file);
+        }
+        return null;
+      } finally { closeSync(sourceFd); }
     } finally {
       relayLock.release();
       lock.release();
@@ -915,7 +920,7 @@ export class MailClient {
     if (!lock) throw new Error("mailbox lock busy; interrupted placement recovery deferred");
     try {
       const replay = mailboxReplayStore(this.mailboxRoot);
-      // Match the intent, recorded device/inode and pre-verification raw bytes.
+      // Match the intent, recorded identity and pre-verification raw bytes.
       if (!replay.hasPendingPlacement(messageId, file)) return null;
       if (!resumableOnRecovery(replay.placementPhase(file))) return null;
       if (envelope.messageId !== messageId) return null;

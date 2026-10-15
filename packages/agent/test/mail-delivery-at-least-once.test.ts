@@ -1,6 +1,7 @@
 
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import { Worker } from "node:worker_threads";
 import { createHash, randomUUID } from "node:crypto";
@@ -97,9 +98,9 @@ function setPhase(fields: Record<string, unknown>, file = "m1.json"): Buffer {
 function committed(messageId: string, fields: Record<string, unknown>, file = "m1.json", from = FROM): Buffer {
   signedRecord(fresh(file), messageId, from);
   const replay = mailboxReplayStore(root);
-  replay.beginPlacement(messageId, file, fresh(file));
   linkSync(fresh(file), cur(file));
   unlinkSync(fresh(file));
+  replay.beginPlacement(messageId, file, cur(file));
   replay.recordConsumed(messageId);
   return setPhase(fields, file);
 }
@@ -302,8 +303,8 @@ describe("in_progress re-presentation in recovery", () => {
   test("recovers a verified placing fixture to in_progress", async () => {
     plant("m1.json", "resume-placing");
     const replay = mailboxReplayStore(root);
-    replay.beginPlacement("resume-placing", "m1.json", fresh("m1.json"));
     linkSync(fresh("m1.json"), cur("m1.json"));
+    replay.beginPlacement("resume-placing", "m1.json", cur("m1.json"));
     // No consumed id and no phase yet: a crash between the link and the phase write.
 
     const c = client();
@@ -359,7 +360,42 @@ describe("completion is bound to the hand-over", () => {
     const m = delivered(await c.deliverNext());
     const bytes = readFileSync(cur("m1.json"));
     unlinkSync(cur("m1.json"));
-    writeFileSync(cur("m1.json"), bytes); // same name and bytes, another inode
+    writeFileSync(cur("m1.json"), bytes);
+    const before = intentText("m1.json");
+    expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
+    expect(intentText("m1.json")).toBe(before);
+  });
+
+  for (const field of ["ctimeNs", "size"] as const) {
+    test(`a cur/ copy with the recorded inode but changed ${field} is refused as identity`, async () => {
+      plant("m1.json", "reused-inode");
+      const c = client();
+      const m = delivered(await c.deliverNext());
+      const before = intentText("m1.json");
+      const recorded = intentJson("m1.json").identity;
+      const stat = fs.lstatSync(cur("m1.json"), { bigint: true });
+      expect(recorded).toEqual({ dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs), size: String(stat.size) });
+      const realStat = fs.lstatSync;
+      const replacement = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { [field]: stat[field] + 1n });
+      const stub = spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, options: unknown) =>
+        path === cur("m1.json") ? replacement : realStat(path, options as { bigint: true })) as typeof fs.lstatSync);
+      try {
+        expect(mailboxReplayStore(root).ownsPendingPlacement("reused-inode", "m1.json")).toBe(false);
+        expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
+        expect(intentText("m1.json")).toBe(before);
+        c.releaseDelivery(m);
+        expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
+        expect(intentText("m1.json")).toBe(before);
+      } finally { stub.mockRestore(); }
+    });
+  }
+
+  test("a legacy device/inode identity is refused and keeps the intent", async () => {
+    plant("m1.json", "legacy-identity");
+    const c = client();
+    const m = delivered(await c.deliverNext());
+    const { dev, ino } = intentJson("m1.json").identity;
+    setPhase({ identity: { dev, ino } });
     const before = intentText("m1.json");
     expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
     expect(intentText("m1.json")).toBe(before);
@@ -459,9 +495,9 @@ describe("deliverNext defers pending cur-copy failures before committing new mai
       checkedOutBy: AGENT, deliveryAttempts: 1,
     }));
     const replay = mailboxReplayStore(root);
-    replay.beginPlacement("cli-shaped", "m1.json", fresh("m1.json"));
     linkSync(fresh("m1.json"), cur("m1.json"));
     unlinkSync(fresh("m1.json"));
+    replay.beginPlacement("cli-shaped", "m1.json", cur("m1.json"));
     replay.recordConsumed("cli-shaped");
     const intentBefore = intentText("m1.json");
     const recordBefore = textOf(cur("m1.json"));

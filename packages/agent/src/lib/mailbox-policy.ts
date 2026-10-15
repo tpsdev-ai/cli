@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, type BigIntStats, closeSync, type Dirent, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, type BigIntStats, closeSync, type Dirent, existsSync, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -260,7 +260,7 @@ export interface ReplayStore {
    * unoccupied, or is the marker's own inode (treated as an interrupted move).
    * An occupied tombstone refuses the placement by name.
    */
-  beginPlacement(messageId: string, file: string, sourcePath?: string): void;
+  beginPlacement(messageId: string, file: string, sourcePath?: string | number): void;
   ownsPendingPlacement(messageId: string, file: string): boolean;
   /** A live (not `failed`) intent for this messageId names `file`. */
   hasPendingPlacement(messageId: string, file: string): boolean;
@@ -307,7 +307,7 @@ export interface ReplayStore {
    * cli#617 slice (b): completion-only finalize, bound to one presentation.
    * Deletes the intent only when it is `in_progress` for this message, its
    * claim carries `token`, and `cur/<file>` is still the file the intent
-   * recorded (device and inode). Otherwise nothing changes: `absent` (no intent
+   * recorded (device, inode, nanosecond ctime and size). Otherwise nothing changes: `absent` (no intent
    * for this message), `stale` (another phase or another presentation's claim),
    * or `identity` (recorded cur/ identity absent or mismatched).
    */
@@ -330,7 +330,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
       if (intent?.messageId !== messageId || !intent.identity) return false;
       try {
         const stat = lstatSync(join(root, "cur", file), { bigint: true });
-        return stat.isFile() && stat.dev.toString() === intent.identity.dev && stat.ino.toString() === intent.identity.ino;
+        return matchesFileIdentity(stat, intent.identity);
       } catch (err) {
         if (isMissing(err)) return false;
         throw err;
@@ -465,10 +465,27 @@ export type PlacementPhase = "placing" | "in_progress" | "failed" | "unknown";
 /** The placement intent schema version this reader understands; an intent without one is this version. */
 const PLACEMENT_INTENT_VERSION = 1;
 
+export interface FileIdentity {
+  dev: string;
+  ino: string;
+  ctimeNs?: string;
+  size?: string;
+}
+
+export function fileIdentity(stat: BigIntStats): FileIdentity {
+  return { dev: stat.dev.toString(), ino: stat.ino.toString(), ctimeNs: stat.ctimeNs.toString(), size: stat.size.toString() };
+}
+
+export function matchesFileIdentity(stat: BigIntStats, identity: FileIdentity): boolean {
+  const current = fileIdentity(stat);
+  return stat.isFile() && current.dev === identity.dev && current.ino === identity.ino
+    && current.ctimeNs === identity.ctimeNs && current.size === identity.size;
+}
+
 interface PlacementIntent {
   messageId: string;
   file: string;
-  identity?: { dev: string; ino: string };
+  identity?: FileIdentity;
   phase: PlacementPhase;
   /** Hand-overs so far (rev 2 liveness bound). */
   presentations?: number;
@@ -541,7 +558,9 @@ function parsePlacement(raw: string, path: string): PlacementIntent | null {
       && isValidEnvelopeId(intent?.messageId)
       && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
         && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
-        && /^[1-9][0-9]*$/.test(intent.identity.ino)))) {
+        && /^[1-9][0-9]*$/.test(intent.identity.ino)
+        && (intent.identity.ctimeNs === undefined || (typeof intent.identity.ctimeNs === "string" && /^-?(0|[1-9][0-9]*)$/.test(intent.identity.ctimeNs)))
+        && (intent.identity.size === undefined || (typeof intent.identity.size === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.size)))))) {
       const phase = phaseOf(intent);
       return {
         messageId: intent.messageId, file: intent.file, identity: intent.identity, phase,
@@ -601,7 +620,7 @@ function retireFailedMarker(root: string, path: string, file: string, messageId:
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     const marker = lstatSync(path, { bigint: true });
     const kept = lstatSync(tombstone, { bigint: true });
-    if (marker.dev !== kept.dev || marker.ino !== kept.ino) {
+    if (!matchesFileIdentity(marker, fileIdentity(kept))) {
       const refusal = new Error(`failed tombstone occupied for ${file} (message ${messageId}); marker and tombstone kept`);
       refusal.name = "FailedTombstoneOccupiedError";
       throw refusal;
@@ -626,7 +645,7 @@ function syncDirectory(root: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
-function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string): void {
+function writePlacementIntent(root: string, messageId: string, file: string, sourcePath?: string | number): void {
   if (!isValidEnvelopeId(messageId)) throw new Error("invalid placement messageId");
   if (!isPlainBasename(file)) throw new Error("placement file is not a plain basename");
   const path = placementIntentPath(root, file);
@@ -647,9 +666,9 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
   }
   let identity: PlacementIntent["identity"];
   if (sourcePath !== undefined) {
-    const stat = lstatSync(sourcePath, { bigint: true });
+    const stat = typeof sourcePath === "number" ? fstatSync(sourcePath, { bigint: true }) : lstatSync(sourcePath, { bigint: true });
     if (!stat.isFile()) throw new Error("placement source is not a regular file");
-    identity = { dev: stat.dev.toString(), ino: stat.ino.toString() };
+    identity = fileIdentity(stat);
   }
   const tmp = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);
@@ -766,7 +785,7 @@ function expireOverduePlacement(
 /**
  * cli#617 slice (b): completion-only finalize, bound to one presentation: the
  * intent must be `in_progress` for this message, carry `token` in its claim,
- * and still name the cur/ file at its recorded device and inode.
+ * and still name the cur/ file at its recorded identity.
  */
 function completeInProgressPlacement(root: string, messageId: string, file: string, token: string): PlacementCompletion {
   const intent = readPlacementIntent(root, file);
@@ -780,7 +799,7 @@ function completeInProgressPlacement(root: string, messageId: string, file: stri
     if (isMissing(err)) return "identity";
     throw err;
   }
-  if (!stat.isFile() || stat.dev.toString() !== intent.identity.dev || stat.ino.toString() !== intent.identity.ino) return "identity";
+  if (!matchesFileIdentity(stat, intent.identity)) return "identity";
   unlinkSync(placementIntentPath(root, file));
   syncDirectory(root);
   return "completed";

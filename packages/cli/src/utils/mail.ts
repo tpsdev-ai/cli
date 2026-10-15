@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -11,7 +11,7 @@ import {
   mailboxReplayStore, hasCommittedMessageId, type PlacementPhase, type ReplayStore,
   parseSignedEnvelope,
   peekConsumedForMailboxRoot,
-  placeCurRecord, relayAcceptanceLockRoot, tryAcquireRelayMoveLock, mailboxLockRoot,
+  placeCurRecord, fileIdentity, matchesFileIdentity, pendingPlacementEntries, relayAcceptanceLockRoot, tryAcquireRelayMoveLock, mailboxLockRoot,
 } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { logEvent } from "./archive.js";
@@ -1398,15 +1398,21 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       mkdirSync(dirs.cur, { recursive: true });
       writeFileSync(scratchPath, JSON.stringify(promoted, null, 2), { encoding: "utf-8", flag: "wx" });
       scratchCreated = true;
-      replay.beginPlacement(envelope.messageId, filename, scratchPath);
-      const placement = placeCurRecord(scratchPath, curPath);
-      if (placement.status !== "placed") {
-        replay.finishPlacement(envelope.messageId, filename);
-        throw new Error(`destination already exists: ${filename}`);
-      }
-      movedToCur = true;
-      rmSync(scratchPath, { force: true });
-      replay.recordConsumed(envelope.messageId);
+      const scratchFd = openSync(scratchPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        replay.beginPlacement(envelope.messageId, filename, scratchFd);
+        const placement = placeCurRecord(scratchPath, curPath);
+        if (placement.status !== "placed") {
+          replay.finishPlacement(envelope.messageId, filename);
+          throw new Error(`destination already exists: ${filename}`);
+        }
+        movedToCur = true;
+        replay.beginPlacement(envelope.messageId, filename, scratchFd);
+        rmSync(scratchPath, { force: true });
+        replay.beginPlacement(envelope.messageId, filename, scratchFd);
+        if (!replay.ownsPendingPlacement(envelope.messageId, filename)) throw new Error("placement identity changed");
+        replay.recordConsumed(envelope.messageId);
+      } finally { closeSync(scratchFd); }
     } catch (err: any) {
       // Cleanup must never itself throw. A real fault (ENOSPC, an unwritable or
       // non-file entry at the scratch path) is expected to persist so a later
@@ -1472,7 +1478,7 @@ export async function redriveRetryable(agent: string, dlqDir: string, verify: Ma
 }
 
 /**
- * Unlink stranded `tmp/*.promote` scratch, including links shared with cur/.
+ * Unlink stranded scratch unless it shares a pending cur/ file.
  */
 export async function sweepStrandedPromoteScratch(root: string): Promise<number> {
   const tmpDir = join(root, "tmp");
@@ -1489,10 +1495,19 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
   }
   if (!lock) return 0;
   try {
+    const held = pendingPlacementEntries(root).filter((entry) => entry.phase !== "failed").flatMap((entry) => {
+      try { return [fileIdentity(lstatSync(join(root, "cur", entry.file), { bigint: true }))]; }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw err;
+      }
+    });
     let removed = 0;
     for (const name of readdirSync(tmpDir)) {
       if (!name.endsWith(".promote")) continue;
       try {
+        const stat = lstatSync(join(tmpDir, name), { bigint: true });
+        if (held.some((identity) => matchesFileIdentity(stat, identity))) continue;
         rmSync(join(tmpDir, name), { force: true, recursive: true });
         removed++;
       } catch {

@@ -55,8 +55,9 @@ function pending() {
     ...record, body: envelope.body, envelopeId: envelope.messageId, envelope,
     checkedOutAt: new Date().toISOString(), checkedOutBy: agent, deliveryAttempts: 1,
   }));
-  mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json", scratch);
   fs.linkSync(scratch, cur);
+  fs.rmSync(scratch);
+  mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json", cur);
   return fixture;
 }
 
@@ -77,6 +78,7 @@ for (const check of ["signature", "binding", "source equality", "record identity
     }
     if (check === "record identity") copy.id = "other-record";
     fs.writeFileSync(cur, check === "null" ? "null" : check === "json" ? "{" : JSON.stringify(copy));
+    mailboxReplayStore(inbox.root).beginPlacement(envelope.messageId, "record.json", cur);
     const result = await mail.promote(agent, source);
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected refusal");
@@ -137,7 +139,7 @@ for (const binding of ["different inode", "legacy intent"] as const) {
 }
 
 for (const read of [false, true]) {
-  test(`pending recovery keeps a same-envelope cur record at another inode retryable (read: ${read})`, async () => {
+  test(`pending recovery keeps a replaced same-envelope cur record retryable (read: ${read})`, async () => {
     const { source, cur, inbox, envelope } = pending();
     const bytes = JSON.stringify({ ...JSON.parse(fs.readFileSync(cur, "utf8")), read });
     fs.rmSync(cur);
@@ -254,6 +256,7 @@ function age(fixture: ReturnType<typeof pending>) {
     fs.writeFileSync(path, JSON.stringify(record));
     fs.utimesSync(path, old, old);
   }
+  mailboxReplayStore(fixture.inbox.root).beginPlacement(fixture.envelope.messageId, "record.json", fixture.cur);
 }
 
 test("mail gc preserves pending placement files", async () => {
@@ -275,6 +278,7 @@ for (const action of ["archiveOldCur", "checkMessages"] as const) {
     fs.writeFileSync(fixture.cur, JSON.stringify(copy));
     const old = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
     fs.utimesSync(fixture.cur, old, old);
+    mailboxReplayStore(fixture.inbox.root).beginPlacement(fixture.envelope.messageId, "record.json", fixture.cur);
     const unrelated = join(fixture.inbox.cur, "ancient.json");
     const bytes = JSON.stringify({ id: "ancient", from: "kern", to: agent, body: "old", timestamp: old.toISOString() });
     fs.writeFileSync(unrelated, bytes);

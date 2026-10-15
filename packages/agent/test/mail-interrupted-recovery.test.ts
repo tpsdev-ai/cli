@@ -176,6 +176,21 @@ describe("MailClient recovery at the tested placement boundaries (cli#600)", () 
   }
 });
 
+for (const at of ["link-to-cur", "source-removal"]) {
+  test(`a kill after ${at} before the ctime refresh keeps the intent`, async () => {
+    const source = plant(`ctime-gap-${at}`);
+    const run = await runAndKillAt(at, source, true);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    const name = readdirSync(mailboxRoot).find((name) => name.startsWith(".placement-") && name.endsWith(".json"))!;
+    const intent = readFileSync(join(mailboxRoot, name));
+    const c = new MailClient(mailDir, undefined, AGENT, verifier());
+    expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
+    expect(readFileSync(join(mailboxRoot, name))).toEqual(intent);
+    expect(existsSync(curPath())).toBe(true);
+  });
+}
+
 describe("pending record classification", () => {
   function plantLater(): void {
     renameSync(plant("later-mail"), join(mailboxRoot, "new", "z-later.json"));
@@ -216,8 +231,8 @@ describe("pending record classification", () => {
       writeFileSync(source, JSON.stringify(record));
       const client = new MailClient(mailDir, undefined, AGENT, verifier());
       const replay = mailboxReplayStore(mailboxRoot);
-      replay.beginPlacement("invalid-pending", "m1.json", source);
       renameSync(source, curPath());
+      replay.beginPlacement("invalid-pending", "m1.json", curPath());
       expect(await client.deliverNext()).toMatchObject({ status: "deferred", reason: "pending-record-invalid" });
       expect(replay.placementPhase("m1.json")).toBeNull();
       expect(existsSync(curPath())).toBe(false);
@@ -250,8 +265,8 @@ describe("pending record classification", () => {
     writeFileSync(source, JSON.stringify(record));
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     const replay = mailboxReplayStore(mailboxRoot);
-    replay.beginPlacement(verified === "cli" ? "cli-outer" : "raw-inner", "m1.json", source);
     renameSync(source, curPath());
+    replay.beginPlacement(verified === "cli" ? "cli-outer" : "raw-inner", "m1.json", curPath());
     const result = await client.deliverNext();
     if (verified === "both") {
       expect(result).toMatchObject({ status: "deferred", reason: "pending-record-ambiguous" });
@@ -304,9 +319,9 @@ describe("MailClient defers unresolved placements", () => {
     expect(original.equals(replacement)).toBe(false);
     expect(original.toString("utf8")).toBe(replacement.toString("utf8"));
     writeFileSync(source, original);
-    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     mkdirSync(join(mailboxRoot, "cur"));
     renameSync(source, curPath());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", curPath());
     const normal = verifier();
     let changed = false;
     const client = new MailClient(mailDir, undefined, AGENT, {
@@ -322,7 +337,8 @@ describe("MailClient defers unresolved placements", () => {
     expect(reasonOf(await client.deliverNext())).toBe("record-changed");
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
-    await assertDeliveredUntilCompleted(messageId);
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
+    expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
   });
 
   test("an older intent without identity with only a cur copy is withheld", async () => {
@@ -351,8 +367,8 @@ describe("MailClient defers unresolved placements", () => {
     const messageId = "lock-failure";
     const source = plant(messageId);
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
-    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     renameSync(source, curPath());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", curPath());
     // The client locks its mailbox at the path it resolved once at construction.
     const lock = await acquireMailLock(realpathSync(mailboxRoot));
     expect(lock).not.toBeNull();

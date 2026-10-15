@@ -65,12 +65,12 @@ function pendingPlacement(id = messageId): void {
   const mailbox = join(root, "mailbox");
   const lock = acquireMailLockSync(mailbox);
   if (!lock) throw new Error("lock unavailable");
-  try { mailboxReplayStore(mailbox).beginPlacement(id, "m1.json", path("new")); }
-  finally { lock.release(); }
   linkSync(path("new"), path("cur"));
+  try { mailboxReplayStore(mailbox).beginPlacement(id, "m1.json", path("cur")); }
+  finally { lock.release(); }
 }
 
-test("a placement interrupted after linking is recovered by a restarted client", async () => {
+test("a placement interrupted before recording the linked ctime stays pending", async () => {
   const link = fs.linkSync;
   const fault = spyOn(fs, "linkSync").mockImplementation((...args: Parameters<typeof link>) => {
     link(...args);
@@ -78,24 +78,16 @@ test("a placement interrupted after linking is recovered by a restarted client",
   });
   try { expect(await client.checkNewMail()).toEqual([]); }
   finally { fault.mockRestore(); }
-  const mailbox = join(root, "mailbox");
-  const lock = acquireMailLockSync(mailbox);
-  if (!lock) throw new Error("lock unavailable");
-  try { expect(mailboxReplayStore(mailbox).hasPendingPlacement(messageId, "m1.json")).toBe(true); }
-  finally { lock.release(); }
+  const replay = mailboxReplayStore(join(root, "mailbox"));
+  expect(replay.hasPendingPlacement(messageId, "m1.json")).toBe(true);
+  expect(replay.ownsPendingPlacement(messageId, "m1.json")).toBe(false);
   const restarted = new MailClient(root, undefined, "mailbox", {
     async getAgent() { return { publicKey: Buffer.from(ed.getPublicKey(seed)) }; },
   });
-  expect(await restarted.checkNewMail()).toHaveLength(1);
   expect(await restarted.checkNewMail()).toEqual([]);
-  const finishedLock = acquireMailLockSync(mailbox);
-  if (!finishedLock) throw new Error("lock unavailable");
-  try { expect(mailboxReplayStore(mailbox).hasPendingPlacement(messageId, "m1.json")).toBe(false); }
-  finally { finishedLock.release(); }
-  pruneConsumedId();
-  linkSync(path("cur"), path("new"));
-  expect(await restarted.checkNewMail()).toEqual([]);
-  expect(() => readFileSync(path("new"))).toThrow();
+  expect(await restarted.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
+  expect(replay.hasPendingPlacement(messageId, "m1.json")).toBe(true);
+  expect(readFileSync(path("new"))).toEqual(readFileSync(path("cur")));
 });
 
 test("an intent for another ID does not authorize delivery", async () => {
