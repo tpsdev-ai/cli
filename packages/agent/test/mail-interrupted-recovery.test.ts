@@ -1,13 +1,4 @@
-/**
- * Real filesystem crash-boundary and unresolved-intent regressions (cli#600).
- *
- * cli#617 slice (b): the recovery these tests exercise is the per-message
- * delivery API's completion-gated path. A message delivered by deliverNext()
- * is presented again by a later call once its hand-over is released (or its
- * process is gone), until completeDelivery() finalizes it, so the old
- * at-most-once assertions become "until completed". An unresolved placement
- * is a named deferral, not a null.
- */
+/** Filesystem crash and unresolved-intent regressions for the per-message delivery API. */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -143,11 +134,6 @@ function runAndKillAt(killAt: string, source: string, after = false, timeoutMs =
 
 const reasonOf = (result: DeliverNextResult) => (result.status === "deferred" ? result.reason : result.status);
 
-/**
- * The cli#617 slice (b) contract: a delivered message is held while its
- * hand-over is live, presented again once released, until it is completed,
- * then never again; placement cleanup is done.
- */
 async function assertDeliveredUntilCompleted(messageId: string): Promise<void> {
   const client = new MailClient(mailDir, undefined, AGENT, verifier());
   const first = await client.deliverNext();
@@ -179,7 +165,7 @@ const CASES: Array<{ at: string; after?: boolean }> = [
 
 describe("MailClient recovery at the tested placement boundaries (cli#600)", () => {
   for (const { at, after } of CASES) {
-    test(`a later call re-presents the message until completed after a kill at ${at}`, async () => {
+    test(`recovers, releases, re-presents and completes after a kill at ${at}`, async () => {
       const messageId = `kill-${at}`;
       const source = plant(messageId);
       const run = await runAndKillAt(at, source, after);

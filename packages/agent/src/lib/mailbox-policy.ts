@@ -216,14 +216,7 @@ export async function decideEnvelopeForMailbox(
 const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
-/**
- * cli#617 slice (b): the delivery liveness bound. Neither is a timer: each is
- * checked when MailClient.deliverNext() next looks at the intent. The count
- * bound is checked when a presentation would exceed it. The deadline is checked
- * whenever deliverNext() finds the intent not claimed by a live presentation,
- * before the payload is re-verified, so a message that no longer verifies still
- * reaches it. Either one moves the intent to terminal `failed`.
- */
+/** Bounds checked on later deliverNext() calls for unclaimed in_progress work; the deadline precedes re-verification. */
 export const MAX_DELIVERY_PRESENTATIONS = 5;
 export const DELIVERY_PRESENTATION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -676,7 +669,7 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
  * messageId and recorded identity. Refuses (returns false) unless a `placing`
  * or `in_progress` intent for this message is present; a `failed` or `unknown`
  * intent, or another message's intent, is never replaced. The write is the
- * temp-file, fsync, rename, directory-fsync sequence used everywhere else. A
+ * temp-file, fsync, rename, directory-fsync sequence. A
  * `.phase.tmp` suffix marks the phase transition for the crash-boundary
  * fixture (mail-kill-child).
  */

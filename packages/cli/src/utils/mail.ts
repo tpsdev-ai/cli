@@ -297,16 +297,16 @@ function placementRefusal(replay: ReplayStore, file: string, envelopeId: unknown
  * lock is a refusal.
  */
 export function curPlacementRefusal(curPath: string, envelopeId: unknown): string | null {
-  const root = dirname(dirname(curPath));
+  const mailbox = dirname(dirname(curPath));
   let lock: MailLock | null;
   try {
-    lock = acquireMailLockSync(root);
+    lock = acquireMailLockSync(mailbox);
   } catch (err) {
     return `mailbox lock unavailable: ${err instanceof Error ? err.message : String(err)}`;
   }
   if (!lock) return "mailbox lock busy";
   try {
-    return placementRefusal(mailboxReplayStore(root), basename(curPath), envelopeId);
+    return placementRefusal(mailboxReplayStore(mailbox), basename(curPath), envelopeId);
   } finally {
     lock.release();
   }
@@ -1578,7 +1578,7 @@ export async function recoverPromoted(
    * ack`/`nack` via verifyMailAction, the plugin's internalInbound); the
    * sweeps keep the fail-fast default.
    */
-  options: { waitForLock?: boolean } = {},
+  options: { waitForLock?: boolean; claim?: string } = {},
 ): Promise<PromoteReject | (PromoteOk & { snapshot: MailMessage })> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
@@ -1594,6 +1594,8 @@ export async function recoverPromoted(
       const lock = acquireMailLockSync(dirs.root, { timeoutMs: 0 });
       if (!lock) return { ok: false, class: "busy", reason: "mailbox lock busy; not delivered" };
       try {
+        const refusal = placementRefusal(mailboxReplayStore(dirs.root), filename, undefined);
+        if (refusal !== null) return { ok: false, class: "busy", reason: `${refusal}; not presented` };
         try { readMessageFile(curPath); } catch (freshError: any) {
           if (freshError?.code !== "ENOENT") rejectToDlq(dirs, filename, curPath, "unverified", reason);
         }
@@ -1602,11 +1604,6 @@ export async function recoverPromoted(
     return { ok: false, class: "unverified", reason };
   }
 
-  // cli#617 slice (b): a record whose placement intent withholds it
-  // (placementRefusal: `in_progress`, `failed`, `unknown`, another consumer's
-  // `placing` commit, or an unreadable history) is not presented, verified or
-  // quarantined. This early check only saves the verification; the decision
-  // that counts is the one under the lock after the verification below.
   const early = placementRefusal(mailboxReplayStore(dirs.root), filename, msg.envelopeId);
   if (early !== null) return { ok: false, class: "busy", reason: `${early}; not presented` };
 
@@ -1632,13 +1629,28 @@ export async function recoverPromoted(
     return { ok: false, class: decision.class, reason: decision.reason };
   }
   const env = decision.envelope;
+  const presented: MailMessage = {
+    ...msg,
+    from: env.from,
+    to: env.to,
+    body: env.body,
+    timestamp: env.timestamp,
+    envelopeId: env.messageId,
+    trustTier: verifiedMailTier(env, mailRoot, verify.bridgeAgentId),
+    replyToId: env.replyToId,
+  };
+  if (options.claim !== undefined) {
+    const claimed = { ...presented, checkedOutBy: options.claim, checkedOutAt: new Date().toISOString() };
+    const result = updateExistingRecord<MailMessage>(curPath, () => claimed, {
+      snapshot: msg,
+      nonBlocking: !options.waitForLock,
+      withholdPlacement: true,
+      afterWrite: () => mailboxReplayStore(dirs.root).finishPlacement(env.messageId, filename),
+    });
+    if (result.status === "updated") return { ok: true, message: result.record, path: curPath, snapshot: result.record };
+    return { ok: false, class: "busy", reason: result.status === "withheld" ? `${result.reason}; not presented` : `dispatch claim ${result.status}; not presented` };
+  }
 
-  // cli#617 slice (b): the FINAL placement decision, made under the mailbox
-  // lock after the awaited verification: the intent may have changed while it
-  // ran, so it is read again here, with the record itself. A caller's later
-  // action outside this lock (a dispatch, an ack, a nack) is a separate
-  // section: the CLI's ack and nack, and the plugin's stamp, check again under
-  // their own mutation lock (updateExistingRecord `withholdPlacement`).
   let finalLock: MailLock | null;
   try {
     finalLock = acquireMailLockSync(dirs.root, options.waitForLock ? {} : { timeoutMs: 0 });
@@ -1656,23 +1668,10 @@ export async function recoverPromoted(
       return { ok: false, class: "busy", reason: "cur/ record unreadable after verification; not presented" };
     }
     if (!isDeepStrictEqual(current, msg)) return { ok: false, class: "busy", reason: "cur/ record changed during verification; not presented" };
+    return { ok: true, message: presented, path: curPath, snapshot: msg };
   } finally {
     finalLock.release();
   }
-
-  // Present the fields from the VERIFIED envelope, not the mutable record —
-  // the same fields the first-delivery path presents.
-  const presented: MailMessage = {
-    ...msg,
-    from: env.from,
-    to: env.to,
-    body: env.body,
-    timestamp: env.timestamp,
-    envelopeId: env.messageId,
-    trustTier: verifiedMailTier(env, mailRoot, verify.bridgeAgentId),
-    replyToId: env.replyToId,
-  };
-  return { ok: true, message: presented, path: curPath, snapshot: msg };
 }
 
 /**

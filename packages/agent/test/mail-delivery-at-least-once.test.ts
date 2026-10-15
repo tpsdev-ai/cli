@@ -1,11 +1,4 @@
-/**
- * cli#617 slice (b): the per-message delivery API. deliverNext() commits one
- * message and leaves its intent `in_progress`, held by a presentation claim;
- * completeDelivery() finalizes only that hand-over; releaseDelivery() ends it
- * without completing. Pending live work is deferred, never skipped, and while
- * it is pending nothing new is committed. Real signed records through the real
- * parser and signer; nothing in the agent runtime calls these methods yet.
- */
+
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -120,7 +113,7 @@ const idOf = (result: DeliverNextResult) => (result.status === "delivered" ? res
 const reasonOf = (result: DeliverNextResult) => (result.status === "deferred" ? result.reason : result.status);
 
 describe("per-message delivery commits one message at a time", () => {
-  test("later messages stay in new/ until the in-flight one completes; a live presentation is not presented again", async () => {
+  test("keeps later mail in new/ while the first presentation is active", async () => {
     plant("m1.json", "id-1");
     plant("m2.json", "id-2");
     plant("m3.json", "id-3");
@@ -218,7 +211,7 @@ describe("in_progress re-presentation in recovery", () => {
     expect(await client().deliverNext()).toEqual({ status: "idle" });
   });
 
-  test("a placing intent left by a crash is finished to in_progress and presented", async () => {
+  test("recovers a verified placing fixture to in_progress", async () => {
     plant("m1.json", "resume-placing");
     const replay = mailboxReplayStore(root);
     replay.beginPlacement("resume-placing", "m1.json", fresh("m1.json"));
@@ -411,7 +404,7 @@ describe("pending live work is deferred, and nothing new is committed meanwhile"
   });
 });
 
-describe("the liveness bound quarantines a message that is never completed", () => {
+describe("liveness-bound transitions for unclaimed in_progress work", () => {
   const FAILED_AT = `not completed after ${MAX_DELIVERY_PRESENTATIONS} presentation(s)`;
 
   test("after the presentation count the intent goes terminal, a line is logged, and other mail flows", async () => {
@@ -441,7 +434,7 @@ describe("the liveness bound quarantines a message that is never completed", () 
     expect(hasCommittedMessageId(root, "poison")).toBe(true);
   });
 
-  test("a message past the deadline is quarantined on the next call", async () => {
+  test("an unclaimed in_progress message past the deadline is quarantined on the next call", async () => {
     const stale = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     committed("stale", { version: 1, phase: "in_progress", presentations: 1, firstPresentedAt: stale });
     plant("m2.json", "healthy");

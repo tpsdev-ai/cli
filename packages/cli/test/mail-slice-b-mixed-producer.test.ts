@@ -1,16 +1,6 @@
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
-/**
- * cli#617 slice (b), the mixed-producer case: a REAL CLI promote() is
- * SIGKILLed after it linked its record into cur/ and committed the message ID,
- * but before it finished its `placing` intent. The agent MailClient then runs
- * deliverNext() on the same mailbox. A CLI-promoted record stores a plaintext
- * body with the signed envelope beside it, a format MailClient does not
- * present: deliverNext() defers by name (`cli-record`), commits no later
- * message, and leaves the CLI's intent and record untouched. A CLI check
- * finishes the placement after its checkout lease, and MailClient then
- * delivers again.
- */
+
 
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";

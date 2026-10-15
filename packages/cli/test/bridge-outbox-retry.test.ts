@@ -53,14 +53,14 @@ function plant(file: string, body: string, trust?: string) {
   return record;
 }
 
-function start() {
+function start(onSend?: () => void) {
   const sent: BridgeEnvelope[] = [];
   const logs: string[] = [];
   const adapter: BridgeAdapter = {
     name: "test",
     async start() {},
     async stop() {},
-    async send(envelope) { sent.push(envelope); },
+    async send(envelope) { onSend?.(); sent.push(envelope); },
   };
   const core = new BridgeCore(adapter, { bridgeAgentId: BRIDGE, defaultAgentId: "agent-a", mailDir: root }, (line) => logs.push(line));
   stop = (core as unknown as { watchOutbox(): () => void }).watchOutbox();
@@ -156,4 +156,19 @@ test("retryable redrive keeps the external tier before send or ack", async () =>
   const record = JSON.parse(fs.readFileSync(join(root, BRIDGE, "cur", "external-retry.json"), "utf8"));
   expect(record.trustTier).toBe("external");
   expect(record.ackedAt).toBeUndefined();
+});
+
+
+test("cur recovery records its dispatch checkout before the bridge sends", async () => {
+  plant("recover.json", "recover me");
+  const source = join(root, BRIDGE, "new", "recover.json");
+  expect((await mail.promote(BRIDGE, source)).ok).toBe(true);
+  let claim: { checkedOutBy?: string; checkedOutAt?: string } | undefined;
+  const { sent } = start(() => {
+    claim = JSON.parse(fs.readFileSync(join(root, BRIDGE, "cur", "recover.json"), "utf8"));
+  });
+  for (let attempt = 0; attempt < 100 && sent.length === 0; attempt++) await settle();
+  expect(sent.map((envelope) => envelope.content)).toEqual(["recover me"]);
+  expect(claim?.checkedOutBy).toBe(BRIDGE);
+  expect(claim?.checkedOutAt).toBeDefined();
 });

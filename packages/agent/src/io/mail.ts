@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
@@ -45,14 +45,7 @@ export interface MailMessage {
  */
 type MailboxRejectClass = MailboxPolicyRejectClass;
 
-/**
- * cli#617 slice (b): one hand-over from MailClient.deliverNext(). The object is
- * the delivery token: only the MailClient that issued it can finalize it, and
- * it is bound to the presentation claim (a per-presentation nonce) recorded in
- * the message's `in_progress` intent. Pass it to completeDelivery() when the
- * handler completes, or to releaseDelivery() when the handler stops without
- * completing.
- */
+/** A handoff token issued by deliverNext(); pass it to completeDelivery() or releaseDelivery(). */
 export interface MailDelivery {
   readonly message: MailMessage;
   /** `<mailbox>/<messageId>`: the same on every presentation of one message, for idempotent handlers. */
@@ -75,9 +68,8 @@ export interface MailDelivery {
  * - `record-changed`: the pending cur/ copy is missing, is not the file the
  *   intent recorded, or changed during re-verification.
  * - `storage-error`: the placement history or new/ could not be read.
- * - `new-mail-deferred`: no placement is pending, but a new/ message could not
- *   be committed this time (unreadable, verifier unavailable, lock or relay
- *   busy); it stays in new/.
+ * - `new-mail-deferred`: a new/ commit was deferred, including when a
+ *   placement appeared before its commit lock.
  */
 export type DeliveryDeferral =
   | "lock-busy"
@@ -92,7 +84,7 @@ export type DeliveryDeferral =
 /** What MailClient.deliverNext() returns (cli#617 slice b). */
 export type DeliverNextResult =
   | { status: "delivered"; delivery: MailDelivery }
-  /** No live placement is pending and new/ holds nothing committable. */
+  /** No placing/in_progress work is pending and new/ holds nothing committable. */
   | { status: "idle" }
   /** Work may be waiting; nothing was handed over and no new mail was committed. */
   | { status: "deferred"; reason: DeliveryDeferral; detail: string; file?: string };
@@ -256,11 +248,7 @@ export class MailClient {
     // configured mail directory (see mail-lock-namespace.ts).
     const lockRoot = mailboxLockRoot(mailDir, agentId);
     for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(lockRoot, dir), { recursive: true });
-    // cli#617 slice (b): the mailbox root is resolved ONCE, here, to its real
-    // path, and every mailbox operation uses it: listing, recovery, commit,
-    // completion, dead-lettering and the lock. Retargeting a mail-root (or
-    // mailbox) symlink after construction does not move this client; a new
-    // MailClient resolves the new target.
+    this.mailDir = dirname(lockRoot);
     this.mailboxRoot = realpathSync(lockRoot);
     this.inboxNew = join(this.mailboxRoot, "new");
     this.inboxCur = join(this.mailboxRoot, "cur");
@@ -372,34 +360,10 @@ export class MailClient {
   }
 
   /**
-   * cli#617 slice (b): the per-message delivery API. Nothing in the agent
-   * runtime calls it until slice (c); the event loop still uses checkNewMail().
-   * One call hands over at most ONE message:
-   *
-   *  1. a committed message whose placement intent is live and not held by a
-   *     live presentation: a `placing` intent (a commit interrupted before the
-   *     hand-over) is moved to `in_progress`, or an `in_progress` intent is
-   *     presented again and counted. The cur/ copy is re-verified first, and
-   *     the liveness bound can move the intent to terminal `failed` instead;
-   *  2. otherwise, only when NO `placing` or `in_progress` intent is pending,
-   *     the next verified new/ message, committed to cur/ with its intent left
-   *     `in_progress`. Later messages stay in new/.
-   *
-   * A pending `placing` or `in_progress` placement that cannot be presented
-   * now (lock busy, held by a live presentation, a CLI-promoted record, failed
-   * or unavailable re-verification, a changed cur/ copy) returns `deferred` and
-   * commits nothing new: unresolved live work is never skipped. An `unknown`
-   * phase (another writer's) is preserved and not presented, and does not
-   * block. `idle` means nothing is pending and new/ holds nothing committable.
-   *
-   * The caller finalizes with completeDelivery(delivery) after the handler
-   * completes, or calls releaseDelivery(delivery) when it stops without
-   * completing. A released delivery, or one whose process exited, is presented
-   * again by a later call once its cur/ copy re-verifies, until it completes or
-   * the liveness bound moves it to `failed`. A `placing` intent has no
-   * deadline: one that cannot be presented (a CLI-promoted record, a copy that
-   * does not verify) defers every call until its writer or an operator
-   * resolves it. The delivery key is mailbox + messageId.
+   * Present verified, unclaimed pending work before committing new mail.
+   * Unresolved placing/in_progress work defers new commits. Active claims defer
+   * re-presentation; released or abandoned claims may be retried after verification,
+   * subject to the presentation bound and mailbox lock. The event loop uses checkNewMail().
    */
   async deliverNext(): Promise<DeliverNextResult> {
     let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
@@ -431,14 +395,7 @@ export class MailClient {
     return this.commitNextForDelivery();
   }
 
-  /**
-   * cli#617 slice (b): the completion-only finalize, bound to the hand-over.
-   * In its own synchronous mailbox-lock section it deletes the message's intent
-   * only when the intent is `in_progress`, carries THIS delivery's claim token,
-   * and cur/ still holds the file the intent recorded. A delivery this client
-   * did not issue, or one presented again since, is refused and changes
-   * nothing. Lock busy defers and leaves the intent `in_progress`.
-   */
+  /** Finalize only this client's issued claim, with its recorded cur/ file identity, under the mailbox lock. */
   async completeDelivery(delivery: MailDelivery): Promise<DeliveryCompletion> {
     const issued = this.issued.get(delivery);
     if (!issued) return { status: "refused", reason: "foreign", detail: "not a delivery this MailClient handed over" };
@@ -467,15 +424,7 @@ export class MailClient {
     };
   }
 
-  /**
-   * cli#617 slice (b): end a hand-over WITHOUT completing it (the handler threw,
-   * hit its turn limit or was stopped). The intent stays `in_progress`, and the
-   * next deliverNext() in this process presents the message again (once its
-   * cur/ copy re-verifies) and counts it. Another process sees the claim as
-   * live until this one exits. Until the message is presented again, the
-   * released delivery can still be completed. Returns false when the delivery
-   * is not an active one this client issued.
-   */
+  /** Release this process's active claim for retry; completion remains possible until it is presented again. */
   releaseDelivery(delivery: MailDelivery): boolean {
     const issued = this.issued.get(delivery);
     if (!issued || issued.state !== "active") return false;
@@ -517,13 +466,6 @@ export class MailClient {
     return this.presentUnderLock(messageId, file, inspected.bytes, outcome.envelope, trustTier);
   }
 
-  /**
-   * Under the lock, before any verification: a live claim defers (and is not
-   * counted); an unclaimed `in_progress` intent past the deadline goes
-   * `failed`; a `placing` intent whose cur/ copy is absent is finished (the
-   * slice (a) cleanup); a `placing` intent naming a CLI-promoted record defers
-   * by name. Otherwise the cur/ bytes are returned for re-verification.
-   */
   private async inspectPending(messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer }> {
     const lock = await this.lockOrDefer("pending placement not inspected", file);
     if ("status" in lock) return lock;
@@ -549,8 +491,6 @@ export class MailClient {
       } catch (err) {
         if (!isMissing(err)) throw err;
         if (state.phase === "placing" && lstatOrAbsent(curPath) === null) {
-          // The slice (a) unlinked-placement cleanup: a `placing` intent whose
-          // cur/ copy was never linked is finished; its new/ source is still there.
           replay.finishPlacement(messageId, file);
           return RESOLVED;
         }
@@ -761,10 +701,6 @@ export class MailClient {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
       if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
-      // cli#617 slice (b): the delivery API commits nothing new while a
-      // `placing` or `in_progress` placement is pending, re-checked here under
-      // the commit lock so that a concurrent deliverNext() cannot put a second
-      // message in flight.
       if (claim && pendingPlacementEntries(this.mailboxRoot).some((e) => e.phase === "placing" || e.phase === "in_progress")) {
         return "live-placement";
       }
@@ -804,10 +740,6 @@ export class MailClient {
         throw err;
       }
       if (claim) {
-        // cli#617 slice (b): the delivery API leaves the intent live, in the
-        // `in_progress` phase (presentation 1, held by `claim`), for the caller
-        // to finalize on completion. The batch checkNewMail() path finalizes as
-        // before.
         const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString(), claim);
         if (advance.status !== "presented") throw new Error(`placement not advanced after commit: ${advance.status}`);
       } else {

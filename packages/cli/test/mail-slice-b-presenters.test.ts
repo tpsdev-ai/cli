@@ -1,20 +1,10 @@
-/**
- * cli#617 slice (b): the CLI's presenters and mail actions decide a cur/
- * record's placement intent under the mailbox lock.
- *
- * - recoverPromoted withholds a record whose intent is `in_progress`, `failed`,
- *   `unknown`, or another consumer's `placing` commit, and makes its FINAL
- *   decision under the lock after the awaited verification (a phase written
- *   while the verifier runs is caught, and never quarantined).
- * - `tps mail ack` / `nack` (and ackMessage / nackMessage) re-check the intent
- *   under their own mutation lock, so a phase written after verifyMailAction
- *   still refuses the action.
- */
+
 
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, spyOn, test, mock } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -142,6 +132,39 @@ describe("recoverPromoted", () => {
     expect((await recoverPromoted("kern", r.path)).ok).toBe(true);
   });
 
+  test("a dispatch claim is written after verification under the phase guard", async () => {
+    const r = await promotedRecord();
+    const recovered = await recoverPromoted("kern", r.path, {}, { claim: "bridge" });
+    expect(recovered.ok).toBe(true);
+    if (!recovered.ok) throw new Error(recovered.reason);
+    const record = JSON.parse(readFileSync(r.path, "utf8"));
+    expect(record.checkedOutBy).toBe("bridge");
+    expect(record.checkedOutAt).toBeDefined();
+    expect(recovered.snapshot).toEqual(record);
+  });
+
+  test("a dispatch claim is refused when an intent appears during verification", async () => {
+    const r = await promotedRecord();
+    const before = readFileSync(r.path, "utf8");
+    const recovered = await duringVerification(
+      () => recoverPromoted("kern", r.path, {}, { claim: "bridge" }),
+      () => writeIntent(r, IN_PROGRESS()),
+    );
+    expect(recovered.ok).toBe(false);
+    expect(readFileSync(r.path, "utf8")).toBe(before);
+  });
+
+  test("a corrupt record held in_progress is refused without quarantine", async () => {
+    const r = await promotedRecord();
+    writeIntent(r, IN_PROGRESS());
+    writeFileSync(r.path, "{corrupt");
+    const recovered = await recoverPromoted("kern", r.path);
+    expect(recovered.ok).toBe(false);
+    if (!recovered.ok) expect(recovered.class).toBe("busy");
+    expect(readFileSync(r.path, "utf8")).toBe("{corrupt");
+    expect(dlqHas(r.file)).toBe(false);
+  });
+
   test("withholds another consumer's placing commit without quarantining it", async () => {
     const r = await promotedRecord();
     writeIntent(r, {}, "another-message-id");
@@ -236,6 +259,31 @@ describe("tps mail ack / nack (the command)", () => {
       try {
         await expect(runMail({ action, agent: "kern", messageId: r.id, reason: "x" } as never)).rejects.toThrow("mail action refused");
       } finally { restore(); }
+      expect(readFileSync(r.path, "utf8")).toBe(before);
+    });
+
+    test(`${action} refuses a phase written after verification releases its lock`, async () => {
+      const r = await promotedRecord();
+      const before = readFileSync(r.path, "utf8");
+      const remove = fs.rmSync;
+      let armed = false;
+      let injected = false;
+      const fault = spyOn(fs, "rmSync").mockImplementation((...args: Parameters<typeof remove>) => {
+        remove(...args);
+        if (armed && args[0] === join(r.root, ".mail-lock")) {
+          armed = false;
+          injected = true;
+          writeIntent(r, IN_PROGRESS());
+        }
+      });
+      const restore = silence();
+      try {
+        await expect(duringVerification(
+          () => runMail({ action, agent: "kern", messageId: r.id, reason: "x" } as never),
+          () => { armed = true; },
+        )).rejects.toThrow("mail action refused");
+      } finally { fault.mockRestore(); restore(); }
+      expect(injected).toBe(true);
       expect(readFileSync(r.path, "utf8")).toBe(before);
     });
 

@@ -1893,7 +1893,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
       try {
         if (!isLive()) return;
-        const recovered = await recoverPromoted(recipient, curPath);
+        const recovered = await recoverPromoted(recipient, curPath, {}, { claim: recipient });
         if (!isLive()) return;
         if (!recovered.ok) {
           log?.warn?.(

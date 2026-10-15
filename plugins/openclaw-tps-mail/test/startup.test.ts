@@ -356,6 +356,9 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     await pollUntil(() => capturedArgs !== null, 5000);
     expect(capturedArgs.ctx.MessageSid).toBe("msg-crash-001");
     expect(capturedArgs.ctx.Body).toBe("recovered after crash");
+    const claimed = JSON.parse(readFileSync(resolve(curDir, filename), "utf-8"));
+    expect(claimed.checkedOutBy).toBe(agentId);
+    expect(claimed.checkedOutAt).toBeDefined();
 
     // The test posts the FINAL reply, then settles. The ack is gated on the
     // receipt that post creates, so it lands only after the file exists.
