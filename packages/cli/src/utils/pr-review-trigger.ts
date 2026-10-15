@@ -90,12 +90,8 @@ export async function handlePrOpened(
 }
 
 /**
- * Start the review-trigger loop: poll the agent's OWN catch-up feed for
- * `pr.opened` events. The feed read is `agentId`'s, so Flair serves it to the
- * agent that signs the read (a read of another participant's feed is refused).
- * Its cursor under `~/.tps/cursors/<agentId>-review-trigger-task-loop.json` is
- * separate from the task loop's, so the two loops reading one agent's feed keep
- * separate positions.
+ * Poll the agent's own feed for `pr.opened`, with a distinct review cursor.
+ * The loop ID allows the CLI's 64-character agent ID plus `-review-trigger`.
  */
 export function startReviewTriggerLoop(
   flair: FlairClient,

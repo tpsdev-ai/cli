@@ -853,9 +853,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
   });
 
-  // Review trigger — starts the review-trigger loop on the agent's own catch-up
-  // feed (cli#631: Flair refuses a read of another participant's feed, so the
-  // loop received no events while it read one).
+  // Review trigger — polls the agent's own feed with a distinct review cursor.
   if (config.reviewTrigger) {
     startReviewTriggerLoop(flair, agentId, config.reviewTrigger);
     console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);

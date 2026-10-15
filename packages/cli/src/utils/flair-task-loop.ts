@@ -8,10 +8,9 @@
  * own watermark for the agent never chooses where reading starts. The position
  * is persisted in `~/.tps/cursors/<loopId>-task-loop.json` as
  * `{ position, updatedAt }` and replaced atomically (a temporary file in the
- * same directory, fsynced, then renamed over it). `loopId` names the cursor and
- * is `agentId` unless the caller names another, so two loops reading one
- * agent's feed keep separate positions. It must be a single safe filename
- * component (see `LOOP_ID_PATTERN`); `startTaskLoop` refuses any other with
+ * same directory, fsynced, then renamed over it). Distinct `loopId` values keep
+ * separate positions; callers that omit it share the `agentId` cursor. It must
+ * be a single safe filename component (see `LOOP_ID_PATTERN`); `startTaskLoop` refuses any other with
  * `InvalidLoopIdError` before reading or writing a cursor. With no usable cursor file, the loop sets the position to
  * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
  * that position is saved: a failed save is logged by name and retried with
@@ -100,13 +99,13 @@ function cursorDir(): string {
 }
 
 /**
- * The allowed set for `loopId`: a single filename component of 1..64 characters
+ * The allowed set for `loopId`: a single filename component of 1..79 characters
  * from `A-Z a-z 0-9 . _ -`, excluding the two dot components `.` and `..`. It
  * names the cursor file `<loopId>-task-loop.json` inside the cursors directory,
  * so a path separator, a NUL, an empty or over-long string, or `.`/`..` is
  * refused rather than allowed to resolve a cursor outside that directory.
  */
-const LOOP_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+const LOOP_ID_PATTERN = /^[A-Za-z0-9._-]{1,79}$/;
 
 /** Whether `loopId` is a single safe filename component (see `LOOP_ID_PATTERN`). */
 export function isSafeLoopId(loopId: string): boolean {
@@ -220,8 +219,7 @@ export function startTaskLoop(
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  // The cursor is named for the loop, not the feed: two loops reading one
-  // agent's feed (`agentId`) keep separate positions.
+  // Distinct loop IDs keep separate positions; omitted IDs share the agentId cursor.
   const loopId = opts.loopId ?? agentId;
   // Refuse an unsafe loopId before any cursor is read or written: it names the
   // cursor file, so one with a path separator or a traversal segment could

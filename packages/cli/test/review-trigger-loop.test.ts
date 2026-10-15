@@ -13,12 +13,13 @@
  * fakes the `gh-as` process call too (`spawnSyncImpl`).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { SnoopLogg } from "snooplogg";
 import { createFlairClient } from "../src/utils/flair-client.js";
+import { InvalidLoopIdError } from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import {
   type CatchupFeed,
@@ -61,18 +62,18 @@ afterEach(() => {
 });
 
 /** The review-trigger loop's cursor file under the test HOME (its own, not the task loop's). */
-const cursorFile = () => join(home, ".tps", "cursors", `${AGENT}-review-trigger-task-loop.json`);
+const cursorFile = (agentId = AGENT) => join(home, ".tps", "cursors", `${agentId}-review-trigger-task-loop.json`);
 
 /** The cursor position the loop persisted, or undefined when it wrote none. */
-function cursorPosition(): string | undefined {
+function cursorPosition(agentId = AGENT): string | undefined {
   try {
-    return JSON.parse(readFileSync(cursorFile(), "utf-8")).position;
+    return JSON.parse(readFileSync(cursorFile(agentId), "utf-8")).position;
   } catch {
     return undefined;
   }
 }
 
-const client = () => createFlairClient(AGENT, stub!.url, keyPath);
+const client = (agentId = AGENT) => createFlairClient(agentId, stub!.url, keyPath);
 
 /** A pr.opened event `handlePrOpened` can request reviews for. */
 const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT]) => ({
@@ -85,11 +86,11 @@ const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT])
 const positionOf = (e: { createdAt: string; id: string }) => `${e.createdAt}\t${e.id}`;
 
 /** Serve `feed` through the verifying stub, recording every participant a catch-up request names. */
-function serve(feed: CatchupFeed): { route: CatchupRoute; asked: string[] } {
+function serve(feed: CatchupFeed, agentId = AGENT): { route: CatchupRoute; asked: string[] } {
   stub?.stop();
   const route = orgEventCatchupRoute(feed);
   const asked: string[] = [];
-  stub = installStubFlairFetch({ [AGENT]: SEED }, (req, url, caller) => {
+  stub = installStubFlairFetch({ [agentId]: SEED }, (req, url, caller) => {
     if (!url.pathname.startsWith("/OrgEventCatchup/")) return undefined;
     asked.push(decodeURIComponent(url.pathname.slice("/OrgEventCatchup/".length)));
     return route(req, url, caller);
@@ -127,9 +128,10 @@ async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<boolean>
 const LOOP_OPTS = { pollIntervalMs: 30 };
 
 describe("cli#631 — the review-trigger loop reads only feeds the agent may read", () => {
-  test("with the HTTP catch-up endpoint faked and the gh-as process call faked (spawnSyncImpl), it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async () => {
-    const e1 = prOpened("e1", 5);
-    const { route, asked } = serve({ events: [e1] });
+  test.each([AGENT, "a".repeat(64)])("agent %s: with the HTTP catch-up endpoint faked and the gh-as process call faked (spawnSyncImpl), it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async (agentId) => {
+    keyPath = writeKeyFile(join(home, ".tps", "identity"), agentId, SEED);
+    const e1 = prOpened("e1", 5, [agentId]);
+    const { route, asked } = serve({ events: [e1] }, agentId);
     const ghCalls: Array<{ cmd: string; args: string[]; input?: string }> = [];
     const deps = {
       spawnSyncImpl: ((cmd: string, args: string[], opts?: { input?: string }) => {
@@ -137,10 +139,10 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
         return { status: 0, stdout: "", stderr: "" };
       }) as any,
     };
-    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    const loop = startReviewTriggerLoop(client(agentId), agentId, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
     try {
       // The cursor advances only after the handler succeeds; a refused read advances nothing.
-      expect(await waitFor(() => cursorPosition() === positionOf(e1))).toBe(true);
+      expect(await waitFor(() => cursorPosition(agentId) === positionOf(e1))).toBe(true);
       expect(ghCalls).toHaveLength(1);
     } finally {
       await loop.stop();
@@ -149,14 +151,21 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     // on the PR in the event's /pull/<n> URL, with the configured reviewers as the payload.
     expect(ghCalls[0]?.cmd).toBe("gh-as");
     expect(ghCalls[0]?.args).toEqual([
-      AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/1/requested_reviewers`, "--input", "-",
+      agentId, "api", "--method", "POST", `repos/${REPO}/pulls/1/requested_reviewers`, "--input", "-",
     ]);
     expect(ghCalls[0]?.input).toBe(JSON.stringify({ reviewers: ["reviewer-1"] }));
     // Every request named the agent's own feed. A foreign feed (…-review-trigger) would 403 and deliver nothing.
     expect(asked.length).toBeGreaterThan(0);
-    expect(new Set(asked)).toEqual(new Set([AGENT]));
+    expect(new Set(asked)).toEqual(new Set([agentId]));
     expect(route.served).toEqual(["e1"]);
     expect(warnings).not.toContain("unavailable");
+  });
+
+  test("refuses the 80-character review loop ID derived from a 65-character agent ID before cursor access", () => {
+    serve({ events: [] });
+    expect(() => startReviewTriggerLoop(client(), "a".repeat(65), { reviewers: [], repo: REPO }))
+      .toThrow(InvalidLoopIdError);
+    expect(existsSync(join(home, ".tps", "cursors"))).toBe(false);
   });
 
   test("a refused read is reported unavailable, not treated as an empty feed", async () => {
