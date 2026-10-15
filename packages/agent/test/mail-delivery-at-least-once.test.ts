@@ -126,13 +126,11 @@ describe("per-message delivery commits one message at a time", () => {
     expect(curFiles()).toEqual(["m1.json"]);
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
 
-    // The handler is still running: deferred, not counted, nothing new committed.
     const again = await c.deliverNext();
     expect(reasonOf(again)).toBe("active");
     expect(intentJson("m1.json").presentations).toBe(1);
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
 
-    // The handler stops without completing: the next call presents it again and counts it.
     expect(c.releaseDelivery(first)).toBe(true);
     const second = delivered(await c.deliverNext());
     expect(second.message.verifiedEnvelope?.messageId).toBe("id-1");
@@ -184,7 +182,7 @@ describe("per-message delivery commits one message at a time", () => {
 });
 
 describe("in_progress re-presentation in recovery", () => {
-  test("another client in the process waits for a live presentation, then presents it again once released", async () => {
+  test("another client in the process waits for a held token, then presents it again once released", async () => {
     plant("m1.json", "resume-in-progress");
     const a = client();
     const first = delivered(await a.deliverNext());
@@ -277,7 +275,7 @@ describe("completion is bound to the hand-over", () => {
     expect(intentText("m1.json")).toBe(before);
   });
 
-  test("an active handler is never counted as an abandoned presentation", async () => {
+  test("a held local token defers re-presentation without increasing its count", async () => {
     plant("m1.json", "long-handler");
     plant("m2.json", "waiting");
     const c = client();
@@ -300,7 +298,7 @@ describe("completion is bound to the hand-over", () => {
     root = join(rootA, AGENT);
     plant("m1.json", "pinned-1");
     plant("m2.json", "pinned-2");
-    // rootB holds the same file name for the same message, live, under another claim.
+    // rootB holds the same file name for the same message under another claim.
     root = join(rootB, AGENT);
     mkdirSync(join(root, "cur"), { recursive: true });
     committed("pinned-1", {
@@ -330,7 +328,7 @@ describe("completion is bound to the hand-over", () => {
   });
 });
 
-describe("pending live work is deferred, and nothing new is committed meanwhile", () => {
+describe("deliverNext defers pending cur-copy failures before committing new mail", () => {
   test("a failed pending verification defers; a later valid message is not committed", async () => {
     plant("m1.json", "will-not-verify");
     const first = client();
@@ -418,7 +416,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
         const m = delivered(await c.deliverNext());
         expect(m.message.verifiedEnvelope?.messageId).toBe("poison");
         expect(m.presentation).toBe(i);
-        c.releaseDelivery(m); // the handler did not complete
+        c.releaseDelivery(m);
       }
       // The next hand-over would exceed the bound: poison is not presented, its
       // intent becomes terminal `failed`, and the next message flows.
@@ -460,7 +458,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
     expect(idOf(next)).toBe("healthy");
   });
 
-  test("a live presentation past the deadline is not quarantined while it is held", async () => {
+  test("a held local token defers expiry past the deadline", async () => {
     plant("m1.json", "slow-but-live");
     const c = client();
     const m = delivered(await c.deliverNext());
@@ -584,7 +582,7 @@ describe("a kill mid-delivery re-presents on the next call", () => {
     expect(newFiles()).toContain("m2.json");
   });
 
-  test("a live presentation in another process is deferred; once that process is killed it is presented again", async () => {
+  test("a foreign claim defers until its process is killed, then permits re-presentation", async () => {
     plant("m1.json", "held-by-child");
     plant("m2.json", "later");
     let whileAlive: DeliverNextResult | undefined;

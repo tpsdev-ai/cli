@@ -57,12 +57,13 @@ export interface MailDelivery {
 /**
  * Why deliverNext() handed nothing over although work may be waiting:
  * - `lock-busy`: the mailbox lock was unavailable.
- * - `active`: a live presentation holds the in-flight message (a handler in
- *   this process that has not completed or released it, or another live
- *   process). It is not counted as a presentation.
+ * - `active`: this process holds the token, or a foreign claiming process is
+ *   not provably gone. Release failed handoffs before retrying in the same process. No presentation
+ *   is counted.
  * - `cli-record`: a `placing` intent names a CLI-promoted cur/ record (a
  *   plaintext body with the signed envelope stored beside it). MailClient does
- *   not present that format; a CLI mail check finishes that placement.
+ *   not present that format; CLI recovery requires an expired or absent checkout
+ *   and successful verification.
  * - `verification-failed` / `verification-unavailable`: the pending cur/ copy
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
  * - `record-changed`: the pending cur/ copy is missing, is not the file the
@@ -95,7 +96,7 @@ export type DeliveryCompletion =
   | { status: "completed" }
   /** An earlier call with this delivery removed it. */
   | { status: "already-completed" }
-  /** The mailbox lock was unavailable; nothing changed and the intent stays `in_progress`. */
+  /** The mailbox lock was unavailable; intent state is unknown. Retry. */
   | { status: "deferred"; reason: "lock-busy"; detail: string }
   /**
    * Not this hand-over's to finalize; nothing changed. `foreign`: not a
@@ -117,10 +118,8 @@ function deferred(reason: DeliveryDeferral, detail: string, file?: string): Defe
 /**
  * cli#617 slice (b): the presentation tokens THIS PROCESS has handed over and
  * not yet completed or released, across every MailClient in it. A claim on disk
- * naming this process is live only while its token is here. A claim naming
- * another process is live unless that process is provably gone (processIsGone,
- * the lock-owner rule). A claim that is not live is an abandoned presentation,
- * which deliverNext() presents again and counts.
+ * naming this process is active while its token is here. A foreign claim is
+ * active until its process is provably gone. Release failed handoffs before retrying in the same process.
  */
 const activePresentations = new Set<string>();
 let ownStartToken: string | null | undefined;
@@ -361,9 +360,9 @@ export class MailClient {
 
   /**
    * Present verified, unclaimed pending work before committing new mail.
-   * Unresolved placing/in_progress work defers new commits. Active claims defer
-   * re-presentation; released or abandoned claims may be retried after verification,
-   * subject to the presentation bound and mailbox lock. The event loop uses checkNewMail().
+   * Unresolved placing/in_progress work defers deliverNext() commits. A held local
+   * token or foreign process not provably gone defers re-presentation. Release
+   * failed handoffs before retrying in the same process. The event loop uses checkNewMail().
    */
   async deliverNext(): Promise<DeliverNextResult> {
     let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
@@ -400,7 +399,7 @@ export class MailClient {
     const issued = this.issued.get(delivery);
     if (!issued) return { status: "refused", reason: "foreign", detail: "not a delivery this MailClient handed over" };
     if (issued.state === "completed") return { status: "already-completed" };
-    const lock = await this.lockOrDefer("delivery not finalized (the intent stays in_progress)");
+    const lock = await this.lockOrDefer("delivery not finalized; intent state unknown, retry");
     if ("status" in lock) return { status: "deferred", reason: "lock-busy", detail: lock.detail };
     let result: ReturnType<ReturnType<typeof mailboxReplayStore>["completePlacement"]>;
     try {
@@ -433,7 +432,7 @@ export class MailClient {
     return true;
   }
 
-  /** Record a hand-over: the token is already live in this process; bind it to the delivery object. */
+  /** Record a hand-over: the token is already held in this process; bind it to the delivery object. */
   private issue(token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
     const delivery: MailDelivery = Object.freeze({ message, deliveryKey: `${this.agentId}/${messageId}`, presentation });
     this.issued.set(delivery, { token, messageId, file, state: "active" });
@@ -475,7 +474,7 @@ export class MailClient {
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
       if (state.phase === "in_progress") {
         if (claimIsLive(state.claim)) {
-          return deferred("active", `message ${messageId} is held by a live presentation (not completed or released)`, file);
+          return deferred("active", `message ${messageId} has an active claim (local token held or foreign process not provably gone)`, file);
         }
         const expiry = replay.expireOverdue(messageId, file, new Date().toISOString());
         if (expiry.status === "absent") return RESOLVED;
@@ -499,7 +498,7 @@ export class MailClient {
       if (state.phase === "placing" && isCliPromotedRecord(bytes)) {
         return deferred(
           "cli-record",
-          `cur/${file} is a CLI-promoted record (plaintext body, signed envelope stored beside it); MailClient does not present it, and a CLI mail check finishes its placement`,
+          `cur/${file} is a CLI-promoted record (plaintext body, signed envelope stored beside it); MailClient does not present it; CLI recovery requires an expired or absent checkout and successful verification`,
           file,
         );
       }
@@ -529,7 +528,7 @@ export class MailClient {
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
       if (state.phase === "in_progress" && claimIsLive(state.claim)) {
-        return deferred("active", `message ${messageId} is held by a live presentation (not completed or released)`, file);
+        return deferred("active", `message ${messageId} has an active claim (local token held or foreign process not provably gone)`, file);
       }
       if (!replay.ownsPendingPlacement(messageId, file)) {
         return deferred("record-changed", `cur/${file} is not the file the intent recorded`, file);
@@ -550,8 +549,7 @@ export class MailClient {
         this.logQuarantine(messageId, advance.presentations, "count");
         return RESOLVED;
       }
-      // Live before the lock is released, so no other call in this process can
-      // read the new claim as abandoned.
+      // Hold the token before releasing the lock so another local call defers.
       activePresentations.add(token);
       const message: MailMessage = {
         filename: file,

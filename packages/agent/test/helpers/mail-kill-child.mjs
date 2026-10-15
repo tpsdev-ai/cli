@@ -16,7 +16,7 @@
 //                         "after-delivery": no filesystem boundary; with
 //                         TPS_DRIVE=deliverNext the child blocks, ALIVE, after
 //                         deliverNext() hands a message over and before it is
-//                         completed or released (a live presentation)
+//                         completed or released (a held local token)
 //        TPS_KILL_AFTER   "1" pauses AFTER the matched op completes
 //        TPS_KILL_MARKER  marker file written just before blocking
 //        TPS_MAIL_ROOT    the mailbox root (<mailDir>/<agentId>)

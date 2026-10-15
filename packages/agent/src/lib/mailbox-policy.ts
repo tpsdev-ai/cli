@@ -225,7 +225,8 @@ export const DELIVERY_PRESENTATION_TTL_MS = 24 * 60 * 60 * 1000;
  * is a per-presentation nonce: completion must present it, so a stale or
  * foreign presentation cannot finalize the current one. `pid` and `start` (the
  * process start token mail-lock records for lock owners) say which process
- * holds it, so a reader can tell a live presentation from an abandoned one.
+ * holds it. A foreign claim stays active until its process is provably gone;
+ * release failed handoffs before retrying in the same process.
  */
 export interface PresentationClaim {
   token: string;
@@ -290,8 +291,8 @@ export interface ReplayStore {
    * phase), `presented` with the new count, or `failed` when the liveness bound
    * (MAX_DELIVERY_PRESENTATIONS or DELIVERY_PRESENTATION_TTL_MS) is reached —
    * the intent is then terminal `failed` and the caller must not present. The
-   * caller decides first that no live presentation holds the intent. Call under
-   * the mailbox lock.
+   * caller first checks for a held local token or a foreign process not provably
+   * gone. Call under the mailbox lock.
    */
   advancePresentation(messageId: string, file: string, nowIso: string, claim: PresentationClaim): PresentationAdvance;
   /**
@@ -299,8 +300,8 @@ export interface ReplayStore {
    * message whose first presentation is more than DELIVERY_PRESENTATION_TTL_MS
    * before `nowIso` goes terminal `failed` (`failed`); otherwise it is unchanged
    * (`live`), or there is no `in_progress` intent for this message (`absent`).
-   * It never presents. The caller decides first that no live presentation holds
-   * the intent. Call under the mailbox lock.
+   * It never presents. The caller first checks for a held local token or a foreign
+   * process not provably gone. Call under the mailbox lock.
    */
   expireOverdue(messageId: string, file: string, nowIso: string): { status: "failed"; presentations: number } | { status: "live" } | { status: "absent" };
   /**
@@ -517,7 +518,7 @@ function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   if (phase === undefined || phase === "placing") resolved = "placing";
   else if (phase === "in_progress" || phase === "failed") resolved = phase;
   else return "unknown";
-  // A claim belongs only to a presentation in flight.
+  // A claim is valid only on an in_progress intent.
   if (claim !== undefined && resolved !== "in_progress") return "unknown";
   return resolved;
 }

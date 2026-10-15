@@ -106,7 +106,7 @@ describe("a CLI promotion killed before it finished its intent, then MailClient.
 
   const intentPath = (mailboxRoot: string, file: string) => join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
 
-  test("deliverNext() defers by name, commits no later message, and resumes once a CLI check finishes the placement", async () => {
+  test("deliverNext() defers a CLI record, then resumes after lease expiry and verified CLI recovery", async () => {
     const inbox = getInbox(AGENT);
     const source = plant("cli-placed", "record.json");
     const run = await promoteAndKillBeforeIntentFinish(source);
@@ -138,8 +138,7 @@ describe("a CLI promotion killed before it finished its intent, then MailClient.
     expect(readFileSync(intentPath(inbox.root, "record.json"), "utf8")).toBe(intentBefore);
     expect(readFileSync(curPath, "utf8")).toBe(recordBefore);
 
-    // The CLI's own check finishes its placement once the checkout lease has
-    // expired (later.json is held aside so the CLI does not promote it too).
+    // Age the checkout before verified CLI recovery; hold later.json aside.
     const aside = join(root, "aside");
     mkdirSync(aside);
     renameSync(join(inbox.fresh, "later.json"), join(aside, "later.json"));

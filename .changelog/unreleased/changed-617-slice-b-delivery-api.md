@@ -2,9 +2,9 @@
 
   Agent event-loop wiring is unchanged.
 
-  Unresolved `placing`/`in_progress` work defers new commits. Active claims
-  defer re-presentation. Released or abandoned claims may be presented again
-  after verification and lock acquisition. Completion checks the issued token
+  Unresolved `placing`/`in_progress` work defers `deliverNext()` commits.
+  Foreign claims defer re-presentation until their process is provably gone.
+  Release failed handoffs before retrying in the same process. Completion checks the issued token
   and recorded file identity. The mailbox path is resolved at construction.
   On later calls, an unclaimed `in_progress` intent becomes `failed` before
   a presentation beyond the fifth, or after the deadline of 24 hours from

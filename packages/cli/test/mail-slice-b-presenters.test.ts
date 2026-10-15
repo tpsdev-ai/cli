@@ -8,10 +8,10 @@ import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import * as ed from "@noble/ed25519";
 import { runMail } from "../src/commands/mail.js";
 import { ackMessage, getInbox, nackMessage, promote, recoverPromoted, sendMessage, verifyMailAction } from "../src/utils/mail.js";
 import { signOutboundBody } from "../src/utils/mail-sign.js";
+import { stubFlairHandler } from "./helpers/stub-flair.js";
 import { mailboxReplayStore } from "../../agent/src/lib/mailbox-policy.js";
 
 afterEach(() => {
@@ -47,20 +47,19 @@ beforeEach(() => {
   flair.gate = null;
   flair.entered = 0;
   flair.senderUnknown = false;
-  const publicKey = Buffer.from(ed.getPublicKey(seed)).toString("base64");
-  patchShared(fetchSpyState, "value", spyOn(globalThis, "fetch").mockImplementation(async (input) => {
-    const url = new URL(String(input));
-    if (url.origin !== "http://flair.test") throw new Error(`unexpected request: ${url.origin}`);
-    if (url.pathname === "/Health") return new Response("ok");
+  const handler = stubFlairHandler({ flint: seed, kern: seed }, async (_req, url) => {
     const name = url.pathname.match(/^\/Agent\/(.+)$/)?.[1];
     if (name === "flint" && flair.gate) {
       flair.entered++;
       await flair.gate;
     }
     if (name === "flint" && flair.senderUnknown) return new Response("not found", { status: 404 });
-    return name && ["flint", "local-agent"].includes(name)
-      ? Response.json({ id: name, publicKey })
-      : new Response("not found", { status: 404 });
+    return undefined;
+  });
+  patchShared(fetchSpyState, "value", spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const req = new Request(input, init);
+    if (new URL(req.url).origin !== "http://flair.test") throw new Error(`unexpected request: ${req.url}`);
+    return handler(req);
   }));
 });
 
@@ -125,6 +124,15 @@ async function duringVerification<T>(action: () => Promise<T>, during: () => voi
 const dlqHas = (file: string) => existsSync(join(getInbox("kern").dlq, file));
 
 describe("recoverPromoted", () => {
+  test("unsigned Agent reads are refused; signed promotion succeeds", async () => {
+    flair.gate = Promise.resolve();
+    const response = await fetch("http://flair.test/Agent/flint");
+    expect(response.status).toBe(403);
+    expect((await response.json()).type).toBe("error:AccessViolation");
+    expect(flair.entered).toBe(0);
+    await promotedRecord();
+  });
+
   test("presents a record with no intent, or its own placing intent", async () => {
     const r = await promotedRecord();
     expect((await recoverPromoted("kern", r.path)).ok).toBe(true);
