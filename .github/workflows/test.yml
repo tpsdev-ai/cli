@@ -10,6 +10,14 @@ on:
 # what its steps use, and names the step beside each grant.
 permissions: {}
 
+# A newer push to the same pull request cancels that PR's pending or in-progress
+# run of this workflow, once the newer push starts a run (the key is `test-pr-`
+# plus the PR number). A push to main gets a group unique per run (`run_id`), so
+# this rule does not cancel a main run.
+concurrency:
+  group: test-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
     name: Build (TypeScript strict)
