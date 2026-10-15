@@ -7,9 +7,10 @@
   is `Last Seen`: the presence status and the age of the agent's last heartbeat.
   Office status shows the same in `LAST SEEN`, and also the agent's current task
   or activity in `ACTIVITY`, or `was: <last activity>` (Flair's `lastActivity`)
-  once Flair reports the activity stale. Presence is per Flair instance (Flair
-  federation does not replicate it), so an agent with no record on the queried
-  instance reads `no presence on this instance`. The presence columns read
+  once Flair reports the activity stale. Only agents in the Agent list are
+  displayed. A listed agent with no stored Presence row on the queried instance
+  reads `no presence on this instance`. An older local row can remain after an
+  agent moves. Presence is not federated. The presence columns read
   `unavailable`, not an empty column, when the read cannot be signed (it is then
   not sent) or fails, or when the roster has a missing or invalid field the
   views read, fields that contradict how Flair derives them, or

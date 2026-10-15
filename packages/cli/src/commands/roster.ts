@@ -263,10 +263,11 @@ export async function runDashboard(opts: { flairUrl?: string; json?: boolean; ke
   // Per-agent presence for the last-seen column: the Presence roster of the
   // Flair instance at flairUrl (see utils/presence-read.ts), not the viewer's
   // catch-up feed. Agents push heartbeats there; Flair derives the status.
-  // Presence is not federated, so an agent with no record here reads "no
-  // presence on this instance". A read that cannot be signed (it is then not
-  // sent) or fails, or that returns a roster the reader does not accept, is
-  // reported, and the column says "unavailable" instead.
+  // Only agents in the Agent list are displayed. A listed agent with no stored
+  // Presence row on the queried instance reads "no presence on this instance".
+  // A read that cannot be signed (it is then not sent) or fails, or that returns
+  // a roster the reader does not accept, is reported, and the column says
+  // "unavailable" instead.
   const read = await readPresence({ flairUrl, sign: makeAuth });
   const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);

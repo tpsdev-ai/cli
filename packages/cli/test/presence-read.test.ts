@@ -57,7 +57,7 @@ function serve(answer: FlairRoutes): StubFlair {
 }
 
 describe("cli#622 — readPresence", () => {
-  test("a verified read returns one record per agent holding only the validated fields", async () => {
+  test("a verified read returns one record per stored local Presence row, keyed by agent, holding only the validated fields", async () => {
     const { url } = serve(presenceRoute(ROWS));
     const read = await readPresence({ flairUrl: url, sign: requestSigner(VIEWER, SEED) });
     if (read.status !== "ok") throw new Error(`expected ok, got ${read.reason}`);

@@ -2,7 +2,7 @@
  * office-status.ts — `tps office status`
  *
  * Full office state at a glance:
- *   - All agents: role, model, status, and their presence status and last
+ *   - Agents in the Agent list: role, model, status, presence status and last
  *     heartbeat on the queried Flair instance (its Presence roster)
  *   - Current activity (Presence's currentTask, else its activity, shown as
  *     "was: <lastActivity>" once Flair reports the activity stale)
@@ -144,10 +144,11 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   // Per-agent presence for the last-seen and activity columns: the Presence
   // roster of the Flair instance at flairUrl (see utils/presence-read.ts).
   // Agents push heartbeats and activity there; Flair derives the status and
-  // whether the activity is fresh. Presence is not federated, so an agent with
-  // no record here reads "no presence on this instance". A read that cannot be
-  // signed (it is then not sent) or fails, or that returns a roster the reader
-  // does not accept, is reported, and the columns say "unavailable" instead.
+  // whether the activity is fresh. Only agents in the Agent list are displayed.
+  // A listed agent with no stored Presence row on the queried instance reads
+  // "no presence on this instance". A read that cannot be signed (it is then
+  // not sent) or fails, or that returns a roster the reader does not accept,
+  // is reported, and the columns say "unavailable" instead.
   const read = await readPresence({ flairUrl, sign: a });
   const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);
@@ -163,7 +164,7 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   // What the agent is doing: its current task, else its activity, or
   // "was: <lastActivity>" once Flair reports the activity stale (Flair then
   // serves no current task, and the reader refuses a record that has one).
-  // Null for an agent with no record on this instance.
+  // Null for a listed agent with no stored Presence row on the queried instance.
   const doingText = (id: string): string | null => {
     if (state === "unavailable") return "unavailable";
     const rec = presenceByAgent.get(id);

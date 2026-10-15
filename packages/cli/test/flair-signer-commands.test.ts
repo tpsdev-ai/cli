@@ -190,7 +190,7 @@ describe("cli#622 — runDashboard reads the Presence roster", () => {
     ["under Flair's idle threshold", 0.5, "active (just now)"],
     ["past Flair's idle threshold", 5, "idle (5m ago)"],
     ["past Flair's offline threshold", 3 * 1440, "offline (3d ago)"],
-  ])("a heartbeat %s shows the status Flair derives and its age; an agent with no record here reads 'no presence on this instance'", async (_label, minutesAgo, shown) => {
+  ])("a heartbeat %s shows the status Flair derives and its age; a listed agent with no stored Presence row on the queried instance reads 'no presence on this instance'", async (_label, minutesAgo, shown) => {
     const out = await dashboard(presenceRoute([beat("agent-a", minutesAgo)]));
     expect(out).not.toContain("Cannot read Presence");
     expect(out).toContain("Last Seen");

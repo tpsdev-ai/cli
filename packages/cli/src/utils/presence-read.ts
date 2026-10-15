@@ -3,19 +3,19 @@
  * and `tps office status` (cli#622), from the Flair instance the command
  * queries.
  *
- * `GET /Presence` is that instance's roster of per-agent presence: one record
- * per agent that has sent a heartbeat to it. Agents push heartbeats, their
- * activity and their current task; Flair derives each record's status
+ * `GET /Presence` returns one record per stored local Presence row, keyed by
+ * agent. Agents push heartbeats, their activity and their current task; Flair
+ * derives each record's status
  * (`active` / `idle` / `offline`) and whether its activity is still fresh when
  * it serves the read (resources/Presence.ts). Unlike the viewer's OrgEvent
  * catch-up feed (events addressed to the viewer or broadcast, from the viewer's
  * acknowledged position), it is per-agent — the source that matches "what is
  * each agent doing / when was it last seen".
  *
- * SCOPE: the roster is per Flair instance. Flair federation replicates Agent
- * records but not Presence, so an agent that heartbeats to a different instance
- * has no record here, though it may be registered here. A missing record means
- * "no presence on this instance", not that the agent was never seen.
+ * SCOPE: the commands display only agents in the Agent list. A listed agent
+ * with no stored Presence row on the queried instance reads "no presence on
+ * this instance". An older local row can remain after an agent moves. Flair
+ * federation replicates Agent records but not Presence.
  *
  * Flair serves the roster to a verified reader (a registered agent's
  * TPS-Ed25519 signature, which is what both commands sign with); an unverified
@@ -24,8 +24,8 @@
  * an unsigned read, which an instance with Flair's public-roster opt-in would
  * answer. It validates the body and returns either
  *
- *   - `ok`, with one record per agent holding only the fields it validated
- *     (`PresenceRecord`), or
+ *   - `ok`, with one record per stored local Presence row, keyed by agent,
+ *     holding only the fields it validated (`PresenceRecord`), or
  *   - `unavailable`, with a bounded reason: the HTTP status, a fixed note
  *     naming what is wrong with the request or the response, or the code or
  *     class of the error a failed signer or a rejected request raised. The
@@ -187,7 +187,7 @@ export function presenceState(read: PresenceRead): PresenceState {
   return read.status === "ok" ? "ok" : "unavailable";
 }
 
-/** What both commands print for an agent with no Presence record on the queried instance. */
+/** What both commands print for a listed agent with no stored Presence row on the queried instance. */
 export const NO_PRESENCE_TEXT = "no presence on this instance";
 
 /**

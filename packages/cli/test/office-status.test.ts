@@ -88,7 +88,7 @@ describe("tps office status", () => {
     expect(joined).toContain("engineer");
   });
 
-  test("shows each agent's presence status, heartbeat age and current task on this instance", async () => {
+  test("shows stored presence status, heartbeat age and current task on the queried instance", async () => {
     await runOfficeStatus(baseOpts());
     const joined = output.join("\n");
     expect(joined).toContain("reviewing a PR");
@@ -156,7 +156,7 @@ describe("cli#622 — office status reads the Presence roster", () => {
   const corrupt = (rows: PresenceRow[], over: Record<string, unknown>): FlairRoutes => () =>
     Response.json(presenceRecords(rows).map((r, i) => (i === 0 ? { ...r, ...over } : r)));
 
-  test("shows each agent's presence status and current task, and 'no presence on this instance' for an agent with no record here", async () => {
+  test("shows presence status and current task, and 'no presence on this instance' for a listed agent with no stored Presence row on the queried instance", async () => {
     const out = await status(presenceRoute([beat("agent-a", 0.5, { currentTask: "reviewing a PR" })]));
     expect(out).not.toContain("Cannot read Presence");
     expect(out).toContain("LAST SEEN");
