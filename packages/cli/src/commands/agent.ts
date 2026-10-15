@@ -19,7 +19,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve as resolvePathMod } from "node:path";
+import { dirname, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -1122,6 +1122,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // the sandboxed child re-enters bin/tps.ts, which runs the runtime
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
+            // Keep the config through the re-exec (cli#516): without it the
+            // child re-resolves ~/.tps/agents/<id>/agent.yaml, so a
+            // `--config <file>` launch silently ran the default config instead.
+            relaunch.push("--config", configPath);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
@@ -1135,7 +1139,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // 0.70+ (exit 1). Use the explicit toolchain read set instead —
               // the macOS roots Kern validated, and their Linux equivalents
               // (systemReadPaths()).
-              read: harnessReadPaths(),
+              // Read the toolchain roots plus the directory the config was read
+              // from, so the child can re-read `--config` inside the sandbox
+              // (cli#516). Read-only, and usually the already-granted agent dir.
+              read: [...new Set([...harnessReadPaths(), dirname(configPath)])],
               // Exactly this agent's own identity files, not the shared
               // identity directory (cli#351 r4).
               readFiles: harnessReadFiles(launchId),
@@ -1158,12 +1165,37 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            const exitCode = await launchAttested(
-              profile,
-              approval.options,
-              relaunch,
-              { runtimeDirectories: approval.runtimeDirectories },
-            );
+            // Worktree setup/cleanup runs HERE, outside the sandbox (cli#516):
+            // the sandboxed child cannot reach the base repository's metadata,
+            // so its hooked setup quietly did nothing under a real nono. The
+            // parent can reach the base repo; the child skips the hooks.
+            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            if (selectedRuntime) {
+              try {
+                onStart(launchId, config.workspace);
+              } catch (err) {
+                console.error(`❌ ${(err as Error).message}`);
+                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+              }
+            }
+            let exitCode: number;
+            try {
+              exitCode = await launchAttested(
+                profile,
+                approval.options,
+                relaunch,
+                { runtimeDirectories: approval.runtimeDirectories },
+              );
+            } finally {
+              if (selectedRuntime) {
+                try {
+                  onStop(launchId, config.workspace);
+                } catch (err) {
+                  console.error(`❌ ${(err as Error).message}`);
+                  process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+                }
+              }
+            }
             process.exit(exitCode);
           }
         } else if (!sandboxed && nonoAvailable) {

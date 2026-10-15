@@ -226,6 +226,18 @@ export interface AgentLifecycleResult {
   reason: string;
 }
 
+/**
+ * A worktree setup or cleanup operation failed (cli#516). Named so a caller can
+ * tell a worktree failure from any other error and report it as one; the message
+ * always names the operation that failed.
+ */
+export class WorktreeLifecycleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeLifecycleError";
+  }
+}
+
 function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
   const out = spawnSync("git", args, { cwd, encoding: "utf-8" });
   return {
@@ -243,7 +255,9 @@ function isGitRepo(path: string): boolean {
 function parseWorktreePaths(baseRepo: string): Set<string> {
   const out = git(baseRepo, ["worktree", "list", "--porcelain"]);
   if (!out.ok) {
-    throw new Error(out.stderr || out.stdout || "git worktree list failed");
+    throw new WorktreeLifecycleError(
+      `worktree listing failed in ${baseRepo}: ${out.stderr || out.stdout || "git worktree list failed"}`,
+    );
   }
   const paths = new Set<string>();
   for (const line of out.stdout.split("\n")) {
@@ -290,7 +304,9 @@ export function onStart(agentId: string, workspacePath?: string): AgentLifecycle
 
   const add = git(baseRepo, ["worktree", "add", workspace, "--detach"]);
   if (!add.ok) {
-    throw new Error(`failed to create worktree for ${agentId}: ${add.stderr || add.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree setup failed for ${agentId} (${baseRepo} -> ${workspace}): ${add.stderr || add.stdout}`,
+    );
   }
 
   return { changed: true, reason: "worktree created" };
@@ -318,7 +334,9 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
 
   const remove = git(baseRepo, ["worktree", "remove", workspace, "--force"]);
   if (!remove.ok) {
-    throw new Error(`failed to remove worktree: ${remove.stderr || remove.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree cleanup failed for ${_agentId} (${workspace}): ${remove.stderr || remove.stdout}`,
+    );
   }
 
   return { changed: true, reason: "worktree removed" };
