@@ -165,20 +165,14 @@ describe("cli#622 — readPresence", () => {
   });
 });
 
-/**
- * The fake's refusals, against Flair's coded responses: an anonymous reader of
- * `GET /Presence` gets Presence.get()'s 401 (resources/Presence.ts, flair#1880),
- * and a malformed TPS-Ed25519 header gets the auth middleware's 401
- * (resources/auth-middleware.ts).
- */
-describe("cli#622 — the Presence fake refuses as Flair does", () => {
+describe("cli#622 — the Presence fake authentication responses", () => {
   test.each([
     ["no Authorization header", undefined, "authentication required"],
-    ["another scheme", "Bearer not-a-credential", "authentication required"],
+    ["an invalid Bearer token", "Bearer not-a-credential", "invalid token"],
     ["a malformed TPS-Ed25519 header", "TPS-Ed25519 not-a-credential", "invalid_authorization_header"],
   ])("a GET /Presence with %s gets 401", async (_label, header, error) => {
-    const { url } = serve(presenceRoute(ROWS));
-    const res = await fetch(`${url}/Presence`, header === undefined ? {} : { headers: { Authorization: header } });
+    const handler = stubFlairHandler({ [VIEWER]: SEED }, presenceRoute(ROWS));
+    const res = await handler(new Request("http://flair.test/Presence", header === undefined ? {} : { headers: { Authorization: header } }));
     expect(res.status).toBe(401);
     expect(await res.json()).toEqual({ error });
   });

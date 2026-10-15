@@ -10,15 +10,15 @@
  * breaks (cli#554). `stubFlairHandler` verifies the caller before it answers:
  *   - a malformed TPS-Ed25519 header  -> 401 { error: "invalid_authorization_header" }
  *     (Flair's auth middleware)
- *   - no header, or another scheme  -> 403 { type: "error:AccessViolation", ... }
- *     (except `GET /Presence`, which gets 401 { error: "authentication required" }:
- *     Flair passes such a request to the resource as anonymous, and
- *     Presence.get() refuses an anonymous reader with 401 by default —
- *     resources/Presence.ts, flair#1880. The stub models no admin credential.)
+ *   - no header on `GET /Presence` -> 401 { error: "authentication required" }
+ *     (Presence.get()'s default anonymous response; resources/Presence.ts)
+ *   - malformed Bearer token -> 401 { error: "invalid token" }
+ *     (Harper authentication rejects it before Presence runs)
  *   - timestamp outside the window  -> 401 { error: "timestamp_out_of_window" }
  *   - a nonce seen before           -> 401 { error: "nonce_replay_detected" }
  *   - a caller with no registered key -> 401 { error: "unknown_agent" }
  *   - a bad signature               -> 401 { error: "invalid_signature" }
+ * The stub models no admin credential.
  *
  * Built in it answers `GET /Health` (unauth, a liveness probe) and
  * `GET /Agent/<name>` (the public-key read the production client makes). A test
@@ -120,6 +120,7 @@ export function stubFlairHandler(
     const auth = tpsScheme && header.length <= 4096 ? /^TPS-Ed25519\s+([^:\s]+):(\d+):([^:\s]+):(.+)$/i.exec(header) : null;
     if (!auth) {
       if (tpsScheme) return Response.json({ error: "invalid_authorization_header" }, { status: 401 });
+      if (header.startsWith("Bearer ")) return Response.json({ error: "invalid token" }, { status: 401 });
       if (req.method === "GET" && url.pathname === "/Presence") return presenceAuthenticationRequired();
       return accessViolation(url);
     }

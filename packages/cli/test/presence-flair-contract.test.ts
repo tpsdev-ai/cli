@@ -38,3 +38,11 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair serves a capped
     }
   }
 }, 30_000);
+
+test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair rejects an invalid Bearer token on GET /Presence", async () => {
+  const response = await fetch("http://127.0.0.1:9926/Presence", {
+    headers: { Authorization: "Bearer not-a-credential" },
+  });
+  expect(response.status).toBe(401);
+  expect(await response.json()).toEqual({ error: "invalid token" });
+});
