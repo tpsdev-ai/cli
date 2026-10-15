@@ -546,7 +546,7 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
       return rename(...args);
     });
     try {
-      await expect(client["commitToCur"]("m1.json", join(inbox("new"), "m1.json"),
+      await expect(client["commitToCur"](client["operationRoots"](), "m1.json", join(inbox("new"), "m1.json"),
         readFileSync(join(inbox("new"), "m1.json"), "utf-8"), env)).rejects.toThrow(/append fault.*rollback fault/);
       expect(readFileSync(join(tmpDir, AGENT, "consumed.jsonl"), "utf-8")).toBe("");
     } finally {
