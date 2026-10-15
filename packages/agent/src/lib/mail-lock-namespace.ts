@@ -5,23 +5,18 @@
  * CLI relay acceptance takes its acceptance stripe from the process mail root
  * (`TPS_MAIL_DIR`); its recipient mailbox locks come from the selected mailbox
  * and scan roots, which can be branch-office mailboxes outside that root.
- * MailClient took its acceptance stripe from the process environment too, not
- * from its configured `mailDir`, so a MailClient whose environment selected a
- * different root locked a stripe under that root, and acceptance's stripe did
- * not exclude its promotion or dead-letter moves. Each side now derives the
- * stripe from the mail root it is configured with, through this module, which
- * both packages import.
+ * MailClient derives its stripe and mailbox paths from one resolved mail-root
+ * string per operation, also resolving the mailbox directory beneath it.
  *
- * Each root derived here starts from a resolved real path (symlinks and `.`/`..`
- * resolved), so callers that reach one mail root by different paths derive equal
- * stripe root STRINGS. Equal strings are not what makes two processes exclude
- * each other: the lock is a directory created inside the locked directory, so a
- * symlinked path and its target already reach one filesystem lock. Within one
- * process the strings do matter, because the lock's re-entrancy check compares
- * lock path strings. Mailbox lock
- * roots come from here only for acceptance and MailClient promotion; MailClient
- * placement recovery and the CLI's other mailbox lock sites lock the mailbox
- * root path as given.
+ * The relay stripe is a cooperative lock among MailClients that resolve the
+ * same canonical path. The OS follows same-user filesystem changes to that
+ * path during an operation; the stripe does not exclude them.
+ *
+ * Mailbox lock roots come from here only for acceptance and
+ * MailClient: acceptance uses canonicalMailboxRoot; MailClient derives its
+ * promotion and recovery lock paths from the canonical mailbox string resolved
+ * once per operation (cli#636). The CLI's other mailbox lock sites use the
+ * mailbox root path as given.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
@@ -48,8 +43,13 @@ export function canonicalMailRoot(mailRoot: string): string {
 
 /** The acceptance-stripe lock root for one relayed delivery, under `mailRoot`. */
 export function acceptanceLockRoot(mailRoot: string, branchId: string, id: string): string {
+  return acceptanceLockRootFromSnapshot(canonicalMailRoot(mailRoot), branchId, id);
+}
+
+/** Derive a stripe path from a canonical mail-root string without resolving again. */
+export function acceptanceLockRootFromSnapshot(mailRoot: string, branchId: string, id: string): string {
   const stripe = createHash("sha256").update(branchId).update("\0").update(id).digest()[0]! % RELAY_ACCEPT_LOCK_STRIPES;
-  return join(canonicalMailRoot(mailRoot), ".relay-accept-locks", String(stripe));
+  return join(mailRoot, ".relay-accept-locks", String(stripe));
 }
 
 /** The mailbox lock root for `agentId`, under `mailRoot`. */
