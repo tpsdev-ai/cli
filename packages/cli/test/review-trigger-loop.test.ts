@@ -8,8 +8,9 @@
  * The catch-up route is `orgEventCatchupRoute`, the shared signed stub modelled
  * on Flair's coded catch-up contract; it refuses a non-admin read of another
  * participant's feed with 403, so a loop that reads a foreign feed gets nothing.
- * The loop runs through the real FlairClient, signer and envelope reader; only
- * the HTTP endpoint is faked.
+ * The loop runs through the real FlairClient, signer and envelope reader; the
+ * HTTP catch-up endpoint is faked, and the case that drives the review request
+ * fakes the `gh-as` process call too (`spawnSyncImpl`).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -126,7 +127,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<boolean>
 const LOOP_OPTS = { pollIntervalMs: 30 };
 
 describe("cli#631 — the review-trigger loop reads only feeds the agent may read", () => {
-  test("it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async () => {
+  test("with the HTTP catch-up endpoint faked and the gh-as process call faked (spawnSyncImpl), it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async () => {
     const e1 = prOpened("e1", 5);
     const { route, asked } = serve({ events: [e1] });
     const ghCalls: Array<{ cmd: string; args: string[]; input?: string }> = [];

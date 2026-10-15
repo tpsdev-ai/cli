@@ -10,7 +10,9 @@
  * `{ position, updatedAt }` and replaced atomically (a temporary file in the
  * same directory, fsynced, then renamed over it). `loopId` names the cursor and
  * is `agentId` unless the caller names another, so two loops reading one
- * agent's feed keep separate positions. With no usable cursor file, the loop sets the position to
+ * agent's feed keep separate positions. It must be a single safe filename
+ * component (see `LOOP_ID_PATTERN`); `startTaskLoop` refuses any other with
+ * `InvalidLoopIdError` before reading or writing a cursor. With no usable cursor file, the loop sets the position to
  * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
  * that position is saved: a failed save is logged by name and retried with
  * backoff, with the same position, and `stop()` ends the retrying. A legacy
@@ -95,6 +97,28 @@ export const MAX_POSITION_SKEW_MS = 5 * 60_000;
 
 function cursorDir(): string {
   return join(homeDir(), ".tps", "cursors");
+}
+
+/**
+ * The allowed set for `loopId`: a single filename component of 1..64 characters
+ * from `A-Z a-z 0-9 . _ -`, excluding the two dot components `.` and `..`. It
+ * names the cursor file `<loopId>-task-loop.json` inside the cursors directory,
+ * so a path separator, a NUL, an empty or over-long string, or `.`/`..` is
+ * refused rather than allowed to resolve a cursor outside that directory.
+ */
+const LOOP_ID_PATTERN = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** Whether `loopId` is a single safe filename component (see `LOOP_ID_PATTERN`). */
+export function isSafeLoopId(loopId: string): boolean {
+  return LOOP_ID_PATTERN.test(loopId) && loopId !== "." && loopId !== "..";
+}
+
+/** Thrown by `startTaskLoop` for a `loopId` that is not a single safe filename component. */
+export class InvalidLoopIdError extends Error {
+  constructor(loopId: string) {
+    super(`Invalid loopId ${JSON.stringify(loopId)}: it must be a single filename component matching ${LOOP_ID_PATTERN} and not "." or ".."`);
+    this.name = "InvalidLoopIdError";
+  }
 }
 
 /** The loop's cursor file for `loopId`. */
@@ -199,6 +223,10 @@ export function startTaskLoop(
   // The cursor is named for the loop, not the feed: two loops reading one
   // agent's feed (`agentId`) keep separate positions.
   const loopId = opts.loopId ?? agentId;
+  // Refuse an unsafe loopId before any cursor is read or written: it names the
+  // cursor file, so one with a path separator or a traversal segment could
+  // resolve a cursor outside the cursors directory.
+  if (!isSafeLoopId(loopId)) throw new InvalidLoopIdError(loopId);
   const loaded = loadCursor(loopId);
   // A new initial position is computed once, here; saving it is retried with
   // this same value until it succeeds, and the feed is not read before then.

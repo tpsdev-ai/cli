@@ -10,13 +10,13 @@
  * the signing and parsing seams are exercised; only the HTTP endpoint is faked.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { SnoopLogg } from "snooplogg";
-import { createFlairClient } from "../src/utils/flair-client.js";
-import { MAX_POSITION_SKEW_MS, startTaskLoop } from "../src/utils/flair-task-loop.js";
+import { createFlairClient, type FlairClient } from "../src/utils/flair-client.js";
+import { InvalidLoopIdError, MAX_POSITION_SKEW_MS, startTaskLoop } from "../src/utils/flair-task-loop.js";
 import { createPatchShared } from "./helpers/patch-shared.js";
 import {
   type CatchupFeed,
@@ -707,5 +707,29 @@ describe("cli#624 — the task loop's cursor file", () => {
     // A rename puts a new file (a new inode) at the path; an in-place write keeps the old one.
     expect(statSync(cursorFile()).ino).not.toBe(inodeBefore);
     expect(readdirSync(join(home, ".tps", "cursors"))).toEqual([`${AGENT}-task-loop.json`]);
+  });
+});
+
+describe("cli#631 — loopId is a single safe filename component", () => {
+  test("refuses a traversal, separator, dot or over-long loopId before reading or writing a cursor", () => {
+    // A client the loop could not use even if it got past the check: the refusal must come first.
+    const untouched = {} as FlairClient;
+    for (const bad of ["../../outside", "a/b", "..", ".", "a\\b", "x".repeat(65), "a\0b"]) {
+      expect(() => startTaskLoop(untouched, AGENT, async () => {}, { loopId: bad })).toThrow(InvalidLoopIdError);
+    }
+    // Nothing was read or written: the cursors directory does not exist, and the
+    // path a traversal loopId would reach is untouched.
+    expect(existsSync(join(home, ".tps", "cursors"))).toBe(false);
+    expect(existsSync(join(home, "outside-task-loop.json"))).toBe(false);
+  });
+
+  test("accepts a valid loopId and names its cursor file with it", async () => {
+    serveFeed({ events: [] });
+    const loop = startTaskLoop(client(), AGENT, async () => {}, { loopId: "agent-a-review-trigger", pollIntervalMs: 60_000 });
+    try {
+      expect(await waitFor(() => existsSync(join(home, ".tps", "cursors", "agent-a-review-trigger-task-loop.json")))).toBe(true);
+    } finally {
+      await loop.stop();
+    }
   });
 });
