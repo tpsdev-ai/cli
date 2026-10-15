@@ -126,16 +126,31 @@ async function waitFor(cond: () => boolean, timeoutMs = 3_000): Promise<boolean>
 const LOOP_OPTS = { pollIntervalMs: 30 };
 
 describe("cli#631 — the review-trigger loop reads only feeds the agent may read", () => {
-  test("it reads the agent's own feed, so a pr.opened trigger addressed to the agent is handled", async () => {
+  test("it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async () => {
     const e1 = prOpened("e1", 5);
     const { route, asked } = serve({ events: [e1] });
-    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: [], repo: REPO }, LOOP_OPTS);
+    const ghCalls: Array<{ cmd: string; args: string[]; input?: string }> = [];
+    const deps = {
+      spawnSyncImpl: ((cmd: string, args: string[], opts?: { input?: string }) => {
+        ghCalls.push({ cmd, args, input: opts?.input });
+        return { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
     try {
       // The cursor advances only after the handler succeeds; a refused read advances nothing.
       expect(await waitFor(() => cursorPosition() === positionOf(e1))).toBe(true);
+      expect(ghCalls).toHaveLength(1);
     } finally {
       await loop.stop();
     }
+    // The handler issued the review request the review-trigger loop exists for: gh-as, as the agent,
+    // on the PR in the event's /pull/<n> URL, with the configured reviewers as the payload.
+    expect(ghCalls[0]?.cmd).toBe("gh-as");
+    expect(ghCalls[0]?.args).toEqual([
+      AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/1/requested_reviewers`, "--input", "-",
+    ]);
+    expect(ghCalls[0]?.input).toBe(JSON.stringify({ reviewers: ["reviewer-1"] }));
     // Every request named the agent's own feed. A foreign feed (…-review-trigger) would 403 and deliver nothing.
     expect(asked.length).toBeGreaterThan(0);
     expect(new Set(asked)).toEqual(new Set([AGENT]));

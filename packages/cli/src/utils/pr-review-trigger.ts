@@ -76,6 +76,7 @@ export function reRequestReviewer(
 export async function handlePrOpened(
   event: { detail?: string; summary: string; refId?: string },
   config: ReviewTriggerConfig,
+  deps: ReviewRequestDeps = {},
 ): Promise<void> {
   const detail = event.detail ?? "";
   const prNumber = extractPrNumber(detail);
@@ -85,29 +86,28 @@ export async function handlePrOpened(
     return;
   }
 
-  requestReviews(prNumber, config);
+  requestReviews(prNumber, config, deps);
 }
 
 /**
  * Start the review-trigger loop: poll the agent's OWN catch-up feed for
- * `pr.opened` events and request reviews. The feed read is `agentId`'s,
- * so Flair serves it to the agent that signs the read (a read of another
- * participant's feed is refused). Its cursor under
- * `~/.tps/cursors/<agentId>-review-trigger-task-loop.json` is separate from the
- * task loop's, so the two loops reading one agent's feed keep separate
- * positions.
+ * `pr.opened` events. The feed read is `agentId`'s, so Flair serves it to the
+ * agent that signs the read (a read of another participant's feed is refused).
+ * Its cursor under `~/.tps/cursors/<agentId>-review-trigger-task-loop.json` is
+ * separate from the task loop's, so the two loops reading one agent's feed keep
+ * separate positions.
  */
 export function startReviewTriggerLoop(
   flair: FlairClient,
   agentId: string,
   config: { reviewers: string[]; repo: string },
-  opts: { pollIntervalMs?: number } = {},
+  opts: { pollIntervalMs?: number; deps?: ReviewRequestDeps } = {},
 ): { stop: () => Promise<void> } {
   const triggerConfig: ReviewTriggerConfig = { reviewers: config.reviewers, agentId, repo: config.repo };
   return startTaskLoop(
     flair,
     agentId,
-    async (event) => { await handlePrOpened(event, triggerConfig); },
+    async (event) => { await handlePrOpened(event, triggerConfig, opts.deps); },
     { kinds: ["pr.opened"], loopId: `${agentId}-review-trigger`, pollIntervalMs: opts.pollIntervalMs },
   );
 }
