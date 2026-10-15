@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -8,8 +8,9 @@ import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
 import { mailboxLockRoot } from "../lib/mail-lock-namespace.js";
-import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
+import { acquireMailLock, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
 import {
+  DELIVERY_PRESENTATION_TTL_MS,
   decideEnvelopeForMailbox,
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
@@ -17,6 +18,7 @@ import {
   pendingPlacementEntries,
   type PlacementPhase,
   placeCurRecord,
+  type PresentationClaim,
 } from "../lib/mailbox-policy.js";
 import { verifiedMailTier } from "../lib/bridge-identity.js";
 
@@ -42,6 +44,120 @@ export interface MailMessage {
  * here.
  */
 type MailboxRejectClass = MailboxPolicyRejectClass;
+
+/**
+ * cli#617 slice (b): one hand-over from MailClient.deliverNext(). The object is
+ * the delivery token: only the MailClient that issued it can finalize it, and
+ * it is bound to the presentation claim (a per-presentation nonce) recorded in
+ * the message's `in_progress` intent. Pass it to completeDelivery() when the
+ * handler completes, or to releaseDelivery() when the handler stops without
+ * completing.
+ */
+export interface MailDelivery {
+  readonly message: MailMessage;
+  /** `<mailbox>/<messageId>`: the same on every presentation of one message, for idempotent handlers. */
+  readonly deliveryKey: string;
+  /** This hand-over's presentation number; 1 for the first. */
+  readonly presentation: number;
+}
+
+/**
+ * Why deliverNext() handed nothing over although work may be waiting:
+ * - `lock-busy`: the mailbox lock was unavailable.
+ * - `active`: a live presentation holds the in-flight message (a handler in
+ *   this process that has not completed or released it, or another live
+ *   process). It is not counted as a presentation.
+ * - `cli-record`: a `placing` intent names a CLI-promoted cur/ record (a
+ *   plaintext body with the signed envelope stored beside it). MailClient does
+ *   not present that format; a CLI mail check finishes that placement.
+ * - `verification-failed` / `verification-unavailable`: the pending cur/ copy
+ *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
+ * - `record-changed`: the pending cur/ copy is missing, is not the file the
+ *   intent recorded, or changed during re-verification.
+ * - `storage-error`: the placement history or new/ could not be read.
+ * - `new-mail-deferred`: no placement is pending, but a new/ message could not
+ *   be committed this time (unreadable, verifier unavailable, lock or relay
+ *   busy); it stays in new/.
+ */
+export type DeliveryDeferral =
+  | "lock-busy"
+  | "active"
+  | "cli-record"
+  | "verification-failed"
+  | "verification-unavailable"
+  | "record-changed"
+  | "storage-error"
+  | "new-mail-deferred";
+
+/** What MailClient.deliverNext() returns (cli#617 slice b). */
+export type DeliverNextResult =
+  | { status: "delivered"; delivery: MailDelivery }
+  /** No live placement is pending and new/ holds nothing committable. */
+  | { status: "idle" }
+  /** Work may be waiting; nothing was handed over and no new mail was committed. */
+  | { status: "deferred"; reason: DeliveryDeferral; detail: string; file?: string };
+
+/** What MailClient.completeDelivery() returns (cli#617 slice b). */
+export type DeliveryCompletion =
+  /** This call removed the message's `in_progress` intent. */
+  | { status: "completed" }
+  /** An earlier call with this delivery removed it. */
+  | { status: "already-completed" }
+  /** The mailbox lock was unavailable; nothing changed and the intent stays `in_progress`. */
+  | { status: "deferred"; reason: "lock-busy"; detail: string }
+  /**
+   * Not this hand-over's to finalize; nothing changed. `foreign`: not a
+   * delivery this MailClient issued. `stale`: the message was presented again
+   * since (another claim), finalized, or moved to another phase. `identity`:
+   * cur/ no longer holds the file the intent recorded.
+   */
+  | { status: "refused"; reason: "foreign" | "stale" | "identity"; detail: string };
+
+type DeferredResult = Extract<DeliverNextResult, { status: "deferred" }>;
+/** A pending placement this call resolved without presenting (gone, terminal, or another writer's phase). */
+type PendingOutcome = DeliverNextResult | { status: "resolved" };
+const RESOLVED: PendingOutcome = { status: "resolved" };
+
+function deferred(reason: DeliveryDeferral, detail: string, file?: string): DeferredResult {
+  return { status: "deferred", reason, detail, ...(file === undefined ? {} : { file }) };
+}
+
+/**
+ * cli#617 slice (b): the presentation tokens THIS PROCESS has handed over and
+ * not yet completed or released, across every MailClient in it. A claim on disk
+ * naming this process is live only while its token is here. A claim naming
+ * another process is live unless that process is provably gone (processIsGone,
+ * the lock-owner rule). A claim that is not live is an abandoned presentation,
+ * which deliverNext() presents again and counts.
+ */
+const activePresentations = new Set<string>();
+let ownStartToken: string | null | undefined;
+
+function ownClaim(token: string): PresentationClaim {
+  if (ownStartToken === undefined) ownStartToken = processStartToken(process.pid);
+  return { token, pid: process.pid, start: ownStartToken };
+}
+
+function claimIsLive(claim: PresentationClaim | undefined): boolean {
+  if (!claim) return false;
+  const own = ownClaim(claim.token);
+  if (claim.pid === own.pid && claim.start === own.start) return activePresentations.has(claim.token);
+  return !processIsGone(claim.pid, claim.start);
+}
+
+/** A CLI-promoted cur/ record stores the signed envelope as an object beside a plaintext body. */
+function isCliPromotedRecord(bytes: Buffer): boolean {
+  try {
+    const record = JSON.parse(bytes.toString("utf8"));
+    return record !== null && typeof record === "object" && record.envelope !== null && typeof record.envelope === "object";
+  } catch {
+    return false;
+  }
+}
+
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
 
 type VerifyOutcome =
   | { pass: true; envelope: Envelope }
@@ -83,8 +199,8 @@ function sameFileByDeviceInode(a: string, b: string): boolean {
  *
  * This is the BATCH reader (`checkNewMail`), which stays at-most-once until
  * slice (c) wires the per-message delivery API. Slice (b)'s `deliverNext`
- * re-presents an `in_progress` intent through its own completion-gated path
- * (`recoverDelivery`), not this one.
+ * presents an `in_progress` intent again through its own completion-gated path
+ * (`presentPending`), not this one.
  */
 function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";
@@ -106,13 +222,19 @@ function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
  * Writes outgoing mail to mailDir/outbox/new.
  */
 export class MailClient {
-  private mailboxRoot: string;
-  private readonly mailboxLockRoot: string;
-  private inboxNew: string;
-  private inboxCur: string;
-  private inboxDlq: string;
-  private outboxNew: string;
+  private readonly mailboxRoot: string;
+  private readonly inboxNew: string;
+  private readonly inboxCur: string;
+  private readonly inboxDlq: string;
+  private readonly outboxNew: string;
   private readonly flairClient: FlairClient;
+  /** cli#617 slice (b): the deliveries this client issued, keyed by the delivery object itself. */
+  private readonly issued = new WeakMap<MailDelivery, {
+    token: string;
+    messageId: string;
+    file: string;
+    state: "active" | "released" | "completed";
+  }>();
 
   constructor(
     public readonly mailDir: string,
@@ -130,18 +252,20 @@ export class MailClient {
       );
     }
     this.flairClient = flairClient;
-    this.mailboxRoot = join(mailDir, agentId);
-    // cli#616: promotion locks the mailbox under the resolved real path of the
-    // configured mail directory (see mail-lock-namespace.ts). Placement recovery
-    // locks `mailboxRoot` as given; both reach one filesystem lock.
-    this.mailboxLockRoot = mailboxLockRoot(mailDir, agentId);
-    this.inboxNew = join(mailDir, agentId, "new");
-    this.inboxCur = join(mailDir, agentId, "cur");
-    this.inboxDlq = join(mailDir, agentId, "dlq");
-    this.outboxNew = join(mailDir, agentId, "outbox");
-    for (const dir of [this.inboxNew, this.inboxCur, this.inboxDlq, this.outboxNew]) {
-      mkdirSync(dir, { recursive: true });
-    }
+    // cli#616: the mailbox lock root starts from the resolved real path of the
+    // configured mail directory (see mail-lock-namespace.ts).
+    const lockRoot = mailboxLockRoot(mailDir, agentId);
+    for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(lockRoot, dir), { recursive: true });
+    // cli#617 slice (b): the mailbox root is resolved ONCE, here, to its real
+    // path, and every mailbox operation uses it: listing, recovery, commit,
+    // completion, dead-lettering and the lock. Retargeting a mail-root (or
+    // mailbox) symlink after construction does not move this client; a new
+    // MailClient resolves the new target.
+    this.mailboxRoot = realpathSync(lockRoot);
+    this.inboxNew = join(this.mailboxRoot, "new");
+    this.inboxCur = join(this.mailboxRoot, "cur");
+    this.inboxDlq = join(this.mailboxRoot, "dlq");
+    this.outboxNew = join(this.mailboxRoot, "outbox");
   }
 
   async checkNewMail(): Promise<MailMessage[]> {
@@ -213,7 +337,8 @@ export class MailClient {
 
       try {
         const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope);
-        if (committed === "already-delivered") continue;
+        // "live-placement" is returned only to the delivery API (a claim was passed).
+        if (committed === "already-delivered" || committed === "live-placement") continue;
         if (committed) {
           this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
           continue;
@@ -247,102 +372,208 @@ export class MailClient {
   }
 
   /**
-   * cli#617 slice (b): the per-message delivery API, inert until slice (c)
-   * wires the event loop. It returns at most ONE message:
+   * cli#617 slice (b): the per-message delivery API. Nothing in the agent
+   * runtime calls it until slice (c); the event loop still uses checkNewMail().
+   * One call hands over at most ONE message:
    *
-   *  1. a committed message whose placement intent is live — a `placing`
-   *     intent finished to `in_progress`, or an `in_progress` re-presentation.
-   *     Recovery is completion-gated, and the liveness bound turns a message
-   *     that is never completed into a terminal `failed` intent;
-   *  2. otherwise the next verified `new/` message, committed to `cur/` with
-   *     its intent left in the `in_progress` phase. Later messages stay in
-   *     `new/`.
+   *  1. a committed message whose placement intent is live and not held by a
+   *     live presentation: a `placing` intent (a commit interrupted before the
+   *     hand-over) is moved to `in_progress`, or an `in_progress` intent is
+   *     presented again and counted. The cur/ copy is re-verified first, and
+   *     the liveness bound can move the intent to terminal `failed` instead;
+   *  2. otherwise, only when NO `placing` or `in_progress` intent is pending,
+   *     the next verified new/ message, committed to cur/ with its intent left
+   *     `in_progress`. Later messages stay in new/.
    *
-   * The caller finalizes with completeDelivery() after the handler
-   * completes; a crash or stop before that re-presents the same message on the
-   * next call. The delivery key is mailbox + messageId.
+   * A pending `placing` or `in_progress` placement that cannot be presented
+   * now (lock busy, held by a live presentation, a CLI-promoted record, failed
+   * or unavailable re-verification, a changed cur/ copy) returns `deferred` and
+   * commits nothing new: unresolved live work is never skipped. An `unknown`
+   * phase (another writer's) is preserved and not presented, and does not
+   * block. `idle` means nothing is pending and new/ holds nothing committable.
+   *
+   * The caller finalizes with completeDelivery(delivery) after the handler
+   * completes, or calls releaseDelivery(delivery) when it stops without
+   * completing. A released delivery, or one whose process exited, is presented
+   * again by a later call once its cur/ copy re-verifies, until it completes or
+   * the liveness bound moves it to `failed`. A `placing` intent has no
+   * deadline: one that cannot be presented (a CLI-promoted record, a copy that
+   * does not verify) defers every call until its writer or an operator
+   * resolves it. The delivery key is mailbox + messageId.
    */
-  async deliverNext(): Promise<MailMessage | null> {
-    const recovered = await this.recoverDelivery();
-    if (recovered) return recovered;
+  async deliverNext(): Promise<DeliverNextResult> {
+    let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
+    const listing = await this.lockOrDefer("pending placements not listed");
+    if ("status" in listing) return listing;
+    try {
+      pending = pendingPlacementEntries(this.mailboxRoot);
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return deferred("storage-error", `pending placements unavailable: ${sanitizeError(err)}`);
+    } finally {
+      listing.release();
+    }
+    pending.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    let firstDeferral: DeferredResult | null = null;
+    for (const { messageId, file, phase } of pending) {
+      if (phase === "unknown") continue; // another writer's phase: preserved, never presented (slice a)
+      let outcome: PendingOutcome;
+      try {
+        outcome = await this.presentPending(messageId, file);
+      } catch (err) {
+        this.emitRecoveryError(err);
+        outcome = deferred("storage-error", sanitizeError(err), file);
+      }
+      if (outcome.status === "delivered") return outcome;
+      if (outcome.status === "deferred") firstDeferral ??= outcome;
+    }
+    if (firstDeferral) return firstDeferral;
     return this.commitNextForDelivery();
   }
 
   /**
-   * cli#617 slice (b): the completion-only finalize for a message handed over
-   * by deliverNext(). Deletes the message's `in_progress` intent in its own
-   * synchronous mailbox-lock section; returns whether an intent was removed.
-   * Idempotent: a message already finalized leaves nothing to delete.
+   * cli#617 slice (b): the completion-only finalize, bound to the hand-over.
+   * In its own synchronous mailbox-lock section it deletes the message's intent
+   * only when the intent is `in_progress`, carries THIS delivery's claim token,
+   * and cur/ still holds the file the intent recorded. A delivery this client
+   * did not issue, or one presented again since, is refused and changes
+   * nothing. Lock busy defers and leaves the intent `in_progress`.
    */
-  async completeDelivery(message: MailMessage): Promise<boolean> {
-    const messageId = message.verifiedEnvelope?.messageId;
-    if (typeof messageId !== "string" || messageId === "") {
-      throw new Error("completeDelivery requires a delivered message carrying its verified envelope");
-    }
-    const lock = await acquireMailLock(this.mailboxRoot);
-    if (!lock) throw new Error("mailbox lock busy; delivery not finalized");
+  async completeDelivery(delivery: MailDelivery): Promise<DeliveryCompletion> {
+    const issued = this.issued.get(delivery);
+    if (!issued) return { status: "refused", reason: "foreign", detail: "not a delivery this MailClient handed over" };
+    if (issued.state === "completed") return { status: "already-completed" };
+    const lock = await this.lockOrDefer("delivery not finalized (the intent stays in_progress)");
+    if ("status" in lock) return { status: "deferred", reason: "lock-busy", detail: lock.detail };
+    let result: ReturnType<ReturnType<typeof mailboxReplayStore>["completePlacement"]>;
     try {
-      return mailboxReplayStore(this.mailboxRoot).completePlacement(messageId, message.filename);
+      result = mailboxReplayStore(this.mailboxRoot).completePlacement(issued.messageId, issued.file, issued.token);
+    } finally {
+      lock.release();
+    }
+    activePresentations.delete(issued.token);
+    if (result === "completed") {
+      issued.state = "completed";
+      return { status: "completed" };
+    }
+    issued.state = "released";
+    if (result === "identity") {
+      return { status: "refused", reason: "identity", detail: `cur/${issued.file} is not the file the intent recorded; not finalized` };
+    }
+    return {
+      status: "refused",
+      reason: "stale",
+      detail: `message ${issued.messageId} is no longer held by this presentation (presented again, finalized or terminal); not finalized`,
+    };
+  }
+
+  /**
+   * cli#617 slice (b): end a hand-over WITHOUT completing it (the handler threw,
+   * hit its turn limit or was stopped). The intent stays `in_progress`, and the
+   * next deliverNext() in this process presents the message again (once its
+   * cur/ copy re-verifies) and counts it. Another process sees the claim as
+   * live until this one exits. Until the message is presented again, the
+   * released delivery can still be completed. Returns false when the delivery
+   * is not an active one this client issued.
+   */
+  releaseDelivery(delivery: MailDelivery): boolean {
+    const issued = this.issued.get(delivery);
+    if (!issued || issued.state !== "active") return false;
+    issued.state = "released";
+    activePresentations.delete(issued.token);
+    return true;
+  }
+
+  /** Record a hand-over: the token is already live in this process; bind it to the delivery object. */
+  private issue(token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
+    const delivery: MailDelivery = Object.freeze({ message, deliveryKey: `${this.agentId}/${messageId}`, presentation });
+    this.issued.set(delivery, { token, messageId, file, state: "active" });
+    return delivery;
+  }
+
+  /**
+   * Present one pending placement: inspect it under the lock, re-verify its
+   * cur/ copy outside the lock, then re-check and advance under the lock.
+   */
+  private async presentPending(messageId: string, file: string): Promise<PendingOutcome> {
+    const inspected = await this.inspectPending(messageId, file);
+    if (inspected.status !== "read") return inspected;
+    let outcome: VerifyOutcome;
+    try {
+      outcome = await this.verifyMailBody(inspected.bytes.toString("utf8"));
+    } catch (err) {
+      return deferred("verification-unavailable", `re-verification could not run: ${sanitizeError(err)}`, file);
+    }
+    if (!outcome.pass) return deferred("verification-failed", `the cur/ copy did not re-verify (${outcome.class}): ${outcome.reason}`, file);
+    if (outcome.envelope.messageId !== messageId) {
+      return deferred("verification-failed", "the cur/ copy's envelope names another message than the intent", file);
+    }
+    let trustTier: MailMessage["trustTier"];
+    try {
+      trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
+    } catch (err) {
+      return deferred("verification-unavailable", `trust tier unavailable: ${sanitizeError(err)}`, file);
+    }
+    return this.presentUnderLock(messageId, file, inspected.bytes, outcome.envelope, trustTier);
+  }
+
+  /**
+   * Under the lock, before any verification: a live claim defers (and is not
+   * counted); an unclaimed `in_progress` intent past the deadline goes
+   * `failed`; a `placing` intent whose cur/ copy is absent is finished (the
+   * slice (a) cleanup); a `placing` intent naming a CLI-promoted record defers
+   * by name. Otherwise the cur/ bytes are returned for re-verification.
+   */
+  private async inspectPending(messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer }> {
+    const lock = await this.lockOrDefer("pending placement not inspected", file);
+    if ("status" in lock) return lock;
+    try {
+      const replay = mailboxReplayStore(this.mailboxRoot);
+      const state = replay.placementState(file);
+      if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
+      if (state.phase === "in_progress") {
+        if (claimIsLive(state.claim)) {
+          return deferred("active", `message ${messageId} is held by a live presentation (not completed or released)`, file);
+        }
+        const expiry = replay.expireOverdue(messageId, file, new Date().toISOString());
+        if (expiry.status === "absent") return RESOLVED;
+        if (expiry.status === "failed") {
+          this.logQuarantine(messageId, expiry.presentations, "deadline");
+          return RESOLVED;
+        }
+      }
+      const curPath = join(this.inboxCur, file);
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(curPath);
+      } catch (err) {
+        if (!isMissing(err)) throw err;
+        if (state.phase === "placing" && lstatOrAbsent(curPath) === null) {
+          // The slice (a) unlinked-placement cleanup: a `placing` intent whose
+          // cur/ copy was never linked is finished; its new/ source is still there.
+          replay.finishPlacement(messageId, file);
+          return RESOLVED;
+        }
+        return deferred("record-changed", `cur/${file} is missing for a ${state.phase} intent`, file);
+      }
+      if (state.phase === "placing" && isCliPromotedRecord(bytes)) {
+        return deferred(
+          "cli-record",
+          `cur/${file} is a CLI-promoted record (plaintext body, signed envelope stored beside it); MailClient does not present it, and a CLI mail check finishes its placement`,
+          file,
+        );
+      }
+      return { status: "read", bytes };
     } finally {
       lock.release();
     }
   }
 
   /**
-   * cli#617 slice (b): completion-gated recovery for deliverNext(). A `placing`
-   * intent is finished and moved to `in_progress`; an `in_progress` intent is
-   * re-presented; `unknown` is skipped (never presented or finished). Returns
-   * the first message presented, or null.
-   */
-  private async recoverDelivery(): Promise<MailMessage | null> {
-    let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
-    let listing: MailLock | null = null;
-    try {
-      listing = await acquireMailLock(this.mailboxRoot);
-      if (!listing) return null;
-      pending = pendingPlacementEntries(this.mailboxRoot);
-    } catch (err) {
-      this.emitRecoveryError(err);
-      return null;
-    } finally {
-      listing?.release();
-    }
-    for (const { messageId, file, phase } of pending) {
-      if (phase === "unknown") continue;
-      try {
-        const presented = await this.presentPendingDelivery(messageId, file);
-        if (presented) return presented;
-      } catch (err) {
-        this.emitRecoveryError(err);
-      }
-    }
-    return null;
-  }
-
-  /** Re-verify a pending cur/ copy and present it under the lock, honoring the liveness bound. */
-  private async presentPendingDelivery(messageId: string, file: string): Promise<MailMessage | null> {
-    const curPath = join(this.inboxCur, file);
-    let bytes: Buffer;
-    try {
-      bytes = readFileSync(curPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-      // Same unlinked-placement cleanup as slice (a): finish only a `placing`
-      // intent whose cur/ copy is absent.
-      await this.finishUnlinkedPlacement(messageId, file);
-      return null;
-    }
-    const outcome = await this.verifyMailBody(bytes.toString("utf8"));
-    if (!outcome.pass || outcome.envelope.messageId !== messageId) return null;
-    const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
-    return this.presentUnderLock(messageId, file, bytes, outcome.envelope, trustTier);
-  }
-
-  /**
-   * Re-read the intent, identity and raw bytes under the lock (the phase may
-   * have changed since the listing), advance the presentation and return the
-   * message. A bound hit writes the terminal `failed` phase and the named log
-   * line, and presents nothing.
+   * Re-read the intent, its claim, the recorded identity and the raw bytes
+   * under the lock (all may have changed during re-verification), then advance
+   * the presentation with a new claim and hand the message over. A bound hit
+   * writes the terminal `failed` phase and logs, and presents nothing.
    */
   private async presentUnderLock(
     messageId: string,
@@ -350,35 +581,39 @@ export class MailClient {
     bytes: Buffer,
     envelope: Envelope,
     trustTier: MailMessage["trustTier"],
-  ): Promise<MailMessage | null> {
-    const lock = await acquireMailLock(this.mailboxRoot);
-    if (!lock) throw new Error("mailbox lock busy; delivery recovery deferred");
+  ): Promise<PendingOutcome> {
+    const lock = await this.lockOrDefer("pending placement not presented", file);
+    if ("status" in lock) return lock;
     try {
       const replay = mailboxReplayStore(this.mailboxRoot);
-      if (!replay.hasPendingPlacement(messageId, file)) return null;
-      const phase = replay.placementPhase(file);
-      if (phase === null || phase === "unknown") return null;
-      if (envelope.messageId !== messageId) return null;
-      if (!replay.ownsPendingPlacement(messageId, file)) return null;
+      const state = replay.placementState(file);
+      if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
+      if (state.phase === "in_progress" && claimIsLive(state.claim)) {
+        return deferred("active", `message ${messageId} is held by a live presentation (not completed or released)`, file);
+      }
+      if (!replay.ownsPendingPlacement(messageId, file)) {
+        return deferred("record-changed", `cur/${file} is not the file the intent recorded`, file);
+      }
       let current: Buffer;
       try {
         current = readFileSync(join(this.inboxCur, file));
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+        if (isMissing(err)) return deferred("record-changed", `cur/${file} disappeared during re-verification`, file);
         throw err;
       }
-      if (!current.equals(bytes)) return null;
+      if (!current.equals(bytes)) return deferred("record-changed", `cur/${file} changed during re-verification`, file);
       if (!replay.isConsumed(messageId, file)) replay.recordConsumed(messageId);
-      const advance = replay.advancePresentation(messageId, file, new Date().toISOString());
-      if (advance.status === "absent") return null;
+      const token = randomUUID();
+      const advance = replay.advancePresentation(messageId, file, new Date().toISOString(), ownClaim(token));
+      if (advance.status === "absent") return RESOLVED;
       if (advance.status === "failed") {
-        console.warn(
-          `[MailClient] placement quarantined for mailbox ${this.agentId}: message ${messageId} not completed ` +
-            `after ${advance.presentations} presentation(s); payload retained for the operator`,
-        );
-        return null;
+        this.logQuarantine(messageId, advance.presentations, "count");
+        return RESOLVED;
       }
-      return {
+      // Live before the lock is released, so no other call in this process can
+      // read the new claim as abandoned.
+      activePresentations.add(token);
+      const message: MailMessage = {
         filename: file,
         body: bytes.toString("utf8"),
         receivedAt: new Date(),
@@ -387,17 +622,44 @@ export class MailClient {
         verifiedEnvelope: envelope,
         trustTier,
       };
+      return { status: "delivered", delivery: this.issue(token, messageId, file, advance.presentations, message) };
     } finally {
       lock.release();
     }
   }
 
-  /** Commit the next verifiable new/ message to cur/ with a live `in_progress` intent, or null. */
-  private async commitNextForDelivery(): Promise<MailMessage | null> {
-    if (!existsSync(this.inboxNew)) return null;
-    const files = readdirSync(this.inboxNew)
-      .filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"))
-      .sort();
+  /**
+   * The bound's log line. It is written after the durable `failed` write, so a
+   * kill between the two leaves the `failed` intent (the durable record) and
+   * no line.
+   */
+  private logQuarantine(messageId: string, presentations: number, cause: "count" | "deadline"): void {
+    const why = cause === "deadline"
+      ? `the deadline (${DELIVERY_PRESENTATION_TTL_MS / 3_600_000} h after the first presentation) passed`
+      : "the presentation bound was reached";
+    console.warn(
+      `[MailClient] placement quarantined for mailbox ${this.agentId}: message ${messageId} not completed ` +
+        `after ${presentations} presentation(s); ${why}; payload retained for the operator`,
+    );
+  }
+
+  /**
+   * Commit the next verifiable new/ message to cur/ with a live `in_progress`
+   * intent. Under the commit lock it re-checks that no `placing` or
+   * `in_progress` placement is pending, so a concurrent call cannot add a
+   * second message in flight.
+   */
+  private async commitNextForDelivery(): Promise<DeliverNextResult> {
+    let files: string[];
+    try {
+      files = existsSync(this.inboxNew)
+        ? readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\")).sort()
+        : [];
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return deferred("storage-error", `new/ unavailable: ${sanitizeError(err)}`);
+    }
+    let skipped: { file: string; detail: string } | null = null;
     for (const file of files) {
       const started = Date.now();
       const srcPath = join(this.inboxNew, file);
@@ -405,14 +667,18 @@ export class MailClient {
       try {
         body = readFileSync(srcPath, "utf-8");
       } catch (err) {
-        this.emitRecoveryError(err);
+        if (!isMissing(err)) {
+          this.emitRecoveryError(err);
+          skipped ??= { file, detail: `unreadable: ${sanitizeError(err)}` };
+        }
         continue;
       }
       let verifyResult: VerifyOutcome;
       try {
         verifyResult = await this.verifyMailBody(body);
       } catch (err) {
-        this.emitRecoveryError(err); // leave in new/ for a later call
+        this.emitRecoveryError(err); // left in new/ for a later call
+        skipped ??= { file, detail: `verification could not run: ${sanitizeError(err)}` };
         continue;
       }
       if (!verifyResult.pass) {
@@ -424,11 +690,19 @@ export class MailClient {
         trustTier = verifiedMailTier(verifyResult.envelope, this.mailDir);
       } catch (err) {
         this.emitRecoveryError(err);
+        skipped ??= { file, detail: `trust tier unavailable: ${sanitizeError(err)}` };
         continue;
       }
+      const token = randomUUID();
+      // Live before the commit writes the claim (see presentUnderLock).
+      activePresentations.add(token);
+      let delivered = false;
       try {
-        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope, true);
+        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope, ownClaim(token));
         if (committed === "already-delivered") continue;
+        if (committed === "live-placement") {
+          return deferred("new-mail-deferred", "a placement became pending before the commit; nothing committed", file);
+        }
         if (committed) {
           this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
           continue;
@@ -437,15 +711,29 @@ export class MailClient {
         this.events?.emit({
           type: "mail.receive", agent: this.agentId, status: "ok", from, durationMs: Date.now() - started,
         });
-        return {
+        delivered = true;
+        const message: MailMessage = {
           filename: file, body, receivedAt: new Date(), headers: {}, from,
           verifiedEnvelope: verifyResult.envelope, trustTier,
         };
+        return { status: "delivered", delivery: this.issue(token, verifyResult.envelope.messageId, file, 1, message) };
       } catch (err) {
         this.emitRecoveryError(err);
+        skipped ??= { file, detail: `not committed: ${sanitizeError(err)}` };
+      } finally {
+        if (!delivered) activePresentations.delete(token);
       }
     }
-    return null;
+    return skipped ? deferred("new-mail-deferred", `new/${skipped.file} ${skipped.detail}`, skipped.file) : { status: "idle" };
+  }
+
+  /** The mailbox lock, or a `lock-busy` deferral (contention, or an acquisition that threw). */
+  private async lockOrDefer(what: string, file?: string): Promise<MailLock | DeferredResult> {
+    try {
+      return (await acquireMailLock(this.mailboxRoot)) ?? deferred("lock-busy", `mailbox lock busy; ${what}`, file);
+    } catch (err) {
+      return deferred("lock-busy", `mailbox lock unavailable (${sanitizeError(err)}); ${what}`, file);
+    }
   }
 
   private emitRecoveryError(err: unknown): void {
@@ -460,9 +748,10 @@ export class MailClient {
     srcPath: string,
     body: string,
     envelope: Envelope,
-    keepInProgress = false,
-  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
-    const lock: MailLock | null = await acquireMailLock(this.mailboxLockRoot);
+    /** cli#617 slice (b): the delivery API's presentation claim; absent for the batch checkNewMail() path. */
+    claim?: PresentationClaim,
+  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | "live-placement" | null> {
+    const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
     if (!lock) throw new Error("mailbox lock busy; not promoted");
     let relayLock: MailLock | null;
     try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body), this.mailDir); }
@@ -472,6 +761,13 @@ export class MailClient {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(this.mailboxRoot);
       if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
+      // cli#617 slice (b): the delivery API commits nothing new while a
+      // `placing` or `in_progress` placement is pending, re-checked here under
+      // the commit lock so that a concurrent deliverNext() cannot put a second
+      // message in flight.
+      if (claim && pendingPlacementEntries(this.mailboxRoot).some((e) => e.phase === "placing" || e.phase === "in_progress")) {
+        return "live-placement";
+      }
       const dstPath = join(this.inboxCur, file);
       if (sameFileByDeviceInode(srcPath, dstPath)) {
         replay.isConsumed(envelope.messageId);
@@ -507,11 +803,12 @@ export class MailClient {
         }
         throw err;
       }
-      if (keepInProgress) {
+      if (claim) {
         // cli#617 slice (b): the delivery API leaves the intent live, in the
-        // `in_progress` phase (presentation 1), for the caller to finalize on
-        // completion. The batch checkNewMail() path finalizes as before.
-        const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString());
+        // `in_progress` phase (presentation 1, held by `claim`), for the caller
+        // to finalize on completion. The batch checkNewMail() path finalizes as
+        // before.
+        const advance = replay.advancePresentation(envelope.messageId, file, new Date().toISOString(), claim);
         if (advance.status !== "presented") throw new Error(`placement not advanced after commit: ${advance.status}`);
       } else {
         replay.finishPlacement(envelope.messageId, file);

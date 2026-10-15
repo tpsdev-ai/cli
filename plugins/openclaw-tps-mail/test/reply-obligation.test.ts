@@ -24,7 +24,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 import { hashes } from "@noble/ed25519";
@@ -171,6 +171,8 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       bodySeed?: Buffer;
       signAgentKey?: boolean;
       noInbound?: boolean;
+      /** With noInbound: a cur/ file left in its raw form (not rewritten to the promoted shape). */
+      keepRawCur?: string;
       accounts?: Record<string, { mailDir: string }>;
       dispatchFailedCounts?: any;
       warnCalls?: string[];
@@ -250,6 +252,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
     if (opts.noInbound) {
       for (const file of readdirSafe(resolve(tempMailDir, agentId, "cur"))) {
+        if (file === opts.keepRawCur) continue;
         const path = resolve(tempMailDir, agentId, "cur", file);
         const record = JSON.parse(readFileSync(path, "utf8"));
         if (record.envelope) {
@@ -441,6 +444,46 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(acked).toBe(true);
     expect(readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length).toBe(1); // NO second post
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("acked");
+    await h2.stop();
+  }, 20000);
+
+  // ── cli#617 slice (b) ──────────────────────────────────────────────────────
+  it("cli#617: a record a MailClient delivery holds in_progress, in its raw envelope-less form, is not settled on restart", async () => {
+    // Drive one normal post + ack, then reconstruct the "posted, not acked"
+    // state with the record in the raw signed-wrapper form MailClient writes
+    // (no stored envelope) and an `in_progress` intent on it. That form goes
+    // through internalInbound's branch WITHOUT recoverPromoted.
+    const h = await start("anvil", "flint", { localSender: true });
+    await h.deliver("final answer", "final");
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
+    await h.stop();
+
+    const file = curFiles("anvil")[0]!;
+    const curFilePath = resolve(tempMailDir, "anvil", "cur", file);
+    const cur = JSON.parse(readFileSync(curFilePath, "utf-8"));
+    writeFileSync(curFilePath, JSON.stringify({
+      id: cur.id, from: cur.from, to: cur.to, body: JSON.stringify(cur.envelope), timestamp: cur.timestamp, read: false,
+    }, null, 2), "utf-8");
+    const mailboxRoot = resolve(tempMailDir, "anvil");
+    mailboxReplayStore(mailboxRoot).beginPlacement(cur.envelope.messageId, file, curFilePath);
+    const intentPath = join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
+    writeFileSync(intentPath, JSON.stringify({
+      ...JSON.parse(readFileSync(intentPath, "utf-8")), version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null },
+    }));
+    const ob = obligationFile("anvil", h.inboundId);
+    writeFileSync(
+      resolve(tempMailDir, "anvil", ".obligations", `${h.inboundId}.json`),
+      JSON.stringify({ ...ob, state: "posted" }, null, 2),
+      "utf-8",
+    );
+    const before = readFileSync(curFilePath, "utf-8");
+
+    const h2 = await start("anvil", "flint", { localSender: true, noInbound: true, keepRawCur: file });
+    await sleep(1500);
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("posted"); // not settled
+    expect(readFileSync(curFilePath, "utf-8")).toBe(before); // not stamped
     await h2.stop();
   }, 20000);
 

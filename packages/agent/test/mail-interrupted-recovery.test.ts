@@ -3,18 +3,20 @@
  *
  * cli#617 slice (b): the recovery these tests exercise is the per-message
  * delivery API's completion-gated path. A message delivered by deliverNext()
- * stays re-presentable until completeDelivery() finalizes it, so the old
- * at-most-once assertions become "until completed".
+ * is presented again by a later call once its hand-over is released (or its
+ * process is gone), until completeDelivery() finalizes it, so the old
+ * at-most-once assertions become "until completed". An unresolved placement
+ * is a named deferral, not a null.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
-import { MailClient } from "../src/io/mail.js";
+import { type DeliverNextResult, MailClient } from "../src/io/mail.js";
 import { hasCommittedMessageId, mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 import { acquireMailLock } from "../src/lib/mail-lock.js";
 import { signEnvelope, type FlairClient } from "../src/lib/signEnvelope.js";
@@ -139,19 +141,25 @@ function runAndKillAt(killAt: string, source: string, after = false, timeoutMs =
   });
 }
 
+const reasonOf = (result: DeliverNextResult) => (result.status === "deferred" ? result.reason : result.status);
+
 /**
- * The cli#617 slice (b) contract: a delivered message is re-presented on the
- * next call until it is completed, then never again; placement cleanup is done.
+ * The cli#617 slice (b) contract: a delivered message is held while its
+ * hand-over is live, presented again once released, until it is completed,
+ * then never again; placement cleanup is done.
  */
 async function assertDeliveredUntilCompleted(messageId: string): Promise<void> {
   const client = new MailClient(mailDir, undefined, AGENT, verifier());
   const first = await client.deliverNext();
+  if (first.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(first)}`);
+  expect(first.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(reasonOf(await client.deliverNext())).toBe("active");
+  client.releaseDelivery(first.delivery);
   const second = await client.deliverNext();
-
-  expect(first?.verifiedEnvelope?.messageId).toBe(messageId);
-  expect(second?.verifiedEnvelope?.messageId).toBe(messageId);
-  expect(await client.completeDelivery(second!)).toBe(true);
-  expect(await client.deliverNext()).toBeNull();
+  if (second.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(second)}`);
+  expect(second.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(await client.completeDelivery(second.delivery)).toEqual({ status: "completed" });
+  expect(await client.deliverNext()).toEqual({ status: "idle" });
   expect(existsSync(newPath())).toBe(false);
   expect(jsonFiles(join(mailboxRoot, "cur"))).toEqual(["m1.json"]);
   expect(jsonFiles(join(mailboxRoot, "dlq"))).toEqual([]);
@@ -195,8 +203,9 @@ describe("MailClient defers unresolved placements", () => {
     const intentPath = join(mailboxRoot, readdirSync(mailboxRoot).find((n) => n.startsWith(".placement-") && n.endsWith(".json"))!);
     const intent = readFileSync(intentPath);
 
-    expect(await client.deliverNext()).toBeNull();
-    expect(await client.deliverNext()).toBeNull();
+    // The cur/ copy verifies, but as another message: deferred by name, twice, unchanged.
+    expect(reasonOf(await client.deliverNext())).toBe("verification-failed");
+    expect(reasonOf(await client.deliverNext())).toBe("verification-failed");
     expect(readFileSync(intentPath).equals(intent)).toBe(true);
     expect(existsSync(source)).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
@@ -229,7 +238,7 @@ describe("MailClient defers unresolved placements", () => {
       },
     });
 
-    expect(await client.deliverNext()).toBeNull();
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
     await assertDeliveredUntilCompleted(messageId);
@@ -241,7 +250,7 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json");
     renameSync(source, curPath());
-    expect(await client.deliverNext()).toBeNull();
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
   });
@@ -263,10 +272,11 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     renameSync(source, curPath());
-    const lock = await acquireMailLock(mailboxRoot);
+    // The client locks its mailbox at the path it resolved once at construction.
+    const lock = await acquireMailLock(realpathSync(mailboxRoot));
     expect(lock).not.toBeNull();
     try {
-      expect(await client.deliverNext()).toBeNull();
+      expect(reasonOf(await client.deliverNext())).toBe("lock-busy");
       expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     } finally {
       lock?.release();

@@ -1,14 +1,25 @@
-- **MailClient gains a per-message delivery API; a committed message stays re-presentable until completed (Refs #617, slice b).**
+- **MailClient gains a per-message delivery API; CLI mail presenters and actions decide a record's placement intent under the mailbox lock (Refs #617, slice b).**
 
-  Nothing in the agent runtime calls the new API yet, so delivery is
-  unchanged until slice (c) wires it. The API commits one message and leaves
-  its placement intent in the `in_progress` phase, removed by an explicit
-  completion. A committed message is re-presented until then, with a liveness
-  bound: after five presentations without completion, or 24 hours after the
-  first, the intent goes terminal `failed`, the payload is kept and one log
-  line names the mailbox, message ID and presentation count.
+  Nothing in the agent runtime calls the new API yet, so the agent event
+  loop's delivery is unchanged until slice (c) wires it. `deliverNext()`
+  commits one message and leaves its placement intent `in_progress`, held by
+  a per-presentation claim; `completeDelivery()` removes the intent only for
+  the hand-over it was given, while cur/ still holds the recorded file;
+  `releaseDelivery()` ends a hand-over without completing it. A released (or
+  abandoned) message is presented again by a later call, after its cur/ copy
+  re-verifies, until it is completed or the liveness bound moves it to
+  terminal `failed`: a presentation beyond the fifth, or a call that finds it
+  unclaimed more than 24 hours after its first presentation. The payload is
+  kept, and a log line names the mailbox, message ID and presentation count
+  (a kill between the `failed` write and the line leaves no line). While a
+  `placing` or `in_progress` placement is pending and cannot be presented now,
+  `deliverNext()` returns a named deferral and commits no new mail. The
+  mailbox path is resolved once, when the client is constructed.
 
-  `recoverPromoted` now reads the placement intent's phase and withholds a
-  record that resolves to anything but `placing` with a retryable `busy`
-  refusal, so `tps mail ack` and `nack` and the bridge and plugin startup
-  sweeps do not present another consumer's in-flight delivery.
+  This changes behaviour now, outside the agent runtime: `recoverPromoted`,
+  `tps mail ack` and `nack` (and `ackMessage` / `nackMessage`), and the
+  OpenClaw mail plugin's ack and nack stamps refuse a cur/ record whose
+  intent is `in_progress`, `failed` or `unknown`, or is another consumer's
+  `placing` commit. `recoverPromoted` makes that decision under the mailbox
+  lock after its verification and never quarantines such a record; ack, nack
+  and the plugin's stamps check again under their own lock.

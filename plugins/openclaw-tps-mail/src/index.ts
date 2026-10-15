@@ -59,7 +59,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -641,8 +641,11 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
         return null;
       }
       return Object.assign(current, patch);
-    });
+    }, { withholdPlacement: true });
     if (r.status === "changed" && alreadyStamped) return { ok: true };
+    // cli#617 slice (b): a placement intent on the record (a MailClient delivery
+    // or commit) refused the stamp under the same lock; nothing was written.
+    if (r.status === "withheld") return { ok: false, reason: "write-failed", path, code: "PLACEMENT_WITHHELD" };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
     return { ok: false, reason: "write-failed", path, code: undefined };
@@ -1046,9 +1049,17 @@ async function internalInbound(ctx: YieldContext): Promise<boolean> {
   try {
     const record = readMailFile(ctx.curPath);
     if (!record) return false;
+    // cli#617 slice (b): a record carrying its stored envelope goes through
+    // recoverPromoted(), which decides its placement intent under the mailbox
+    // lock after verification. A record WITHOUT one (the raw signed-wrapper
+    // format MailClient writes) does not, so it is checked here, under the
+    // lock, before and again after its verification: any placement intent on
+    // it withholds it.
+    if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     const recovered = record.envelope
-      ? await recoverPromoted(ctx.agent, ctx.curPath)
+      ? await recoverPromoted(ctx.agent, ctx.curPath, {}, { waitForLock: true })
       : await verifyRecordForMailbox(ctx.agent, record as any, mailRootForRecordPath(ctx.curPath));
+    if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     if (!isLiveContext(ctx) || !recovered.ok || recovered.message.trustTier === "external") return false;
     return recovered.message.from === ctx.sender && recovered.message.id === ctx.inboundId
       && (ctx.inboundEnvelopeId === undefined || recovered.message.envelopeId === ctx.inboundEnvelopeId);

@@ -2,7 +2,7 @@
  * Shared mailbox policy and consumed-id replay store for both first-delivery
  * paths: the CLI's `promote()` and this package's `MailClient`.
  */
-import { appendFileSync, closeSync, type Dirent, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, type BigIntStats, closeSync, type Dirent, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -217,12 +217,40 @@ const CONSUMED_LEDGER_FILE = "consumed.jsonl";
 const CONSUMED_LEDGER_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 
 /**
- * cli#617 slice (b): the delivery liveness bound. After this many presentations
- * of one committed message without completion, or this long after the first
- * presentation, the intent goes terminal `failed`.
+ * cli#617 slice (b): the delivery liveness bound. Neither is a timer: each is
+ * checked when MailClient.deliverNext() next looks at the intent. The count
+ * bound is checked when a presentation would exceed it. The deadline is checked
+ * whenever deliverNext() finds the intent not claimed by a live presentation,
+ * before the payload is re-verified, so a message that no longer verifies still
+ * reaches it. Either one moves the intent to terminal `failed`.
  */
 export const MAX_DELIVERY_PRESENTATIONS = 5;
 export const DELIVERY_PRESENTATION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * cli#617 slice (b): the presenter that holds an `in_progress` intent. `token`
+ * is a per-presentation nonce: completion must present it, so a stale or
+ * foreign presentation cannot finalize the current one. `pid` and `start` (the
+ * process start token mail-lock records for lock owners) say which process
+ * holds it, so a reader can tell a live presentation from an abandoned one.
+ */
+export interface PresentationClaim {
+  token: string;
+  pid: number;
+  start: string | null;
+}
+
+/** What a placement intent records (cli#617), as the ReplayStore reads it. */
+export interface PlacementState {
+  messageId: string;
+  phase: PlacementPhase;
+  presentations?: number;
+  firstPresentedAt?: string;
+  claim?: PresentationClaim;
+}
+
+/** The result of a completion attempt against the intent (cli#617 slice b). */
+export type PlacementCompletion = "completed" | "absent" | "stale" | "identity";
 
 /**
  * The replay gate and placement intents for one mailbox. Call while holding
@@ -256,21 +284,41 @@ export interface ReplayStore {
    */
   recordConsumed(messageId: string): void;
   /**
-   * cli#617 slice (b): advance a live (`placing` or `in_progress`) intent for
-   * this message to its next presentation. A `placing` intent becomes
-   * `in_progress` at presentation 1; an `in_progress` intent's count increments.
-   * Returns `absent` when no live intent for this message is present (missing,
-   * another message, or a `failed`/`unknown` phase), `presented` with the new
-   * count, or `failed` when the liveness bound (MAX_DELIVERY_PRESENTATIONS or
-   * DELIVERY_PRESENTATION_TTL_MS) is reached — the intent is then terminal
-   * `failed` and the caller must not present. Call under the mailbox lock.
+   * cli#617 slice (b): what `file`'s intent records, or null when it has none.
+   * Throws MalformedPlacementIntentError on a quarantined or malformed intent.
    */
-  advancePresentation(messageId: string, file: string, nowIso: string): PresentationAdvance;
+  placementState(file: string): PlacementState | null;
   /**
-   * cli#617 slice (b): completion-only finalize. Deletes only an `in_progress`
-   * intent for this message; returns whether an intent was removed.
+   * cli#617 slice (b): advance a live (`placing` or `in_progress`) intent for
+   * this message to its next presentation, recording `claim` as its holder. A
+   * `placing` intent becomes `in_progress` at presentation 1; an `in_progress`
+   * intent's count increments. Returns `absent` when no live intent for this
+   * message is present (missing, another message, or a `failed`/`unknown`
+   * phase), `presented` with the new count, or `failed` when the liveness bound
+   * (MAX_DELIVERY_PRESENTATIONS or DELIVERY_PRESENTATION_TTL_MS) is reached —
+   * the intent is then terminal `failed` and the caller must not present. The
+   * caller decides first that no live presentation holds the intent. Call under
+   * the mailbox lock.
    */
-  completePlacement(messageId: string, file: string): boolean;
+  advancePresentation(messageId: string, file: string, nowIso: string, claim: PresentationClaim): PresentationAdvance;
+  /**
+   * cli#617 slice (b): the deadline alone. An `in_progress` intent for this
+   * message whose first presentation is more than DELIVERY_PRESENTATION_TTL_MS
+   * before `nowIso` goes terminal `failed` (`failed`); otherwise it is unchanged
+   * (`live`), or there is no `in_progress` intent for this message (`absent`).
+   * It never presents. The caller decides first that no live presentation holds
+   * the intent. Call under the mailbox lock.
+   */
+  expireOverdue(messageId: string, file: string, nowIso: string): { status: "failed"; presentations: number } | { status: "live" } | { status: "absent" };
+  /**
+   * cli#617 slice (b): completion-only finalize, bound to one presentation.
+   * Deletes the intent only when it is `in_progress` for this message, its
+   * claim carries `token`, and `cur/<file>` is still the file the intent
+   * recorded (device and inode). Otherwise nothing changes: `absent` (no intent
+   * for this message), `stale` (another phase or another presentation's claim),
+   * or `identity` (the cur/ copy is not the recorded file).
+   */
+  completePlacement(messageId: string, file: string, token: string): PlacementCompletion;
 }
 
 /** The result of advancing a placement intent to its next presentation (cli#617 slice b). */
@@ -308,8 +356,19 @@ export function mailboxReplayStore(root: string): ReplayStore {
       syncDirectory(root);
     },
     recordConsumed: (messageId) => recordConsumedMessageId(root, messageId),
-    advancePresentation: (messageId, file, nowIso) => advancePlacementPresentation(root, messageId, file, nowIso),
-    completePlacement: (messageId, file) => completeInProgressPlacement(root, messageId, file),
+    placementState: (file) => {
+      const intent = readPlacementIntent(root, file);
+      if (!intent) return null;
+      return {
+        messageId: intent.messageId, phase: intent.phase,
+        ...(intent.presentations === undefined ? {} : { presentations: intent.presentations }),
+        ...(intent.firstPresentedAt === undefined ? {} : { firstPresentedAt: intent.firstPresentedAt }),
+        ...(intent.claim === undefined ? {} : { claim: { ...intent.claim } }),
+      };
+    },
+    advancePresentation: (messageId, file, nowIso, claim) => advancePlacementPresentation(root, messageId, file, nowIso, claim),
+    expireOverdue: (messageId, file, nowIso) => expireOverduePlacement(root, messageId, file, nowIso),
+    completePlacement: (messageId, file, token) => completeInProgressPlacement(root, messageId, file, token),
   };
 }
 
@@ -397,13 +456,16 @@ function quarantinePlacement(path: string): void {
  *   the new placement is refused. The record is kept until an operator
  *   removes it.
  * - `unknown`: an unsupported value in a recognized field (`phase`, `version`,
- *   `presentations` or `firstPresentedAt`, where `presentations` must be a
- *   non-negative safe integer); other extra fields are ignored. The store
- *   never finishes or replaces it; MailClient recovery, the CLI lease sweep and
- *   CLI promotion never present it; and it is not quarantined solely for that
+ *   `presentations`, `firstPresentedAt` or `claim`, where `presentations` must
+ *   be a non-negative safe integer and a `claim` is valid only on an
+ *   `in_progress` intent); other extra fields are ignored. The store never
+ *   finishes or replaces it; MailClient recovery, the CLI lease sweep and CLI
+ *   promotion never present it; and it is not quarantined solely for that
  *   value. It keeps its own per-file gate closed.
  *
- * Slice (a) only reads phases; no writer emits `in_progress` or `failed` yet.
+ * Slice (b) adds the writers: MailClient.deliverNext() writes `in_progress`
+ * (with its presentation claim) and the liveness bound writes `failed`. Nothing
+ * in the agent runtime calls deliverNext() until slice (c).
  */
 export type PlacementPhase = "placing" | "in_progress" | "failed" | "unknown";
 
@@ -415,15 +477,28 @@ interface PlacementIntent {
   file: string;
   identity?: { dev: string; ino: string };
   phase: PlacementPhase;
-  /** Hand-overs so far (rev 2 liveness bound); read, not yet written. */
+  /** Hand-overs so far (rev 2 liveness bound). */
   presentations?: number;
-  /** When the first hand-over happened (rev 2 liveness bound); read, not yet written. */
+  /** When the first hand-over happened (rev 2 liveness bound). */
   firstPresentedAt?: string;
+  /** The presentation holding an `in_progress` intent (slice b). */
+  claim?: PresentationClaim;
 }
 
 /** A plain basename: non-empty, not `.` or `..`, with no path separator or NUL. */
 function isPlainBasename(file: string): boolean {
   return file !== "" && file !== "." && file !== ".." && !/[/\\\0]/.test(file);
+}
+
+const CLAIM_TOKEN_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** A well-formed presentation claim: a UUID token, a positive pid, a start token string or null. */
+function isPresentationClaim(value: unknown): value is PresentationClaim {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const claim = value as Record<string, unknown>;
+  return typeof claim.token === "string" && CLAIM_TOKEN_SHAPE.test(claim.token)
+    && Number.isSafeInteger(claim.pid) && (claim.pid as number) > 0
+    && (claim.start === null || (typeof claim.start === "string" && claim.start.length > 0 && claim.start.length <= 256));
 }
 
 /**
@@ -442,10 +517,16 @@ function phaseOf(intent: Record<string, unknown>): PlacementPhase {
   if (firstPresentedAt !== undefined && (typeof firstPresentedAt !== "string" || Number.isNaN(Date.parse(firstPresentedAt)))) {
     return "unknown";
   }
+  const claim = intent.claim;
+  if (claim !== undefined && !isPresentationClaim(claim)) return "unknown";
   const phase = intent.phase;
-  if (phase === undefined || phase === "placing") return "placing";
-  if (phase === "in_progress" || phase === "failed") return phase;
-  return "unknown";
+  let resolved: PlacementPhase;
+  if (phase === undefined || phase === "placing") resolved = "placing";
+  else if (phase === "in_progress" || phase === "failed") resolved = phase;
+  else return "unknown";
+  // A claim belongs only to a presentation in flight.
+  if (claim !== undefined && resolved !== "in_progress") return "unknown";
+  return resolved;
 }
 
 /** A pending intent: any resolved phase but `failed`. */
@@ -470,7 +551,11 @@ function parsePlacement(raw: string, path: string): PlacementIntent | null {
       const phase = phaseOf(intent);
       return {
         messageId: intent.messageId, file: intent.file, identity: intent.identity, phase,
-        ...(phase === "unknown" ? {} : { presentations: intent.presentations, firstPresentedAt: intent.firstPresentedAt }),
+        ...(phase === "unknown" ? {} : {
+          presentations: intent.presentations,
+          firstPresentedAt: intent.firstPresentedAt,
+          ...(intent.claim === undefined ? {} : { claim: { token: intent.claim.token, pid: intent.claim.pid, start: intent.claim.start } }),
+        }),
       };
     }
   } catch {}
@@ -621,19 +706,37 @@ function writePlacementPhase(root: string, messageId: string, file: string, fiel
   return true;
 }
 
+/** Is an `in_progress` intent past the deadline at `nowIso`? An intent without a first presentation never is. */
+function pastDeliveryDeadline(intent: PlacementIntent, nowIso: string): boolean {
+  if (intent.firstPresentedAt === undefined) return false;
+  return Date.parse(nowIso) - Date.parse(intent.firstPresentedAt) > DELIVERY_PRESENTATION_TTL_MS;
+}
+
+/** Write the terminal `failed` phase over a live intent, dropping its claim. */
+function failPlacement(root: string, messageId: string, file: string, presentations: number, firstPresentedAt: string): boolean {
+  return writePlacementPhase(root, messageId, file, {
+    version: PLACEMENT_INTENT_VERSION, phase: "failed", presentations, firstPresentedAt,
+  });
+}
+
 /**
  * cli#617 slice (b): advance a live intent to its next presentation, or to the
  * terminal `failed` phase when the liveness bound is reached. A `placing`
  * intent becomes `in_progress` at presentation 1 (the first hand-over, counted
- * before it); an `in_progress` intent's count increments. `failed` and
- * `unknown` are not live, so they advance to `absent`.
+ * before it); an `in_progress` intent's count increments. Either way the new
+ * presentation's claim replaces any earlier one, so an earlier presentation can
+ * no longer complete it. `failed` and `unknown` are not live, so they advance
+ * to `absent`.
  */
-function advancePlacementPresentation(root: string, messageId: string, file: string, nowIso: string): PresentationAdvance {
+function advancePlacementPresentation(
+  root: string, messageId: string, file: string, nowIso: string, claim: PresentationClaim,
+): PresentationAdvance {
+  if (!isPresentationClaim(claim)) throw new Error("invalid presentation claim");
   const intent = readPlacementIntent(root, file);
   if (!intent || intent.messageId !== messageId) return { status: "absent" };
   if (intent.phase === "placing") {
     const written = writePlacementPhase(root, messageId, file, {
-      version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: 1, firstPresentedAt: nowIso,
+      version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: 1, firstPresentedAt: nowIso, claim,
     });
     return written ? { status: "presented", presentations: 1 } : { status: "absent" };
   }
@@ -641,26 +744,51 @@ function advancePlacementPresentation(root: string, messageId: string, file: str
   const previous = intent.presentations ?? 0;
   const firstPresentedAt = intent.firstPresentedAt ?? nowIso;
   const next = previous + 1;
-  const tooOld = Date.parse(nowIso) - Date.parse(firstPresentedAt) > DELIVERY_PRESENTATION_TTL_MS;
-  if (next > MAX_DELIVERY_PRESENTATIONS || tooOld) {
-    writePlacementPhase(root, messageId, file, {
-      version: PLACEMENT_INTENT_VERSION, phase: "failed", presentations: previous, firstPresentedAt,
-    });
-    return { status: "failed", presentations: previous };
+  if (next > MAX_DELIVERY_PRESENTATIONS || pastDeliveryDeadline(intent, nowIso)) {
+    return failPlacement(root, messageId, file, previous, firstPresentedAt)
+      ? { status: "failed", presentations: previous }
+      : { status: "absent" };
   }
-  writePlacementPhase(root, messageId, file, {
-    version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: next, firstPresentedAt,
+  const written = writePlacementPhase(root, messageId, file, {
+    version: PLACEMENT_INTENT_VERSION, phase: "in_progress", presentations: next, firstPresentedAt, claim,
   });
-  return { status: "presented", presentations: next };
+  return written ? { status: "presented", presentations: next } : { status: "absent" };
 }
 
-/** cli#617 slice (b): completion-only finalize — delete only an `in_progress` intent for this message. */
-function completeInProgressPlacement(root: string, messageId: string, file: string): boolean {
+/** cli#617 slice (b): the deadline alone, never a presentation (see ReplayStore.expireOverdue). */
+function expireOverduePlacement(
+  root: string, messageId: string, file: string, nowIso: string,
+): { status: "failed"; presentations: number } | { status: "live" } | { status: "absent" } {
   const intent = readPlacementIntent(root, file);
-  if (!intent || intent.messageId !== messageId || intent.phase !== "in_progress") return false;
+  if (!intent || intent.messageId !== messageId || intent.phase !== "in_progress") return { status: "absent" };
+  if (!pastDeliveryDeadline(intent, nowIso)) return { status: "live" };
+  const presentations = intent.presentations ?? 0;
+  return failPlacement(root, messageId, file, presentations, intent.firstPresentedAt!)
+    ? { status: "failed", presentations }
+    : { status: "absent" };
+}
+
+/**
+ * cli#617 slice (b): completion-only finalize, bound to one presentation: the
+ * intent must be `in_progress` for this message, carry `token` in its claim,
+ * and still name the cur/ file at its recorded device and inode.
+ */
+function completeInProgressPlacement(root: string, messageId: string, file: string, token: string): PlacementCompletion {
+  const intent = readPlacementIntent(root, file);
+  if (!intent || intent.messageId !== messageId) return "absent";
+  if (intent.phase !== "in_progress" || intent.claim?.token !== token) return "stale";
+  if (!intent.identity) return "identity";
+  let stat: BigIntStats;
+  try {
+    stat = lstatSync(join(root, "cur", file), { bigint: true });
+  } catch (err) {
+    if (isMissing(err)) return "identity";
+    throw err;
+  }
+  if (!stat.isFile() || stat.dev.toString() !== intent.identity.dev || stat.ino.toString() !== intent.identity.ino) return "identity";
   unlinkSync(placementIntentPath(root, file));
   syncDirectory(root);
-  return true;
+  return "completed";
 }
 
 function pendingPlacementIds(root: string, quarantine = false): { ids: Set<string>; blocked: Set<string>; retainAll: boolean } {

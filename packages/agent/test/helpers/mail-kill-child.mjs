@@ -12,7 +12,11 @@
 // argv:  <mailDir> <agentId>
 // env:   TPS_MAIL_MODULE  file:// URL of the mail module
 //        TPS_DRIVE        "checkNewMail" (default) or "deliverNext"
-//        TPS_KILL_AT      symbolic step boundary (see BOUNDARIES below)
+//        TPS_KILL_AT      symbolic step boundary (see BOUNDARIES below), or
+//                         "after-delivery": no filesystem boundary; with
+//                         TPS_DRIVE=deliverNext the child blocks, ALIVE, after
+//                         deliverNext() hands a message over and before it is
+//                         completed or released (a live presentation)
 //        TPS_KILL_AFTER   "1" pauses AFTER the matched op completes
 //        TPS_KILL_MARKER  marker file written just before blocking
 //        TPS_MAIL_ROOT    the mailbox root (<mailDir>/<agentId>)
@@ -48,7 +52,8 @@ const BOUNDARIES = {
   // cli#617 slice (b): the `in_progress` phase write (placing -> in_progress).
   "phase-write": (name, args) => name === "renameSync" && isIntent(args[1]) && isPhaseScratch(args[0]),
 };
-const matches = BOUNDARIES[KILL_AT];
+const HOLD_AFTER_DELIVERY = KILL_AT === "after-delivery";
+const matches = HOLD_AFTER_DELIVERY ? () => false : BOUNDARIES[KILL_AT];
 if (!matches) {
   process.stderr.write(`mail-kill-child: unknown TPS_KILL_AT=${JSON.stringify(KILL_AT)}\n`);
   process.exit(2);
@@ -89,8 +94,9 @@ const client = new mod.MailClient(mailDir, undefined, agentId, {
 });
 let count;
 if ((process.env.TPS_DRIVE ?? "checkNewMail") === "deliverNext") {
-  const message = await client.deliverNext();
-  count = message ? 1 : 0;
+  const result = await client.deliverNext();
+  count = result.status === "delivered" ? 1 : 0;
+  if (HOLD_AFTER_DELIVERY && result.status === "delivered") pause();
 } else {
   count = (await client.checkNewMail()).length;
 }

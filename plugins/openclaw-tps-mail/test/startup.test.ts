@@ -13,7 +13,7 @@
  * Tests use hermetic mock verify client via module mocking.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -374,6 +374,64 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     if (origKeysDir === undefined) delete process.env.TPS_TEST_KEYS_DIR;
     else process.env.TPS_TEST_KEYS_DIR = origKeysDir;
     rmSync(keysDir, { recursive: true, force: true });
+
+    abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
+  });
+
+  it("cli#617: does not re-dispatch (or quarantine) an unacked cur/ record a MailClient delivery holds in_progress", async () => {
+    const agentId = "test-agent";
+    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
+      createMailVerifyClient: async () => ({
+        async getAgent(name: string) {
+          return name === "flint" ? { publicKey: pubkeyFromSeed(FLINT_SEED) } : null;
+        },
+      }),
+    }));
+    const env = buildEnvelopeObj("flint", agentId, "held by a delivery", "msg-held-001");
+    const record = { id: "msg-held-001", from: "flint", to: agentId, body: JSON.stringify(env), timestamp: env.timestamp, read: false };
+    const filename = `2026-04-27T00-00-00-${record.id}.json`;
+    const newDir = resolve(tempMailDir, agentId, "new");
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(resolve(newDir, filename), JSON.stringify(record, null, 2), "utf-8");
+    const { promote } = await import("@tpsdev-ai/cli/utils/mail");
+    expect((await promote(agentId, resolve(newDir, filename))).ok).toBe(true);
+
+    const mailboxRoot = resolve(tempMailDir, agentId);
+    const curPath = resolve(mailboxRoot, "cur", filename);
+    const { mailboxReplayStore } = await import("@tpsdev-ai/agent");
+    mailboxReplayStore(mailboxRoot).beginPlacement("msg-held-001", filename, curPath);
+    const intentPath = resolve(mailboxRoot, `.placement-${createHash("sha256").update(filename).digest("hex")}.json`);
+    writeFileSync(intentPath, JSON.stringify({
+      ...JSON.parse(readFileSync(intentPath, "utf-8")), version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: new Date().toISOString(), claim: { token: "0b4f3c2e-6f0a-4d3e-9a51-3f1c2b7d8e90", pid: process.pid, start: null },
+    }));
+    const before = readFileSync(curPath, "utf-8");
+
+    let dispatchCount = 0;
+    const warnings: string[] = [];
+    const channelRuntime = {
+      routing: { buildAgentSessionKey: (params: any) => `agent:${params.agentId}:tps-mail:default:${params.peer.id}` },
+      reply: {
+        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        dispatchReplyWithBufferedBlockDispatcher: async () => { dispatchCount++; },
+      },
+    };
+    const ctx = {
+      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
+      cfg: { bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }] },
+      log: { info: () => {}, warn: (...a: any[]) => warnings.push(a.map(String).join(" ")), error: () => {} },
+      channelRuntime,
+      abortSignal: abortController.signal,
+    };
+    const startPromise = capturedPlugin.gateway.startAccount(ctx);
+    await pollUntil(() => warnings.some((w) => w.includes("msg-held-001") && w.includes("in_progress")), 3000);
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(dispatchCount).toBe(0);
+    expect(warnings.some((w) => w.includes("cur/ recovery refused msg-held-001 (busy)") && w.includes("is in_progress"))).toBe(true);
+    expect(readFileSync(curPath, "utf-8")).toBe(before);
+    expect(existsSync(resolve(mailboxRoot, "dlq", filename))).toBe(false);
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }
