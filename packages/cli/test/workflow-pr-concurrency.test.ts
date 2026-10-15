@@ -1,19 +1,5 @@
 /**
- * workflow-pr-concurrency.test.ts — the pull-request load cut's two behaviours,
- * checked semantically against the workflow files themselves.
- *
- * cli#643 gives `.github/workflows/test.yml` and `.github/workflows/smoke.yml` a
- * workflow-level `concurrency` block (a newer push to a PR cancels that PR's
- * pending or in-progress run; a main push keeps a group unique per run) and makes
- * `smoke.yml`'s compiled-binary matrix linux-x64 only on a pull request.
- * actionlint parses the workflow for structure, not for what its expressions
- * select: `cancel-in-progress: false`, or a matrix that keeps all four targets on
- * a pull request, still parses. This file
- * evaluates the expressions the workflows actually carry and holds them to that
- * behaviour — the real workflow text, not a fixture copy of it.
- *
- * This test pins the matrix targets, concurrency keys and cancellation flags
- * for the contexts below.
+ * Check workflow concurrency and, when the smoke workflow starts, its matrix.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -45,10 +31,8 @@ interface Ctx {
 }
 
 /**
- * Resolve one GitHub expression for the two events this change distinguishes.
- * Only the forms these workflows carry are understood; anything else throws, so
- * an expression rewritten into a shape this test cannot read fails rather than
- * passing unread.
+ * Handles the current patterns and `github.workflow` for regression detection.
+ * Throws on unsupported patterns.
  */
 function resolve(expr: string, ctx: Ctx): string {
   const e = expr.trim();
@@ -96,11 +80,11 @@ function pushCtx(file: string): Ctx {
 }
 
 describe("PR load cut — smoke matrix selection (cli#643)", () => {
-  test("a pull request smokes linux-x64 alone", () => {
+  test("a pull request smokes linux-x64 alone when the smoke workflow starts", () => {
     expect(matrixTargets("smoke.yml", prCtx("smoke.yml"))).toEqual(["linux-x64"]);
   });
 
-  test("a push to main smokes all four targets", () => {
+  test("a push to main smokes all four targets when the smoke workflow starts", () => {
     expect(matrixTargets("smoke.yml", pushCtx("smoke.yml"))).toEqual([
       "linux-x64",
       "linux-arm64",
