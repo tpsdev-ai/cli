@@ -88,7 +88,7 @@ export type DeliveryDeferral =
 /** What MailClient.deliverNext() returns (cli#617 slice b). */
 export type DeliverNextResult =
   | { status: "delivered"; delivery: MailDelivery }
-  /** No placing/in_progress work is pending and new/ holds nothing committable. */
+  /** No work found during this scan. */
   | { status: "idle" }
   /** Work may be waiting; nothing was handed over. */
   | { status: "deferred"; reason: DeliveryDeferral; detail: string; file?: string };
@@ -581,7 +581,7 @@ export class MailClient {
    * Re-read the intent, its claim, the recorded identity and the raw bytes
    * under the lock (all may have changed during re-verification), then advance
    * the presentation with a new claim and hand the message over. A bound hit
-   * writes the terminal `failed` phase and logs, and presents nothing.
+   * writes the terminal `failed` phase and presents nothing.
    */
   private async presentUnderLock(
     messageId: string,
@@ -646,7 +646,7 @@ export class MailClient {
       : "the presentation bound was reached";
     console.warn(
       `[MailClient] placement quarantined for mailbox ${this.agentId}: message ${messageId} not completed ` +
-        `after ${presentations} presentation(s); ${why}; payload retained for the operator`,
+        `after ${presentations} presentation(s); ${why}; failure transition does not delete an existing payload`,
     );
   }
 

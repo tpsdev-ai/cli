@@ -148,7 +148,7 @@ describe("per-message delivery commits one message at a time", () => {
     expect(newFiles()).toEqual(["m3.json"]);
   });
 
-  test("completion is idempotent and stops re-presentation; an empty mailbox is idle", async () => {
+  test("completion is idempotent and stops re-presentation", async () => {
     plant("m1.json", "solo");
     const c = client();
     const m = delivered(await c.deliverNext());
@@ -519,7 +519,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
     expect(warnings.some((w) => w.includes("poison") && w.includes(FAILED_AT))).toBe(true);
     expect(intentPhase("m1.json")).toBe("failed");
     expect(intentJson("m1.json").claim).toBeUndefined();
-    expect(textOf(cur("m1.json"))).not.toBeNull(); // payload retained
+    expect(textOf(cur("m1.json"))).not.toBeNull();
     expect(pendingPlacementEntries(root).map((e) => e.messageId)).toEqual(["healthy"]);
     expect(mailboxReplayStore(root).hasPendingFile("m1.json")).toBe(false);
     expect(hasCommittedMessageId(root, "poison")).toBe(true);
