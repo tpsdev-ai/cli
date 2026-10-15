@@ -422,7 +422,10 @@ describe("cli#483 — launcher grant checks", () => {
           expect(handoff.options.workdir).toBe(sb.ws);
           expect(handoff.options.allow).toContain(custom);
           expect(handoff.options.read.length).toBeGreaterThan(0);
-          expect(handoff.cmd.slice(-2)).toEqual(["--runtime", "claude-code"]);
+          // cli#516: the re-exec also carries --config, so assert the runtime by
+          // position rather than by the argv tail.
+          expect(handoff.cmd[handoff.cmd.indexOf("--runtime") + 1]).toBe("claude-code");
+          expect(handoff.cmd).toContain("--config");
           expect(handoff.cmd).toContain("--sandboxed");
           expect(handoff.cmd).toContain("--sandbox-required");
         }
