@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { Worker } from "node:worker_threads";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync,
@@ -14,6 +15,7 @@ import * as ed from "@noble/ed25519";
 import { type DeliverNextResult, type MailDelivery, MailClient } from "../src/io/mail.js";
 import { acquireMailLock } from "../src/lib/mail-lock.js";
 import {
+  DELIVERY_PRESENTATION_TTL_MS,
   MAX_DELIVERY_PRESENTATIONS,
   hasCommittedMessageId,
   mailboxReplayStore,
@@ -182,7 +184,95 @@ describe("per-message delivery commits one message at a time", () => {
 });
 
 describe("in_progress re-presentation in recovery", () => {
-  test("another client in the process waits for a held token, then presents it again once released", async () => {
+  test("a foreign module nonce in the same process defers re-presentation", async () => {
+    plant("m1.json", "foreign-module");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    c.releaseDelivery(first);
+    const claim = intentJson("m1.json").claim;
+    setPhase({ claim: { ...claim, moduleNonce: randomUUID() } });
+    const before = intentText("m1.json");
+
+    for (let i = 0; i < MAX_DELIVERY_PRESENTATIONS * 2; i++) {
+      expect(reasonOf(await client().deliverNext())).toBe("active");
+    }
+    expect(intentText("m1.json")).toBe(before);
+    expect(mailboxReplayStore(root).placementState("m1.json")?.claim?.moduleNonce).not.toBe(claim.moduleNonce);
+    setPhase({ claim });
+    expect(delivered(await client().deliverNext()).presentation).toBe(2);
+  });
+
+  test("this module's nonce with no local token permits re-presentation", async () => {
+    plant("m1.json", "released-module");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    const claim = intentJson("m1.json").claim;
+    expect(c.releaseDelivery(first)).toBe(true);
+
+    const again = delivered(await client().deliverNext());
+    expect(again.presentation).toBe(2);
+    expect(intentJson("m1.json").claim.moduleNonce).toBe(claim.moduleNonce);
+  });
+
+  test("lease expiry releases a foreign module claim to the delivery deadline", async () => {
+    plant("m1.json", "expired-module");
+    plant("m2.json", "healthy");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    c.releaseDelivery(first);
+    const claim = intentJson("m1.json").claim;
+    setPhase({
+      claim: { ...claim, moduleNonce: randomUUID() },
+      firstPresentedAt: new Date(Date.now() - DELIVERY_PRESENTATION_TTL_MS - 1_000).toISOString(),
+    });
+
+    expect(idOf(await client().deliverNext())).toBe("healthy");
+    expect(intentPhase("m1.json")).toBe("failed");
+    expect(intentJson("m1.json").claim).toBeUndefined();
+    expect(curFiles()).toContain("m1.json");
+  });
+
+  test("a real worker's held delivery defers repeated calls from this module copy", async () => {
+    plant("probe.json", "own-module");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    const own = intentJson("probe.json").claim;
+    expect(await c.completeDelivery(first)).toEqual({ status: "completed" });
+    plant("m1.json", "worker-held");
+    plant("m2.json", "waiting");
+    const worker = new Worker(new URL("./helpers/mail-delivery-worker.mjs", import.meta.url), {
+      workerData: { mailDir, agent: AGENT, from: FROM, seed: SEED.toString("base64"), module: MODULE },
+    });
+    try {
+      const result = await new Promise<DeliverNextResult>((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+        worker.once("exit", (code) => reject(new Error(`worker exited before handoff: ${code}`)));
+      });
+      expect(delivered(result).presentation).toBe(1);
+      const claim = intentJson("m1.json").claim;
+      expect(claim.pid).toBe(own.pid);
+      expect(claim.start).toBe(own.start);
+      expect(claim.moduleNonce).not.toBe(own.moduleNonce);
+      const before = intentText("m1.json");
+      for (let i = 0; i < MAX_DELIVERY_PRESENTATIONS * 2; i++) {
+        expect(reasonOf(await c.deliverNext())).toBe("active");
+      }
+      expect(intentText("m1.json")).toBe(before);
+      expect(newFiles()).toEqual(["m2.json"]);
+      const completed = new Promise((resolve, reject) => {
+        worker.once("message", resolve);
+        worker.once("error", reject);
+      });
+      worker.postMessage("complete");
+      expect(await completed).toEqual({ status: "completed" });
+      expect(idOf(await c.deliverNext())).toBe("waiting");
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  test("another client in the module copy waits for a held token, then presents it again once released", async () => {
     plant("m1.json", "resume-in-progress");
     const a = client();
     const first = delivered(await a.deliverNext());
@@ -303,7 +393,7 @@ describe("completion is bound to the hand-over", () => {
     mkdirSync(join(root, "cur"), { recursive: true });
     committed("pinned-1", {
       version: 1, phase: "in_progress", presentations: 1, firstPresentedAt: new Date().toISOString(),
-      claim: { token: randomUUID(), pid: process.pid, start: null },
+      claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
     });
     const rootBIntent = intentText("m1.json");
     plant("m9.json", "other-root");
@@ -495,9 +585,9 @@ describe("an unknown phase is preserved", () => {
 
   test("a malformed claim, or a claim on a placing intent, resolves to unknown", async () => {
     const base = { version: 1, phase: "in_progress", presentations: 1, firstPresentedAt: new Date().toISOString() };
-    committed("bad-claim", { ...base, claim: { token: "not-a-uuid", pid: process.pid, start: null } });
+    committed("bad-claim", { ...base, claim: { token: "not-a-uuid", pid: process.pid, start: null, moduleNonce: randomUUID() } });
     expect(intentPhase("m1.json")).toBe("unknown");
-    committed("placing-claim", { phase: "placing", claim: { token: randomUUID(), pid: process.pid, start: null } }, "m2.json");
+    committed("placing-claim", { phase: "placing", claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() } }, "m2.json");
     expect(intentPhase("m2.json")).toBe("unknown");
     expect(await client().deliverNext()).toEqual({ status: "idle" });
   });

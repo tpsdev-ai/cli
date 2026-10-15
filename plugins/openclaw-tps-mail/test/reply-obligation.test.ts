@@ -470,7 +470,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     const intentPath = join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
     writeFileSync(intentPath, JSON.stringify({
       ...JSON.parse(readFileSync(intentPath, "utf-8")), version: 1, phase: "in_progress", presentations: 1,
-      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null },
+      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
     }));
     const ob = obligationFile("anvil", h.inboundId);
     writeFileSync(

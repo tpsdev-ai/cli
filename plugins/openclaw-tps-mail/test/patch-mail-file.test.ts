@@ -78,7 +78,7 @@ describe("patchMailFile", () => {
     const intent = join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
     realFs.writeFileSync(intent, JSON.stringify({
       ...JSON.parse(String(realFs.readFileSync(intent))), version: 1, phase: "in_progress", presentations: 1,
-      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null },
+      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
     }));
     const before = String(realFs.readFileSync(f.curPath));
     expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toEqual({

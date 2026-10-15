@@ -95,7 +95,7 @@ function writeIntent(r: Promoted, fields: Record<string, unknown>, messageId = r
 
 const IN_PROGRESS = () => ({
   version: 1, phase: "in_progress", presentations: 1, firstPresentedAt: new Date().toISOString(),
-  claim: { token: randomUUID(), pid: process.pid, start: null },
+  claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
 });
 
 /** Start `action`, run `during` once Flair is asked for the sender, then let verification finish. */

@@ -3,9 +3,10 @@
   Agent event-loop wiring is unchanged.
 
   Unresolved `placing`/`in_progress` work defers `deliverNext()` commits.
-  Foreign claims defer re-presentation until their process is provably gone.
-  Release failed handoffs before retrying in the same process. Completion checks the issued token
-  and recorded file identity. The mailbox path is resolved at construction.
+  The token set covers MailClients of one module copy; claims from other copies
+  in the same process are treated as live until process exit or lease expiry.
+  Release failed handoffs before retrying through the owning copy. Completion
+  checks the issued token and recorded file identity. The mailbox path is resolved at construction.
   On later calls, an unclaimed `in_progress` intent becomes `failed` before
   a presentation beyond the fifth, or after the deadline of 24 hours from
   first presentation. The payload stays; a kill after the phase write can

@@ -57,9 +57,9 @@ export interface MailDelivery {
 /**
  * Why deliverNext() handed nothing over although work may be waiting:
  * - `lock-busy`: the mailbox lock was unavailable.
- * - `active`: this process holds the token, or a foreign claiming process is
- *   not provably gone. Release failed handoffs before retrying in the same process. No presentation
- *   is counted.
+ * - `active`: this module copy holds the token, or another copy/process has
+ *   a claim whose process is not provably gone and whose lease has not expired.
+ *   No presentation is counted.
  * - `cli-record`: a `placing` record verifies only as CLI-promoted.
  *   The CLI lease sweep requires an expired or absent checkout; direct bridge
  *   and plugin startup recovery does not check lease expiry.
@@ -119,23 +119,26 @@ function deferred(reason: DeliveryDeferral, detail: string, file?: string): Defe
 }
 
 /**
- * cli#617 slice (b): the presentation tokens THIS PROCESS has handed over and
- * not yet completed or released, across every MailClient in it. A claim on disk
- * naming this process is active while its token is here. A foreign claim is
- * active until its process is provably gone. Release failed handoffs before retrying in the same process.
+ * Tokens held by the MailClients of this module copy. Other copies in the same
+ * process are treated as live until process exit or lease expiry.
  */
 const activePresentations = new Set<string>();
+const moduleNonce = randomUUID();
 let ownStartToken: string | null | undefined;
 
 function ownClaim(token: string): PresentationClaim {
   if (ownStartToken === undefined) ownStartToken = processStartToken(process.pid);
-  return { token, pid: process.pid, start: ownStartToken };
+  return { token, pid: process.pid, start: ownStartToken, moduleNonce };
 }
 
-function claimIsLive(claim: PresentationClaim | undefined): boolean {
+function claimIsLive(claim: PresentationClaim | undefined, firstPresentedAt: string | undefined): boolean {
   if (!claim) return false;
   const own = ownClaim(claim.token);
-  if (claim.pid === own.pid && claim.start === own.start) return activePresentations.has(claim.token);
+  if (claim.pid === own.pid && claim.start === own.start) {
+    if (claim.moduleNonce === moduleNonce) return activePresentations.has(claim.token);
+    return firstPresentedAt === undefined || Date.now() - Date.parse(firstPresentedAt) <= DELIVERY_PRESENTATION_TTL_MS;
+  }
+  if (firstPresentedAt !== undefined && Date.now() - Date.parse(firstPresentedAt) > DELIVERY_PRESENTATION_TTL_MS) return false;
   return !processIsGone(claim.pid, claim.start);
 }
 
@@ -372,9 +375,10 @@ export class MailClient {
 
   /**
    * Present verified, unclaimed pending work before committing new mail.
-   * Unresolved placing/in_progress work defers deliverNext() commits. A held local
-   * token or foreign process not provably gone defers re-presentation. Release
-   * failed handoffs before retrying in the same process. The event loop uses checkNewMail().
+   * Unresolved placing/in_progress work defers deliverNext() commits. The token
+   * set covers MailClients of this module copy; claims from other copies in the
+   * same process are treated as live until process exit or lease expiry.
+   * Release failed handoffs before retrying through this copy. The event loop uses checkNewMail().
    */
   async deliverNext(): Promise<DeliverNextResult> {
     let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
@@ -436,7 +440,7 @@ export class MailClient {
   }
 
   /**
-   * Release this process's active claim for retry. Completion requires the same
+   * Release this client's active claim for retry. Completion requires the same
    * live intent, claim and recorded file identity. The next deliverNext() can
    * fail an overdue released intent, making completion stale.
    */
@@ -448,7 +452,7 @@ export class MailClient {
     return true;
   }
 
-  /** Record a hand-over: the token is already held in this process; bind it to the delivery object. */
+  /** Record a hand-over: the token is already held in this module copy; bind it to the delivery object. */
   private issue(token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
     const delivery: MailDelivery = Object.freeze({ message, deliveryKey: `${this.agentId}/${messageId}`, presentation });
     this.issued.set(delivery, { token, messageId, file, state: "active" });
@@ -545,8 +549,8 @@ export class MailClient {
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
       if (state.phase === "in_progress") {
-        if (claimIsLive(state.claim)) {
-          return deferred("active", `message ${messageId} has an active claim (local token held or foreign process not provably gone)`, file);
+        if (claimIsLive(state.claim, state.firstPresentedAt)) {
+          return deferred("active", `message ${messageId} has an active claim (this module copy holds the token, or another copy/process has an unexpired claim)`, file);
         }
         const expiry = replay.expireOverdue(messageId, file, new Date().toISOString());
         if (expiry.status === "absent") return RESOLVED;
@@ -592,8 +596,8 @@ export class MailClient {
       const replay = mailboxReplayStore(this.mailboxRoot);
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
-      if (state.phase === "in_progress" && claimIsLive(state.claim)) {
-        return deferred("active", `message ${messageId} has an active claim (local token held or foreign process not provably gone)`, file);
+      if (state.phase === "in_progress" && claimIsLive(state.claim, state.firstPresentedAt)) {
+        return deferred("active", `message ${messageId} has an active claim (this module copy holds the token, or another copy/process has an unexpired claim)`, file);
       }
       if (!replay.ownsPendingPlacement(messageId, file)) {
         return deferred("record-changed", `cur/${file} recorded identity is absent or mismatched`, file);

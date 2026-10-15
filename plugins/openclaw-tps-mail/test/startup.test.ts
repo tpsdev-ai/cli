@@ -407,7 +407,7 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     const intentPath = resolve(mailboxRoot, `.placement-${createHash("sha256").update(filename).digest("hex")}.json`);
     writeFileSync(intentPath, JSON.stringify({
       ...JSON.parse(readFileSync(intentPath, "utf-8")), version: 1, phase: "in_progress", presentations: 1,
-      firstPresentedAt: new Date().toISOString(), claim: { token: "0b4f3c2e-6f0a-4d3e-9a51-3f1c2b7d8e90", pid: process.pid, start: null },
+      firstPresentedAt: new Date().toISOString(), claim: { token: "0b4f3c2e-6f0a-4d3e-9a51-3f1c2b7d8e90", pid: process.pid, start: null, moduleNonce: "ac96bec1-3c23-41ae-bb92-f96a25ccbe5f" },
     }));
     const before = readFileSync(curPath, "utf-8");
 
