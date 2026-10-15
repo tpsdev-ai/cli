@@ -380,7 +380,6 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     renameSync(source, curPath());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", curPath());
-    // The client locks its mailbox at the path it resolved once at construction.
     const lock = await acquireMailLock(realpathSync(mailboxRoot));
     expect(lock).not.toBeNull();
     try {

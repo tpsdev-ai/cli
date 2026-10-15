@@ -1,5 +1,5 @@
-import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
 import { sanitizeError } from "../telemetry/events.js";
@@ -7,13 +7,8 @@ import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "
 import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
-<<<<<<< HEAD
-import { mailboxLockRoot } from "../lib/mail-lock-namespace.js";
-import { acquireMailLock, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
-=======
 import { canonicalMailboxRoot, canonicalMailRoot } from "../lib/mail-lock-namespace.js";
-import { acquireMailLock, type MailLock } from "../lib/mail-lock.js";
->>>>>>> origin/main
+import { acquireMailLock, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
 import {
   DELIVERY_PRESENTATION_TTL_MS,
   decideEnvelopeForMailbox,
@@ -74,7 +69,7 @@ export interface MailDelivery {
  *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
  * - `record-changed`: the pending cur/ copy is missing, its recorded identity
  *   is absent or mismatched, or its bytes changed during re-verification.
- * - `storage-error`: listing new/ threw, or a history, cur/, quarantine or
+ * - `storage-error`: resolving roots or listing new/ threw, or a history, cur/, quarantine or
  *   placement-state operation threw while pending placements were processed.
  * - `new-mail-deferred`: one new/ file's attempt did not complete: reading it,
  *   verifying it (including the verifier or trust-tier read not answering), a
@@ -222,9 +217,6 @@ function resumableOnRecovery(phase: PlacementPhase | null): boolean {
   return phase === "placing";
 }
 
-<<<<<<< HEAD
-function lstatOrAbsent(path: string): import("node:fs").BigIntStats | null {
-=======
 /**
  * cli#636: resolve both roots to canonical path strings once per operation;
  * derive subsequent paths, including locks, by joining those strings.
@@ -236,8 +228,7 @@ interface OperationRoots {
   readonly mailbox: string;
 }
 
-function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
->>>>>>> origin/main
+function lstatOrAbsent(path: string): import("node:fs").BigIntStats | null {
   try {
     return lstatSync(path, { bigint: true });
   } catch (err) {
@@ -252,14 +243,6 @@ function lstatOrAbsent(path: string): { dev: number; ino: number } | null {
  * Writes outgoing mail to mailDir/outbox/new.
  */
 export class MailClient {
-<<<<<<< HEAD
-  private readonly mailboxRoot: string;
-  private readonly inboxNew: string;
-  private readonly inboxCur: string;
-  private readonly inboxDlq: string;
-  private readonly outboxNew: string;
-=======
->>>>>>> origin/main
   private readonly flairClient: FlairClient;
   /** cli#617 slice (b): the deliveries this client issued, keyed by the delivery object itself. */
   private readonly issued = new WeakMap<MailDelivery, {
@@ -285,18 +268,6 @@ export class MailClient {
       );
     }
     this.flairClient = flairClient;
-<<<<<<< HEAD
-    // cli#616: the mailbox lock root starts from the resolved real path of the
-    // configured mail directory (see mail-lock-namespace.ts).
-    const lockRoot = mailboxLockRoot(mailDir, agentId);
-    for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(lockRoot, dir), { recursive: true });
-    this.mailDir = dirname(lockRoot);
-    this.mailboxRoot = realpathSync(lockRoot);
-    this.inboxNew = join(this.mailboxRoot, "new");
-    this.inboxCur = join(this.mailboxRoot, "cur");
-    this.inboxDlq = join(this.mailboxRoot, "dlq");
-    this.outboxNew = join(this.mailboxRoot, "outbox");
-=======
     // cli#636: no resolved canonical root is cached at construction.
     // Every operation resolves its own roots (operationRoots).
     this.operationRoots();
@@ -314,7 +285,6 @@ export class MailClient {
     const mailbox = canonicalMailboxRoot(join(mailRoot, this.agentId));
     for (const dir of ["new", "cur", "dlq", "outbox"]) mkdirSync(join(mailbox, dir), { recursive: true });
     return { mailRoot, mailbox };
->>>>>>> origin/main
   }
 
   async checkNewMail(): Promise<MailMessage[]> {
@@ -387,14 +357,9 @@ export class MailClient {
       }
 
       try {
-<<<<<<< HEAD
-        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope);
+        const committed = await this.commitToCur(roots, file, srcPath, body, verifyResult.envelope);
         // "live-placement" is returned only to the delivery API (a claim was passed).
         if (committed === "already-delivered" || committed === "live-placement") continue;
-=======
-        const committed = await this.commitToCur(roots, file, srcPath, body, verifyResult.envelope);
-        if (committed === "already-delivered") continue;
->>>>>>> origin/main
         if (committed) {
           this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started, roots);
           continue;
@@ -435,11 +400,18 @@ export class MailClient {
    * Release failed handoffs before retrying through this copy. The event loop uses checkNewMail().
    */
   async deliverNext(): Promise<DeliverNextResult> {
+    let roots: OperationRoots;
+    try {
+      roots = this.operationRoots();
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return deferred("storage-error", `mailbox roots unavailable: ${sanitizeError(err)}`);
+    }
     let pending: Array<{ messageId: string; file: string; phase: PlacementPhase }>;
-    const listing = await this.lockOrDefer("pending placements not listed");
+    const listing = await this.lockOrDefer(roots, "pending placements not listed");
     if ("status" in listing) return listing;
     try {
-      pending = pendingPlacementEntries(this.mailboxRoot);
+      pending = pendingPlacementEntries(roots.mailbox);
     } catch (err) {
       this.emitRecoveryError(err);
       return deferred("storage-error", `pending placements unavailable: ${sanitizeError(err)}`);
@@ -452,7 +424,7 @@ export class MailClient {
       if (phase === "unknown") continue; // another writer's phase: preserved, never presented (slice a)
       let outcome: PendingOutcome;
       try {
-        outcome = await this.presentPending(messageId, file);
+        outcome = await this.presentPending(roots, messageId, file);
       } catch (err) {
         this.emitRecoveryError(err);
         outcome = deferred("storage-error", sanitizeError(err), file);
@@ -461,7 +433,7 @@ export class MailClient {
       if (outcome.status === "deferred") firstDeferral ??= outcome;
     }
     if (firstDeferral) return firstDeferral;
-    return this.commitNextForDelivery();
+    return this.commitNextForDelivery(roots);
   }
 
   /** Finalize only this client's issued claim, with its recorded cur/ file identity, under the mailbox lock. */
@@ -469,11 +441,17 @@ export class MailClient {
     const issued = this.issued.get(delivery);
     if (!issued) return { status: "refused", reason: "foreign", detail: "not a delivery this MailClient handed over" };
     if (issued.state === "completed") return { status: "already-completed" };
-    const lock = await this.lockOrDefer("delivery not finalized; intent state unknown, retry");
+    let roots: OperationRoots;
+    try {
+      roots = this.operationRoots();
+    } catch (err) {
+      return { status: "deferred", reason: "lock-busy", detail: `mailbox roots unavailable (${sanitizeError(err)}); delivery not finalized` };
+    }
+    const lock = await this.lockOrDefer(roots, "delivery not finalized; intent state unknown, retry");
     if ("status" in lock) return { status: "deferred", reason: "lock-busy", detail: lock.detail };
     let result: ReturnType<ReturnType<typeof mailboxReplayStore>["completePlacement"]>;
     try {
-      result = mailboxReplayStore(this.mailboxRoot).completePlacement(issued.messageId, issued.file, issued.token);
+      result = mailboxReplayStore(roots.mailbox).completePlacement(issued.messageId, issued.file, issued.token);
     } finally {
       lock.release();
     }
@@ -517,8 +495,8 @@ export class MailClient {
    * Present one pending placement: inspect it under the lock, re-verify its
    * cur/ copy outside the lock, then re-check and advance under the lock.
    */
-  private async presentPending(messageId: string, file: string): Promise<PendingOutcome> {
-    const inspected = await this.inspectPending(messageId, file);
+  private async presentPending(roots: OperationRoots, messageId: string, file: string): Promise<PendingOutcome> {
+    const inspected = await this.inspectPending(roots, messageId, file);
     if (inspected.status !== "read") return inspected;
     let outcome: VerifyOutcome;
     try {
@@ -526,7 +504,7 @@ export class MailClient {
         const classified = await this.classifyPending(inspected.bytes);
         if (classified.kind === "cli") return deferred("cli-record", `cur/${file} verifies only as CLI-promoted; awaiting CLI recovery`, file);
         if (classified.kind === "pending-record-invalid" || classified.kind === "pending-record-ambiguous") {
-          return this.quarantinePending(messageId, file, inspected.bytes, classified.kind);
+          return this.quarantinePending(roots, messageId, file, inspected.bytes, classified.kind);
         }
         outcome = classified.outcome;
       } else {
@@ -541,11 +519,11 @@ export class MailClient {
     }
     let trustTier: MailMessage["trustTier"];
     try {
-      trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
+      trustTier = verifiedMailTier(outcome.envelope, roots.mailRoot);
     } catch (err) {
       return deferred("verification-unavailable", `trust tier unavailable: ${sanitizeError(err)}`, file);
     }
-    return this.presentUnderLock(messageId, file, inspected.bytes, outcome.envelope, trustTier);
+    return this.presentUnderLock(roots, messageId, file, inspected.bytes, outcome.envelope, trustTier);
   }
 
   private async classifyPending(bytes: Buffer): Promise<
@@ -573,21 +551,22 @@ export class MailClient {
   }
 
   private async quarantinePending(
+    roots: OperationRoots,
     messageId: string, file: string, bytes: Buffer,
     reason: "pending-record-invalid" | "pending-record-ambiguous",
   ): Promise<PendingOutcome> {
-    const lock = await this.lockOrDefer("pending record not quarantined", file);
+    const lock = await this.lockOrDefer(roots, "pending record not quarantined", file);
     if ("status" in lock) return lock;
     try {
-      const replay = mailboxReplayStore(this.mailboxRoot);
+      const replay = mailboxReplayStore(roots.mailbox);
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase !== "placing") return RESOLVED;
-      if (!replay.ownsPendingPlacement(messageId, file) || !readFileSync(join(this.inboxCur, file)).equals(bytes)) {
+      if (!replay.ownsPendingPlacement(messageId, file) || !readFileSync(join(roots.mailbox, "cur", file)).equals(bytes)) {
         return deferred("record-changed", `cur/${file} identity absent or mismatched, or bytes changed; not quarantined`, file);
       }
-      mkdirSync(this.inboxDlq, { recursive: true });
-      writeRejectSidecar(this.inboxDlq, file, "invalid", reason);
-      renameSync(join(this.inboxCur, file), join(this.inboxDlq, file));
+      mkdirSync(join(roots.mailbox, "dlq"), { recursive: true });
+      writeRejectSidecar(join(roots.mailbox, "dlq"), file, "invalid", reason);
+      renameSync(join(roots.mailbox, "cur", file), join(roots.mailbox, "dlq", file));
       replay.finishPlacement(messageId, file);
       return deferred(reason, `cur/${file} quarantined: ${reason}; intent cleared`, file);
     } finally {
@@ -595,11 +574,11 @@ export class MailClient {
     }
   }
 
-  private async inspectPending(messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer; phase: PlacementPhase }> {
-    const lock = await this.lockOrDefer("pending placement not inspected", file);
+  private async inspectPending(roots: OperationRoots, messageId: string, file: string): Promise<PendingOutcome | { status: "read"; bytes: Buffer; phase: PlacementPhase }> {
+    const lock = await this.lockOrDefer(roots, "pending placement not inspected", file);
     if ("status" in lock) return lock;
     try {
-      const replay = mailboxReplayStore(this.mailboxRoot);
+      const replay = mailboxReplayStore(roots.mailbox);
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
       if (state.phase === "in_progress") {
@@ -613,7 +592,7 @@ export class MailClient {
           return RESOLVED;
         }
       }
-      const curPath = join(this.inboxCur, file);
+      const curPath = join(roots.mailbox, "cur", file);
       let bytes: Buffer;
       try {
         bytes = readFileSync(curPath);
@@ -638,16 +617,17 @@ export class MailClient {
    * writes the terminal `failed` phase and presents nothing.
    */
   private async presentUnderLock(
+    roots: OperationRoots,
     messageId: string,
     file: string,
     bytes: Buffer,
     envelope: Envelope,
     trustTier: MailMessage["trustTier"],
   ): Promise<PendingOutcome> {
-    const lock = await this.lockOrDefer("pending placement not presented", file);
+    const lock = await this.lockOrDefer(roots, "pending placement not presented", file);
     if ("status" in lock) return lock;
     try {
-      const replay = mailboxReplayStore(this.mailboxRoot);
+      const replay = mailboxReplayStore(roots.mailbox);
       const state = replay.placementState(file);
       if (!state || state.messageId !== messageId || state.phase === "failed" || state.phase === "unknown") return RESOLVED;
       if (state.phase === "in_progress" && claimIsLive(state.claim, state.firstPresentedAt)) {
@@ -658,7 +638,7 @@ export class MailClient {
       }
       let current: Buffer;
       try {
-        current = readFileSync(join(this.inboxCur, file));
+        current = readFileSync(join(roots.mailbox, "cur", file));
       } catch (err) {
         if (isMissing(err)) return deferred("record-changed", `cur/${file} disappeared during re-verification`, file);
         throw err;
@@ -710,11 +690,11 @@ export class MailClient {
    * `in_progress` placement is pending, so a concurrent call cannot add a
    * second message in flight.
    */
-  private async commitNextForDelivery(): Promise<DeliverNextResult> {
+  private async commitNextForDelivery(roots: OperationRoots): Promise<DeliverNextResult> {
     let files: string[];
     try {
-      files = existsSync(this.inboxNew)
-        ? readdirSync(this.inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\")).sort()
+      files = existsSync(join(roots.mailbox, "new"))
+        ? readdirSync(join(roots.mailbox, "new")).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\")).sort()
         : [];
     } catch (err) {
       this.emitRecoveryError(err);
@@ -723,7 +703,7 @@ export class MailClient {
     let skipped: { file: string; detail: string } | null = null;
     for (const file of files) {
       const started = Date.now();
-      const srcPath = join(this.inboxNew, file);
+      const srcPath = join(roots.mailbox, "new", file);
       let body: string;
       try {
         body = readFileSync(srcPath, "utf-8");
@@ -743,12 +723,12 @@ export class MailClient {
         continue;
       }
       if (!verifyResult.pass) {
-        this.deadLetter(file, srcPath, verifyResult, started);
+        this.deadLetter(file, srcPath, verifyResult, started, roots);
         continue;
       }
       let trustTier: MailMessage["trustTier"];
       try {
-        trustTier = verifiedMailTier(verifyResult.envelope, this.mailDir);
+        trustTier = verifiedMailTier(verifyResult.envelope, roots.mailRoot);
       } catch (err) {
         this.emitRecoveryError(err);
         skipped ??= { file, detail: `trust tier unavailable: ${sanitizeError(err)}` };
@@ -759,13 +739,13 @@ export class MailClient {
       activePresentations.add(token);
       let delivered = false;
       try {
-        const committed = await this.commitToCur(file, srcPath, body, verifyResult.envelope, ownClaim(token));
+        const committed = await this.commitToCur(roots, file, srcPath, body, verifyResult.envelope, ownClaim(token));
         if (committed === "already-delivered") continue;
         if (committed === "live-placement") {
           return deferred("new-mail-deferred", "a placement became pending before the commit; nothing committed", file);
         }
         if (committed) {
-          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started);
+          this.deadLetter(file, srcPath, { ...committed, from: verifyResult.envelope.from }, started, roots);
           continue;
         }
         const from = verifyResult.envelope.from;
@@ -789,9 +769,9 @@ export class MailClient {
   }
 
   /** The mailbox lock, or a `lock-busy` deferral (contention, or an acquisition that threw). */
-  private async lockOrDefer(what: string, file?: string): Promise<MailLock | DeferredResult> {
+  private async lockOrDefer(roots: OperationRoots, what: string, file?: string): Promise<MailLock | DeferredResult> {
     try {
-      return (await acquireMailLock(this.mailboxRoot)) ?? deferred("lock-busy", `mailbox lock busy; ${what}`, file);
+      return (await acquireMailLock(roots.mailbox)) ?? deferred("lock-busy", `mailbox lock busy; ${what}`, file);
     } catch (err) {
       return deferred("lock-busy", `mailbox lock unavailable (${sanitizeError(err)}); ${what}`, file);
     }
@@ -810,15 +790,10 @@ export class MailClient {
     srcPath: string,
     body: string,
     envelope: Envelope,
-<<<<<<< HEAD
     /** cli#617 slice (b): the delivery API's presentation claim; absent for the batch checkNewMail() path. */
     claim?: PresentationClaim,
   ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | "live-placement" | null> {
-    const lock: MailLock | null = await acquireMailLock(this.mailboxRoot);
-=======
-  ): Promise<{ pass: false; class: MailboxRejectClass; reason: string } | "already-delivered" | null> {
     const lock: MailLock | null = await acquireMailLock(roots.mailbox);
->>>>>>> origin/main
     if (!lock) throw new Error("mailbox lock busy; not promoted");
     let relayLock: MailLock | null;
     try { relayLock = tryAcquireRelayMoveLock(JSON.parse(body), roots.mailRoot); }
@@ -828,16 +803,11 @@ export class MailClient {
       if (readFileSync(srcPath, "utf-8") !== body) throw new Error("source changed during promotion; not promoted");
       const replay = mailboxReplayStore(roots.mailbox);
       if (replay.hasPendingFile(file)) throw new Error(`pending placement unresolved: ${file}`);
-<<<<<<< HEAD
-      if (claim && pendingPlacementEntries(this.mailboxRoot).some((e) => e.phase === "placing" || e.phase === "in_progress")) {
+      if (claim && pendingPlacementEntries(roots.mailbox).some((e) => e.phase === "placing" || e.phase === "in_progress")) {
         return "live-placement";
       }
-      const dstPath = join(this.inboxCur, file);
-      if (sameFileIdentity(srcPath, dstPath)) {
-=======
       const dstPath = join(roots.mailbox, "cur", file);
-      if (sameFileByDeviceInode(srcPath, dstPath)) {
->>>>>>> origin/main
+      if (sameFileIdentity(srcPath, dstPath)) {
         replay.isConsumed(envelope.messageId);
         unlinkSync(srcPath);
         return "already-delivered";
@@ -929,22 +899,15 @@ export class MailClient {
           await this.finishUnlinkedPlacement(messageId, file, root);
           continue;
         }
-<<<<<<< HEAD
         const classified = await this.classifyPending(bytes);
         if (classified.kind === "cli") continue;
         if (classified.kind === "pending-record-invalid" || classified.kind === "pending-record-ambiguous") {
-          await this.quarantinePending(messageId, file, bytes, classified.kind);
+          await this.quarantinePending(roots, messageId, file, bytes, classified.kind);
           continue;
         }
         const outcome = classified.outcome;
-        const trustTier = verifiedMailTier(outcome.envelope, this.mailDir);
-        const delivered = await this.completeInterruptedPlacement(messageId, file, bytes, outcome.envelope, trustTier);
-=======
-        const outcome = await this.verifyMailBody(bytes.toString("utf8"));
-        if (!outcome.pass) continue; // withhold: the cur copy is not a verified message
         const trustTier = verifiedMailTier(outcome.envelope, roots.mailRoot);
         const delivered = await this.completeInterruptedPlacement(messageId, file, root, bytes, outcome.envelope, trustTier);
->>>>>>> origin/main
         if (delivered) messages.push(delivered);
       } catch (err) {
         this.events?.emit({
@@ -988,13 +951,8 @@ export class MailClient {
     const lock = await acquireMailLock(root);
     if (!lock) throw new Error("mailbox lock busy; interrupted placement recovery deferred");
     try {
-<<<<<<< HEAD
-      const replay = mailboxReplayStore(this.mailboxRoot);
-      // Match the intent, recorded identity and pre-verification raw bytes.
-=======
       const replay = mailboxReplayStore(root);
-      // Match the intent, recorded device/inode and pre-verification raw bytes.
->>>>>>> origin/main
+      // Match the intent, recorded identity and pre-verification raw bytes.
       if (!replay.hasPendingPlacement(messageId, file)) return null;
       if (!resumableOnRecovery(replay.placementPhase(file))) return null;
       if (envelope.messageId !== messageId) return null;

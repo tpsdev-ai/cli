@@ -451,7 +451,7 @@ describe("completion is bound to the hand-over", () => {
     expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
   });
 
-  test("the mailbox path is resolved once: retargeting the mail-root symlink does not move completion or delivery", async () => {
+  test("completion and delivery resolve the retargeted mail root", async () => {
     const rootA = join(mailDir, "rootA");
     const rootB = join(mailDir, "rootB");
     for (const r of [rootA, rootB]) mkdirSync(join(r, AGENT, "new"), { recursive: true });
@@ -479,15 +479,86 @@ describe("completion is bound to the hand-over", () => {
     symlinkSync(rootB, link);
     expect(realpathSync(join(link, AGENT))).toBe(realpathSync(join(rootB, AGENT)));
 
-    expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
-    expect(intentPhase("m1.json")).toBeNull(); // rootA's intent is the one finalized
-    const next = delivered(await c.deliverNext());
-    expect(next.message.verifiedEnvelope?.messageId).toBe("pinned-2"); // rootA's new/, not rootB's
+    const rootAIntent = intentText("m1.json");
+    expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "stale" });
+    expect(intentText("m1.json")).toBe(rootAIntent);
+    expect(newFiles()).toEqual(["m2.json"]);
 
     root = join(rootB, AGENT);
     expect(intentText("m1.json")).toBe(rootBIntent);
-    expect(newFiles()).toEqual(["m9.json"]);
+    expect(reasonOf(await c.deliverNext())).toBe("active");
+    setPhase({ claim: undefined });
+    const resumed = delivered(await c.deliverNext());
+    expect(resumed.message.verifiedEnvelope?.messageId).toBe("pinned-1");
+    expect(resumed.presentation).toBe(2);
+    expect(await c.completeDelivery(resumed)).toEqual({ status: "completed" });
+    const next = delivered(await c.deliverNext());
+    expect(next.message.verifiedEnvelope?.messageId).toBe("other-root");
+    expect(newFiles()).toEqual([]);
   });
+
+  test("release frees its token across a mail-root repoint", async () => {
+    const other = join(mailDir, "other");
+    mkdirSync(other);
+    const link = join(mailDir, "mail-link");
+    symlinkSync(mailDir, link);
+    plant("m1.json", "released-root");
+    const c = new MailClient(link, undefined, AGENT, verifier());
+    const first = delivered(await c.deliverNext());
+    unlinkSync(link);
+    symlinkSync(other, link);
+    expect(c.releaseDelivery(first)).toBe(true);
+    expect(await c.deliverNext()).toEqual({ status: "idle" });
+    unlinkSync(link);
+    symlinkSync(mailDir, link);
+    const retry = delivered(await c.deliverNext());
+    expect(retry.message.verifiedEnvelope?.messageId).toBe("released-root");
+    expect(retry.presentation).toBe(2);
+    expect(await c.completeDelivery(retry)).toEqual({ status: "completed" });
+  });
+
+  test("unavailable operation roots defer delivery and completion", async () => {
+    const link = join(mailDir, "mail-link");
+    symlinkSync(mailDir, link);
+    plant("m1.json", "unavailable-root");
+    const c = new MailClient(link, undefined, AGENT, verifier());
+    const first = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    unlinkSync(link);
+    writeFileSync(link, "not a directory");
+    expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "storage-error" });
+    expect(await c.completeDelivery(first)).toMatchObject({ status: "deferred", reason: "lock-busy" });
+    expect(intentText("m1.json")).toBe(before);
+    expect(c.releaseDelivery(first)).toBe(true);
+  });
+
+  for (const phase of ["new", "placing", "in_progress"] as const) {
+    test(`${phase} delivery keeps its operation roots during verification`, async () => {
+      const other = join(mailDir, "other");
+      mkdirSync(other);
+      const link = join(mailDir, "mail-link");
+      symlinkSync(mailDir, link);
+      mkdirSync(join(mailDir, ".bridge-principals"));
+      writeFileSync(join(mailDir, ".bridge-principals", `${FROM}.json`), JSON.stringify({ id: FROM }));
+      if (phase === "new") plant("m1.json", "operation-root");
+      else committed("operation-root", { phase });
+      const c = new MailClient(link, undefined, AGENT, {
+        async getAgent(name: string) {
+          unlinkSync(link);
+          symlinkSync(other, link);
+          return verifier().getAgent(name);
+        },
+      });
+      const first = delivered(await c.deliverNext());
+      expect(first.message.verifiedEnvelope?.messageId).toBe("operation-root");
+      expect(first.message.trustTier).toBe("external");
+      expect(intentPhase("m1.json")).toBe("in_progress");
+      expect(existsSync(join(other, AGENT, "cur", "m1.json"))).toBe(false);
+      unlinkSync(link);
+      symlinkSync(mailDir, link);
+      expect(await c.completeDelivery(first)).toEqual({ status: "completed" });
+    });
+  }
 });
 
 describe("deliverNext defers pending cur-copy failures before committing new mail", () => {
