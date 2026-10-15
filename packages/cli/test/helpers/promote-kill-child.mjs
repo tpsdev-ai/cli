@@ -1,7 +1,7 @@
 // promote-kill-child.mjs — test helper for cli#515.
 //
 // Runs a REAL promote() in a child process that a test can SIGKILL at an
-// injected pause point BEFORE a named filesystem operation, so an interrupted
+// injected pause point at a named filesystem operation, so an interrupted
 // first delivery is simulated with a KILLED process (never an injected error).
 //
 // The pause point is injected by wrapping node:fs BEFORE the mail module is
@@ -53,6 +53,8 @@ let paused = false;
 for (const name of ["writeFileSync", "openSync", "linkSync", "appendFileSync", "rmSync", "unlinkSync", "renameSync"]) {
   const orig = fs[name];
   fs[name] = function (...args) {
+    const after = process.env.TPS_KILL_AFTER === "1";
+    const result = after ? orig.apply(this, args) : undefined;
     if (!paused && matches(name, args)) {
       paused = true;
       if (MARKER) origWrite.call(fs, MARKER, "paused");
@@ -62,7 +64,7 @@ for (const name of ["writeFileSync", "openSync", "linkSync", "appendFileSync", "
       }
       process.exit(3);
     }
-    return orig.apply(this, args);
+    return after ? result : orig.apply(this, args);
   };
 }
 

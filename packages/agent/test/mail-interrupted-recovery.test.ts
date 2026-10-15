@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -177,17 +177,27 @@ describe("MailClient recovery at the tested placement boundaries (cli#600)", () 
 });
 
 for (const at of ["link-to-cur", "source-removal"]) {
-  test(`a kill after ${at} before the ctime refresh keeps the intent`, async () => {
-    const source = plant(`ctime-gap-${at}`);
-    const run = await runAndKillAt(at, source, true);
+  test(`a kill after ${at} leaves the original message deliverable`, async () => {
+    const messageId = `after-${at}`;
+    const run = await runAndKillAt(at, plant(messageId), true);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    await assertDeliveredUntilCompleted(messageId);
+  });
+
+  test(`a different-byte replacement after a kill after ${at} is withheld`, async () => {
+    const run = await runAndKillAt(at, plant(`replaced-${at}`), true);
     expect(run.reached, run.stderr).toBe(true);
     expect(run.signal).toBe("SIGKILL");
     const name = readdirSync(mailboxRoot).find((name) => name.startsWith(".placement-") && name.endsWith(".json"))!;
     const intent = readFileSync(join(mailboxRoot, name));
+    const bytes = readFileSync(curPath(), "utf8");
+    unlinkSync(curPath());
+    writeFileSync(curPath(), bytes + " ");
     const c = new MailClient(mailDir, undefined, AGENT, verifier());
     expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
     expect(readFileSync(join(mailboxRoot, name))).toEqual(intent);
-    expect(existsSync(curPath())).toBe(true);
+    expect(readFileSync(curPath(), "utf8")).toBe(bytes + " ");
   });
 }
 

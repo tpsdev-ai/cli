@@ -1,7 +1,7 @@
 // mail-kill-child.mjs — test helper for cli#600.
 //
-// Runs a REAL MailClient.checkNewMail() in a child process that a test can
-// SIGKILL at an injected pause point BEFORE a named filesystem operation, so an
+// Runs a REAL MailClient in a child process that a test can
+// SIGKILL at an injected pause point at a named filesystem operation, so an
 // interrupted first delivery is simulated with a KILLED process (never an
 // injected error).
 //

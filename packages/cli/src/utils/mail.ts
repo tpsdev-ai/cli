@@ -1407,9 +1407,7 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
           throw new Error(`destination already exists: ${filename}`);
         }
         movedToCur = true;
-        replay.beginPlacement(envelope.messageId, filename, scratchFd);
         rmSync(scratchPath, { force: true });
-        replay.beginPlacement(envelope.messageId, filename, scratchFd);
         if (!replay.ownsPendingPlacement(envelope.messageId, filename)) throw new Error("placement identity changed");
         replay.recordConsumed(envelope.messageId);
       } finally { closeSync(scratchFd); }
@@ -1496,7 +1494,7 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
   if (!lock) return 0;
   try {
     const held = pendingPlacementEntries(root).filter((entry) => entry.phase !== "failed").flatMap((entry) => {
-      try { return [fileIdentity(lstatSync(join(root, "cur", entry.file), { bigint: true }))]; }
+      try { return [fileIdentity(lstatSync(join(root, "cur", entry.file), { bigint: true }), readFileSync(join(root, "cur", entry.file)))]; }
       catch (err) {
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
         throw err;
@@ -1507,7 +1505,7 @@ export async function sweepStrandedPromoteScratch(root: string): Promise<number>
       if (!name.endsWith(".promote")) continue;
       try {
         const stat = lstatSync(join(tmpDir, name), { bigint: true });
-        if (held.some((identity) => matchesFileIdentity(stat, identity))) continue;
+        if (stat.isFile() && held.some((identity) => matchesFileIdentity(stat, identity, readFileSync(join(tmpDir, name))))) continue;
         rmSync(join(tmpDir, name), { force: true, recursive: true });
         removed++;
       } catch {

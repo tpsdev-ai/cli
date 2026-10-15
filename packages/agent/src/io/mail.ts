@@ -196,7 +196,8 @@ function writeRejectSidecar(dlqDir: string, filename: string, cls: MailboxReject
 function sameFileIdentity(a: string, b: string): boolean {
   const sa = lstatOrAbsent(a);
   const sb = lstatOrAbsent(b);
-  return sa !== null && sb !== null && matchesFileIdentity(sa, fileIdentity(sb));
+  return sa !== null && sb !== null && sa.isFile() && sb.isFile()
+    && matchesFileIdentity(sa, fileIdentity(sb, readFileSync(b)), readFileSync(a));
 }
 
 /**
@@ -792,7 +793,6 @@ export class MailClient {
           replay.finishPlacement(envelope.messageId, file);
           throw new Error(`destination already exists: ${file}`);
         }
-        replay.beginPlacement(envelope.messageId, file, sourceFd);
         try {
           unlinkSync(srcPath);
         } catch (err) {
@@ -801,7 +801,6 @@ export class MailClient {
           throw err;
         }
         try {
-          replay.beginPlacement(envelope.messageId, file, sourceFd);
           if (!replay.ownsPendingPlacement(envelope.messageId, file)) throw new Error("placement identity changed");
           replay.recordConsumed(envelope.messageId);
         } catch (err) {

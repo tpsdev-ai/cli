@@ -360,27 +360,29 @@ describe("completion is bound to the hand-over", () => {
     const m = delivered(await c.deliverNext());
     const bytes = readFileSync(cur("m1.json"));
     unlinkSync(cur("m1.json"));
-    writeFileSync(cur("m1.json"), bytes);
+    writeFileSync(cur("m1.json"), Buffer.concat([bytes, Buffer.from(" ")]));
     const before = intentText("m1.json");
     expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
     expect(intentText("m1.json")).toBe(before);
   });
 
-  for (const field of ["ctimeNs", "size"] as const) {
-    test(`a cur/ copy with the recorded inode but changed ${field} is refused as identity`, async () => {
-      plant("m1.json", "reused-inode");
+  for (const field of ["ino", "size"] as const) {
+    test(`a cur/ copy with changed ${field} is refused as identity`, async () => {
+      plant("m1.json", "changed-identity");
       const c = client();
       const m = delivered(await c.deliverNext());
       const before = intentText("m1.json");
-      const recorded = intentJson("m1.json").identity;
       const stat = fs.lstatSync(cur("m1.json"), { bigint: true });
-      expect(recorded).toEqual({ dev: String(stat.dev), ino: String(stat.ino), ctimeNs: String(stat.ctimeNs), size: String(stat.size) });
+      expect(intentJson("m1.json").identity).toEqual({
+        dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size),
+        sha256: createHash("sha256").update(readFileSync(cur("m1.json"))).digest("hex"),
+      });
       const realStat = fs.lstatSync;
       const replacement = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { [field]: stat[field] + 1n });
       const stub = spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, options: unknown) =>
         path === cur("m1.json") ? replacement : realStat(path, options as { bigint: true })) as typeof fs.lstatSync);
       try {
-        expect(mailboxReplayStore(root).ownsPendingPlacement("reused-inode", "m1.json")).toBe(false);
+        expect(mailboxReplayStore(root).ownsPendingPlacement("changed-identity", "m1.json")).toBe(false);
         expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
         expect(intentText("m1.json")).toBe(before);
         c.releaseDelivery(m);
@@ -390,12 +392,46 @@ describe("completion is bound to the hand-over", () => {
     });
   }
 
-  test("a legacy device/inode identity is refused and keeps the intent", async () => {
+  test("inode reuse with different same-size bytes is refused as identity", async () => {
+    plant("m1.json", "reused-inode");
+    const c = client();
+    const m = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    const recorded = intentJson("m1.json").identity;
+    const bytes = readFileSync(cur("m1.json"), "utf8");
+    unlinkSync(cur("m1.json"));
+    writeFileSync(cur("m1.json"), bytes.replace("delivery-body", "different-msg"));
+    const realStat = fs.lstatSync;
+    const stat = realStat(cur("m1.json"), { bigint: true });
+    expect(String(stat.size)).toBe(recorded.size);
+    const replacement = Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { ino: BigInt(recorded.ino) });
+    const stub = spyOn(fs, "lstatSync").mockImplementation(((path: fs.PathLike, options: unknown) =>
+      path === cur("m1.json") ? replacement : realStat(path, options as { bigint: true })) as typeof fs.lstatSync);
+    try {
+      expect(mailboxReplayStore(root).ownsPendingPlacement("reused-inode", "m1.json")).toBe(false);
+      expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
+      expect(intentText("m1.json")).toBe(before);
+    } finally { stub.mockRestore(); }
+  });
+
+  test("the same inode and bytes remain the same message after link changes and a rewrite", async () => {
+    plant("m1.json", "same-message");
+    const c = client();
+    const m = delivered(await c.deliverNext());
+    const bytes = readFileSync(cur("m1.json"));
+    linkSync(cur("m1.json"), fresh("linked.json"));
+    unlinkSync(fresh("linked.json"));
+    writeFileSync(cur("m1.json"), bytes);
+    expect(mailboxReplayStore(root).ownsPendingPlacement("same-message", "m1.json")).toBe(true);
+    expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+  });
+
+  test("an identity without a byte hash is refused and keeps the intent", async () => {
     plant("m1.json", "legacy-identity");
     const c = client();
     const m = delivered(await c.deliverNext());
-    const { dev, ino } = intentJson("m1.json").identity;
-    setPhase({ identity: { dev, ino } });
+    const { dev, ino, size } = intentJson("m1.json").identity;
+    setPhase({ identity: { dev, ino, size, ctimeNs: String(fs.lstatSync(cur("m1.json"), { bigint: true }).ctimeNs) } });
     const before = intentText("m1.json");
     expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
     expect(intentText("m1.json")).toBe(before);

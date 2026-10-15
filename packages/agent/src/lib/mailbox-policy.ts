@@ -307,7 +307,7 @@ export interface ReplayStore {
    * cli#617 slice (b): completion-only finalize, bound to one presentation.
    * Deletes the intent only when it is `in_progress` for this message, its
    * claim carries `token`, and `cur/<file>` is still the file the intent
-   * recorded (device, inode, nanosecond ctime and size). Otherwise nothing changes: `absent` (no intent
+   * recorded (device, inode, size and SHA-256). Otherwise nothing changes: `absent` (no intent
    * for this message), `stale` (another phase or another presentation's claim),
    * or `identity` (recorded cur/ identity absent or mismatched).
    */
@@ -330,7 +330,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
       if (intent?.messageId !== messageId || !intent.identity) return false;
       try {
         const stat = lstatSync(join(root, "cur", file), { bigint: true });
-        return matchesFileIdentity(stat, intent.identity);
+        return stat.isFile() && matchesFileIdentity(stat, intent.identity, readFileSync(join(root, "cur", file)));
       } catch (err) {
         if (isMissing(err)) return false;
         throw err;
@@ -468,18 +468,19 @@ const PLACEMENT_INTENT_VERSION = 1;
 export interface FileIdentity {
   dev: string;
   ino: string;
-  ctimeNs?: string;
   size?: string;
+  sha256?: string;
 }
 
-export function fileIdentity(stat: BigIntStats): FileIdentity {
-  return { dev: stat.dev.toString(), ino: stat.ino.toString(), ctimeNs: stat.ctimeNs.toString(), size: stat.size.toString() };
+// Link changes preserve this identity. The same device, inode and bytes are accepted as the same message.
+export function fileIdentity(stat: BigIntStats, bytes: Buffer): FileIdentity {
+  return { dev: stat.dev.toString(), ino: stat.ino.toString(), size: stat.size.toString(), sha256: createHash("sha256").update(bytes).digest("hex") };
 }
 
-export function matchesFileIdentity(stat: BigIntStats, identity: FileIdentity): boolean {
-  const current = fileIdentity(stat);
+export function matchesFileIdentity(stat: BigIntStats, identity: FileIdentity, bytes: Buffer): boolean {
+  const current = fileIdentity(stat, bytes);
   return stat.isFile() && current.dev === identity.dev && current.ino === identity.ino
-    && current.ctimeNs === identity.ctimeNs && current.size === identity.size;
+    && current.size === identity.size && current.sha256 === identity.sha256;
 }
 
 interface PlacementIntent {
@@ -559,7 +560,7 @@ function parsePlacement(raw: string, path: string): PlacementIntent | null {
       && (intent.identity === undefined || (typeof intent.identity?.dev === "string"
         && typeof intent.identity?.ino === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.dev)
         && /^[1-9][0-9]*$/.test(intent.identity.ino)
-        && (intent.identity.ctimeNs === undefined || (typeof intent.identity.ctimeNs === "string" && /^-?(0|[1-9][0-9]*)$/.test(intent.identity.ctimeNs)))
+        && (intent.identity.sha256 === undefined || (typeof intent.identity.sha256 === "string" && /^[a-f0-9]{64}$/.test(intent.identity.sha256)))
         && (intent.identity.size === undefined || (typeof intent.identity.size === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.size)))))) {
       const phase = phaseOf(intent);
       return {
@@ -620,7 +621,7 @@ function retireFailedMarker(root: string, path: string, file: string, messageId:
     if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
     const marker = lstatSync(path, { bigint: true });
     const kept = lstatSync(tombstone, { bigint: true });
-    if (!matchesFileIdentity(marker, fileIdentity(kept))) {
+    if (!marker.isFile() || !kept.isFile() || !matchesFileIdentity(marker, fileIdentity(kept, readFileSync(tombstone)), readFileSync(path))) {
       const refusal = new Error(`failed tombstone occupied for ${file} (message ${messageId}); marker and tombstone kept`);
       refusal.name = "FailedTombstoneOccupiedError";
       throw refusal;
@@ -668,7 +669,7 @@ function writePlacementIntent(root: string, messageId: string, file: string, sou
   if (sourcePath !== undefined) {
     const stat = typeof sourcePath === "number" ? fstatSync(sourcePath, { bigint: true }) : lstatSync(sourcePath, { bigint: true });
     if (!stat.isFile()) throw new Error("placement source is not a regular file");
-    identity = fileIdentity(stat);
+    identity = fileIdentity(stat, readFileSync(sourcePath));
   }
   const tmp = `${path}.${randomUUID()}.tmp`;
   const fd = openSync(tmp, "wx", 0o600);
@@ -795,11 +796,11 @@ function completeInProgressPlacement(root: string, messageId: string, file: stri
   let stat: BigIntStats;
   try {
     stat = lstatSync(join(root, "cur", file), { bigint: true });
+    if (!stat.isFile() || !matchesFileIdentity(stat, intent.identity, readFileSync(join(root, "cur", file)))) return "identity";
   } catch (err) {
     if (isMissing(err)) return "identity";
     throw err;
   }
-  if (!matchesFileIdentity(stat, intent.identity)) return "identity";
   unlinkSync(placementIntentPath(root, file));
   syncDirectory(root);
   return "completed";
