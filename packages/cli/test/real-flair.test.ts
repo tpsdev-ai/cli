@@ -98,7 +98,7 @@ realFlair("agent registration reads its key back from Flair, the cli#512 seam", 
   const missing = freshAgentId("reg");
   expect(await agent.client.readStoredPublicKey(missing, target.admin)).toEqual({ found: false, publicKey: null });
   // On current Flair a registration over Agent PUT does not complete, so the
-  // read-back is the only honest source of truth: it stays absent.
+  // read-back stays the source of truth: it stays absent.
   const registrar = new FlairClient({ agentId: missing, keyPath: agent.keyPath, baseUrl: target.baseUrl });
   await expect(registrar.registerAgent(missing, agent.publicKey, target.admin)).rejects.toThrow();
   expect(await agent.client.readStoredPublicKey(missing, target.admin)).toEqual({ found: false, publicKey: null });

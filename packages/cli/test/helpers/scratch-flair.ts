@@ -1,7 +1,7 @@
 /**
  * scratch-flair.ts — ONE scratch Flair for the tests that cross the Flair seam.
  *
- * Every other cli test of a Flair interaction drives a fake. This helper starts a
+ * A cli test of a Flair interaction usually drives a fake. This helper starts a
  * REAL one instead: it installs the published `@tpsdev-ai/flair` package into a
  * throwaway prefix, boots the Harper that serves it on OS-chosen loopback ports
  * with an isolated HOME and a short-root data dir, and seeds one operator and two
@@ -194,7 +194,7 @@ export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess
   mkdirSync(prefix, { recursive: true });
 
   // Install the published Flair (it brings Harper). Isolated prefix, isolated
-  // npm cache (HOME is the scratch home), public registry only.
+  // npm cache (HOME is the scratch home).
   execFileSync(
     "npm",
     ["install", "--prefix", prefix, "--no-audit", "--no-fund", "--loglevel", "error", `${FLAIR_PACKAGE}@${FLAIR_VERSION}`],

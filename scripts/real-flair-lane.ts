@@ -22,7 +22,7 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI_DIR = join(REPO, "packages", "cli");
 const TEST_DIR = join(CLI_DIR, "test");
 
-/** Every `.test.ts` under `packages/cli/test` that opts into the real-Flair cases. */
+/** Every test file under `packages/cli/test` that opts into the real-Flair cases. */
 function markedFiles(): string[] {
   const found: string[] = [];
   const walk = (dir: string): void => {

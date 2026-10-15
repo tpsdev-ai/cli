@@ -23,6 +23,7 @@
  * CODE and have adopted the shape cli#415 gave `test.yml`:
  *
  *   - `test.yml` — guarded (runs on `pull_request`).
+ *   - `real-flair.yml` — guarded (runs on `pull_request`, path-filtered).
  *   - `docker.yml` — NOT guarded: its only trigger is `workflow_dispatch`; it
  *     has no `pull_request` trigger.
  *   - `release.yml` — NOT guarded: triggered by a `push` of `v*` tags, not by a
@@ -69,7 +70,7 @@ const REPO = join(import.meta.dir, "..", "..", "..");
 const WORKFLOW_DIR = join(REPO, ".github", "workflows");
 
 /** Workflows the four rules are enforced on. */
-const GUARDED = ["test.yml"];
+const GUARDED = ["test.yml", "real-flair.yml"];
 
 /** Workflows that run PR-controlled code but are not (yet) held to the rules. */
 const PR_EXCLUDED: Record<string, string> = {
