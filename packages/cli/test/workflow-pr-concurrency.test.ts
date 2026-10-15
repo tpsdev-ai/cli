@@ -8,13 +8,12 @@
  * `smoke.yml`'s compiled-binary matrix linux-x64 only on a pull request.
  * actionlint parses the workflow for structure, not for what its expressions
  * select: `cancel-in-progress: false`, or a matrix that keeps all four targets on
- * a pull request, still parses and still passes every other test. This file
+ * a pull request, still parses. This file
  * evaluates the expressions the workflows actually carry and holds them to that
  * behaviour — the real workflow text, not a fixture copy of it.
  *
- * This is a detective, not a boundary: a pull request can edit the workflow and
- * this test together, and the boundary is review of the diff. What it holds is
- * that the behaviour cannot change silently.
+ * This test pins the matrix targets, concurrency keys and cancellation flags
+ * for the contexts below.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -112,23 +111,36 @@ describe("PR load cut — smoke matrix selection (cli#643)", () => {
 });
 
 describe("PR load cut — concurrency-group separation (cli#643)", () => {
-  for (const file of ["test.yml", "smoke.yml"]) {
-    test(`${file}: a pull request cancels its own run; a main push is grouped per run`, () => {
+  for (const [file, prefix, otherFile] of [
+    ["test.yml", "test", "smoke.yml"],
+    ["smoke.yml", "smoke", "test.yml"],
+  ]) {
+    test(`${file}: PR keys survive workflow renames and differ from main keys`, () => {
       const wf = load(file);
       const pr = prCtx(file);
+      const nextPr = { ...pr, runId: pr.runId + 1, workflow: `${pr.workflow} renamed` };
       const push = pushCtx(file);
       const group = wf.concurrency?.group;
       const cancel = wf.concurrency?.["cancel-in-progress"];
       expect(group, `${file}: a concurrency group is present`).toBeTruthy();
       expect(cancel, `${file}: a cancel-in-progress flag is present`).toBeTruthy();
 
-      expect(interpolate(group as string, pr)).toBe(`${wf.name}-pr-42`);
-      expect(interpolate(group as string, push)).toBe(`${wf.name}-7001`);
-      // The two events never share a group, so a main push cannot cancel a PR's
-      // run (or the reverse).
-      expect(interpolate(group as string, pr)).not.toBe(interpolate(group as string, push));
+      const prKey = interpolate(group as string, pr);
+      const mainKey = interpolate(group as string, push);
+      const otherGroup = load(otherFile).concurrency?.group;
+      expect(otherGroup, `${otherFile}: a concurrency group is present`).toBeTruthy();
+      const otherPrKey = interpolate(otherGroup as string, prCtx(otherFile));
+
+      expect(prKey).toBe(`${prefix}-pr-42`);
+      expect(interpolate(group as string, nextPr)).toBe(prKey);
+      expect(prKey).not.toBe(otherPrKey);
+      expect(mainKey).toBe(`${prefix}-7001`);
+      expect(mainKey).not.toBe(prKey);
+      expect(mainKey).not.toBe(otherPrKey);
+      expect(interpolate(group as string, { ...push, runId: push.runId + 1 })).not.toBe(mainKey);
 
       expect(interpolate(cancel as string, pr)).toBe("true");
+      expect(interpolate(cancel as string, nextPr)).toBe("true");
       expect(interpolate(cancel as string, push)).toBe("false");
     });
   }

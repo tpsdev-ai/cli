@@ -24,7 +24,7 @@ permissions:
 # only when this workflow's path filter matches. A push to main gets a group
 # unique per run (`run_id`), so this rule does not cancel a main run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  group: smoke-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
