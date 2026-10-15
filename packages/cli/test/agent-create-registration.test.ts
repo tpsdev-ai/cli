@@ -675,10 +675,10 @@ test("the row holds a value that decodes to the wrong length: exits non-zero", a
 
 /**
  * The seam through the REAL component: a real Harper running Flair. Skipped
- * unless TPS_TEST_REAL_FLAIR=1 (cli#591), in which case `getScratchFlair()`
- * boots the scratch instance this file runs against. Current Flair drops
- * `publicKey` on Agent PUT/PATCH, so a fresh `create` cannot register: it must
- * exit non-zero and print no success line.
+ * unless TPS_TEST_REAL_FLAIR=1 (cli#591); the real-Flair lane starts the scratch
+ * instance and exports its ports, which `flairTarget()` reads. Current Flair
+ * drops `publicKey` on Agent PUT/PATCH, so a fresh `create` cannot register: it
+ * must exit non-zero and print no success line.
  */
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
   "against a real Flair, create refuses when the generated key cannot be registered",
