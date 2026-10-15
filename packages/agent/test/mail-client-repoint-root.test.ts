@@ -11,7 +11,7 @@
  * The first case repoints the configured mail root between operations and
  * checks that the next operation uses the new target. The remaining cases
  * repoint a symlink while an operation is in progress (paused in signature
- * verification, or between the outbox read and the delivery move) and check
+ * verification, or immediately before the underlying outbox read) and check
  * that the operation finishes against the target it started with. Where a
  * lock must exclude the client, a real second process holds it.
  */
@@ -302,7 +302,7 @@ test("deliverOutbox moves a record into the recipient inbox under the root the o
   writeFileSync(join(storeOld, AGENT, "outbox", "o.json"), JSON.stringify({ to: "peer", body: "x", sentAt }));
   const dest = "2026-10-13T00-00-00-000Z-o.json";
 
-  // Repoint the mail root after the outbox record is read and before it is moved.
+  // Repoint the mail root immediately before the underlying outbox read.
   const read = fs.readFileSync;
   let repointed = false;
   const spy = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof read>) => {
