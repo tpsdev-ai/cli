@@ -13,5 +13,9 @@
   agent moves. Presence is not federated. The presence columns read
   `unavailable`, not an empty column, when the read cannot be signed (it is then
   not sent) or fails, or when the roster has a missing or invalid field the
-  views read, fields that contradict how Flair derives them, or
-  two records for one agent. Office status prints no blocker line.
+  views read or two records for one agent. Cross-field checks reject stale
+  task/activity (a stale record with a current task or non-`idle` activity),
+  fresh activity equality (fresh activity differing from lastActivity), and
+  offline freshness (an offline record with fresh activity). Other combinations
+  are not checked, including status versus a future heartbeat. Office status
+  prints no blocker line.

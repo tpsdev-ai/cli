@@ -35,11 +35,12 @@
  * whole read is `unavailable` when one record has such a field missing or
  * invalid (a status or activity outside Flair's vocabulary, a heartbeat time
  * that is not a finite number, or a current task other than null or the output
- * of slicing a non-empty trimmed string to 200 characters), when one
- * record's fields contradict how Flair derives them (a stale record with a
- * current task or an activity other than `idle`, a fresh record whose activity
- * differs from its last activity, an offline record with fresh activity), or
- * when two records share an id.
+ * of slicing a non-empty trimmed string to 200 characters), or when two records
+ * share an id. Cross-field checks reject: stale task/activity (a stale record
+ * with a current task or non-`idle` activity), fresh activity equality (fresh
+ * activity differing from lastActivity), and offline freshness (an offline
+ * record with fresh activity). Other combinations are not checked, including
+ * status versus a future heartbeat.
  */
 
 /** Flair's derived presence status (resources/Presence.ts derivePresenceStatus). */
@@ -119,11 +120,9 @@ function toPresenceRecord(value: unknown): PresenceRecord | { invalid: string } 
     task.trimStart() !== task || (task.length < CURRENT_TASK_MAX_LENGTH && task.trimEnd() !== task)
   ))
     return bad("currentTask");
-  // How Flair derives the record (resources/Presence.ts get()): a stale record
-  // serves "idle" as its activity and no current task; a fresh one serves the
-  // asserted activity as both activity and lastActivity; and the activity is
-  // stale by the time the heartbeat is offline (same threshold, and the
-  // activity stamp is never newer than the heartbeat).
+  // For rows written through Flair's heartbeat path, the activity stamp is
+  // never newer than the heartbeat. Flair's read path does not enforce this
+  // for stored rows.
   if (!r.activityFresh && (task !== null || r.activity !== "idle"))
     return { invalid: "a stale presence record carries a current task or an activity other than idle" };
   if (r.activityFresh && r.activity !== r.lastActivity)

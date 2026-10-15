@@ -1,12 +1,15 @@
 /**
- * cli#622 — `readPresence` fails closed. It is driven against the shared
+ * cli#622 — `readPresence` is driven against the shared
  * verifying stub (`helpers/stub-flair.ts`), whose `presenceRoute` is a fake of
  * Flair's coded `GET /Presence` contract (resources/Presence.ts): a verified
  * reader gets records derived from stored heartbeat rows, and an unverified
  * caller gets 401. A read the reader cannot sign is not sent, and a refused or
  * rejected request, or a roster the reader does not accept (see its module
- * doc), returns the bounded `unavailable`. The fixtures name no production
- * agent.
+ * doc), returns the bounded `unavailable`. Cross-field cases cover stale
+ * task/activity (a stale record with a current task or non-idle activity),
+ * fresh activity equality (fresh activity differing from lastActivity), and
+ * offline freshness (an offline record with fresh activity). Other combinations
+ * are not checked, including status versus a future heartbeat.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readPresence } from "../src/utils/presence-read.js";
