@@ -10,6 +10,8 @@
 
 import { spawnSync } from "node:child_process";
 import snooplogg from "snooplogg";
+import type { FlairClient } from "./flair-client.js";
+import { startTaskLoop } from "./flair-task-loop.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:github");
 
 
@@ -74,6 +76,7 @@ export function reRequestReviewer(
 export async function handlePrOpened(
   event: { detail?: string; summary: string; refId?: string },
   config: ReviewTriggerConfig,
+  deps: ReviewRequestDeps = {},
 ): Promise<void> {
   const detail = event.detail ?? "";
   const prNumber = extractPrNumber(detail);
@@ -83,5 +86,24 @@ export async function handlePrOpened(
     return;
   }
 
-  requestReviews(prNumber, config);
+  requestReviews(prNumber, config, deps);
+}
+
+/**
+ * Poll the agent's own feed for `pr.opened`, using a different cursor filename from the task loop.
+ * The loop ID allows the CLI's 64-character agent ID plus `-review-trigger`.
+ */
+export function startReviewTriggerLoop(
+  flair: FlairClient,
+  agentId: string,
+  config: { reviewers: string[]; repo: string },
+  opts: { pollIntervalMs?: number; deps?: ReviewRequestDeps } = {},
+): { stop: () => Promise<void> } {
+  const triggerConfig: ReviewTriggerConfig = { reviewers: config.reviewers, agentId, repo: config.repo };
+  return startTaskLoop(
+    flair,
+    agentId,
+    async (event) => { await handlePrOpened(event, triggerConfig, opts.deps); },
+    { kinds: ["pr.opened"], loopId: `${agentId}-review-trigger`, pollIntervalMs: opts.pollIntervalMs },
+  );
 }

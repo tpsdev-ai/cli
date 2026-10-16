@@ -26,7 +26,7 @@ import {
 } from "./agent-lifecycle.js";
 import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
-import { handlePrOpened } from "./pr-review-trigger.js";
+import { startReviewTriggerLoop } from "./pr-review-trigger.js";
 import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
 import type { Envelope } from "@tpsdev-ai/agent";
@@ -853,16 +853,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     }
   });
 
-  // Review trigger — listens for pr.opened and auto-requests K&S review
+  // Review trigger — polls the agent's own feed using a different cursor filename from the task loop.
   if (config.reviewTrigger) {
-    const triggerConfig = {
-      reviewers: config.reviewTrigger.reviewers,
-      agentId,
-      repo: config.reviewTrigger.repo,
-    };
-    startTaskLoop(flair, `${agentId}-review-trigger`, async (event) => {
-      await handlePrOpened(event, triggerConfig);
-    }, { kinds: ["pr.opened"] });
+    startReviewTriggerLoop(flair, agentId, config.reviewTrigger);
     console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
   }
 
