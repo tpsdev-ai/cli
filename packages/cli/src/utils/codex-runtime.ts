@@ -715,9 +715,12 @@ export const PR_RESULT_PUBLISH_RETRY_MS = 250;
 
 /**
  * Publish the PR URL as a `pr.opened` OrgEvent targeted at the agent, so the
- * agent's own review-trigger loop sees it. The POST is idempotent; a failure is
- * retried up to `PR_RESULT_PUBLISH_ATTEMPTS` times, and the final failure is
- * logged with the PR URL so an operator can request the review manually.
+ * agent's own review-trigger loop sees it. Flair assigns the event a fresh id on
+ * each POST, so a retry after an uncertain response can publish it twice; the
+ * review loop tolerates a duplicate because GitHub treats re-requesting the same
+ * reviewer as idempotent. A failed publish is attempted up to
+ * `PR_RESULT_PUBLISH_ATTEMPTS` times in total, and the final failure is logged
+ * with the PR URL so an operator can request the review manually.
  */
 export async function publishPrResult(
   flair: Pick<FlairClient, "request">,

@@ -34,11 +34,11 @@ describe("pr-review-trigger", () => {
   });
 
   test("handlePrOpened: fails the handler when detail has no PR URL", async () => {
-    // Missing PR data must fail the handler, so the loop retries the event
-    // instead of marking it done and advancing the cursor.
+    // A missing PR URL is a permanent failure: the handler throws
+    // PermanentEventError, so the loop records and skips the event.
     await expect(
       handlePrOpened({ detail: "branch-name-only", summary: "PR" }, cfg)
-    ).rejects.toThrow("No PR number in event detail: branch-name-only");
+    ).rejects.toThrow(PermanentEventError);
   });
 
   test("handlePrOpened: fails the handler when detail is empty", async () => {

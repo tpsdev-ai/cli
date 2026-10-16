@@ -212,7 +212,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
   );
 
   test("a permanently bad pr.opened is recorded and skipped, and a later good one still gets its review request", async () => {
-    // detail is immutable once published: no /pull/<n> URL is a permanent failure.
+    // A branch-only detail is permanently rejected by this handler.
     const bad = { ...prOpened("e1", 5, [AGENT], 1, AGENT), detail: "branch-only" };
     const good = prOpened("e2", 4, [AGENT], 2, AGENT);
     const { route } = serve({ events: [bad, good] });
@@ -286,5 +286,30 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     expect(attempts).toBe(REVIEW_TRIGGER_MAX_ATTEMPTS + 1);
     expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));
     expect(warnings).toContain("skipped after the attempt bound");
+  });
+
+  test("a duplicate pr.opened from a retried publish is handled again harmlessly: the same reviewer is requested, which GitHub treats as idempotent", async () => {
+    // A lost publication response makes the runtime POST the same pr.opened
+    // twice; each copy reaches a review request for the same PR and reviewer.
+    const first = prOpened("e1", 5, [AGENT], 1, AGENT);
+    const duplicate = { ...first, id: "e2" };
+    const { route } = serve({ events: [first, duplicate] });
+    const ghCalls: Array<{ args: string[] }> = [];
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, args: string[]) => {
+        ghCalls.push({ args });
+        return { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    try {
+      expect(await waitFor(() => cursorPosition() === positionOf(duplicate))).toBe(true);
+    } finally {
+      await loop.stop();
+    }
+    // Both copies requested the same reviewer on the same PR; the second is a no-op on GitHub.
+    expect(ghCalls).toHaveLength(2);
+    expect(ghCalls[1]).toEqual(ghCalls[0]);
+    expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));
   });
 });

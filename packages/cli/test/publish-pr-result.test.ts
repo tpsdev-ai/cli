@@ -1,8 +1,9 @@
 /**
  * The runtime publishes a `pr.opened` OrgEvent when a task opens a PR, so the
- * agent's own review-trigger loop sees it (cli#644). The POST is idempotent; a
- * failure is retried a bounded number of times and the last failure is logged
- * with the PR URL, so a lost event is at least visible to an operator.
+ * agent's own review-trigger loop sees it (cli#644). Flair assigns a fresh id on
+ * each POST, so a retry after an uncertain response can publish the event twice;
+ * a failure is attempted a bounded number of times and the last failure is
+ * logged with the PR URL, so a lost event is at least visible to an operator.
  */
 import { describe, expect, test } from "bun:test";
 import { PR_RESULT_PUBLISH_ATTEMPTS, publishPrResult } from "../src/utils/codex-runtime.js";
@@ -49,7 +50,7 @@ describe("publishPrResult", () => {
     expect(calls).toBe(0);
   });
 
-  test("retries the idempotent POST a bounded number of times and logs the PR URL with the last error", async () => {
+  test("retries the POST a bounded number of times and logs the PR URL with the last error", async () => {
     let calls = 0;
     const flair = { request: async () => { calls++; throw new Error("flair 503"); } };
     const lines = await captureWarn(async () => {
@@ -59,6 +60,26 @@ describe("publishPrResult", () => {
     const text = lines.join("\n");
     expect(text).toContain(PR_URL);
     expect(text).toContain("flair 503");
+    expect(text).toContain(`after ${PR_RESULT_PUBLISH_ATTEMPTS} attempts`);
+  });
+
+  test("a lost response after an accepted write posts the event a second time, so a duplicate is possible", async () => {
+    const posts: Array<Record<string, unknown>> = [];
+    let calls = 0;
+    const flair = {
+      request: async (_method: string, _path: string, body?: unknown) => {
+        calls++;
+        posts.push(body as Record<string, unknown>);
+        // The write was accepted but its response was lost: the client cannot
+        // tell, so it retries and Flair stores a second event.
+        if (calls === 1) throw new Error("socket hang up");
+        return {};
+      },
+    };
+    await publishPrResult(flair as never, "agent-a", "task-1", PR_URL, { sleep: async () => {} });
+    expect(calls).toBe(2);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toEqual(posts[0]);
   });
 
   test("stops retrying once the POST succeeds", async () => {

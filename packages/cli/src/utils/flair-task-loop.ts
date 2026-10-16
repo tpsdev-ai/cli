@@ -38,8 +38,9 @@
  * memory, so the saved position stays behind it until a later save succeeds; a
  * restart before that replays the events in between rather than skipping them.
  *
- * SAFETY. The saved position never passes a task before its handler succeeds,
- * provided that once saved, the cursor file is not removed or corrupted; the
+ * SAFETY. The saved position never passes a task before its handler succeeds or
+ * the task is recorded and skipped (BOUNDED RETRIES below), provided that once
+ * saved, the cursor file is not removed or corrupted; the
  * feed only appends (a new event sorts after those already served), with
  * positions within MAX_POSITION_SKEW_MS of the server's time; and an event does
  * not expire before its handler succeeds.
@@ -56,9 +57,10 @@
  *
  * BOUNDED RETRIES. A handler that throws `PermanentEventError` (a failure a
  * retry cannot fix) or keeps failing past the caller's `maxAttempts` has its
- * reason recorded, its event marked handled, and the cursor advanced past it, so
- * no event holds the loop forever. With `maxAttempts` unset the retry is
- * unbounded, as the DELIVERY paragraph above describes.
+ * reason recorded and its event marked handled; the cursor advances past it
+ * subject to the existing skew and persistence rules, so no event holds the
+ * loop forever. With `maxAttempts` unset the retry is unbounded, as the DELIVERY
+ * paragraph above describes.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
@@ -120,9 +122,10 @@ export function isSafeLoopId(loopId: string): boolean {
 
 /**
  * Thrown by a task handler for a failure a retry cannot fix: a malformed event,
- * a 404/422 from the upstream API. The loop records its reason, marks the event
- * handled and advances the cursor past it, so one bad event cannot hold the loop
- * at it (head-of-line blocking) forever.
+ * a 404/422 from the upstream API. The loop records its reason and marks the
+ * event handled; the cursor advances past it subject to the existing skew and
+ * persistence rules, so one bad event cannot hold the loop at it (head-of-line
+ * blocking) forever.
  */
 export class PermanentEventError extends Error {
   constructor(reason: string) {

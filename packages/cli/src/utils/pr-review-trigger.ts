@@ -10,7 +10,7 @@
  * itself authored. `handlePrOpened` throws `PermanentEventError` for a failure a
  * retry cannot fix (a detail that names no repository, a 404/422 from gh) and an
  * ordinary error for a transient one, so the loop skips the former and retries
- * the latter up to `REVIEW_TRIGGER_MAX_ATTEMPTS` times.
+ * the latter within the attempt bound.
  */
 
 import { spawnSync } from "node:child_process";
@@ -19,7 +19,7 @@ import type { FlairClient } from "./flair-client.js";
 import { PermanentEventError, startTaskLoop } from "./flair-task-loop.js";
 const { log: slog, warn: swarn } = snooplogg("tps:github");
 
-/** How many times the review loop retries one event whose review request failed transiently. */
+/** Maximum total attempts per event, including the initial request. */
 export const REVIEW_TRIGGER_MAX_ATTEMPTS = 3;
 
 
