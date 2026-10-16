@@ -19,7 +19,7 @@ export type {
 
 // I/O
 export { MailClient } from "./io/mail.js";
-export type { MailMessage } from "./io/mail.js";
+export type { MailMessage, MailDelivery, DeliverNextResult, DeliveryDeferral, DeliveryCompletion, DeliveryRelease } from "./io/mail.js";
 export { MemoryStore } from "./io/memory.js";
 export type { MemoryEvent } from "./io/memory.js";
 export { ContextManager } from "./io/context.js";
@@ -53,10 +53,11 @@ export {
   ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId, tryParseEnvelope, parseSignedEnvelope,
   decideEnvelopeForMailbox, isTopicRecipient, mailboxReplayStore, peekConsumedForMailboxRoot, hasCommittedMessageId,
   pendingPlacementEntries,
-  placeCurRecord,
+  placeCurRecord, fileIdentity, matchesFileIdentity,
+  MAX_DELIVERY_PRESENTATIONS, DELIVERY_PRESENTATION_TTL_MS,
 } from "./lib/mailbox-policy.js";
-export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery } from "./lib/mailbox-policy.js";
-export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processStartToken } from "./lib/mail-lock.js";
+export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery, PresentationAdvance, PresentationClaim, PlacementState, PlacementCompletion } from "./lib/mailbox-policy.js";
+export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, processIsGone, processStartToken } from "./lib/mail-lock.js";
 export type { MailLock } from "./lib/mail-lock.js";
 export {
   KeyFormatError, AgentKeyError, AgentKeyConflictError,

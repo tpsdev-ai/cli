@@ -68,8 +68,9 @@ function committed(fields: Record<string, unknown>) {
     checkedOutAt: now(), checkedOutBy: agent, deliveryAttempts: 1,
   }));
   const replay = mailboxReplayStore(inbox.root);
-  replay.beginPlacement(envelope.messageId, "record.json", scratch);
   fs.linkSync(scratch, cur);
+  fs.rmSync(scratch);
+  replay.beginPlacement(envelope.messageId, "record.json", cur);
   replay.recordConsumed(envelope.messageId);
   const [name] = fs.readdirSync(inbox.root).filter((n) => n.startsWith(".placement-") && n.endsWith(".json"));
   const intent = join(inbox.root, name!);

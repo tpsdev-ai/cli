@@ -1,3 +1,4 @@
+import { mailboxReplayStore } from "@tpsdev-ai/agent";
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
@@ -75,6 +76,28 @@ test("direct promotion and the scratch sweep preserve a stranded hard-linked cur
   expect(retry.ok).toBe(false);
   if (retry.ok) throw new Error("uncommitted record retried");
   expect(retry.class).toBe("replay");
+});
+
+test("the scratch sweep keeps links to a pending cur file until its intent is finished", async () => {
+  const source = plant("pending", "pending-scratch");
+  const inbox = mail.getInbox(agent);
+  const cur = join(inbox.cur, "record.json");
+  const scratch = join(inbox.tmp, "record.json.promote");
+  fs.linkSync(source, cur);
+  fs.linkSync(source, scratch);
+  const replay = mailboxReplayStore(inbox.root);
+  replay.beginPlacement("pending-scratch", "record.json", cur);
+  const before = fs.lstatSync(cur, { bigint: true });
+  const unrelated = join(inbox.tmp, "unrelated.promote");
+  fs.writeFileSync(unrelated, "stranded");
+  expect(await mail.sweepStrandedPromoteScratch(inbox.root)).toBe(1);
+  expect(fs.existsSync(scratch)).toBe(true);
+  expect(fs.existsSync(unrelated)).toBe(false);
+  expect(fs.lstatSync(cur, { bigint: true }).ctimeNs).toBe(before.ctimeNs);
+  expect(replay.ownsPendingPlacement("pending-scratch", "record.json")).toBe(true);
+  replay.finishPlacement("pending-scratch", "record.json");
+  expect(await mail.sweepStrandedPromoteScratch(inbox.root)).toBe(1);
+  expect(fs.existsSync(scratch)).toBe(false);
 });
 
 test("exclusive scratch creation refuses an existing hard link without changing its bytes", async () => {

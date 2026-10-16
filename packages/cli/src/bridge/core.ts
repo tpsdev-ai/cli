@@ -204,7 +204,9 @@ Message: ${envelope.content}`;
       const fullPath = join(recovery ? cur : fresh, file);
       if (!existsSync(fullPath)) return;
       try {
-        const result = await (recovery ? recoverPromoted : promote)(this.bridgeAgentId, fullPath);
+        const result = recovery
+          ? await recoverPromoted(this.bridgeAgentId, fullPath, {}, { claim: this.bridgeAgentId })
+          : await promote(this.bridgeAgentId, fullPath);
         if (!result.ok) {
           this.log(`[bridge:outbound] ${file} not promoted (${result.class}); not forwarded`);
           return;
