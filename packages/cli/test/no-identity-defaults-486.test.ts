@@ -82,7 +82,8 @@ describe("cli#486 — configured identity, no anvil default", () => {
 
       process.env.TPS_AGENT_ID = "kern";
       await expect(runDashboard({ flairUrl: stub.url })).resolves.toBeUndefined();
-      expect(requests).toEqual(["/Agent/", "/OrgEventCatchup/kern"]);
+      // No key exists for kern, so the Presence read cannot be signed and is not sent (utils/presence-read.ts).
+      expect(requests).toEqual(["/Agent/"]);
     } finally {
       fetchSpy.mockRestore();
       stub.stop();
