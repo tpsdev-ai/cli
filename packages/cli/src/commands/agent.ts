@@ -1143,7 +1143,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // (systemReadPaths()).
               // Read the toolchain roots plus the directory the config was read
               // from, so the child can re-read `--config` inside the sandbox
-              // (cli#516). Read-only, and usually the already-granted agent dir.
+              // (cli#516). This adds read access to that directory; when it is
+              // the agent dir, the `allow` grant below also makes it writable.
               read: [...new Set([...harnessReadPaths(), dirname(configPath)])],
               // Exactly this agent's own identity files, not the shared
               // identity directory (cli#351 r4).
@@ -1201,6 +1202,13 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               }
               approval = recheck;
             }
+            // The child checks the worktree out only when THIS launch created
+            // it. Remove any inherited TPS_WORKTREE_PENDING before launch and
+            // set it only after a worktree was actually created, so an
+            // inherited value never names someone else's worktree (cli#516).
+            const launchEnv: NodeJS.ProcessEnv = { ...process.env };
+            delete launchEnv.TPS_WORKTREE_PENDING;
+            if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = resolvePathMod(config.workspace);
             let exitCode: number;
             try {
               exitCode = await launchAttested(
@@ -1209,12 +1217,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 relaunch,
                 {
                   runtimeDirectories: approval.runtimeDirectories,
-                  // Signals the sandboxed child that the worktree it is about
-                  // to enter was created with the checkout suppressed. Absent
-                  // when this launch left an existing worktree alone (cli#516).
-                  env: worktreeCreated
-                    ? { ...process.env, TPS_WORKTREE_PENDING: resolvePathMod(config.workspace) }
-                    : process.env,
+                  env: launchEnv,
                 },
               );
             } finally {

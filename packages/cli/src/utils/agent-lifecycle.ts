@@ -430,6 +430,19 @@ export function checkoutWorktree(workspacePath: string): AgentLifecycleResult {
   return { changed: true, reason: "worktree checked out" };
 }
 
+/** True when `path` exists; only ENOENT counts as absent (cli#516). Any other
+ *  lstat failure — e.g. EACCES on a parent, a non-directory in the path — is
+ *  thrown, so a failed probe is never read as "nothing there". */
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
 export function onStop(_agentId: string, workspacePath?: string): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
@@ -441,7 +454,15 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "base repo not found or not a git repo" };
   }
 
-  if (!existsSync(workspace)) {
+  let workspaceExists: boolean;
+  try {
+    workspaceExists = pathExists(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `workspace probe failed for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+  if (!workspaceExists) {
     return { changed: false, reason: "workspace does not exist" };
   }
 

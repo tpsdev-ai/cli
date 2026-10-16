@@ -6,6 +6,7 @@
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { resolve, join, dirname } from "node:path";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -20,7 +21,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import { NONO_MIN_VERSION, nonoVersion, versionAtLeast } from "../src/utils/nono.js";
 import { onStart, onStop, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
-import { realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { realNonoHomeBase, sandboxHomeBase, NONO_PROBE_DENIED_PREFIX } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The shipped CLI is a node script; the real-nono case must run it with node
@@ -461,6 +462,56 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
     }
   });
 
+  test("an inherited TPS_WORKTREE_PENDING does not check an existing worktree out", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+      g(["init", "-q"]);
+      g(["config", "user.email", "agent-a@tps.dev"]);
+      g(["config", "user.name", "agent-a"]);
+      writeFileSync(join(base, "README.md"), "# base\n");
+      g(["add", "README.md"]);
+      g(["commit", "-qm", "init"]);
+      // An EXISTING branch worktree this launch did not create.
+      g(["branch", "feature"]);
+      rmSync(sb.ws, { recursive: true, force: true });
+      g(["worktree", "add", sb.ws, "feature"]);
+
+      // The child checks the worktree out only when it inherits this marker
+      // (bin/tps.ts). Record the child's environment: it must not carry the
+      // marker, because this launch created no worktree.
+      installFakeNono(
+        sb,
+        `  if [ -n "\${TPS_WORKTREE_PENDING:-}" ]; then echo "CHILD_MARKER=$TPS_WORKTREE_PENDING" >> "\${NONO_ARGV_LOG:?}"; else echo "CHILD_MARKER=absent" >> "\${NONO_ARGV_LOG:?}"; fi`,
+      );
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+      );
+
+      runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb, { TPS_WORKTREE_PENDING: sb.ws }) },
+      );
+
+      const log = existsSync(join(sb.root, "nono.log"))
+        ? readFileSync(join(sb.root, "nono.log"), "utf-8")
+        : "";
+      expect(log).toContain("CHILD_MARKER=absent");
+      // The worktree survived and is still on its branch.
+      expect(readFileSync(join(sb.ws, "README.md"), "utf-8")).toBe("# base\n");
+      const head = spawnSync("git", ["-C", sb.ws, "symbolic-ref", "-q", "HEAD"], {
+        encoding: "utf-8",
+      });
+      expect(head.stdout.trim()).toBe("refs/heads/feature");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
   for (const kind of ["absent", "plain", "file", "path-link", "marker-link", "marker-dangling"] as const) {
     test(`setup and cleanup classify a ${kind} candidate consistently`, () => {
       const sb = makeSandbox();
@@ -596,6 +647,38 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
       }
     });
   }
+
+  test("cleanup reports a workspace probe failure, not absence, when the path cannot be probed", () => {
+    const sb = makeSandbox();
+    try {
+      // A child process is given a HOME whose base repository resolves, so the
+      // workspace probe is the one that runs. The workspace's parent is a
+      // regular file, so lstat on the workspace fails with ENOTDIR on every uid
+      // (root included), where existsSync reports false.
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+      expect(g(["init", "-q"]).status).toBe(0);
+      const blocker = join(sb.root, "not-a-dir");
+      writeFileSync(blocker, "fixture\n");
+      const ws = join(blocker, "ws");
+
+      const mod = resolve(import.meta.dir, "../src/utils/agent-lifecycle.js");
+      const script =
+        `import(${JSON.stringify(mod)}).then((m) => {` +
+        ` try { m.onStop("probe", ${JSON.stringify(ws)}); console.log("NO-THROW"); }` +
+        ` catch (err) { console.log("THREW:" + err.name); } });`;
+      const r = spawnSync("bun", ["-e", script], {
+        cwd: import.meta.dir,
+        encoding: "utf-8",
+        timeout: 30_000,
+        env: { ...process.env, HOME: sb.home },
+      });
+      expect(output(r)).toContain("THREW:WorktreeLifecycleError");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -710,14 +793,15 @@ function seedRealNonoProfiles(home: string): void {
   // The monorepo root (packages/cli/test -> the checkout), where the hoisted
   // node_modules the CLI resolves its dependencies from lives.
   const repoRoot = resolve(import.meta.dir, "..", "..", "..");
-  // Exactly these directories, never their ancestors: a read grant is
-  // recursive, so an ancestor grant reaches every sibling of the checkout and
-  // the interpreter. With bun under ~/.bun that is /Users and the operator's
-  // whole home, the fixture HOME's base among them, which the launcher then
-  // (correctly) refuses. Under macOS Seatbelt, node and bun run a script and a
-  // binary below an exact grant without one (measured). The Linux Docker lane's
-  // effective grants are unchanged: /app has no ancestor below /, and the
-  // oven/bun image's /usr/local/bin already sits under the granted /usr.
+  // On macOS, these exact directories rather than their ancestors: a read
+  // grant is recursive, so an ancestor grant reaches every sibling of the
+  // checkout and the interpreter. With bun under ~/.bun that is /Users and the
+  // operator's whole home, the fixture HOME's base among them, which the
+  // launcher then (correctly) refuses. Under macOS Seatbelt, node and bun run a
+  // script and a binary below an exact grant without one (measured). On the
+  // Linux Docker lane /usr is granted and is an ancestor of the interpreter's
+  // directory; that lane's grants are otherwise unchanged: /app has no ancestor
+  // below /, and the oven/bun image's /usr/local/bin already sits under /usr.
   const read = [
     ...new Set([
       ...SYSTEM_READ,
@@ -801,7 +885,7 @@ const realNonoSuite = realNono ? describe : describe.skip;
 realNonoSuite(
   realNono ? `cli#516 — real nono (${realNono})` : `cli#516 — real nono SKIPPED: ${realNonoSkip}`,
   () => {
-    test("the base repo resolves outside the sandbox and does NOT inside it", () => {
+    test("the base repository is a repo outside the sandbox and unreadable inside it", () => {
       const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.root, "base");
@@ -849,17 +933,27 @@ realNonoSuite(
             },
           );
 
-        // The sandbox ran the command at all: the granted twin is readable, so
-        // an empty result below is a denial, not a nono that failed to start.
-        const granted = join(sb.ws, "canary-inside");
-        writeFileSync(granted, "inside-nonce");
-        const grantedRead = nonoRun(["cat", granted]);
-        expect(grantedRead.status, `nono run exited ${grantedRead.status}: ${grantedRead.stderr}`).toBe(0);
-        expect(grantedRead.stdout.trim()).toBe("inside-nonce");
-
-        // Inside the real profile: the base repo is not reachable.
-        const inside = nonoRun(["git", "-C", base, "rev-parse", "--is-inside-work-tree"]);
-        expect(inside.stdout.trim()).not.toBe("true");
+        // One successful real-nono run proves both: it reads the granted
+        // control file, and the base-repository read in the same sandbox is
+        // denied with a distinct marker. A nono that failed to start, or that
+        // granted the base read, yields neither line and fails below.
+        const controlFile = join(sb.ws, "control-inside");
+        writeFileSync(controlFile, "control-nonce");
+        const token = randomBytes(8).toString("hex");
+        const deniedMarker = `${NONO_PROBE_DENIED_PREFIX}${token}`;
+        const probe = nonoRun([
+          "sh",
+          "-c",
+          `cat "$1" 2>/dev/null || echo CONTROL-UNREADABLE; cat "$2" 2>/dev/null || echo "${NONO_PROBE_DENIED_PREFIX}$3"`,
+          "sh",
+          controlFile,
+          join(base, "README.md"),
+          token,
+        ]);
+        const lines = probe.stdout.trim().split("\n");
+        expect(probe.status, `nono run exited ${probe.status}: ${probe.stderr}`).toBe(0);
+        expect(lines[0]).toBe("control-nonce");
+        expect(lines[1]).toBe(deniedMarker);
       } finally {
         rmSync(sb.root, { recursive: true, force: true });
       }
