@@ -707,7 +707,9 @@ const SYSTEM_READ = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/opt/ho
 function seedRealNonoProfiles(home: string): void {
   const profileDir = join(home, ".config", "nono", "profiles");
   mkdirSync(profileDir, { recursive: true });
-  const repoRoot = resolve(import.meta.dir, "..", "..");
+  // The monorepo root (packages/cli/test -> the checkout), where the hoisted
+  // node_modules the CLI resolves its dependencies from lives.
+  const repoRoot = resolve(import.meta.dir, "..", "..", "..");
   // Exactly these directories, never their ancestors: a read grant is
   // recursive, so an ancestor grant reaches every sibling of the checkout and
   // the interpreter. With bun under ~/.bun that is /Users and the operator's
