@@ -4,23 +4,23 @@ import { expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { load } from "js-yaml";
-import { assertRealFlairReport, EXPECTED_CASES } from "../../../scripts/real-flair-lane.js";
-import { assertListenerAddresses, initializeScratchFlair, ScratchFlairBindError, waitForOk, withScratchFlair, type ScratchFlair, type ScratchProcess } from "./helpers/scratch-flair.js";
+import { assertRealFlairReport, EXPECTED_CASES, runRealFlairSuite } from "../../../scripts/real-flair-lane.js";
+import { assertListenerAddresses, initializeScratchFlair, provisionAgent, ScratchFlairBindError, waitForOk, withScratchFlair, type ScratchFlair, type ScratchProcess } from "./helpers/scratch-flair.js";
 import { FlairClient } from "../src/utils/flair-client.js";
 
 const repo = resolve(import.meta.dir, "../../..");
-const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
+const escapeXml = (value: string) => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 const report = () => `<testsuites>${Object.entries(EXPECTED_CASES).flatMap(([file, names]) => names.map((name) =>
-  `<testcase file="test/${file}" name="${escape(name)}" time="0.1"/>`,
+  `<testcase file="test/${file}" name="${escapeXml(name)}" time="0.1"/>`,
 )).join("")}</testsuites>`;
 
 test("the lane requires each named case in the fresh JUnit report to pass without skips", () => {
   expect(() => assertRealFlairReport(report())).not.toThrow();
   for (const [file, names] of Object.entries(EXPECTED_CASES)) {
     for (const name of names) {
-      const entry = `<testcase file="test/${file}" name="${escape(name)}" time="0.1"/>`;
+      const entry = `<testcase file="test/${file}" name="${escapeXml(name)}" time="0.1"/>`;
       for (const replacement of ["", entry.replace("/>", "><skipped/></testcase>"), entry.replace("/>", "><failure/></testcase>"), entry + entry]) {
         expect(() => assertRealFlairReport(report().replace(entry, replacement))).toThrow("expected a passed, unskipped case");
       }
@@ -159,3 +159,64 @@ test("an npm installation error removes the scratch root", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+for (const outcome of ["success", "test failure", "registration failure", "transport failure"] as const) {
+  test(`provisioned key cleanup after withScratchFlair: ${outcome}`, async () => {
+    const keys = () => [...new Bun.Glob("**/flair-key-*").scanSync({ cwd: tmpdir(), onlyFiles: true })].sort();
+    const dirs = () => [...new Bun.Glob("flair-agent-*").scanSync({ cwd: tmpdir(), onlyFiles: false })].sort();
+    expect(keys()).toEqual([]);
+    expect(dirs()).toEqual([]);
+    const restore = patchShared(globalThis, "fetch", (async () => {
+      expect(keys()).toHaveLength(1);
+      if (outcome === "transport failure") throw new Error(outcome);
+      return new Response("{}", { status: outcome === "registration failure" ? 500 : 200 });
+    }) as typeof fetch);
+    try {
+      const run = withScratchFlair(async () => {
+        const agent = await provisionAgent({ baseUrl: "http://127.0.0.1:1", opsUrl: "http://127.0.0.1:2", admin: "admin:test123" });
+        try {
+          expect(readFileSync(agent.keyPath).length).toBeGreaterThan(0);
+          if (outcome === "test failure") throw new Error(outcome);
+        } finally {
+          agent.cleanup();
+        }
+      }, async (instance) => instance as ScratchFlair & ScratchProcess);
+      if (outcome === "success") await run;
+      else await expect(run).rejects.toThrow(outcome === "registration failure" ? "could not register" : outcome);
+      expect(keys()).toEqual([]);
+      expect(dirs()).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+}
+
+test("the lane reads the launcher's report with a relative TPS_TEST_REPORT_DIR", async () => {
+  const root = mkdtempSync(join(tmpdir(), "lane-report-"));
+  const originalCwd = process.cwd();
+  const originalReportDir = process.env.TPS_TEST_REPORT_DIR;
+  const originalHome = process.env.HOME;
+  try {
+    mkdirSync(join(root, "home"));
+    process.env.HOME = join(root, "home");
+    const reportDir = join(root, "reports");
+    process.env.TPS_TEST_REPORT_DIR = relative(join(repo, "packages/cli"), reportDir);
+    const files = Object.entries(EXPECTED_CASES).map(([file, names]) => {
+      const path = join(root, file);
+      writeFileSync(path, `import { test, expect } from "bun:test";\n${names.map((name) =>
+        `test(${JSON.stringify(name)}, () => expect(process.env.TPS_TEST_REAL_FLAIR).toBe("1"));`,
+      ).join("\n")}\n`);
+      return path;
+    });
+    process.chdir(repo);
+    expect(await runRealFlairSuite({ httpPort: 45001, opsPort: 45002 }, new AbortController().signal, files)).toBe(0);
+    expect(() => assertRealFlairReport(readFileSync(join(reportDir, "real-flair.xml"), "utf8"))).not.toThrow();
+  } finally {
+    process.chdir(originalCwd);
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalReportDir === undefined) delete process.env.TPS_TEST_REPORT_DIR;
+    else process.env.TPS_TEST_REPORT_DIR = originalReportDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { withScratchFlair } from "../packages/cli/test/helpers/scratch-flair.js";
+import { withScratchFlair, type ScratchFlair } from "../packages/cli/test/helpers/scratch-flair.js";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI_DIR = join(REPO, "packages", "cli");
@@ -45,39 +45,49 @@ export function assertRealFlairReport(xml: string): void {
   }
 }
 
+export async function runRealFlairSuite(
+  flair: Pick<ScratchFlair, "httpPort" | "opsPort">,
+  signal: AbortSignal,
+  files = Object.keys(EXPECTED_CASES).map((file) => `test/${file}`),
+): Promise<number> {
+  const reportDir = process.env.TPS_TEST_REPORT_DIR
+    ? resolve(CLI_DIR, process.env.TPS_TEST_REPORT_DIR)
+    : join(REPO, "test-reports");
+  const child = spawn("node", [join(REPO, "scripts", "test-suite.mjs"), "real-flair", ...files], {
+    cwd: CLI_DIR,
+    detached: true,
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      TPS_TEST_REPORT_DIR: reportDir,
+      TPS_TEST_REAL_FLAIR: "1",
+      TPS_TEST_FLAIR_HTTP_PORT: String(flair.httpPort),
+      TPS_TEST_FLAIR_OPS_PORT: String(flair.opsPort),
+    },
+  });
+  const terminate = () => {
+    if (child.pid) {
+      try { process.kill(-child.pid, "SIGTERM"); } catch { /* child already exited */ }
+    }
+  };
+  signal.addEventListener("abort", terminate, { once: true });
+  let code: number;
+  try {
+    code = await new Promise<number>((resolveExit, reject) => {
+      child.once("error", reject);
+      child.once("exit", (status) => resolveExit(status ?? 1));
+    });
+  } finally {
+    signal.removeEventListener("abort", terminate);
+  }
+  assertRealFlairReport(readFileSync(join(reportDir, "real-flair.xml"), "utf8"));
+  return code;
+}
+
 async function main(): Promise<void> {
   const files = Object.keys(EXPECTED_CASES).map((file) => `test/${file}`);
   console.log(`real-flair lane: ${files.length} named file(s): ${files.join(", ")}`);
-  process.exitCode = await withScratchFlair(async (flair, signal) => {
-    const child = spawn("node", [join(REPO, "scripts", "test-suite.mjs"), "real-flair", ...files], {
-      cwd: CLI_DIR,
-      detached: true,
-      stdio: "inherit",
-      env: {
-        ...process.env,
-        TPS_TEST_REAL_FLAIR: "1",
-        TPS_TEST_FLAIR_HTTP_PORT: String(flair.httpPort),
-        TPS_TEST_FLAIR_OPS_PORT: String(flair.opsPort),
-      },
-    });
-    const terminate = () => {
-      if (child.pid) {
-        try { process.kill(-child.pid, "SIGTERM"); } catch { /* child already exited */ }
-      }
-    };
-    signal.addEventListener("abort", terminate, { once: true });
-    let code: number;
-    try {
-      code = await new Promise<number>((resolveExit, reject) => {
-        child.once("error", reject);
-        child.once("exit", (status) => resolveExit(status ?? 1));
-      });
-    } finally {
-      signal.removeEventListener("abort", terminate);
-    }
-    assertRealFlairReport(readFileSync(join(process.env.TPS_TEST_REPORT_DIR ?? join(REPO, "test-reports"), "real-flair.xml"), "utf8"));
-    return code;
-  });
+  process.exitCode = await withScratchFlair((flair, signal) => runRealFlairSuite(flair, signal, files));
 }
 
 if (import.meta.main) {

@@ -12,12 +12,23 @@
  * and the instance's ports, and runs this file plus the other files that carry
  * real-Flair cases.
  */
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { freshAgentId, flairTarget, provisionAgent, SEEDED_AGENTS } from "./helpers/scratch-flair.js";
 
 const realFlair = test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1");
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  while (cleanups.length) cleanups.pop()?.();
+});
+
+async function provisionTestAgent(target: ReturnType<typeof flairTarget>) {
+  const agent = await provisionAgent(target);
+  cleanups.push(agent.cleanup);
+  return agent;
+}
 
 test("flairTarget reads the lane's ports and still honours the cli#591 URL variables", () => {
   expect(freshAgentId("reg")).toMatch(/^reg-/);
@@ -52,7 +63,7 @@ test("flairTarget refuses malformed or out-of-range lane ports", () => {
 });
 
 realFlair("a signed memory write reads back with the fields it was written with", async () => {
-  const agent = await provisionAgent(flairTarget());
+  const agent = await provisionTestAgent(flairTarget());
   const id = `mem-${randomUUID()}`;
   await agent.client.writeMemory(id, "the quick brown fox jumps over the lazy dog", {
     tags: ["seam"],
@@ -72,8 +83,8 @@ realFlair("a signed memory write reads back with the fields it was written with"
 
 realFlair("a non-admin searching another agent's scope is refused, and its own scope is served", async () => {
   const target = flairTarget();
-  const reader = await provisionAgent(target);
-  const other = await provisionAgent(target);
+  const reader = await provisionTestAgent(target);
+  const other = await provisionTestAgent(target);
   const id = `mem-${randomUUID()}`;
   await reader.client.writeMemory(id, "a distinctive line about quantum bananas", { tags: ["scope"] });
   // The signer is `reader`; the requested scope is `other`'s. Flair refuses.
@@ -83,7 +94,7 @@ realFlair("a non-admin searching another agent's scope is refused, and its own s
 }, 120_000);
 
 realFlair("archiving over PATCH keeps the memory's other fields", async () => {
-  const agent = await provisionAgent(flairTarget());
+  const agent = await provisionTestAgent(flairTarget());
   const id = `mem-${randomUUID()}`;
   await agent.client.writeMemory(id, "content that must survive the archive", {
     tags: ["keep"],
@@ -105,7 +116,7 @@ realFlair("archiving over PATCH keeps the memory's other fields", async () => {
 
 realFlair("agent registration reads its key back from Flair, the cli#512 seam", async () => {
   const target = flairTarget();
-  const agent = await provisionAgent(target);
+  const agent = await provisionTestAgent(target);
   // The registered row reads back exactly the key it was registered with.
   const registered = await agent.client.readStoredPublicKey(agent.id, target.admin);
   expect(registered).toEqual({ found: true, publicKey: agent.publicKey });

@@ -240,7 +240,8 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
   const env = scratchEnv(root, home, models, httpPort, opsPort);
   await execFileAsync(NODE_BIN, [harperBin, "install"], { cwd: flairDir, env, signal, timeout: 120_000 });
 
-  const proc = instance.proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
+  const proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
+  instance.proc = proc;
   let log = "";
   proc.once("error", (error) => { log += String(error); });
   proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
@@ -329,26 +330,33 @@ export function freshAgentId(prefix = "agent"): string {
 
 /**
  * Create a keypair, register its public key through the operator API, and return a
- * signed client for it. The private key is written under the test's own temp dir.
+ * signed client for it. Call cleanup when the client is no longer needed.
  * A non-OK registration response throws.
  */
 export async function provisionAgent(
   target: FlairTarget,
   id: string = freshAgentId(),
-): Promise<{ id: string; keyPath: string; publicKey: string; client: FlairClient }> {
+): Promise<{ id: string; keyPath: string; publicKey: string; client: FlairClient; cleanup(): void }> {
   const keyPair = generateKeyPair();
-  const keyPath = join(tmpdir(), `flair-key-${id}`);
-  writeFileSync(keyPath, Buffer.from(keyPair.signing.privateKey), { mode: 0o600 });
-  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64");
-  const adminB64 = Buffer.from(target.admin).toString("base64");
-  const registered = await fetch(target.opsUrl, {
-    method: "POST",
-    headers: { Authorization: `Basic ${adminB64}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ operation: "insert", database: "flair", table: "Agent", records: [{ id, name: id, publicKey, createdAt: new Date().toISOString() }] }),
-  });
-  if (!registered.ok) {
-    const text = await registered.text().catch(() => "");
-    throw new Error(`provisionAgent could not register ${id} (${registered.status}): ${text.slice(0, 300)}`);
+  const keyDir = mkdtempSync(join(tmpdir(), "flair-agent-"));
+  const cleanup = () => rmSync(keyDir, { recursive: true, force: true });
+  try {
+    const keyPath = join(keyDir, "flair-key-private");
+    writeFileSync(keyPath, Buffer.from(keyPair.signing.privateKey), { mode: 0o600 });
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64");
+    const adminB64 = Buffer.from(target.admin).toString("base64");
+    const registered = await fetch(target.opsUrl, {
+      method: "POST",
+      headers: { Authorization: `Basic ${adminB64}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ operation: "insert", database: "flair", table: "Agent", records: [{ id, name: id, publicKey, createdAt: new Date().toISOString() }] }),
+    });
+    if (!registered.ok) {
+      const text = await registered.text().catch(() => "");
+      throw new Error(`provisionAgent could not register ${id} (${registered.status}): ${text.slice(0, 300)}`);
+    }
+    return { id, keyPath, publicKey, client: new FlairClient({ agentId: id, keyPath, baseUrl: target.baseUrl }), cleanup };
+  } catch (error) {
+    cleanup();
+    throw error;
   }
-  return { id, keyPath, publicKey, client: new FlairClient({ agentId: id, keyPath, baseUrl: target.baseUrl }) };
 }
