@@ -120,7 +120,7 @@ interface WriteScope {
   /** The job the declaration belongs to, or null for the workflow-level block. */
   job: string | null;
   scope: string;
-  /** The scope declaration’s YAML comment, which `yaml.load` does not preserve. */
+  /** Comment from the trimmed source line of the parsed node. */
   comment: string;
 }
 
@@ -167,7 +167,7 @@ interface SourceNode {
   children: SourceNode[];
 }
 
-/** Listener nodes bind comments to parsed mapping entries; unresolved ownership fails closed. */
+/** Read comments from the trimmed source line of the parsed node. */
 function declarationComments(text: string): {
   wf: Workflow;
   comments: Map<string, string>;
@@ -219,8 +219,10 @@ function declarationComments(text: string): {
   };
 
   const declarationComment = (node: SourceNode, mapping: SourceNode): string => {
-    const start = source.lastIndexOf("\n", node.end - 1) + 1;
-    const end = source.indexOf("\n", node.end);
+    const tokenEnd =
+      node.start + source.slice(node.start, node.end).trimEnd().length;
+    const start = source.lastIndexOf("\n", tokenEnd - 1) + 1;
+    const end = source.indexOf("\n", tokenEnd);
     const comment = commentOn(source.slice(start, end === -1 ? source.length : end));
     if (!comment) return "";
     const at = start + comment.column;
@@ -238,7 +240,7 @@ function declarationComments(text: string): {
         continue;
       }
       let comment = declarationComment(key, permission);
-      // A value's single source line also covers explicit `? key` / `: value` pairs.
+      // Try the value node for explicit `? key` / `: value` pairs.
       if (comment === "" && !source.slice(value.start, value.end).trim().includes("\n")) {
         comment = declarationComment(value, permission);
       }
@@ -258,7 +260,7 @@ function declarationComments(text: string): {
   return { wf, comments, unreadable };
 }
 
-/** Parsed write grants with comments from their scope's source lines. Null permissions is skipped. */
+/** Parsed write grants; comments use the trimmed source line of the parsed node. Null permissions is skipped. */
 function scanPermissions(text: string): PermScan {
   const { wf, comments, unreadable } = declarationComments(text);
   const writes: WriteScope[] = [];
@@ -281,7 +283,6 @@ function scanPermissions(text: string): PermScan {
   return { writes, unreadable };
 }
 
-/** The scan over a workflow file: parsed grants, raw-text comments. */
 function scanFile(file: string): PermScan {
   return scanPermissions(raw(file));
 }
@@ -704,6 +705,24 @@ jobs:
     expect(problems(text).join("; ")).toContain("build → contents: write (no inline comment)");
   });
 
+  test("an aliased write cannot borrow the following read grant's comment", () => {
+    const text = `permissions: {}
+jobs:
+  build:
+    env:
+      MODE: &w write
+    permissions:
+      contents: *w
+      issues: read # actions/checkout
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+`;
+    expect(scanText(text).writes).toEqual([{ job: "build", scope: "contents", comment: "" }]);
+    expect(problems(text).join("; ")).toContain("build → contents: write (no inline comment)");
+  });
+
   test("a quoted next job cannot justify the previous job's write", () => {
     const text = `${grant}  "lint":
     permissions:
@@ -789,7 +808,7 @@ describe("workflow permissions — every mutation fails for every guarded workfl
     problems: (wf: Workflow, text: string) => string[];
   }
 
-  /** The line index of the first job-level `permissions:` key. */
+  /** The line index of the first indented bare `permissions:` key. */
   const firstJobPermissionsLine = (lines: string[]): number =>
     lines.findIndex((line) => /^\s+permissions:\s*(#.*)?$/.test(line));
 
