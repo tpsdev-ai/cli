@@ -257,6 +257,10 @@ async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSig
     throw new Error(`scratch Flair refused the seed insert (${seeded.status}): ${text.slice(0, 500)}`);
   }
 
+  const warmupStarted = performance.now();
+  await agents[SEEDED_AGENTS[0]].client.writeMemory("embedding-warmup", "Warm the embedding model before the real-Flair tests.");
+  console.log(`real-flair lane: embedding warm-up took ${Math.round(performance.now() - warmupStarted)}ms`);
+
   return { baseUrl: httpUrl, opsUrl, httpPort, opsPort, admin: ADMIN_AUTH, root, agents, ops, log: () => log, proc };
 }
 

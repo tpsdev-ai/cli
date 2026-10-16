@@ -53,7 +53,7 @@ realFlair("a signed memory write reads back with the fields it was written with"
   expect(read.type).toBe("note");
   expect(read.tags).toEqual(["seam"]);
   expect(read.archived ?? false).toBe(false);
-});
+}, 120_000);
 
 realFlair("a non-admin searching another agent's scope is refused, and its own scope is served", async () => {
   const target = flairTarget();
@@ -65,7 +65,7 @@ realFlair("a non-admin searching another agent's scope is refused, and its own s
   await expect(reader.client.search("quantum bananas", 5, { agentId: other.id })).rejects.toThrow(/403/);
   const own = await reader.client.search("quantum bananas", 5, { agentId: reader.id });
   expect(own.map((r) => r.id)).toContain(id);
-});
+}, 120_000);
 
 realFlair("archiving over PATCH keeps the memory's other fields", async () => {
   const agent = await provisionAgent(flairTarget());
@@ -86,7 +86,7 @@ realFlair("archiving over PATCH keeps the memory's other fields", async () => {
   expect(after.tags).toEqual(before.tags);
   expect(after.type).toBe(before.type);
   expect(after.durability).toBe(before.durability);
-});
+}, 120_000);
 
 realFlair("agent registration reads its key back from Flair, the cli#512 seam", async () => {
   const target = flairTarget();
@@ -102,4 +102,4 @@ realFlair("agent registration reads its key back from Flair, the cli#512 seam", 
   const registrar = new FlairClient({ agentId: missing, keyPath: agent.keyPath, baseUrl: target.baseUrl });
   await expect(registrar.registerAgent(missing, agent.publicKey, target.admin)).rejects.toThrow();
   expect(await agent.client.readStoredPublicKey(missing, target.admin)).toEqual({ found: false, publicKey: null });
-});
+}, 120_000);
