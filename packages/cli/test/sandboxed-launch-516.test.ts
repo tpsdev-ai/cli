@@ -11,7 +11,8 @@
  *       hooked setup could not create the worktree), and only a worktree this
  *       launch created is removed;
  *   (3) the sandbox-flag scan reads the arguments before a wrapped payload: a
- *       `--sandbox <word>` inside a message or a wrapped command is not a flag.
+ *       `--sandbox <word>` or `--sandboxed` inside a message or a wrapped
+ *       command is not a flag, while tps's own such flag is still refused.
  *
  * The launcher cases spawn the built binary with piped stdio (a non-TTY context)
  * against a fake nono that logs its argv; each behavioural case fails on `main`
@@ -417,10 +418,10 @@ describe("cli#516 (2) — worktree setup reaches the base repository", () => {
 });
 
 // ---------------------------------------------------------------------------
-// (3) — the sandbox-flag scan reads only tps's own arguments
+// (3) — the sandbox-flag scan reads the arguments before a wrapped payload
 // ---------------------------------------------------------------------------
 
-describe("cli#516 (3) — --sandbox inside a message or wrapped command is not a flag", () => {
+describe("cli#516 (3) — --sandbox/--sandboxed inside a message or wrapped command is not a flag", () => {
   test("a message body containing --sandbox <word> is not refused as a flag", () => {
     const sb = makeSandbox();
     try {
@@ -456,6 +457,47 @@ describe("cli#516 (3) — --sandbox inside a message or wrapped command is not a
         { cwd: sb.run, env: { ...process.env, HOME: sb.home } },
       );
       expect(output(r)).toContain("--sandbox accepts only 'true' or 'false'");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a message payload containing --sandboxed is not refused as a launcher claim", () => {
+    const sb = makeSandbox();
+    try {
+      const r = runLauncher(
+        ["agent", "run", "--id", "ghost", "--message", "hi", "--sandboxed"],
+        { cwd: sb.run, env: { ...process.env, HOME: sb.home } },
+      );
+      expect(output(r)).not.toContain("no launcher released this process");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a wrapped command containing --sandboxed is not refused as a launcher claim", () => {
+    const sb = makeSandbox();
+    try {
+      const r = runLauncher(["secrets-guard", "printf", "hi", "--sandboxed"], {
+        cwd: sb.run,
+        env: { ...process.env, HOME: sb.home },
+      });
+      expect(output(r)).not.toContain("no launcher released this process");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("an actual, unattested --sandboxed flag is still refused", () => {
+    // The gate must still refuse tps's OWN --sandboxed, or the fix would let a
+    // hand-typed claim through.
+    const sb = makeSandbox();
+    try {
+      const r = runLauncher(["agent", "start", "--sandboxed"], {
+        cwd: sb.run,
+        env: { ...process.env, HOME: sb.home },
+      });
+      expect(output(r)).toContain("no launcher released this process");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
