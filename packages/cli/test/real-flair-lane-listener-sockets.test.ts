@@ -8,7 +8,7 @@
 import { expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createServer, type AddressInfo, type Server } from "node:net";
-import { assertLoopbackListeners, type DiscoveryTool } from "./helpers/scratch-flair.js";
+import { assertLoopbackListeners, type DiscoveryTool, ScratchFlairBindError } from "./helpers/scratch-flair.js";
 
 /** The no-argument entry, plus each discovery tool forced. */
 type Mode = "default" | DiscoveryTool;
@@ -48,10 +48,37 @@ function check(mode: Mode, ports: number[]): void {
   else assertLoopbackListeners(ports, mode);
 }
 
-/** Register a case for `mode`; a forced tool that is not installed skips, naming the reason. */
+/**
+ * Register a case for `mode`. A forced tool that is not installed skips, naming the reason; the
+ * default entry needs at least one of the tools, so it skips, naming both, when neither is installed
+ * (otherwise every refusal case would pass on the missing-tool error instead of a refusal).
+ */
 function caseFor(mode: Mode, name: string, fn: () => Promise<void> | void): void {
-  if (mode === "default" || toolPresent(mode)) test(`[${mode}] ${name}`, fn);
+  if (mode === "default") {
+    if (toolPresent("lsof") || toolPresent("ss")) test(`[${mode}] ${name}`, fn);
+    else test.skip(`[${mode}] ${name} (skipped: neither lsof nor ss is installed)`, () => {});
+  } else if (toolPresent(mode)) test(`[${mode}] ${name}`, fn);
   else test.skip(`[${mode}] ${name} (skipped: ${mode} is not installed)`, () => {});
+}
+
+/** A refusal that is the checker's own address verdict, never an error from running the tool. */
+function expectBindRefusal(mode: Mode, ports: number[]): void {
+  expect(() => check(mode, ports)).toThrow(ScratchFlairBindError);
+}
+
+/**
+ * A port with no listener is refused: ss reports no address (a ScratchFlairBindError), and lsof
+ * exits non-zero for an unbound port. Either way the refusal is never a missing-tool error.
+ */
+function expectNoListenerRefusal(mode: Mode, port: number): void {
+  let thrown: unknown;
+  try {
+    check(mode, [port]);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as NodeJS.ErrnoException).code).not.toBe("ENOENT");
 }
 
 for (const mode of MODES) {
@@ -67,7 +94,7 @@ for (const mode of MODES) {
   caseFor(mode, "refuses a wildcard IPv4 listener", async () => {
     const { server, port } = await listen("0.0.0.0", 0);
     try {
-      expect(() => check(mode, [port])).toThrow();
+      expectBindRefusal(mode, [port]);
     } finally {
       await close(server);
     }
@@ -76,7 +103,7 @@ for (const mode of MODES) {
   caseFor(mode, "refuses a wildcard IPv6 listener", async () => {
     const { server, port } = await listen("::", 0, true);
     try {
-      expect(() => check(mode, [port])).toThrow();
+      expectBindRefusal(mode, [port]);
     } finally {
       await close(server);
     }
@@ -87,7 +114,7 @@ for (const mode of MODES) {
     try {
       const wildcard = await listen("::", loopback.port, true);
       try {
-        expect(() => check(mode, [loopback.port])).toThrow();
+        expectBindRefusal(mode, [loopback.port]);
       } finally {
         await close(wildcard.server);
       }
@@ -99,6 +126,6 @@ for (const mode of MODES) {
   caseFor(mode, "refuses a port with no listener", async () => {
     const { server, port } = await listen("127.0.0.1", 0);
     await close(server);
-    expect(() => check(mode, [port])).toThrow();
+    expectNoListenerRefusal(mode, port);
   });
 }
