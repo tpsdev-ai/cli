@@ -147,6 +147,13 @@ function expectNoAgentWriteAfterRegistration(requests: Array<{ method: string; p
   expect(requests.slice(post + 1).filter((req) => (req.method === "PUT" || req.method === "PATCH") && req.path === `/Agent/${id}`)).toEqual([]);
 }
 
+/** The registration POST happened, and a read-back `GET /Agent/<id>` follows it. */
+function expectReadBackAfterRegistration(requests: Array<{ method: string; path: string }>, id: string): void {
+  const post = requests.findIndex((req) => req.method === "POST" && req.path === "/AgentKeyRegister");
+  expect(post).toBeGreaterThan(-1);
+  expect(requests.slice(post + 1).some((req) => req.method === "GET" && req.path === `/Agent/${id}`)).toBe(true);
+}
+
 test("refused write and no Agent row: exits non-zero, prints no success, names agent, URL and remedy", async () => {
   const id = `${AGENT}-no-row`;
   const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
@@ -180,7 +187,8 @@ test("a pending row and an unrecognized 404 from POST /AgentKeyRegister: exits n
     const res = await runCreate(fake.url, id);
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' is not registered in Flair at ${fake.url}`);
+    expect(res.stderr).toContain(`Agent '${id}'`);
+    expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
     // the response is not asserted to have a cause: only that this client cannot
     // recognize it as the endpoint's refusal
     expect(res.stderr).toContain("POST /AgentKeyRegister answered 404 with no refusal this client recognizes");
@@ -232,11 +240,12 @@ interface RegistrarFlair {
  * `unknown_agent` (a pending row cannot authenticate as itself). `route` omits
  * the route (an unrecognized 404) or answers 405; `refusal` answers a named
  * refusal; `store: false` answers 200 without storing (the read-back then
- * differs). `route: "transport"` answers a redirect the client follows to a
- * closed port, so its fetch fails before any response; `route: "unparseable"`
- * answers 200 with a body that is not JSON; `route: "unavailable"` commits a
- * write to the row and then answers 503 `registration_unavailable` (the status
- * Flair returns after committing when its own read-back fails).
+ * differs). For the three unconfirmed routes — `transport` (a redirect the
+ * client follows to a closed port, so its fetch fails before any response),
+ * `unparseable` (200 with a body that is not JSON), and `unavailable` (503
+ * `registration_unavailable`, the status Flair returns after committing when
+ * its own read-back fails) — `commit: true` writes the key to the row before
+ * the unconfirmed response, so the read-back after the POST reads it equal.
  */
 function startRegistrarFlair(
   id: string,
@@ -245,6 +254,7 @@ function startRegistrarFlair(
     route?: "serve" | "missing" | "method" | "transport" | "unparseable" | "unavailable";
     refusal?: { status: number; error: string };
     store?: boolean;
+    commit?: boolean;
   } = {},
 ): RegistrarFlair {
   const route = opts.route ?? "serve";
@@ -258,11 +268,6 @@ function startRegistrarFlair(
     if (req.method === "POST" && url.pathname === "/AgentKeyRegister") {
       if (route === "missing") return undefined;
       if (route === "method") return new Response("method not allowed", { status: 405 });
-      // A transport failure: the client follows this redirect to a closed port and
-      // its fetch rejects, so no response body reaches the caller.
-      if (route === "transport") return new Response(null, { status: 302, headers: { Location: "http://127.0.0.1:1/nope" } });
-      // A success status whose body is not JSON: the parse path, not a refusal.
-      if (route === "unparseable") return new Response("not json", { status: 200 });
       let body: Record<string, unknown> = {};
       try {
         body = (await req.json()) as Record<string, unknown>;
@@ -270,10 +275,25 @@ function startRegistrarFlair(
         /* no body */
       }
       registerBodies.push(body);
+      // `commit: true` models a write Flair made before the unconfirmed
+      // response: the row then holds the key although the client cannot confirm
+      // the response, and the read-back after the POST reads it equal.
+      const commit = opts.commit === true;
+      // A transport failure: the client follows this redirect to a closed port and
+      // its fetch rejects, so no response body reaches the caller.
+      if (route === "transport") {
+        if (commit) row.publicKey = String(body.publicKey);
+        return new Response(null, { status: 302, headers: { Location: "http://127.0.0.1:1/nope" } });
+      }
+      // A success status whose body is not JSON: the parse path, not a refusal.
+      if (route === "unparseable") {
+        if (commit) row.publicKey = String(body.publicKey);
+        return new Response("not json", { status: 200 });
+      }
       // The committed write, then the endpoint reports the registration
       // unavailable (as Flair does after committing when its read-back fails).
       if (route === "unavailable") {
-        row.publicKey = String(body.publicKey);
+        if (commit) row.publicKey = String(body.publicKey);
         return Response.json({ error: "registration_unavailable" }, { status: 503 });
       }
       if (opts.refusal) return Response.json({ error: opts.refusal.error }, { status: opts.refusal.status });
@@ -366,7 +386,8 @@ for (const refusal of KEY_REGISTRATION_REFUSALS) {
       const res = await runCreate(fake.url, id, { keyPair });
       expect(res.exitCode).toBe(1);
       expect(res.stdout).not.toContain("registered in Flair");
-      expect(res.stderr).toContain(`Agent '${id}' is not registered in Flair at ${fake.url}`);
+      expect(res.stderr).toContain(`Agent '${id}'`);
+      expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
       expect(res.stderr).toContain(`POST /AgentKeyRegister refused the registration (${refusal.error})`);
       expect(res.stderr).toContain(refusal.remedy);
       // the endpoint's own refusal, never the unrecognized-response case
@@ -379,8 +400,24 @@ for (const refusal of KEY_REGISTRATION_REFUSALS) {
   });
 }
 
-test("the registration POST receives no response: exits non-zero reporting the registration unconfirmed, never 'not registered' and never a refusal", async () => {
-  const id = `${AGENT}-register-transport`;
+test("a transport failure after the POST was sent, but the key reads back equal: success, and the read-back runs after the POST", async () => {
+  const id = `${AGENT}-transport-equal`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey, { route: "transport", commit: true });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair, inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.exitCode).toBeUndefined();
+    expect(res.stdout).toContain("registered in Flair");
+    expectReadBackAfterRegistration(fake.requests, id);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("a transport failure after the POST and a pending read-back: this attempt was not confirmed, naming the observed state", async () => {
+  const id = `${AGENT}-transport-pending`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
   const fake = startRegistrarFlair(id, publicKey, { route: "transport" });
@@ -388,21 +425,38 @@ test("the registration POST receives no response: exits non-zero reporting the r
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
     expect(res.stderr).toContain("transport failure");
-    // the transport failure's own bounded reason, not a refusal and not the word
+    // the transport failure's own bounded reason, not a refusal name
     expect(res.stderr).toContain("connection refused");
+    expect(res.stderr).toContain("The read-back after the POST found the stored public key 'pending', not the generated key");
     expect(res.stderr).not.toContain("refused the registration");
-    expect(res.stderr).not.toContain("no refusal named");
     expect(res.stderr).not.toContain("not registered");
+    expectReadBackAfterRegistration(fake.requests, id);
     expectNoAgentWriteAfterRegistration(fake.requests, id);
   } finally {
     fake.stop();
   }
 });
 
-test("the registration POST answers 200 with a body that is not JSON: exits non-zero reporting the registration unconfirmed, a parsing failure distinct from a transport one", async () => {
-  const id = `${AGENT}-register-unparseable`;
+test("an unparseable success body, but the key reads back equal: success, and the read-back runs after the POST", async () => {
+  const id = `${AGENT}-unparseable-equal`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey, { route: "unparseable", commit: true });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair, inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.exitCode).toBeUndefined();
+    expect(res.stdout).toContain("registered in Flair");
+    expectReadBackAfterRegistration(fake.requests, id);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("an unparseable success body and a pending read-back: this attempt was not confirmed, a parsing failure distinct from a transport one", async () => {
+  const id = `${AGENT}-unparseable-pending`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
   const fake = startRegistrarFlair(id, publicKey, { route: "unparseable" });
@@ -410,20 +464,37 @@ test("the registration POST answers 200 with a body that is not JSON: exits non-
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
     expect(res.stderr).toContain("response-parsing failure");
     expect(res.stderr).toContain("malformed response body");
+    expect(res.stderr).toContain("The read-back after the POST found the stored public key 'pending', not the generated key");
     expect(res.stderr).not.toContain("refused the registration");
-    expect(res.stderr).not.toContain("no refusal named");
     expect(res.stderr).not.toContain("not registered");
+    expectReadBackAfterRegistration(fake.requests, id);
     expectNoAgentWriteAfterRegistration(fake.requests, id);
   } finally {
     fake.stop();
   }
 });
 
-test("a registration_unavailable response after a committed write: exits non-zero reporting the registration unconfirmed, never 'not registered', and the read-back check ran", async () => {
-  const id = `${AGENT}-register-unavailable`;
+test("registration_unavailable after a committed write and an equal read-back: success, and the read-back runs after the POST", async () => {
+  const id = `${AGENT}-unavailable-equal`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey, { route: "unavailable", commit: true });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair, inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.exitCode).toBeUndefined();
+    expect(res.stdout).toContain("registered in Flair");
+    expectReadBackAfterRegistration(fake.requests, id);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("registration_unavailable without a committed write and a pending read-back: this attempt was not confirmed, naming the observed state", async () => {
+  const id = `${AGENT}-unavailable-pending`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
   const fake = startRegistrarFlair(id, publicKey, { route: "unavailable" });
@@ -431,16 +502,12 @@ test("a registration_unavailable response after a committed write: exits non-zer
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
     expect(res.stderr).toContain("registration_unavailable");
-    // Flair returns this after a commit too, so it never names the agent unregistered
+    expect(res.stderr).toContain("The read-back after the POST found the stored public key 'pending', not the generated key");
     expect(res.stderr).not.toContain("not registered");
     expect(res.stderr).not.toContain("refused the registration");
-    // the read-back check ran (the operator read of the row before the POST),
-    // and no fallback write followed the registration POST
-    const registration = fake.requests.findIndex((req) => req.method === "POST" && req.path === "/AgentKeyRegister");
-    expect(registration).toBeGreaterThan(-1);
-    expect(fake.requests.slice(0, registration).some((req) => req.method === "GET" && req.path === `/Agent/${id}`)).toBe(true);
+    expectReadBackAfterRegistration(fake.requests, id);
     expectNoAgentWriteAfterRegistration(fake.requests, id);
   } finally {
     fake.stop();
@@ -1018,7 +1085,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
 );
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
-  "against a real Flair, create on a pending row completes registration when the instance serves POST /AgentKeyRegister, and refuses otherwise",
+  "against a real Flair, create on a pending row completes registration when the instance serves POST /AgentKeyRegister and the stored key reads back equal; when the route is absent it refuses naming the minimum version",
   async () => {
     const { baseUrl, opsUrl, admin } = flairTarget();
     const id = `create-pending-${randomUUID()}`;

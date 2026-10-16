@@ -426,7 +426,7 @@ const PENDING_PUBLIC_KEY = "pending";
 function refuseKeyRegistration(id: string, flairUrl: string, status: number, refusal: string | null): never {
   if (refusal === null && (status === 404 || status === 405)) {
     console.error(
-      `❌ Agent '${id}' is not registered in Flair at ${flairUrl} — POST /AgentKeyRegister answered ${status} with no refusal this client recognizes, so a key generated here was not stored; this Flair may not serve the route.`,
+      `❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: POST /AgentKeyRegister answered ${status} with no refusal this client recognizes, so whether a key was stored is unknown; this Flair may not serve the route.`,
     );
     console.error(
       `   Remedy: if this Flair predates the route, upgrade it to ${MIN_FLAIR_VERSION_FOR_KEY_REGISTER} or newer, then re-run \`tps agent create --id ${id}\`.`,
@@ -443,30 +443,32 @@ function refuseKeyRegistration(id: string, flairUrl: string, status: number, ref
     agent_key_not_pending: `the stored key for '${id}' is not 'pending', so this operation does not apply; replacing a key is the key-rotation path, not create`,
     registration_conflict: "another write to this agent is in progress or already committed; re-run `tps agent create`",
   };
-  const name = refusal ?? `no refusal named (${status})`;
+  const name = refusal ?? "no refusal named";
   const remedy = refusal !== null
     ? (remedies[refusal] ?? "the endpoint refused the registration; re-run `tps agent create`")
     : "the response named no refusal this client recognizes; check that Flair serves this route and its version";
-  console.error(`❌ Agent '${id}' is not registered in Flair at ${flairUrl} — POST /AgentKeyRegister refused the registration (${name}).`);
+  console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: POST /AgentKeyRegister refused the registration (${name}) with HTTP ${status}.`);
   console.error(`   Remedy: ${remedy}.`);
   process.exit(1);
 }
 
 /**
  * cli#512 — the POST /AgentKeyRegister call left the generated key's fate
- * unknown, so the registration is reported UNCONFIRMED, never as a refusal and
- * never as unregistered. The paths: no response arrived (a transport failure),
- * a success status carried a body that was not JSON (a response-parsing
- * failure), or Flair answered `registration_unavailable` — which Flair returns
- * both before committing (nothing changed) and after committing when its own
- * read-back fails. The diagnostic
- * carries the client's own bounded cause; a refusal name is never invented and,
- * for a response that arrived, only its own status travels in the cause.
+ * unknown and the read-back after the POST did not show the key stored, so this
+ * attempt is reported UNCONFIRMED, never as a refusal and never as unregistered.
+ * The paths: no response arrived (a transport failure), a success status carried
+ * a body that was not JSON (a response-parsing failure), or Flair answered
+ * `registration_unavailable` — which Flair returns both before committing
+ * (nothing changed) and after committing when its own read-back fails. `cause`
+ * is the client's own bounded account of the POST request; a refusal name is
+ * never invented and, for a response that arrived, only its own status travels
+ * in the cause. `observed` is what the read-back after the POST found.
  */
-function refuseKeyRegistrationUnconfirmed(id: string, flairUrl: string, cause: string): never {
-  console.error(`❌ Agent '${id}' registration in Flair at ${flairUrl} is unconfirmed — ${cause}.`);
+function refuseKeyRegistrationUnconfirmed(id: string, flairUrl: string, cause: string, observed: string): never {
+  console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: ${cause}.`);
+  console.error(`   The read-back after the POST ${observed}.`);
   console.error(
-    `   Remedy: re-run \`tps agent create --id ${id}\`; it reads the stored key back and reports it.`,
+    `   Remedy: re-run \`tps agent create --id ${id}\`; it registers the key again and reads the stored key back.`,
   );
   process.exit(1);
 }
@@ -562,7 +564,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
         if (storedKeyAsHex(existing.publicKey ?? "") !== pubKeyHex) {
           // cli#512: an existing row whose stored key differs still gets an Agent
           // PUT carrying the key; Flair drops `publicKey` on that write, so it
-          // stores nothing, and the read-back below decides.
+          // cannot store the key, and the read-back below decides.
           await flair.updateAgent(id, { publicKey: pubKeyHex });
         }
         successLine = `  Agent '${id}' already registered in Flair.`;
@@ -611,32 +613,50 @@ async function createAgent(args: AgentArgs): Promise<void> {
     }
     if (stored.found && stored.publicKey === PENDING_PUBLIC_KEY) {
       // cli#512 — the row is `pending`: register the generated key through
-      // Flair's supported operation, then read again; the slice-1 check below
-      // decides, so the Flair registration line is printed only on an equal
-      // read-back. This covers a row seeded earlier.
+      // Flair's supported operation, then read the stored key back after the
+      // POST on every path. The read-back decides: a key that reads back equal
+      // is success, and a POST whose response was unconfirmed — a transport
+      // failure, a success body that is not JSON, or `registration_unavailable`
+      // — is resolved by what the row now holds. This covers a row seeded
+      // earlier.
       const publicKeyB64url = Buffer.from(kp.signing.publicKey).toString("base64url");
+      let unconfirmed: string | null = null;
       try {
         await flair.registerAgentKey(id, publicKeyB64url);
       } catch (e) {
         if (e instanceof FlairAgentKeyRegisterError) {
           // Flair returns `registration_unavailable` both before committing
           // (nothing changed) and after committing when its own read-back
-          // fails, so the key's fate is unknown here: report it unconfirmed,
-          // never as a refusal and never as unregistered.
+          // fails, so whether the key is stored is unknown here: the read-back
+          // below decides, never as a refusal and never as unregistered.
           if (e.refusal === "registration_unavailable") {
-            refuseKeyRegistrationUnconfirmed(id, flairUrl, "POST /AgentKeyRegister answered registration_unavailable, which Flair returns both before committing (nothing changed) and after committing when its own read-back fails, so whether the key is stored is unconfirmed");
+            unconfirmed = "POST /AgentKeyRegister answered registration_unavailable, which Flair returns both before committing (nothing changed) and after committing when its own read-back fails";
+          } else {
+            refuseKeyRegistration(id, flairUrl, e.status, e.refusal);
           }
-          refuseKeyRegistration(id, flairUrl, e.status, e.refusal);
         } else if (e instanceof FlairRequestError && e.status !== 0) {
-          refuseKeyRegistrationUnconfirmed(id, flairUrl, `the registration response carried status ${e.status} but no readable JSON body — a response-parsing failure (${e.message})`);
+          unconfirmed = `the registration response carried status ${e.status} but no readable JSON body — a response-parsing failure (${e.message})`;
         } else {
-          refuseKeyRegistrationUnconfirmed(id, flairUrl, `the registration request received no response — a transport failure (${e instanceof Error ? e.message : String(e)})`);
+          unconfirmed = `the registration request received no response — a transport failure (${e instanceof Error ? e.message : String(e)})`;
         }
       }
+      // The read-back runs after the POST whether or not the response was
+      // confirmed: only the stored key shows whether this attempt landed.
       try {
         stored = await flair.readStoredPublicKey(id);
       } catch (e) {
+        if (unconfirmed !== null) {
+          refuseKeyRegistrationUnconfirmed(id, flairUrl, unconfirmed, `failed (${e instanceof Error ? e.message : String(e)})`);
+        }
         refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
+      }
+      if (unconfirmed !== null && !(stored.found && storedKeyAsHex(stored.publicKey ?? "") === pubKeyHex)) {
+        const observed = !stored.found
+          ? "found no Agent row"
+          : stored.publicKey === null
+            ? "found no stored public key"
+            : `found the stored public key '${stored.publicKey}', not the generated key`;
+        refuseKeyRegistrationUnconfirmed(id, flairUrl, unconfirmed, observed);
       }
     }
     if (!stored.found) {
