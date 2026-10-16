@@ -1,4 +1,4 @@
-import type { MailMessage, MailClient } from "../io/mail.js";
+import type { MailMessage, MailClient, MailDelivery, DeliverNextResult, DeliveryCompletion, DeliveryRelease } from "../io/mail.js";
 import {
   signedTrustTier,
   type AgentConfig,
@@ -69,6 +69,23 @@ interface EventLoopDeps {
   mailClient?: MailClient;
 }
 
+/**
+ * The per-message delivery API the event loop consumes (cli#617 slice c).
+ * MailClient satisfies it. Each `deliverNext()` call returns at most one
+ * delivery, already committed with a live `in_progress` intent: either a
+ * re-presented message (already committed, from pending placement recovery or
+ * an earlier unfinished hand-over) or a newly committed one. Pending work is
+ * presented before new mail is committed, so the loop never re-commits a
+ * re-presented message. `completeDelivery` finalizes a delivery after the
+ * handler returns a completed outcome; `releaseDelivery` drops the hand-over's
+ * local claim without finalizing, leaving the intent for the next check.
+ */
+export interface MailDeliverySource {
+  deliverNext(): Promise<DeliverNextResult>;
+  completeDelivery(delivery: MailDelivery): Promise<DeliveryCompletion>;
+  releaseDelivery(delivery: MailDelivery): DeliveryRelease;
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -121,9 +138,87 @@ export class EventLoop {
     }
   }
 
+  /**
+   * cli#617 slice (c): the delivery loop, one message at a time. The source
+   * hands over a message that is already committed with a live `in_progress`
+   * intent; the loop processes it and finalizes it (completeDelivery) ONLY on a
+   * completed outcome. A non-completion — a turn-limit return or a thrown
+   * handler — releases the hand-over instead, leaving the intent `in_progress`
+   * so the next check re-presents it. A graceful stop breaks before the next
+   * `deliverNext()`, so no message beyond the one in flight is ever committed.
+   */
+  async runDeliveries(source: MailDeliverySource): Promise<void> {
+    this.running = true;
+    this.state = "idle";
+    this.deps.events?.emit({
+      type: "session.start",
+      model: this.deps.config.llm.model,
+      contextTokens: this.deps.config.contextWindowTokens ?? 0,
+    });
+
+    try {
+      while (this.running) {
+        let result: DeliverNextResult;
+        try {
+          result = await source.deliverNext();
+        } catch (err: any) {
+          await this.recordError(err);
+          if (!this.running) break;
+          await sleep(this.pollMs);
+          continue;
+        }
+
+        // idle: nothing to do; deferred (lock busy, an active hand-over, an
+        // unresolved placement): work may be waiting, retry after a pause. A
+        // stop requested while the check was in flight breaks here.
+        if (result.status !== "delivered") {
+          if (!this.running) break;
+          await sleep(this.pollMs);
+          continue;
+        }
+
+        // A delivery is already committed. Finish it even if a stop was
+        // requested meanwhile, then break at the loop condition — before the
+        // next `deliverNext()`, which is the next commit.
+        const { delivery } = result;
+        this.state = "processing";
+        let completed = false;
+        try {
+          completed = await this.processMail(delivery.message);
+        } catch (err: any) {
+          await this.recordError(err);
+        }
+        this.state = "idle";
+
+        // Finalize only a completed outcome. Anything else leaves the message's
+        // intent in `in_progress` and drops only this hand-over's local claim,
+        // so the next check presents it again (at least once).
+        try {
+          if (completed) await source.completeDelivery(delivery);
+          else source.releaseDelivery(delivery);
+        } catch (err: any) {
+          await this.recordError(err);
+        }
+      }
+    } finally {
+      this.deps.events?.emit({
+        type: "session.end",
+        model: this.deps.config.llm.model,
+      });
+    }
+  }
+
   async stop(): Promise<void> {
     this.running = false;
     this.state = "stopped";
+  }
+
+  private async recordError(err: unknown): Promise<void> {
+    await this.deps.memory.append({
+      type: "error",
+      ts: new Date().toISOString(),
+      data: String((err as { message?: unknown } | undefined)?.message ?? err),
+    });
   }
 
   getState(): AgentState {
@@ -261,17 +356,22 @@ export class EventLoop {
     return this.deps.tools.execute(call.name, call.input);
   }
 
-  private async processMail(message: MailMessage): Promise<void> {
+  private async processMail(message: MailMessage): Promise<boolean> {
     const body =
       typeof message.body === "string" ? message.body : JSON.stringify(message.body);
     const trust = this.parseTrust(message);
     const sender = this.parseSender(message);
     const prompt = this.formatMailPrompt(body, trust, sender);
 
-    await this.processMessage(prompt, trust, sender);
+    return this.processMessage(prompt, trust, sender);
   }
 
-  private async processMessage(promptRaw: string, trust: TrustLevel, sender?: string): Promise<void> {
+  /**
+   * Handle one prompt to an outcome. Returns true on completion (the model
+   * stopped calling tools); false when the tool-turn limit was reached, which
+   * is NOT completion and must not finalize a delivery (cli#617 slice c).
+   */
+  private async processMessage(promptRaw: string, trust: TrustLevel, sender?: string): Promise<boolean> {
     const prompt = String(promptRaw).trim();
     const tools = this.buildToolSpecs(trust);
     const allowedTools = new Set(tools.map((tool) => tool.name));
@@ -359,7 +459,7 @@ export class EventLoop {
       this.trimHistory(messages, systemPrompt, tools);
 
       // No tool calls = done
-      if (!completion.toolCalls?.length) return;
+      if (!completion.toolCalls?.length) return true;
 
       if (++turns > maxTurns) {
         await this.deps.memory.append({
@@ -369,7 +469,7 @@ export class EventLoop {
         });
         // Graceful notification: auto-commit any staged changes and mail the sender
         await this.notifyTurnLimitReached(sender, turns);
-        return;
+        return false;
       }
 
       // Execute tools and append results to conversation

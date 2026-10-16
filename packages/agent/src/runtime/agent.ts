@@ -66,7 +66,6 @@ export class AgentRuntime {
   }
 
   async start(): Promise<void> {
-    const checkInbox = async () => this.mail.checkNewMail();
     const deliverOutbox = () => this.mail.deliverOutbox();
 
 
@@ -84,7 +83,9 @@ export class AgentRuntime {
     });
 
     try {
-      await Promise.race([this.loop.run(checkInbox), shutdown]);
+      // cli#617 slice (c): deliver one message at a time, finalizing only on a
+      // completed outcome, so a crash or stop re-presents the message in flight.
+      await Promise.race([this.loop.runDeliveries(this.mail), shutdown]);
     } finally {
       rmSync(pidPath, { force: true });
     }
