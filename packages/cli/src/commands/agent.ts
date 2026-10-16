@@ -1126,9 +1126,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // the sandboxed child re-enters bin/tps.ts, which runs the runtime
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
-            // Keep the config through the re-exec (cli#516): without it the
-            // child re-resolves ~/.tps/agents/<id>/agent.yaml, so a
-            // `--config <file>` launch silently ran the default config instead.
+            // Carry the resolved config pathname through the re-exec (cli#516).
             relaunch.push("--config", configPath);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
@@ -1169,14 +1167,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            // Worktree setup runs HERE, outside the sandbox (cli#516). Nothing
-            // the base repository configures may execute in this process:
-            // onStart pins the hook path and fsmonitor off and creates the
-            // worktree with the checkout suppressed. The sandboxed child runs
-            // that checkout as its first step, so the two grants the checkout
-            // needs — read of the base repository, write of the new worktree's
-            // own git directory — are added and validated here, once the
-            // worktree exists to name them.
+            // With deferCheckout: true, the parent creates the worktree without
+            // checkout; the sandboxed child checks it out (cli#516). Grant read
+            // of the base repository and write of the worktree's git directory.
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
             let worktreeGitDir: string | undefined;
@@ -1224,8 +1217,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 },
               );
             } finally {
-              // Remove ONLY a worktree this launch created (cli#516): an
-              // existing worktree, or a workspace that is not one, survives.
+              // Attempt cleanup only after this launch created a worktree (cli#516).
               if (worktreeCreated) {
                 try {
                   onStop(launchId, config.workspace);

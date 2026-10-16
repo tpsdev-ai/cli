@@ -5,5 +5,4 @@
   attested re-exec; the parent creates the worktree with the checkout suppressed
   and the hook path and fsmonitor disabled, and the sandboxed child checks it out
   inside the sandbox, so no repository-configured filter or hook runs outside it;
-  and the sandbox-flag scan stops at the `--` before a message or wrapped
-  command, so a `--sandbox <word>` inside one is no longer refused as a flag.
+  and the sandbox-flag scan reads parsed arguments before a wrapped payload.

@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -238,8 +238,8 @@ export interface AgentLifecycleResult {
 /**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
  * caller can tell a worktree failure from any other error and report it as one;
- * the message names the operation that failed. Only a failed git operation
- * raises it: a workspace with no base repository is reported as changed:false.
+ * the message names the operation that failed. A workspace with no base
+ * repository is reported as changed:false.
  */
 export class WorktreeLifecycleError extends Error {
   constructor(message: string) {
@@ -253,9 +253,8 @@ function gitEnv(): NodeJS.ProcessEnv {
   for (const [key, value] of Object.entries(process.env)) {
     if (!key.startsWith("GIT_")) env[key] = value;
   }
-  // No inherited GIT_* variables, no system or global config: the base
-  // repository's own config is the only one in play, and worktree add overrides
-  // the hook path explicitly below.
+  // Disable inherited GIT_* variables and system/global config entry points;
+  // local config includes remain enabled.
   env.GIT_CONFIG_NOSYSTEM = "1";
   env.GIT_CONFIG_GLOBAL = "/dev/null";
   env.GIT_TERMINAL_PROMPT = "0";
@@ -271,30 +270,42 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
   };
 }
 
-/**
- * The result of probing a candidate base repository (cli#516).
- *
- *   repo        — a work tree (the probe succeeded and said so)
- *   not-a-repo  — CONFIRMED absent, or CONFIRMED outside any work tree
- *   error       — the probe failed on a path that exists (broken repository,
- *                 bad config, unreadable metadata): unknown, never "no base"
- */
 type RepoProbe =
   | { kind: "repo" }
   | { kind: "not-a-repo" }
   | { kind: "error"; detail: string };
 
-/**
- * Probe one candidate base repository. Only an absent path or a path git
- * reports as outside any work tree counts as "no base": a failed probe of a
- * path that exists is an error, so a broken managed repository can never be
- * mistaken for an unconfigured workspace and let the launch proceed (cli#516).
- */
 function probeRepo(path: string): RepoProbe {
-  if (!existsSync(path)) return { kind: "not-a-repo" };
+  try {
+    let candidate;
+    try {
+      candidate = lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
+    }
+    if (!candidate.isDirectory() || candidate.isSymbolicLink()) {
+      return { kind: "error", detail: "base path is not a plain directory" };
+    }
+    readdirSync(path);
+    const markerPath = join(path, ".git");
+    let marker;
+    try {
+      marker = lstatSync(markerPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
+    }
+    if (marker.isSymbolicLink() || (!marker.isDirectory() && !marker.isFile())) {
+      return { kind: "error", detail: "git marker is not a regular file or directory" };
+    }
+    if (marker.isDirectory()) readdirSync(markerPath);
+    else readFileSync(markerPath);
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
+  }
   const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
-  if (out.ok) return out.stdout === "true" ? { kind: "repo" } : { kind: "not-a-repo" };
-  if (/not a git repository/i.test(out.stderr)) return { kind: "not-a-repo" };
+  if (out.ok && out.stdout === "true") return { kind: "repo" };
   return { kind: "error", detail: out.stderr || out.stdout || "git probe produced no output" };
 }
 
@@ -336,14 +347,10 @@ function resolveBaseRepo(workspacePath: string): string | null {
  * repository. A workspace with no base repository is left untouched and
  * reported as changed:false.
  *
- * Nothing the repository configures may execute in the parent process
- * (cli#516): the git invocations pin `core.hooksPath` off and `core.fsmonitor`
- * off, and with `deferCheckout` the worktree is created with `--no-checkout` so
- * no checkout-time filter runs either. The checkout is then the caller's, and
- * belongs inside the sandbox; `checkoutWorktree` performs it there.
+ * With `deferCheckout: true`, setup disables hooks and fsmonitor and defers
+ * checkout to `checkoutWorktree` inside the sandbox (cli#516).
  *
- * Throws `WorktreeLifecycleError` when a git operation fails, including a probe
- * that fails for a path that exists.
+ * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
 export function onStart(
   agentId: string,
@@ -373,12 +380,7 @@ export function onStart(
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  // onStart is called BEFORE the sandbox is entered (cli#516), so no executable
-  // the base repository configures may run here: `git worktree add` would run
-  // `post-checkout`, the configured fsmonitor, and any configured smudge filter.
-  // The two hooks are pinned off below, and a caller that has a sandbox to run
-  // the checkout in passes `deferCheckout`, which suppresses the checkout — and
-  // with it the filter; `checkoutWorktree` performs it inside the sandbox.
+  // With deferCheckout: true, checkout runs in the sandbox (cli#516).
   const defer = opts.deferCheckout === true;
   const args = [
     "-c",
@@ -413,10 +415,8 @@ export function onStart(
 
 /**
  * Populate a worktree the parent created with `--no-checkout` (cli#516). This
- * checkout reads the base repository's tree and runs whatever filter and hook
- * the repository configures, so it must run where those are confined — inside
- * the sandbox, as the sandboxed child's first step. Throws
- * `WorktreeLifecycleError` when the checkout fails.
+ * checkout may run repository-configured filters and hooks, so the caller must
+ * run it inside the sandbox. Throws `WorktreeLifecycleError` on failure.
  */
 export function checkoutWorktree(workspacePath: string): AgentLifecycleResult {
   const workspace = resolve(workspacePath);
