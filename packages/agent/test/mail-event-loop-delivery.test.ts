@@ -87,8 +87,7 @@ interface Seen { id: string; presentation: number; }
 /**
  * Run the real EventLoop against `c` and record every delivery. The loop runs
  * until `stopAfter` deliveries have been handed over, or a delivery names
- * `stopOnId`, whichever comes first — a delivery already handed over is still
- * processed and settled before the loop returns.
+ * `stopOnId`, whichever comes first.
  */
 async function runLoop(
   c: MailClient,
@@ -219,7 +218,7 @@ describe("a committed delivery killed mid-handler is re-presented when verificat
   });
 });
 
-describe("a stop drains a delivery returned by the check in flight", () => {
+describe("a stop finalizes a returned delivery when completion succeeds", () => {
   test("durably finalized mail is not re-presented; later mail is handled next", async () => {
     plant("m1.json", "first");
     plant("m2.json", "second");
@@ -419,6 +418,82 @@ for (const operation of ["completeDelivery", "releaseDelivery"] as const) {
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  test(`AgentRuntime.start logs an identity refusal and keeps the intent pending after ${signal}`, async () => {
+    plant("m1.json", "identity-refusal");
+    plant("m2.json", "later");
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let finish!: () => void;
+    const finishing = new Promise<void>((resolve) => { finish = resolve; });
+    const lookup = spyOn(FlairContextProvider.prototype, "getAgent").mockImplementation(async () => ({ publicKey: Buffer.from(ed.getPublicKey(SEED)).toString("base64") }) as never);
+    const provider = spyOn(ProviderManager.prototype, "complete").mockImplementation(async () => {
+      writeFileSync(cur("m1.json"), `${readFileSync(cur("m1.json"), "utf8")} `);
+      enter(); await finishing;
+      return completingProvider.complete();
+    });
+    const memoryPath = join(workspace, "memory.jsonl");
+    const pidPath = join(workspace, ".tps-agent.pid");
+    const runtime = new AgentRuntime({
+      agentId: AGENT, name: "identity-refusal-test", mailDir, workspace, memoryPath,
+      llm: { provider: "openai", model: "test", apiKey: "test" },
+    });
+    const seen: string[] = [];
+    const next = MailClient.prototype.deliverNext;
+    const nextSpy = spyOn(MailClient.prototype, "deliverNext").mockImplementation(async function() {
+      const result = await next.call(this);
+      if (result.status === "delivered") seen.push(result.delivery.message.verifiedEnvelope!.messageId);
+      return result;
+    });
+    const complete = MailClient.prototype.completeDelivery;
+    const settlementSpy = spyOn(MailClient.prototype, "completeDelivery").mockImplementation(async function(delivery) {
+      expect(existsSync(pidPath)).toBe(true);
+      const before = readFileSync(intentPath("m1.json"), "utf8");
+      const result = await complete.call(this, delivery);
+      expect(result).toMatchObject({ status: "refused", reason: "identity" });
+      expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(before);
+      return result;
+    });
+    let loopReturned = false;
+    const run = EventLoop.prototype.runDeliveries;
+    const loopSpy = spyOn(EventLoop.prototype, "runDeliveries").mockImplementation(async function(source) {
+      await run.call(this, source);
+      expect(existsSync(pidPath)).toBe(true);
+      loopReturned = true;
+    });
+    const start = runtime.start();
+    void start.catch(() => {});
+    try {
+      await entered;
+      const pending = readFileSync(intentPath("m1.json"), "utf8");
+      process.emit(signal);
+      expect(loopReturned).toBe(false);
+      expect(existsSync(pidPath)).toBe(true);
+      finish();
+      await start;
+      expect(settlementSpy).toHaveBeenCalledTimes(1);
+      expect(loopReturned).toBe(true);
+      expect(existsSync(pidPath)).toBe(false);
+      expect(readFileSync(memoryPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toContainEqual({
+        type: "error", ts: expect.any(String), data: "delivery settlement refused: identity",
+      });
+      expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(pending);
+      expect(intentPhase("m1.json")).toBe("in_progress");
+      expect(intentJson("m1.json").claim).toBeDefined();
+      expect(nextSpy).toHaveBeenCalledTimes(1);
+      expect(seen).toEqual(["identity-refusal"]);
+      expect(await client().deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
+      expect(seen).toEqual(["identity-refusal"]);
+      expect(newFiles()).toEqual(["m2.json"]);
+      expect(curFiles()).toEqual(["m1.json"]);
+    } finally {
+      finish();
+      await runtime.stop();
+      await start.catch(() => {});
+      loopSpy.mockRestore(); settlementSpy.mockRestore(); nextSpy.mockRestore();
+      provider.mockRestore(); lookup.mockRestore();
+    }
+  }, 15_000);
+
   test(`AgentRuntime.start releases after memory writes fail during ${signal} before removing its PID file`, async () => {
     plant("m1.json", "memory-failure");
     plant("m2.json", "later");

@@ -5,7 +5,10 @@
   the same delivery. Deadline quarantine requires the mailbox lock and storage
   to become available; until then the claim stays pending. A stop prevents
   the next `deliverNext()` call; a check already waiting can return a delivery,
-  which is processed and settled before shutdown removes the PID file.
+  which is processed and settled before shutdown removes the PID file, except
+  that a `completeDelivery()` refusal with `identity` after `cur/` changes during
+  the handler is logged and leaves the intent pending, blocking further delivery
+  of that message until resolved.
 
   A handler that never returns cannot reach the presentation or deadline checks.
 
