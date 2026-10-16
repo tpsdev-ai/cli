@@ -303,8 +303,9 @@ function responseError(entry: string, method: string, path: string, status: numb
  * The refusal names POST /AgentKeyRegister is documented to answer in its
  * `error` field (flair#2266): the authentication denials and the registration
  * refusals. A body naming none of these yields `null` — the response text is
- * never echoed, so a response that is not this endpoint's refusal names no
- * refusal (a Flair without the route answers 404 or 405 with no such field).
+ * never echoed, so a response this client cannot recognize as this endpoint
+ * names no refusal, and such a response (a 404 or 405 without the field, say)
+ * is not proof the route is absent.
  */
 const AGENT_KEY_REGISTER_REFUSALS: readonly string[] = [
   "authentication required",

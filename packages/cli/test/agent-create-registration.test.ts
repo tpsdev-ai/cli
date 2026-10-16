@@ -219,7 +219,7 @@ test("a 405 on the registration route: exits non-zero naming the minimum version
 interface RegistrarFlair {
   url: string;
   stop(): void;
-  readonly row: { id: string; name: string; publicKey: string };
+  readonly row: { id: string; name: string; publicKey: string; updatedAt?: string };
   readonly requests: Array<{ method: string; path: string; auth: string }>;
   readonly registerBodies: Array<Record<string, unknown>>;
 }
@@ -234,19 +234,21 @@ interface RegistrarFlair {
  * refusal; `store: false` answers 200 without storing (the read-back then
  * differs). `route: "transport"` answers a redirect the client follows to a
  * closed port, so its fetch fails before any response; `route: "unparseable"`
- * answers 200 with a body that is not JSON.
+ * answers 200 with a body that is not JSON; `route: "unavailable"` commits a
+ * write to the row and then answers 503 `registration_unavailable` (the status
+ * Flair returns after committing when its own read-back fails).
  */
 function startRegistrarFlair(
   id: string,
   publicKey: string,
   opts: {
-    route?: "serve" | "missing" | "method" | "transport" | "unparseable";
+    route?: "serve" | "missing" | "method" | "transport" | "unparseable" | "unavailable";
     refusal?: { status: number; error: string };
     store?: boolean;
   } = {},
 ): RegistrarFlair {
   const route = opts.route ?? "serve";
-  const row = { id, name: id, publicKey: "pending" };
+  const row: RegistrarFlair["row"] = { id, name: id, publicKey: "pending" };
   const requests: RegistrarFlair["requests"] = [];
   const registerBodies: Array<Record<string, unknown>> = [];
   let registrations = 0;
@@ -268,6 +270,12 @@ function startRegistrarFlair(
         /* no body */
       }
       registerBodies.push(body);
+      // The committed write, then the endpoint reports the registration
+      // unavailable (as Flair does after committing when its read-back fails).
+      if (route === "unavailable") {
+        row.publicKey = String(body.publicKey);
+        return Response.json({ error: "registration_unavailable" }, { status: 503 });
+      }
       if (opts.refusal) return Response.json({ error: opts.refusal.error }, { status: opts.refusal.status });
       registrations += 1;
       if (opts.store === false) {
@@ -346,7 +354,6 @@ const KEY_REGISTRATION_REFUSALS: ReadonlyArray<{ status: number; error: string; 
   { status: 404, error: "agent_not_found", remedy: "no Agent row exists" },
   { status: 409, error: "agent_key_not_pending", remedy: "key-rotation path" },
   { status: 409, error: "registration_conflict", remedy: "another write to this agent is in progress" },
-  { status: 503, error: "registration_unavailable", remedy: "re-run `tps agent create`" },
 ];
 
 for (const refusal of KEY_REGISTRATION_REFUSALS) {
@@ -372,7 +379,7 @@ for (const refusal of KEY_REGISTRATION_REFUSALS) {
   });
 }
 
-test("the registration POST fails in transport: exits non-zero with its own diagnostic, never a refusal and no invented status", async () => {
+test("the registration POST receives no response: exits non-zero reporting the registration unconfirmed, never 'not registered' and never a refusal", async () => {
   const id = `${AGENT}-register-transport`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
@@ -381,19 +388,20 @@ test("the registration POST fails in transport: exits non-zero with its own diag
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' could not be registered in Flair at ${fake.url}`);
-    expect(res.stderr).toContain("POST /AgentKeyRegister did not complete");
+    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain("transport failure");
+    // the transport failure's own bounded reason, not a refusal and not the word
     expect(res.stderr).toContain("connection refused");
-    // not called a refusal, and no status is invented for it
     expect(res.stderr).not.toContain("refused the registration");
     expect(res.stderr).not.toContain("no refusal named");
+    expect(res.stderr).not.toContain("not registered");
     expectNoAgentWriteAfterRegistration(fake.requests, id);
   } finally {
     fake.stop();
   }
 });
 
-test("the registration POST answers 200 with a body that is not JSON: exits non-zero with its own diagnostic, not a refusal", async () => {
+test("the registration POST answers 200 with a body that is not JSON: exits non-zero reporting the registration unconfirmed, a parsing failure distinct from a transport one", async () => {
   const id = `${AGENT}-register-unparseable`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
@@ -402,10 +410,37 @@ test("the registration POST answers 200 with a body that is not JSON: exits non-
     const res = await runCreate(fake.url, id, { keyPair });
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain(`Agent '${id}' could not be registered in Flair at ${fake.url}`);
+    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain("response-parsing failure");
     expect(res.stderr).toContain("malformed response body");
     expect(res.stderr).not.toContain("refused the registration");
     expect(res.stderr).not.toContain("no refusal named");
+    expect(res.stderr).not.toContain("not registered");
+    expectNoAgentWriteAfterRegistration(fake.requests, id);
+  } finally {
+    fake.stop();
+  }
+});
+
+test("a registration_unavailable response after a committed write: exits non-zero reporting the registration unconfirmed, never 'not registered', and the read-back check ran", async () => {
+  const id = `${AGENT}-register-unavailable`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey, { route: "unavailable" });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair });
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stderr).toContain(`Agent '${id}' registration in Flair at ${fake.url} is unconfirmed`);
+    expect(res.stderr).toContain("registration_unavailable");
+    // Flair returns this after a commit too, so it never names the agent unregistered
+    expect(res.stderr).not.toContain("not registered");
+    expect(res.stderr).not.toContain("refused the registration");
+    // the read-back check ran (the operator read of the row before the POST),
+    // and no fallback write followed the registration POST
+    const registration = fake.requests.findIndex((req) => req.method === "POST" && req.path === "/AgentKeyRegister");
+    expect(registration).toBeGreaterThan(-1);
+    expect(fake.requests.slice(0, registration).some((req) => req.method === "GET" && req.path === `/Agent/${id}`)).toBe(true);
     expectNoAgentWriteAfterRegistration(fake.requests, id);
   } finally {
     fake.stop();
