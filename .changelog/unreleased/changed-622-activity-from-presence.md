@@ -18,5 +18,6 @@
   fresh activity equality (fresh activity differing from lastActivity), and
   offline freshness (an offline record with fresh activity). Other combinations
   are not checked, including status versus a future heartbeat. Office status
-  prints no blocker line. It prints the table's values with control characters
-  replaced by a visible placeholder, so each stays within its cell.
+  prints no blocker line. It prints the table's values with C0, DEL and C1
+  control characters replaced by a visible placeholder (U+FFFD); a long value
+  is not truncated and can widen its row.

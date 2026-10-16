@@ -59,7 +59,7 @@ const dim    = (t: string, nc: boolean) => esc(2,  t, nc);
 
 /**
  * Replace terminal control characters (C0 0x00-0x1F, DEL 0x7F, C1 0x80-0x9F)
- * in a table value with U+FFFD, so each becomes visible and stays in its cell.
+ * in a table value with U+FFFD, so each becomes visible. Widths are minimums, not caps.
  * Flair caps a current task but does not redact its content
  * (resources/Presence.ts), so the renderer makes controls visible here.
  */
