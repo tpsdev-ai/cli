@@ -69,17 +69,7 @@ interface EventLoopDeps {
   mailClient?: MailClient;
 }
 
-/**
- * The per-message delivery API the event loop consumes (cli#617 slice c).
- * MailClient satisfies it. Each `deliverNext()` call returns at most one
- * delivery, already committed with a live `in_progress` intent: either a
- * re-presented message (already committed, from pending placement recovery or
- * an earlier unfinished hand-over) or a newly committed one. Pending work is
- * presented before new mail is committed, so the loop never re-commits a
- * re-presented message. `completeDelivery` finalizes a delivery after the
- * handler returns a completed outcome; `releaseDelivery` drops the hand-over's
- * local claim without finalizing, leaving the intent for the next check.
- */
+/** The delivery API consumed by the loop; finalize and release may defer. */
 export interface MailDeliverySource {
   deliverNext(): Promise<DeliverNextResult>;
   completeDelivery(delivery: MailDelivery): Promise<DeliveryCompletion>;
@@ -139,13 +129,8 @@ export class EventLoop {
   }
 
   /**
-   * cli#617 slice (c): the delivery loop, one message at a time. The source
-   * hands over a message that is already committed with a live `in_progress`
-   * intent; the loop processes it and finalizes it (completeDelivery) ONLY on a
-   * completed outcome. A non-completion — a turn-limit return or a thrown
-   * handler — releases the hand-over instead, leaving the intent `in_progress`
-   * so the next check re-presents it. A graceful stop breaks before the next
-   * `deliverNext()`, so no message beyond the one in flight is ever committed.
+   * Process a returned delivery even if stop was requested during deliverNext().
+   * Retry deferred settlement on that delivery before checking for more mail.
    */
   async runDeliveries(source: MailDeliverySource): Promise<void> {
     this.running = true;
@@ -177,9 +162,6 @@ export class EventLoop {
           continue;
         }
 
-        // A delivery is already committed. Finish it even if a stop was
-        // requested meanwhile, then break at the loop condition — before the
-        // next `deliverNext()`, which is the next commit.
         const { delivery } = result;
         this.state = "processing";
         let completed = false;
@@ -188,23 +170,40 @@ export class EventLoop {
         } catch (err: any) {
           await this.recordError(err);
         }
-        this.state = "idle";
 
-        // Finalize only a completed outcome. Anything else leaves the message's
-        // intent in `in_progress` and drops only this hand-over's local claim,
-        // so the next check presents it again (at least once).
-        try {
-          if (completed) await source.completeDelivery(delivery);
-          else source.releaseDelivery(delivery);
-        } catch (err: any) {
-          await this.recordError(err);
-        }
+        await this.settleDelivery(source, delivery, completed);
+        this.state = this.running ? "idle" : "stopped";
       }
     } finally {
       this.deps.events?.emit({
         type: "session.end",
         model: this.deps.config.llm.model,
       });
+    }
+  }
+
+  private async settleDelivery(source: MailDeliverySource, delivery: MailDelivery, completed: boolean): Promise<void> {
+    while (true) {
+      try {
+        const result = completed
+          ? await source.completeDelivery(delivery)
+          : source.releaseDelivery(delivery);
+        switch (result.status) {
+          case "completed":
+          case "already-completed":
+          case "released":
+          case "quarantined":
+            return;
+          case "refused":
+            await this.recordError(`delivery settlement refused: ${result.reason}`);
+            return;
+          case "deferred":
+            break;
+        }
+      } catch (err) {
+        await this.recordError(err);
+      }
+      await sleep(this.pollMs);
     }
   }
 

@@ -1,24 +1,21 @@
-/**
- * cli#617 slice (c): the event loop consumes the per-message delivery API
- * (deliverNext / completeDelivery / releaseDelivery) and finalizes a message
- * only after its processing completes. A stop breaks before the next commit; a
- * crash or kill at any point before completion re-presents the message on the
- * next check. The design's acceptance list for this slice, at the loop seam.
- */
+/** Real loop/mailbox tests for settlement retries and verifiable committed recovery. */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
-  existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, unlinkSync, writeFileSync,
+  existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
 import { type DeliverNextResult, type MailDelivery, MailClient } from "../src/io/mail.js";
+import { AgentRuntime } from "../src/runtime/agent.js";
+import { ProviderManager } from "../src/llm/provider.js";
+import { FlairContextProvider } from "../src/io/flair.js";
 import { EventLoop, type MailDeliverySource } from "../src/runtime/event-loop.js";
-import { mailboxReplayStore } from "../src/lib/mailbox-policy.js";
+import { DELIVERY_PRESENTATION_TTL_MS, mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 import { signEnvelope, type FlairClient } from "../src/lib/signEnvelope.js";
 
 const AGENT = "agent-a";
@@ -90,7 +87,7 @@ interface Seen { id: string; presentation: number; }
  * Run the real EventLoop against `c` and record every delivery. The loop runs
  * until `stopAfter` deliveries have been handed over, or a delivery names
  * `stopOnId`, whichever comes first — a delivery already handed over is still
- * processed and finalized before the stop takes effect.
+ * processed and settled before the loop returns.
  */
 async function runLoop(
   c: MailClient,
@@ -108,7 +105,7 @@ async function runLoop(
     context: {} as never,
     provider: opts.provider as never,
     tools: { list: () => [], execute: async () => ({ content: "ok" }) } as never,
-  });
+  }, 1);
   const stopAfter = opts.stopAfter ?? Number.POSITIVE_INFINITY;
   let handovers = 0;
   const source: MailDeliverySource = {
@@ -132,7 +129,7 @@ async function runLoop(
 const completingProvider = { async complete() { return { content: "done", toolCalls: undefined, inputTokens: 1, outputTokens: 1 }; } };
 /** A provider whose handler always calls a tool, so the turn limit is reached. */
 const toolCallingProvider = { async complete() { return { content: "", toolCalls: [{ id: "t1", name: "noop", input: {} }], inputTokens: 1, outputTokens: 1 }; } };
-/** A provider that never completes for a body containing `poison-body`. */
+/** Calls tools for a body containing `poison-body`. */
 const poisonAwareProvider = {
   async complete(req: unknown) {
     const text = JSON.stringify((req as { messages?: unknown }).messages ?? "");
@@ -182,7 +179,7 @@ function runChildAndKill(timeoutMs = 30_000): Promise<KillRun> {
   });
 }
 
-describe("a kill mid-handler re-presents the message on the loop's next check", () => {
+describe("a committed delivery killed mid-handler is re-presented when verification succeeds", () => {
   test("first delivery, killed while in_progress: re-presented once, later mail handled", async () => {
     plant("m1.json", "kill-first");
     plant("m2.json", "later");
@@ -221,15 +218,14 @@ describe("a kill mid-handler re-presents the message on the loop's next check", 
   });
 });
 
-describe("a graceful stop drains the message in flight and commits nothing further", () => {
-  test("completed mail is not re-presented; every unhandled message is handled next", async () => {
+describe("a stop drains a delivery returned by the check in flight", () => {
+  test("durably finalized mail is not re-presented; later mail is handled next", async () => {
     plant("m1.json", "first");
     plant("m2.json", "second");
     plant("m3.json", "third");
 
     const first = await runLoop(client(), { provider: completingProvider, stopAfter: 1 });
     expect(first).toEqual([{ id: "first", presentation: 1 }]);
-    // The stop broke before committing the next message: both stay in new/.
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
     expect(curFiles()).toEqual(["m1.json"]);
     expect(intentPhase("m1.json")).toBeNull();
@@ -258,7 +254,7 @@ describe("a turn-limit return is not completion", () => {
   });
 });
 
-describe("the liveness bound quarantines a handler that never completes", () => {
+describe("the liveness bound quarantines repeated non-completion", () => {
   test("five presentations then the intent is failed with its log line, and other mail keeps flowing", async () => {
     plant("m1.json", "poison", "poison-body");
     plant("m2.json", "healthy", "healthy-body");
@@ -302,3 +298,186 @@ describe("a re-presented message is never committed twice", () => {
     expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
   });
 });
+
+for (const operation of ["completeDelivery", "releaseDelivery"] as const) {
+  test(`${operation} retries the same deferred delivery before later mail`, async () => {
+    plant("m1.json", "retry", "poison-body");
+    plant("m2.json", "later", "healthy-body");
+    const c = client();
+    const original = c[operation].bind(c);
+    let attempts = 0;
+    let held: MailDelivery | undefined;
+    const next = c.deliverNext.bind(c);
+    const nextSpy = spyOn(c, "deliverNext").mockImplementation(async () => {
+      expect(held).toBeUndefined();
+      return next();
+    });
+    const claimDir = join(root, ".mail-lock.claim");
+    const savedMailbox = `${root}.saved`;
+    const provider = {
+      async complete(req: unknown) {
+        if (attempts === 0) {
+          if (operation === "completeDelivery") mkdirSync(claimDir);
+          else {
+            renameSync(root, savedMailbox);
+            writeFileSync(root, "not a directory");
+          }
+        }
+        return poisonAwareProvider.complete(req);
+      },
+    };
+    const observe = (delivery: MailDelivery, result: { status: string; reason?: string }) => {
+      if (delivery.message.verifiedEnvelope?.messageId !== "retry" || attempts >= 2) return;
+      attempts++;
+      if (attempts === 1) {
+        expect(result).toMatchObject({ status: "deferred", reason: operation === "completeDelivery" ? "lock-busy" : "storage-error" });
+        held = delivery;
+        if (operation === "completeDelivery") rmSync(claimDir, { recursive: true });
+        else {
+          rmSync(root);
+          renameSync(savedMailbox, root);
+        }
+        expect(intentJson("m1.json").claim).toBeDefined();
+      } else {
+        expect(delivery).toBe(held);
+        expect(result.status).toBe(operation === "completeDelivery" ? "completed" : "released");
+        held = undefined;
+      }
+    };
+    const settlementSpy = operation === "completeDelivery"
+      ? spyOn(c, "completeDelivery").mockImplementation(async (delivery) => {
+          const result = await (original as MailClient["completeDelivery"])(delivery);
+          observe(delivery, result);
+          return result;
+        })
+      : spyOn(c, "releaseDelivery").mockImplementation((delivery) => {
+          const result = (original as MailClient["releaseDelivery"])(delivery);
+          observe(delivery, result);
+          return result;
+        });
+    try {
+      const seen = await runLoop(c, {
+        provider: operation === "completeDelivery" ? {
+          async complete(req) { await provider.complete(req); return completingProvider.complete(); },
+        } : provider,
+        maxToolTurns: 0, stopOnId: "later",
+      });
+      expect(attempts).toBe(2);
+      expect(seen.at(-1)).toEqual({ id: "later", presentation: 1 });
+      expect(intentPhase("m2.json")).toBeNull();
+      expect(held).toBeUndefined();
+    } finally {
+      settlementSpy.mockRestore();
+      nextSpy.mockRestore();
+    }
+  }, 15_000);
+
+  test(`${operation} quarantines an overdue deferred claim before later mail`, async () => {
+    plant("m1.json", "overdue");
+    plant("m2.json", "later");
+    const c = client();
+    const claimDir = join(root, ".mail-lock.claim");
+    let attempts = 0;
+    const original = c[operation].bind(c);
+    const expire = () => {
+      attempts++;
+      if (attempts !== 1) return;
+      const intent = intentJson("m1.json");
+      intent.firstPresentedAt = new Date(Date.now() - DELIVERY_PRESENTATION_TTL_MS - 1_000).toISOString();
+      writeFileSync(intentPath("m1.json"), JSON.stringify(intent));
+      mkdirSync(claimDir);
+    };
+    const observe = (result: { status: string }) => {
+      if (attempts === 1) {
+        expect(result.status).toBe("deferred");
+        rmSync(claimDir, { recursive: true });
+      } else if (attempts === 2) expect(result.status).toBe("quarantined");
+    };
+    const settlementSpy = operation === "completeDelivery"
+      ? spyOn(c, "completeDelivery").mockImplementation(async (delivery) => {
+          expire();
+          const result = await (original as MailClient["completeDelivery"])(delivery);
+          observe(result); return result;
+        })
+      : spyOn(c, "releaseDelivery").mockImplementation((delivery) => {
+          expire();
+          const result = (original as MailClient["releaseDelivery"])(delivery);
+          observe(result); return result;
+        });
+    try {
+      const seen = await runLoop(c, {
+        provider: operation === "completeDelivery" ? completingProvider : toolCallingProvider,
+        maxToolTurns: 0, stopOnId: "later",
+      });
+      expect(seen).toEqual([{ id: "overdue", presentation: 1 }, { id: "later", presentation: 1 }]);
+      expect(intentPhase("m1.json")).toBe("failed");
+      expect(intentJson("m1.json").claim).toBeUndefined();
+      expect(existsSync(cur("m1.json"))).toBe(true);
+    } finally { settlementSpy.mockRestore(); }
+  }, 15_000);
+}
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  for (const completed of [true, false]) {
+    test(`AgentRuntime.start drains ${completed ? "finalize" : "release"} after ${signal} before removing its PID file`, async () => {
+      plant("m1.json", "in-flight");
+      plant("m2.json", "later");
+      let enter!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      let finish!: () => void;
+      const finishing = new Promise<void>((resolve) => { finish = resolve; });
+      const lookup = spyOn(FlairContextProvider.prototype, "getAgent").mockImplementation(async () => ({ publicKey: Buffer.from(ed.getPublicKey(SEED)).toString("base64") }) as never);
+      const provider = spyOn(ProviderManager.prototype, "complete").mockImplementation(async () => {
+        enter(); await finishing;
+        return completed ? completingProvider.complete() : toolCallingProvider.complete();
+      });
+      const runtime = new AgentRuntime({
+        agentId: AGENT, name: "signal-test", mailDir, workspace,
+        memoryPath: join(workspace, "memory.jsonl"), maxToolTurns: 0,
+        llm: { provider: "openai", model: "test", apiKey: "test" },
+      });
+      let returned = false;
+      const start = runtime.start().then(() => { returned = true; });
+      const pidPath = join(workspace, ".tps-agent.pid");
+      const claimDir = join(root, ".mail-lock.claim");
+      const original = MailClient.prototype[completed ? "completeDelivery" : "releaseDelivery"];
+      let deferred!: () => void;
+      const deferring = new Promise<void>((resolve) => { deferred = resolve; });
+      const settlementSpy = completed
+        ? spyOn(MailClient.prototype, "completeDelivery").mockImplementation(async function(delivery) {
+            const result = await (original as MailClient["completeDelivery"]).call(this, delivery);
+            if (result.status === "deferred") deferred();
+            return result;
+          })
+        : spyOn(MailClient.prototype, "releaseDelivery").mockImplementation(function(delivery) {
+            const result = (original as MailClient["releaseDelivery"]).call(this, delivery);
+            if (result.status === "deferred") deferred();
+            return result;
+          });
+      try {
+        await entered;
+        process.emit(signal);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(returned).toBe(false);
+        expect(existsSync(pidPath)).toBe(true);
+        mkdirSync(claimDir);
+        finish();
+        await deferring;
+        expect(returned).toBe(false);
+        expect(existsSync(pidPath)).toBe(true);
+        expect(intentJson("m1.json").claim).toBeDefined();
+        rmSync(claimDir, { recursive: true });
+        await start;
+        expect(existsSync(pidPath)).toBe(false);
+        expect(newFiles()).toEqual(["m2.json"]);
+        expect(completed ? intentPhase("m1.json") : intentJson("m1.json").claim).toBe(completed ? null : undefined);
+      } finally {
+        finish();
+        rmSync(claimDir, { recursive: true, force: true });
+        await runtime.stop();
+        await start;
+        settlementSpy.mockRestore(); provider.mockRestore(); lookup.mockRestore();
+      }
+    }, 15_000);
+  }
+}

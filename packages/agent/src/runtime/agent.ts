@@ -66,27 +66,24 @@ export class AgentRuntime {
   }
 
   async start(): Promise<void> {
-    const deliverOutbox = () => this.mail.deliverOutbox();
-
-
     const pidPath = join(this.config.workspace, ".tps-agent.pid");
     mkdirSync(dirname(pidPath), { recursive: true });
     writeFileSync(pidPath, `${process.pid}\n`, "utf-8");
 
-    const shutdown = new Promise<void>((resolve) => {
-      const onStop = async () => {
-        await this.loop.stop();
-        resolve();
-      };
-      process.once("SIGINT", onStop);
-      process.once("SIGTERM", onStop);
-    });
+    let loopRun: Promise<void>;
+    const onStop = async () => {
+      await this.loop.stop();
+      await loopRun.catch(() => {});
+    };
+    process.once("SIGINT", onStop);
+    process.once("SIGTERM", onStop);
 
     try {
-      // cli#617 slice (c): deliver one message at a time, finalizing only on a
-      // completed outcome, so a crash or stop re-presents the message in flight.
-      await Promise.race([this.loop.runDeliveries(this.mail), shutdown]);
+      loopRun = this.loop.runDeliveries(this.mail);
+      await loopRun;
     } finally {
+      process.removeListener("SIGINT", onStop);
+      process.removeListener("SIGTERM", onStop);
       rmSync(pidPath, { force: true });
     }
   }

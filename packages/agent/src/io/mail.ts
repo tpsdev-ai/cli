@@ -107,6 +107,7 @@ export type DeliveryCompletion =
   | { status: "completed" }
   /** An earlier call with this delivery removed it. */
   | { status: "already-completed" }
+  | { status: "quarantined" }
   | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string }
   /**
    * Not this hand-over's to finalize: a refusal finalizes no intent (one may
@@ -121,6 +122,7 @@ export type DeliveryCompletion =
 
 export type DeliveryRelease =
   | { status: "released" }
+  | { status: "quarantined" }
   | { status: "refused"; reason: "foreign" | "stale" }
   | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string };
 
@@ -412,7 +414,7 @@ export class MailClient {
    * Unresolved placing/in_progress work defers deliverNext() commits. The token
    * set covers MailClients of this module copy; claims from other copies in the
    * same process are treated as live until process exit or lease expiry.
-   * Release failed handoffs before retrying. The event loop uses checkNewMail().
+   * Retry deferred completion or release on the same hand-over.
    */
   async deliverNext(): Promise<DeliverNextResult> {
     let roots: OperationRoots;
@@ -467,6 +469,7 @@ export class MailClient {
     if ("status" in lock) return { status: "deferred", reason: "lock-busy", detail: lock.detail };
     let result: ReturnType<ReturnType<typeof mailboxReplayStore>["completePlacement"]>;
     try {
+      if (this.expireIssuedDelivery(roots.mailbox, issued)) return { status: "quarantined" };
       result = mailboxReplayStore(roots.mailbox).completePlacement(issued.messageId, issued.file, issued.token);
     } catch (err) {
       this.emitRecoveryError(err);
@@ -505,6 +508,7 @@ export class MailClient {
       if (!lock) return { status: "deferred", reason: "lock-busy", detail: "delivery not released; retry" };
       let released: boolean;
       try {
+        if (this.expireIssuedDelivery(issued.mailbox, issued)) return { status: "quarantined" };
         released = mailboxReplayStore(issued.mailbox).releasePlacement(issued.messageId, issued.file, issued.token);
       } finally {
         lock.release();
@@ -517,6 +521,19 @@ export class MailClient {
       this.emitRecoveryError(err);
       return { status: "deferred", reason: "storage-error", detail: `release persistence failed (${sanitizeError(err)}); retry` };
     }
+  }
+
+  /** Called under the mailbox lock; only this issued claim may hit the deadline. */
+  private expireIssuedDelivery(mailbox: string, issued: { messageId: string; file: string; token: string; state: string }): boolean {
+    const replay = mailboxReplayStore(mailbox);
+    const state = replay.placementState(issued.file);
+    if (state?.claim?.token !== issued.token) return false;
+    const expiry = replay.expireOverdue(issued.messageId, issued.file, new Date().toISOString());
+    if (expiry.status !== "failed") return false;
+    issued.state = "released";
+    activePresentations.delete(issued.token);
+    this.logQuarantine(issued.messageId, expiry.presentations, "deadline");
+    return true;
   }
 
   /** Record a hand-over: the token is already held in this module copy; bind it to the delivery object. */

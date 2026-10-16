@@ -1,15 +1,12 @@
-- **The agent event loop delivers mail one message at a time and finalizes it only after its handler completes (Refs #617, slice c).**
+- **The agent event loop processes one mail delivery at a time (Refs #617, slice c).**
 
-  Delivery moves from the batch `checkNewMail()` path to the per-message
-  delivery API. A check commits a single message with a live `in_progress`
-  intent; the loop processes it and finalizes it on a completed outcome. A
-  turn-limit return or a thrown handler is not completion: the hand-over is
-  released and the message is presented again on the next check. A graceful
-  stop breaks before the next commit, so only the message in flight is
-  committed. A kill at any point before completion re-presents that message on
-  the next check, and messages not yet reached stay in `new/`.
+  Handler completion requests finalization; a turn-limit return or thrown
+  handler requests release. Deferred finalization and release are retried on
+  the same delivery until settlement or deadline quarantine. A stop prevents
+  the next `deliverNext()` call; a check already waiting can return a delivery,
+  which is processed and settled before shutdown removes the PID file.
 
-  The guarantee: every committed message is presented until it completes or is
-  quarantined by the liveness bound (five presentations or 24 hours). A
-  completed message is never presented again, and the delivery key
-  `mailbox/messageId` lets handlers make repeats idempotent.
+  A committed unfinished hand-over can be re-presented after a kill when
+  recovery can verify it. A durably finalized delivery is not presented again.
+  Delivery API consumers receive a JSON-encoded
+  `[canonical mailbox path, messageId]` key, stable across presentations at that path.
