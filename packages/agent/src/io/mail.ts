@@ -72,11 +72,12 @@ export interface MailDelivery {
  *   is absent or mismatched, or its bytes changed during re-verification.
  * - `storage-error`: resolving roots or listing new/ threw, or a history, cur/, quarantine or
  *   placement-state operation threw while pending placements were processed.
+ *   Quarantine may have moved the payload and unlinked the intent before sync failed.
  * - `new-mail-deferred`: one new/ file's attempt did not complete: reading it,
  *   verifying it (including the verifier or trust-tier read not answering), a
- *   history read, or its commit failed or was deferred, including when a
- *   placement appeared before its commit lock. A listed file that disappears
- *   before it is read is skipped, and the scan continues.
+ *   history read or a commit operation threw, or a placement appeared before
+ *   its commit lock. A storage failure may follow a commit. A listed file that
+ *   disappears before it is read is skipped, and the scan continues.
  */
 export type DeliveryDeferral =
   | "lock-busy"
@@ -117,6 +118,10 @@ type DeferredResult = Extract<DeliverNextResult, { status: "deferred" }>;
 /** A pending placement this call resolved without presenting (gone, terminal, or another writer's phase). */
 type PendingOutcome = DeliverNextResult | { status: "resolved" };
 const RESOLVED: PendingOutcome = { status: "resolved" };
+
+function report(fn: () => void): void {
+  try { fn(); } catch {}
+}
 
 function deferred(reason: DeliveryDeferral, detail: string, file?: string): DeferredResult {
   return { status: "deferred", reason, detail, ...(file === undefined ? {} : { file }) };
@@ -304,14 +309,14 @@ export class MailClient {
       try {
         body = readFileSync(srcPath, "utf-8");
       } catch (err) {
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "error",
           from: "unknown",
           durationMs: Date.now() - started,
           error: sanitizeError(err),
-        });
+        }));
         continue; // leave in new/ — a later check retries
       }
 
@@ -322,15 +327,15 @@ export class MailClient {
         verifyResult = await this.verifyMailBody(body);
       } catch (err) {
         const detail = sanitizeError(err);
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "error",
           from: "unknown",
           durationMs: Date.now() - started,
           error: detail,
-        });
-        console.error(`[MailClient] verification could not run for ${file} — NOT promoting: ${detail}`);
+        }));
+        report(() => console.error(`[MailClient] verification could not run for ${file} — NOT promoting: ${detail}`));
         continue; // leave in new/
       }
 
@@ -344,15 +349,15 @@ export class MailClient {
         trustTier = verifiedMailTier(verifyResult.envelope, roots.mailRoot);
       } catch (err) {
         const detail = sanitizeError(err);
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "error",
           from: verifyResult.envelope.from,
           durationMs: Date.now() - started,
           error: detail,
-        });
-        console.error(`[MailClient] trust tier could not be resolved for ${file} — NOT promoting: ${detail}`);
+        }));
+        report(() => console.error(`[MailClient] trust tier could not be resolved for ${file} — NOT promoting: ${detail}`));
         continue; // leave in new/
       }
 
@@ -370,22 +375,22 @@ export class MailClient {
           verifiedEnvelope: verifyResult.envelope,
           trustTier,
         });
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "ok",
           from,
           durationMs: Date.now() - started,
-        });
+        }));
       } catch (err) {
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "error",
           from: "unknown",
           durationMs: Date.now() - started,
           error: sanitizeError(err),
-        });
+        }));
       }
     }
 
@@ -687,10 +692,10 @@ export class MailClient {
     const why = cause === "deadline"
       ? `the deadline (${DELIVERY_PRESENTATION_TTL_MS / 3_600_000} h after the first presentation) passed`
       : "the presentation bound was reached";
-    console.warn(
+    report(() => console.warn(
       `[MailClient] placement quarantined for mailbox ${this.agentId}: message ${messageId} not completed ` +
         `after ${presentations} presentation(s); ${why}; failure transition does not delete an existing payload`,
-    );
+    ));
   }
 
   /**
@@ -758,9 +763,9 @@ export class MailClient {
           continue;
         }
         const from = verifyResult.envelope.from;
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive", agent: this.agentId, status: "ok", from, durationMs: Date.now() - started,
-        });
+        }));
         delivered = true;
         const message: MailMessage = {
           filename: file, body, receivedAt: new Date(), headers: {}, from,
@@ -769,7 +774,7 @@ export class MailClient {
         return { status: "delivered", delivery: this.issue(roots, token, verifyResult.envelope.messageId, file, 1, message) };
       } catch (err) {
         this.emitRecoveryError(err);
-        skipped ??= { file, detail: `not committed: ${sanitizeError(err)}` };
+        skipped ??= { file, detail: `delivery attempt failed: ${sanitizeError(err)}` };
       } finally {
         if (!delivered) activePresentations.delete(token);
       }
@@ -787,11 +792,9 @@ export class MailClient {
   }
 
   private emitRecoveryError(err: unknown): void {
-    try {
-      this.events?.emit({
-        type: "mail.receive", agent: this.agentId, status: "error", from: "unknown", durationMs: 0, error: sanitizeError(err),
-      });
-    } catch {}
+    report(() => this.events?.emit({
+      type: "mail.receive", agent: this.agentId, status: "error", from: "unknown", durationMs: 0, error: sanitizeError(err),
+    }));
   }
 
   /** Commit under the mailbox lock; attempt placement rollback on append failure. */
@@ -884,14 +887,14 @@ export class MailClient {
       if (!listing) return; // lock unavailable; defer recovery
       pending = pendingPlacementEntries(root);
     } catch (err) {
-      this.events?.emit({
+      report(() => this.events?.emit({
         type: "mail.receive",
         agent: this.agentId,
         status: "error",
         from: "unknown",
         durationMs: 0,
         error: sanitizeError(err),
-      });
+      }));
       return; // a later check retries
     } finally {
       listing?.release();
@@ -921,14 +924,14 @@ export class MailClient {
         const delivered = await this.completeInterruptedPlacement(messageId, file, root, bytes, outcome.envelope, trustTier);
         if (delivered) messages.push(delivered);
       } catch (err) {
-        this.events?.emit({
+        report(() => this.events?.emit({
           type: "mail.receive",
           agent: this.agentId,
           status: "error",
           from: "unknown",
           durationMs: 0,
           error: sanitizeError(err),
-        });
+        }));
       }
     }
   }
@@ -1011,16 +1014,16 @@ export class MailClient {
       if (srcPath !== dlqPath) renameSync(srcPath, dlqPath);
       writeRejectSidecar(dlqDir, file, rejected.class, rejected.reason);
     } catch (err) {
-      console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`);
+      report(() => console.error(`[MailClient] failed to dead-letter ${file}: ${sanitizeError(err)}`));
     } finally { relayLock?.release(); }
-    this.events?.emit({
+    report(() => this.events?.emit({
       type: "mail.receive",
       agent: this.agentId,
       status: "rejected",
       from: rejected.from ?? "unknown",
       durationMs: Date.now() - started,
       error: rejected.reason,
-    });
+    }));
   }
 
   /** Write a message to outbox/new for relay delivery. */
@@ -1039,22 +1042,22 @@ export class MailClient {
         JSON.stringify({ from: this.agentId, to, body: signed, sentAt: new Date().toISOString() }, null, 2),
         "utf-8"
       );
-      this.events?.emit({
+      report(() => this.events?.emit({
         type: "mail.send",
         agent: this.agentId,
         to,
         status: "ok",
         durationMs: Date.now() - started,
-      });
+      }));
     } catch (err) {
-      this.events?.emit({
+      report(() => this.events?.emit({
         type: "mail.send",
         agent: this.agentId,
         to,
         status: "error",
         durationMs: Date.now() - started,
         error: sanitizeError(err),
-      });
+      }));
       throw err;
     }
   }

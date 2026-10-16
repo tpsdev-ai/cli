@@ -363,6 +363,105 @@ describe("in_progress re-presentation in recovery", () => {
   });
 });
 
+describe("reporting failures", () => {
+  function failingEvents(): EventLogger {
+    const eventDir = join(mailDir, "events");
+    const events = new EventLogger(AGENT, eventDir);
+    rmSync(eventDir, { recursive: true });
+    writeFileSync(eventDir, "not a directory");
+    expect(() => events.emit({ type: "mail.receive", status: "error" })).toThrow();
+    return events;
+  }
+
+  test("a failed real event destination preserves a committed delivery", async () => {
+    plant("m1.json", "logger-success");
+    const events = failingEvents();
+    const emit = spyOn(events, "emit");
+    const c = new MailClient(mailDir, events, AGENT, verifier());
+    try {
+      const m = delivered(await c.deliverNext());
+      expect(m.message.verifiedEnvelope?.messageId).toBe("logger-success");
+      expect(hasCommittedMessageId(root, "logger-success")).toBe(true);
+      expect(intentPhase("m1.json")).toBe("in_progress");
+      expect(newFiles()).toEqual([]);
+      expect(curFiles()).toEqual(["m1.json"]);
+      expect(emit).toHaveBeenCalledWith(expect.objectContaining({ status: "ok" }));
+      expect(reasonOf(await c.deliverNext())).toBe("active");
+      expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+    } finally { emit.mockRestore(); }
+  });
+
+  test("a failed real event destination preserves rejection", async () => {
+    writeFileSync(fresh("m1.json"), "{}");
+    const events = failingEvents();
+    const emit = spyOn(events, "emit");
+    try {
+      expect(await new MailClient(mailDir, events, AGENT, verifier()).deliverNext()).toEqual({ status: "idle" });
+      expect(newFiles()).toEqual([]);
+      expect(curFiles()).toEqual([]);
+      expect(readFileSync(join(root, "dlq", "m1.json"), "utf8")).toBe("{}");
+      expect(readFileSync(join(root, "dlq", "m1.json.reason"), "utf8")).toContain("class: invalid");
+      expect(emit).toHaveBeenCalledWith(expect.objectContaining({ status: "rejected" }));
+    } finally { emit.mockRestore(); }
+  });
+
+  for (const failSync of [false, true]) {
+    test(`quarantine with a failed real event destination and directory sync failure=${failSync}`, async () => {
+      writeFileSync(cur("m1.json"), "{}");
+      const c = new MailClient(mailDir, failingEvents(), AGENT, verifier());
+      mailboxReplayStore(root).beginPlacement("logger-quarantine", "m1.json", cur("m1.json"));
+      const fsync = fs.fsyncSync;
+      let boundaryReached = false;
+      const sync = spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+        if (fs.fstatSync(fd).isDirectory() && !existsSync(intentPath("m1.json"))) {
+          boundaryReached = true;
+          expect(existsSync(cur("m1.json"))).toBe(false);
+          expect(readFileSync(join(root, "dlq", "m1.json"), "utf8")).toBe("{}");
+          if (failSync) throw new Error("quarantine directory sync failed");
+        }
+        fsync(fd);
+      });
+      try {
+        const result = await c.deliverNext();
+        expect(result).toMatchObject({ status: "deferred", reason: failSync ? "storage-error" : "pending-record-invalid" });
+        if (failSync) expect(result).toMatchObject({ detail: "quarantine directory sync failed" });
+        expect(boundaryReached).toBe(true);
+        expect(existsSync(intentPath("m1.json"))).toBe(false);
+        expect(readFileSync(join(root, "dlq", "m1.json.reason"), "utf8")).toContain("pending-record-invalid");
+        const lock = await acquireMailLock(realpathSync(root));
+        expect(lock).not.toBeNull();
+        lock?.release();
+      } finally { sync.mockRestore(); }
+    });
+  }
+
+  test("a throwing warning preserves the failed-intent transition and later delivery", async () => {
+    committed("expired", {
+      version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: new Date(Date.now() - DELIVERY_PRESENTATION_TTL_MS - 1).toISOString(),
+    });
+    plant("m2.json", "later");
+    const warn = spyOn(console, "warn").mockImplementation(() => { throw new Error("warning failed"); });
+    try {
+      expect(idOf(await client().deliverNext())).toBe("later");
+      expect(intentPhase("m1.json")).toBe("failed");
+      expect(warn).toHaveBeenCalled();
+    } finally { warn.mockRestore(); }
+  });
+
+  test("a throwing error log preserves a rejection whose DLQ move failed", async () => {
+    const c = new MailClient(mailDir, failingEvents(), AGENT, verifier());
+    writeFileSync(fresh("m1.json"), "{}");
+    mkdirSync(join(root, "dlq", "m1.json"));
+    const error = spyOn(console, "error").mockImplementation(() => { throw new Error("error log failed"); });
+    try {
+      expect(await c.deliverNext()).toEqual({ status: "idle" });
+      expect(newFiles()).toEqual(["m1.json"]);
+      expect(error).toHaveBeenCalled();
+    } finally { error.mockRestore(); }
+  });
+});
+
 describe("completion is bound to the hand-over", () => {
   test("a failed real event destination cannot reject a placement-error deferral", async () => {
     plant("m1.json", "logger-error");
