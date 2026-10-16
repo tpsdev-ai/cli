@@ -187,7 +187,33 @@ export async function withScratchFlair<T>(
   }
 }
 
-async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSignal): Promise<ScratchFlair & ScratchProcess> {
+export function assertListenerAddresses(port: number, addresses: string[]): void {
+  if (addresses.length === 0 || addresses.some((address) => address !== `127.0.0.1:${port}`)) {
+    throw new ScratchFlairBindError(`real-flair lane: port ${port} must listen only on 127.0.0.1; got ${JSON.stringify(addresses)}`);
+  }
+}
+
+export function assertLoopbackListeners(ports: number[]): void {
+  for (const port of ports) {
+    let addresses: string[];
+    try {
+      const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"], { encoding: "utf8" });
+      addresses = out.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const out = execFileSync("ss", ["-H", "-ltn", "sport", "=", `:${port}`], { encoding: "utf8" });
+      addresses = out.trim().split("\n").filter(Boolean).map((line) => line.trim().split(/\s+/)[3]);
+    }
+    assertListenerAddresses(port, addresses);
+    console.log(`real-flair lane: listening socket ${port}: ${addresses.join(", ")}`);
+  }
+}
+
+export class ScratchFlairBindError extends Error {
+  override name = "ScratchFlairBindError";
+}
+
+async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
   const { root } = instance;
   const home = join(root, "home");
   const models = join(root, "models");
@@ -220,6 +246,17 @@ async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSig
   proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
   proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
 
+  return { home, httpPort, opsPort, log: () => log };
+}
+
+export async function initializeScratchFlair(
+  instance: ScratchProcess,
+  signal: AbortSignal,
+  boot = bootScratchFlair,
+  checkListeners = assertLoopbackListeners,
+): Promise<ScratchFlair & ScratchProcess> {
+  const { home, httpPort, opsPort, log } = await boot(instance, signal);
+  const { root, proc } = instance;
   const httpUrl = `http://127.0.0.1:${httpPort}`;
   const opsUrl = `http://127.0.0.1:${opsPort}`;
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
@@ -228,8 +265,10 @@ async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSig
   const httpUp = await waitForOk(`${httpUrl}/Health`, deadline, signal);
   const opsUp = httpUp && (await waitForOk(`${opsUrl}/health`, deadline, signal));
   if (!httpUp || !opsUp) {
-    throw new Error(`scratch Flair did not start within ${BOOT_TIMEOUT_MS}ms (http=${httpUp} ops=${opsUp}). Boot log tail:\n${log.slice(-4000)}`);
+    throw new Error(`scratch Flair did not start within ${BOOT_TIMEOUT_MS}ms (http=${httpUp} ops=${opsUp}). Boot log tail:\n${log().slice(-4000)}`);
   }
+
+  checkListeners([httpPort, opsPort]);
 
   const adminB64 = Buffer.from(ADMIN_AUTH).toString("base64");
   const ops = (body: unknown) =>
@@ -261,21 +300,24 @@ async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSig
   await agents[SEEDED_AGENTS[0]].client.writeMemory("embedding-warmup", "Warm the embedding model before the real-Flair tests.");
   console.log(`real-flair lane: embedding warm-up took ${Math.round(performance.now() - warmupStarted)}ms`);
 
-  return { baseUrl: httpUrl, opsUrl, httpPort, opsPort, admin: ADMIN_AUTH, root, agents, ops, log: () => log, proc };
+  return { baseUrl: httpUrl, opsUrl, httpPort, opsPort, admin: ADMIN_AUTH, root, agents, ops, log, proc };
 }
 
-/**
- * Resolve the Flair a real-seam test talks to, from the environment. The lane
- * exports the instance's loopback ports (path-free, so the HOME-isolation
- * launcher passes them); `TPS_TEST_FLAIR_URL`/`_OPS_URL`/`_ADMIN` (the contract
- * cli#591 established) still win when a caller sets them directly.
- */
+function parsePort(raw: string | undefined, name: string, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const port = Number(raw);
+  if (!/^[0-9]+$/.test(raw) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`real-flair lane: ${name} must be a decimal integer in 1–65535`);
+  }
+  return port;
+}
+
 export function flairTarget(env: NodeJS.ProcessEnv = process.env): FlairTarget {
-  const httpPort = env.TPS_TEST_FLAIR_HTTP_PORT;
-  const opsPort = env.TPS_TEST_FLAIR_OPS_PORT;
+  const httpPort = parsePort(env.TPS_TEST_FLAIR_HTTP_PORT, "TPS_TEST_FLAIR_HTTP_PORT", 9926);
+  const opsPort = parsePort(env.TPS_TEST_FLAIR_OPS_PORT, "TPS_TEST_FLAIR_OPS_PORT", 9925);
   return {
-    baseUrl: env.TPS_TEST_FLAIR_URL ?? (httpPort ? `http://127.0.0.1:${httpPort}` : "http://127.0.0.1:9926"),
-    opsUrl: env.TPS_TEST_FLAIR_OPS_URL ?? (opsPort ? `http://127.0.0.1:${opsPort}` : "http://127.0.0.1:9925"),
+    baseUrl: env.TPS_TEST_FLAIR_URL ?? `http://127.0.0.1:${httpPort}`,
+    opsUrl: env.TPS_TEST_FLAIR_OPS_URL ?? `http://127.0.0.1:${opsPort}`,
     admin: env.TPS_TEST_FLAIR_ADMIN ?? ADMIN_AUTH,
   };
 }

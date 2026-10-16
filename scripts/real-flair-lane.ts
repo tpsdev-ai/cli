@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,33 +45,10 @@ export function assertRealFlairReport(xml: string): void {
   }
 }
 
-export function assertListenerAddresses(port: number, addresses: string[]): void {
-  if (addresses.length === 0 || addresses.some((address) => address !== `127.0.0.1:${port}`)) {
-    throw new Error(`real-flair lane: port ${port} must listen only on 127.0.0.1; got ${JSON.stringify(addresses)}`);
-  }
-}
-
-export function assertLoopbackListeners(ports: number[]): void {
-  for (const port of ports) {
-    let addresses: string[];
-    try {
-      const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"], { encoding: "utf8" });
-      addresses = out.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const out = execFileSync("ss", ["-H", "-ltn", "sport", "=", `:${port}`], { encoding: "utf8" });
-      addresses = out.trim().split("\n").filter(Boolean).map((line) => line.trim().split(/\s+/)[3]);
-    }
-    assertListenerAddresses(port, addresses);
-    console.log(`real-flair lane: listening socket ${port}: ${addresses.join(", ")}`);
-  }
-}
-
 async function main(): Promise<void> {
   const files = Object.keys(EXPECTED_CASES).map((file) => `test/${file}`);
   console.log(`real-flair lane: ${files.length} named file(s): ${files.join(", ")}`);
   process.exitCode = await withScratchFlair(async (flair, signal) => {
-    assertLoopbackListeners([flair.httpPort, flair.opsPort]);
     const child = spawn("node", [join(REPO, "scripts", "test-suite.mjs"), "real-flair", ...files], {
       cwd: CLI_DIR,
       detached: true,

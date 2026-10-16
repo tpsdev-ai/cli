@@ -36,6 +36,21 @@ test("flairTarget reads the lane's ports and still honours the cli#591 URL varia
   expect(flairTarget({}).baseUrl).toBe("http://127.0.0.1:9926");
 });
 
+test("flairTarget refuses malformed or out-of-range lane ports", () => {
+  for (const name of ["TPS_TEST_FLAIR_HTTP_PORT", "TPS_TEST_FLAIR_OPS_PORT"]) {
+    for (const value of ["80@evil.example", "", "0", "65536", "-1", "1.5", "1e3", " 80", "80 ", "Infinity"]) {
+      expect(() => flairTarget({ [name]: value })).toThrow(`${name} must be a decimal integer in 1–65535`);
+      expect(() => flairTarget({ [name]: value, TPS_TEST_FLAIR_URL: "http://127.0.0.1:9931", TPS_TEST_FLAIR_OPS_URL: "http://127.0.0.1:9932" })).toThrow(name);
+    }
+    for (const value of ["1", "65535", "00080"]) {
+      const target = flairTarget({ [name]: value });
+      const url = new URL(name === "TPS_TEST_FLAIR_HTTP_PORT" ? target.baseUrl : target.opsUrl);
+      expect(url.hostname).toBe("127.0.0.1");
+      expect(url.port || "80").toBe(String(Number(value)));
+    }
+  }
+});
+
 realFlair("a signed memory write reads back with the fields it was written with", async () => {
   const agent = await provisionAgent(flairTarget());
   const id = `mem-${randomUUID()}`;

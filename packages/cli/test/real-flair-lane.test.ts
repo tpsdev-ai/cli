@@ -6,8 +6,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { load } from "js-yaml";
-import { assertListenerAddresses, assertRealFlairReport, EXPECTED_CASES } from "../../../scripts/real-flair-lane.js";
-import { waitForOk, withScratchFlair, type ScratchFlair, type ScratchProcess } from "./helpers/scratch-flair.js";
+import { assertRealFlairReport, EXPECTED_CASES } from "../../../scripts/real-flair-lane.js";
+import { assertListenerAddresses, initializeScratchFlair, ScratchFlairBindError, waitForOk, withScratchFlair, type ScratchFlair, type ScratchProcess } from "./helpers/scratch-flair.js";
+import { FlairClient } from "../src/utils/flair-client.js";
 
 const repo = resolve(import.meta.dir, "../../..");
 const escape = (value: string) => value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
@@ -35,6 +36,41 @@ test("the listener assertion rejects wildcard, external and missing binds", () =
   }
 });
 
+for (const wrongPort of [45001, 45002]) {
+  test(`a non-loopback bind on ${wrongPort} refuses seed and warm-up writes`, async () => {
+    const requests: Array<{ url: string; method: string }> = [];
+    let warmups = 0;
+    let ran = false;
+    const restoreFetch = patchShared(globalThis, "fetch", (async (url: unknown, init?: RequestInit) => {
+      requests.push({ url: String(url), method: init?.method ?? "GET" });
+      return new Response("{}");
+    }) as typeof fetch);
+    const restoreWarmup = patchShared(FlairClient.prototype, "writeMemory", async () => { warmups++; });
+    try {
+      const lane = withScratchFlair(async () => { ran = true; }, (instance, signal) =>
+        initializeScratchFlair(instance, signal, async () => ({
+          home: instance.root, httpPort: 45001, opsPort: 45002, log: () => "",
+        }), (ports) => {
+          expect(ports).toEqual([45001, 45002]);
+          for (const port of ports) {
+            assertListenerAddresses(port, [`${port === wrongPort ? "0.0.0.0" : "127.0.0.1"}:${port}`]);
+          }
+        }));
+      await expect(lane).rejects.toBeInstanceOf(ScratchFlairBindError);
+      await expect(lane).rejects.toThrow(`port ${wrongPort} must listen only on 127.0.0.1`);
+      expect(requests).toEqual([
+        { url: "http://127.0.0.1:45001/Health", method: "GET" },
+        { url: "http://127.0.0.1:45002/health", method: "GET" },
+      ]);
+      expect(warmups).toBe(0);
+      expect(ran).toBe(false);
+    } finally {
+      restoreWarmup();
+      restoreFetch();
+    }
+  });
+}
+
 test("the workflow paths cover mail, identity, mail verification and lane inputs", () => {
   const workflow = load(readFileSync(resolve(repo, ".github/workflows/real-flair.yml"), "utf8")) as {
     on: { pull_request: { paths: string[] } };
@@ -44,6 +80,9 @@ test("the workflow paths cover mail, identity, mail verification and lane inputs
     "packages/cli/src/utils/mail.ts", "packages/cli/src/utils/identity.ts", "packages/cli/src/utils/mail-verify.ts",
     "packages/agent/src/io/mail.ts", "packages/cli/test/helpers/scratch-flair.ts", "scripts/real-flair-lane.ts",
     "packages/cli/test/real-flair-lane.test.ts", ".github/workflows/real-flair.yml", "package.json", "bun.lock",
+    "scripts/home-isolation-preload.ts", "packages/cli/test/helpers/patch-shared.ts",
+    "packages/cli/test/helpers/leak-preload.ts", "packages/cli/bunfig.toml", "bunfig.toml",
+    "packages/cli/package.json", "packages/agent/package.json", "packages/cli/tsconfig.json", "packages/agent/tsconfig.json",
     ...Object.keys(EXPECTED_CASES).map((file) => `packages/cli/test/${file}`),
   ]) {
     expect(globs.some((glob) => glob.match(path))).toBe(true);
