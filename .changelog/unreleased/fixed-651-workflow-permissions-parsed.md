@@ -1,0 +1,1 @@
+- **The workflow permissions test reads each write grant from the parsed workflow, using the text only for the grant's justification comment (Closes #651).**

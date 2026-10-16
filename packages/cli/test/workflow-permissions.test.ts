@@ -140,33 +140,54 @@ function commentOn(line: string): string {
   return hash === -1 ? "" : line.slice(hash + 1).trim();
 }
 
-/**
- * Every `<scope>: write` declaration under a `permissions:` key, workflow-level
- * or per-job, read from the RAW text because YAML drops comments. Block-style
- * maps are read line by line; a single-line flow-style map
- * (`permissions: {a: read, b: write}`) is read from its own line. A scalar grant
- * (`permissions: write-all`) or a flow map that does not close on its line is
- * reported as unreadable, so an unread form cannot slip past the comment check.
- * The job a declaration sits under is the nearest preceding two-space-indented
- * `name:` line.
- */
-function scanPermissions(file: string): PermScan {
-  return scanPermissionsText(raw(file));
+/** The map key for one scope of one job; the workflow level gets its own job. */
+function scopeKey(job: string | null, scope: string): string {
+  return `${job ?? "\u0000workflow"}\u0000${scope}`;
 }
 
-/** The same scan over workflow text, so the rules can be checked on fixtures. */
-function scanPermissionsText(text: string): PermScan {
-  const lines = text.split("\n");
-  const writes: WriteScope[] = [];
-  const unreadable: string[] = [];
+/**
+ * The `#`-comment on the raw line that declares each scope under a
+ * `permissions:` key. YAML drops comments, so the text is read for the comment
+ * alone; which scopes GRANT write is decided from the parsed workflow (see
+ * scanPermissions). Block-style maps, a flow map on the `permissions:` line or
+ * the line after it, a quoted key and an explicit `? key` / `: value` pair are
+ * all read. The job a declaration sits under is the nearest preceding key under
+ * `jobs:`.
+ */
+function declarationComments(text: string): Map<string, string> {
+  const byKey = new Map<string, string>();
   let job: string | null = null;
   let inJobs = false;
-  let inBlock = false;
-  let blockIndent = -1;
+  let inPermissions = false;
+  let permissionsIndent = -1;
+  let explicitScope: string | null = null;
 
-  for (const line of lines) {
-    // A two-space key is a JOB only under `jobs:`; the same indent under `on:`
-    // names a trigger (`pull_request:`), which must not be reported as a job.
+  const record = (line: string): void => {
+    const comment = commentOn(line);
+    const code = line.indexOf("#") === -1 ? line : line.slice(0, line.indexOf("#"));
+    const explicitKey = /^\s*\?\s*(?:"|')?([A-Za-z][A-Za-z0-9_-]*)(?:"|')?\s*$/.exec(code);
+    if (explicitKey) {
+      explicitScope = scopeKey(job, explicitKey[1]);
+      byKey.set(explicitScope, comment);
+      return;
+    }
+    if (/^\s*:\s*.*$/.test(code) && explicitScope !== null) {
+      if (comment !== "" && byKey.get(explicitScope) === "") byKey.set(explicitScope, comment);
+      explicitScope = null;
+      return;
+    }
+    explicitScope = null;
+    // A mapping key, optionally quoted: `key:`, `"key":` or `{key:`.
+    const re = /(?:"|')?([A-Za-z][A-Za-z0-9_-]*)(?:"|')?\s*:/g;
+    for (let m = re.exec(code); m !== null; m = re.exec(code)) {
+      if (m[1] === "permissions") continue; // the key itself, not a scope
+      byKey.set(scopeKey(job, m[1]), comment);
+    }
+  };
+
+  for (const line of text.split("\n")) {
+    // A top-level key (no indent). `jobs:` starts the job list; any other
+    // top-level key ends it and clears the current job.
     if (/^[A-Za-z0-9_-]+:/.test(line)) {
       inJobs = /^jobs:\s*(#.*)?$/.test(line);
       job = null;
@@ -174,45 +195,69 @@ function scanPermissionsText(text: string): PermScan {
     const jobMatch = inJobs ? /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line) : null;
     if (jobMatch) job = jobMatch[1];
 
-    const permMatch = /^(\s*)permissions:\s*(.*)$/.exec(line);
+    const permMatch = /^(\s*)(?:"|')?permissions(?:"|')?\s*:\s*(.*)$/.exec(line);
     if (permMatch) {
-      const value = permMatch[2].trim();
-      if (value === "") {
-        inBlock = true;
-        blockIndent = permMatch[1].length;
-      } else if (value === "{}") {
-        // Grants nothing — the shape cli#415 uses at the top level.
-      } else if (value.startsWith("{")) {
-        if (!value.endsWith("}")) {
-          unreadable.push(`${where(job)} → flow-style map not closed on one line`);
-        } else {
-          const re = /([A-Za-z0-9_-]+)\s*:\s*["']?([A-Za-z-]+)["']?/g;
-          for (let m = re.exec(value); m !== null; m = re.exec(value)) {
-            if (m[2] === "write") writes.push({ job, scope: m[1], comment: commentOn(line) });
-          }
-        }
-      } else {
-        unreadable.push(`${where(job)} → scalar permissions "${value}"`);
-      }
+      inPermissions = true;
+      permissionsIndent = permMatch[1].length;
+      explicitScope = null;
+      record(line);
       continue;
     }
-
-    if (!inBlock) continue;
+    if (!inPermissions) continue;
     if (line.trim() === "") continue;
     // A line at or above the `permissions:` line closes the block.
     const indent = line.length - line.trimStart().length;
-    if (indent <= blockIndent) {
-      inBlock = false;
+    if (indent > permissionsIndent) {
+      record(line);
       continue;
     }
+    inPermissions = false;
+    explicitScope = null;
+  }
+  return byKey;
+}
 
-    const entry = /^\s*([A-Za-z0-9_-]+):\s*(\S+)(.*)$/.exec(line);
-    if (entry && entry[2] === "write") {
-      writes.push({ job, scope: entry[1], comment: commentOn(entry[3]) });
+/**
+ * Every write grant in a parsed workflow: the workflow-level `permissions` map
+ * and each job's map. A scope grants write when its value is `write` or
+ * `write-all`, read from the parsed document, so the spelling in the text —
+ * quoted key or value, flow map, anchor or alias, a `!!str` tag, an explicit
+ * `? key` — does not decide whether the grant is found. A `permissions` value
+ * that is not a map (a scalar such as `write-all`) has no scope to name a step,
+ * so it is reported as unreadable and fails closed. The justification comment
+ * comes from the raw text, the one thing YAML drops.
+ */
+function scanPermissions(wf: Workflow, text: string): PermScan {
+  const comments = declarationComments(text);
+  const writes: WriteScope[] = [];
+  const unreadable: string[] = [];
+
+  const maps: Array<[string | null, unknown]> = [[null, wf.permissions]];
+  for (const [name, job] of Object.entries(wf.jobs ?? {})) maps.push([name, job.permissions]);
+
+  for (const [job, permissions] of maps) {
+    if (permissions === undefined || permissions === null) continue;
+    if (typeof permissions !== "object" || Array.isArray(permissions)) {
+      unreadable.push(`${where(job)} → permissions is not a map (${JSON.stringify(permissions)})`);
+      continue;
+    }
+    for (const [scope, value] of Object.entries(permissions as Record<string, unknown>)) {
+      if (value === "write" || value === "write-all") {
+        writes.push({ job, scope, comment: comments.get(scopeKey(job, scope)) ?? "" });
+      }
     }
   }
-
   return { writes, unreadable };
+}
+
+/** The scan over a workflow file: parsed grants, raw-text comments. */
+function scanFile(file: string): PermScan {
+  return scanPermissions(load(file), raw(file));
+}
+
+/** The scan over workflow text, so the rules can be checked on fixtures. */
+function scanText(text: string): PermScan {
+  return scanPermissions(yaml.load(text) as Workflow, text);
 }
 
 /**
@@ -341,7 +386,7 @@ describe("guarded workflows — least privilege (cli#416)", () => {
       // whether it is still needed at all; a `# TODO` says just as little.
       // real-flair.yml declares no write scope, so for it this rule passes
       // vacuously — the non-vacuous positive control is the test.yml case below.
-      const { writes, unreadable } = scanPermissions(file);
+      const { writes, unreadable } = scanFile(file);
       const problems = writeScopeProblems(wf, { writes, unreadable });
       expect(
         problems,
@@ -364,7 +409,7 @@ describe("guarded workflows — least privilege (cli#416)", () => {
   test("test.yml declares at least one write scope (positive control)", () => {
     // Tied to test.yml: real-flair.yml needs no write grant, so it cannot prove
     // the write rule is non-vacuous.
-    const { writes } = scanPermissions("test.yml");
+    const { writes } = scanFile("test.yml");
     expect(writes.length, "test.yml declares at least one write scope").toBeGreaterThan(0);
   });
 });
@@ -441,7 +486,7 @@ jobs:
     steps:
       - run: echo hi
 `;
-    const problems = writeScopeProblems(parse(text), scanPermissionsText(text));
+    const problems = writeScopeProblems(parse(text), scanText(text));
     expect(problems.join("; ")).toContain("no named or uses: step");
   });
 
@@ -456,10 +501,154 @@ jobs:
     steps:
       - run: echo hi
 `;
-    const { unreadable } = scanPermissionsText(text);
+    const { unreadable } = scanText(text);
     expect(unreadable.join("; ")).toContain("<workflow-level>");
     expect(unreadable.join("; ")).not.toContain("pull_request");
   });
+});
+
+// cli#651: the write rule reads each grant from the parsed workflow, so how the
+// grant is spelled in the text does not decide whether the rule sees it. Each
+// spelling below fails without a justification — the `#`-comment that names one
+// of the job's steps — and passes once it carries one.
+describe("workflow permissions — every spelling of a write grant (cli#651)", () => {
+  const parse = (text: string): Workflow => yaml.load(text) as Workflow;
+  const STEP = "Publish results";
+  const c = (comment: string): string => (comment === "" ? "" : ` # ${comment}`);
+
+  /** A whole workflow whose job `a` grants `contents: write` in one spelling. */
+  const SPELLINGS: Array<{ name: string; text: (comment: string) => string }> = [
+    {
+      name: "plain block",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      contents: write${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "quoted value",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      contents: "write"${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "quoted key",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      "contents": write${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "flow map on the permissions line",
+      text: (comment) => `
+jobs:
+  a:
+    permissions: { contents: write }${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "flow map on the line after permissions",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      { contents: write }${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "quoted permissions key over a block",
+      text: (comment) => `
+jobs:
+  a:
+    "permissions":
+      contents: write${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "anchor under another key, aliased into permissions",
+      text: (comment) => `
+jobs:
+  a:
+    env:
+      MODE: &w write
+    permissions:
+      contents: *w${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "!!str tag on the value",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      contents: !!str write${c(comment)}
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+    {
+      name: "explicit ? key / : value pair",
+      text: (comment) => `
+jobs:
+  a:
+    permissions:
+      ? contents${c(comment)}
+      : write
+    steps:
+      - name: ${STEP}
+        run: echo hi
+`,
+    },
+  ];
+
+  for (const spelling of SPELLINGS) {
+    test(`${spelling.name}: a write grant with no justification fails`, () => {
+      const text = spelling.text("");
+      const problems = writeScopeProblems(parse(text), scanText(text));
+      expect(
+        problems.length,
+        `${spelling.name} is rejected without a justification: ${problems.join("; ")}`,
+      ).toBeGreaterThan(0);
+    });
+
+    test(`${spelling.name}: a write grant justified by naming the step passes`, () => {
+      const text = spelling.text(STEP);
+      const problems = writeScopeProblems(parse(text), scanText(text));
+      expect(
+        problems,
+        `${spelling.name} is accepted when the comment names the step: ${problems.join("; ")}`,
+      ).toEqual([]);
+    });
+  }
 });
 
 // The blind review found the permission rules hard-coded to test.yml while
@@ -478,6 +667,27 @@ describe("workflow permissions — every mutation fails for every guarded workfl
     problems: (wf: Workflow, text: string) => string[];
   }
 
+  /** The line index of the first job-level `permissions:` key. */
+  const firstJobPermissionsLine = (lines: string[]): number =>
+    lines.findIndex((line) => /^\s+permissions:\s*(#.*)?$/.test(line));
+
+  /**
+   * The index just past the block map opened at `at`: its own line and every
+   * following line that is blank or more deeply indented. The mutations below
+   * edit only by indentation, so a line added inside a permissions block does
+   * not stop them from applying.
+   */
+  const blockEnd = (lines: string[], at: number): number => {
+    const indent = lines[at].length - lines[at].trimStart().length;
+    let end = at + 1;
+    while (end < lines.length) {
+      const line = lines[end];
+      if (line.trim() !== "" && line.length - line.trimStart().length <= indent) break;
+      end++;
+    }
+    return end;
+  };
+
   const MUTATIONS: Mutation[] = [
     {
       name: "broader top-level grant",
@@ -486,17 +696,26 @@ describe("workflow permissions — every mutation fails for every guarded workfl
     },
     {
       name: "missing job permissions block",
-      text: (file) => raw(file).replace(/ {4}permissions:\n {6}contents: read[^\n]*\n/, ""),
+      text: (file) => {
+        const lines = raw(file).split("\n");
+        const at = firstJobPermissionsLine(lines);
+        if (at === -1) return raw(file);
+        lines.splice(at, blockEnd(lines, at) - at);
+        return lines.join("\n");
+      },
       problems: (wf) => jobPermissionProblems(wf),
     },
     {
       name: "write grant with no named step",
-      text: (file) =>
-        raw(file).replace(
-          /( {4}permissions:\n {6}contents: read[^\n]*\n)/,
-          "$1      security-events: write # TODO\n",
-        ),
-      problems: (wf, text) => writeScopeProblems(wf, scanPermissionsText(text)),
+      text: (file) => {
+        const lines = raw(file).split("\n");
+        const at = firstJobPermissionsLine(lines);
+        if (at === -1) return raw(file);
+        const indent = lines[at].length - lines[at].trimStart().length;
+        lines.splice(at + 1, 0, `${" ".repeat(indent + 2)}security-events: write # TODO`);
+        return lines.join("\n");
+      },
+      problems: (wf, text) => writeScopeProblems(wf, scanText(text)),
     },
     {
       name: "persisted checkout credential",
