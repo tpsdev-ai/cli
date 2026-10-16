@@ -373,11 +373,12 @@ export function onStart(
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  // The parent runs this BEFORE entering nono (cli#516), so it must not execute
-  // repository-controlled code: `git worktree add` runs `post-checkout` and the
-  // configured fsmonitor, so both are pinned off below (with gitEnv()'s clean
-  // environment), and a normal checkout is suppressed entirely — it would
-  // otherwise run a configured smudge filter.
+  // onStart is called BEFORE the sandbox is entered (cli#516), so no executable
+  // the base repository configures may run here: `git worktree add` would run
+  // `post-checkout`, the configured fsmonitor, and any configured smudge filter.
+  // The two hooks are pinned off below, and a caller that has a sandbox to run
+  // the checkout in passes `deferCheckout`, which suppresses the checkout — and
+  // with it the filter; `checkoutWorktree` performs it inside the sandbox.
   const defer = opts.deferCheckout === true;
   const args = [
     "-c",
