@@ -67,9 +67,11 @@ export interface MailDelivery {
  * - `pending-record-invalid` / `pending-record-ambiguous`: a `placing` record
  *   verified as neither format or both, was quarantined and its intent cleared.
  * - `verification-failed` / `verification-unavailable`: the pending cur/ copy
- *   did not re-verify, or the verifier (or the trust-tier read) did not answer.
- * - `record-changed`: the pending cur/ copy is missing, its recorded identity
- *   is absent or mismatched, or its bytes changed during re-verification.
+ *   did not re-verify, or it verified but its envelope names a different message
+ *   than the intent; or the verifier (or the trust-tier read) did not answer.
+ * - `record-changed`: the pending cur/ copy is missing (a `placing` intent whose
+ *   copy is gone can instead be resolved as gone), its recorded identity is
+ *   absent or mismatched, or its bytes changed during re-verification.
  * - `storage-error`: resolving roots or listing new/ threw, or a history, cur/, quarantine or
  *   placement-state operation threw while pending placements were processed.
  *   Quarantine may have moved the payload and unlinked the intent before sync failed.
@@ -107,7 +109,9 @@ export type DeliveryCompletion =
   | { status: "already-completed" }
   | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string }
   /**
-   * Not this hand-over's to finalize; nothing changed. `foreign`: not a
+   * Not this hand-over's to finalize: the persisted intent is left unfinalized,
+   * and the client's local token is released (its issued state becomes
+   * `released`). `foreign`: not a
    * delivery this MailClient issued. `stale`: no matching live intent and claim
    * in the currently resolved mailbox. `identity`:
    * recorded cur/ identity is absent or mismatched.
