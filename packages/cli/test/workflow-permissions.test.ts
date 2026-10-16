@@ -151,7 +151,7 @@ function scopeKey(job: string | null, scope: string): string {
  * alone; which scopes GRANT write is decided from the parsed workflow (see
  * scanPermissions). Block-style maps, a flow map on the `permissions:` line or
  * the line after it, a quoted key and an explicit `? key` / `: value` pair are
- * all read. The job a declaration sits under is the nearest preceding key under
+ * read. The job a declaration sits under is the nearest preceding key under
  * `jobs:`.
  */
 function declarationComments(text: string): Map<string, string> {
@@ -511,7 +511,7 @@ jobs:
 // grant is spelled in the text does not decide whether the rule sees it. Each
 // spelling below fails without a justification — the `#`-comment that names one
 // of the job's steps — and passes once it carries one.
-describe("workflow permissions — every spelling of a write grant (cli#651)", () => {
+describe("workflow permissions — the write rule on each listed spelling (cli#651)", () => {
   const parse = (text: string): Workflow => yaml.load(text) as Workflow;
   const STEP = "Publish results";
   const c = (comment: string): string => (comment === "" ? "" : ` # ${comment}`);
@@ -673,9 +673,9 @@ describe("workflow permissions — every mutation fails for every guarded workfl
 
   /**
    * The index just past the block map opened at `at`: its own line and every
-   * following line that is blank or more deeply indented. The mutations below
-   * edit only by indentation, so a line added inside a permissions block does
-   * not stop them from applying.
+   * following line that is blank or more deeply indented. The two mutations that
+   * drop or extend a job's permissions block edit by indentation, so a line added
+   * inside a permissions block does not stop them from applying.
    */
   const blockEnd = (lines: string[], at: number): number => {
     const indent = lines[at].length - lines[at].trimStart().length;
