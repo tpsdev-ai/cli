@@ -299,6 +299,56 @@ function responseError(entry: string, method: string, path: string, status: numb
   return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
 }
 
+/**
+ * The refusal names POST /AgentKeyRegister is documented to answer in its
+ * `error` field (flair#2266): the authentication denials and the registration
+ * refusals. A body naming none of these yields `null` — the response text is
+ * never echoed, so a route that is not this endpoint (a Flair without it
+ * answers 404 or 405 with no such field) is recognised as naming no refusal.
+ */
+const AGENT_KEY_REGISTER_REFUSALS: readonly string[] = [
+  "authentication required",
+  "forbidden",
+  "registration_request_invalid",
+  "agent_not_found",
+  "agent_not_local",
+  "agent_inactive",
+  "agent_key_not_pending",
+  "registration_conflict",
+  "registration_unavailable",
+];
+
+/** Membership — module-private, so nothing outside this module can change how a refusal is named. */
+const AGENT_KEY_REGISTER_REFUSAL_SET: ReadonlySet<string> = new Set(AGENT_KEY_REGISTER_REFUSALS);
+
+/** The refusal name on a POST /AgentKeyRegister response, or null when the body named none this client knows. */
+function agentKeyRegisterRefusal(body: string): string | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  const code = (parsed as { error?: unknown } | null)?.error;
+  return typeof code === "string" && AGENT_KEY_REGISTER_REFUSAL_SET.has(code) ? code : null;
+}
+
+/**
+ * A refusal from POST /AgentKeyRegister: the HTTP status and the endpoint's own
+ * refusal name, or null when the response named none this client knows. A 404
+ * or 405 with a null refusal is a Flair without the route. The message carries
+ * the status and the allow-listed name only, never response text.
+ */
+export class FlairAgentKeyRegisterError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly refusal: string | null,
+  ) {
+    super(`Flair registerAgentKey POST /AgentKeyRegister → ${status}: ${refusal ?? UNRECOGNIZED_ERROR}`);
+    this.name = "FlairAgentKeyRegisterError";
+  }
+}
+
 /** The `code` of an object-valued failure or cause; other candidates, including callables, are ignored. */
 function errorCode(err: unknown): string {
   try {
@@ -560,6 +610,48 @@ export class FlairClient {
       return (await res.json()) as FlairAgent;
     } catch {
       throw new Error(parseError("registerAgent", "PUT", requestedRoute, res.status));
+    }
+  }
+
+  /**
+   * POST /AgentKeyRegister — register `publicKey` (the canonical base64url
+   * encoding of 32 bytes) for the `pending` Agent row `agentId`, over the
+   * operator (Basic admin) credential. cli#512: this is Flair's supported
+   * operation for a row whose key Flair's Agent PUT and PATCH do not store. A
+   * non-OK response throws a FlairAgentKeyRegisterError carrying the status and
+   * the endpoint's refusal name (null when the body named none this client
+   * knows, which is how a Flair without the route is recognised). A transport
+   * failure throws a FlairRequestError (status 0).
+   */
+  async registerAgentKey(
+    agentId: string,
+    publicKey: string,
+    adminAuth?: string,
+  ): Promise<{ agentId: string; publicKey: string; updatedAt: string; registrationId: string }> {
+    const url = `${this.baseUrl}/AgentKeyRegister`;
+    const route = requestedPath(url);
+    const auth = adminAuth ?? process.env.FLAIR_ADMIN_AUTH ?? "admin:admin123";
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(auth).toString("base64")}`,
+        },
+        body: JSON.stringify({ agentId, publicKey }),
+      });
+    } catch (err) {
+      throw new FlairRequestError(transportError("registerAgentKey", "POST", route, err), 0);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new FlairAgentKeyRegisterError(res.status, agentKeyRegisterRefusal(text));
+    }
+    try {
+      return (await res.json()) as { agentId: string; publicKey: string; updatedAt: string; registrationId: string };
+    } catch {
+      throw new FlairRequestError(parseError("registerAgentKey", "POST", route, res.status), res.status);
     }
   }
 

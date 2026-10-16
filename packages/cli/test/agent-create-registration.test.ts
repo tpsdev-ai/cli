@@ -146,7 +146,7 @@ test("refused write and no Agent row: exits non-zero, prints no success, names a
     expect(res.stderr).toContain(id);
     expect(res.stderr).toContain(fake.url);
     expect(res.stderr).toContain("no Agent row exists");
-    expect(res.stderr).toContain("seed or key update failed");
+    expect(res.stderr).toContain("seed failed");
     expect(res.stderr).toContain("flair#2266");
     expect(res.stderr).toContain(`flair agent add ${id} --keys-dir`);
     expect(res.stderr).not.toContain("remove");
@@ -158,8 +158,8 @@ test("refused write and no Agent row: exits non-zero, prints no success, names a
   }
 });
 
-test("the stored key is still `pending`: exits non-zero naming the stored value", async () => {
-  const id = `${AGENT}-pending`;
+test("a pending row on a Flair without POST /AgentKeyRegister: exits non-zero naming the minimum version, prints no success", async () => {
+  const id = `${AGENT}-pending-no-route`;
   const fake = startFakeFlair(async (req, url) => {
     if (req.method === "PUT") return refusePut(url, id);
     if (url.pathname === `/Agent/${id}`) return Response.json({ id, name: id, publicKey: "pending" });
@@ -169,15 +169,180 @@ test("the stored key is still `pending`: exits non-zero naming the stored value"
     const res = await runCreate(fake.url, id);
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain("the stored public key is 'pending'");
-    const remove = res.stderr.indexOf(`flair agent remove ${id}`);
-    expect(remove).toBeGreaterThan(-1);
-    expect(remove).toBeLessThan(res.stderr.indexOf(`flair agent add ${id}`));
-    expect(res.stderr).toContain("Memory and Soul rows");
+    expect(res.stderr).toContain(`Agent '${id}' is not registered in Flair at ${fake.url}`);
+    expect(res.stderr).toContain("this Flair has no POST /AgentKeyRegister (404)");
+    expect(res.stderr).toContain("upgrade this Flair to 0.62.0 or newer");
+    // no fallback write after the missing route: the registration POST is last
+    expect(fake.requests.at(-1)).toEqual({ method: "POST", path: "/AgentKeyRegister", auth: expect.stringContaining("Basic ") });
   } finally {
     fake.stop();
   }
 });
+
+test("a 405 on the registration route: exits non-zero naming the minimum version", async () => {
+  const id = `${AGENT}-pending-method`;
+  const fake = startFakeFlair(async (req, url) => {
+    if (req.method === "PUT") return refusePut(url, id);
+    if (req.method === "POST" && url.pathname === "/AgentKeyRegister") return new Response("method not allowed", { status: 405 });
+    if (url.pathname === `/Agent/${id}`) return Response.json({ id, name: id, publicKey: "pending" });
+    return undefined;
+  });
+  try {
+    const res = await runCreate(fake.url, id);
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stderr).toContain("this Flair has no POST /AgentKeyRegister (405)");
+    expect(res.stderr).toContain("upgrade this Flair to 0.62.0 or newer");
+  } finally {
+    fake.stop();
+  }
+});
+
+interface RegistrarFlair {
+  url: string;
+  stop(): void;
+  readonly row: { id: string; name: string; publicKey: string };
+  readonly requests: Array<{ method: string; path: string; auth: string }>;
+  readonly registerBodies: Array<Record<string, unknown>>;
+}
+
+/**
+ * A fake Flair that serves POST /AgentKeyRegister over Basic admin for a
+ * `pending` Agent row, modeled on flair resources/AgentKeyRegister.ts: it admits
+ * Basic admin, stores the body's publicKey on the row and answers the documented
+ * body on 200, and answers a signed GET for a still-`pending` row as
+ * `unknown_agent` (a pending row cannot authenticate as itself). `route` omits
+ * the route (404) or answers 405; `refusal` answers a named refusal; `store:
+ * false` answers 200 without storing (the read-back then differs).
+ */
+function startRegistrarFlair(
+  id: string,
+  publicKey: string,
+  opts: {
+    route?: "serve" | "missing" | "method";
+    refusal?: { status: number; error: string };
+    store?: boolean;
+  } = {},
+): RegistrarFlair {
+  const route = opts.route ?? "serve";
+  const row = { id, name: id, publicKey: "pending" };
+  const requests: RegistrarFlair["requests"] = [];
+  const registerBodies: Array<Record<string, unknown>> = [];
+  let registrations = 0;
+  const routes = async (req: Request, url: URL): Promise<Response | undefined> => {
+    const auth = req.headers.get("Authorization") ?? "";
+    const signed = auth.startsWith("TPS-Ed25519 ");
+    if (req.method === "POST" && url.pathname === "/AgentKeyRegister") {
+      if (route === "missing") return undefined;
+      if (route === "method") return new Response("method not allowed", { status: 405 });
+      let body: Record<string, unknown> = {};
+      try {
+        body = (await req.json()) as Record<string, unknown>;
+      } catch {
+        /* no body */
+      }
+      registerBodies.push(body);
+      if (opts.refusal) return Response.json({ error: opts.refusal.error }, { status: opts.refusal.status });
+      registrations += 1;
+      if (opts.store === false) {
+        return Response.json({ agentId: id, publicKey: String(body.publicKey), updatedAt: new Date().toISOString(), registrationId: `reg-${registrations}` });
+      }
+      row.publicKey = String(body.publicKey);
+      return Response.json({ agentId: id, publicKey: row.publicKey, updatedAt: new Date().toISOString(), registrationId: `reg-${registrations}` });
+    }
+    if (req.method === "GET" && url.pathname === `/Agent/${id}`) {
+      if (signed && row.publicKey === "pending") return Response.json({ error: "unknown_agent" }, { status: 401 });
+      return Response.json({ ...row });
+    }
+    if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
+    return undefined;
+  };
+  const signedStub = stubFlairHandler({ [id]: publicKey }, routes);
+  const server = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/Health") return new Response("ok");
+      const auth = req.headers.get("Authorization") ?? "";
+      requests.push({ method: req.method, path: url.pathname, auth });
+      if (auth.startsWith("Basic ")) return (await routes(req, url)) ?? new Response("not found", { status: 404 });
+      return signedStub(req);
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true), row, requests, registerBodies };
+}
+
+test("a pending row and a Flair that serves POST /AgentKeyRegister: the generated key is registered and read back equal, then success", async () => {
+  const id = `${AGENT}-registers`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey);
+  try {
+    const res = await runCreate(fake.url, id, { keyPair, inspectError: true });
+    expect(res.hasError).toBe(false);
+    expect(res.exitCode).toBeUndefined();
+    expect(res.stdout).toContain("registered in Flair");
+    // the key registered is the base64url of the generated public key
+    expect(fake.registerBodies).toEqual([{ agentId: id, publicKey }]);
+    expect(fake.row.publicKey).toBe(publicKey);
+    // the registration is over Basic admin; the signed verification follows it
+    const registration = fake.requests.findIndex((req) => req.method === "POST" && req.path === "/AgentKeyRegister");
+    expect(registration).toBeGreaterThan(-1);
+    expect(fake.requests[registration]!.auth).toStartWith("Basic ");
+    expect(fake.requests.at(-1)).toEqual({ method: "GET", path: `/Agent/${id}`, auth: expect.stringContaining("TPS-Ed25519 ") });
+  } finally {
+    fake.stop();
+  }
+});
+
+test("the endpoint answers 200 but the row does not read the key back: exits non-zero, prints no success", async () => {
+  const id = `${AGENT}-accepted-unstored`;
+  const keyPair = generateKeyPair();
+  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+  const fake = startRegistrarFlair(id, publicKey, { store: false });
+  try {
+    const res = await runCreate(fake.url, id, { keyPair });
+    expect(res.exitCode).toBe(1);
+    expect(res.stdout).not.toContain("registered in Flair");
+    expect(res.stderr).toContain("the stored public key is 'pending', not the generated key");
+  } finally {
+    fake.stop();
+  }
+});
+
+/** A refusal from POST /AgentKeyRegister: the status the endpoint answers and the remedy its refusal names. */
+const KEY_REGISTRATION_REFUSALS: ReadonlyArray<{ status: number; error: string; status404?: boolean; remedy: string }> = [
+  { status: 400, error: "registration_request_invalid", remedy: "the generated agent id or public key was refused as malformed" },
+  { status: 401, error: "authentication required", remedy: "set FLAIR_ADMIN_AUTH" },
+  { status: 403, error: "forbidden", remedy: "set FLAIR_ADMIN_AUTH to its admin credential" },
+  { status: 403, error: "agent_not_local", remedy: "register its key on the agent's home instance" },
+  { status: 403, error: "agent_inactive", remedy: "reactivate it before registering a key" },
+  { status: 404, error: "agent_not_found", status404: true, remedy: "no Agent row exists" },
+  { status: 409, error: "agent_key_not_pending", remedy: "key-rotation path" },
+  { status: 409, error: "registration_conflict", remedy: "another write to this agent is in progress" },
+  { status: 503, error: "registration_unavailable", remedy: "re-run `tps agent create`" },
+];
+
+for (const refusal of KEY_REGISTRATION_REFUSALS) {
+  test(`POST /AgentKeyRegister refusal ${refusal.error}: exits non-zero naming the agent, URL, refusal and remedy`, async () => {
+    const id = `${AGENT}-refuse-${refusal.error.replace(/\W/g, "-")}`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const fake = startRegistrarFlair(id, publicKey, { refusal: { status: refusal.status, error: refusal.error } });
+    try {
+      const res = await runCreate(fake.url, id, { keyPair });
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered in Flair");
+      expect(res.stderr).toContain(`Agent '${id}' is not registered in Flair at ${fake.url}`);
+      expect(res.stderr).toContain(`POST /AgentKeyRegister refused the registration (${refusal.error})`);
+      expect(res.stderr).toContain(refusal.remedy);
+      // agent_not_found is the endpoint's own refusal, not the missing-route case
+      if (!refusal.status404) expect(res.stderr).not.toContain("this Flair has no POST /AgentKeyRegister");
+    } finally {
+      fake.stop();
+    }
+  });
+}
 
 test("the stored key differs from the generated one: exits non-zero", async () => {
   const id = `${AGENT}-mismatch`;
@@ -741,6 +906,66 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
     } finally {
       const deleted = await fetch(opsUrl, {
         method: "POST", headers,
+        body: JSON.stringify({ operation: "delete", database: "flair", table: "Agent", hash_values: [id] }),
+      });
+      expect(deleted.ok).toBe(true);
+    }
+  },
+  240_000,
+);
+
+test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
+  "against a real Flair, create on a pending row completes registration when the instance serves POST /AgentKeyRegister, and refuses otherwise",
+  async () => {
+    const { baseUrl, opsUrl, admin } = flairTarget();
+    const id = `create-pending-${randomUUID()}`;
+    const wire = Buffer.from(admin).toString("base64");
+    const headers = { Authorization: `Basic ${wire}`, "Content-Type": "application/json" };
+    const inserted = await fetch(opsUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        operation: "insert",
+        database: "flair",
+        table: "Agent",
+        records: [{ id, name: id, publicKey: "pending", createdAt: new Date().toISOString() }],
+      }),
+    });
+    expect(inserted.ok).toBe(true);
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    try {
+      // Whether this Flair serves POST /AgentKeyRegister: a missing route answers
+      // 404, a present one refuses an empty body 400. Measured once, before the run.
+      const probe = await fetch(`${baseUrl}/AgentKeyRegister`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({}),
+      });
+      const capable = probe.status !== 404 && probe.status !== 405;
+
+      const res = await runCreate(baseUrl, id, { keyPair, credential: admin, inspectError: true });
+      if (capable) {
+        expect(res.exitCode).toBeUndefined();
+        expect(res.hasError).toBe(false);
+        expect(res.stdout).toContain("registered in Flair");
+        const record = await fetch(`${baseUrl}/Agent/${id}`, { headers });
+        expect(record.ok).toBe(true);
+        expect((await record.json() as { publicKey: string }).publicKey).toBe(publicKey);
+      } else {
+        expect(res.exitCode).toBe(1);
+        expect(res.stdout).not.toContain("registered in Flair");
+        expect(res.stderr).toContain("this Flair has no POST /AgentKeyRegister");
+        expect(res.stderr).toContain("0.62.0");
+      }
+      for (const stream of [res.stdout, res.stderr, format(res.error)]) {
+        expect(stream).not.toContain(admin);
+        expect(stream).not.toContain(wire);
+      }
+    } finally {
+      const deleted = await fetch(opsUrl, {
+        method: "POST",
+        headers,
         body: JSON.stringify({ operation: "delete", database: "flair", table: "Agent", hash_values: [id] }),
       });
       expect(deleted.ok).toBe(true);

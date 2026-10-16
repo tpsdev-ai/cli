@@ -13,7 +13,7 @@
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
-import { createFlairClient, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
+import { createFlairClient, FlairAgentKeyRegisterError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
@@ -398,6 +398,54 @@ function refuseUnloadableIdentity(id: string, identityDir: string, err: unknown)
   process.exit(1);
 }
 
+/**
+ * cli#512 — the first Flair release that serves POST /AgentKeyRegister, the
+ * operation `create` uses to store a locally generated key on a `pending` row.
+ * The route merged into Flair main after its 0.61.0 entry, so no published
+ * release has it (the newest published is 0.59.0).
+ */
+const MIN_FLAIR_VERSION_FOR_KEY_REGISTER = "0.62.0";
+
+/** Flair's stored `publicKey` value for an Agent row seeded but not yet registered (flair#2266). */
+const PENDING_PUBLIC_KEY = "pending";
+
+/**
+ * cli#512 — `create` refuses when POST /AgentKeyRegister does not store the
+ * generated key. `status`/`refusal` are the endpoint's own response: the HTTP
+ * status and its refusal name, or null when the body named none this client
+ * knows. A 404 or 405 with no refusal is a Flair without the route.
+ *
+ * Every branch exits non-zero and none falls back to a write the old server
+ * would mishandle; the slice-1 read-back remains the only source of success.
+ */
+function refuseKeyRegistration(id: string, flairUrl: string, status: number, refusal: string | null): never {
+  if (refusal === null && (status === 404 || status === 405)) {
+    console.error(
+      `❌ Agent '${id}' is not registered in Flair at ${flairUrl} — this Flair has no POST /AgentKeyRegister (${status}), so a key generated here cannot be stored.`,
+    );
+    console.error(
+      `   Remedy: upgrade this Flair to ${MIN_FLAIR_VERSION_FOR_KEY_REGISTER} or newer, then re-run \`tps agent create --id ${id}\`.`,
+    );
+    process.exit(1);
+  }
+  const remedies: Record<string, string> = {
+    "authentication required": "the admin credential is empty or invalid; set FLAIR_ADMIN_AUTH to this Flair's admin credential",
+    forbidden: "the credential is not this Flair's admin; set FLAIR_ADMIN_AUTH to its admin credential",
+    registration_request_invalid: "the generated agent id or public key was refused as malformed",
+    agent_not_found: `no Agent row exists for '${id}'; create the agent's row on this Flair instance, then re-run \`tps agent create --id ${id}\``,
+    agent_not_local: `'${id}' did not originate on this instance; register its key on the agent's home instance`,
+    agent_inactive: `'${id}' is deactivated; reactivate it before registering a key`,
+    agent_key_not_pending: `'${id}' already holds a key; replacing it is the key-rotation path, not create`,
+    registration_conflict: "another write to this agent is in progress; re-run `tps agent create`",
+    registration_unavailable: "the registration store was unavailable or the committed key did not read back; re-run `tps agent create`",
+  };
+  const name = refusal ?? `no refusal named (${status})`;
+  const remedy = refusal !== null ? remedies[refusal] : "the response named no refusal this client knows; check that Flair is reachable and its version";
+  console.error(`❌ Agent '${id}' is not registered in Flair at ${flairUrl} — POST /AgentKeyRegister refused the registration (${name}).`);
+  console.error(`   Remedy: ${remedy}.`);
+  process.exit(1);
+}
+
 async function createAgent(args: AgentArgs): Promise<void> {
   const id = args.id;
   if (!id) {
@@ -471,8 +519,9 @@ async function createAgent(args: AgentArgs): Promise<void> {
   //
   // cli#512: registration is reported only when Flair reads the key back equal
   // to the key just generated. Current Flair drops `publicKey` on Agent PUT and
-  // PATCH, so neither can store it. The exit decision rests on the read-back;
-  // the write errors recorded in writeError are reported when it fails.
+  // PATCH, so neither can store it; a `pending` row is completed through
+  // POST /AgentKeyRegister. The exit decision rests on the read-back; the write
+  // errors recorded in writeError are reported when it fails.
   const flair = createFlairClient(id, flairUrl, keyPath);
   const online = await flair.ping();
 
@@ -503,12 +552,14 @@ async function createAgent(args: AgentArgs): Promise<void> {
             soulTemplate,
             starterMemories,
           });
-          // Update the public key on the agent record that AgentSeed created
-          await flair.updateAgent(id, { publicKey: pubKeyHex });
+          // cli#512: the seed leaves (or keeps) a row whose stored key is
+          // `pending`; the block after the write registers the generated key
+          // through Flair's supported operation. Flair's Agent PUT does not
+          // store `publicKey`, so it is not sent here.
           successLine = `  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`;
         } catch (seedErr) {
           // AgentSeed requires admin auth — fall back to direct registration
-          writeError = `seed or key update failed: ${seedErr instanceof Error ? seedErr.message : String(seedErr)}`;
+          writeError = `seed failed: ${seedErr instanceof Error ? seedErr.message : String(seedErr)}`;
           await flair.registerAgent(name, pubKeyHex);
           successLine = `  Agent '${id}' registered in Flair (no seed — not admin).`;
         }
@@ -529,6 +580,24 @@ async function createAgent(args: AgentArgs): Promise<void> {
       // The read failed with a non-404 error: whether a row exists is unknown, so
       // the remedy must name the remove branch as well as the add branch (cli#593).
       refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
+    }
+    if (stored.found && stored.publicKey === PENDING_PUBLIC_KEY) {
+      // cli#512 — the row is `pending`: register the generated key through
+      // Flair's supported operation, then read again; the slice-1 check below
+      // decides, so success is printed only on an equal read-back. This covers a
+      // row seeded earlier and one this run seeded.
+      const publicKeyB64url = Buffer.from(kp.signing.publicKey).toString("base64url");
+      try {
+        await flair.registerAgentKey(id, publicKeyB64url);
+      } catch (e) {
+        if (e instanceof FlairAgentKeyRegisterError) refuseKeyRegistration(id, flairUrl, e.status, e.refusal);
+        refuseKeyRegistration(id, flairUrl, 0, null);
+      }
+      try {
+        stored = await flair.readStoredPublicKey(id);
+      } catch (e) {
+        refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
+      }
     }
     if (!stored.found) {
       refuseRegistration(id, flairUrl, identityDir, "no Agent row exists", writeError, "absent");

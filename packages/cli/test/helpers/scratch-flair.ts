@@ -14,6 +14,13 @@ import { generateKeyPair } from "../../src/utils/identity.js";
 export const FLAIR_PACKAGE = "@tpsdev-ai/flair";
 export const FLAIR_VERSION = "0.58.0";
 
+/**
+ * The npm spec the scratch instance installs. Defaults to the pinned release;
+ * `TPS_TEST_FLAIR_SPEC` overrides it, so the lane can run against a Flair build
+ * that is not on npm yet (a tarball packed from a checkout, say).
+ */
+const FLAIR_INSTALL_SPEC = process.env.TPS_TEST_FLAIR_SPEC ?? `${FLAIR_PACKAGE}@${FLAIR_VERSION}`;
+
 /** The operator (Harper admin) credential the helper boots and seeds with. */
 export const ADMIN_AUTH = "admin:test123";
 
@@ -226,7 +233,7 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
   // npm cache (HOME is the scratch home).
   await execFileAsync(
     "npm",
-    ["install", "--prefix", prefix, "--no-audit", "--no-fund", "--loglevel", "error", `${FLAIR_PACKAGE}@${FLAIR_VERSION}`],
+    ["install", "--prefix", prefix, "--no-audit", "--no-fund", "--loglevel", "error", FLAIR_INSTALL_SPEC],
     { env: { PATH: process.env.PATH ?? "", HOME: home, npm_config_cache: join(home, ".npm") }, signal, timeout: 300_000 },
   );
 
