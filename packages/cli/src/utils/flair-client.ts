@@ -303,8 +303,8 @@ function responseError(entry: string, method: string, path: string, status: numb
  * The refusal names POST /AgentKeyRegister is documented to answer in its
  * `error` field (flair#2266): the authentication denials and the registration
  * refusals. A body naming none of these yields `null` — the response text is
- * never echoed, so a route that is not this endpoint (a Flair without it
- * answers 404 or 405 with no such field) is recognised as naming no refusal.
+ * never echoed, so a response that is not this endpoint's refusal names no
+ * refusal (a Flair without the route answers 404 or 405 with no such field).
  */
 const AGENT_KEY_REGISTER_REFUSALS: readonly string[] = [
   "authentication required",
@@ -336,8 +336,9 @@ function agentKeyRegisterRefusal(body: string): string | null {
 /**
  * A refusal from POST /AgentKeyRegister: the HTTP status and the endpoint's own
  * refusal name, or null when the response named none this client knows. A 404
- * or 405 with a null refusal is a Flair without the route. The message carries
- * the status and the allow-listed name only, never response text.
+ * or 405 with a null refusal names no response this client recognizes as the
+ * endpoint, so it is not proof the route is absent. The message carries the
+ * status and the allow-listed name only, never response text.
  */
 export class FlairAgentKeyRegisterError extends Error {
   constructor(
@@ -620,8 +621,8 @@ export class FlairClient {
    * operation for a row whose key Flair's Agent PUT and PATCH do not store. A
    * non-OK response throws a FlairAgentKeyRegisterError carrying the status and
    * the endpoint's refusal name (null when the body named none this client
-   * knows, which is how a Flair without the route is recognised). A transport
-   * failure throws a FlairRequestError (status 0).
+   * knows, which is how a response this client cannot recognize as this route's
+   * refusal is named). A transport failure throws a FlairRequestError (status 0).
    */
   async registerAgentKey(
     agentId: string,
