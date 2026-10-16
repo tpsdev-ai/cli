@@ -2,7 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from "node:fs";
@@ -418,83 +418,92 @@ for (const operation of ["completeDelivery", "releaseDelivery"] as const) {
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
-  test(`AgentRuntime.start logs an identity refusal and keeps the intent pending after ${signal}`, async () => {
-    plant("m1.json", "identity-refusal");
-    plant("m2.json", "later");
-    let enter!: () => void;
-    const entered = new Promise<void>((resolve) => { enter = resolve; });
-    let finish!: () => void;
-    const finishing = new Promise<void>((resolve) => { finish = resolve; });
-    const lookup = spyOn(FlairContextProvider.prototype, "getAgent").mockImplementation(async () => ({ publicKey: Buffer.from(ed.getPublicKey(SEED)).toString("base64") }) as never);
-    const provider = spyOn(ProviderManager.prototype, "complete").mockImplementation(async () => {
-      writeFileSync(cur("m1.json"), `${readFileSync(cur("m1.json"), "utf8")} `);
-      enter(); await finishing;
-      return completingProvider.complete();
-    });
-    const memoryPath = join(workspace, "memory.jsonl");
-    const pidPath = join(workspace, ".tps-agent.pid");
-    const runtime = new AgentRuntime({
-      agentId: AGENT, name: "identity-refusal-test", mailDir, workspace, memoryPath,
-      llm: { provider: "openai", model: "test", apiKey: "test" },
-    });
-    const seen: string[] = [];
-    const next = MailClient.prototype.deliverNext;
-    const nextSpy = spyOn(MailClient.prototype, "deliverNext").mockImplementation(async function() {
-      const result = await next.call(this);
-      if (result.status === "delivered") seen.push(result.delivery.message.verifiedEnvelope!.messageId);
-      return result;
-    });
-    const complete = MailClient.prototype.completeDelivery;
-    const settlementSpy = spyOn(MailClient.prototype, "completeDelivery").mockImplementation(async function(delivery) {
-      expect(existsSync(pidPath)).toBe(true);
-      const before = readFileSync(intentPath("m1.json"), "utf8");
-      const result = await complete.call(this, delivery);
-      expect(result).toMatchObject({ status: "refused", reason: "identity" });
-      expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(before);
-      return result;
-    });
-    let loopReturned = false;
-    const run = EventLoop.prototype.runDeliveries;
-    const loopSpy = spyOn(EventLoop.prototype, "runDeliveries").mockImplementation(async function(source) {
-      await run.call(this, source);
-      expect(existsSync(pidPath)).toBe(true);
-      loopReturned = true;
-    });
-    const start = runtime.start();
-    void start.catch(() => {});
-    try {
-      await entered;
-      const pending = readFileSync(intentPath("m1.json"), "utf8");
-      process.emit(signal);
-      expect(loopReturned).toBe(false);
-      expect(existsSync(pidPath)).toBe(true);
-      finish();
-      await start;
-      expect(settlementSpy).toHaveBeenCalledTimes(1);
-      expect(loopReturned).toBe(true);
-      expect(existsSync(pidPath)).toBe(false);
-      expect(readFileSync(memoryPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toContainEqual({
-        type: "error", ts: expect.any(String), data: "delivery settlement refused: identity",
+  for (const refusal of ["identity", "stale"] as const) {
+    test(`AgentRuntime.start logs ${refusal} refusal and keeps the intent pending after ${signal}`, async () => {
+      plant("m1.json", `${refusal}-refusal`);
+      plant("m2.json", "later");
+      let enter!: () => void;
+      const entered = new Promise<void>((resolve) => { enter = resolve; });
+      let finish!: () => void;
+      const finishing = new Promise<void>((resolve) => { finish = resolve; });
+      const lookup = spyOn(FlairContextProvider.prototype, "getAgent").mockImplementation(async () => ({ publicKey: Buffer.from(ed.getPublicKey(SEED)).toString("base64") }) as never);
+      const provider = spyOn(ProviderManager.prototype, "complete").mockImplementation(async () => {
+        if (refusal === "identity") {
+          writeFileSync(cur("m1.json"), `${readFileSync(cur("m1.json"), "utf8")} `);
+        } else {
+          const intent = intentJson("m1.json");
+          intent.claim.token = randomUUID();
+          intent.claim.moduleNonce = randomUUID();
+          writeFileSync(intentPath("m1.json"), JSON.stringify(intent));
+        }
+        enter(); await finishing;
+        return completingProvider.complete();
       });
-      expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(pending);
-      expect(intentPhase("m1.json")).toBe("in_progress");
-      expect(intentJson("m1.json").claim).toBeDefined();
-      expect(nextSpy).toHaveBeenCalledTimes(1);
-      expect(seen).toEqual(["identity-refusal"]);
-      expect(await client().deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
-      expect(seen).toEqual(["identity-refusal"]);
-      expect(newFiles()).toEqual(["m2.json"]);
-      expect(curFiles()).toEqual(["m1.json"]);
-    } finally {
-      finish();
-      await runtime.stop();
-      await start.catch(() => {});
-      loopSpy.mockRestore(); settlementSpy.mockRestore(); nextSpy.mockRestore();
-      provider.mockRestore(); lookup.mockRestore();
-    }
-  }, 15_000);
+      const memoryPath = join(workspace, "memory.jsonl");
+      const pidPath = join(workspace, ".tps-agent.pid");
+      const runtime = new AgentRuntime({
+        agentId: AGENT, name: `${refusal}-refusal-test`, mailDir, workspace, memoryPath,
+        llm: { provider: "openai", model: "test", apiKey: "test" },
+      });
+      const seen: string[] = [];
+      const next = MailClient.prototype.deliverNext;
+      const nextSpy = spyOn(MailClient.prototype, "deliverNext").mockImplementation(async function() {
+        const result = await next.call(this);
+        if (result.status === "delivered") seen.push(result.delivery.message.verifiedEnvelope!.messageId);
+        return result;
+      });
+      const complete = MailClient.prototype.completeDelivery;
+      const settlementSpy = spyOn(MailClient.prototype, "completeDelivery").mockImplementation(async function(delivery) {
+        expect(existsSync(pidPath)).toBe(true);
+        const before = readFileSync(intentPath("m1.json"), "utf8");
+        const result = await complete.call(this, delivery);
+        expect(result).toMatchObject({ status: "refused", reason: refusal });
+        expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(before);
+        return result;
+      });
+      let loopReturned = false;
+      const run = EventLoop.prototype.runDeliveries;
+      const loopSpy = spyOn(EventLoop.prototype, "runDeliveries").mockImplementation(async function(source) {
+        await run.call(this, source);
+        expect(existsSync(pidPath)).toBe(true);
+        loopReturned = true;
+      });
+      const start = runtime.start();
+      void start.catch(() => {});
+      try {
+        await entered;
+        const pending = readFileSync(intentPath("m1.json"), "utf8");
+        process.emit(signal);
+        expect(loopReturned).toBe(false);
+        expect(existsSync(pidPath)).toBe(true);
+        finish();
+        await start;
+        expect(settlementSpy).toHaveBeenCalledTimes(1);
+        expect(loopReturned).toBe(true);
+        expect(existsSync(pidPath)).toBe(false);
+        expect(readFileSync(memoryPath, "utf8").trim().split("\n").map((line) => JSON.parse(line))).toContainEqual({
+          type: "error", ts: expect.any(String), data: `delivery settlement refused: ${refusal}`,
+        });
+        expect(readFileSync(intentPath("m1.json"), "utf8")).toBe(pending);
+        expect(intentPhase("m1.json")).toBe("in_progress");
+        expect(intentJson("m1.json").claim).toBeDefined();
+        expect(nextSpy).toHaveBeenCalledTimes(1);
+        expect(seen).toEqual([`${refusal}-refusal`]);
+        expect(await client().deliverNext()).toMatchObject({ status: "deferred", reason: refusal === "identity" ? "record-changed" : "active" });
+        expect(seen).toEqual([`${refusal}-refusal`]);
+        expect(newFiles()).toEqual(["m2.json"]);
+        expect(curFiles()).toEqual(["m1.json"]);
+      } finally {
+        finish();
+        await runtime.stop();
+        await start.catch(() => {});
+        loopSpy.mockRestore(); settlementSpy.mockRestore(); nextSpy.mockRestore();
+        provider.mockRestore(); lookup.mockRestore();
+      }
+    }, 15_000);
+  }
 
-  test(`AgentRuntime.start releases after memory writes fail during ${signal} before removing its PID file`, async () => {
+  test(`AgentRuntime.start attempts release after memory writes fail during ${signal} before removing its PID file`, async () => {
     plant("m1.json", "memory-failure");
     plant("m2.json", "later");
     let enter!: () => void;
@@ -558,7 +567,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   }, 15_000);
 
   for (const completed of [true, false]) {
-    test(`AgentRuntime.start drains ${completed ? "finalize" : "release"} after ${signal} before removing its PID file`, async () => {
+    test(`AgentRuntime.start retries deferred ${completed ? "finalize" : "release"} after ${signal} before removing its PID file`, async () => {
       plant("m1.json", "in-flight");
       plant("m2.json", "later");
       let enter!: () => void;
