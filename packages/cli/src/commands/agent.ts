@@ -1167,7 +1167,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            // With deferCheckout: true, the parent creates the worktree without
+            // With deferCheckout: true, when a base repository exists and the
+            // workspace is absent, the parent creates the worktree without
             // checkout; the sandboxed child checks it out (cli#516). Grant read
             // of the base repository and write of the worktree's git directory.
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");

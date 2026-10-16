@@ -343,9 +343,10 @@ function resolveBaseRepo(workspacePath: string): string | null {
 }
 
 /**
- * Create the agent's worktree when the workspace is a worktree of a base
- * repository. A workspace with no base repository is left untouched and
- * reported as changed:false.
+ * Create the agent's worktree when a base repository exists and the workspace
+ * is absent. An existing worktree, an existing ordinary workspace, the base
+ * repository itself, and a workspace with no base repository are left
+ * untouched and reported as changed:false.
  *
  * With `deferCheckout: true`, setup disables hooks and fsmonitor and defers
  * checkout to `checkoutWorktree` inside the sandbox (cli#516).

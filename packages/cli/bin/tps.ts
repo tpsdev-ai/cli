@@ -556,8 +556,9 @@ async function main() {
               }
             }
 
-            // cli#516 — the parent creates the worktree outside the sandbox with
-            // the checkout suppressed, and that checkout runs HERE, inside the
+            // cli#516 — when the parent created the worktree (a base repository
+            // exists and the workspace was absent), it did so outside the sandbox
+            // with the checkout suppressed, and that checkout runs HERE, inside the
             // sandbox, where a repository-configured filter or hook is confined.
             // A launch that is not sandboxed owns both halves itself.
             const { onStart, onStop, checkoutWorktree } = await import("../src/utils/agent-lifecycle.js");
