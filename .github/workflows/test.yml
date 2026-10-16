@@ -14,6 +14,10 @@ permissions: {}
 # run of this workflow, once the newer push starts a run (the key is `test-pr-`
 # plus the PR number). A push to main gets a group unique per run (`run_id`), so
 # this rule does not cancel a main run.
+#
+# A manual re-run of an older PR run cancels the current head's run only while
+# that run is pending or in progress; a replacement head run may then be needed.
+# A stale run does not supply a completed check for the current head.
 concurrency:
   group: test-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
