@@ -229,7 +229,7 @@ export interface AgentLifecycleResult {
 /**
  * A worktree setup or cleanup operation failed (cli#516). Named so a caller can
  * tell a worktree failure from any other error and report it as one; the message
- * always names the operation that failed.
+ * names the operation that failed.
  */
 export class WorktreeLifecycleError extends Error {
   constructor(message: string) {
@@ -325,7 +325,7 @@ export function onStart(agentId: string, workspacePath?: string): AgentLifecycle
   // The parent runs this BEFORE entering nono (cli#516), so it must not execute
   // repository-controlled code: `git worktree add` runs `post-checkout`, so the
   // hook path is overridden to /dev/null (with gitEnv()'s clean environment),
-  // which suppresses every hook for this checkout.
+  // which disables the repository's hooks for this checkout.
   const add = git(baseRepo, ["-c", "core.hooksPath=/dev/null", "worktree", "add", workspace, "--detach"]);
   if (!add.ok) {
     throw new WorktreeLifecycleError(

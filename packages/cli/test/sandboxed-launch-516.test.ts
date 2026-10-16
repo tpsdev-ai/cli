@@ -15,11 +15,9 @@
  *       command is not a flag, while tps's own such flag is still refused.
  *
  * The launcher cases spawn the built binary with piped stdio (a non-TTY context)
- * against a fake nono that logs its argv; each behavioural case fails on `main`
- * on the behaviour assertion, except the invalid-`--sandbox`-value case, which
- * already passed there. The real-nono case skips where no nono at or above the
- * 0.70 floor is reachable by an absolute path. Flag/env literals are duplicated
- * on purpose.
+ * against a fake nono that logs its argv. The real-nono case skips where no nono
+ * at or above the 0.70 floor is reachable by an absolute path. Flag/env literals
+ * are duplicated on purpose.
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { resolve, join, dirname } from "node:path";
@@ -40,7 +38,7 @@ import { sandboxHomeBase } from "./helpers/launcher-grants.js";
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The shipped CLI is a node script; the real-nono case must run it with node
  * (bun inside a nono sandbox sees an empty environment, so the launcher's
- * socket locator never reaches a bun child). */
+ * socket locator does not reach a bun child). */
 const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
