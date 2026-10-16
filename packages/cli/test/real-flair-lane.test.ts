@@ -2,7 +2,7 @@ import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 import { expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { load } from "js-yaml";
@@ -27,6 +27,17 @@ test("the lane requires each named case in the fresh JUnit report to pass withou
     }
   }
   expect(() => assertRealFlairReport("")).toThrow();
+});
+
+test("the report rejects a named file with no expected cases", () => {
+  const file = Object.keys(EXPECTED_CASES)[0];
+  const xml = report();
+  const restore = patchShared(EXPECTED_CASES, file, []);
+  try {
+    expect(() => assertRealFlairReport(xml)).toThrow(`expected at least one case for ${file}`);
+  } finally {
+    restore();
+  }
 });
 
 test("the listener assertion rejects wildcard, external and missing binds", () => {
@@ -89,26 +100,63 @@ test("the workflow paths cover mail, identity, mail verification and lane inputs
   }
 });
 
-test("every test file gated on TPS_TEST_REAL_FLAIR is named by the lane and covered by the workflow paths", () => {
+function assertFlagReferences(root: string, named: string[], paths: string[]): string[] {
+  const globs = paths.map((path) => new Bun.Glob(path));
+  const referenced: string[] = [];
+  function discover(dir: string): void {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (entry.name !== "node_modules" && entry.name !== "dist") discover(join(dir, entry.name));
+      } else if (entry.isFile() && /\.test\.(?:ts|js)$/.test(entry.name)) {
+        const file = join(dir, entry.name);
+        // Any reference to the flag counts, including this guard's own references.
+        if (readFileSync(file, "utf8").includes("TPS_TEST_REAL_FLAIR")) {
+          referenced.push(relative(root, file).replaceAll("\\", "/"));
+        }
+      }
+    }
+  }
+  discover(root);
+  referenced.sort();
+  expect(referenced.filter((file) => !named.includes(file))).toEqual([]);
+  expect(referenced.filter((file) => !globs.some((glob) => glob.match(file)))).toEqual([]);
+  return referenced;
+}
+
+test("test files referencing the real-Flair flag are named by the lane and covered by workflow paths", () => {
   const workflow = load(readFileSync(resolve(repo, ".github/workflows/real-flair.yml"), "utf8")) as {
     on: { pull_request: { paths: string[] } };
   };
-  const globs = workflow.on.pull_request.paths.map((path) => new Bun.Glob(path));
-  // A test file is gated when it compares the flag against "1", by equality or
-  // inequality — the skipIf idiom this lane's files use, or an alias bound to it.
-  // Naming the flag without such a comparison, as this guard file does, is not a gate.
-  const gate = /TPS_TEST_REAL_FLAIR\s*(?:!==|===)\s*"1"/;
-  const testDir = join(repo, "packages", "cli", "test");
-  const gated = ["packages/*/test/**/*.test.ts", "plugins/*/test/**/*.test.ts", "test/**/*.test.ts"]
-    .flatMap((pattern) => [...new Bun.Glob(pattern).scanSync({ cwd: repo, onlyFiles: true })])
-    .filter((file) => gate.test(readFileSync(resolve(repo, file), "utf8")))
-    .map((file) => relative(testDir, resolve(repo, file)).replaceAll("\\", "/"))
-    .sort();
-  expect(gated.length).toBeGreaterThan(0);
-  const named = Object.keys(EXPECTED_CASES);
-  expect(gated.filter((file) => !named.includes(file))).toEqual([]);
-  expect(gated.filter((file) => !globs.some((glob) => glob.match(`packages/cli/test/${file}`)))).toEqual([]);
+  const named = Object.keys(EXPECTED_CASES).map((file) =>
+    relative(repo, resolve(repo, "packages/cli/test", file)).replaceAll("\\", "/"));
+  expect(assertFlagReferences(repo, named, workflow.on.pull_request.paths).length).toBeGreaterThan(0);
 });
+
+for (const [kind, file, source] of [
+  ["single-quoted comparison", "packages/cli/test/quoted.test.ts", "process.env.TPS_TEST_REAL_FLAIR !== '1'"],
+  ["reversed comparison", "packages/cli/test/reversed.test.ts", "'1' === process.env.TPS_TEST_REAL_FLAIR"],
+  ["bracket access", "packages/cli/test/bracket.test.js", 'process.env["TPS_TEST_REAL_FLAIR"] !== "1"'],
+  ["single-quoted bracket access", "packages/cli/test/bracket-single.test.ts", "process.env['TPS_TEST_REAL_FLAIR'] === '1'"],
+  ["directory outside the old roots", "other/nested/gated.test.js", 'process.env.TPS_TEST_REAL_FLAIR === "1"'],
+] as const) {
+  test(`flag reference guard rejects an omitted file: ${kind}`, () => {
+    const root = mkdtempSync(join(tmpdir(), "lane-discovery-"));
+    try {
+      mkdirSync(dirname(join(root, file)), { recursive: true });
+      writeFileSync(join(root, file), source);
+      expect(() => assertFlagReferences(root, [], ["**"])).toThrow();
+      expect(() => assertFlagReferences(root, [file], [])).toThrow();
+      expect(assertFlagReferences(root, [file], [file])).toEqual([file]);
+      for (const excluded of ["node_modules", "dist", "other/node_modules", "other/dist"]) {
+        mkdirSync(join(root, excluded), { recursive: true });
+        writeFileSync(join(root, excluded, "ignored.test.ts"), source);
+      }
+      expect(assertFlagReferences(root, [file], [file])).toEqual([file]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 for (const stage of ["install", "setup", "seed", "test"] as const) {
   test(`scratch ownership removes its root after an injected ${stage} error`, async () => {

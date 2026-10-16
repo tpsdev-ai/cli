@@ -24,6 +24,9 @@ export const EXPECTED_CASES: Record<string, string[]> = {
     "real Flair serves a capped task to a signed reader",
     "real Flair rejects an invalid Bearer token on GET /Presence",
   ],
+  "real-flair-lane.test.ts": [
+    "test files referencing the real-Flair flag are named by the lane and covered by workflow paths",
+  ],
 };
 
 function decodeXml(value: string): string {
@@ -40,6 +43,9 @@ export function assertRealFlairReport(xml: string): void {
     return { name: attrs.name, file: attrs.file, body: match[2] ?? "" };
   });
   for (const [file, names] of Object.entries(EXPECTED_CASES)) {
+    if (names.length === 0) {
+      throw new Error(`real-flair lane: expected at least one case for ${file}`);
+    }
     for (const name of names) {
       const found = cases.filter((item) => item.name === name && item.file?.replaceAll("\\", "/").endsWith(`/${file}`));
       if (found.length !== 1 || /<(?:skipped|failure|error)\b/.test(found[0].body)) {
