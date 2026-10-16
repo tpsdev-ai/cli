@@ -20,7 +20,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import { NONO_MIN_VERSION, nonoVersion, versionAtLeast } from "../src/utils/nono.js";
 import { onStart, onStop, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
-import { sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The shipped CLI is a node script; the real-nono case must run it with node
@@ -114,10 +114,12 @@ interface Sandbox {
   nonoBin: string;
 }
 
-function makeSandbox(): Sandbox {
+function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
   // The base must sit outside every launcher grant (cli#558): a HOME inside one
   // makes the launcher's runtime-options gate refuse before the case under test.
-  const root = mkdtempSync(join(sandboxHomeBase(), "tps-516-"));
+  // The real-nono cases pass realNonoHomeBase(), which is also outside nono's
+  // own built-in grants.
+  const root = mkdtempSync(join(base, "tps-516-"));
   const home = join(root, "home");
   const run = join(root, "run");
   const tmp = join(root, "tmp");
@@ -702,26 +704,24 @@ const realNonoSkip = !resolvedNono.bin
 // the running interpreter, and HOME/.bun.
 const SYSTEM_READ = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/opt/homebrew", "/private/etc/ssl"];
 
-function ancestors(p: string): string[] {
-  const out: string[] = [];
-  let cur = resolve(p);
-  while (cur !== "/" && cur !== dirname(cur)) {
-    out.push(cur);
-    cur = dirname(cur);
-  }
-  return out;
-}
-
 function seedRealNonoProfiles(home: string): void {
   const profileDir = join(home, ".config", "nono", "profiles");
   mkdirSync(profileDir, { recursive: true });
   const repoRoot = resolve(import.meta.dir, "..", "..");
+  // Exactly these directories, never their ancestors: a read grant is
+  // recursive, so an ancestor grant reaches every sibling of the checkout and
+  // the interpreter. With bun under ~/.bun that is /Users and the operator's
+  // whole home, the fixture HOME's base among them, which the launcher then
+  // (correctly) refuses. Under macOS Seatbelt, node and bun run a script and a
+  // binary below an exact grant without one (measured). The Linux Docker lane's
+  // effective grants are unchanged: /app has no ancestor below /, and the
+  // oven/bun image's /usr/local/bin already sits under the granted /usr.
   const read = [
     ...new Set([
       ...SYSTEM_READ,
       join(home, ".bun"),
-      ...ancestors(repoRoot),
-      ...ancestors(dirname(process.execPath)),
+      repoRoot,
+      dirname(process.execPath),
     ]),
   ];
   writeFileSync(
@@ -773,12 +773,34 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
   return predicate();
 }
 
+/** Where the real-nono fixtures live: outside the launcher's grants AND nono's
+ * own built-in grants (on macOS, system_read_macos covers /var/tmp). Resolved on
+ * first use, so a host without nono never queries it. */
+let realNonoBase: string | undefined;
+function makeRealNonoSandbox(): Sandbox {
+  realNonoBase ??= realNonoHomeBase(realNono as string);
+  return makeSandbox(realNonoBase);
+}
+
+/** Wait (bounded) for `predicate`, giving up early once the launcher exits. */
+function waitWhileRunning(
+  child: ReturnType<typeof spawn>,
+  predicate: () => boolean,
+  timeoutMs: number,
+): Promise<boolean> {
+  let exited = child.exitCode !== null || child.signalCode !== null;
+  child.once("exit", () => {
+    exited = true;
+  });
+  return waitFor(() => predicate() || exited, timeoutMs).then(() => predicate());
+}
+
 const realNonoSuite = realNono ? describe : describe.skip;
 realNonoSuite(
   realNono ? `cli#516 — real nono (${realNono})` : `cli#516 — real nono SKIPPED: ${realNonoSkip}`,
   () => {
     test("the base repo resolves outside the sandbox and does NOT inside it", () => {
-      const sb = makeSandbox();
+      const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.root, "base");
         mkdirSync(base, { recursive: true });
@@ -830,7 +852,7 @@ realNonoSuite(
         const granted = join(sb.ws, "canary-inside");
         writeFileSync(granted, "inside-nonce");
         const grantedRead = nonoRun(["cat", granted]);
-        expect(grantedRead.status).toBe(0);
+        expect(grantedRead.status, `nono run exited ${grantedRead.status}: ${grantedRead.stderr}`).toBe(0);
         expect(grantedRead.stdout.trim()).toBe("inside-nonce");
 
         // Inside the real profile: the base repo is not reachable.
@@ -842,7 +864,7 @@ realNonoSuite(
     }, 40_000);
 
     test("the re-exec child loads the custom --config, not the default", async () => {
-      const sb = makeSandbox();
+      const sb = makeRealNonoSandbox();
       try {
         // The default config points at one workspace and the custom config at a
         // different one; the runtime writes `.tps-agent.pid` into ITS workspace,
@@ -870,8 +892,15 @@ realNonoSuite(
             },
           },
         );
+        let out = "";
+        child.stdout?.on("data", (d: Buffer) => {
+          out += d.toString();
+        });
+        child.stderr?.on("data", (d: Buffer) => {
+          out += d.toString();
+        });
         const customPid = join(wsCustom, ".tps-agent.pid");
-        const loaded = await waitFor(() => canRead(customPid), 45_000);
+        const loaded = await waitWhileRunning(child, () => canRead(customPid), 45_000);
 
         // Stop the released agent before asserting, so a failure cannot leak it.
         let pid = Number.NaN;
@@ -891,7 +920,7 @@ realNonoSuite(
         await new Promise((r) => setTimeout(r, 500));
         child.kill("SIGKILL");
 
-        expect(loaded).toBe(true);
+        expect(loaded, `no pid file in the custom workspace; launcher output:\n${out}`).toBe(true);
         // The child did NOT fall back to the default config's workspace.
         expect(canRead(join(wsDefault, ".tps-agent.pid"))).toBe(false);
       } finally {
@@ -900,7 +929,7 @@ realNonoSuite(
     }, 60_000);
 
     test("the sandboxed child checks the worktree out inside the sandbox", async () => {
-      const sb = makeSandbox();
+      const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.home, "ops", "tps");
         mkdirSync(base, { recursive: true });
@@ -939,13 +968,13 @@ realNonoSuite(
         child.stderr?.on("data", (d: Buffer) => {
           out += d.toString();
         });
-        const checkedOut = await waitFor(() => out.includes("worktree checked out"), 45_000);
+        const checkedOut = await waitWhileRunning(child, () => out.includes("worktree checked out"), 45_000);
         child.kill("SIGTERM");
         await new Promise((r) => setTimeout(r, 500));
         child.kill("SIGKILL");
 
         // Git reported checkout success inside the sandbox.
-        expect(checkedOut).toBe(true);
+        expect(checkedOut, `no checkout report; launcher output:\n${out}`).toBe(true);
       } finally {
         rmSync(sb.root, { recursive: true, force: true });
       }

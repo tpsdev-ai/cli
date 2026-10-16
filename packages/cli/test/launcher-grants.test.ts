@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { launcherGrantCovering, realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 /**
  * Whether a write into the directory under test is refused for want of
@@ -166,6 +166,74 @@ describe("writeRefusedForPermission", () => {
       expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A fake nono that answers `why --json --profile default --path P --op OP`:
+ * "allowed" for a path under $FAKE_GRANTED, "denied" otherwise, and a failed
+ * query when $FAKE_FAIL is set.
+ */
+function fakeWhyNono(dir: string): string {
+  const bin = join(dir, "nono");
+  writeFileSync(
+    bin,
+    [
+      "#!/usr/bin/env bash",
+      'if [ -n "${FAKE_FAIL:-}" ]; then echo "fake failure" >&2; exit 2; fi',
+      'path="$6"',
+      'case "$path" in',
+      '  "${FAKE_GRANTED:-/nonexistent-prefix}"/*) echo \'{"status":"allowed","reason":"granted_path","granted_path":"\'"$FAKE_GRANTED"\'","access":"read","source":"group:fake_group"}\' ;;',
+      '  *) echo \'{"status":"denied","reason":"path_not_granted"}\' ;;',
+      "esac",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+describe("realNonoHomeBase", () => {
+  test("skips a candidate nono's built-in policy grants and returns the next one", () => {
+    const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
+    try {
+      const granted = join(parent, "granted");
+      const free = join(parent, "free");
+      mkdirSync(granted);
+      mkdirSync(free);
+      const nono = fakeWhyNono(parent);
+      const env = { ...process.env, FAKE_GRANTED: realpathSync(granted) };
+      expect(realNonoHomeBase(nono, [granted, free], env)).toBe(realpathSync(free));
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("throws, naming the candidate and nono's grant, when no candidate qualifies", () => {
+    const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
+    try {
+      const granted = join(parent, "granted");
+      mkdirSync(granted);
+      const nono = fakeWhyNono(parent);
+      const env = { ...process.env, FAKE_GRANTED: realpathSync(granted) };
+      expect(() => realNonoHomeBase(nono, [granted, "/tmp"], env)).toThrow(
+        /granted: nono's built-in policy grants read via .*granted \(group:fake_group\); \/tmp: inside the launcher's '\/tmp' grant/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed nono query throws instead of reading as not granted", () => {
+    const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
+    try {
+      const nono = fakeWhyNono(parent);
+      expect(() => realNonoHomeBase(nono, [parent], { ...process.env, FAKE_FAIL: "1" })).toThrow(
+        /failed \(status 2\): fake failure/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 });
