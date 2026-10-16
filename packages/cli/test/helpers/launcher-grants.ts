@@ -8,7 +8,8 @@
  * one shared list and one shared chooser keep them from drifting apart.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { BUN_TEMP_DIR, harnessReadPaths } from "../../src/utils/nono.js";
@@ -74,28 +75,86 @@ export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): 
   );
 }
 
+/** The fixed half of the line the probe prints when the sandboxed read fails. */
+export const NONO_PROBE_DENIED_PREFIX = "TPS-NONO-PROBE-DENIED-";
+
+/** What real nono did with a sandboxed read of a file under a candidate base. */
+export type NonoProbeVerdict =
+  | { kind: "denied" }
+  | { kind: "granted" }
+  | { kind: "refused"; stderr: string };
+
 /**
- * What nono's built-in policy grants on `path`, as "<op> via <granted path>
- * (<source>)", or null when it grants neither read nor write. nono applies its
- * default security groups to every profile, a profile without `extends`
- * included, so `nono why --profile default` answers for the groups any fixture
- * profile inherits. A failed or unparseable query throws: no answer is never
- * read as "not granted".
+ * Measure, with real nono, whether its built-in policy lets a sandboxed process
+ * read a file under `base` (cli#516). A scratch directory under `base` holds a
+ * fixture-like HOME and a file with a random nonce; nono runs
+ * `sh -c 'cat <file> || echo <marker>'` under a profile that only extends
+ * nono's `default`. Behavioural on purpose: it needs nothing from nono beyond
+ * `run`, the invocation every real-nono case already depends on (the pinned
+ * Linux build answered `nono why --profile default` with exit 0 and no output).
+ *
+ *   - the marker, exit 0: nono ran and the read was denied — "denied";
+ *   - the nonce, exit 0: the default policy grants read there — "granted";
+ *   - non-zero with no output: nono refused to start — "refused", with its
+ *     stderr (on macOS, a default group's grant overlapping the state root
+ *     HOME/.nono is refused this way);
+ *   - anything else throws: an unknown answer is never "not granted".
+ *
+ * Neither the nonce nor the whole marker appears in nono's argv, so nono
+ * echoing its command line cannot pass for either answer.
  */
-export function nonoBuiltinGrant(nono: string, path: string, env: NodeJS.ProcessEnv = process.env): string | null {
-  for (const op of ["read", "write"]) {
-    const args = ["why", "--json", "--profile", "default", "--path", path, "--op", op];
-    const r = spawnSync(nono, args, { encoding: "utf-8", env, timeout: 10_000 });
-    if (r.error || r.status !== 0) {
-      throw new Error(`\`${nono} ${args.join(" ")}\` failed (status ${r.status}): ${r.error?.message ?? r.stderr.trim()}`);
+export function probeNonoBuiltinRead(
+  nono: string,
+  base: string,
+  env: NodeJS.ProcessEnv = process.env,
+): NonoProbeVerdict {
+  const scratch = mkdtempSync(join(base, "tps-nono-probe-"));
+  try {
+    const home = join(scratch, "home");
+    const profileDir = join(home, ".config", "nono", "profiles");
+    const cwd = join(scratch, "cwd");
+    mkdirSync(profileDir, { recursive: true });
+    mkdirSync(cwd);
+    const profile = join(profileDir, "tps-nono-probe.json");
+    writeFileSync(
+      profile,
+      JSON.stringify({
+        $schema: "https://nono.sh/schemas/nono-profile.schema.json",
+        extends: "default",
+        meta: { name: "tps-nono-probe" },
+      }),
+    );
+    const file = join(scratch, "probe-file");
+    const nonce = `tps-nono-probe-nonce-${randomBytes(8).toString("hex")}`;
+    writeFileSync(file, `${nonce}\n`);
+    const token = randomBytes(8).toString("hex");
+    const marker = `${NONO_PROBE_DENIED_PREFIX}${token}`;
+    const args = [
+      "run", "-s", "--profile", profile, "--",
+      "sh", "-c", `cat "$1" || echo "${NONO_PROBE_DENIED_PREFIX}$2"`, "sh", file, token,
+    ];
+    const r = spawnSync(nono, args, {
+      cwd,
+      encoding: "utf-8",
+      timeout: 20_000,
+      env: { ...env, HOME: home, XDG_STATE_HOME: join(scratch, "nono-state") },
+    });
+    const stdout = (r.stdout ?? "").trim();
+    const stderr = (r.stderr ?? "").trim();
+    if (!r.error && r.status === 0 && stdout === marker) return { kind: "denied" };
+    if (!r.error && r.status === 0 && stdout === nonce) return { kind: "granted" };
+    if (!r.error && typeof r.status === "number" && r.status !== 0 && stdout === "") {
+      return { kind: "refused", stderr };
     }
-    const answer = JSON.parse(r.stdout) as { status?: unknown; granted_path?: unknown; source?: unknown };
-    if (answer.status === "allowed") return `${op} via ${String(answer.granted_path)} (${String(answer.source)})`;
-    if (answer.status !== "denied") {
-      throw new Error(`\`${nono} ${args.join(" ")}\` returned neither allowed nor denied: ${r.stdout.trim()}`);
-    }
+    throw new Error(
+      `the nono read probe under ${base} gave an unknown answer, which is never read as "not granted": ` +
+        `\`${nono} ${args.join(" ")}\` ` +
+        (r.error ? `failed to run (${r.error.message})` : `exited ${r.status ?? `on signal ${r.signal}`}`) +
+        `, stdout ${JSON.stringify(stdout)}, stderr ${JSON.stringify(stderr)}`,
+    );
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
-  return null;
 }
 
 /** The default candidates for a real-nono fixture base, in order of preference. */
@@ -110,12 +169,13 @@ export function realNonoHomeBaseCandidates(platform: NodeJS.Platform = process.p
 /**
  * A base for a fixture HOME that REAL nono confines (cli#516): outside every
  * launcher grant, as sandboxHomeBase() requires, AND outside every path nono's
- * own built-in groups grant on this host. Inside one, the fixture tests nothing
- * real: nono refuses to start (the group's grant overlaps its state root
- * HOME/.nono), and the launcher refuses the profile (nono reports read access to
- * the fixture HOME's credential files). Each candidate is checked with real
- * nono, never assumed; when none qualifies this throws, naming each candidate
- * and the grant that rules it out.
+ * own built-in policy grants on this host. Inside one, the fixture tests nothing
+ * real: nono refuses to start (the grant overlaps its state root HOME/.nono),
+ * or the launcher refuses the profile (nono reports read access to the fixture
+ * HOME's credential files). Each candidate is measured with real nono
+ * (probeNonoBuiltinRead), never assumed; when none qualifies this throws,
+ * naming each candidate and what ruled it out. An unknown probe answer throws
+ * at once rather than moving on to the next candidate.
  */
 export function realNonoHomeBase(
   nono: string,
@@ -134,12 +194,13 @@ export function realNonoHomeBase(
       continue;
     }
     const base = realpathSync(candidate);
-    const builtin = nonoBuiltinGrant(nono, join(base, "tps-fixture-probe"), env);
-    if (builtin !== null) {
-      rejected.push(`${candidate}: nono's built-in policy grants ${builtin}`);
-      continue;
-    }
-    return base;
+    const verdict = probeNonoBuiltinRead(nono, base, env);
+    if (verdict.kind === "denied") return base;
+    rejected.push(
+      verdict.kind === "granted"
+        ? `${candidate}: nono's default policy lets a sandboxed process read a file under it`
+        : `${candidate}: nono refused to start with a fixture HOME under it: ${verdict.stderr || "(no stderr)"}`,
+    );
   }
   throw new Error(
     "a real-nono fixture HOME needs a base outside every launcher grant and every path nono's " +
