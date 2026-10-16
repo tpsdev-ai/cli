@@ -142,8 +142,12 @@ for (const read of [false, true]) {
   test(`pending recovery keeps a replaced same-envelope cur record retryable (read: ${read})`, async () => {
     const { source, cur, inbox, envelope } = pending();
     const bytes = JSON.stringify({ ...JSON.parse(fs.readFileSync(cur, "utf8")), read });
-    fs.rmSync(cur);
-    fs.writeFileSync(cur, bytes);
+    // A different file takes the name: written beside it while the original still exists (so
+    // it gets its own inode on every filesystem), then renamed over it. Deleting first and
+    // rewriting the name could reuse the freed inode, and a same-inode, same-content file is
+    // the same message by design.
+    fs.writeFileSync(`${cur}.replacement`, bytes);
+    fs.renameSync(`${cur}.replacement`, cur);
     for (const path of [source, join(inbox.dlq, "record.json")]) {
       const result = await mail.promote(agent, path);
       expect(result.ok).toBe(false);
