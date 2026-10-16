@@ -938,7 +938,7 @@ realNonoSuite(
         // denied with a distinct marker. A nono that failed to start, or that
         // granted the base read, yields neither line and fails below.
         const controlFile = join(sb.ws, "control-inside");
-        writeFileSync(controlFile, "control-nonce");
+        writeFileSync(controlFile, "control-nonce\n");
         const token = randomBytes(8).toString("hex");
         const deniedMarker = `${NONO_PROBE_DENIED_PREFIX}${token}`;
         const probe = nonoRun([
