@@ -3,9 +3,12 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { load as parseYaml } from "js-yaml";
+import { PermanentEventError } from "../src/utils/flair-task-loop.js";
 import {
   InvalidReviewTriggerConfigError,
   handlePrOpened,
+  isPermanentGhFailure,
+  parsePrUrl,
   parseReviewTriggerConfig,
   reRequestReviewer,
   requestReviews,
@@ -107,6 +110,80 @@ describe("pr-review-trigger", () => {
 
     expect(result).toBe(true);
     expect(calls[0]?.input).toBe(JSON.stringify({ reviewers: ["reviewer-1"] }));
+  });
+
+  test("handlePrOpened: targets the repository named by the event's own PR URL", async () => {
+    const calls: Array<{ args: string[] }> = [];
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, args: string[]) => {
+        calls.push({ args });
+        return { status: 0, stdout: "", stderr: "" } as any;
+      }) as any,
+    };
+    await handlePrOpened(
+      { detail: "https://github.com/tpsdev-ai/cli/pull/131", summary: "PR" },
+      { reviewers: ["reviewer-1"], agentId: "anvil", repo: "tpsdev-ai/cli" },
+      deps,
+    );
+    expect(calls[0]?.args[4]).toBe("repos/tpsdev-ai/cli/pulls/131/requested_reviewers");
+  });
+
+  test("handlePrOpened: refuses a PR URL naming a repository other than the configured one, without calling gh", async () => {
+    let calls = 0;
+    const deps = {
+      spawnSyncImpl: (() => { calls++; return { status: 0, stdout: "", stderr: "" } as any; }) as any,
+    };
+    await expect(
+      handlePrOpened({ detail: "https://github.com/other/repo/pull/5", summary: "PR" }, cfg, deps),
+    ).rejects.toThrow(PermanentEventError);
+    expect(calls).toBe(0);
+  });
+
+  test.each([["(HTTP 404)", true], ["Not Found (HTTP 404)", true], ["Unprocessable Entity (HTTP 422)", true], ["Server Error (HTTP 500)", false], ["gh-as: connection refused", false], ["rate limit exceeded", false]])(
+    "isPermanentGhFailure(%j)",
+    (stderr, permanent) => {
+      expect(isPermanentGhFailure(stderr)).toBe(permanent);
+    },
+  );
+
+  test.each(["404", "422"])("handlePrOpened: a gh %s failure is permanent, so the loop skips the event", async (code) => {
+    const deps = {
+      spawnSyncImpl: (() => ({ status: 1, stdout: "", stderr: `gh: error (HTTP ${code})` }) as any) as any,
+    };
+    await expect(
+      handlePrOpened({ detail: "https://github.com/tpsdev-ai/cli/pull/9", summary: "PR" }, cfg, deps),
+    ).rejects.toThrow(PermanentEventError);
+  });
+
+  test("handlePrOpened: a transient gh failure is not permanent, so the loop retries the event", async () => {
+    const deps = {
+      spawnSyncImpl: (() => ({ status: 1, stdout: "", stderr: "gh: Server Error (HTTP 502)" }) as any) as any,
+    };
+    const error = await handlePrOpened({ detail: "https://github.com/tpsdev-ai/cli/pull/9", summary: "PR" }, cfg, deps)
+      .then(() => null, (e: unknown) => e as Error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(PermanentEventError);
+  });
+});
+
+describe("parsePrUrl", () => {
+  test.each([
+    ["https://github.com/tpsdev-ai/cli/pull/131", { repo: "tpsdev-ai/cli", number: 131 }],
+    ["https://github.com/owner.name/repo_name/pull/7", { repo: "owner.name/repo_name", number: 7 }],
+    ["https://github.com/a/b/pull/1/files", { repo: "a/b", number: 1 }],
+    ["https://github.com/tpsdev-ai/cli/pull/131\n", { repo: "tpsdev-ai/cli", number: 131 }],
+  ])("parses %j", (detail, expected) => {
+    expect(parsePrUrl(detail)).toEqual(expected);
+  });
+
+  test.each([
+    "branch-name-only",
+    "",
+    "https://github.com/tpsdev-ai/cli/pull/not-a-number",
+    "https://evil.example.com/tpsdev-ai/cli/pull/1",
+    "https://github.com/tpsdev-ai/cli/issues/1",
+  ])("returns null for %j", (detail) => {
+    expect(parsePrUrl(detail)).toBeNull();
   });
 });
 

@@ -708,20 +708,45 @@ export function shutdownHandler(
   };
 }
 
-async function publishPrResult(
-  flair: FlairClient,
+/** How many times publishing a pr.opened event is attempted before it is logged and dropped. */
+export const PR_RESULT_PUBLISH_ATTEMPTS = 3;
+/** The delay between pr.opened publication attempts. */
+export const PR_RESULT_PUBLISH_RETRY_MS = 250;
+
+/**
+ * Publish the PR URL as a `pr.opened` OrgEvent targeted at the agent, so the
+ * agent's own review-trigger loop sees it. The POST is idempotent; a failure is
+ * retried up to `PR_RESULT_PUBLISH_ATTEMPTS` times, and the final failure is
+ * logged with the PR URL so an operator can request the review manually.
+ */
+export async function publishPrResult(
+  flair: Pick<FlairClient, "request">,
   agentId: string,
   taskId: string,
   prUrl: string | null,
+  deps: { sleep?: (ms: number) => Promise<void> } = {},
 ): Promise<void> {
   if (!prUrl) return;
-  try {
-    await flair.request("POST", "/OrgEvent", {
-      kind: "pr.opened", authorId: agentId,
-      summary: `PR opened for ${taskId}`, refId: taskId,
-      detail: prUrl,
-    });
-  } catch { /* non-fatal */ }
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const event = {
+    kind: "pr.opened", authorId: agentId, targetIds: [agentId],
+    summary: `PR opened for ${taskId}`, refId: taskId,
+    detail: prUrl,
+  };
+  for (let attempt = 1; attempt <= PR_RESULT_PUBLISH_ATTEMPTS; attempt++) {
+    try {
+      await flair.request("POST", "/OrgEvent", event);
+      return;
+    } catch (e) {
+      const message = (e as Error).message;
+      if (attempt < PR_RESULT_PUBLISH_ATTEMPTS) {
+        console.warn(`[${agentId}] Failed to publish pr.opened for ${prUrl} (attempt ${attempt}/${PR_RESULT_PUBLISH_ATTEMPTS}): ${message}; retrying`);
+        await sleep(PR_RESULT_PUBLISH_RETRY_MS);
+      } else {
+        console.warn(`[${agentId}] Failed to publish pr.opened for ${prUrl} after ${attempt} attempts: ${message}`);
+      }
+    }
+  }
 }
 
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
