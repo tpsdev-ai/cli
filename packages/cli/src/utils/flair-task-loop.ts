@@ -55,8 +55,8 @@
  * restart after a failed save if it occurs before a later successful save.
  * Handlers must be idempotent.
  *
- * BOUNDED RETRIES. A handler that throws `PermanentEventError` (a failure a
- * retry cannot fix) or keeps failing past the caller's `maxAttempts` has its
+ * BOUNDED RETRIES. A handler that throws `PermanentEventError` (a failure its
+ * handler classifies as terminal) or keeps failing past the caller's `maxAttempts` has its
  * reason recorded and its event marked handled; the cursor advances past it
  * subject to the existing skew and persistence rules, so no event holds the
  * loop forever. With `maxAttempts` unset the retry is unbounded, as the DELIVERY
@@ -121,8 +121,8 @@ export function isSafeLoopId(loopId: string): boolean {
 }
 
 /**
- * Thrown by a task handler for a failure a retry cannot fix: a malformed event,
- * a 404/422 from the upstream API. The loop records its reason and marks the
+ * Thrown by a task handler for a failure it classifies as terminal, such as a
+ * malformed event or a 404/422 from the upstream API. The loop records its reason and marks the
  * event handled; the cursor advances past it subject to the existing skew and
  * persistence rules, so one bad event cannot hold the loop at it (head-of-line
  * blocking) forever.
@@ -324,7 +324,7 @@ export function startTaskLoop(
                   const err = e as Error;
                   const count = (attempts.get(event.id) ?? 0) + 1;
                   if (err instanceof PermanentEventError) {
-                    // A retry cannot fix this: record its reason and let the cursor advance.
+                    // Classified as terminal by the handler: record its reason and let the cursor advance.
                     attempts.delete(event.id);
                     serror(`[${agentId}] Task ${event.id} failed permanently (${err.message}); recorded and marked handled`);
                   } else if (count >= maxAttempts) {

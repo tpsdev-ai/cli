@@ -7,10 +7,10 @@
  *
  * `startReviewTriggerLoop` runs it as its own loop over the agent's feed, with a
  * cursor file separate from the task loop's, acting only on events the agent
- * itself authored. `handlePrOpened` throws `PermanentEventError` for a failure a
- * retry cannot fix (a detail that names no repository, a 404/422 from gh) and an
- * ordinary error for a transient one, so the loop skips the former and retries
- * the latter within the attempt bound.
+ * itself authored. `handlePrOpened` throws `PermanentEventError` for a failure
+ * classified as terminal (a detail that names no repository, a 404 or 422 from
+ * gh) and an ordinary error for any other failure, so the loop skips the former
+ * and retries the latter within the attempt bound.
  */
 
 import { spawnSync } from "node:child_process";
@@ -79,10 +79,10 @@ function ghHttpStatus(stderr: string): number | null {
 }
 
 /**
- * Whether a failed `gh-as api` call is permanent: a 404 (a missing repository or
- * PR) or a 422 (an invalid reviewer), the two a review request is refused with
- * and that a retry cannot fix. A network error, a 5xx or a rate limit is
- * transient.
+ * Whether a failed `gh-as api` call is classified as terminal. HTTP 404 and 422
+ * failures are classified as terminal and skipped, whatever explanation comes
+ * with them; every other request failure (a network error, a 5xx, a rate limit,
+ * an authentication or authorization refusal) uses bounded retries.
  */
 export function isPermanentGhFailure(stderr: string): boolean {
   const status = ghHttpStatus(stderr);
@@ -91,7 +91,7 @@ export function isPermanentGhFailure(stderr: string): boolean {
 
 interface ReviewRequestOutcome {
   ok: boolean;
-  /** For a failure, whether a retry cannot succeed. */
+  /** For a failure, whether it is classified as terminal (HTTP 404 or 422). */
   permanent: boolean;
   /** For a failure, a short reason for the log. */
   reason: string;
@@ -146,7 +146,7 @@ export function reRequestReviewer(
 
 /**
  * Handle a pr.opened OrgEvent: parse the PR URL and request reviews on that
- * repository. Throws `PermanentEventError` for a failure a retry cannot fix (no
+ * repository. Throws `PermanentEventError` for a failure classified as terminal (no
  * PR URL or repository in `detail`, a URL naming another repository, a 404/422
  * from gh) and an ordinary error for a transient one, so the loop skips the
  * former and retries the latter.
