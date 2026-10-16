@@ -5,7 +5,10 @@
  * this trigger calls `gh-as <agentId> api` to request reviews from the configured
  * reviewer list.
  *
- * Designed to run inside Anvil's task loop as a second kind handler.
+ * `startReviewTriggerLoop` runs it as its own loop over the agent's feed, with a
+ * cursor file separate from the task loop's. `handlePrOpened` refuses (throws)
+ * when the event carries no PR number or the review request fails, so the loop
+ * retries the event instead of marking it done and advancing its cursor.
  */
 
 import { spawnSync } from "node:child_process";
@@ -22,6 +25,35 @@ export interface ReviewTriggerConfig {
 }
 export interface ReviewRequestDeps {
   spawnSyncImpl?: typeof spawnSync;
+}
+
+/** Thrown for a malformed `reviewTrigger` in an agent's config. */
+export class InvalidReviewTriggerConfigError extends Error {
+  constructor(reason: string) {
+    super(`Invalid reviewTrigger config: ${reason}`);
+    this.name = "InvalidReviewTriggerConfigError";
+  }
+}
+
+/**
+ * Validate an agent's raw `reviewTrigger` config and reduce it to the loop's
+ * `{ reviewers, repo }`. Returns undefined when the key is absent, and refuses
+ * (throws) a value that is present but malformed. `agentId` is the runtime's
+ * own, not config.
+ */
+export function parseReviewTriggerConfig(raw: unknown): { reviewers: string[]; repo: string } | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new InvalidReviewTriggerConfigError("it must be a mapping with `reviewers` and `repo`");
+  }
+  const { reviewers, repo } = raw as { reviewers?: unknown; repo?: unknown };
+  if (!Array.isArray(reviewers) || reviewers.length === 0 || !reviewers.every((r) => typeof r === "string" && r.length > 0)) {
+    throw new InvalidReviewTriggerConfigError("`reviewers` must be a non-empty list of GitHub usernames");
+  }
+  if (typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+    throw new InvalidReviewTriggerConfigError("`repo` must be an owner/name string");
+  }
+  return { reviewers, repo };
 }
 
 /**
@@ -71,7 +103,9 @@ export function reRequestReviewer(
 }
 
 /**
- * Handle a pr.opened OrgEvent: extract PR URL and request reviews.
+ * Handle a pr.opened OrgEvent: extract PR URL and request reviews. Throws when
+ * the event carries no PR number or the review request fails, so the task loop
+ * retries the event rather than marking it done.
  */
 export async function handlePrOpened(
   event: { detail?: string; summary: string; refId?: string },
@@ -82,11 +116,12 @@ export async function handlePrOpened(
   const prNumber = extractPrNumber(detail);
 
   if (!prNumber) {
-    swarn(`[pr-review-trigger] No PR number in event detail: ${detail}`);
-    return;
+    throw new Error(`[pr-review-trigger] No PR number in event detail: ${detail || "(empty)"}`);
   }
 
-  requestReviews(prNumber, config, deps);
+  if (!requestReviews(prNumber, config, deps)) {
+    throw new Error(`[pr-review-trigger] Review request failed for PR #${prNumber}`);
+  }
 }
 
 /**

@@ -132,7 +132,7 @@ describe("runAutoCommit", () => {
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
     });
 
-    await runAutoCommit(
+    const prUrl = await runAutoCommit(
       config,
       { publishEvent: mock(async () => {}) },
       {
@@ -149,6 +149,10 @@ describe("runAutoCommit", () => {
       },
       { spawnSyncImpl },
     );
+
+    // The runtime publishes pr.opened with this URL; the review handler reads
+    // /pull/<number> from it.
+    expect(prUrl).toBe("https://github.com/tpsdev-ai/cli/pull/123");
 
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
@@ -264,6 +268,43 @@ describe("runAutoCommit", () => {
         ],
       },
     ]);
+  });
+
+  test("returns no PR URL when no PR is opened", async () => {
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/feat/task-1\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: 0, stdout: " M file.ts\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-parse --verify refs/remotes/origin/feat/task-1") {
+        return { status: 1, stdout: "", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "rev-list --count HEAD") {
+        return { status: 0, stdout: "0\n", stderr: "" };
+      }
+      if (cmd === "tps") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    const prUrl = await runAutoCommit(
+      config,
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-1",
+        branchName: "feat/task-1",
+        commitMessage: "feat: ship task 1",
+        authorName: "ember",
+        authorEmail: "ember@tps.dev",
+        push: true,
+      },
+      { spawnSyncImpl },
+    );
+
+    expect(prUrl).toBeUndefined();
   });
 
   test("publishes a blocker OrgEvent when runtime PR creation fails", async () => {
