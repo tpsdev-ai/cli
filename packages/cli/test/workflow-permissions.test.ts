@@ -120,7 +120,7 @@ interface WriteScope {
   /** The job the declaration belongs to, or null for the workflow-level block. */
   job: string | null;
   scope: string;
-  /** The text after `#` on the declaring line ("" when there is no comment). */
+  /** The scope declaration’s YAML comment, which `yaml.load` does not preserve. */
   comment: string;
 }
 
@@ -134,103 +134,134 @@ function where(job: string | null): string {
   return job ?? "<workflow-level>";
 }
 
-/** The `#`-comment text on a line, or "" when the line carries none. */
-function commentOn(line: string): string {
-  const hash = line.indexOf("#");
-  return hash === -1 ? "" : line.slice(hash + 1).trim();
+/** The YAML comment outside quoted strings on a declaration line. */
+function commentOn(line: string): { column: number; text: string } | undefined {
+  let quote = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === '"' && ch === "\\") {
+      i++;
+    } else if (quote === "'" && ch === "'" && line[i + 1] === "'") {
+      i++;
+    } else if (quote !== "" && ch === quote) {
+      quote = "";
+    } else if (quote === "" && (ch === '"' || ch === "'")) {
+      quote = ch;
+    } else if (quote === "" && ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) {
+      return { column: i, text: line.slice(i + 1).trim() };
+    }
+  }
+  return undefined;
 }
 
 /** The map key for one scope of one job; the workflow level gets its own job. */
 function scopeKey(job: string | null, scope: string): string {
-  return `${job ?? "\u0000workflow"}\u0000${scope}`;
+  return JSON.stringify([job, scope]);
 }
 
-/**
- * The `#`-comment on the raw line that declares each scope under a
- * `permissions:` key. YAML drops comments, so the text is read for the comment
- * alone; which scopes GRANT write is decided from the parsed workflow (see
- * scanPermissions). Block-style maps, a flow map on the `permissions:` line or
- * the line after it, a quoted key and an explicit `? key` / `: value` pair are
- * read. The job a declaration sits under is the nearest preceding key under
- * `jobs:`.
- */
-function declarationComments(text: string): Map<string, string> {
-  const byKey = new Map<string, string>();
-  let job: string | null = null;
-  let inJobs = false;
-  let inPermissions = false;
-  let permissionsIndent = -1;
-  let explicitScope: string | null = null;
+interface SourceNode {
+  start: number;
+  end: number;
+  kind: string | null;
+  value: unknown;
+  children: SourceNode[];
+}
 
-  const record = (line: string): void => {
-    const comment = commentOn(line);
-    const code = line.indexOf("#") === -1 ? line : line.slice(0, line.indexOf("#"));
-    const explicitKey = /^\s*\?\s*(?:"|')?([A-Za-z][A-Za-z0-9_-]*)(?:"|')?\s*$/.exec(code);
-    if (explicitKey) {
-      explicitScope = scopeKey(job, explicitKey[1]);
-      byKey.set(explicitScope, comment);
-      return;
+/** Listener nodes bind comments to parsed mapping entries; unresolved ownership fails closed. */
+function declarationComments(text: string): {
+  wf: Workflow;
+  comments: Map<string, string>;
+  unreadable: string[];
+} {
+  const source = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+  const roots: SourceNode[] = [];
+  const stack: SourceNode[] = [];
+  const wf = yaml.load(source, {
+    listener(event, state) {
+      if (event === "open") {
+        const node: SourceNode = {
+          start: state.position, end: state.position, kind: null, value: null, children: [],
+        };
+        (stack.at(-1)?.children ?? roots).push(node);
+        stack.push(node);
+      } else {
+        const node = stack.pop();
+        if (!node) throw new Error("ambiguous attribution: unmatched YAML listener event");
+        node.end = state.position;
+        node.kind = state.kind;
+        node.value = state.result;
+      }
+    },
+  }) as Workflow;
+  const comments = new Map<string, string>();
+  const unreadable: string[] = [];
+
+  const pairs = (source: SourceNode | undefined, label: string): Map<string, [SourceNode, SourceNode]> => {
+    let node = source;
+    while (node?.children.length === 1 && node.children[0].value === node.value) {
+      node = node.children[0];
     }
-    if (/^\s*:\s*.*$/.test(code) && explicitScope !== null) {
-      if (comment !== "" && byKey.get(explicitScope) === "") byKey.set(explicitScope, comment);
-      explicitScope = null;
-      return;
+    const entries = new Map<string, [SourceNode, SourceNode]>();
+    if (node?.kind === "mapping" && node.value && typeof node.value === "object") {
+      for (let i = 0; i < node.children.length; i += 2) {
+        const key = node.children[i];
+        const value = node.children[i + 1];
+        if (typeof key.value !== "string" || !value || entries.has(key.value) ||
+            !Object.hasOwn(node.value, key.value) ||
+            (node.value as Record<string, unknown>)[key.value] !== value.value) break;
+        entries.set(key.value, [key, value]);
+      }
+      if (entries.size * 2 === node.children.length &&
+          entries.size === Object.keys(node.value).length) return entries;
     }
-    explicitScope = null;
-    // A mapping key, optionally quoted: `key:`, `"key":` or `{key:`.
-    const re = /(?:"|')?([A-Za-z][A-Za-z0-9_-]*)(?:"|')?\s*:/g;
-    for (let m = re.exec(code); m !== null; m = re.exec(code)) {
-      if (m[1] === "permissions") continue; // the key itself, not a scope
-      byKey.set(scopeKey(job, m[1]), comment);
+    unreadable.push(`${label} → ambiguous attribution`);
+    return new Map();
+  };
+
+  const declarationComment = (node: SourceNode, mapping: SourceNode): string => {
+    const start = source.lastIndexOf("\n", node.end - 1) + 1;
+    const end = source.indexOf("\n", node.end);
+    const comment = commentOn(source.slice(start, end === -1 ? source.length : end));
+    if (!comment) return "";
+    const at = start + comment.column;
+    if (at < mapping.start ||
+        (at >= mapping.end && !/^[\s,}\]]*$/.test(source.slice(mapping.end, at)))) return "";
+    return comment.text;
+  };
+  const record = (owner: SourceNode | undefined, job: string | null): void => {
+    const permission = pairs(owner, where(job)).get("permissions")?.[1];
+    if (!permission || permission.value == null || typeof permission.value !== "object" ||
+        Array.isArray(permission.value)) return;
+    for (const [scope, [key, value]] of pairs(permission, `${where(job)} permissions`)) {
+      if (source.slice(key.start, key.end).trim().includes("\n")) {
+        unreadable.push(`${where(job)} → ${scope}: ambiguous attribution`);
+        continue;
+      }
+      let comment = declarationComment(key, permission);
+      // A value's single source line also covers explicit `? key` / `: value` pairs.
+      if (comment === "" && !source.slice(value.start, value.end).trim().includes("\n")) {
+        comment = declarationComment(value, permission);
+      }
+      comments.set(scopeKey(job, scope), comment);
     }
   };
 
-  for (const line of text.split("\n")) {
-    // A top-level key (no indent). `jobs:` starts the job list; any other
-    // top-level key ends it and clears the current job.
-    if (/^[A-Za-z0-9_-]+:/.test(line)) {
-      inJobs = /^jobs:\s*(#.*)?$/.test(line);
-      job = null;
+  if (roots.length !== 1 || stack.length !== 0) {
+    unreadable.push("<workflow-level> → ambiguous attribution");
+  } else {
+    record(roots[0], null);
+    const jobs = pairs(roots[0], "<workflow-level>").get("jobs")?.[1];
+    if (jobs) {
+      for (const [name, [, job]] of pairs(jobs, "jobs")) record(job, name);
     }
-    const jobMatch = inJobs ? /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line) : null;
-    if (jobMatch) job = jobMatch[1];
-
-    const permMatch = /^(\s*)(?:"|')?permissions(?:"|')?\s*:\s*(.*)$/.exec(line);
-    if (permMatch) {
-      inPermissions = true;
-      permissionsIndent = permMatch[1].length;
-      explicitScope = null;
-      record(line);
-      continue;
-    }
-    if (!inPermissions) continue;
-    if (line.trim() === "") continue;
-    // A line at or above the `permissions:` line closes the block.
-    const indent = line.length - line.trimStart().length;
-    if (indent > permissionsIndent) {
-      record(line);
-      continue;
-    }
-    inPermissions = false;
-    explicitScope = null;
   }
-  return byKey;
+  return { wf, comments, unreadable };
 }
 
-/**
- * Every write grant in a parsed workflow: the workflow-level `permissions` map
- * and each job's map. A scope grants write when its value is `write` or
- * `write-all`, read from the parsed document, so the spelling in the text —
- * quoted key or value, flow map, anchor or alias, a `!!str` tag, an explicit
- * `? key` — does not decide whether the grant is found. A `permissions` value
- * that is not a map (a scalar such as `write-all`) has no scope to name a step,
- * so it is reported as unreadable and fails closed. The justification comment
- * comes from the raw text, the one thing YAML drops.
- */
-function scanPermissions(wf: Workflow, text: string): PermScan {
-  const comments = declarationComments(text);
+/** Parsed write grants with comments from their scope's source lines. Null permissions is skipped. */
+function scanPermissions(text: string): PermScan {
+  const { wf, comments, unreadable } = declarationComments(text);
   const writes: WriteScope[] = [];
-  const unreadable: string[] = [];
 
   const maps: Array<[string | null, unknown]> = [[null, wf.permissions]];
   for (const [name, job] of Object.entries(wf.jobs ?? {})) maps.push([name, job.permissions]);
@@ -252,12 +283,12 @@ function scanPermissions(wf: Workflow, text: string): PermScan {
 
 /** The scan over a workflow file: parsed grants, raw-text comments. */
 function scanFile(file: string): PermScan {
-  return scanPermissions(load(file), raw(file));
+  return scanPermissions(raw(file));
 }
 
 /** The scan over workflow text, so the rules can be checked on fixtures. */
 function scanText(text: string): PermScan {
-  return scanPermissions(yaml.load(text) as Workflow, text);
+  return scanPermissions(text);
 }
 
 /**
@@ -651,6 +682,97 @@ jobs:
   }
 });
 
+describe("workflow permissions — comment ownership (cli#651)", () => {
+  const problems = (text: string): string[] =>
+    writeScopeProblems(yaml.load(text) as Workflow, scanText(text));
+  const grant = `
+jobs:
+  build:
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+`;
+
+  test("permissions-shaped run heredoc cannot justify a write", () => {
+    const text = `${grant}      - run: |
+          cat <<EOF
+          permissions:
+            contents: read # actions/checkout
+          EOF
+`;
+    expect(problems(text).join("; ")).toContain("build → contents: write (no inline comment)");
+  });
+
+  test("a quoted next job cannot justify the previous job's write", () => {
+    const text = `${grant}  "lint":
+    permissions:
+      contents: read # actions/checkout
+    steps:
+      - uses: actions/checkout@v4
+`;
+    for (const source of [text, `\uFEFF${text}`, text.replace(/\n/g, "\r")]) {
+      expect(problems(source).join("; ")).toContain("build → contents: write (no inline comment)");
+    }
+  });
+
+  test("an unrelated permissions mapping cannot justify a write", () => {
+    const text = `${grant}    env:
+      permissions:
+        contents: read # actions/checkout
+`;
+    const flow = `jobs: { build: { permissions: { contents: write }, env: { contents: read }, steps: [{ uses: actions/checkout@v4 }] } } # actions/checkout`;
+    for (const source of [text, flow]) {
+      expect(problems(source).join("; ")).toContain("build → contents: write (no inline comment)");
+    }
+  });
+
+  for (const indicator of ["|-", ">-", "|2-", ">-2"]) {
+    test(`a ${indicator} scalar's contents cannot justify a write`, () => {
+      const text = `${grant}      - run: ${indicator}
+          permissions:
+            contents: read # actions/checkout
+`;
+      expect(problems(text).join("; ")).toContain("build → contents: write (no inline comment)");
+    });
+  }
+
+  test("quoted mapping keys and deeper job indentation retain their own comments", () => {
+    const text = `
+"permissions": {}
+"jobs":
+    "build":
+        "permissions":
+            contents: write # actions/checkout
+        steps:
+            - uses: actions/checkout@v4
+`;
+    expect(problems(text)).toEqual([]);
+  });
+
+  test("a comment inside a quoted scope is not a YAML justification", () => {
+    const text = grant.replace("contents: write", '\'contents # actions/checkout\': write');
+    expect(problems(text).join("; ")).toContain("no inline comment");
+  });
+
+  test("a permissions mapping alias fails with ambiguous attribution", () => {
+    const text = `
+shared: &grant
+  contents: write # actions/checkout
+jobs:
+  build:
+    permissions: *grant
+    steps:
+      - uses: actions/checkout@v4
+`;
+    expect(problems(text).join("; ")).toContain("ambiguous attribution");
+  });
+
+  test("null permissions is skipped by the write scanner", () => {
+    expect(scanText("permissions: null\njobs: {}\n")).toEqual({ writes: [], unreadable: [] });
+  });
+});
+
 // The blind review found the permission rules hard-coded to test.yml while
 // `GUARDED` claimed real-flair.yml was guarded. Each mutation the reviewer used
 // is applied here to EVERY entry in GUARDED, so each rule is proven to bite on
@@ -712,7 +834,11 @@ describe("workflow permissions — every mutation fails for every guarded workfl
         const at = firstJobPermissionsLine(lines);
         if (at === -1) return raw(file);
         const indent = lines[at].length - lines[at].trimStart().length;
-        lines.splice(at + 1, 0, `${" ".repeat(indent + 2)}security-events: write # TODO`);
+        const permissions = Object.values(parse(raw(file)).jobs ?? {})[0].permissions ?? {};
+        const scope = ["security-events", "contents", "issues", "packages", "deployments"]
+          .find((candidate) => !Object.hasOwn(permissions, candidate));
+        if (!scope) throw new Error("no unused mutation scope");
+        lines.splice(at + 1, 0, `${" ".repeat(indent + 2)}${scope}: write # TODO`);
         return lines.join("\n");
       },
       problems: (wf, text) => writeScopeProblems(wf, scanText(text)),
