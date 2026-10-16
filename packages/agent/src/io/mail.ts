@@ -108,8 +108,8 @@ export type DeliveryCompletion =
   | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string }
   /**
    * Not this hand-over's to finalize; nothing changed. `foreign`: not a
-   * delivery this MailClient issued. `stale`: the message was presented again
-   * since (another claim), finalized, or moved to another phase. `identity`:
+   * delivery this MailClient issued. `stale`: no matching live intent and claim
+   * in the currently resolved mailbox. `identity`:
    * recorded cur/ identity is absent or mismatched.
    */
   | { status: "refused"; reason: "foreign" | "stale" | "identity"; detail: string };
@@ -481,7 +481,7 @@ export class MailClient {
     return {
       status: "refused",
       reason: "stale",
-      detail: `message ${issued.messageId} is no longer held by this presentation (presented again, finalized or terminal); not finalized`,
+      detail: `message ${issued.messageId}: no matching live intent and claim in the currently resolved mailbox`,
     };
   }
 

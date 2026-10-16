@@ -308,7 +308,7 @@ export interface ReplayStore {
    * Deletes the intent only when it is `in_progress` for this message, its
    * claim carries `token`, and `cur/<file>` is still the file the intent
    * recorded (device, inode, size and SHA-256). These results leave it unchanged: `absent` (no intent
-   * for this message), `stale` (another phase or another presentation's claim),
+   * for this message), `stale` (phase is not `in_progress` or claim token does not match),
    * or `identity` (recorded cur/ identity absent or mismatched).
    */
   completePlacement(messageId: string, file: string, token: string): PlacementCompletion;

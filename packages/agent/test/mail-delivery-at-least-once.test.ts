@@ -745,6 +745,29 @@ describe("completion is bound to the hand-over", () => {
     expect(newFiles()).toEqual([]);
   });
 
+  test("completion reports no matching live intent and claim after retargeting to an empty mailbox", async () => {
+    const empty = join(mailDir, "empty");
+    mkdirSync(join(empty, AGENT, "new"), { recursive: true });
+    mkdirSync(join(empty, AGENT, "cur"), { recursive: true });
+    const link = join(mailDir, "mail-link");
+    symlinkSync(mailDir, link);
+    plant("m1.json", "retargeted-empty");
+    const c = new MailClient(link, undefined, AGENT, verifier());
+    const m = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    expect(intentPhase("m1.json")).toBe("in_progress");
+
+    unlinkSync(link);
+    symlinkSync(empty, link);
+    expect(await c.completeDelivery(m)).toEqual({
+      status: "refused",
+      reason: "stale",
+      detail: "message retargeted-empty: no matching live intent and claim in the currently resolved mailbox",
+    });
+    expect(intentText("m1.json")).toBe(before);
+    expect(mailboxReplayStore(join(empty, AGENT)).placementPhase("m1.json")).toBeNull();
+  });
+
   test("release frees its token across a mail-root repoint", async () => {
     const other = join(mailDir, "other");
     mkdirSync(other);
