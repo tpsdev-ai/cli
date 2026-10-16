@@ -57,6 +57,17 @@ const yellow = (t: string, nc: boolean) => esc(33, t, nc);
 const cyan   = (t: string, nc: boolean) => esc(36, t, nc);
 const dim    = (t: string, nc: boolean) => esc(2,  t, nc);
 
+/**
+ * Replace terminal control characters (C0 0x00-0x1F, DEL 0x7F, C1 0x80-0x9F)
+ * in a table value with U+FFFD, so each becomes visible and stays in its cell.
+ * Flair caps a current task but does not redact its content
+ * (resources/Presence.ts), so the renderer makes controls visible here.
+ */
+function visibleControls(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate — replace terminal control chars before they reach stdout
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, "\uFFFD");
+}
+
 // ── Auth helper ───────────────────────────────────────────────────────────────
 function makeAuth(viewerId: string, keyPath: string, method: string, urlPath: string): string | undefined {
   if (!existsSync(keyPath)) return undefined;
@@ -206,12 +217,12 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
 
   for (const ag of agents) {
     const id   = ag.id ?? ag.agentId ?? "?";
-    const name = (ag.name ?? id).padEnd(12);
-    const role = (ag.role ?? "?").padEnd(26);
-    const model= ((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
+    const name = visibleControls(ag.name ?? id).padEnd(12);
+    const role = visibleControls(ag.role ?? "?").padEnd(26);
+    const model= visibleControls((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
     const rec  = presenceByAgent.get(id);
-    const lastSeen = lastSeenText(id);
-    const doing = doingText(id) ?? "—";
+    const lastSeen = visibleControls(lastSeenText(id));
+    const doing = visibleControls(doingText(id) ?? "—");
     const dot  = ag.status === "active" ? green("●", nc) : yellow("○", nc);
     const doingColored = state !== "unavailable" && rec?.currentTask ? cyan(doing, nc) : dim(doing, nc);
 

@@ -167,6 +167,31 @@ describe("cli#622 — office status reads the Presence roster", () => {
     expect(out).not.toContain("never seen");
   });
 
+  test("a current task's control characters are replaced in the table, keeping its other text", async () => {
+    // ESC (window/cursor control), BEL, an internal newline and a C1 byte.
+    const task = "deploy\x1b[2J\x1b[Howned\x1b]0;pwned\x07\nforged\u009fline";
+    const out = await status(presenceRoute([beat("agent-a", 0.5, { currentTask: task })]));
+    const line = row(out, "Agent A");
+    // The text survives, on the one row.
+    expect(line).toContain("deploy");
+    expect(line).toContain("owned");
+    expect(line).toContain("forged");
+    // Each control became a visible placeholder; none reaches the terminal raw
+    // (the command runs noColor, so any raw byte here is the task's).
+    expect(line).toContain("\uFFFD");
+    expect(out).not.toContain("\x1b");
+    expect(out).not.toContain("\x07");
+    expect(out).not.toContain("\u009f");
+  });
+
+  test("the --json output keeps a current task's control characters (JSON escapes them)", async () => {
+    const task = "deploy\x1b[2J\nnext\u009f";
+    const out = await status(presenceRoute([beat("agent-a", 0.5, { currentTask: task })]), { json: true });
+    expect(jsonAgents()[0]!.presence.currentTask).toBe(task);
+    expect(jsonAgents()[0]!.doing).toBe(task);
+    expect(out).toContain("\\u001b");
+  });
+
   test("accepts a task whose trim-then-slice output ends in a space", async () => {
     const task = "x".repeat(199) + " ";
     const route = presenceRoute([beat("agent-a", 0.5, { currentTask: `  ${task}tail  ` })]);
