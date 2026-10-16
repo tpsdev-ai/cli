@@ -1,8 +1,10 @@
 /**
  * pr-review-trigger.ts — Listens for pr.opened OrgEvents and auto-requests K&S review.
  *
- * When an agent opens a PR (publishes pr.opened OrgEvent with detail=PR URL),
- * this trigger calls `gh-as <agentId> api` to request reviews from the configured
+ * The runtime attempts bounded `pr.opened` publication with detail=PR URL.
+ * Only an accepted POST can reach this loop; exhausted retries call `console.warn`
+ * and return without an event if no POST was accepted.
+ * This trigger calls `gh-as <agentId> api` to request reviews from the configured
  * reviewer list, on the repository named by the event's own PR URL.
  *
  * `startReviewTriggerLoop` runs it as its own loop over the agent's feed, with a

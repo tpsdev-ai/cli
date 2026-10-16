@@ -714,12 +714,11 @@ export const PR_RESULT_PUBLISH_ATTEMPTS = 3;
 export const PR_RESULT_PUBLISH_RETRY_MS = 250;
 
 /**
- * Publish the PR URL as a `pr.opened` OrgEvent targeted at the agent, so the
- * agent's own review-trigger loop sees it. Flair assigns the event a fresh id on
- * each POST, so a retry after an uncertain response can publish it twice.
- * A failed publish is attempted up to
- * `PR_RESULT_PUBLISH_ATTEMPTS` times in total, and the final failure is logged
- * with the PR URL so an operator can request the review manually.
+ * Attempt to publish the PR URL as a `pr.opened` OrgEvent targeted at the agent,
+ * up to `PR_RESULT_PUBLISH_ATTEMPTS` times. Only an accepted POST can reach the
+ * review loop; exhausted retries call `console.warn` with the PR URL and return
+ * without an event if no POST was accepted. Flair assigns a fresh id per POST,
+ * so a retry after an uncertain response can publish the event twice.
  */
 export async function publishPrResult(
   flair: Pick<FlairClient, "request">,

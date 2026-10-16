@@ -150,8 +150,9 @@ describe("runAutoCommit", () => {
       { spawnSyncImpl },
     );
 
-    // The runtime publishes pr.opened with this URL; the review handler reads
-    // /pull/<number> from it.
+    // The runtime attempts bounded pr.opened publication with this URL; only an
+    // accepted POST can reach the review loop. Exhausted retries call console.warn
+    // and return without an event if no POST was accepted.
     expect(prUrl).toBe("https://github.com/tpsdev-ai/cli/pull/123");
 
     expect(calls).toEqual([

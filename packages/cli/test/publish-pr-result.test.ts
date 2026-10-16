@@ -1,9 +1,9 @@
 /**
- * The runtime publishes a `pr.opened` OrgEvent when a task opens a PR, so the
- * agent's own review-trigger loop sees it (cli#644). Flair assigns a fresh id on
- * each POST, so a retry after an uncertain response can publish the event twice;
- * a failure is attempted a bounded number of times and the last failure is
- * logged with the PR URL, so a lost event is at least visible to an operator.
+ * The runtime attempts bounded `pr.opened` publication when a task opens a PR.
+ * Only an accepted POST can reach the review loop; exhausted retries call
+ * `console.warn` with the PR URL and return without an event if no POST was accepted.
+ * Flair assigns a fresh id per POST, so a retry after an uncertain response can
+ * publish the event twice.
  */
 import { describe, expect, test } from "bun:test";
 import { PR_RESULT_PUBLISH_ATTEMPTS, publishPrResult } from "../src/utils/codex-runtime.js";

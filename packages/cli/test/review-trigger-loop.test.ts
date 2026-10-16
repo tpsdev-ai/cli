@@ -73,7 +73,7 @@ function cursorPosition(agentId = AGENT): string | undefined {
 
 const client = (agentId = AGENT) => createFlairClient(agentId, stub!.url, keyPath);
 
-/** A pr.opened event in the shape the runtime publishes after a successful PR:
+/** A pr.opened event in the shape of an accepted runtime POST:
  *  attributed to the agent, `detail` the PR URL `runAutoCommit` returned. */
 const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT], prNumber = 1, authorId = AGENT) => ({
   id, kind: "pr.opened", authorId, summary: `PR ${id}`,
@@ -203,7 +203,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
       } finally {
         await loop.stop();
       }
-      // Only the agent's own PR #2 event reached the command.
+      // Only the event attributed to the agent and naming PR #2 reached the command.
       expect(ghCalls[0]?.args).toEqual([
         AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/2/requested_reviewers`, "--input", "-",
       ]);
