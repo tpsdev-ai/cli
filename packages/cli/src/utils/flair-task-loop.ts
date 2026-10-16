@@ -244,7 +244,7 @@ export function startTaskLoop(
   // When set, only events this author wrote are eligible; the review loop uses it
   // to act on the agent's OWN pr.opened events, never another agent's broadcast.
   const authorId = opts.authorId;
-  // A transient handler failure is retried at most this many times per event,
+  // A transient handler failure is attempted at most this many times per event,
   // then recorded and skipped so it cannot hold the loop. Undefined keeps the
   // original unbounded retry (the task loop's at-least-once contract).
   const maxAttempts = opts.maxAttempts ?? Infinity;
