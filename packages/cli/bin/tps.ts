@@ -504,7 +504,7 @@ async function main() {
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
-            const { join } = await import("node:path");
+            const { join, resolve } = await import("node:path");
             const { homedir } = await import("node:os");
             const { readFileSync, existsSync } = await import("node:fs");
             const { load: parseYaml } = await import("js-yaml");
@@ -556,14 +556,17 @@ async function main() {
               }
             }
 
-            // cli#516 — worktree setup/cleanup belongs to the process that can
-            // write the base repository. This sandboxed child is not granted
-            // that write, so the parent (the launcher that re-execs it) runs the
-            // hooks instead and this process must not silently no-op them again.
-            const manageWorktree = !sandboxed;
-            const { onStart, onStop } = await import("../src/utils/agent-lifecycle.js");
+            // cli#516 — the parent creates the worktree outside the sandbox with
+            // the checkout suppressed, and that checkout runs HERE, inside the
+            // sandbox, where a repository-configured filter or hook is confined.
+            // A launch that is not sandboxed owns both halves itself.
+            const { onStart, onStop, checkoutWorktree } = await import("../src/utils/agent-lifecycle.js");
+            const pendingCheckout = process.env.TPS_WORKTREE_PENDING;
             let worktreeCreated = false;
-            if (manageWorktree) {
+            if (sandboxed && pendingCheckout && resolve(pendingCheckout) === resolve(agentWorkspace)) {
+              const checkedOut = checkoutWorktree(agentWorkspace);
+              console.log(`[${agentId}] worktree: ${checkedOut.reason}`);
+            } else if (!sandboxed) {
               const startResult = onStart(agentId!, agentWorkspace);
               worktreeCreated = startResult.changed;
               if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);

@@ -1136,6 +1136,33 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
             const runtimeGrants = runtimeNonoOptions(selectedRuntime);
+            const profile = runtimeNonoProfile(selectedRuntime);
+            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
+            if (profileRefusal) {
+              console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+            }
+            // Worktree setup runs HERE, outside the sandbox (cli#516). Nothing
+            // the base repository configures may execute in this process:
+            // onStart pins the hook path and fsmonitor off and creates the
+            // worktree with the checkout suppressed. The sandboxed child runs
+            // that checkout as its first step, so the worktree's own git
+            // directory is granted writable for it.
+            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            let worktreeCreated = false;
+            let worktreeGitDir: string | undefined;
+            let worktreeBaseRepo: string | undefined;
+            if (selectedRuntime) {
+              try {
+                const startResult = onStart(launchId, config.workspace, { deferCheckout: true });
+                worktreeCreated = startResult.changed;
+                worktreeGitDir = startResult.gitDir;
+                worktreeBaseRepo = startResult.baseRepo;
+              } catch (err) {
+                console.error(`❌ ${(err as Error).message}`);
+                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+              }
+            }
             const launchOptions = {
               workdir: config.workspace,
               // CHANGE (cli#341 S1b): this used to grant a read of the
@@ -1146,7 +1173,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // Read the toolchain roots plus the directory the config was read
               // from, so the child can re-read `--config` inside the sandbox
               // (cli#516). Read-only, and usually the already-granted agent dir.
-              read: [...new Set([...harnessReadPaths(), dirname(configPath)])],
+              // The base repository is readable too, so the child's deferred
+              // checkout can read the tree it is checking out; the child is not
+              // granted write to any of it.
+              read: [...new Set([...harnessReadPaths(), dirname(configPath), ...(worktreeBaseRepo ? [worktreeBaseRepo] : [])])],
               // Exactly this agent's own identity files, not the shared
               // identity directory (cli#351 r4).
               readFiles: harnessReadFiles(launchId),
@@ -1156,32 +1186,22 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
               // to /var/folders/…, so /tmp would otherwise not be granted at
               // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-              allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
+              // The new worktree's own git directory is writable so the child
+              // can build its index during the deferred checkout (cli#516); the
+              // rest of the base repository's metadata stays read-only to it.
+              allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? []), ...(worktreeGitDir ? [worktreeGitDir] : [])])],
             };
-            const profile = runtimeNonoProfile(selectedRuntime);
             const approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
             if (approval.refusal) {
               console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
-              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
-            }
-            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
-            if (profileRefusal) {
-              console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
-              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
-            }
-            // Worktree setup/cleanup runs HERE, outside the sandbox (cli#516):
-            // the sandboxed child is not granted write to the base repository's
-            // worktree metadata, so its hooked setup could not create the
-            // worktree under a real nono. The parent can; the child skips them.
-            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
-            let worktreeCreated = false;
-            if (selectedRuntime) {
-              try {
-                worktreeCreated = onStart(launchId, config.workspace).changed;
-              } catch (err) {
-                console.error(`❌ ${(err as Error).message}`);
-                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+              if (worktreeCreated) {
+                try {
+                  onStop(launchId, config.workspace);
+                } catch (cleanupErr) {
+                  console.error(`❌ ${(cleanupErr as Error).message}`);
+                }
               }
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             let exitCode: number;
             try {
@@ -1189,7 +1209,15 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 profile,
                 approval.options,
                 relaunch,
-                { runtimeDirectories: approval.runtimeDirectories },
+                {
+                  runtimeDirectories: approval.runtimeDirectories,
+                  // Signals the sandboxed child that the worktree it is about
+                  // to enter was created with the checkout suppressed. Absent
+                  // when this launch left an existing worktree alone (cli#516).
+                  env: worktreeCreated
+                    ? { ...process.env, TPS_WORKTREE_PENDING: resolvePathMod(config.workspace) }
+                    : process.env,
+                },
               );
             } finally {
               // Remove ONLY a worktree this launch created (cli#516): an

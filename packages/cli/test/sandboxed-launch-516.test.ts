@@ -2,17 +2,19 @@
  * cli#516 — sandboxed agent launch.
  *
  *   (1) the attested re-exec keeps `--config`: `tps agent start --config <file>`
- *       loads the file it names, resolved to one absolute path, when nono is
- *       installed (the re-exec used to drop the flag and run the default config
- *       instead);
- *   (2) worktree setup/cleanup runs where it can write the base repository: the
- *       parent, before entering the sandbox and after leaving it (a sandboxed
- *       child is not granted write to the base repo's worktree metadata, so its
- *       hooked setup could not create the worktree), and only a worktree this
- *       launch created is removed;
+ *       loads the file it names, resolved to one absolute path, when a
+ *       supported, loadable nono is in play (the re-exec used to drop the flag
+ *       and run the default config instead);
+ *   (2) for a selected runtime and a workspace whose base repository is found,
+ *       the parent creates the worktree outside the sandbox with the checkout
+ *       suppressed, so no repository-configured executable runs there, and the
+ *       sandboxed child checks the worktree out inside the sandbox. A base
+ *       repository that is merely absent is an explicit no-op, and only a
+ *       worktree this launch created is removed;
  *   (3) the sandbox-flag scan reads the arguments before a wrapped payload: a
  *       `--sandbox <word>` or `--sandboxed` inside a message or a wrapped
- *       command is not a flag, while tps's own such flag is still refused.
+ *       command is not a flag, while an invalid `--sandbox` value tps owns, or
+ *       an unattested `--sandboxed` tps owns, is still refused.
  *
  * The launcher cases spawn the built binary with piped stdio (a non-TTY context)
  * against a fake nono that logs its argv. The real-nono case skips where no nono
@@ -251,7 +253,7 @@ describe("cli#516 (1) — the attested re-exec keeps --config", () => {
 // named error (a workspace with no base repository is a no-op, not a failure)
 // ---------------------------------------------------------------------------
 
-describe("cli#516 (2) — worktree setup reaches the base repository", () => {
+describe("cli#516 (2) — parent-side worktree setup runs no repository-configured code", () => {
   test("the managed worktree exists before the sandbox is entered", () => {
     const sb = makeSandbox();
     try {
@@ -377,6 +379,68 @@ describe("cli#516 (2) — worktree setup reaches the base repository", () => {
     }
   });
 
+  test("a smudge filter and an fsmonitor hook from the base repository do not run during parent-side setup", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+      g(["init", "-q"]);
+      g(["config", "user.email", "agent-a@tps.dev"]);
+      g(["config", "user.name", "agent-a"]);
+      // The base repository's LOCAL config is the one the parent's clean
+      // environment keeps: a smudge filter selected by `.gitattributes`, and an
+      // fsmonitor hook. Each writes a marker when it runs.
+      const smudgeMarker = join(sb.root, "smudge-ran");
+      const fsmonitorMarker = join(sb.root, "fsmonitor-ran");
+      const smudge = join(sb.root, "smudge.sh");
+      writeFileSync(smudge, `#!/bin/sh\ntouch "${smudgeMarker}"\ncat\n`);
+      chmodSync(smudge, 0o755);
+      const fsmonitor = join(sb.root, "fsmonitor.sh");
+      writeFileSync(fsmonitor, `#!/bin/sh\ntouch "${fsmonitorMarker}"\necho\nexit 0\n`);
+      chmodSync(fsmonitor, 0o755);
+      g(["config", "filter.marker.smudge", smudge]);
+      g(["config", "core.fsmonitor", fsmonitor]);
+      writeFileSync(join(base, ".gitattributes"), "* filter=marker\n");
+      writeFileSync(join(base, "README.md"), "# base\n");
+      g(["add", "-A"]);
+      g(["commit", "-qm", "init"]);
+      rmSync(sb.ws, { recursive: true, force: true });
+      // The base repository's own git commands above had their chance to run the
+      // two hooks; clear the markers so only the launch is measured.
+      rmSync(smudgeMarker, { force: true });
+      rmSync(fsmonitorMarker, { force: true });
+
+      installFakeNono(
+        sb,
+        `  if [ -e "\${WORKTREE_WS:?}/README.md" ]; then echo "WORKTREE_CHECKED_OUT=yes" >> "\${NONO_ARGV_LOG:?}"; else echo "WORKTREE_CHECKED_OUT=no" >> "\${NONO_ARGV_LOG:?}"; fi`,
+      );
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+      );
+
+      runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb, { WORKTREE_WS: sb.ws }) },
+      );
+
+      const log = existsSync(join(sb.root, "nono.log"))
+        ? readFileSync(join(sb.root, "nono.log"), "utf-8")
+        : "";
+      // The parent registered the worktree but left it UNCHECKED OUT, so the
+      // checkout (and with it any filter or hook) is still to come, inside the
+      // sandbox…
+      expect(log).toContain("WORKTREE_CHECKED_OUT=no");
+      // …and neither marker-writing executable ran in the parent.
+      expect(existsSync(smudgeMarker)).toBe(false);
+      expect(existsSync(fsmonitorMarker)).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
   test("an existing worktree survives the launch", () => {
     const sb = makeSandbox();
     try {
@@ -409,6 +473,80 @@ describe("cli#516 (2) — worktree setup reaches the base repository", () => {
       expect(readFileSync(join(sb.ws, "README.md"), "utf-8")).toBe("# base\n");
       const listed = g(["worktree", "list", "--porcelain"]).stdout;
       expect(listed).toContain(sb.ws);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed probe of an existing base repository stops the launch, and nono never starts", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+      g(["init", "-q"]);
+      g(["config", "user.email", "agent-a@tps.dev"]);
+      g(["config", "user.name", "agent-a"]);
+      writeFileSync(join(base, "README.md"), "# base\n");
+      g(["add", "README.md"]);
+      g(["commit", "-qm", "init"]);
+      rmSync(sb.ws, { recursive: true, force: true });
+      // The repository exists, but its local config is unparseable, so every
+      // probe of it FAILS. A failed probe of an existing repository is not
+      // "no base repository". (This fails for any uid, root included.)
+      writeFileSync(join(base, ".git", "config"), "this is not a git config\n");
+
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+      );
+
+      const r = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb) },
+      );
+
+      expect(output(r)).toContain("git probe failed");
+      // The failure is reported instead of proceeding, and nono never starts.
+      expect(fakeNonoRuns(sb.root)).toEqual([]);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("the cleanup probe applies the same rule: a broken base repository throws", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+      g(["init", "-q"]);
+      g(["config", "user.email", "agent-a@tps.dev"]);
+      g(["config", "user.name", "agent-a"]);
+      writeFileSync(join(base, "README.md"), "# base\n");
+      g(["add", "README.md"]);
+      g(["commit", "-qm", "init"]);
+      rmSync(sb.ws, { recursive: true, force: true });
+
+      // The parent creates the worktree and the launch proceeds; the base
+      // repository's local config is broken while the sandbox is up, so
+      // cleanup meets a FAILED probe of an existing repository, not an absent
+      // one. (This fails for any uid, root included.)
+      installFakeNono(sb, `  printf 'this is not a git config\\n' > "\${BASE_REPO:?}/.git/config"`);
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+      );
+
+      const r = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb, { BASE_REPO: base }) },
+      );
+
+      expect(output(r)).toContain("git probe failed");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -561,6 +699,15 @@ function seedRealNonoProfiles(home: string): void {
       workdir: { access: "readwrite" },
     }),
   );
+  writeFileSync(
+    join(profileDir, "tps-agent-run-codex.json"),
+    JSON.stringify({
+      $schema: "https://nono.sh/schemas/nono-profile.schema.json",
+      extends: "tps-base-fixture",
+      meta: { name: "tps-agent-run-codex" },
+      workdir: { access: "readwrite" },
+    }),
+  );
 }
 
 /** Read a file, reporting absence with false rather than a stat-then-read pair. */
@@ -584,11 +731,11 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 }
 
 /**
- * A sandboxed child is not granted write to the base repository's worktree
- * metadata, so it cannot run `git worktree` against it (the old silent no-op);
- * the config handoff is observed end to end here. Runs only where a real nono
- * >= the floor is reachable by an absolute path (the CI Docker `attested`
- * lane); the unit lane skips with a stated reason.
+ * The child's deferred checkout and the config handoff are observed end to end
+ * here, against a real nono: the parent creates the worktree with the checkout
+ * suppressed, and the sandboxed child performs the checkout. Runs only where a
+ * real nono >= the floor is reachable by an absolute path (the CI Docker
+ * `attested` lane); the unit lane skips with a stated reason.
  */
 const realNonoSuite = realNono ? describe : describe.skip;
 realNonoSuite(
@@ -711,6 +858,60 @@ realNonoSuite(
         expect(loaded).toBe(true);
         // The child did NOT fall back to the default config's workspace.
         expect(canRead(join(wsDefault, ".tps-agent.pid"))).toBe(false);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    }, 60_000);
+
+    test("the sandboxed child checks the worktree out inside the sandbox", async () => {
+      const sb = makeSandbox();
+      try {
+        const base = join(sb.home, "ops", "tps");
+        mkdirSync(base, { recursive: true });
+        const g = (args: string[], cwd = base) =>
+          spawnSync("git", args, { cwd, encoding: "utf-8" });
+        g(["init", "-q"]);
+        g(["config", "user.email", "agent-a@tps.dev"]);
+        g(["config", "user.name", "agent-a"]);
+        writeFileSync(join(base, "checked-out.txt"), "from the base repository\n");
+        g(["add", "-A"]);
+        g(["commit", "-qm", "init"]);
+        rmSync(sb.ws, { recursive: true, force: true });
+
+        seedRealNonoProfiles(sb.home);
+        const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        writeFileSync(cfg, agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"));
+
+        const child = spawn(
+          NODE,
+          [TPS_BIN, "agent", "start", "--config", cfg, "--runtime", "codex", SANDBOX_REQUIRED],
+          {
+            cwd: sb.run,
+            env: {
+              ...process.env,
+              HOME: sb.home,
+              [NONO_BIN_ENV]: realNono as string,
+              XDG_STATE_HOME: join(sb.root, "nono-state"),
+              TPS_LAUNCH_TIMEOUT_MS: "20000",
+            },
+          },
+        );
+        let out = "";
+        child.stdout?.on("data", (d: Buffer) => {
+          out += d.toString();
+        });
+        child.stderr?.on("data", (d: Buffer) => {
+          out += d.toString();
+        });
+        const checkedOut = await waitFor(() => out.includes("worktree checked out"), 45_000);
+        child.kill("SIGTERM");
+        await new Promise((r) => setTimeout(r, 500));
+        child.kill("SIGKILL");
+
+        // The checkout writes the working tree; its success line means it ran
+        // inside the sandbox and produced the files. The parent created the
+        // worktree unchecked out, so nothing else could have.
+        expect(checkedOut).toBe(true);
       } finally {
         rmSync(sb.root, { recursive: true, force: true });
       }
