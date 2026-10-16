@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
 import { type DeliverNextResult, type MailDelivery, MailClient } from "../src/io/mail.js";
 import { AgentRuntime } from "../src/runtime/agent.js";
+import { MemoryStore } from "../src/io/memory.js";
 import { ProviderManager } from "../src/llm/provider.js";
 import { FlairContextProvider } from "../src/io/flair.js";
 import { EventLoop, type MailDeliverySource } from "../src/runtime/event-loop.js";
@@ -372,7 +373,7 @@ for (const operation of ["completeDelivery", "releaseDelivery"] as const) {
     }
   }, 15_000);
 
-  test(`${operation} quarantines an overdue deferred claim before later mail`, async () => {
+  test(`${operation} quarantines an overdue deferred claim once the mailbox lock and storage are available`, async () => {
     plant("m1.json", "overdue");
     plant("m2.json", "later");
     const c = client();
@@ -418,6 +419,69 @@ for (const operation of ["completeDelivery", "releaseDelivery"] as const) {
 }
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  test(`AgentRuntime.start releases after memory writes fail during ${signal} before removing its PID file`, async () => {
+    plant("m1.json", "memory-failure");
+    plant("m2.json", "later");
+    let enter!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    let finish!: () => void;
+    const finishing = new Promise<void>((resolve) => { finish = resolve; });
+    const lookup = spyOn(FlairContextProvider.prototype, "getAgent").mockImplementation(async () => ({ publicKey: Buffer.from(ed.getPublicKey(SEED)).toString("base64") }) as never);
+    const provider = spyOn(ProviderManager.prototype, "complete").mockImplementation(async () => {
+      enter(); await finishing;
+      return completingProvider.complete();
+    });
+    const memoryPath = join(workspace, "memory.jsonl");
+    const pidPath = join(workspace, ".tps-agent.pid");
+    const runtime = new AgentRuntime({
+      agentId: AGENT, name: "memory-failure-test", mailDir, workspace, memoryPath,
+      llm: { provider: "openai", model: "test", apiKey: "test" },
+    });
+    const append = MemoryStore.prototype.append;
+    const failedWrites: string[] = [];
+    const memorySpy = spyOn(MemoryStore.prototype, "append").mockImplementation(function(event) {
+      try { return append.call(this, event); }
+      catch (error) { failedWrites.push(event.type); throw error; }
+    });
+    const errorLog = spyOn(console, "error").mockImplementation(() => {});
+    let released = false;
+    const release = MailClient.prototype.releaseDelivery;
+    const settlementSpy = spyOn(MailClient.prototype, "releaseDelivery").mockImplementation(function(delivery) {
+      expect(existsSync(pidPath)).toBe(true);
+      expect(intentJson("m1.json").claim).toBeDefined();
+      const result = release.call(this, delivery);
+      expect(result.status).toBe("released");
+      expect(intentJson("m1.json").claim).toBeUndefined();
+      released = true;
+      return result;
+    });
+    const start = runtime.start();
+    void start.catch(() => {});
+    try {
+      await entered;
+      expect(intentJson("m1.json").claim).toBeDefined();
+      expect(existsSync(memoryPath)).toBe(true);
+      renameSync(memoryPath, `${memoryPath}.saved`);
+      mkdirSync(memoryPath);
+      process.emit(signal);
+      expect(existsSync(pidPath)).toBe(true);
+      finish();
+      await start;
+      expect(failedWrites).toEqual(["assistant", "error"]);
+      expect(errorLog).toHaveBeenCalledWith("Failed to record event-loop error:", expect.any(String));
+      expect(released).toBe(true);
+      expect(existsSync(pidPath)).toBe(false);
+      expect(intentJson("m1.json").claim).toBeUndefined();
+      expect(newFiles()).toEqual(["m2.json"]);
+    } finally {
+      finish();
+      await runtime.stop();
+      await start.catch(() => {});
+      settlementSpy.mockRestore(); memorySpy.mockRestore(); errorLog.mockRestore();
+      provider.mockRestore(); lookup.mockRestore();
+    }
+  }, 15_000);
+
   for (const completed of [true, false]) {
     test(`AgentRuntime.start drains ${completed ? "finalize" : "release"} after ${signal} before removing its PID file`, async () => {
       plant("m1.json", "in-flight");

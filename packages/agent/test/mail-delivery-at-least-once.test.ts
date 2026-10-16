@@ -1093,7 +1093,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
     expect(idOf(next)).toBe("healthy");
   });
 
-  test("a held local token blocks another delivery until settlement quarantines it at the deadline", async () => {
+  test("a held local token blocks another delivery until completion quarantines the overdue claim", async () => {
     plant("m1.json", "slow-but-live");
     const c = client();
     const m = delivered(await c.deliverNext());

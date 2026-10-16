@@ -169,10 +169,10 @@ export class EventLoop {
           completed = await this.processMail(delivery.message);
         } catch (err: any) {
           await this.recordError(err);
+        } finally {
+          await this.settleDelivery(source, delivery, completed);
+          this.state = this.running ? "idle" : "stopped";
         }
-
-        await this.settleDelivery(source, delivery, completed);
-        this.state = this.running ? "idle" : "stopped";
       }
     } finally {
       this.deps.events?.emit({
@@ -213,11 +213,15 @@ export class EventLoop {
   }
 
   private async recordError(err: unknown): Promise<void> {
-    await this.deps.memory.append({
-      type: "error",
-      ts: new Date().toISOString(),
-      data: String((err as { message?: unknown } | undefined)?.message ?? err),
-    });
+    try {
+      await this.deps.memory.append({
+        type: "error",
+        ts: new Date().toISOString(),
+        data: String((err as { message?: unknown } | undefined)?.message ?? err),
+      });
+    } catch (reportingError) {
+      console.error("Failed to record event-loop error:", sanitizeError(reportingError));
+    }
   }
 
   getState(): AgentState {
