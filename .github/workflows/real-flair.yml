@@ -12,6 +12,7 @@ on:
       - 'packages/cli/test/agent-create-registration.test.ts'
       - 'packages/cli/test/mail-flair-read-auth.test.ts'
       - 'packages/cli/test/presence-flair-contract.test.ts'
+      - 'packages/cli/test/review-trigger-flair.test.ts'
       - 'packages/cli/test/helpers/**'
       - 'packages/cli/bunfig.toml'
       - 'packages/cli/package.json'

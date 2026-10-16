@@ -24,6 +24,9 @@ export const EXPECTED_CASES: Record<string, string[]> = {
     "real Flair serves a capped task to a signed reader",
     "real Flair rejects an invalid Bearer token on GET /Presence",
   ],
+  "review-trigger-flair.test.ts": [
+    "real Flair stamps a signed non-admin POST and the review loop skips its claimed agent attribution",
+  ],
   "real-flair-lane.test.ts": [
     "test files referencing the real-Flair flag are named by the lane and covered by workflow paths",
   ],
