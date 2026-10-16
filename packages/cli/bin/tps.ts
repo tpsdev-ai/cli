@@ -571,7 +571,7 @@ async function main() {
                 systemPrompt: typeof agentCfg.systemPrompt === "string" ? agentCfg.systemPrompt : undefined,
                 workspaceProvider,
                 autoCommit: agentCfg.autoCommit,
-                reviewTrigger: parseReviewTriggerConfig(agentCfg.reviewTrigger),
+                reviewTrigger: parseReviewTriggerConfig(agentCfg),
               });
             } else if (runtimeArg === "gemini") {
               const { runGeminiRuntime } = await import("../src/utils/gemini-runtime.js");

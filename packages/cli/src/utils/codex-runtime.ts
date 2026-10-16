@@ -563,11 +563,7 @@ export async function runAutoCommit(
   throw new Error(`tps agent commit failed: ${errMsg}`);
 }
 
-/**
- * @internal Legacy inline auto-commit for the mail loop. Wraps runAutoCommit and
- * returns the PR URL when a PR was created, else null — the caller publishes
- * `pr.opened` only for a real PR URL.
- */
+/** @internal Legacy auto-commit wrapper. */
 async function _runAutoCommitLegacy(
   agentId: string,
   workspace: string,
@@ -712,6 +708,22 @@ export function shutdownHandler(
   };
 }
 
+async function publishPrResult(
+  flair: FlairClient,
+  agentId: string,
+  taskId: string,
+  prUrl: string | null,
+): Promise<void> {
+  if (!prUrl) return;
+  try {
+    await flair.request("POST", "/OrgEvent", {
+      kind: "pr.opened", authorId: agentId,
+      summary: `PR opened for ${taskId}`, refId: taskId,
+      detail: prUrl,
+    });
+  } catch { /* non-fatal */ }
+}
+
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
   const { agentId, workspace, flairUrl, flairKeyPath, workspaceProvider } = config;
   writeFileSync(join(workspace, ".tps-agent.pid"), `${process.pid}\n`, "utf-8");
@@ -827,18 +839,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        // Publish pr.opened only once the PR exists, carrying its URL: the review
-        // handler reads /pull/<number> from the detail.
         const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
-        if (prUrl) {
-          try {
-            await (flair as any).request("POST", "/OrgEvent", {
-              kind: "pr.opened", authorId: agentId,
-              summary: `PR opened for ${taskId}`, refId: taskId,
-              detail: prUrl,
-            });
-          } catch { /* non-fatal */ }
-        }
+        await publishPrResult(flair, agentId, taskId, prUrl);
       }
     } catch (e) {
       const err = e as Error;
@@ -954,7 +956,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             );
           } else {
             const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-            await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+            const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+            await publishPrResult(flair, agentId, msg.id, prUrl);
           }
         }
       } catch (err: any) {

@@ -36,21 +36,20 @@ export class InvalidReviewTriggerConfigError extends Error {
 }
 
 /**
- * Validate an agent's raw `reviewTrigger` config and reduce it to the loop's
- * `{ reviewers, repo }`. Returns undefined when the key is absent, and refuses
- * (throws) a value that is present but malformed. `agentId` is the runtime's
- * own, not config.
+ * Validate an agent's `reviewTrigger` property. An absent key disables the loop;
+ * invalid values throw.
  */
-export function parseReviewTriggerConfig(raw: unknown): { reviewers: string[]; repo: string } | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== "object" || Array.isArray(raw)) {
+export function parseReviewTriggerConfig(config: { reviewTrigger?: unknown }): { reviewers: string[]; repo: string } | undefined {
+  if (!Object.hasOwn(config, "reviewTrigger")) return undefined;
+  const raw = config.reviewTrigger;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new InvalidReviewTriggerConfigError("it must be a mapping with `reviewers` and `repo`");
   }
   const { reviewers, repo } = raw as { reviewers?: unknown; repo?: unknown };
-  if (!Array.isArray(reviewers) || reviewers.length === 0 || !reviewers.every((r) => typeof r === "string" && r.length > 0)) {
+  if (!Array.isArray(reviewers) || reviewers.length === 0 || !reviewers.every((r) => typeof r === "string" && r.trim().length > 0)) {
     throw new InvalidReviewTriggerConfigError("`reviewers` must be a non-empty list of GitHub usernames");
   }
-  if (typeof repo !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+  if (typeof repo !== "string" || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
     throw new InvalidReviewTriggerConfigError("`repo` must be an owner/name string");
   }
   return { reviewers, repo };

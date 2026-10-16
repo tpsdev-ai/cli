@@ -4,13 +4,6 @@
  * event addressed to that agent to. Flair refuses a non-admin agent's read of
  * `<agentId>-review-trigger` with 403.
  *
- * cli#644 — the loop runs end to end on the events the runtime itself produces:
- * an agent config's `reviewTrigger` (validated by `parseReviewTriggerConfig`, as
- * the launcher passes it) starts the loop, and the `pr.opened` event the runtime
- * publishes after a successful PR carries its URL in `detail`. A failed review
- * request fails the handler, so the cursor stays before the event and the loop
- * retries it.
- *
  * The catch-up route is `orgEventCatchupRoute`, the shared signed stub modelled
  * on Flair's coded catch-up contract; it refuses a non-admin read of another
  * participant's feed with 403, so a non-admin agent gets nothing from a foreign feed.
@@ -19,15 +12,14 @@
  * fakes the `gh-as` process call too (`spawnSyncImpl`).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
-import { load as parseYaml } from "js-yaml";
 import { SnoopLogg } from "snooplogg";
 import { createFlairClient } from "../src/utils/flair-client.js";
 import { InvalidLoopIdError } from "../src/utils/flair-task-loop.js";
-import { parseReviewTriggerConfig, startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
+import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import {
   type CatchupFeed,
   type CatchupRoute,
@@ -213,36 +205,4 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     }
   });
 
-  test("a real agent.yaml reviewTrigger starts the loop and requests its configured reviewers", async () => {
-    const cfgPath = join(home, "agent.yaml");
-    writeFileSync(cfgPath, [
-      "agentId: agent-a",
-      "reviewTrigger:",
-      "  reviewers: [reviewer-1, reviewer-2]",
-      "  repo: example/repo",
-      "",
-    ].join("\n"));
-    const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as { reviewTrigger?: unknown };
-    const reviewTrigger = parseReviewTriggerConfig(agentCfg.reviewTrigger);
-    expect(reviewTrigger).toEqual({ reviewers: ["reviewer-1", "reviewer-2"], repo: REPO });
-
-    serve({ events: [prOpened("e1", 5)] });
-    const ghCalls: Array<{ args: string[]; input?: string }> = [];
-    const deps = {
-      spawnSyncImpl: ((_cmd: string, args: string[], opts?: { input?: string }) => {
-        ghCalls.push({ args, input: opts?.input });
-        return { status: 0, stdout: "", stderr: "" };
-      }) as any,
-    };
-    const loop = startReviewTriggerLoop(client(), AGENT, reviewTrigger!, { ...LOOP_OPTS, deps });
-    try {
-      expect(await waitFor(() => ghCalls.length === 1)).toBe(true);
-    } finally {
-      await loop.stop();
-    }
-    expect(ghCalls[0]?.args).toEqual([
-      AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/1/requested_reviewers`, "--input", "-",
-    ]);
-    expect(ghCalls[0]?.input).toBe(JSON.stringify({ reviewers: ["reviewer-1", "reviewer-2"] }));
-  });
 });

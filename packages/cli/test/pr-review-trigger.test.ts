@@ -124,7 +124,7 @@ describe("parseReviewTriggerConfig", () => {
       ].join("\n"));
       const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as { reviewTrigger?: unknown };
 
-      expect(parseReviewTriggerConfig(agentCfg.reviewTrigger)).toEqual({
+      expect(parseReviewTriggerConfig(agentCfg)).toEqual({
         reviewers: ["reviewer-1", "reviewer-2"],
         repo: "example/repo",
       });
@@ -134,13 +134,23 @@ describe("parseReviewTriggerConfig", () => {
   });
 
   test("returns undefined when the config has no reviewTrigger", () => {
-    expect(parseReviewTriggerConfig(undefined)).toBeUndefined();
-    expect(parseReviewTriggerConfig(null)).toBeUndefined();
+    expect(parseReviewTriggerConfig({})).toBeUndefined();
   });
 
-  test("refuses a malformed reviewTrigger instead of starting a loop", () => {
-    expect(() => parseReviewTriggerConfig("reviewer-1")).toThrow(InvalidReviewTriggerConfigError);
-    expect(() => parseReviewTriggerConfig({ reviewers: [], repo: "example/repo" })).toThrow(/non-empty list/);
-    expect(() => parseReviewTriggerConfig({ reviewers: ["reviewer-1"], repo: "not-a-repo" })).toThrow(/owner\/name/);
+  test.each([
+    undefined,
+    null,
+    { reviewers: [null], repo: "example/repo" },
+    { reviewers: [""], repo: "example/repo" },
+    { reviewers: ["   "], repo: "example/repo" },
+    ...["owner/repo?x", "owner/repo#x", "https://owner/repo", "owner/repo/extra", "owner:port/repo", "owner/repo@x", "owner/repo x"].map((repo) => ({ reviewers: ["reviewer-1"], repo })),
+  ])("refuses invalid value %j with the named error", (raw) => {
+    expect(() => parseReviewTriggerConfig({ reviewTrigger: raw })).toThrow(InvalidReviewTriggerConfigError);
+  });
+
+  test("refuses a malformed reviewTrigger", () => {
+    expect(() => parseReviewTriggerConfig({ reviewTrigger: "reviewer-1" })).toThrow(InvalidReviewTriggerConfigError);
+    expect(() => parseReviewTriggerConfig({ reviewTrigger: { reviewers: [], repo: "example/repo" } })).toThrow(/non-empty list/);
+    expect(() => parseReviewTriggerConfig({ reviewTrigger: { reviewers: ["reviewer-1"], repo: "not-a-repo" } })).toThrow(/owner\/name/);
   });
 });
