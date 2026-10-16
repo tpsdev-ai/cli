@@ -109,9 +109,10 @@ export type DeliveryCompletion =
   | { status: "already-completed" }
   | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string }
   /**
-   * Not this hand-over's to finalize: the persisted intent is left unfinalized,
-   * and the client's local token is released (its issued state becomes
-   * `released`). `foreign`: not a
+   * Not this hand-over's to finalize: a refusal finalizes no intent (one may
+   * already be absent). Only a locally issued `stale` or `identity` refusal
+   * releases the client's local token (its issued state becomes `released`);
+   * a `foreign` refusal changes no local state. `foreign`: not a
    * delivery this MailClient issued. `stale`: no matching live intent and claim
    * in the currently resolved mailbox. `identity`:
    * recorded cur/ identity is absent or mismatched.
