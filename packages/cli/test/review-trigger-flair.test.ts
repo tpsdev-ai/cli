@@ -6,18 +6,19 @@ import { join } from "node:path";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { taskLoopCursorPath } from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
+import { flairTarget } from "./helpers/scratch-flair.js";
 import { pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair stamps a signed non-admin POST and the review loop skips its claimed agent attribution", async () => {
-  const baseUrl = "http://127.0.0.1:9926";
+  const { baseUrl, opsUrl, admin } = flairTarget();
   const root = mkdtempSync(join(tmpdir(), "review-flair-"));
   const savedHome = process.env.HOME;
   process.env.HOME = root;
   const agent = `review-${randomUUID()}`;
   const foreign = `foreign-${randomUUID()}`;
   const seeds = new Map([[agent, Buffer.alloc(32, 0x31)], [foreign, Buffer.alloc(32, 0x32)]]);
-  const headers = { Authorization: `Basic ${Buffer.from("admin:test123").toString("base64")}`, "Content-Type": "application/json" };
-  const operation = (body: unknown) => fetch("http://127.0.0.1:9925", { method: "POST", headers, body: JSON.stringify(body) });
+  const headers = { Authorization: `Basic ${Buffer.from(admin).toString("base64")}`, "Content-Type": "application/json" };
+  const operation = (body: unknown) => fetch(opsUrl, { method: "POST", headers, body: JSON.stringify(body) });
   const forgedId = `forged-${randomUUID()}`;
   const goodId = `good-${randomUUID()}`;
   let loop: ReturnType<typeof startReviewTriggerLoop> | undefined;
