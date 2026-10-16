@@ -557,13 +557,15 @@ async function main() {
             }
 
             // cli#516 — worktree setup/cleanup belongs to the process that can
-            // reach the base repository. This sandboxed child cannot, so the
-            // parent (the launcher that re-execs it) runs the hooks instead and
-            // this process must not silently no-op them a second time.
+            // write the base repository. This sandboxed child is not granted
+            // that write, so the parent (the launcher that re-execs it) runs the
+            // hooks instead and this process must not silently no-op them again.
             const manageWorktree = !sandboxed;
             const { onStart, onStop } = await import("../src/utils/agent-lifecycle.js");
+            let worktreeCreated = false;
             if (manageWorktree) {
               const startResult = onStart(agentId!, agentWorkspace);
+              worktreeCreated = startResult.changed;
               if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
             }
 
@@ -627,7 +629,7 @@ async function main() {
               });
             }
             } finally {
-              if (manageWorktree) {
+              if (worktreeCreated) {
                 const stopResult = onStop(agentId!, agentWorkspace);
                 if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
               }

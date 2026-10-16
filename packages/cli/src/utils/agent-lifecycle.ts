@@ -238,8 +238,22 @@ export class WorktreeLifecycleError extends Error {
   }
 }
 
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith("GIT_")) env[key] = value;
+  }
+  // No inherited GIT_* variables, no system or global config: the base
+  // repository's own config is the only one in play, and worktree add overrides
+  // the hook path explicitly below.
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
+}
+
 function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
-  const out = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  const out = spawnSync("git", args, { cwd, encoding: "utf-8", env: gitEnv() });
   return {
     ok: out.status === 0,
     stdout: (out.stdout ?? "").trim(),
@@ -278,6 +292,12 @@ function resolveBaseRepo(workspacePath: string): string | null {
   return null;
 }
 
+/**
+ * Create the agent's worktree when the workspace is a worktree of a base
+ * repository. A workspace with no base repository is left untouched and
+ * reported as changed:false; only a failed git operation throws (a
+ * WorktreeLifecycleError naming the operation).
+ */
 export function onStart(agentId: string, workspacePath?: string): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
@@ -302,7 +322,11 @@ export function onStart(agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  const add = git(baseRepo, ["worktree", "add", workspace, "--detach"]);
+  // The parent runs this BEFORE entering nono (cli#516), so it must not execute
+  // repository-controlled code: `git worktree add` runs `post-checkout`, so the
+  // hook path is overridden to /dev/null (with gitEnv()'s clean environment),
+  // which suppresses every hook for this checkout.
+  const add = git(baseRepo, ["-c", "core.hooksPath=/dev/null", "worktree", "add", workspace, "--detach"]);
   if (!add.ok) {
     throw new WorktreeLifecycleError(
       `worktree setup failed for ${agentId} (${baseRepo} -> ${workspace}): ${add.stderr || add.stdout}`,

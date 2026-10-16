@@ -1005,6 +1005,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         console.error("   or: tps agent run --config <path> --message <text>");
         process.exit(1);
       }
+      // cli#516 — resolve to ONE absolute file path BEFORE any read, so the
+      // path this process loads, the read grant it derives, and the path the
+      // re-exec child re-reads are the same file even for a relative `--config`.
+      configPath = resolvePathMod(configPath);
       if (!existsSync(configPath)) {
         console.error(`Config not found: ${configPath}`);
         console.error(`Run 'tps agent create --id ${args.id ?? "<id>"}' first.`);
@@ -1166,13 +1170,14 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             // Worktree setup/cleanup runs HERE, outside the sandbox (cli#516):
-            // the sandboxed child cannot reach the base repository's metadata,
-            // so its hooked setup quietly did nothing under a real nono. The
-            // parent can reach the base repo; the child skips the hooks.
+            // the sandboxed child is not granted write to the base repository's
+            // worktree metadata, so its hooked setup could not create the
+            // worktree under a real nono. The parent can; the child skips them.
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            let worktreeCreated = false;
             if (selectedRuntime) {
               try {
-                onStart(launchId, config.workspace);
+                worktreeCreated = onStart(launchId, config.workspace).changed;
               } catch (err) {
                 console.error(`❌ ${(err as Error).message}`);
                 process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
@@ -1187,7 +1192,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 { runtimeDirectories: approval.runtimeDirectories },
               );
             } finally {
-              if (selectedRuntime) {
+              // Remove ONLY a worktree this launch created (cli#516): an
+              // existing worktree, or a workspace that is not one, survives.
+              if (worktreeCreated) {
                 try {
                   onStop(launchId, config.workspace);
                 } catch (err) {
