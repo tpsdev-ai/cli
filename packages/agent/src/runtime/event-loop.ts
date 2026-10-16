@@ -220,7 +220,9 @@ export class EventLoop {
         data: String((err as { message?: unknown } | undefined)?.message ?? err),
       });
     } catch (reportingError) {
-      console.error("Failed to record event-loop error:", sanitizeError(reportingError));
+      // The durable record failed, so the fallback line carries the error too —
+      // a settlement refusal's reason must not disappear with the append.
+      console.error(`Failed to record event-loop error (${sanitizeError(err)}):`, sanitizeError(reportingError));
     }
   }
 

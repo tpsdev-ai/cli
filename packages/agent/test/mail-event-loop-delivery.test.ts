@@ -552,7 +552,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
       finish();
       await start;
       expect(failedWrites).toEqual(["assistant", "error"]);
-      expect(errorLog).toHaveBeenCalledWith("Failed to record event-loop error:", expect.any(String));
+      expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("Failed to record event-loop error"), expect.any(String));
       expect(released).toBe(true);
       expect(existsSync(pidPath)).toBe(false);
       expect(intentJson("m1.json").claim).toBeUndefined();
@@ -629,3 +629,57 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     }, 15_000);
   }
 }
+
+test("a settlement refusal whose durable record fails still logs the refusal reason", async () => {
+  plant("m1.json", "identity-refusal");
+  const c = client();
+  const memoryPath = join(workspace, "memory.jsonl");
+  const memory = new MemoryStore(memoryPath);
+  const config = {
+    agentId: AGENT, name: "refusal-log", mailDir, memoryPath, workspace,
+    llm: { provider: "test", model: "test-model" }, contextWindowTokens: 8000, maxToolTurns: 50,
+  };
+  const provider = {
+    async complete() {
+      // Break the committed cur/ record's identity so the settlement is refused.
+      writeFileSync(cur("m1.json"), `${readFileSync(cur("m1.json"), "utf8")} `);
+      return completingProvider.complete();
+    },
+  };
+  const loop = new EventLoop({
+    config: config as never,
+    memory,
+    context: {} as never,
+    provider: provider as never,
+    tools: { list: () => [], execute: async () => ({ content: "ok" }) } as never,
+  }, 1);
+  const errorLog = spyOn(console, "error").mockImplementation(() => {});
+  const complete = c.completeDelivery.bind(c);
+  const settlementSpy = spyOn(c, "completeDelivery").mockImplementation(async (delivery) => {
+    // The real memory file becomes unwritable (a directory) before the refusal is recorded.
+    renameSync(memoryPath, `${memoryPath}.saved`);
+    mkdirSync(memoryPath);
+    const result = await complete(delivery);
+    expect(result).toMatchObject({ status: "refused", reason: "identity" });
+    return result;
+  });
+  const source: MailDeliverySource = {
+    async deliverNext() {
+      const result = await c.deliverNext();
+      if (result.status === "delivered") void loop.stop();
+      return result;
+    },
+    completeDelivery: (delivery) => c.completeDelivery(delivery),
+    releaseDelivery: (delivery) => c.releaseDelivery(delivery),
+  };
+  try {
+    await loop.runDeliveries(source);
+    const refusal = errorLog.mock.calls.find((call) => String(call[0]).includes("delivery settlement refused: identity"));
+    expect(refusal).toBeDefined();
+    expect(String(refusal?.[1]).length).toBeGreaterThan(0);
+    expect(intentPhase("m1.json")).toBe("in_progress");
+  } finally {
+    settlementSpy.mockRestore();
+    errorLog.mockRestore();
+  }
+}, 15_000);

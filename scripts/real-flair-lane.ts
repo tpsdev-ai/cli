@@ -27,6 +27,10 @@ export const EXPECTED_CASES: Record<string, string[]> = {
   "review-trigger-flair.test.ts": [
     "real Flair stamps a signed non-admin POST and the review loop skips its claimed agent attribution",
   ],
+  "runtime-flair-verify.test.ts": [
+    "real Flair verifies and handles a signed delivery through the runtime's Agent read",
+    "a refused Agent read leaves the runtime's mail uncommitted",
+  ],
   "real-flair-lane.test.ts": [
     "test files referencing the real-Flair flag are named by the lane and covered by workflow paths",
   ],
