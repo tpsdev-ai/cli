@@ -19,7 +19,7 @@ import { Writable } from "node:stream";
 import { SnoopLogg } from "snooplogg";
 import { createFlairClient } from "../src/utils/flair-client.js";
 import { InvalidLoopIdError } from "../src/utils/flair-task-loop.js";
-import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
+import { REVIEW_TRIGGER_MAX_ATTEMPTS, startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import {
   type CatchupFeed,
   type CatchupRoute,
@@ -30,7 +30,6 @@ import {
 } from "./helpers/stub-flair.js";
 
 const AGENT = "agent-a";
-const AUTHOR = "agent-b";
 const SEED = Buffer.alloc(32, 0x31);
 const REPO = "example/repo";
 
@@ -74,10 +73,11 @@ function cursorPosition(agentId = AGENT): string | undefined {
 
 const client = (agentId = AGENT) => createFlairClient(agentId, stub!.url, keyPath);
 
-/** A pr.opened event `handlePrOpened` can request reviews for. */
-const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT]) => ({
-  id, kind: "pr.opened", authorId: AUTHOR, summary: `PR ${id}`,
-  detail: `https://github.com/${REPO}/pull/1`,
+/** A pr.opened event in the shape of an accepted runtime POST:
+ *  attributed to the agent, `detail` the PR URL `runAutoCommit` returned. */
+const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT], prNumber = 1, authorId = AGENT) => ({
+  id, kind: "pr.opened", authorId, summary: `PR ${id}`,
+  detail: `https://github.com/${REPO}/pull/${prNumber}`,
   createdAt: new Date(Date.now() - minutesAgo * 60_000).toISOString(), targetIds,
 });
 
@@ -129,7 +129,7 @@ const LOOP_OPTS = { pollIntervalMs: 30 };
 describe("cli#631 — the review-trigger loop reads only feeds the agent may read", () => {
   test.each([AGENT, "a".repeat(64)])("agent %s: with the HTTP catch-up endpoint faked and the gh-as process call faked (spawnSyncImpl), it reads the agent's own feed and requests the configured reviewers for a trigger addressed to the agent", async (agentId) => {
     keyPath = writeKeyFile(join(home, ".tps", "identity"), agentId, SEED);
-    const e1 = prOpened("e1", 5, [agentId]);
+    const e1 = prOpened("e1", 5, [agentId], 1, agentId);
     const { route, asked } = serve({ events: [e1] }, agentId);
     const ghCalls: Array<{ cmd: string; args: string[]; input?: string }> = [];
     const deps = {
@@ -179,5 +179,137 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     expect(warnings).toContain("(HTTP 403)");
     // The initial position was saved; the refused read advanced the cursor no further.
     expect(cursorPosition()).toBe(route.afters[0]);
+  });
+
+  test.each([[[] as string[]], [[AGENT]]])(
+    "a pr.opened attributed to another agent, broadcast or addressed to this agent, never reaches the review-request command, and the cursor advances past it",
+    async (targetIds) => {
+      // A foreign author, broadcast or addressed to this agent, is ineligible.
+      const foreign = prOpened("e1", 5, targetIds, 1, "agent-b");
+      const good = prOpened("e2", 4, [AGENT], 2, AGENT);
+      const { route } = serve({ events: [foreign, good] });
+      const ghCalls: Array<{ cmd: string; args: string[]; input?: string }> = [];
+      const deps = {
+        spawnSyncImpl: ((cmd: string, args: string[], opts?: { input?: string }) => {
+          ghCalls.push({ cmd, args, input: opts?.input });
+          return { status: 0, stdout: "", stderr: "" };
+        }) as any,
+      };
+      const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+      try {
+        // The cursor advances over both: the foreign event is skipped, the good one handled.
+        expect(await waitFor(() => cursorPosition() === positionOf(good))).toBe(true);
+        expect(ghCalls).toHaveLength(1);
+      } finally {
+        await loop.stop();
+      }
+      // Only the event attributed to the agent and naming PR #2 reached the command.
+      expect(ghCalls[0]?.args).toEqual([
+        AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/2/requested_reviewers`, "--input", "-",
+      ]);
+      expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));
+    },
+  );
+
+  test("a pr.opened classified terminal is recorded and skipped, and a later good one still gets its review request", async () => {
+    // A branch-only detail is classified terminal by this handler.
+    const bad = { ...prOpened("e1", 5, [AGENT], 1, AGENT), detail: "branch-only" };
+    const good = prOpened("e2", 4, [AGENT], 2, AGENT);
+    const { route } = serve({ events: [bad, good] });
+    const ghCalls: Array<{ args: string[] }> = [];
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, args: string[]) => {
+        ghCalls.push({ args });
+        return { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    try {
+      expect(await waitFor(() => cursorPosition() === positionOf(good))).toBe(true);
+      expect(ghCalls).toHaveLength(1);
+    } finally {
+      await loop.stop();
+    }
+    expect(ghCalls[0]?.args).toEqual([
+      AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/2/requested_reviewers`, "--input", "-",
+    ]);
+    expect(route.served).toEqual(expect.arrayContaining(["e1", "e2"]));
+    expect(warnings).toContain("failure classified terminal");
+  });
+
+  test("a review-request failure outside the terminal classification is retried, and the event is handled when it recovers within the bound", async () => {
+    const e1 = prOpened("e1", 5);
+    const { route } = serve({ events: [e1] });
+    let attempts = 0;
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, _args: string[]) => {
+        attempts++;
+        // The first call fails with a network error; the retry succeeds.
+        return attempts < 2
+          ? { status: 1, stdout: "", stderr: "gh-as: connection reset" }
+          : { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    try {
+      expect(await waitFor(() => cursorPosition() === positionOf(e1))).toBe(true);
+    } finally {
+      await loop.stop();
+    }
+    // Retried once, then handled: the cursor advanced past the event.
+    expect(attempts).toBe(2);
+    expect(route.served).toContain("e1");
+    expect(warnings).toContain("it will be retried");
+  });
+
+  test("a review-request failure outside the terminal classification that keeps failing is skipped after the attempt bound, and a later event is still handled", async () => {
+    const e1 = prOpened("e1", 5, [AGENT], 1, AGENT);
+    const good = prOpened("e2", 4, [AGENT], 2, AGENT);
+    const { route } = serve({ events: [e1, good] });
+    let attempts = 0;
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, args: string[]) => {
+        attempts++;
+        // PR #1 always fails with a network error; PR #2 succeeds.
+        return args[4]?.includes("/pulls/1/")
+          ? { status: 1, stdout: "", stderr: "gh-as: server unavailable" }
+          : { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    try {
+      // The bound is spent on e1, it is skipped, and e2 then gets its request.
+      expect(await waitFor(() => cursorPosition() === positionOf(good))).toBe(true);
+    } finally {
+      await loop.stop();
+    }
+    expect(attempts).toBe(REVIEW_TRIGGER_MAX_ATTEMPTS + 1);
+    expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));
+    expect(warnings).toContain("skipped after the attempt bound");
+  });
+
+  test("a duplicate pr.opened from a retried publish issues the same review-request command again", async () => {
+    // A lost publication response makes the runtime POST the same pr.opened
+    // twice; each copy reaches a review request for the same PR and reviewer.
+    const first = prOpened("e1", 5, [AGENT], 1, AGENT);
+    const duplicate = { ...first, id: "e2" };
+    const { route } = serve({ events: [first, duplicate] });
+    const ghCalls: Array<{ args: string[] }> = [];
+    const deps = {
+      spawnSyncImpl: ((_cmd: string, args: string[]) => {
+        ghCalls.push({ args });
+        return { status: 0, stdout: "", stderr: "" };
+      }) as any,
+    };
+    const loop = startReviewTriggerLoop(client(), AGENT, { reviewers: ["reviewer-1"], repo: REPO }, { ...LOOP_OPTS, deps });
+    try {
+      expect(await waitFor(() => cursorPosition() === positionOf(duplicate))).toBe(true);
+    } finally {
+      await loop.stop();
+    }
+    // Both copies requested the same reviewer on the same PR.
+    expect(ghCalls).toHaveLength(2);
+    expect(ghCalls[1]).toEqual(ghCalls[0]);
+    expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));
   });
 });

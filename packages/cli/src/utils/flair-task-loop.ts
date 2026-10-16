@@ -38,8 +38,9 @@
  * memory, so the saved position stays behind it until a later save succeeds; a
  * restart before that replays the events in between rather than skipping them.
  *
- * SAFETY. The saved position never passes a task before its handler succeeds,
- * provided that once saved, the cursor file is not removed or corrupted; the
+ * SAFETY. The saved position never passes a task before its handler succeeds or
+ * the task is recorded and skipped (BOUNDED RETRIES below), provided that once
+ * saved, the cursor file is not removed or corrupted; the
  * feed only appends (a new event sorts after those already served), with
  * positions within MAX_POSITION_SKEW_MS of the server's time; and an event does
  * not expire before its handler succeeds.
@@ -53,6 +54,14 @@
  * handler returning and the save that follows replays that task, as does a
  * restart after a failed save if it occurs before a later successful save.
  * Handlers must be idempotent.
+ *
+ * BOUNDED RETRIES. Classified terminal failures (`PermanentEventError`) and
+ * other failures that exhaust the caller's `maxAttempts` are recorded and marked
+ * handled; the cursor advances past them
+ * subject to the existing skew and persistence rules. Within a running loop
+ * whose handler attempts return, no event holds the cursor beyond the attempt
+ * bound. Attempts reset on restart; a review-request subprocess with no timeout
+ * can hold a single attempt. With `maxAttempts` unset the retry is unbounded.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
@@ -110,6 +119,19 @@ const LOOP_ID_PATTERN = /^[A-Za-z0-9._-]{1,79}$/;
 /** Whether `loopId` is a single safe filename component (see `LOOP_ID_PATTERN`). */
 export function isSafeLoopId(loopId: string): boolean {
   return LOOP_ID_PATTERN.test(loopId) && loopId !== "." && loopId !== "..";
+}
+
+/**
+ * Thrown by a task handler for a failure classified terminal, such as a
+ * malformed event or a 404/422 from the upstream API. The loop records its reason and marks the
+ * event handled; the cursor advances past it subject to the existing skew and
+ * persistence rules.
+ */
+export class PermanentEventError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "PermanentEventError";
+  }
 }
 
 /** Thrown by `startTaskLoop` for a `loopId` that is not a single safe filename component. */
@@ -215,10 +237,16 @@ export function startTaskLoop(
   flair: FlairClient,
   agentId: string,
   handler: TaskHandler,
-  opts: { pollIntervalMs?: number; kinds?: string[]; loopId?: string } = {},
+  opts: { pollIntervalMs?: number; kinds?: string[]; loopId?: string; authorId?: string; maxAttempts?: number } = {},
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
+  // Filter by stored attribution; an admin caller may supply authorId.
+  const authorId = opts.authorId;
+  // Other failures are given bounded attempts, then recorded and skipped.
+  // Undefined keeps the original unbounded retry.
+  const maxAttempts = opts.maxAttempts ?? Infinity;
+  const attempts = new Map<string, number>();
   // Omitted loop IDs use the agentId cursor.
   const loopId = opts.loopId ?? agentId;
   // Refuse an unsafe loopId before any cursor is read or written: it names the
@@ -285,15 +313,28 @@ export function startTaskLoop(
           for (const event of read.events) {
             if (!seen.has(event.id)) {
               const targets = event.targetIds ?? [];
-              if (kinds.has(event.kind) && (targets.length === 0 || targets.includes(agentId))) {
+              if (kinds.has(event.kind) && (authorId === undefined || event.authorId === authorId) && (targets.length === 0 || targets.includes(agentId))) {
                 slog(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
                 try {
                   await handler(event);
+                  attempts.delete(event.id);
                 } catch (e) {
                   const err = e as Error;
-                  serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}; it will be retried`);
-                  failed = true;
-                  break;
+                  const count = (attempts.get(event.id) ?? 0) + 1;
+                  if (err instanceof PermanentEventError) {
+                    // Classified terminal by the handler: record its reason and let the cursor advance.
+                    attempts.delete(event.id);
+                    serror(`[${agentId}] Task ${event.id} failure classified terminal (${err.message}); recorded and marked handled`);
+                  } else if (count >= maxAttempts) {
+                    // Other failures, given bounded attempts: record and skip at the bound.
+                    attempts.delete(event.id);
+                    serror(`[${agentId}] Task ${event.id} failed ${count} times (last: ${err.message}); recorded and skipped after the attempt bound of ${maxAttempts}`);
+                  } else {
+                    attempts.set(event.id, count);
+                    serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}; it will be retried`);
+                    failed = true;
+                    break;
+                  }
                 }
               }
               // Marked seen only once done, so a failed event stays eligible.

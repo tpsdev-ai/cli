@@ -399,7 +399,7 @@ function openPullRequest(
   options: AutoCommitOptions,
   authorEmail: string,
   repo: string,
-): Promise<void> {
+): Promise<string | undefined> {
   const {
     taskId,
     branchName,
@@ -411,7 +411,7 @@ function openPullRequest(
   } = options;
 
   return (async () => {
-    if (!options.push || !options.openPr || !prRepo) return;
+    if (!options.push || !options.openPr || !prRepo) return undefined;
     const prArgs = [
       ghAgent ?? authorEmail.split("@")[0] ?? "",
       "pr",
@@ -444,7 +444,7 @@ function openPullRequest(
           }
         }
       }
-      return;
+      return prUrl;
     }
 
     const prErrMsg = prStderr2 || prStdout2 || `exit ${prResult.status ?? "unknown"}`;
@@ -465,7 +465,7 @@ export async function runAutoCommit(
   flair: AutoCommitFlair,
   options: AutoCommitOptions,
   deps: AutoCommitDeps = {},
-): Promise<void> {
+): Promise<string | undefined> {
   const runSync = deps.spawnSyncImpl ?? spawnSync;
   const tpsCmd = deps.tpsCommand ?? "tps";
   const repo = config.workspace;
@@ -521,8 +521,7 @@ export async function runAutoCommit(
         throw new Error(`git push failed: ${pushStderr || pushStdout || `exit ${pushResult.status ?? "unknown"}`}`);
       }
     }
-    await openPullRequest(runSync, flair, options, authorEmail, repo);
-    return;
+    return openPullRequest(runSync, flair, options, authorEmail, repo);
   }
 
   const args = [
@@ -542,8 +541,7 @@ export async function runAutoCommit(
   if (resultStdout) console.log(`[autoCommit] stdout: ${resultStdout.slice(0, 200)}`);
   if (resultStderr) console.log(`[autoCommit] stderr: ${resultStderr.slice(0, 200)}`);
   if (result.status === 0) {
-    await openPullRequest(runSync, flair, options, authorEmail, repo);
-    return;
+    return openPullRequest(runSync, flair, options, authorEmail, repo);
   }
 
   const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
@@ -565,7 +563,7 @@ export async function runAutoCommit(
   throw new Error(`tps agent commit failed: ${errMsg}`);
 }
 
-/** @internal Legacy inline auto-commit for the mail loop. Wraps runAutoCommit. */
+/** @internal Legacy auto-commit wrapper. */
 async function _runAutoCommitLegacy(
   agentId: string,
   workspace: string,
@@ -588,7 +586,7 @@ async function _runAutoCommitLegacy(
 
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
-    await runAutoCommit(
+    const prUrl = await runAutoCommit(
       { workspace: cfg.repo ?? workspace },
       flair,
       {
@@ -609,7 +607,7 @@ async function _runAutoCommitLegacy(
       { tpsCommand },
     );
     console.log(`[${agentId}] Auto-commit succeeded: ${safeBranch}`);
-    return safeBranch;
+    return prUrl ?? null;
   } catch (e) {
     const err = e as Error;
     console.warn(`[${agentId}] Auto-commit failed (non-fatal): ${err.message}`);
@@ -708,6 +706,48 @@ export function shutdownHandler(
     stopHeartbeat();
     void shutdownPresenceBeat(client, agentId, timeoutMs).finally(() => exit(0));
   };
+}
+
+/** How many times publishing a pr.opened event is attempted before it is logged and dropped. */
+export const PR_RESULT_PUBLISH_ATTEMPTS = 3;
+/** The delay between pr.opened publication attempts. */
+export const PR_RESULT_PUBLISH_RETRY_MS = 250;
+
+/**
+ * Attempt to publish the PR URL as a `pr.opened` OrgEvent targeted at the agent,
+ * up to `PR_RESULT_PUBLISH_ATTEMPTS` times. Only an accepted POST can reach the
+ * review loop; exhausted retries call `console.warn` with the PR URL and return
+ * without an event if no POST was accepted. Flair assigns a fresh id per POST,
+ * so a retry after an uncertain response can publish the event twice.
+ */
+export async function publishPrResult(
+  flair: Pick<FlairClient, "request">,
+  agentId: string,
+  taskId: string,
+  prUrl: string | null,
+  deps: { sleep?: (ms: number) => Promise<void> } = {},
+): Promise<void> {
+  if (!prUrl) return;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const event = {
+    kind: "pr.opened", authorId: agentId, targetIds: [agentId],
+    summary: `PR opened for ${taskId}`, refId: taskId,
+    detail: prUrl,
+  };
+  for (let attempt = 1; attempt <= PR_RESULT_PUBLISH_ATTEMPTS; attempt++) {
+    try {
+      await flair.request("POST", "/OrgEvent", event);
+      return;
+    } catch (e) {
+      const message = (e as Error).message;
+      if (attempt < PR_RESULT_PUBLISH_ATTEMPTS) {
+        console.warn(`[${agentId}] Failed to publish pr.opened for ${prUrl} (attempt ${attempt}/${PR_RESULT_PUBLISH_ATTEMPTS}): ${message}; retrying`);
+        await sleep(PR_RESULT_PUBLISH_RETRY_MS);
+      } else {
+        console.warn(`[${agentId}] Failed to publish pr.opened for ${prUrl} after ${attempt} attempts: ${message}`);
+      }
+    }
+  }
 }
 
 export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void> {
@@ -825,16 +865,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        const branchRef = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
-        if (branchRef && config.autoCommit.push) {
-          try {
-            await (flair as any).request("POST", "/OrgEvent", {
-              kind: "pr.opened", authorId: agentId,
-              summary: `PR opened for ${taskId}`, refId: taskId,
-              detail: branchRef,
-            });
-          } catch { /* non-fatal */ }
-        }
+        const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
+        await publishPrResult(flair, agentId, taskId, prUrl);
       }
     } catch (e) {
       const err = e as Error;
@@ -950,7 +982,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             );
           } else {
             const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-            await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+            const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+            await publishPrResult(flair, agentId, msg.id, prUrl);
           }
         }
       } catch (err: any) {
