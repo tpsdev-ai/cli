@@ -141,7 +141,7 @@ async function assertDeliveredUntilCompleted(messageId: string): Promise<void> {
   if (first.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(first)}`);
   expect(first.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);
   expect(reasonOf(await client.deliverNext())).toBe("active");
-  client.releaseDelivery(first.delivery);
+  expect(client.releaseDelivery(first.delivery)).toEqual({ status: "released" });
   const second = await client.deliverNext();
   if (second.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(second)}`);
   expect(second.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);

@@ -5,7 +5,7 @@
   Unresolved `placing`/`in_progress` work defers `deliverNext()` commits.
   The token set covers MailClients of one module copy; claims from other copies
   in the same process are treated as live until process exit or lease expiry.
-  Release failed handoffs before retrying through the owning copy. Completion
+  Release failed handoffs before retrying. Completion
   checks the issued token and recorded device, inode, size and SHA-256.
   On later calls, an unclaimed `in_progress` intent becomes `failed` before
   a presentation beyond the fifth, or after the deadline of 24 hours from

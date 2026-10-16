@@ -312,6 +312,7 @@ export interface ReplayStore {
    * or `identity` (recorded cur/ identity absent or mismatched).
    */
   completePlacement(messageId: string, file: string, token: string): PlacementCompletion;
+  releasePlacement(messageId: string, file: string, token: string): boolean;
 }
 
 /** The result of advancing a placement intent to its next presentation (cli#617 slice b). */
@@ -362,6 +363,7 @@ export function mailboxReplayStore(root: string): ReplayStore {
     advancePresentation: (messageId, file, nowIso, claim) => advancePlacementPresentation(root, messageId, file, nowIso, claim),
     expireOverdue: (messageId, file, nowIso) => expireOverduePlacement(root, messageId, file, nowIso),
     completePlacement: (messageId, file, token) => completeInProgressPlacement(root, messageId, file, token),
+    releasePlacement: (messageId, file, token) => releaseInProgressPlacement(root, messageId, file, token),
   };
 }
 
@@ -783,6 +785,17 @@ function expireOverduePlacement(
   return failPlacement(root, messageId, file, presentations, intent.firstPresentedAt!)
     ? { status: "failed", presentations }
     : { status: "absent" };
+}
+
+function releaseInProgressPlacement(root: string, messageId: string, file: string, token: string): boolean {
+  const intent = readPlacementIntent(root, file);
+  if (!intent || intent.messageId !== messageId || intent.phase !== "in_progress" || intent.claim?.token !== token) return false;
+  return writePlacementPhase(root, messageId, file, {
+    version: PLACEMENT_INTENT_VERSION,
+    phase: "in_progress",
+    presentations: intent.presentations,
+    firstPresentedAt: intent.firstPresentedAt,
+  });
 }
 
 export class PlacementDurabilityError extends Error {}

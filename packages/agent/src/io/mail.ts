@@ -8,7 +8,7 @@ import { PublicKeyFormatError } from "../lib/public-key.js";
 import { agentKeyCandidates, readAgentPrivateKey } from "../lib/agent-keys.js";
 import { tryAcquireRelayMoveLock } from "../lib/relay-lock.js";
 import { canonicalMailboxRoot, canonicalMailRoot } from "../lib/mail-lock-namespace.js";
-import { acquireMailLock, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
+import { acquireMailLock, acquireMailLockSync, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
 import {
   DELIVERY_PRESENTATION_TTL_MS,
   PlacementDurabilityError,
@@ -113,6 +113,11 @@ export type DeliveryCompletion =
    * recorded cur/ identity is absent or mismatched.
    */
   | { status: "refused"; reason: "foreign" | "stale" | "identity"; detail: string };
+
+export type DeliveryRelease =
+  | { status: "released" }
+  | { status: "refused"; reason: "foreign" | "stale" }
+  | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string };
 
 type DeferredResult = Extract<DeliverNextResult, { status: "deferred" }>;
 /** A pending placement this call resolved without presenting (gone, terminal, or another writer's phase). */
@@ -254,6 +259,7 @@ export class MailClient {
     token: string;
     messageId: string;
     file: string;
+    mailbox: string;
     state: "active" | "released" | "completed";
   }>();
 
@@ -274,7 +280,6 @@ export class MailClient {
     }
     this.flairClient = flairClient;
     // cli#636: no resolved canonical root is cached at construction.
-    // Every operation resolves its own roots (operationRoots).
     this.operationRoots();
   }
 
@@ -402,7 +407,7 @@ export class MailClient {
    * Unresolved placing/in_progress work defers deliverNext() commits. The token
    * set covers MailClients of this module copy; claims from other copies in the
    * same process are treated as live until process exit or lease expiry.
-   * Release failed handoffs before retrying through this copy. The event loop uses checkNewMail().
+   * Release failed handoffs before retrying. The event loop uses checkNewMail().
    */
   async deliverNext(): Promise<DeliverNextResult> {
     let roots: OperationRoots;
@@ -485,23 +490,34 @@ export class MailClient {
     };
   }
 
-  /**
-   * Release this client's active claim for retry. Completion requires the same
-   * live intent, claim and recorded file identity. The next deliverNext() can
-   * fail an overdue released intent, making completion stale.
-   */
-  releaseDelivery(delivery: MailDelivery): boolean {
+  /** Persist matching claim release under the issued mailbox's lock; contention and storage errors defer. */
+  releaseDelivery(delivery: MailDelivery): DeliveryRelease {
     const issued = this.issued.get(delivery);
-    if (!issued || issued.state !== "active") return false;
-    issued.state = "released";
-    activePresentations.delete(issued.token);
-    return true;
+    if (!issued) return { status: "refused", reason: "foreign" };
+    if (issued.state !== "active") return { status: "refused", reason: "stale" };
+    try {
+      const lock = acquireMailLockSync(issued.mailbox, { timeoutMs: 0 });
+      if (!lock) return { status: "deferred", reason: "lock-busy", detail: "delivery not released; retry" };
+      let released: boolean;
+      try {
+        released = mailboxReplayStore(issued.mailbox).releasePlacement(issued.messageId, issued.file, issued.token);
+      } finally {
+        lock.release();
+      }
+      if (!released) return { status: "refused", reason: "stale" };
+      issued.state = "released";
+      activePresentations.delete(issued.token);
+      return { status: "released" };
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return { status: "deferred", reason: "storage-error", detail: `release persistence failed (${sanitizeError(err)}); retry` };
+    }
   }
 
   /** Record a hand-over: the token is already held in this module copy; bind it to the delivery object. */
   private issue(roots: OperationRoots, token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
     const delivery: MailDelivery = Object.freeze({ message, deliveryKey: JSON.stringify([roots.mailbox, messageId]), presentation });
-    this.issued.set(delivery, { token, messageId, file, state: "active" });
+    this.issued.set(delivery, { token, messageId, file, mailbox: roots.mailbox, state: "active" });
     return delivery;
   }
 

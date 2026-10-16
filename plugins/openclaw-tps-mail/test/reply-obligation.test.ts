@@ -531,7 +531,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       expect(await client.deliverNext()).toMatchObject({ status: "deferred", reason: "active" });
     } finally {
       await h.stop();
-      expect(client.releaseDelivery(result.delivery)).toBe(true);
+      expect(client.releaseDelivery(result.delivery)).toEqual({ status: "released" });
     }
   });
 

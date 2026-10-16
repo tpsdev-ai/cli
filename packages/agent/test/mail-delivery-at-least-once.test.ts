@@ -135,7 +135,7 @@ describe("per-message delivery commits one message at a time", () => {
     expect(intentJson("m1.json").presentations).toBe(1);
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
 
-    expect(c.releaseDelivery(first)).toBe(true);
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
     const second = delivered(await c.deliverNext());
     expect(second.message.verifiedEnvelope?.messageId).toBe("id-1");
     expect(second.presentation).toBe(2);
@@ -203,13 +203,102 @@ describe("per-message delivery commits one message at a time", () => {
   });
 });
 
+describe("persisted delivery release", () => {
+  test("another client defers before release, then retries and delivers later mail", async () => {
+    plant("m1.json", "released");
+    plant("m2.json", "later");
+    const a = client();
+    const b = client();
+    const first = delivered(await a.deliverNext());
+    const claim = intentJson("m1.json").claim;
+    setPhase({ claim: { ...claim, moduleNonce: randomUUID() } });
+    const before = intentJson("m1.json");
+    expect(reasonOf(await b.deliverNext())).toBe("active");
+    expect(newFiles()).toEqual(["m2.json"]);
+    expect(a.releaseDelivery(first)).toEqual({ status: "released" });
+    const { claim: _claim, ...unclaimed } = before;
+    expect(intentJson("m1.json")).toEqual(unclaimed);
+    const retry = delivered(await b.deliverNext());
+    expect(retry.message.verifiedEnvelope?.messageId).toBe("released");
+    expect(retry.presentation).toBe(2);
+    expect(await b.completeDelivery(retry)).toEqual({ status: "completed" });
+    expect(idOf(await b.deliverNext())).toBe("later");
+  });
+
+  test("a foreign claim at the presentation limit blocks later mail until released", async () => {
+    plant("m1.json", "at-limit");
+    plant("m2.json", "later");
+    const a = client();
+    const first = delivered(await a.deliverNext());
+    const claim = intentJson("m1.json").claim;
+    setPhase({
+      claim: { ...claim, moduleNonce: randomUUID() },
+      presentations: MAX_DELIVERY_PRESENTATIONS,
+    });
+    const b = client();
+    expect(reasonOf(await b.deliverNext())).toBe("active");
+    expect(a.releaseDelivery(first)).toEqual({ status: "released" });
+    expect(idOf(await b.deliverNext())).toBe("later");
+    expect(intentPhase("m1.json")).toBe("failed");
+  });
+
+  test("release refuses a replaced token without changing the intent", async () => {
+    plant("m1.json", "replaced-token");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    const claim = intentJson("m1.json").claim;
+    setPhase({ claim: { ...claim, token: randomUUID() } });
+    const before = intentText("m1.json");
+    expect(c.releaseDelivery(first)).toEqual({ status: "refused", reason: "stale" });
+    expect(client().releaseDelivery(first)).toEqual({ status: "refused", reason: "foreign" });
+    expect(c.releaseDelivery({ ...first })).toEqual({ status: "refused", reason: "foreign" });
+    expect(intentText("m1.json")).toBe(before);
+  });
+
+  test("lock contention defers release and permits a retry", async () => {
+    plant("m1.json", "release-busy");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    const claimDir = join(root, ".mail-lock.claim");
+    mkdirSync(claimDir);
+    try {
+      expect(c.releaseDelivery(first)).toMatchObject({ status: "deferred", reason: "lock-busy" });
+      expect(intentText("m1.json")).toBe(before);
+    } finally { rmSync(claimDir, { recursive: true }); }
+    expect(reasonOf(await client().deliverNext())).toBe("active");
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
+    expect(c.releaseDelivery(first)).toEqual({ status: "refused", reason: "stale" });
+  });
+
+  test("a phase-write error defers release and retains the claim for retry", async () => {
+    plant("m1.json", "release-error");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    const realOpen = fs.openSync;
+    const stub = spyOn(fs, "openSync").mockImplementation(((path: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
+      if (String(path).endsWith(".phase.tmp")) throw new Error("release write failed");
+      return realOpen(path, flags, mode);
+    }) as typeof fs.openSync);
+    try {
+      expect(c.releaseDelivery(first)).toMatchObject({ status: "deferred", reason: "storage-error" });
+      expect(intentText("m1.json")).toBe(before);
+      expect(existsSync(join(root, ".mail-lock"))).toBe(false);
+    } finally { stub.mockRestore(); }
+    expect(reasonOf(await client().deliverNext())).toBe("active");
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
+    expect(delivered(await client().deliverNext()).presentation).toBe(2);
+  });
+});
+
 describe("in_progress re-presentation in recovery", () => {
   test("a foreign module nonce in the same process defers re-presentation", async () => {
     plant("m1.json", "foreign-module");
     const c = client();
     const first = delivered(await c.deliverNext());
-    c.releaseDelivery(first);
     const claim = intentJson("m1.json").claim;
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
     setPhase({ claim: { ...claim, moduleNonce: randomUUID() } });
     const before = intentText("m1.json");
 
@@ -226,8 +315,8 @@ describe("in_progress re-presentation in recovery", () => {
     plant("m1.json", "missing-time");
     const c = client();
     const first = delivered(await c.deliverNext());
-    c.releaseDelivery(first);
     const claim = intentJson("m1.json").claim;
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
     setPhase({ claim: { ...claim, moduleNonce: randomUUID() }, firstPresentedAt: undefined });
     expect(() => mailboxReplayStore(root).placementState("m1.json")).toThrow("malformed placement intent");
     expect(quarantined("m1.json")).toBe(true);
@@ -245,7 +334,8 @@ describe("in_progress re-presentation in recovery", () => {
     const c = client();
     const first = delivered(await c.deliverNext());
     const claim = intentJson("m1.json").claim;
-    expect(c.releaseDelivery(first)).toBe(true);
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
+    setPhase({ claim });
 
     const again = delivered(await client().deliverNext());
     expect(again.presentation).toBe(2);
@@ -257,8 +347,8 @@ describe("in_progress re-presentation in recovery", () => {
     plant("m2.json", "healthy");
     const c = client();
     const first = delivered(await c.deliverNext());
-    c.releaseDelivery(first);
     const claim = intentJson("m1.json").claim;
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
     setPhase({
       claim: { ...claim, moduleNonce: randomUUID() },
       firstPresentedAt: new Date(Date.now() - DELIVERY_PRESENTATION_TTL_MS - 1_000).toISOString(),
@@ -321,7 +411,7 @@ describe("in_progress re-presentation in recovery", () => {
     expect(reasonOf(await b.deliverNext())).toBe("active");
     expect(intentJson("m1.json").presentations).toBe(1);
 
-    a.releaseDelivery(first);
+    expect(a.releaseDelivery(first)).toEqual({ status: "released" });
     const again = delivered(await b.deliverNext());
     expect(again.message.verifiedEnvelope?.messageId).toBe("resume-in-progress");
     expect(again.presentation).toBe(2);
@@ -351,7 +441,7 @@ describe("in_progress re-presentation in recovery", () => {
     expect(hasCommittedMessageId(root, "resume-placing")).toBe(true);
 
     expect(reasonOf(await c.deliverNext())).toBe("active");
-    c.releaseDelivery(m);
+    expect(c.releaseDelivery(m)).toEqual({ status: "released" });
     expect(idOf(await c.deliverNext())).toBe("resume-placing");
   });
 
@@ -633,7 +723,7 @@ describe("completion is bound to the hand-over", () => {
         expect(mailboxReplayStore(root).ownsPendingPlacement("changed-identity", "m1.json")).toBe(false);
         expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "identity" });
         expect(intentText("m1.json")).toBe(before);
-        c.releaseDelivery(m);
+        expect(c.releaseDelivery(m)).toEqual({ status: "refused", reason: "stale" });
         expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
         expect(intentText("m1.json")).toBe(before);
       } finally { stub.mockRestore(); }
@@ -768,7 +858,7 @@ describe("completion is bound to the hand-over", () => {
     expect(mailboxReplayStore(join(empty, AGENT)).placementPhase("m1.json")).toBeNull();
   });
 
-  test("release frees its token across a mail-root repoint", async () => {
+  test("release persists under the issued mailbox lock after a mail-root repoint", async () => {
     const other = join(mailDir, "other");
     mkdirSync(other);
     const link = join(mailDir, "mail-link");
@@ -778,7 +868,30 @@ describe("completion is bound to the hand-over", () => {
     const first = delivered(await c.deliverNext());
     unlinkSync(link);
     symlinkSync(other, link);
-    expect(c.releaseDelivery(first)).toBe(true);
+    const before = intentJson("m1.json");
+    const originalRoot = root;
+    root = join(other, AGENT);
+    mkdirSync(join(root, "cur"), { recursive: true });
+    mkdirSync(join(root, "new"), { recursive: true });
+    committed("released-root", {
+      version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: before.firstPresentedAt, claim: before.claim,
+    });
+    const otherIntent = intentText("m1.json");
+    const otherIntentPath = intentPath("m1.json");
+    root = originalRoot;
+    const claimDir = join(root, ".mail-lock.claim");
+    mkdirSync(claimDir);
+    try {
+      expect(c.releaseDelivery(first)).toMatchObject({ status: "deferred", reason: "lock-busy" });
+      expect(intentJson("m1.json")).toEqual(before);
+    } finally { rmSync(claimDir, { recursive: true }); }
+    expect(c.releaseDelivery(first)).toEqual({ status: "released" });
+    const { claim: _claim, ...unclaimed } = before;
+    expect(intentJson("m1.json")).toEqual(unclaimed);
+    expect(readFileSync(otherIntentPath, "utf8")).toBe(otherIntent);
+    rmSync(other, { recursive: true });
+    mkdirSync(other);
     expect(await c.deliverNext()).toEqual({ status: "idle" });
     unlinkSync(link);
     symlinkSync(mailDir, link);
@@ -851,7 +964,7 @@ describe("deliverNext defers pending cur-copy failures before committing new mai
   test("a failed pending verification defers; a later valid message is not committed", async () => {
     plant("m1.json", "will-not-verify");
     const first = client();
-    first.releaseDelivery(delivered(await first.deliverNext()));
+    expect(first.releaseDelivery(delivered(await first.deliverNext()))).toEqual({ status: "released" });
     plant("m2.json", "later-valid", OTHER);
 
     // FROM is no longer resolvable: m1's cur/ copy fails re-verification.
@@ -870,7 +983,7 @@ describe("deliverNext defers pending cur-copy failures before committing new mai
   test("an unavailable verifier defers the pending message; a later message is not committed", async () => {
     plant("m1.json", "verifier-down");
     const first = client();
-    first.releaseDelivery(delivered(await first.deliverNext()));
+    expect(first.releaseDelivery(delivered(await first.deliverNext()))).toEqual({ status: "released" });
     plant("m2.json", "later");
     const down = client({ async getAgent() { throw new Error("flair unreachable"); } });
     expect(reasonOf(await down.deliverNext())).toBe("verification-unavailable");
@@ -938,7 +1051,7 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
         const m = delivered(await c.deliverNext());
         expect(m.message.verifiedEnvelope?.messageId).toBe("poison");
         expect(m.presentation).toBe(i);
-        c.releaseDelivery(m);
+        expect(c.releaseDelivery(m)).toEqual({ status: "released" });
       }
       // The next hand-over would exceed the bound: poison is not presented, its
       // intent becomes terminal `failed`, and the next message flows.
