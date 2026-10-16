@@ -89,6 +89,27 @@ test("the workflow paths cover mail, identity, mail verification and lane inputs
   }
 });
 
+test("every test file gated on TPS_TEST_REAL_FLAIR is named by the lane and covered by the workflow paths", () => {
+  const workflow = load(readFileSync(resolve(repo, ".github/workflows/real-flair.yml"), "utf8")) as {
+    on: { pull_request: { paths: string[] } };
+  };
+  const globs = workflow.on.pull_request.paths.map((path) => new Bun.Glob(path));
+  // A test file is gated when it compares the flag against "1", by equality or
+  // inequality — the skipIf idiom this lane's files use, or an alias bound to it.
+  // Naming the flag without such a comparison, as this guard file does, is not a gate.
+  const gate = /TPS_TEST_REAL_FLAIR\s*(?:!==|===)\s*"1"/;
+  const testDir = join(repo, "packages", "cli", "test");
+  const gated = ["packages/*/test/**/*.test.ts", "plugins/*/test/**/*.test.ts", "test/**/*.test.ts"]
+    .flatMap((pattern) => [...new Bun.Glob(pattern).scanSync({ cwd: repo, onlyFiles: true })])
+    .filter((file) => gate.test(readFileSync(resolve(repo, file), "utf8")))
+    .map((file) => relative(testDir, resolve(repo, file)).replaceAll("\\", "/"))
+    .sort();
+  expect(gated.length).toBeGreaterThan(0);
+  const named = Object.keys(EXPECTED_CASES);
+  expect(gated.filter((file) => !named.includes(file))).toEqual([]);
+  expect(gated.filter((file) => !globs.some((glob) => glob.match(`packages/cli/test/${file}`)))).toEqual([]);
+});
+
 for (const stage of ["install", "setup", "seed", "test"] as const) {
   test(`scratch ownership removes its root after an injected ${stage} error`, async () => {
     let root = "";

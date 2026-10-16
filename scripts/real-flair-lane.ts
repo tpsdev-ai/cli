@@ -20,6 +20,10 @@ export const EXPECTED_CASES: Record<string, string[]> = {
     "against a real Flair, create succeeds with an existing Agent and matching local key",
   ],
   "mail-flair-read-auth.test.ts": ["real Flair Agent read guards and refused-read mail recovery"],
+  "presence-flair-contract.test.ts": [
+    "real Flair serves a capped task to a signed reader",
+    "real Flair rejects an invalid Bearer token on GET /Presence",
+  ],
 };
 
 function decodeXml(value: string): string {
