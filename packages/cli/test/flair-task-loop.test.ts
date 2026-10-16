@@ -339,7 +339,7 @@ describe("cli#624 — the task loop reads the catch-up envelope", () => {
       if (e.id !== "e1") return;
       if (!failedOnce) {
         failedOnce = true;
-        throw new Error("transient failure");
+        throw new Error("handler failure");
       }
       cursorAtRetry = cursorPosition();
     }, { pollIntervalMs: 30 });
@@ -355,7 +355,7 @@ describe("cli#624 — the task loop reads the catch-up envelope", () => {
     expect(catchup.afters[1]).toBe(positionOf(e0));
     expect(cursorAtRetry).toBe(positionOf(e0));
     expect(cursorPosition()).toBe(positionOf(e2));
-    expect(warnings).toContain("Task handler error for e1: transient failure");
+    expect(warnings).toContain("Task handler error for e1: handler failure");
   });
 
   test("after a handler failure, a restart retries the failed event: the persisted cursor stops before it", async () => {
@@ -452,7 +452,7 @@ describe("cli#624 — the initial position is set once and always sent", () => {
         failedOnce = true;
         // Half an hour passes before the retry: a floor recomputed now would exclude e1.
         clock.advance(30 * 60_000);
-        throw new Error("transient failure");
+        throw new Error("handler failure");
       }
     }, { pollIntervalMs: 30 });
     try {
