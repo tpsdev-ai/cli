@@ -307,7 +307,7 @@ export interface ReplayStore {
    * cli#617 slice (b): completion-only finalize, bound to one presentation.
    * Deletes the intent only when it is `in_progress` for this message, its
    * claim carries `token`, and `cur/<file>` is still the file the intent
-   * recorded (device, inode, size and SHA-256). Otherwise nothing changes: `absent` (no intent
+   * recorded (device, inode, size and SHA-256). These results leave it unchanged: `absent` (no intent
    * for this message), `stale` (another phase or another presentation's claim),
    * or `identity` (recorded cur/ identity absent or mismatched).
    */
@@ -548,8 +548,9 @@ function isLivePlacement(intent: PlacementIntent | null): boolean {
 
 /**
  * Parse an intent, or null when it is malformed: the name, messageId and
- * identity must hold. An unsupported value in `phase`, `version` or a liveness
- * field alone never makes an intent malformed (see phaseOf).
+ * identity must hold; an in_progress claim requires firstPresentedAt.
+ * An unsupported value in `phase`, `version` or a liveness field alone never
+ * makes an intent malformed (see phaseOf).
  */
 function parsePlacement(raw: string, path: string): PlacementIntent | null {
   try {
@@ -562,6 +563,7 @@ function parsePlacement(raw: string, path: string): PlacementIntent | null {
         && /^[1-9][0-9]*$/.test(intent.identity.ino)
         && (intent.identity.sha256 === undefined || (typeof intent.identity.sha256 === "string" && /^[a-f0-9]{64}$/.test(intent.identity.sha256)))
         && (intent.identity.size === undefined || (typeof intent.identity.size === "string" && /^(0|[1-9][0-9]*)$/.test(intent.identity.size)))))) {
+      if (intent.phase === "in_progress" && intent.claim !== undefined && intent.firstPresentedAt === undefined) return null;
       const phase = phaseOf(intent);
       return {
         messageId: intent.messageId, file: intent.file, identity: intent.identity, phase,
@@ -783,6 +785,8 @@ function expireOverduePlacement(
     : { status: "absent" };
 }
 
+export class PlacementDurabilityError extends Error {}
+
 /**
  * cli#617 slice (b): completion-only finalize, bound to one presentation: the
  * intent must be `in_progress` for this message, carry `token` in its claim,
@@ -802,7 +806,9 @@ function completeInProgressPlacement(root: string, messageId: string, file: stri
     throw err;
   }
   unlinkSync(placementIntentPath(root, file));
-  syncDirectory(root);
+  try { syncDirectory(root); } catch (cause) {
+    throw new PlacementDurabilityError("intent unlinked; directory sync failed, durability uncertain", { cause });
+  }
   return "completed";
 }
 

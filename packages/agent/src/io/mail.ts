@@ -11,6 +11,7 @@ import { canonicalMailboxRoot, canonicalMailRoot } from "../lib/mail-lock-namesp
 import { acquireMailLock, type MailLock, processIsGone, processStartToken } from "../lib/mail-lock.js";
 import {
   DELIVERY_PRESENTATION_TTL_MS,
+  PlacementDurabilityError,
   decideEnvelopeForMailbox,
   type MailboxPolicyRejectClass,
   mailboxReplayStore,
@@ -48,7 +49,7 @@ type MailboxRejectClass = MailboxPolicyRejectClass;
 /** A handoff token issued by deliverNext(); pass it to completeDelivery() or releaseDelivery(). */
 export interface MailDelivery {
   readonly message: MailMessage;
-  /** `<mailbox>/<messageId>`: the same on every presentation of one message, for idempotent handlers. */
+  /** JSON-encoded [canonical mailbox path, messageId]; stable across presentations at that path. */
   readonly deliveryKey: string;
   /** This hand-over's presentation number; 1 for the first. */
   readonly presentation: number;
@@ -454,7 +455,12 @@ export class MailClient {
       result = mailboxReplayStore(roots.mailbox).completePlacement(issued.messageId, issued.file, issued.token);
     } catch (err) {
       this.emitRecoveryError(err);
-      return { status: "deferred", reason: "storage-error", detail: `placement state unavailable (${sanitizeError(err)}); delivery not finalized, retry` };
+      const detail = err instanceof PlacementDurabilityError
+        ? err.message
+        : err instanceof Error && err.name === "MalformedPlacementIntentError"
+          ? "quarantined placement intent needs repair before a retry can complete"
+          : `placement state unavailable (${sanitizeError(err)}); completion state unknown`;
+      return { status: "deferred", reason: "storage-error", detail };
     } finally {
       lock.release();
     }
@@ -488,8 +494,8 @@ export class MailClient {
   }
 
   /** Record a hand-over: the token is already held in this module copy; bind it to the delivery object. */
-  private issue(token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
-    const delivery: MailDelivery = Object.freeze({ message, deliveryKey: `${this.agentId}/${messageId}`, presentation });
+  private issue(roots: OperationRoots, token: string, messageId: string, file: string, presentation: number, message: MailMessage): MailDelivery {
+    const delivery: MailDelivery = Object.freeze({ message, deliveryKey: JSON.stringify([roots.mailbox, messageId]), presentation });
     this.issued.set(delivery, { token, messageId, file, state: "active" });
     return delivery;
   }
@@ -666,7 +672,7 @@ export class MailClient {
         verifiedEnvelope: envelope,
         trustTier,
       };
-      return { status: "delivered", delivery: this.issue(token, messageId, file, advance.presentations, message) };
+      return { status: "delivered", delivery: this.issue(roots, token, messageId, file, advance.presentations, message) };
     } finally {
       lock.release();
     }
@@ -760,7 +766,7 @@ export class MailClient {
           filename: file, body, receivedAt: new Date(), headers: {}, from,
           verifiedEnvelope: verifyResult.envelope, trustTier,
         };
-        return { status: "delivered", delivery: this.issue(token, verifyResult.envelope.messageId, file, 1, message) };
+        return { status: "delivered", delivery: this.issue(roots, token, verifyResult.envelope.messageId, file, 1, message) };
       } catch (err) {
         this.emitRecoveryError(err);
         skipped ??= { file, detail: `not committed: ${sanitizeError(err)}` };
@@ -781,9 +787,11 @@ export class MailClient {
   }
 
   private emitRecoveryError(err: unknown): void {
-    this.events?.emit({
-      type: "mail.receive", agent: this.agentId, status: "error", from: "unknown", durationMs: 0, error: sanitizeError(err),
-    });
+    try {
+      this.events?.emit({
+        type: "mail.receive", agent: this.agentId, status: "error", from: "unknown", durationMs: 0, error: sanitizeError(err),
+      });
+    } catch {}
   }
 
   /** Commit under the mailbox lock; attempt placement rollback on append failure. */

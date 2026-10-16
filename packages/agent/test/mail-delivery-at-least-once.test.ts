@@ -126,7 +126,7 @@ describe("per-message delivery commits one message at a time", () => {
     const first = delivered(await c.deliverNext());
     expect(first.message.verifiedEnvelope?.messageId).toBe("id-1");
     expect(first.presentation).toBe(1);
-    expect(first.deliveryKey).toBe(`${AGENT}/id-1`);
+    expect(first.deliveryKey).toBe(JSON.stringify([realpathSync(root), "id-1"]));
     expect(curFiles()).toEqual(["m1.json"]);
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
 
@@ -139,6 +139,7 @@ describe("per-message delivery commits one message at a time", () => {
     const second = delivered(await c.deliverNext());
     expect(second.message.verifiedEnvelope?.messageId).toBe("id-1");
     expect(second.presentation).toBe(2);
+    expect(second.deliveryKey).toBe(first.deliveryKey);
     expect(newFiles()).toEqual(["m2.json", "m3.json"]);
 
     expect(await c.completeDelivery(second)).toEqual({ status: "completed" });
@@ -148,6 +149,23 @@ describe("per-message delivery commits one message at a time", () => {
     expect(next.message.verifiedEnvelope?.messageId).toBe("id-2");
     expect(curFiles()).toEqual(["m1.json", "m2.json"]);
     expect(newFiles()).toEqual(["m3.json"]);
+  });
+
+  test("distinct mailbox roots produce distinct delivery keys for the same agent and message", async () => {
+    plant("m1.json", "same-id");
+    const otherDir = join(mailDir, "other-root");
+    const otherRoot = join(otherDir, AGENT);
+    mkdirSync(join(otherRoot, "new"), { recursive: true });
+    mkdirSync(join(otherRoot, "cur"), { recursive: true });
+    signedRecord(join(otherRoot, "new", "m1.json"), "same-id");
+    const a = client();
+    const b = new MailClient(otherDir, undefined, AGENT, verifier());
+    const first = delivered(await a.deliverNext());
+    const second = delivered(await b.deliverNext());
+    expect(second.deliveryKey).toBe(JSON.stringify([realpathSync(otherRoot), "same-id"]));
+    expect(second.deliveryKey).not.toBe(first.deliveryKey);
+    expect(await a.completeDelivery(first)).toEqual({ status: "completed" });
+    expect(await b.completeDelivery(second)).toEqual({ status: "completed" });
   });
 
   test("completion is idempotent and stops re-presentation", async () => {
@@ -202,6 +220,24 @@ describe("in_progress re-presentation in recovery", () => {
     expect(mailboxReplayStore(root).placementState("m1.json")?.claim?.moduleNonce).not.toBe(claim.moduleNonce);
     setPhase({ claim });
     expect(delivered(await client().deliverNext()).presentation).toBe(2);
+  });
+
+  test("a claimed intent without firstPresentedAt is rejected at parse and quarantined", async () => {
+    plant("m1.json", "missing-time");
+    const c = client();
+    const first = delivered(await c.deliverNext());
+    c.releaseDelivery(first);
+    const claim = intentJson("m1.json").claim;
+    setPhase({ claim: { ...claim, moduleNonce: randomUUID() }, firstPresentedAt: undefined });
+    expect(() => mailboxReplayStore(root).placementState("m1.json")).toThrow("malformed placement intent");
+    expect(quarantined("m1.json")).toBe(true);
+    expect(existsSync(intentPath("m1.json"))).toBe(false);
+    expect(await c.deliverNext()).toEqual({ status: "idle" });
+    expect(await c.completeDelivery(first)).toMatchObject({
+      status: "deferred", reason: "storage-error",
+      detail: "quarantined placement intent needs repair before a retry can complete",
+    });
+    expect(curFiles()).toEqual(["m1.json"]);
   });
 
   test("this module's nonce with no local token permits re-presentation", async () => {
@@ -328,6 +364,50 @@ describe("in_progress re-presentation in recovery", () => {
 });
 
 describe("completion is bound to the hand-over", () => {
+  test("a failed real event destination cannot reject a placement-error deferral", async () => {
+    plant("m1.json", "logger-error");
+    const eventDir = join(mailDir, "events");
+    const events = new EventLogger(AGENT, eventDir);
+    const c = new MailClient(mailDir, events, AGENT, verifier());
+    const m = delivered(await c.deliverNext());
+    const before = readFileSync(intentPath("m1.json"));
+    rmSync(eventDir, { recursive: true });
+    writeFileSync(eventDir, "not a directory");
+    expect(() => events.emit({ type: "mail.receive", status: "error" })).toThrow();
+    unlinkSync(intentPath("m1.json"));
+    mkdirSync(intentPath("m1.json"));
+    try {
+      expect(await c.completeDelivery(m)).toMatchObject({ status: "deferred", reason: "storage-error" });
+      const lock = await acquireMailLock(realpathSync(root));
+      expect(lock).not.toBeNull();
+      lock?.release();
+    } finally {
+      rmSync(intentPath("m1.json"), { recursive: true });
+      writeFileSync(intentPath("m1.json"), before);
+    }
+    expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+  });
+
+  test("directory-sync failure after unlink reports uncertain durability", async () => {
+    plant("m1.json", "sync-error");
+    const c = client();
+    const m = delivered(await c.deliverNext());
+    const sync = spyOn(fs, "fsyncSync").mockImplementation(() => { throw new Error("sync failed"); });
+    try {
+      expect(await c.completeDelivery(m)).toEqual({
+        status: "deferred", reason: "storage-error",
+        detail: "intent unlinked; directory sync failed, durability uncertain",
+      });
+      expect(existsSync(intentPath("m1.json"))).toBe(false);
+      const lock = await acquireMailLock(realpathSync(root));
+      expect(lock).not.toBeNull();
+      lock?.release();
+    } finally {
+      sync.mockRestore();
+    }
+    expect(await c.completeDelivery(m)).toMatchObject({ status: "refused", reason: "stale" });
+  });
+
   for (const failure of ["unreadable", "malformed"] as const) {
     test(`${failure} intent defers completion with storage-error and retains the token`, async () => {
       plant("m1.json", "intent-error");
@@ -342,6 +422,12 @@ describe("completion is bound to the hand-over", () => {
       try {
         const result = await c.completeDelivery(m);
         expect(result).toMatchObject({ status: "deferred", reason: "storage-error" });
+        if (failure === "malformed") {
+          expect(result).toMatchObject({ detail: "quarantined placement intent needs repair before a retry can complete" });
+          expect(quarantined("m1.json")).toBe(true);
+          expect(existsSync(intentPath("m1.json"))).toBe(false);
+          expect(await c.completeDelivery(m)).toEqual(result);
+        }
         expect(emit).toHaveBeenLastCalledWith(expect.objectContaining({
           type: "mail.receive", agent: AGENT, status: "error", from: "unknown", durationMs: 0,
           error: expect.any(String),
