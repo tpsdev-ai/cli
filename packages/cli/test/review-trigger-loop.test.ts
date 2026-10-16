@@ -74,7 +74,7 @@ function cursorPosition(agentId = AGENT): string | undefined {
 const client = (agentId = AGENT) => createFlairClient(agentId, stub!.url, keyPath);
 
 /** A pr.opened event in the shape the runtime publishes after a successful PR:
- *  authored by the agent, `detail` the PR URL `runAutoCommit` returned. */
+ *  attributed to the agent, `detail` the PR URL `runAutoCommit` returned. */
 const prOpened = (id: string, minutesAgo: number, targetIds: string[] = [AGENT], prNumber = 1, authorId = AGENT) => ({
   id, kind: "pr.opened", authorId, summary: `PR ${id}`,
   detail: `https://github.com/${REPO}/pull/${prNumber}`,
@@ -182,7 +182,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
   });
 
   test.each([[[] as string[]], [[AGENT]]])(
-    "a pr.opened authored by another agent, broadcast or addressed to this agent, never reaches the review-request command, and the cursor advances past it",
+    "a pr.opened attributed to another agent, broadcast or addressed to this agent, never reaches the review-request command, and the cursor advances past it",
     async (targetIds) => {
       // A foreign author, broadcast or addressed to this agent, is ineligible.
       const foreign = prOpened("e1", 5, targetIds, 1, "agent-b");
@@ -211,8 +211,8 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     },
   );
 
-  test("a permanently bad pr.opened is recorded and skipped, and a later good one still gets its review request", async () => {
-    // A branch-only detail is permanently rejected by this handler.
+  test("a pr.opened classified terminal is recorded and skipped, and a later good one still gets its review request", async () => {
+    // A branch-only detail is classified terminal by this handler.
     const bad = { ...prOpened("e1", 5, [AGENT], 1, AGENT), detail: "branch-only" };
     const good = prOpened("e2", 4, [AGENT], 2, AGENT);
     const { route } = serve({ events: [bad, good] });
@@ -234,17 +234,17 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
       AGENT, "api", "--method", "POST", `repos/${REPO}/pulls/2/requested_reviewers`, "--input", "-",
     ]);
     expect(route.served).toEqual(expect.arrayContaining(["e1", "e2"]));
-    expect(warnings).toContain("failed permanently");
+    expect(warnings).toContain("failure classified terminal");
   });
 
-  test("a transient review-request failure is retried, and the event is handled when it recovers within the bound", async () => {
+  test("a review-request failure outside the terminal classification is retried, and the event is handled when it recovers within the bound", async () => {
     const e1 = prOpened("e1", 5);
     const { route } = serve({ events: [e1] });
     let attempts = 0;
     const deps = {
       spawnSyncImpl: ((_cmd: string, _args: string[]) => {
         attempts++;
-        // A network error is transient: the first call fails, the retry succeeds.
+        // The first call fails with a network error; the retry succeeds.
         return attempts < 2
           ? { status: 1, stdout: "", stderr: "gh-as: connection reset" }
           : { status: 0, stdout: "", stderr: "" };
@@ -262,7 +262,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     expect(warnings).toContain("it will be retried");
   });
 
-  test("a transient review-request failure that never recovers is skipped after the attempt bound, and a later event is still handled", async () => {
+  test("a review-request failure outside the terminal classification that keeps failing is skipped after the attempt bound, and a later event is still handled", async () => {
     const e1 = prOpened("e1", 5, [AGENT], 1, AGENT);
     const good = prOpened("e2", 4, [AGENT], 2, AGENT);
     const { route } = serve({ events: [e1, good] });
@@ -270,7 +270,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     const deps = {
       spawnSyncImpl: ((_cmd: string, args: string[]) => {
         attempts++;
-        // PR #1 always fails transiently; PR #2 succeeds.
+        // PR #1 always fails with a network error; PR #2 succeeds.
         return args[4]?.includes("/pulls/1/")
           ? { status: 1, stdout: "", stderr: "gh-as: server unavailable" }
           : { status: 0, stdout: "", stderr: "" };
@@ -288,7 +288,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     expect(warnings).toContain("skipped after the attempt bound");
   });
 
-  test("a duplicate pr.opened from a retried publish is handled again harmlessly: the same reviewer is requested, which GitHub treats as idempotent", async () => {
+  test("a duplicate pr.opened from a retried publish issues the same review-request command again", async () => {
     // A lost publication response makes the runtime POST the same pr.opened
     // twice; each copy reaches a review request for the same PR and reviewer.
     const first = prOpened("e1", 5, [AGENT], 1, AGENT);
@@ -307,7 +307,7 @@ describe("cli#631 — the review-trigger loop reads only feeds the agent may rea
     } finally {
       await loop.stop();
     }
-    // Both copies requested the same reviewer on the same PR; the second is a no-op on GitHub.
+    // Both copies requested the same reviewer on the same PR.
     expect(ghCalls).toHaveLength(2);
     expect(ghCalls[1]).toEqual(ghCalls[0]);
     expect(new Set(route.served)).toEqual(new Set(["e1", "e2"]));

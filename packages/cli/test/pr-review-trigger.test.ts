@@ -34,7 +34,7 @@ describe("pr-review-trigger", () => {
   });
 
   test("handlePrOpened: fails the handler when detail has no PR URL", async () => {
-    // A missing PR URL is a permanent failure: the handler throws
+    // A missing PR URL is classified terminal: the handler throws
     // PermanentEventError, so the loop records and skips the event.
     await expect(
       handlePrOpened({ detail: "branch-name-only", summary: "PR" }, cfg)
@@ -146,7 +146,7 @@ describe("pr-review-trigger", () => {
     },
   );
 
-  test.each(["404", "422"])("handlePrOpened: a gh %s failure is permanent, so the loop skips the event", async (code) => {
+  test.each(["404", "422"])("handlePrOpened: a gh %s failure is classified terminal, so the loop skips the event", async (code) => {
     const deps = {
       spawnSyncImpl: (() => ({ status: 1, stdout: "", stderr: `gh: error (HTTP ${code})` }) as any) as any,
     };
@@ -155,7 +155,7 @@ describe("pr-review-trigger", () => {
     ).rejects.toThrow(PermanentEventError);
   });
 
-  test("handlePrOpened: a transient gh failure is not permanent, so the loop retries the event", async () => {
+  test("handlePrOpened: a gh 502 failure is given bounded attempts by the loop", async () => {
     const deps = {
       spawnSyncImpl: (() => ({ status: 1, stdout: "", stderr: "gh: Server Error (HTTP 502)" }) as any) as any,
     };
@@ -208,6 +208,17 @@ describe("parseReviewTriggerConfig", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test.each(["bad user", "-reviewer", "reviewer-", "bad--user", "reviewer\n", "a".repeat(40)])("refuses reviewer %j and names the bad value", (reviewer) => {
+    const config = { reviewTrigger: { reviewers: [reviewer], repo: "example/repo" } };
+    expect(() => parseReviewTriggerConfig(config)).toThrow(InvalidReviewTriggerConfigError);
+    expect(() => parseReviewTriggerConfig(config)).toThrow(`Invalid reviewer ${JSON.stringify(reviewer)}: GitHub logins must be 1-39 alphanumeric characters or single hyphens, with no leading or trailing hyphen`);
+  });
+
+  test.each(["a", "Reviewer-1", "a".repeat(39)])("accepts GitHub login %j", (reviewer) => {
+    const reviewTrigger = { reviewers: [reviewer], repo: "example/repo" };
+    expect(parseReviewTriggerConfig({ reviewTrigger })).toEqual(reviewTrigger);
   });
 
   test("returns undefined when the config has no reviewTrigger", () => {

@@ -6,9 +6,10 @@
  * reviewer list, on the repository named by the event's own PR URL.
  *
  * `startReviewTriggerLoop` runs it as its own loop over the agent's feed, with a
- * cursor file separate from the task loop's, acting only on events the agent
- * itself authored. `handlePrOpened` throws `PermanentEventError` for a failure
- * classified as terminal (a detail that names no repository, a 404 or 422 from
+ * cursor file separate from the task loop's, acting on events attributed to the
+ * agent by stored `authorId`; an admin caller may supply `authorId`.
+ * `handlePrOpened` throws `PermanentEventError` for a failure
+ * classified terminal (a detail that names no repository, a 404 or 422 from
  * gh) and an ordinary error for any other failure, so the loop skips the former
  * and retries the latter within the attempt bound.
  */
@@ -24,7 +25,7 @@ export const REVIEW_TRIGGER_MAX_ATTEMPTS = 3;
 
 
 export interface ReviewTriggerConfig {
-  reviewers: string[];   // GitHub usernames to request review from
+  reviewers: string[];   // GitHub logins to request review from
   agentId: string;       // gh-as identity (e.g. "anvil")
   repo: string;          // owner/repo (e.g. "tpsdev-ai/cli")
 }
@@ -42,7 +43,8 @@ export class InvalidReviewTriggerConfigError extends Error {
 
 /**
  * Validate an agent's `reviewTrigger` property. An absent key disables the loop;
- * invalid values throw.
+ * reviewers must be GitHub logins: 1-39 alphanumeric characters or single
+ * hyphens, with no leading or trailing hyphen. Invalid values throw.
  */
 export function parseReviewTriggerConfig(config: { reviewTrigger?: unknown }): { reviewers: string[]; repo: string } | undefined {
   if (!Object.hasOwn(config, "reviewTrigger")) return undefined;
@@ -51,8 +53,13 @@ export function parseReviewTriggerConfig(config: { reviewTrigger?: unknown }): {
     throw new InvalidReviewTriggerConfigError("it must be a mapping with `reviewers` and `repo`");
   }
   const { reviewers, repo } = raw as { reviewers?: unknown; repo?: unknown };
-  if (!Array.isArray(reviewers) || reviewers.length === 0 || !reviewers.every((r) => typeof r === "string" && r.trim().length > 0)) {
-    throw new InvalidReviewTriggerConfigError("`reviewers` must be a non-empty list of GitHub usernames");
+  if (!Array.isArray(reviewers) || reviewers.length === 0) {
+    throw new InvalidReviewTriggerConfigError("`reviewers` must be a non-empty list of GitHub logins");
+  }
+  for (const reviewer of reviewers) {
+    if (typeof reviewer !== "string" || reviewer.length < 1 || reviewer.length > 39 || /[^A-Za-z0-9-]|^-|-$|--/.test(reviewer)) {
+      throw new InvalidReviewTriggerConfigError(`Invalid reviewer ${JSON.stringify(reviewer)}: GitHub logins must be 1-39 alphanumeric characters or single hyphens, with no leading or trailing hyphen`);
+    }
   }
   if (typeof repo !== "string" || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) {
     throw new InvalidReviewTriggerConfigError("`repo` must be an owner/name string");
@@ -79,10 +86,9 @@ function ghHttpStatus(stderr: string): number | null {
 }
 
 /**
- * Whether a failed `gh-as api` call is classified as terminal. HTTP 404 and 422
- * failures are classified as terminal and skipped, whatever explanation comes
- * with them; every other request failure (a network error, a 5xx, a rate limit,
- * an authentication or authorization refusal) uses bounded retries.
+ * Whether a failed `gh-as api` call is classified terminal. HTTP 404 and 422
+ * failures are classified terminal and skipped by the review loop, whatever
+ * explanation comes with them; other failures are given bounded attempts.
  */
 export function isPermanentGhFailure(stderr: string): boolean {
   const status = ghHttpStatus(stderr);
@@ -91,13 +97,13 @@ export function isPermanentGhFailure(stderr: string): boolean {
 
 interface ReviewRequestOutcome {
   ok: boolean;
-  /** For a failure, whether it is classified as terminal (HTTP 404 or 422). */
+  /** For a failure, whether it is classified terminal (HTTP 404 or 422). */
   permanent: boolean;
   /** For a failure, a short reason for the log. */
   reason: string;
 }
 
-/** Attempt the review request once and report whether a failure may be retried. */
+/** Attempt the review request once and classify a failure. */
 function attemptRequestReviews(
   repo: string,
   prNumber: number,
@@ -146,10 +152,10 @@ export function reRequestReviewer(
 
 /**
  * Handle a pr.opened OrgEvent: parse the PR URL and request reviews on that
- * repository. Throws `PermanentEventError` for a failure classified as terminal (no
+ * repository. Throws `PermanentEventError` for a failure classified terminal (no
  * PR URL or repository in `detail`, a URL naming another repository, a 404/422
- * from gh) and an ordinary error for a transient one, so the loop skips the
- * former and retries the latter.
+ * from gh). The loop skips classified terminal failures; other failures are
+ * given bounded attempts.
  */
 export async function handlePrOpened(
   event: { detail?: string; summary: string; refId?: string },
@@ -175,7 +181,7 @@ export async function handlePrOpened(
 }
 
 /**
- * Poll the agent's own feed for `pr.opened` events the agent itself authored,
+ * Poll the agent's feed for `pr.opened` events attributed to it by stored `authorId`,
  * using a different cursor filename from the task loop. The loop ID allows the
  * CLI's 64-character agent ID plus `-review-trigger`.
  */

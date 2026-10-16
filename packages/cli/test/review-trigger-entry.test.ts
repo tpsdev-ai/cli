@@ -11,7 +11,7 @@ function readRows(path: string): any[] {
 }
 
 for (const taskPath of ["flair", "mail"]) {
-  test(`${taskPath} task: config-file launch publishes the PR URL and requests configured reviewers`, async () => {
+  test(`${taskPath} task: config-file launch requests configured reviewers and ignores a signed non-admin POST claiming the agent's authorId`, async () => {
     const root = mkdtempSync(join(tmpdir(), "review-entry-"));
     const bin = join(root, "bin");
     const workspace = join(root, "workspace");
@@ -70,8 +70,11 @@ for (const taskPath of ["flair", "mail"]) {
         await Bun.sleep(20);
       } while (Date.now() < deadline);
       const emitted = readRows(join(root, "events.jsonl")).filter((event) => event.kind === "pr.opened");
-      expect(emitted, output).toHaveLength(1);
-      expect(emitted[0]).toMatchObject({ authorId: "agent-a", refId: `task-${taskPath}`, detail: "https://github.com/example/repo/pull/17" });
+      expect(emitted, output).toHaveLength(2);
+      const forged = emitted.find((event) => event.refId === "forged");
+      expect(forged).toMatchObject({ authorId: "flint", detail: "https://github.com/example/repo/pull/999" });
+      expect(readRows(join(root, "catchup.jsonl")).some((read) => read.served.includes(forged.id)), output).toBe(true);
+      expect(emitted.find((event) => event.refId === `task-${taskPath}`)).toMatchObject({ authorId: "agent-a", detail: "https://github.com/example/repo/pull/17" });
       expect(calls.filter((call) => call.command === "codex"), output).toHaveLength(1);
       expect(calls.some((call) => call.command === "git" && call.args[0] === "push"), output).toBe(true);
       expect(calls.filter((call) => call.command === "gh-as" && call.args[1] === "api"), output).toEqual([{

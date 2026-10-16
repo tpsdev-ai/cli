@@ -55,12 +55,13 @@
  * restart after a failed save if it occurs before a later successful save.
  * Handlers must be idempotent.
  *
- * BOUNDED RETRIES. A handler that throws `PermanentEventError` (a failure its
- * handler classifies as terminal) or keeps failing past the caller's `maxAttempts` has its
- * reason recorded and its event marked handled; the cursor advances past it
- * subject to the existing skew and persistence rules, so no event holds the
- * loop forever. With `maxAttempts` unset the retry is unbounded, as the DELIVERY
- * paragraph above describes.
+ * BOUNDED RETRIES. Classified terminal failures (`PermanentEventError`) and
+ * other failures that exhaust the caller's `maxAttempts` are recorded and marked
+ * handled; the cursor advances past them
+ * subject to the existing skew and persistence rules. Within a running loop
+ * whose handler attempts return, no event holds the cursor beyond the attempt
+ * bound. Attempts reset on restart; a review-request subprocess with no timeout
+ * can hold a single attempt. With `maxAttempts` unset the retry is unbounded.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
@@ -121,11 +122,10 @@ export function isSafeLoopId(loopId: string): boolean {
 }
 
 /**
- * Thrown by a task handler for a failure it classifies as terminal, such as a
+ * Thrown by a task handler for a failure classified terminal, such as a
  * malformed event or a 404/422 from the upstream API. The loop records its reason and marks the
  * event handled; the cursor advances past it subject to the existing skew and
- * persistence rules, so one bad event cannot hold the loop at it (head-of-line
- * blocking) forever.
+ * persistence rules.
  */
 export class PermanentEventError extends Error {
   constructor(reason: string) {
@@ -241,12 +241,10 @@ export function startTaskLoop(
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  // When set, only events this author wrote are eligible; the review loop uses it
-  // to act on the agent's OWN pr.opened events, never another agent's broadcast.
+  // Filter by stored attribution; an admin caller may supply authorId.
   const authorId = opts.authorId;
-  // A transient handler failure is attempted at most this many times per event,
-  // then recorded and skipped so it cannot hold the loop. Undefined keeps the
-  // original unbounded retry (the task loop's at-least-once contract).
+  // Other failures are given bounded attempts, then recorded and skipped.
+  // Undefined keeps the original unbounded retry.
   const maxAttempts = opts.maxAttempts ?? Infinity;
   const attempts = new Map<string, number>();
   // Omitted loop IDs use the agentId cursor.
@@ -324,11 +322,11 @@ export function startTaskLoop(
                   const err = e as Error;
                   const count = (attempts.get(event.id) ?? 0) + 1;
                   if (err instanceof PermanentEventError) {
-                    // Classified as terminal by the handler: record its reason and let the cursor advance.
+                    // Classified terminal by the handler: record its reason and let the cursor advance.
                     attempts.delete(event.id);
-                    serror(`[${agentId}] Task ${event.id} failed permanently (${err.message}); recorded and marked handled`);
+                    serror(`[${agentId}] Task ${event.id} failure classified terminal (${err.message}); recorded and marked handled`);
                   } else if (count >= maxAttempts) {
-                    // The transient-failure bound is spent: record and skip it.
+                    // Other failures, given bounded attempts: record and skip at the bound.
                     attempts.delete(event.id);
                     serror(`[${agentId}] Task ${event.id} failed ${count} times (last: ${err.message}); recorded and skipped after the attempt bound of ${maxAttempts}`);
                   } else {
