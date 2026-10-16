@@ -4,8 +4,6 @@
   workflows, once that push starts a run. Smoke starts a pull-request run only
   when its path filter matches; a push to main keeps all four targets.
 
-  A pull request's runs of either workflow share that workflow's group, so
-  cancellation follows the order in which runs enter it: a manual re-run of an
-  older run enters the group again and cancels the current head's run, which then
-  needs re-running, and a stale run's results appear only on its own commit,
-  never on the PR head.
+  A manual re-run of an older PR run cancels the current head's run only while
+  that run is pending or in progress; a replacement head run may then be needed.
+  A stale run does not supply a completed check for the current head.
