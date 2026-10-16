@@ -13,7 +13,10 @@ mock.module(join(utils, "agent-lifecycle.ts"), () => ({
   onBoot: async () => ({}), onTaskStart: async () => ({}),
   onTaskComplete: async () => {}, onTaskFailure: async () => {},
 }));
-mock.module(join(utils, "flair-task-loop.ts"), () => ({ startTaskLoop: () => () => {} }));
+mock.module(join(utils, "flair-task-loop.ts"), () => ({
+  startTaskLoop: () => () => {},
+  PermanentEventError: class PermanentEventError extends Error {},
+}));
 const seeds = { flint: Buffer.alloc(32, 1), "openclaw-bridge": Buffer.alloc(32, 2), kern: Buffer.alloc(32, 3) };
 const stub = startUnverifiedFetchFlair(seeds);
 process.env.TPS_MAIL_DIR = join(root!, "mail");

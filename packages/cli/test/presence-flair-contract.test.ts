@@ -1,18 +1,18 @@
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { readPresence } from "../src/utils/presence-read.js";
+import { flairTarget } from "./helpers/scratch-flair.js";
 import { pubkeyFromSeed, requestSigner } from "./helpers/stub-flair.js";
 
-test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair serves a capped task and accepts a lowercase signed header", async () => {
-  const flairUrl = "http://127.0.0.1:9926";
-  const opsUrl = "http://127.0.0.1:9925";
+test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair serves a capped task to a signed reader", async () => {
+  const { baseUrl: flairUrl, opsUrl, admin } = flairTarget();
   const id = `presence-contract-${randomUUID()}`;
   const seed = Buffer.alloc(32, 0x6b);
-  const signer = requestSigner(id, seed);
-  const sign = (method: string, path: string) => signer(method, path).replace("TPS-Ed25519", "tps-ed25519");
+  // The production scheme: real Flair 0.58.0 matches `TPS-Ed25519` case-sensitively.
+  const sign = requestSigner(id, seed);
   const operation = (body: unknown) => fetch(opsUrl, {
     method: "POST",
-    headers: { Authorization: `Basic ${Buffer.from("admin:test123").toString("base64")}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Basic ${Buffer.from(admin).toString("base64")}`, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const task = "x".repeat(199) + " ";
@@ -40,7 +40,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair serves a capped
 }, 30_000);
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair rejects an invalid Bearer token on GET /Presence", async () => {
-  const response = await fetch("http://127.0.0.1:9926/Presence", {
+  const response = await fetch(`${flairTarget().baseUrl}/Presence`, {
     headers: { Authorization: "Bearer not-a-credential" },
   });
   expect(response.status).toBe(401);

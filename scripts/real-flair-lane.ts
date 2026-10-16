@@ -21,6 +21,16 @@ export const EXPECTED_CASES: Record<string, string[]> = {
     "against a real Flair, create on a pending row completes registration when the instance serves POST /AgentKeyRegister, and refuses otherwise",
   ],
   "mail-flair-read-auth.test.ts": ["real Flair Agent read guards and refused-read mail recovery"],
+  "presence-flair-contract.test.ts": [
+    "real Flair serves a capped task to a signed reader",
+    "real Flair rejects an invalid Bearer token on GET /Presence",
+  ],
+  "review-trigger-flair.test.ts": [
+    "real Flair stamps a signed non-admin POST and the review loop skips its claimed agent attribution",
+  ],
+  "real-flair-lane.test.ts": [
+    "test files referencing the real-Flair flag are named by the lane and covered by workflow paths",
+  ],
 };
 
 function decodeXml(value: string): string {
@@ -37,6 +47,9 @@ export function assertRealFlairReport(xml: string): void {
     return { name: attrs.name, file: attrs.file, body: match[2] ?? "" };
   });
   for (const [file, names] of Object.entries(EXPECTED_CASES)) {
+    if (names.length === 0) {
+      throw new Error(`real-flair lane: expected at least one case for ${file}`);
+    }
     for (const name of names) {
       const found = cases.filter((item) => item.name === name && item.file?.replaceAll("\\", "/").endsWith(`/${file}`));
       if (found.length !== 1 || /<(?:skipped|failure|error)\b/.test(found[0].body)) {

@@ -200,16 +200,38 @@ export function assertListenerAddresses(port: number, addresses: string[]): void
   }
 }
 
-export function assertLoopbackListeners(ports: number[]): void {
+/** The socket-table tools the listener checker can read a port through. */
+export type DiscoveryTool = "lsof" | "ss";
+
+/** The listening addresses on `port` as lsof reports them; an unbound port makes lsof exit non-zero. */
+function lsofListeners(port: number): string[] {
+  const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"], { encoding: "utf8" });
+  return out.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
+}
+
+/** The listening addresses on `port` as ss reports them; an empty list means no listener. */
+function ssListeners(port: number): string[] {
+  const out = execFileSync("ss", ["-H", "-ltn", "sport", "=", `:${port}`], { encoding: "utf8" });
+  return out.trim().split("\n").filter(Boolean).map((line) => line.trim().split(/\s+/)[3]);
+}
+
+/**
+ * Refuse any port not listening only on 127.0.0.1. With no `tool`, lsof is read
+ * and ss takes over when lsof is not installed; a caller passing `tool` forces
+ * that one tool, so a test can cover either path.
+ */
+export function assertLoopbackListeners(ports: number[], tool?: DiscoveryTool): void {
   for (const port of ports) {
     let addresses: string[];
-    try {
-      const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"], { encoding: "utf8" });
-      addresses = out.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      const out = execFileSync("ss", ["-H", "-ltn", "sport", "=", `:${port}`], { encoding: "utf8" });
-      addresses = out.trim().split("\n").filter(Boolean).map((line) => line.trim().split(/\s+/)[3]);
+    if (tool === "ss") {
+      addresses = ssListeners(port);
+    } else {
+      try {
+        addresses = lsofListeners(port);
+      } catch (error) {
+        if (tool === "lsof" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        addresses = ssListeners(port);
+      }
     }
     assertListenerAddresses(port, addresses);
     console.log(`real-flair lane: listening socket ${port}: ${addresses.join(", ")}`);
