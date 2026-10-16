@@ -23,6 +23,7 @@
  * CODE and have adopted the shape cli#415 gave `test.yml`:
  *
  *   - `test.yml` — guarded (runs on `pull_request`).
+ *   - `real-flair.yml` — guarded (runs on `pull_request`, path-filtered).
  *   - `docker.yml` — NOT guarded: its only trigger is `workflow_dispatch`; it
  *     has no `pull_request` trigger.
  *   - `release.yml` — NOT guarded: triggered by a `push` of `v*` tags, not by a
@@ -69,7 +70,7 @@ const REPO = join(import.meta.dir, "..", "..", "..");
 const WORKFLOW_DIR = join(REPO, ".github", "workflows");
 
 /** Workflows the four rules are enforced on. */
-const GUARDED = ["test.yml"];
+const GUARDED = ["test.yml", "real-flair.yml"];
 
 /** Workflows that run PR-controlled code but are not (yet) held to the rules. */
 const PR_EXCLUDED: Record<string, string> = {
@@ -274,62 +275,97 @@ function stepLabel(step: Step): string {
   return step.name ?? step.uses ?? "<unnamed step>";
 }
 
-describe("test workflow — least privilege (cli#416)", () => {
-  const wf = load("test.yml");
+/**
+ * Rule: the top level grants nothing. cli#415 put `permissions: {}` there.
+ * Anything else — a `contents: read` at the top, or a `write` of any scope —
+ * hands every job that omits its own block whatever the top level declares, one
+ * edit from widening all of them at once.
+ */
+function topLevelProblems(wf: Workflow): string[] {
+  if (wf.permissions === undefined || wf.permissions === null) {
+    return ["no top-level permissions block (it must be `permissions: {}`)"];
+  }
+  const grants = Object.keys(wf.permissions);
+  return grants.length === 0 ? [] : [`the top level grants ${grants.join(", ")}`];
+}
 
-  test("the top level grants nothing: every job opts in to its own scopes", () => {
-    // cli#415 put `permissions: {}` at the top level. Anything else here — a
-    // `contents: read` at the top, or a `write` of any scope — hands every job
-    // that omits its own block whatever the top level declares, one edit from
-    // widening all of them at once.
-    expect(wf.permissions).toEqual({});
+/**
+ * Rule: every job declares its own permissions map. A missing block inherits
+ * the workflow default; a scalar (`write-all`) is a whole access class with no
+ * step to name. Either way the job does not opt in to a scope it can be held to.
+ */
+function jobPermissionProblems(wf: Workflow): string[] {
+  return Object.keys(wf.jobs ?? {}).filter((name) => {
+    const p = wf.jobs?.[name].permissions as unknown;
+    return p === undefined || p === null || typeof p !== "object" || Array.isArray(p);
   });
+}
 
-  test("every job declares its own permissions map", () => {
-    const jobNames = Object.keys(wf.jobs ?? {});
-    expect(jobNames.length, "test.yml has at least one job").toBeGreaterThan(0);
+/** Rule: no checkout persists the token into `.git/config`. */
+function checkoutCredentialProblems(wf: Workflow): string[] {
+  return checkoutsOf(wf)
+    .filter(({ step }) => step.with?.["persist-credentials"] !== false)
+    .map(({ job, step }) => `${job} → ${stepLabel(step)}`);
+}
 
-    // A missing block inherits the workflow default; a scalar (`write-all`) is a
-    // whole access class with no step to name. Either way the job does not opt
-    // in to a scope it can be held to, so both fail here.
-    const bad = jobNames.filter((name) => {
-      const p = wf.jobs?.[name].permissions as unknown;
-      return p === undefined || p === null || typeof p !== "object" || Array.isArray(p);
+describe("guarded workflows — least privilege (cli#416)", () => {
+  // The four rules run on every entry in GUARDED, so putting a workflow in that
+  // set actually holds it to them; the inventory test alone only records the
+  // decision.
+  for (const file of GUARDED) {
+    const wf = load(file);
+
+    test(`${file}: the top level grants nothing: every job opts in to its own scopes`, () => {
+      const problems = topLevelProblems(wf);
+      expect(problems, `top-level permissions in ${file}: ${problems.join("; ")}`).toEqual([]);
     });
-    expect(
-      bad,
-      `jobs without a permissions map of their own (they inherit the workflow default, or grant a whole access class): ${bad.join(", ")}`,
-    ).toEqual([]);
-  });
 
-  test("every write scope is readable and names the step that needs it", () => {
-    // The model is the CodeQL job's `security-events: write # CodeQL's upload of
-    // SARIF results (the "Perform CodeQL Analysis" step)`. A bare `write` says a
-    // scope is needed but not by what, so the next reader cannot tell whether it
-    // is still needed at all; a `# TODO` says just as little.
-    const { writes, unreadable } = scanPermissions("test.yml");
-    expect(writes.length, "test.yml declares at least one write scope (positive control)").toBeGreaterThan(
-      0,
-    );
+    test(`${file}: every job declares its own permissions map`, () => {
+      const jobNames = Object.keys(wf.jobs ?? {});
+      expect(jobNames.length, `${file} has at least one job`).toBeGreaterThan(0);
 
-    const problems = writeScopeProblems(wf, { writes, unreadable });
-    expect(
-      problems,
-      `write scopes with no comment naming the step that needs them: ${problems.join("; ")}`,
-    ).toEqual([]);
-  });
+      // A missing block inherits the workflow default; a scalar (`write-all`)
+      // is a whole access class with no step to name. Either way the job does
+      // not opt in to a scope it can be held to, so both fail here.
+      const bad = jobPermissionProblems(wf);
+      expect(
+        bad,
+        `jobs in ${file} without a permissions map of their own (they inherit the workflow default, or grant a whole access class): ${bad.join(", ")}`,
+      ).toEqual([]);
+    });
 
-  test("every checkout (any owner's checkout action) disables credential persistence", () => {
-    const found = checkouts("test.yml");
-    expect(found.length, "test.yml checks out at least once").toBeGreaterThan(0);
+    test(`${file}: every write scope is readable and names the step that needs it`, () => {
+      // The model is the CodeQL job's `security-events: write # CodeQL's upload
+      // of SARIF results (the "Perform CodeQL Analysis" step)`. A bare `write`
+      // says a scope is needed but not by what, so the next reader cannot tell
+      // whether it is still needed at all; a `# TODO` says just as little.
+      // real-flair.yml declares no write scope, so for it this rule passes
+      // vacuously — the non-vacuous positive control is the test.yml case below.
+      const { writes, unreadable } = scanPermissions(file);
+      const problems = writeScopeProblems(wf, { writes, unreadable });
+      expect(
+        problems,
+        `write scopes in ${file} with no comment naming the step that needs them: ${problems.join("; ")}`,
+      ).toEqual([]);
+    });
 
-    const offending = found
-      .filter(({ step }) => step.with?.["persist-credentials"] !== false)
-      .map(({ job, step }) => `${job} → ${stepLabel(step)}`);
-    expect(
-      offending,
-      `checkouts that persist the token into .git/config: ${offending.join("; ")}`,
-    ).toEqual([]);
+    test(`${file}: every checkout (any owner's checkout action) disables credential persistence`, () => {
+      const found = checkouts(file);
+      expect(found.length, `${file} checks out at least once`).toBeGreaterThan(0);
+
+      const offending = checkoutCredentialProblems(wf);
+      expect(
+        offending,
+        `checkouts in ${file} that persist the token into .git/config: ${offending.join("; ")}`,
+      ).toEqual([]);
+    });
+  }
+
+  test("test.yml declares at least one write scope (positive control)", () => {
+    // Tied to test.yml: real-flair.yml needs no write grant, so it cannot prove
+    // the write rule is non-vacuous.
+    const { writes } = scanPermissions("test.yml");
+    expect(writes.length, "test.yml declares at least one write scope").toBeGreaterThan(0);
   });
 });
 
@@ -424,4 +460,62 @@ jobs:
     expect(unreadable.join("; ")).toContain("<workflow-level>");
     expect(unreadable.join("; ")).not.toContain("pull_request");
   });
+});
+
+// The blind review found the permission rules hard-coded to test.yml while
+// `GUARDED` claimed real-flair.yml was guarded. Each mutation the reviewer used
+// is applied here to EVERY entry in GUARDED, so each rule is proven to bite on
+// the workflow that names it, not on test.yml alone.
+describe("workflow permissions — every mutation fails for every guarded workflow (cli#646)", () => {
+  const parse = (text: string): Workflow => yaml.load(text) as Workflow;
+
+  interface Mutation {
+    /** Human name for the failure message. */
+    name: string;
+    /** The mutated workflow text. */
+    text: (file: string) => string;
+    /** The rule the mutation must trip. */
+    problems: (wf: Workflow, text: string) => string[];
+  }
+
+  const MUTATIONS: Mutation[] = [
+    {
+      name: "broader top-level grant",
+      text: (file) => raw(file).replace(/^permissions: \{\}$/m, "permissions:\n  contents: read"),
+      problems: (wf) => topLevelProblems(wf),
+    },
+    {
+      name: "missing job permissions block",
+      text: (file) => raw(file).replace(/ {4}permissions:\n {6}contents: read[^\n]*\n/, ""),
+      problems: (wf) => jobPermissionProblems(wf),
+    },
+    {
+      name: "write grant with no named step",
+      text: (file) =>
+        raw(file).replace(
+          /( {4}permissions:\n {6}contents: read[^\n]*\n)/,
+          "$1      security-events: write # TODO\n",
+        ),
+      problems: (wf, text) => writeScopeProblems(wf, scanPermissionsText(text)),
+    },
+    {
+      name: "persisted checkout credential",
+      text: (file) => raw(file).replace(/\n[ \t]*persist-credentials: false[^\n]*/, ""),
+      problems: (wf) => checkoutCredentialProblems(wf),
+    },
+  ];
+
+  for (const file of GUARDED) {
+    for (const mutation of MUTATIONS) {
+      test(`${file}: a ${mutation.name} trips the rule`, () => {
+        const text = mutation.text(file);
+        expect(text, `the ${mutation.name} mutation edited ${file}`).not.toBe(raw(file));
+        const problems = mutation.problems(parse(text), text);
+        expect(
+          problems.length,
+          `the ${mutation.name} mutation in ${file} is rejected: ${problems.join("; ")}`,
+        ).toBeGreaterThan(0);
+      });
+    }
+  }
 });

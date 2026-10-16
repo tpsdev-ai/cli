@@ -70,7 +70,9 @@ import { basename, dirname, join, resolve, sep } from "node:path";
  * (`isPathFree`), so a path cannot arrive under one of these names either.
  */
 export const PASSED_ENV = {
-  TPS_TEST_REAL_FLAIR: "opts into the real-Flair test, which uses a Flair server already listening on 127.0.0.1:9925 and :9926",
+  TPS_TEST_REAL_FLAIR: "opts into tests against a running Flair server",
+  TPS_TEST_FLAIR_HTTP_PORT: "scratch HTTP port; flairTarget validates it before building a loopback URL",
+  TPS_TEST_FLAIR_OPS_PORT: "scratch operator-API port; flairTarget validates it before building a loopback URL",
   PATH: "bun, node, git and the other tools the tests spawn are found through it",
   LANG: "locale: the language and encoding of the tools the tests spawn",
   LANGUAGE: "locale: message-language preference of the tools the tests spawn",
