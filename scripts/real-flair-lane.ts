@@ -1,68 +1,113 @@
 #!/usr/bin/env bun
-/**
- * real-flair-lane.ts — the runner for the real-Flair lane (cli#520).
- *
- * It starts ONE scratch Flair (the helper in
- * `packages/cli/test/helpers/scratch-flair.ts`), runs every test file that carries
- * the `TPS_TEST_REAL_FLAIR=1` opt-in through the HOME-isolated suite launcher
- * (`scripts/test-suite.mjs`), and stops the instance in a `finally` so the job
- * leaves no process and no tree behind. The tests read the instance's loopback
- * ports from the environment, so no path crosses into the sandboxed child.
- *
- * Run it with bun (it imports TypeScript):
- *   bun scripts/real-flair-lane.ts
- */
-import { spawnSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { startScratchFlair, stopScratchFlair } from "../packages/cli/test/helpers/scratch-flair.js";
+import { withScratchFlair } from "../packages/cli/test/helpers/scratch-flair.js";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const CLI_DIR = join(REPO, "packages", "cli");
-const TEST_DIR = join(CLI_DIR, "test");
 
-/** Every test file under `packages/cli/test` that opts into the real-Flair cases. */
-function markedFiles(): string[] {
-  const found: string[] = [];
-  const walk = (dir: string): void => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === "node_modules") continue;
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) walk(path);
-      else if (/[._]test\.ts$/.test(entry.name) && readFileSync(path, "utf8").includes("TPS_TEST_REAL_FLAIR")) {
-        found.push(relative(CLI_DIR, path).replaceAll("\\", "/"));
+export const EXPECTED_CASES: Record<string, string[]> = {
+  "real-flair.test.ts": [
+    "a signed memory write reads back with the fields it was written with",
+    "a non-admin searching another agent's scope is refused, and its own scope is served",
+    "archiving over PATCH keeps the memory's other fields",
+    "agent registration reads its key back from Flair, the cli#512 seam",
+  ],
+  "agent-create-registration.test.ts": [
+    "against a real Flair, create refuses when the generated key cannot be registered",
+    "against a real Flair, create succeeds with an existing Agent and matching local key",
+  ],
+  "mail-flair-read-auth.test.ts": ["real Flair Agent read guards and refused-read mail recovery"],
+};
+
+function decodeXml(value: string): string {
+  return value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (_, entity: string) => {
+    if (entity.startsWith("#x")) return String.fromCodePoint(Number.parseInt(entity.slice(2), 16));
+    if (entity.startsWith("#")) return String.fromCodePoint(Number(entity.slice(1)));
+    return ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" } as Record<string, string>)[entity];
+  });
+}
+
+export function assertRealFlairReport(xml: string): void {
+  const cases = [...xml.matchAll(/<testcase\b([^>]*?)(?:\/>|>([\s\S]*?)<\/testcase>)/g)].map((match) => {
+    const attrs = Object.fromEntries([...match[1].matchAll(/([\w-]+)="([^"]*)"/g)].map((attr) => [attr[1], decodeXml(attr[2])]));
+    return { name: attrs.name, file: attrs.file, body: match[2] ?? "" };
+  });
+  for (const [file, names] of Object.entries(EXPECTED_CASES)) {
+    for (const name of names) {
+      const found = cases.filter((item) => item.name === name && item.file?.replaceAll("\\", "/").endsWith(`/${file}`));
+      if (found.length !== 1 || /<(?:skipped|failure|error)\b/.test(found[0].body)) {
+        throw new Error(`real-flair lane: expected a passed, unskipped case: ${file}: ${name}`);
       }
     }
-  };
-  walk(TEST_DIR);
-  return found.sort();
+  }
 }
 
-const files = markedFiles();
-if (files.length === 0) {
-  console.error("real-flair lane: no test file under packages/cli/test carries TPS_TEST_REAL_FLAIR");
-  process.exit(1);
+export function assertListenerAddresses(port: number, addresses: string[]): void {
+  if (addresses.length === 0 || addresses.some((address) => address !== `127.0.0.1:${port}`)) {
+    throw new Error(`real-flair lane: port ${port} must listen only on 127.0.0.1; got ${JSON.stringify(addresses)}`);
+  }
 }
-console.log(`real-flair lane: ${files.length} marked file(s): ${files.join(", ")}`);
 
-const flair = await startScratchFlair();
-console.log(`real-flair lane: scratch Flair on http://127.0.0.1:${flair.httpPort} (ops :${flair.opsPort})`);
-let code = 1;
-try {
-  const run = spawnSync("node", [join(REPO, "scripts", "test-suite.mjs"), "real-flair", ...files], {
-    cwd: CLI_DIR,
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      TPS_TEST_REAL_FLAIR: "1",
-      TPS_TEST_FLAIR_HTTP_PORT: String(flair.httpPort),
-      TPS_TEST_FLAIR_OPS_PORT: String(flair.opsPort),
-    },
+export function assertLoopbackListeners(ports: number[]): void {
+  for (const port of ports) {
+    let addresses: string[];
+    try {
+      const out = execFileSync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fn"], { encoding: "utf8" });
+      addresses = out.split("\n").filter((line) => line.startsWith("n")).map((line) => line.slice(1));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const out = execFileSync("ss", ["-H", "-ltn", "sport", "=", `:${port}`], { encoding: "utf8" });
+      addresses = out.trim().split("\n").filter(Boolean).map((line) => line.trim().split(/\s+/)[3]);
+    }
+    assertListenerAddresses(port, addresses);
+    console.log(`real-flair lane: listening socket ${port}: ${addresses.join(", ")}`);
+  }
+}
+
+async function main(): Promise<void> {
+  const files = Object.keys(EXPECTED_CASES).map((file) => `test/${file}`);
+  console.log(`real-flair lane: ${files.length} named file(s): ${files.join(", ")}`);
+  process.exitCode = await withScratchFlair(async (flair, signal) => {
+    assertLoopbackListeners([flair.httpPort, flair.opsPort]);
+    const child = spawn("node", [join(REPO, "scripts", "test-suite.mjs"), "real-flair", ...files], {
+      cwd: CLI_DIR,
+      detached: true,
+      stdio: "inherit",
+      env: {
+        ...process.env,
+        TPS_TEST_REAL_FLAIR: "1",
+        TPS_TEST_FLAIR_HTTP_PORT: String(flair.httpPort),
+        TPS_TEST_FLAIR_OPS_PORT: String(flair.opsPort),
+      },
+    });
+    const terminate = () => {
+      if (child.pid) {
+        try { process.kill(-child.pid, "SIGTERM"); } catch { /* child already exited */ }
+      }
+    };
+    signal.addEventListener("abort", terminate, { once: true });
+    let code: number;
+    try {
+      code = await new Promise<number>((resolveExit, reject) => {
+        child.once("error", reject);
+        child.once("exit", (status) => resolveExit(status ?? 1));
+      });
+    } finally {
+      signal.removeEventListener("abort", terminate);
+    }
+    assertRealFlairReport(readFileSync(join(process.env.TPS_TEST_REPORT_DIR ?? join(REPO, "test-reports"), "real-flair.xml"), "utf8"));
+    return code;
   });
-  code = run.status ?? 1;
-} finally {
-  await stopScratchFlair(flair);
-  console.log(`real-flair lane: stopped the scratch Flair and removed ${flair.root}`);
 }
-process.exit(code);
+
+if (import.meta.main) {
+  try {
+    await main();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+  }
+}

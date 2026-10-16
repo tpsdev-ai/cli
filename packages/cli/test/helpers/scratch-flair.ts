@@ -1,28 +1,11 @@
-/**
- * scratch-flair.ts — ONE scratch Flair for the tests that cross the Flair seam.
- *
- * A cli test of a Flair interaction usually drives a fake. This helper starts a
- * REAL one instead: it installs the published `@tpsdev-ai/flair` package into a
- * throwaway prefix, boots the Harper that serves it on OS-chosen loopback ports
- * with an isolated HOME and a short-root data dir, and seeds one operator and two
- * agents. The real-Flair lane (`.github/workflows/real-flair.yml`) starts it once,
- * runs the tests that carry the `TPS_TEST_REAL_FLAIR=1` flag cli#591 introduced,
- * and tears it down in a `finally`.
- *
- * It is the real component on the far side of the seam: the CLI's FlairClient
- * signs with an Ed25519 key and Flair verifies that signature against the public
- * key it stores, so a test that reaches this instance fails when the client and
- * Flair disagree about the wire, the signature or the read scope.
- *
- * Names are neutral (`agent-a`, `agent-b`): a fixture must not name a real fleet
- * host or agent.
- */
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+/** Scratch Harper serving @tpsdev-ai/flair 0.58.0 for the real-Flair lane. */
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "../../src/utils/flair-client.js";
 import { generateKeyPair } from "../../src/utils/identity.js";
@@ -34,14 +17,14 @@ export const FLAIR_VERSION = "0.58.0";
 /** The operator (Harper admin) credential the helper boots and seeds with. */
 export const ADMIN_AUTH = "admin:test123";
 
-/** The agents `startScratchFlair` seeds, by name. */
+/** The agents the lane seeds, by name. */
 export const SEEDED_AGENTS = ["agent-a", "agent-b"] as const;
 
-/** The data root's name under the scratch tree; kept short for unix sockets. */
 const SCRATCH_PREFIX = "flair-test-";
 
-/** How long to wait for the two listeners before failing with the boot log. */
 const BOOT_TIMEOUT_MS = 180_000;
+
+const execFileAsync = promisify(execFile);
 
 /**
  * The node binary the scratch Harper runs under. Harper's native modules need
@@ -82,18 +65,20 @@ export interface FlairTarget {
 
 /** Ask the OS for `count` distinct free loopback TCP ports. */
 async function freePorts(count: number): Promise<number[]> {
-  const servers = await Promise.all(
-    Array.from({ length: count }, () =>
-      new Promise<ReturnType<typeof createServer>>((resolve, reject) => {
-        const server = createServer();
+  const servers: ReturnType<typeof createServer>[] = [];
+  try {
+    for (let index = 0; index < count; index++) {
+      const server = createServer();
+      await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
-        server.listen(0, "127.0.0.1", () => resolve(server));
-      }),
-    ),
-  );
-  const ports = servers.map((server) => (server.address() as AddressInfo).port);
-  await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-  return ports;
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      servers.push(server);
+    }
+    return servers.map((server) => (server.address() as AddressInfo).port);
+  } finally {
+    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  }
 }
 
 /** The environment the scratch Harper and its installer run under. */
@@ -116,33 +101,29 @@ function scratchEnv(root: string, home: string, models: string, httpPort: number
     MQTT_WEBSOCKET: "false",
     THREADS_DEBUG: "false",
     FLAIR_MODELS_DIR: models,
-    OPERATIONSAPI_NETWORK_PORT: String(opsPort),
+    OPERATIONSAPI_NETWORK_PORT: `127.0.0.1:${opsPort}`,
     HTTP_PORT: `127.0.0.1:${httpPort}`,
   };
 }
 
 /** Poll a URL until it answers OK, or the deadline passes. */
-async function waitForOk(url: string, deadline: number): Promise<boolean> {
+export async function waitForOk(url: string, deadline: number, signal?: AbortSignal): Promise<boolean> {
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     try {
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - Date.now())))]) });
+      await res.body?.cancel();
       if (res.ok) return true;
     } catch {
       /* not listening yet */
     }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(500, deadline - Date.now()))));
   }
   return false;
 }
 
-/**
- * Terminate the Harper process and every process whose argv names this
- * instance's own scratch root. Positive pids only, and only ones matching the
- * root this helper created — never a pattern sweep and never another instance's
- * process.
- */
-function killScratchProcesses(proc: ChildProcess, root: string, signal: NodeJS.Signals = "SIGTERM"): void {
-  if (proc.pid && proc.exitCode === null && proc.signalCode === null) {
+function killScratchProcesses(proc: ChildProcess | undefined, root: string, signal: NodeJS.Signals = "SIGTERM"): void {
+  if (proc?.pid && proc.exitCode === null && proc.signalCode === null) {
     try {
       process.kill(proc.pid, signal);
     } catch {
@@ -169,23 +150,45 @@ function killScratchProcesses(proc: ChildProcess, root: string, signal: NodeJS.S
 
 /** The process handle and tree a `stopScratchFlair` call tears down. */
 export interface ScratchProcess {
-  proc: ChildProcess;
+  proc?: ChildProcess;
   root: string;
 }
 
 /** Stop the instance and remove its tree. */
 export async function stopScratchFlair(instance: ScratchProcess): Promise<void> {
   killScratchProcesses(instance.proc, instance.root);
-  await new Promise((resolve) => setTimeout(resolve, 4000));
+  if (instance.proc) await new Promise((resolve) => setTimeout(resolve, 4000));
   killScratchProcesses(instance.proc, instance.root, "SIGKILL");
-  // Remove exactly the tree this helper created (never a variable from an earlier
-  // shell, never a glob). A leftover is worse than a retry, so this throws.
   rmSync(instance.root, { recursive: true, force: true, maxRetries: 4 });
 }
 
-/** Boot the scratch instance: install Flair, boot Harper, seed the operator and two agents. */
-export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess> {
-  const root = mkdtempSync(join(tmpdir(), SCRATCH_PREFIX));
+export async function withScratchFlair<T>(
+  run: (flair: ScratchFlair & ScratchProcess, signal: AbortSignal) => Promise<T>,
+  initialize = initializeScratchFlair,
+): Promise<T> {
+  const instance: ScratchProcess = { root: mkdtempSync(join(tmpdir(), SCRATCH_PREFIX)) };
+  const controller = new AbortController();
+  const terminate = () => controller.abort(new Error("real-Flair lane interrupted"));
+  process.once("SIGINT", terminate);
+  process.once("SIGTERM", terminate);
+  try {
+    const flair = await initialize(instance, controller.signal);
+    controller.signal.throwIfAborted();
+    const result = await run(flair, controller.signal);
+    controller.signal.throwIfAborted();
+    return result;
+  } finally {
+    try {
+      await stopScratchFlair(instance);
+    } finally {
+      process.removeListener("SIGINT", terminate);
+      process.removeListener("SIGTERM", terminate);
+    }
+  }
+}
+
+async function initializeScratchFlair(instance: ScratchProcess, signal: AbortSignal): Promise<ScratchFlair & ScratchProcess> {
+  const { root } = instance;
   const home = join(root, "home");
   const models = join(root, "models");
   const prefix = join(root, "install");
@@ -195,10 +198,10 @@ export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess
 
   // Install the published Flair (it brings Harper). Isolated prefix, isolated
   // npm cache (HOME is the scratch home).
-  execFileSync(
+  await execFileAsync(
     "npm",
     ["install", "--prefix", prefix, "--no-audit", "--no-fund", "--loglevel", "error", `${FLAIR_PACKAGE}@${FLAIR_VERSION}`],
-    { env: { PATH: process.env.PATH ?? "", HOME: home, npm_config_cache: join(home, ".npm") }, stdio: "pipe", timeout: 300_000 },
+    { env: { PATH: process.env.PATH ?? "", HOME: home, npm_config_cache: join(home, ".npm") }, signal, timeout: 300_000 },
   );
 
   const flairDir = join(prefix, "node_modules", "@tpsdev-ai", "flair");
@@ -209,10 +212,11 @@ export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess
 
   const [httpPort, opsPort] = await freePorts(2);
   const env = scratchEnv(root, home, models, httpPort, opsPort);
-  execFileSync(NODE_BIN, [harperBin, "install"], { cwd: flairDir, env, stdio: "pipe", timeout: 120_000 });
+  await execFileAsync(NODE_BIN, [harperBin, "install"], { cwd: flairDir, env, signal, timeout: 120_000 });
 
-  const proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
+  const proc = instance.proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
   let log = "";
+  proc.once("error", (error) => { log += String(error); });
   proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
   proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
 
@@ -221,16 +225,15 @@ export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess
   const deadline = Date.now() + BOOT_TIMEOUT_MS;
   // HTTP /Health answers with the Flair version; the operator API's liveness
   // probe is /health (lowercase) on its own port.
-  const httpUp = await waitForOk(`${httpUrl}/Health`, deadline);
-  const opsUp = httpUp && (await waitForOk(`${opsUrl}/health`, deadline));
+  const httpUp = await waitForOk(`${httpUrl}/Health`, deadline, signal);
+  const opsUp = httpUp && (await waitForOk(`${opsUrl}/health`, deadline, signal));
   if (!httpUp || !opsUp) {
-    await stopScratchFlair({ proc, root });
     throw new Error(`scratch Flair did not start within ${BOOT_TIMEOUT_MS}ms (http=${httpUp} ops=${opsUp}). Boot log tail:\n${log.slice(-4000)}`);
   }
 
   const adminB64 = Buffer.from(ADMIN_AUTH).toString("base64");
   const ops = (body: unknown) =>
-    fetch(opsUrl, { method: "POST", headers: { Authorization: `Basic ${adminB64}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    fetch(opsUrl, { signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]), method: "POST", headers: { Authorization: `Basic ${adminB64}`, "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
   const keysDir = join(home, ".tps", "identity");
   mkdirSync(keysDir, { recursive: true });
@@ -251,7 +254,6 @@ export async function startScratchFlair(): Promise<ScratchFlair & ScratchProcess
   const seeded = await ops({ operation: "insert", database: "flair", table: "Agent", records });
   if (!seeded.ok) {
     const text = await seeded.text().catch(() => "");
-    await stopScratchFlair({ proc, root });
     throw new Error(`scratch Flair refused the seed insert (${seeded.status}): ${text.slice(0, 500)}`);
   }
 
@@ -282,8 +284,7 @@ export function freshAgentId(prefix = "agent"): string {
 /**
  * Create a keypair, register its public key through the operator API, and return a
  * signed client for it. The private key is written under the test's own temp dir.
- * A refused registration throws — a test must never run against a key Flair did
- * not store.
+ * A non-OK registration response throws.
  */
 export async function provisionAgent(
   target: FlairTarget,

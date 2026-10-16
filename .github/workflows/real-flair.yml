@@ -1,21 +1,13 @@
 name: Real-Flair integration lane
 
-# cli#520 — run the tests that cross the Flair seam against a REAL Flair (a
-# scratch Harper served by the published @tpsdev-ai/flair). On `main` it runs on
-# every push; on a pull request it runs only when a Flair-facing file changes, so
-# an unrelated PR does not pay to install and boot Flair.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
     paths:
-      - 'packages/cli/src/utils/flair-client*'
-      - 'packages/cli/src/commands/flair*.ts'
-      - 'packages/cli/src/commands/memory*.ts'
-      - 'packages/cli/src/commands/agent.ts'
-      - 'packages/cli/src/commands/office-flair-spoke.ts'
-      - 'packages/cli/src/commands/skill.ts'
+      - 'packages/cli/src/**'
+      - 'packages/agent/src/**'
       - 'packages/cli/test/real-flair.test.ts'
       - 'packages/cli/test/agent-create-registration.test.ts'
       - 'packages/cli/test/mail-flair-read-auth.test.ts'
@@ -23,6 +15,9 @@ on:
       - 'scripts/real-flair-lane.ts'
       - 'scripts/test-suite.mjs'
       - 'scripts/test-home-guard.mjs'
+      - 'packages/cli/test/real-flair-lane.test.ts'
+      - 'package.json'
+      - 'bun.lock'
       - '.github/workflows/real-flair.yml'
 
 permissions: {}
@@ -49,6 +44,4 @@ jobs:
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - name: Real-Flair lane (scratch Flair on a local Harper)
-        # Starts the scratch Flair, runs the marked tests through the isolated
-        # launcher, and stops the instance in a finally.
         run: bun scripts/real-flair-lane.ts

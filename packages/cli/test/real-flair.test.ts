@@ -1,5 +1,5 @@
 /**
- * real-flair.test.ts — the cli's first tests that cross the Flair seam against a
+ * real-flair.test.ts — additional tests across the Flair seam against a
  * REAL Flair (a scratch Harper serving the published @tpsdev-ai/flair), not a
  * fake. The cases cover the four seams a post-merge review found most often
  * wrong: signature-authenticated memory writes and reads, search read scoping for
@@ -7,7 +7,7 @@
  * other fields intact, and the agent key registration read-back of cli#512.
  *
  * They are opt-in, on the same flag cli#591 introduced (`TPS_TEST_REAL_FLAIR=1`):
- * the default suite skips them, so it never opens a port. The real-Flair lane
+ * the default suite skips them. The real-Flair lane
  * (`.github/workflows/real-flair.yml`) starts the scratch instance, sets the flag
  * and the instance's ports, and runs this file plus the other files that carry
  * real-Flair cases.
@@ -97,7 +97,7 @@ realFlair("agent registration reads its key back from Flair, the cli#512 seam", 
   // An id with no row reads as absent — a 404 is the only "no such row".
   const missing = freshAgentId("reg");
   expect(await agent.client.readStoredPublicKey(missing, target.admin)).toEqual({ found: false, publicKey: null });
-  // On current Flair a registration over Agent PUT does not complete, so the
+  // On Flair 0.58.0 a registration over Agent PUT does not complete, so the
   // read-back stays the source of truth: it stays absent.
   const registrar = new FlairClient({ agentId: missing, keyPath: agent.keyPath, baseUrl: target.baseUrl });
   await expect(registrar.registerAgent(missing, agent.publicKey, target.admin)).rejects.toThrow();
