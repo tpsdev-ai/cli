@@ -103,8 +103,7 @@ export type DeliveryCompletion =
   | { status: "completed" }
   /** An earlier call with this delivery removed it. */
   | { status: "already-completed" }
-  /** The mailbox lock was unavailable; intent state is unknown. Retry. */
-  | { status: "deferred"; reason: "lock-busy"; detail: string }
+  | { status: "deferred"; reason: "lock-busy" | "storage-error"; detail: string }
   /**
    * Not this hand-over's to finalize; nothing changed. `foreign`: not a
    * delivery this MailClient issued. `stale`: the message was presented again
@@ -445,13 +444,17 @@ export class MailClient {
     try {
       roots = this.operationRoots();
     } catch (err) {
-      return { status: "deferred", reason: "lock-busy", detail: `mailbox roots unavailable (${sanitizeError(err)}); delivery not finalized` };
+      this.emitRecoveryError(err);
+      return { status: "deferred", reason: "storage-error", detail: `mailbox roots unavailable (${sanitizeError(err)}); delivery not finalized` };
     }
     const lock = await this.lockOrDefer(roots, "delivery not finalized; intent state unknown, retry");
     if ("status" in lock) return { status: "deferred", reason: "lock-busy", detail: lock.detail };
     let result: ReturnType<ReturnType<typeof mailboxReplayStore>["completePlacement"]>;
     try {
       result = mailboxReplayStore(roots.mailbox).completePlacement(issued.messageId, issued.file, issued.token);
+    } catch (err) {
+      this.emitRecoveryError(err);
+      return { status: "deferred", reason: "storage-error", detail: `placement state unavailable (${sanitizeError(err)}); delivery not finalized, retry` };
     } finally {
       lock.release();
     }

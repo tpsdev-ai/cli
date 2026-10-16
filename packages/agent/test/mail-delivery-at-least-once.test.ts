@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
 import { type DeliverNextResult, type MailDelivery, MailClient } from "../src/io/mail.js";
 import { acquireMailLock } from "../src/lib/mail-lock.js";
+import { EventLogger } from "../src/telemetry/events.js";
 import {
   DELIVERY_PRESENTATION_TTL_MS,
   MAX_DELIVERY_PRESENTATIONS,
@@ -327,6 +328,68 @@ describe("in_progress re-presentation in recovery", () => {
 });
 
 describe("completion is bound to the hand-over", () => {
+  for (const failure of ["unreadable", "malformed"] as const) {
+    test(`${failure} intent defers completion with storage-error and retains the token`, async () => {
+      plant("m1.json", "intent-error");
+      const events = new EventLogger(AGENT, join(mailDir, "events"));
+      const emit = spyOn(events, "emit");
+      const c = new MailClient(mailDir, events, AGENT, verifier());
+      const m = delivered(await c.deliverNext());
+      const before = readFileSync(intentPath("m1.json"), "utf8");
+      unlinkSync(intentPath("m1.json"));
+      if (failure === "unreadable") mkdirSync(intentPath("m1.json"));
+      else writeFileSync(intentPath("m1.json"), "{");
+      try {
+        const result = await c.completeDelivery(m);
+        expect(result).toMatchObject({ status: "deferred", reason: "storage-error" });
+        expect(emit).toHaveBeenLastCalledWith(expect.objectContaining({
+          type: "mail.receive", agent: AGENT, status: "error", from: "unknown", durationMs: 0,
+          error: expect.any(String),
+        }));
+        const lock = await acquireMailLock(realpathSync(root));
+        expect(lock).not.toBeNull();
+        lock?.release();
+      } finally {
+        emit.mockRestore();
+        rmSync(intentPath("m1.json"), { recursive: true, force: true });
+        rmSync(`${intentPath("m1.json")}.quarantined`, { force: true });
+        writeFileSync(intentPath("m1.json"), before);
+      }
+      expect(reasonOf(await client().deliverNext())).toBe("active");
+      expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+    });
+  }
+
+  test("intent unlink failure defers completion with storage-error and retains the token", async () => {
+    plant("m1.json", "unlink-error");
+    const events = new EventLogger(AGENT, join(mailDir, "events"));
+    const emit = spyOn(events, "emit");
+    const c = new MailClient(mailDir, events, AGENT, verifier());
+    const m = delivered(await c.deliverNext());
+    const before = intentText("m1.json");
+    const original = fs.unlinkSync;
+    const unlink = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+      if (String(path) === intentPath("m1.json")) throw new Error("intent unlink unavailable");
+      return original(path);
+    });
+    try {
+      expect(await c.completeDelivery(m)).toMatchObject({ status: "deferred", reason: "storage-error" });
+      expect(emit).toHaveBeenLastCalledWith({
+        type: "mail.receive", agent: AGENT, status: "error", from: "unknown", durationMs: 0,
+        error: "intent unlink unavailable",
+      });
+      expect(intentText("m1.json")).toBe(before);
+      const lock = await acquireMailLock(realpathSync(root));
+      expect(lock).not.toBeNull();
+      lock?.release();
+    } finally {
+      unlink.mockRestore();
+      emit.mockRestore();
+    }
+    expect(reasonOf(await client().deliverNext())).toBe("active");
+    expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+  });
+
   test("a delivery another client issued, or a copied one, is refused as foreign and changes nothing", async () => {
     plant("m1.json", "bound");
     const owner = client();
@@ -521,15 +584,30 @@ describe("completion is bound to the hand-over", () => {
     const link = join(mailDir, "mail-link");
     symlinkSync(mailDir, link);
     plant("m1.json", "unavailable-root");
-    const c = new MailClient(link, undefined, AGENT, verifier());
+    const events = new EventLogger(AGENT, join(mailDir, "events"));
+    const emit = spyOn(events, "emit");
+    const c = new MailClient(link, events, AGENT, verifier());
     const first = delivered(await c.deliverNext());
     const before = intentText("m1.json");
     unlinkSync(link);
     writeFileSync(link, "not a directory");
-    expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "storage-error" });
-    expect(await c.completeDelivery(first)).toMatchObject({ status: "deferred", reason: "lock-busy" });
-    expect(intentText("m1.json")).toBe(before);
-    expect(c.releaseDelivery(first)).toBe(true);
+    try {
+      expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "storage-error" });
+      emit.mockClear();
+      expect(await c.completeDelivery(first)).toMatchObject({ status: "deferred", reason: "storage-error" });
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenLastCalledWith(expect.objectContaining({
+        type: "mail.receive", agent: AGENT, status: "error", from: "unknown", durationMs: 0,
+        error: expect.any(String),
+      }));
+      expect(intentText("m1.json")).toBe(before);
+    } finally {
+      emit.mockRestore();
+      unlinkSync(link);
+      symlinkSync(mailDir, link);
+    }
+    expect(reasonOf(await client().deliverNext())).toBe("active");
+    expect(await c.completeDelivery(first)).toEqual({ status: "completed" });
   });
 
   for (const phase of ["new", "placing", "in_progress"] as const) {
