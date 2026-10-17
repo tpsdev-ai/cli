@@ -127,9 +127,9 @@ async function runLoop(
 
 /** A provider whose handler returns a normal completion. */
 const completingProvider = { async complete() { return { content: "done", toolCalls: undefined, inputTokens: 1, outputTokens: 1 }; } };
-/** A provider whose handler always calls a tool, so the turn limit is reached. */
+/** A provider whose handler always requests a tool call, so the turn limit is reached. */
 const toolCallingProvider = { async complete() { return { content: "", toolCalls: [{ id: "t1", name: "noop", input: {} }], inputTokens: 1, outputTokens: 1 }; } };
-/** Calls tools for a body containing `poison-body`. */
+/** Requests a tool call for a body containing `poison-body`. */
 const poisonAwareProvider = {
   async complete(req: unknown) {
     const text = JSON.stringify((req as { messages?: unknown }).messages ?? "");

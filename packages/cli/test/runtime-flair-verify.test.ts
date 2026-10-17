@@ -30,7 +30,7 @@ function register(operation: (body: unknown) => Promise<Response>, ids: string[]
   });
 }
 
-/** Plant one signed record for `receiver` in its mailbox `new/`, and return the message id. */
+/** Plant one signed record for `receiver` in its mailbox `new/`, and return its canonical mailbox path. */
 function plant(messageId: string, mailDir: string, receiver: string, sender: string, body: string): string {
   const envelope = buildSignedEnvelope(sender, receiver, body, { [sender]: SEED }, { messageId });
   const mailbox = canonicalMailboxRoot(join(mailDir, receiver));
@@ -51,17 +51,43 @@ async function waitFor(predicate: () => boolean, deadlineMs: number): Promise<vo
   throw new Error(`runtime-flair lane: condition not met within ${deadlineMs}ms`);
 }
 
-/** True once the runtime's mailbox wrote a `mail.receive` error for a refused read. */
-function recoveryLogged(workspace: string): boolean {
+/** Parse every JSONL line in a workspace's event log; unparsable lines are dropped. */
+function eventLog(workspace: string): Array<Record<string, unknown>> {
   const dir = join(workspace, ".tps", "events");
+  let names: string[];
   try {
-    return readdirSync(dir).some((name) => {
-      const text = readFileSync(join(dir, name), "utf8");
-      return text.includes('"mail.receive"') && text.includes('"status":"error"');
-    });
+    names = readdirSync(dir);
   } catch {
-    return false;
+    return [];
   }
+  return names.flatMap((name) => {
+    let text: string;
+    try {
+      text = readFileSync(join(dir, name), "utf8");
+    } catch {
+      return [];
+    }
+    return text.split("\n").flatMap((line): Array<Record<string, unknown>> => {
+      try {
+        const parsed: unknown = JSON.parse(line);
+        return parsed !== null && typeof parsed === "object" ? [parsed as Record<string, unknown>] : [];
+      } catch {
+        return [];
+      }
+    });
+  });
+}
+
+/**
+ * True once the runtime's mailbox recorded an event of type `mail.receive`
+ * whose own `status`/`error` fields carry the failure — one parsed event, not
+ * two lookalike substrings. It proves a `mail.receive` error was logged; it
+ * does not establish the cause.
+ */
+function recoveryLogged(workspace: string): boolean {
+  return eventLog(workspace).some(
+    (event) => event.type === "mail.receive" && event.status === "error" && typeof event.error === "string" && event.error.length > 0,
+  );
 }
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair verifies and handles a signed delivery through the runtime's Agent read", async () => {
@@ -113,8 +139,8 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("a refused Agent read leave
   const root = mkdtempSync(join(tmpdir(), "runtime-flair-"));
   const receiver = `runtime-receiver-${randomUUID()}`;
   const sender = `runtime-sender-${randomUUID()}`;
-  // The mailbox is registered with SEED's public key, but the runtime signs the
-  // Agent read with WRONG_SEED, so Flair refuses it.
+  // The receiver's Agent row is registered with SEED's public key, but the
+  // runtime signs the Agent read with WRONG_SEED, so Flair refuses it.
   const keyPath = writeKeyFile(root, receiver, WRONG_SEED);
   const mailDir = join(root, "mail");
   const workspace = join(root, "workspace");
