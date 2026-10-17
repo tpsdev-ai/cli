@@ -461,14 +461,13 @@ function refuseKeyRegistration(id: string, flairUrl: string, status: number, ref
  * `registration_unavailable` — which Flair returns both before committing
  * (nothing changed) and after committing when its own read-back fails. `cause`
  * is the client's own bounded account of the POST request; a refusal name is
- * never invented and, for a response that arrived, only its own status travels
- * in the cause. `observed` is what the read-back after the POST found.
+ * never invented. `observed` is what the read-back after the POST found.
  */
 function refuseKeyRegistrationUnconfirmed(id: string, flairUrl: string, cause: string, observed: string): never {
   console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: ${cause}.`);
   console.error(`   The read-back after the POST ${observed}.`);
   console.error(
-    `   Remedy: re-run \`tps agent create --id ${id}\`; it registers the key again and reads the stored key back.`,
+    `   Remedy: re-run \`tps agent create --id ${id}\`; it retries registration if the row is still pending and checks the stored key.`,
   );
   process.exit(1);
 }
@@ -547,8 +546,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
   // cli#512: the Flair registration line is printed only when Flair reads the
   // key back equal to the key just generated. Current Flair drops `publicKey` on
   // Agent PUT and PATCH, so neither can store it; a `pending` row is completed
-  // through POST /AgentKeyRegister. The exit decision rests on the read-back;
-  // the write errors recorded in writeError are reported when it fails.
+  // through POST /AgentKeyRegister.
   const flair = createFlairClient(id, flairUrl, keyPath);
   const online = await flair.ping();
 
@@ -582,10 +580,8 @@ async function createAgent(args: AgentArgs): Promise<void> {
             soulTemplate,
             starterMemories,
           });
-          // cli#512: the seed leaves (or keeps) a row whose stored key is
-          // `pending`; the block after the write registers the generated key
-          // through Flair's supported operation. This path sends no `publicKey`:
-          // Flair's Agent PUT does not store it.
+          // cli#512: the seed creates a `pending` row if absent; an existing
+          // row stays unchanged. The read below determines the stored key.
           successLine = `  Agent seeded: ${seeded.soulEntries.length} soul entries, ${seeded.memories.length} memories.`;
         } catch (seedErr) {
           // AgentSeed requires admin auth — fall back to direct registration
@@ -612,13 +608,9 @@ async function createAgent(args: AgentArgs): Promise<void> {
       refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
     }
     if (stored.found && stored.publicKey === PENDING_PUBLIC_KEY) {
-      // cli#512 — the row is `pending`: register the generated key through
-      // Flair's supported operation, then read the stored key back after the
-      // POST on every path. The read-back decides: a key that reads back equal
-      // is success, and a POST whose response was unconfirmed — a transport
-      // failure, a success body that is not JSON, or `registration_unavailable`
-      // — is resolved by what the row now holds. This covers a row seeded
-      // earlier.
+      // cli#512 — register the `pending` row's key, then read it back after
+      // success, a transport failure, a success body that is not JSON, or
+      // `registration_unavailable`. Definitive refusals exit before that read.
       const publicKeyB64url = Buffer.from(kp.signing.publicKey).toString("base64url");
       let unconfirmed: string | null = null;
       try {
@@ -640,8 +632,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
           unconfirmed = `the registration request received no response — a transport failure (${e instanceof Error ? e.message : String(e)})`;
         }
       }
-      // The read-back runs after the POST whether or not the response was
-      // confirmed: only the stored key shows whether this attempt landed.
+      // Read after success or an ambiguous outcome; definitive refusals exited above.
       try {
         stored = await flair.readStoredPublicKey(id);
       } catch (e) {
