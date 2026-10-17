@@ -18,6 +18,7 @@ export const EXPECTED_CASES: Record<string, string[]> = {
   "agent-create-registration.test.ts": [
     "against a real Flair, create refuses when the generated key cannot be registered",
     "against a real Flair, create succeeds with an existing Agent and matching local key",
+    "against a real Flair, create on a pending row completes registration when the instance serves POST /AgentKeyRegister and the stored key reads back equal; when the route is absent it refuses naming the minimum version",
   ],
   "mail-flair-read-auth.test.ts": ["real Flair Agent read guards and refused-read mail recovery"],
   "presence-flair-contract.test.ts": [
