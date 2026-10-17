@@ -1093,14 +1093,15 @@ describe("liveness-bound transitions for unclaimed in_progress work", () => {
     expect(idOf(next)).toBe("healthy");
   });
 
-  test("a held local token defers expiry past the deadline", async () => {
+  test("a held local token blocks another delivery until completion quarantines the overdue claim", async () => {
     plant("m1.json", "slow-but-live");
     const c = client();
     const m = delivered(await c.deliverNext());
     setPhase({ firstPresentedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() });
     expect(reasonOf(await c.deliverNext())).toBe("active");
     expect(intentPhase("m1.json")).toBe("in_progress");
-    expect(await c.completeDelivery(m)).toEqual({ status: "completed" });
+    expect(await c.completeDelivery(m)).toEqual({ status: "quarantined" });
+    expect(intentPhase("m1.json")).toBe("failed");
   });
 
   test("the terminal intent keeps its message refused by the replay gate", async () => {
