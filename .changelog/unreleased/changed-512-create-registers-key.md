@@ -9,5 +9,4 @@
   success body that is not JSON, or a `registration_unavailable` is answered by
   that read-back: `create` reports success only when the key reads back equal,
   and otherwise reports this attempt unconfirmed with the observed state. Flair
-  drops `publicKey` on `Agent` PUT and PATCH: an existing row whose stored key
-  differs still gets an `Agent` PUT carrying the key, which cannot store it.
+  drops `publicKey` on `Agent` PUT and PATCH.

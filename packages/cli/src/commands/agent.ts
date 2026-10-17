@@ -445,11 +445,7 @@ function refuseKeyRegistration(id: string, flairUrl: string, status: number, ref
  * cli#512 — the POST /AgentKeyRegister call left the generated key's fate
  * unknown and the read-back after the POST did not show the key stored, so this
  * attempt is reported UNCONFIRMED, never as a refusal and never as unregistered.
- * The paths: no response arrived (a transport failure), a success status carried
- * a body that was not JSON (a response-parsing failure), or Flair answered
- * `registration_unavailable` — which Flair returns both before committing
- * (nothing changed) and after committing when its own read-back fails. `cause`
- * is the client's own bounded account of the POST request; a refusal name is
+ * `cause` is the client's own bounded account of the POST request; a refusal name is
  * never invented. `observed` is what the read-back after the POST found.
  */
 function refuseKeyRegistrationUnconfirmed(id: string, flairUrl: string, cause: string, observed: string): never {
@@ -549,9 +545,6 @@ async function createAgent(args: AgentArgs): Promise<void> {
       const existing = await flair.getAgent(id);
       if (existing) {
         if (storedKeyAsHex(existing.publicKey ?? "") !== pubKeyHex) {
-          // cli#512: an existing row whose stored key differs still gets an Agent
-          // PUT carrying the key; Flair drops `publicKey` on that write, so it
-          // cannot store the key, and the read-back below decides.
           await flair.updateAgent(id, { publicKey: pubKeyHex });
         }
         successLine = `  Agent '${id}' already registered in Flair.`;
@@ -625,10 +618,12 @@ async function createAgent(args: AgentArgs): Promise<void> {
       try {
         stored = await flair.readStoredPublicKey(id);
       } catch (e) {
-        if (unconfirmed !== null) {
-          refuseKeyRegistrationUnconfirmed(id, flairUrl, unconfirmed, `failed (${e instanceof Error ? e.message : String(e)})`);
-        }
-        refuseRegistration(id, flairUrl, identityDir, `the read-back failed (${e instanceof Error ? e.message : String(e)})`, writeError, "unknown");
+        refuseKeyRegistrationUnconfirmed(
+          id,
+          flairUrl,
+          unconfirmed ?? "POST /AgentKeyRegister succeeded",
+          `failed (${e instanceof Error ? e.message : String(e)})`,
+        );
       }
       if (unconfirmed !== null && !(stored.found && storedKeyAsHex(stored.publicKey ?? "") === pubKeyHex)) {
         const observed = !stored.found

@@ -391,6 +391,42 @@ test("a pending row and a Flair that serves POST /AgentKeyRegister: the generate
   }
 });
 
+for (const route of ["serve", "unavailable"] as const) {
+  test(`a ${route === "serve" ? "successful" : "registration_unavailable"} POST followed by a read-back exception: unconfirmed with a re-run remedy and no removal advice`, async () => {
+    const id = `${AGENT}-${route}-read-fail`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const fake = startRegistrarFlair(id, publicKey, { fetchOnly: true, route, commit: true });
+    const restore = patchShared(globalThis, "fetch", (async (input, init) => {
+      const req = new Request(input, init);
+      const response = await fake.fetch(req);
+      if (req.method === "GET" && new URL(req.url).pathname === `/Agent/${id}` && fake.registerBodies.length > 0) {
+        throw new Error("post-registration read failed");
+      }
+      return response;
+    }) as typeof fetch);
+    try {
+      const res = await runCreate(fake.url, id, { keyPair, credential: ADMIN_AUTH });
+      expect(fake.registerBodies).toEqual([{ agentId: id, publicKey }]);
+      expect(fake.row.publicKey).toBe(publicKey);
+      expectReadBackAfterRegistration(fake.requests, id);
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered in Flair");
+      expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
+      expect(res.stderr).toContain(route === "serve" ? "POST /AgentKeyRegister succeeded" : "POST /AgentKeyRegister answered registration_unavailable");
+      expect(res.stderr).toContain("The read-back after the POST failed (");
+      expect(res.stderr).toContain("transport error: network failure");
+      expect(res.stderr).toContain(`Remedy: re-run \`tps agent create --id ${id}\``);
+      expect(res.stderr).not.toContain("flair agent remove");
+      expect(res.stderr).not.toContain("is not registered in Flair");
+      expectNoAgentWriteAfterRegistration(fake.requests, id);
+    } finally {
+      restore();
+      fake.stop();
+    }
+  });
+}
+
 test("the endpoint answers 200 but the row does not read the key back: exits non-zero, prints no success", async () => {
   const id = `${AGENT}-accepted-unstored`;
   const keyPair = generateKeyPair();
