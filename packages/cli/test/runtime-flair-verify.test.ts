@@ -51,7 +51,7 @@ async function waitFor(predicate: () => boolean, deadlineMs: number): Promise<vo
   throw new Error(`runtime-flair lane: condition not met within ${deadlineMs}ms`);
 }
 
-/** Parse every JSONL line in a workspace's event log; unparsable lines are dropped. */
+/** The parsed JSONL lines a workspace's event-log files hold; unreadable files and unparsable lines contribute nothing. */
 function eventLog(workspace: string): Array<Record<string, unknown>> {
   const dir = join(workspace, ".tps", "events");
   let names: string[];
