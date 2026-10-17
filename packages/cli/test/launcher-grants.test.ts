@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { launcherGrantCovering, realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 /**
  * Whether a write into the directory under test is refused for want of
@@ -166,6 +166,129 @@ describe("writeRefusedForPermission", () => {
       expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A fake nono for the read probe. `run … -- <cmd…>` is decided by the candidate
+ * base the probe's `--profile` file sits under:
+ *   - under $FAKE_REFUSED_UNDER: refuses to start (stderr, exit 1, no output);
+ *   - under $FAKE_UNKNOWN_UNDER: exits 0 with no output (the CI `why` symptom);
+ *   - under $FAKE_GRANTED_UNDER: runs the payload as is, so `cat` prints the nonce;
+ *   - anywhere else: runs the payload with a `cat` that is denied, so the
+ *     payload's own `||` branch prints the marker.
+ * The fake never knows the nonce or the marker: each answer comes from running
+ * the probe's own payload.
+ */
+function fakeProbeNono(dir: string): string {
+  const denyBin = join(dir, "deny-bin");
+  mkdirSync(denyBin);
+  writeFileSync(join(denyBin, "cat"), '#!/bin/sh\necho "cat: $1: Operation not permitted" >&2\nexit 1\n');
+  chmodSync(join(denyBin, "cat"), 0o755);
+  const bin = join(dir, "nono");
+  writeFileSync(
+    bin,
+    [
+      "#!/usr/bin/env bash",
+      'if [ "${1:-}" != "run" ]; then echo "fake nono: unexpected $*" >&2; exit 64; fi',
+      'profile=""',
+      'while [ $# -gt 0 ] && [ "$1" != "--" ]; do',
+      '  if [ "$1" = "--profile" ]; then profile="$2"; shift; fi',
+      "  shift",
+      "done",
+      "shift",
+      'under() { [ -n "$1" ] && case "$profile" in "$1"/*) return 0 ;; esac; return 1; }',
+      'if under "${FAKE_REFUSED_UNDER:-}"; then echo "nono: Sandbox initialization failed: fake refusal" >&2; exit 1; fi',
+      'if under "${FAKE_UNKNOWN_UNDER:-}"; then exit 0; fi',
+      'if under "${FAKE_GRANTED_UNDER:-}"; then exec "$@"; fi',
+      `PATH="${denyBin}:$PATH" exec "$@"`,
+      "",
+    ].join("\n"),
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+/** A parent dir (outside every launcher grant) with one candidate dir per name. */
+function probeCandidates(...names: string[]): { parent: string; dirs: Record<string, string> } {
+  const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
+  const dirs: Record<string, string> = {};
+  for (const name of names) {
+    dirs[name] = join(parent, name);
+    mkdirSync(dirs[name]);
+  }
+  return { parent, dirs };
+}
+
+describe("realNonoHomeBase", () => {
+  test("accepts a candidate whose sandboxed read nono denies, and leaves no probe behind", () => {
+    const { parent, dirs } = probeCandidates("free");
+    try {
+      const nono = fakeProbeNono(parent);
+      expect(realNonoHomeBase(nono, [dirs.free], process.env)).toBe(realpathSync(dirs.free));
+      expect(readdirSync(dirs.free)).toEqual([]);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a candidate whose sandboxed read nono grants, and returns the next one", () => {
+    const { parent, dirs } = probeCandidates("granted", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_GRANTED_UNDER: realpathSync(dirs.granted) };
+      expect(realNonoHomeBase(nono, [dirs.granted, dirs.free], env)).toBe(realpathSync(dirs.free));
+      expect(() => realNonoHomeBase(nono, [dirs.granted], env)).toThrow(
+        /granted: nono's default policy lets a sandboxed process read a file under it/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a candidate where nono refuses to start, quoting its stderr, and returns the next one", () => {
+    const { parent, dirs } = probeCandidates("refused", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_REFUSED_UNDER: realpathSync(dirs.refused) };
+      expect(realNonoHomeBase(nono, [dirs.refused, dirs.free], env)).toBe(realpathSync(dirs.free));
+      expect(() => realNonoHomeBase(nono, [dirs.refused], env)).toThrow(
+        /refused: nono refused to start with a fixture HOME under it: nono: Sandbox initialization failed: fake refusal/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("an unknown answer throws instead of reading as not granted or moving on", () => {
+    const { parent, dirs } = probeCandidates("unknown", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_UNKNOWN_UNDER: realpathSync(dirs.unknown) };
+      expect(() => realNonoHomeBase(nono, [dirs.unknown, dirs.free], env)).toThrow(
+        /unknown answer, which is never read as "not granted".*exited 0, stdout "", stderr ""/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("names every rejected candidate when none qualifies", () => {
+    const { parent, dirs } = probeCandidates("granted", "refused");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = {
+        ...process.env,
+        FAKE_GRANTED_UNDER: realpathSync(dirs.granted),
+        FAKE_REFUSED_UNDER: realpathSync(dirs.refused),
+      };
+      const missing = join(parent, "missing");
+      expect(() => realNonoHomeBase(nono, [dirs.granted, dirs.refused, "/tmp", missing], env)).toThrow(
+        /granted: nono's default policy lets .*; .*refused: nono refused to start .*fake refusal; \/tmp: inside the launcher's '\/tmp' grant; .*missing: not a writable directory/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 });

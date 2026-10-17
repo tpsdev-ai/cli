@@ -17,8 +17,20 @@ try {
   process.exit(1);
 }
 
-const launchFlags = readLaunchFlags(process.argv);
-if (launchFlags.refusal) enforceLaunchControl({ argv: process.argv });
+/**
+ * tps's OWN arguments — the parsed list, with `--` inserted before a wrapped
+ * payload (`--message`, mail-watch `--exec`, secrets-guard's command). The
+ * sandbox-flag scan and the `--sandboxed` gate read these, so a
+ * `--sandbox <word>` inside a message or a wrapped command is not a flag
+ * (cli#516). Node and the script path are prepended so the callers' index-2
+ * convention is unchanged.
+ */
+function ownArgv(): string[] {
+  return [process.argv[0]!, process.argv[1]!, ...helpArgs.argv];
+}
+
+const launchFlags = readLaunchFlags(ownArgv());
+if (launchFlags.refusal) enforceLaunchControl({ argv: ownArgv() });
 
 const cli = meow(
   `
@@ -121,7 +133,7 @@ async function enforceLaunchControlOrExit(): Promise<void> {
   // `no released child within …`. A human who types `--sandboxed` at a terminal
   // carries no locator, so confinement stays undefined and rule 1b refuses it.
   let confinement: { released: boolean; reason?: string } | undefined;
-  if (process.argv.includes(SANDBOXED_FLAG)) {
+  if (ownArgv().includes(SANDBOXED_FLAG)) {
     const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
       "../src/utils/launch-attestation.js"
     );
@@ -130,7 +142,7 @@ async function enforceLaunchControlOrExit(): Promise<void> {
       confinement = { released: attestation.ok, reason: attestation.reason };
     }
   }
-  enforceLaunchControl({ command, rest, argv: process.argv, parsedFlags: cli.flags, confinement });
+  enforceLaunchControl({ command, rest, argv: ownArgv(), parsedFlags: cli.flags, confinement });
   if (launchFlags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
@@ -492,7 +504,7 @@ async function main() {
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
-            const { join } = await import("node:path");
+            const { join, resolve } = await import("node:path");
             const { homedir } = await import("node:os");
             const { readFileSync, existsSync } = await import("node:fs");
             const { load: parseYaml } = await import("js-yaml");
@@ -544,9 +556,22 @@ async function main() {
               }
             }
 
-            const { onStart, onStop } = await import("../src/utils/agent-lifecycle.js");
-            const startResult = onStart(agentId!, agentWorkspace);
-            if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
+            // cli#516 — when the parent created the worktree (a base repository
+            // exists and the workspace was absent), it did so outside the sandbox
+            // with the checkout suppressed, and that checkout runs HERE, inside the
+            // sandbox, where a repository-configured filter or hook is confined.
+            // A launch that is not sandboxed owns both halves itself.
+            const { onStart, onStop, checkoutWorktree } = await import("../src/utils/agent-lifecycle.js");
+            const pendingCheckout = process.env.TPS_WORKTREE_PENDING;
+            let worktreeCreated = false;
+            if (sandboxed && pendingCheckout && resolve(pendingCheckout) === resolve(agentWorkspace)) {
+              const checkedOut = checkoutWorktree(agentWorkspace);
+              console.log(`[${agentId}] worktree: ${checkedOut.reason}`);
+            } else if (!sandboxed) {
+              const startResult = onStart(agentId!, agentWorkspace);
+              worktreeCreated = startResult.changed;
+              if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
+            }
 
             try {
               if (runtimeArg === "codex") {
@@ -610,8 +635,10 @@ async function main() {
               });
             }
             } finally {
-              const stopResult = onStop(agentId!, agentWorkspace);
-              if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
+              if (worktreeCreated) {
+                const stopResult = onStop(agentId!, agentWorkspace);
+                if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
+              }
             }
           } else {
             await runAgent({

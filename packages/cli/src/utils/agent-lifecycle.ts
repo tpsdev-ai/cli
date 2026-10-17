@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -224,10 +224,45 @@ export async function writeTaskMemory(
 export interface AgentLifecycleResult {
   changed: boolean;
   reason: string;
+  /**
+   * Absolute path of the created worktree's git directory. Present only when
+   * this call created the worktree and deferred its checkout to the caller
+   * (cli#516): the caller needs it to grant the checking-out side access.
+   */
+  gitDir?: string;
+  /** Absolute path of the base repository the worktree belongs to. Present in
+   *  the same case as `gitDir`. */
+  baseRepo?: string;
+}
+
+/**
+ * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
+ * caller can tell a worktree failure from any other error and report it as one;
+ * the message names the operation that failed. A workspace with no base
+ * repository is reported as changed:false.
+ */
+export class WorktreeLifecycleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeLifecycleError";
+  }
+}
+
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith("GIT_")) env[key] = value;
+  }
+  // Disable inherited GIT_* variables and system/global config entry points;
+  // local config includes remain enabled.
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
 }
 
 function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
-  const out = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  const out = spawnSync("git", args, { cwd, encoding: "utf-8", env: gitEnv() });
   return {
     ok: out.status === 0,
     stdout: (out.stdout ?? "").trim(),
@@ -235,15 +270,51 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
   };
 }
 
-function isGitRepo(path: string): boolean {
+type RepoProbe =
+  | { kind: "repo" }
+  | { kind: "not-a-repo" }
+  | { kind: "error"; detail: string };
+
+function probeRepo(path: string): RepoProbe {
+  try {
+    let candidate;
+    try {
+      candidate = lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
+    }
+    if (!candidate.isDirectory() || candidate.isSymbolicLink()) {
+      return { kind: "error", detail: "base path is not a plain directory" };
+    }
+    readdirSync(path);
+    const markerPath = join(path, ".git");
+    let marker;
+    try {
+      marker = lstatSync(markerPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
+    }
+    if (marker.isSymbolicLink() || (!marker.isDirectory() && !marker.isFile())) {
+      return { kind: "error", detail: "git marker is not a regular file or directory" };
+    }
+    if (marker.isDirectory()) readdirSync(markerPath);
+    else readFileSync(markerPath);
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
+  }
   const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
-  return out.ok && out.stdout === "true";
+  if (out.ok && out.stdout === "true") return { kind: "repo" };
+  return { kind: "error", detail: out.stderr || out.stdout || "git probe produced no output" };
 }
 
 function parseWorktreePaths(baseRepo: string): Set<string> {
   const out = git(baseRepo, ["worktree", "list", "--porcelain"]);
   if (!out.ok) {
-    throw new Error(out.stderr || out.stdout || "git worktree list failed");
+    throw new WorktreeLifecycleError(
+      `worktree listing failed in ${baseRepo}: ${out.stderr || out.stdout || "git worktree list failed"}`,
+    );
   }
   const paths = new Set<string>();
   for (const line of out.stdout.split("\n")) {
@@ -255,16 +326,38 @@ function parseWorktreePaths(baseRepo: string): Set<string> {
 }
 
 function resolveBaseRepo(workspacePath: string): string | null {
-  const defaultBase = resolve(join(homedir(), "ops", "tps"));
-  if (isGitRepo(defaultBase)) return defaultBase;
-
-  const derivedBase = resolve(join(dirname(workspacePath), "tps"));
-  if (isGitRepo(derivedBase)) return derivedBase;
-
+  const candidates = [
+    resolve(join(homedir(), "ops", "tps")),
+    resolve(join(dirname(workspacePath), "tps")),
+  ];
+  for (const candidate of candidates) {
+    const probe = probeRepo(candidate);
+    if (probe.kind === "repo") return candidate;
+    if (probe.kind === "error") {
+      throw new WorktreeLifecycleError(
+        `git probe failed for the base repository ${candidate}: ${probe.detail}`,
+      );
+    }
+  }
   return null;
 }
 
-export function onStart(agentId: string, workspacePath?: string): AgentLifecycleResult {
+/**
+ * Create the agent's worktree when a base repository exists and the workspace
+ * is absent. An existing worktree, an existing ordinary workspace, the base
+ * repository itself, and a workspace with no base repository are left
+ * untouched and reported as changed:false.
+ *
+ * With `deferCheckout: true`, setup disables hooks and fsmonitor and defers
+ * checkout to `checkoutWorktree` inside the sandbox (cli#516).
+ *
+ * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
+ */
+export function onStart(
+  agentId: string,
+  workspacePath?: string,
+  opts: { deferCheckout?: boolean } = {},
+): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
   }
@@ -272,7 +365,7 @@ export function onStart(agentId: string, workspacePath?: string): AgentLifecycle
   const workspace = resolve(workspacePath);
   const baseRepo = resolveBaseRepo(workspace);
   if (!baseRepo) {
-    return { changed: false, reason: "base repo not found or not a git repo" };
+    return { changed: false, reason: "no base repository for the workspace" };
   }
 
   if (workspace === baseRepo) {
@@ -288,12 +381,66 @@ export function onStart(agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  const add = git(baseRepo, ["worktree", "add", workspace, "--detach"]);
+  // With deferCheckout: true, checkout runs in the sandbox (cli#516).
+  const defer = opts.deferCheckout === true;
+  const args = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "worktree",
+    "add",
+    ...(defer ? ["--no-checkout"] : []),
+    workspace,
+    "--detach",
+  ];
+  const add = git(baseRepo, args);
   if (!add.ok) {
-    throw new Error(`failed to create worktree for ${agentId}: ${add.stderr || add.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree setup failed for ${agentId} (${baseRepo} -> ${workspace}): ${add.stderr || add.stdout}`,
+    );
   }
 
-  return { changed: true, reason: "worktree created" };
+  if (!defer) {
+    return { changed: true, reason: "worktree created" };
+  }
+
+  const gitDir = git(workspace, ["rev-parse", "--absolute-git-dir"]);
+  if (!gitDir.ok || !gitDir.stdout) {
+    throw new WorktreeLifecycleError(
+      `worktree git directory could not be resolved for ${workspace}: ${gitDir.stderr || gitDir.stdout || "git rev-parse produced no output"}`,
+    );
+  }
+  return { changed: true, reason: "worktree created; checkout deferred", gitDir: gitDir.stdout, baseRepo };
+}
+
+/**
+ * Populate a worktree the parent created with `--no-checkout` (cli#516). This
+ * checkout may run repository-configured filters and hooks, so the caller must
+ * run it inside the sandbox. Throws `WorktreeLifecycleError` on failure.
+ */
+export function checkoutWorktree(workspacePath: string): AgentLifecycleResult {
+  const workspace = resolve(workspacePath);
+  const out = git(workspace, ["checkout", "--detach"]);
+  if (!out.ok) {
+    throw new WorktreeLifecycleError(
+      `worktree checkout failed for ${workspace}: ${out.stderr || out.stdout}`,
+    );
+  }
+  return { changed: true, reason: "worktree checked out" };
+}
+
+/** True when `path` exists; only ENOENT counts as absent (cli#516). Any other
+ *  lstat failure — e.g. EACCES on a parent, a non-directory in the path — is
+ *  thrown, so a failed probe is never read as "nothing there". */
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 export function onStop(_agentId: string, workspacePath?: string): AgentLifecycleResult {
@@ -307,7 +454,15 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "base repo not found or not a git repo" };
   }
 
-  if (!existsSync(workspace)) {
+  let workspaceExists: boolean;
+  try {
+    workspaceExists = pathExists(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `workspace probe failed for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+  if (!workspaceExists) {
     return { changed: false, reason: "workspace does not exist" };
   }
 
@@ -318,7 +473,9 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
 
   const remove = git(baseRepo, ["worktree", "remove", workspace, "--force"]);
   if (!remove.ok) {
-    throw new Error(`failed to remove worktree: ${remove.stderr || remove.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree cleanup failed for ${_agentId} (${workspace}): ${remove.stderr || remove.stdout}`,
+    );
   }
 
   return { changed: true, reason: "worktree removed" };

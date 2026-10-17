@@ -1212,6 +1212,17 @@ export interface ConfinementVerdict {
 }
 
 /**
+ * True when `flag` is one of tps's OWN arguments: it appears before the `--`
+ * that separates a wrapped payload (`--message`, `mail watch --exec`,
+ * secrets-guard's command) (cli#516). A `--sandboxed` inside a payload is not
+ * this process's flag, so it must not trip the `--sandboxed` gate.
+ */
+function ownFlag(argv: readonly string[], flag: string): boolean {
+  const end = argv.indexOf("--");
+  return (end === -1 ? argv : argv.slice(0, end)).includes(flag);
+}
+
+/**
  * Commands that hand control to an agent. These are exactly the commands that
  * generated units invoke, and the ones that must assert `--sandbox-required`
  * when there is no TTY to ask.
@@ -1318,7 +1329,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   // spawned and to this pid, with enforcement verified behaviourally). The TTY
   // is irrelevant (cli#350 r4f): an un-released `--sandboxed` is refused
   // everywhere, because the interactive opt-out is `--no-sandbox`.
-  if (argv.includes(SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
+  if (ownFlag(argv, SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
     const hint = nonoLaunchHint();
     return deny(
       `${SANDBOXED_FLAG} is refused: no launcher released this process` +

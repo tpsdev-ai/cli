@@ -19,7 +19,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve as resolvePathMod } from "node:path";
+import { dirname, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -1005,6 +1005,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         console.error("   or: tps agent run --config <path> --message <text>");
         process.exit(1);
       }
+      // cli#516 — resolve to ONE absolute path BEFORE any read, so the pathname
+      // this process loads, the read grant it derives, and the pathname the
+      // re-exec child reopens are the same, even for a relative `--config`.
+      configPath = resolvePathMod(configPath);
       if (!existsSync(configPath)) {
         console.error(`Config not found: ${configPath}`);
         console.error(`Run 'tps agent create --id ${args.id ?? "<id>"}' first.`);
@@ -1122,6 +1126,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // the sandboxed child re-enters bin/tps.ts, which runs the runtime
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
+            // Carry the resolved config pathname through the re-exec (cli#516).
+            relaunch.push("--config", configPath);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
@@ -1135,7 +1141,11 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // 0.70+ (exit 1). Use the explicit toolchain read set instead —
               // the macOS roots Kern validated, and their Linux equivalents
               // (systemReadPaths()).
-              read: harnessReadPaths(),
+              // Read the toolchain roots plus the directory the config was read
+              // from, so the child can re-read `--config` inside the sandbox
+              // (cli#516). This adds read access to that directory; when it is
+              // the agent dir, the `allow` grant below also makes it writable.
+              read: [...new Set([...harnessReadPaths(), dirname(configPath)])],
               // Exactly this agent's own identity files, not the shared
               // identity directory (cli#351 r4).
               readFiles: harnessReadFiles(launchId),
@@ -1148,7 +1158,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
             };
             const profile = runtimeNonoProfile(selectedRuntime);
-            const approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
+            let approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
             if (approval.refusal) {
               console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
@@ -1158,12 +1168,69 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            const exitCode = await launchAttested(
-              profile,
-              approval.options,
-              relaunch,
-              { runtimeDirectories: approval.runtimeDirectories },
-            );
+            // With deferCheckout: true, when a base repository exists and the
+            // workspace is absent, the parent creates the worktree without
+            // checkout; the sandboxed child checks it out (cli#516). Grant read
+            // of the base repository and write of the worktree's git directory.
+            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            let worktreeCreated = false;
+            let worktreeGitDir: string | undefined;
+            let worktreeBaseRepo: string | undefined;
+            if (selectedRuntime) {
+              try {
+                const startResult = onStart(launchId, config.workspace, { deferCheckout: true });
+                worktreeCreated = startResult.changed;
+                worktreeGitDir = startResult.gitDir;
+                worktreeBaseRepo = startResult.baseRepo;
+              } catch (err) {
+                console.error(`❌ ${(err as Error).message}`);
+                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+              }
+            }
+            if (worktreeGitDir && worktreeBaseRepo) {
+              launchOptions.read.push(worktreeBaseRepo);
+              launchOptions.allow.push(worktreeGitDir);
+              const recheck = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
+              if (recheck.refusal) {
+                console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${recheck.refusal}`);
+                try {
+                  onStop(launchId, config.workspace);
+                } catch (cleanupErr) {
+                  console.error(`❌ ${(cleanupErr as Error).message}`);
+                }
+                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+              }
+              approval = recheck;
+            }
+            // The child checks the worktree out only when THIS launch created
+            // it. Remove any inherited TPS_WORKTREE_PENDING before launch and
+            // set it only after a worktree was actually created, so an
+            // inherited value never names someone else's worktree (cli#516).
+            const launchEnv: NodeJS.ProcessEnv = { ...process.env };
+            delete launchEnv.TPS_WORKTREE_PENDING;
+            if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = resolvePathMod(config.workspace);
+            let exitCode: number;
+            try {
+              exitCode = await launchAttested(
+                profile,
+                approval.options,
+                relaunch,
+                {
+                  runtimeDirectories: approval.runtimeDirectories,
+                  env: launchEnv,
+                },
+              );
+            } finally {
+              // Attempt cleanup only after this launch created a worktree (cli#516).
+              if (worktreeCreated) {
+                try {
+                  onStop(launchId, config.workspace);
+                } catch (err) {
+                  console.error(`❌ ${(err as Error).message}`);
+                  process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+                }
+              }
+            }
             process.exit(exitCode);
           }
         } else if (!sandboxed && nonoAvailable) {
