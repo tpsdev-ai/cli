@@ -212,7 +212,8 @@ export class EventLoop {
       // While running, retrying is what keeps at-least-once delivery when
       // another writer holds the lock. A stop must let shutdown finish: once
       // `running` is false, bound the retries, record the last outcome, and
-      // return. The claim stays pending, so the next run re-presents it.
+      // return. The intent remains pending and may be re-presented after the claim
+      // is no longer live, subject to recovery's verification and the delivery bound.
       if (!this.running && ++stoppedAttempts >= MAX_SETTLEMENT_ATTEMPTS) {
         await this.recordError(
           lastDeferral
