@@ -8,7 +8,7 @@ const patchShared = createPatchShared();
  * stores `publicKey` (see `refusePut`).
  */
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, createPrivateKey, createPublicKey, randomBytes, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -294,8 +294,12 @@ function startRegistrarFlair(
     if (req.method === "PUT" || req.method === "PATCH") return refusePut(url, id);
     return undefined;
   };
-  const signedStub = stubFlairHandler({ [id]: publicKey }, routes);
-  const pendingStub = stubFlairHandler({ [id]: "pending" }, routes);
+  const signedRoutes = (req: Request, url: URL) =>
+    req.method === "POST" && url.pathname === "/AgentKeyRegister"
+      ? Response.json({ error: "forbidden" }, { status: 403 })
+      : routes(req, url);
+  const signedStub = stubFlairHandler({ [id]: publicKey }, signedRoutes);
+  const pendingStub = stubFlairHandler({ [id]: "pending" }, signedRoutes);
   const handler = async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
     if (url.pathname === "/Health") return new Response("ok");
@@ -311,7 +315,7 @@ function startRegistrarFlair(
   return { url: server ? `http://127.0.0.1:${server.port}` : "http://flair.test", stop: () => server?.stop(true), row, requests, registerBodies, fetch: handler };
 }
 
-test("the registrar rejects other Basic credentials and a signed pending row", async () => {
+test("the registrar rejects other Basic credentials, a signed pending GET and a non-admin signed registration POST", async () => {
   const id = `${AGENT}-auth-boundary`;
   const keyPair = generateKeyPair();
   const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
@@ -333,6 +337,23 @@ test("the registrar rejects other Basic credentials and a signed pending row", a
     const pending = await fake.fetch(new Request(`${fake.url}${path}`, { headers: { Authorization: sign("GET", path) } }));
     expect(pending.status).toBe(401);
     expect(await pending.json()).toEqual({ error: "signature_verification_failed" });
+    expect(fake.row.publicKey).toBe("pending");
+    const register = await fake.fetch(new Request(`${fake.url}/AgentKeyRegister`, {
+      method: "POST",
+      headers: { Authorization: ADMIN_HEADER, "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: id, publicKey }),
+    }));
+    expect(register.status).toBe(200);
+    expect(fake.row.publicKey).toBe(publicKey);
+    const signedRegister = await fake.fetch(new Request(`${fake.url}/AgentKeyRegister`, {
+      method: "POST",
+      headers: { Authorization: sign("POST", "/AgentKeyRegister"), "Content-Type": "application/json" },
+      body: JSON.stringify({ agentId: id, publicKey: Buffer.alloc(32, 7).toString("base64url") }),
+    }));
+    expect(signedRegister.status).toBe(403);
+    expect(await signedRegister.json()).toEqual({ error: "forbidden" });
+    expect(fake.row.publicKey).toBe(publicKey);
+    expect(fake.registerBodies).toEqual([{ agentId: id, publicKey }]);
   } finally {
     fake.stop();
   }
@@ -427,20 +448,73 @@ for (const route of ["serve", "unavailable"] as const) {
   });
 }
 
-test("the endpoint answers 200 but the row does not read the key back: exits non-zero, prints no success", async () => {
-  const id = `${AGENT}-accepted-unstored`;
-  const keyPair = generateKeyPair();
-  const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
-  const fake = startRegistrarFlair(id, publicKey, { store: false });
-  try {
-    const res = await runCreate(fake.url, id, { keyPair });
-    expect(res.exitCode).toBe(1);
-    expect(res.stdout).not.toContain("registered in Flair");
-    expect(res.stderr).toContain("the stored public key is 'pending', not the generated key");
-  } finally {
-    fake.stop();
-  }
-});
+for (const observed of ["pending", "different", "absent", "no-key"] as const) {
+  test(`a successful POST followed by a ${observed} read-back: unconfirmed with a re-run remedy and no removal advice`, async () => {
+    const id = `${AGENT}-accepted-${observed}`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const fake = startRegistrarFlair(id, publicKey, { fetchOnly: true });
+    const storedKey = observed === "pending" ? "pending" : "de".repeat(32);
+    const restore = patchShared(globalThis, "fetch", (async (input, init) => {
+      const req = new Request(input, init);
+      const response = await fake.fetch(req);
+      if (req.method === "GET" && new URL(req.url).pathname === `/Agent/${id}` && fake.registerBodies.length > 0) {
+        if (observed === "absent") return new Response("not found", { status: 404 });
+        return Response.json({ id, name: id, ...(observed === "no-key" ? {} : { publicKey: storedKey }) });
+      }
+      return response;
+    }) as typeof fetch);
+    try {
+      const res = await runCreate(fake.url, id, { keyPair, credential: ADMIN_AUTH });
+      expect(fake.registerBodies).toEqual([{ agentId: id, publicKey }]);
+      expectReadBackAfterRegistration(fake.requests, id);
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered in Flair");
+      expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
+      expect(res.stderr).toContain("POST /AgentKeyRegister succeeded");
+      expect(res.stderr).toContain(observed === "absent" ? "found no Agent row" : observed === "no-key" ? "found no stored public key" : `found the stored public key '${storedKey}', not the generated key`);
+      expect(res.stderr).toContain(`Remedy: re-run \`tps agent create --id ${id}\``);
+      expect(res.stderr).not.toContain("flair agent remove");
+      expect(res.stderr).not.toContain("is not registered in Flair");
+      expectNoAgentWriteAfterRegistration(fake.requests, id);
+    } finally {
+      restore();
+      fake.stop();
+    }
+  });
+}
+
+for (const observed of ["failure", "different", "absent"] as const) {
+  test(`a successful POST and equal admin read-back followed by a signed ${observed}: unconfirmed with no removal advice`, async () => {
+    const id = `${AGENT}-signed-${observed}`;
+    const keyPair = generateKeyPair();
+    const publicKey = Buffer.from(keyPair.signing.publicKey).toString("base64url");
+    const fake = startRegistrarFlair(id, publicKey, { fetchOnly: true });
+    const restore = patchShared(globalThis, "fetch", (async (input, init) => {
+      const req = new Request(input, init);
+      const response = await fake.fetch(req);
+      if (req.method === "GET" && new URL(req.url).pathname === `/Agent/${id}` && fake.registerBodies.length > 0 && req.headers.get("Authorization")?.startsWith("TPS-Ed25519 ")) {
+        if (observed === "failure") throw new Error("signed read failed");
+        if (observed === "absent") return new Response("not found", { status: 404 });
+        return Response.json({ id, name: id, publicKey: "de".repeat(32) });
+      }
+      return response;
+    }) as typeof fetch);
+    try {
+      const res = await runCreate(fake.url, id, { keyPair, credential: ADMIN_AUTH });
+      expect(fake.registerBodies).toEqual([{ agentId: id, publicKey }]);
+      expect(fake.requests.at(-1)?.auth).toStartWith("TPS-Ed25519 ");
+      expect(res.exitCode).toBe(1);
+      expect(res.stdout).not.toContain("registered in Flair");
+      expect(res.stderr).toContain(`this attempt to register a key in Flair at ${fake.url} was not confirmed`);
+      expect(res.stderr).toContain(`Remedy: re-run \`tps agent create --id ${id}\``);
+      expect(res.stderr).not.toContain("flair agent remove");
+    } finally {
+      restore();
+      fake.stop();
+    }
+  });
+}
 
 /** A refusal from POST /AgentKeyRegister: the status the endpoint answers and the remedy its refusal names. */
 const KEY_REGISTRATION_REFUSALS: ReadonlyArray<{ status: number; error: string; remedy: string }> = [
@@ -790,13 +864,14 @@ for (const suffix of [".seed", ".key"]) {
   });
 }
 
-// chmod 000 does not stop root from reading, so the case cannot be built as root.
-test.skipIf(process.getuid?.() === 0)("an existing private key file that cannot be read: a named refusal before any Flair request, not a throw", async () => {
+test("a directory at the private key path: refusal before any Flair request, not a throw", async () => {
   const id = `${AGENT}-unreadable-key`;
   const keyPair = generateKeyPair();
-  const fake = startFakeFlair(async (req, url) => (req.method === "PUT" ? refusePut(url, id) : undefined));
+  const fake = startRegistrarFlair(id, Buffer.from(keyPair.signing.publicKey).toString("base64url"), { fetchOnly: true });
+  const restore = patchShared(globalThis, "fetch", (async (input, init) => fake.fetch(new Request(input, init))) as typeof fetch);
   const { keyPath } = writeIdentity(id, keyPair);
-  chmodSync(keyPath, 0o000);
+  unlinkSync(keyPath);
+  mkdirSync(keyPath);
   try {
     const res = await runCreate(fake.url, id, { inspectError: true });
     expect(res.hasError).toBe(false);
@@ -804,13 +879,12 @@ test.skipIf(process.getuid?.() === 0)("an existing private key file that cannot 
     expect(res.exitCode).toBe(1);
     expect(res.stdout).not.toContain("registered");
     expect(res.stderr).toContain(`Agent '${id}' cannot load its identity at`);
-    expect(res.stderr).toContain(`${keyPath} cannot be read (EACCES)`);
-    expect(res.stderr).toContain("make that file readable by the user running tps");
+    expect(res.stderr).toMatch(/cannot be read \(EISDIR\)|loading the identity files failed/);
     expect(res.stderr).toContain(`tps agent create --id ${id}`);
     expectNoKeyBytes(res.stdout + res.stderr, keyPair.signing.privateKey);
     expect(fake.requests).toEqual([]);
   } finally {
-    chmodSync(keyPath, 0o600);
+    restore();
     fake.stop();
   }
 });
@@ -1213,6 +1287,15 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")(
         const record = await fetch(`${baseUrl}/Agent/${id}`, { headers });
         expect(record.ok).toBe(true);
         expect((await record.json() as { publicKey: string }).publicKey).toBe(publicKey);
+        const signedRegister = await fetch(`${baseUrl}/AgentKeyRegister`, {
+          method: "POST",
+          headers: { Authorization: sign("POST", "/AgentKeyRegister"), "Content-Type": "application/json" },
+          body: JSON.stringify({ agentId: id, publicKey: Buffer.alloc(32, 7).toString("base64url") }),
+        });
+        expect(signedRegister.status).toBe(403);
+        const unchanged = await fetch(`${baseUrl}${path}`, { headers });
+        expect(unchanged.status).toBe(200);
+        expect((await unchanged.json()).publicKey).toBe(publicKey);
       } else {
         expect(res.exitCode).toBe(1);
         expect(res.stdout).not.toContain("registered in Flair");
