@@ -683,3 +683,87 @@ test("a settlement refusal whose durable record fails still logs the refusal rea
     errorLog.mockRestore();
   }
 }, 15_000);
+
+/** The loop config a settlement test drives; the memory mock records every appended event. */
+function settlementLoop(events: Array<{ data?: unknown }>, provider: unknown, pollMs = 1): EventLoop {
+  const config = {
+    agentId: AGENT, name: "settlement-bound", mailDir, memoryPath: join(workspace, "mem.jsonl"), workspace,
+    llm: { provider: "test", model: "test-model" }, contextWindowTokens: 8000, maxToolTurns: 50,
+  };
+  return new EventLoop({
+    config: config as never,
+    memory: { append: async (event: unknown) => { events.push(event as { data?: unknown }); } } as never,
+    context: {} as never,
+    provider: provider as never,
+    tools: { list: () => [], execute: async () => ({ content: "ok" }) } as never,
+  }, pollMs);
+}
+
+test("a deferred settlement that never clears is abandoned after a stop and recorded", async () => {
+  plant("m1.json", "never-clears");
+  const c = client();
+  let calls = 0;
+  const complete = spyOn(c, "completeDelivery").mockImplementation(async () => {
+    calls++;
+    return { status: "deferred", reason: "storage-error", detail: "permanent storage failure" };
+  });
+  const events: Array<{ data?: unknown }> = [];
+  const loop = settlementLoop(events, completingProvider);
+  const source: MailDeliverySource = {
+    async deliverNext() {
+      const result = await c.deliverNext();
+      if (result.status === "delivered") void loop.stop();
+      return result;
+    },
+    completeDelivery: (delivery) => c.completeDelivery(delivery),
+    releaseDelivery: (delivery) => c.releaseDelivery(delivery),
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      loop.runDeliveries(source),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("runDeliveries did not return within 5s")), 5_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    complete.mockRestore();
+  }
+  expect(calls).toBe(20);
+  expect(events.some((event) => String(event.data).includes("deferred past the shutdown bound"))).toBe(true);
+}, 10_000);
+
+test("a stop during settlement retries still settles when the deferral clears before the bound", async () => {
+  plant("m1.json", "clears-in-time");
+  const c = client();
+  const real = c.completeDelivery.bind(c);
+  let attempts = 0;
+  const complete = spyOn(c, "completeDelivery").mockImplementation(async (delivery) => {
+    attempts++;
+    if (attempts <= 3) return { status: "deferred", reason: "lock-busy", detail: "mailbox lock busy; retry" };
+    return real(delivery);
+  });
+  const events: Array<{ data?: unknown }> = [];
+  const loop = settlementLoop(events, completingProvider);
+  const source: MailDeliverySource = {
+    async deliverNext() {
+      const result = await c.deliverNext();
+      if (result.status === "delivered") void loop.stop();
+      return result;
+    },
+    completeDelivery: (delivery) => c.completeDelivery(delivery),
+    releaseDelivery: (delivery) => c.releaseDelivery(delivery),
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      loop.runDeliveries(source),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("runDeliveries did not return within 5s")), 5_000); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    complete.mockRestore();
+  }
+  expect(attempts).toBe(4);
+  expect(intentPhase("m1.json")).toBeNull();
+  expect(events.some((event) => String(event.data).includes("shutdown bound"))).toBe(false);
+}, 10_000);

@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { AgentRuntime, canonicalMailboxRoot, hasCommittedMessageId, ProviderManager } from "@tpsdev-ai/agent";
+import { AgentRuntime, canonicalMailboxRoot, hasCommittedMessageId, mailboxReplayStore, ProviderManager } from "@tpsdev-ai/agent";
 import { flairTarget } from "./helpers/scratch-flair.js";
 import { buildSignedEnvelope, pubkeyFromSeed, writeKeyFile } from "./helpers/stub-flair.js";
 
@@ -79,14 +79,18 @@ function eventLog(workspace: string): Array<Record<string, unknown>> {
 }
 
 /**
- * True once the runtime's mailbox recorded an event of type `mail.receive`
- * whose own `status`/`error` fields carry the failure — one parsed event, not
- * two lookalike substrings. It proves a `mail.receive` error was logged; it
- * does not establish the cause.
+ * True once the runtime's mailbox recorded the wrong-key Agent-read refusal:
+ * a `mail.receive` error event whose own `error` names the Flair Agent read
+ * and the verifier's rejection. A mailbox storage error shares the event
+ * shape but carries neither, so it cannot satisfy this.
  */
 function recoveryLogged(workspace: string): boolean {
   return eventLog(workspace).some(
-    (event) => event.type === "mail.receive" && event.status === "error" && typeof event.error === "string" && event.error.length > 0,
+    (event) => event.type === "mail.receive"
+      && event.status === "error"
+      && typeof event.error === "string"
+      && event.error.includes("/Agent/")
+      && event.error.includes("invalid_signature"),
   );
 }
 
@@ -124,6 +128,7 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair verifies and ha
     expect(readdirSync(join(mailbox, "cur"))).toEqual(["m1.json"]);
     expect(readdirSync(join(mailbox, "new"))).toEqual([]);
     expect(hasCommittedMessageId(mailbox, messageId)).toBe(true);
+    expect(mailboxReplayStore(mailbox).placementPhase("m1.json")).toBeNull();
     expect(provider).toHaveBeenCalledTimes(1);
   } finally {
     await runtime.stop();
