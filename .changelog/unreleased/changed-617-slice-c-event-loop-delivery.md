@@ -3,7 +3,8 @@
   Handler completion requests finalization; a turn-limit return or thrown
   handler requests release. Deferred finalization and release are retried on
   the same delivery. Deadline quarantine requires the mailbox lock and storage
-  to become available; until then the claim stays pending. A stop prevents
+  to become available. A failed storage operation can leave the durable transition
+  uncertain. A stop prevents
   the next `deliverNext()` call; a check already waiting can return a delivery,
   which the loop processes and attempts to settle before shutdown removes the
   PID file. Deferred settlement is retried; a stop bounds the retries, and the
