@@ -299,14 +299,7 @@ function responseError(entry: string, method: string, path: string, status: numb
   return `Flair ${entry} ${method} ${path} → ${status}: ${code}`;
 }
 
-/**
- * The refusal names POST /AgentKeyRegister is documented to answer in its
- * `error` field (flair#2266): the authentication denials and the registration
- * refusals. A body naming none of these yields `null` — the response text is
- * never echoed, so a response this client cannot recognize as this endpoint
- * names no refusal, and such a response (a 404 or 405 without the field, say)
- * is not proof the route is absent.
- */
+/** Recognized POST /AgentKeyRegister refusal names. */
 const AGENT_KEY_REGISTER_REFUSALS: readonly string[] = [
   "authentication required",
   "forbidden",
@@ -322,7 +315,7 @@ const AGENT_KEY_REGISTER_REFUSALS: readonly string[] = [
 /** Membership — module-private, so nothing outside this module can change how a refusal is named. */
 const AGENT_KEY_REGISTER_REFUSAL_SET: ReadonlySet<string> = new Set(AGENT_KEY_REGISTER_REFUSALS);
 
-/** The refusal name on a POST /AgentKeyRegister response, or null when the body named none this client knows. */
+/** Parse a recognized refusal name from the body. */
 function agentKeyRegisterRefusal(body: string): string | null {
   let parsed: unknown;
   try {
@@ -334,13 +327,7 @@ function agentKeyRegisterRefusal(body: string): string | null {
   return typeof code === "string" && AGENT_KEY_REGISTER_REFUSAL_SET.has(code) ? code : null;
 }
 
-/**
- * A refusal from POST /AgentKeyRegister: the HTTP status and the endpoint's own
- * refusal name, or null when the response named none this client knows. A 404
- * or 405 with a null refusal names no response this client recognizes as the
- * endpoint, so it is not proof the route is absent. The message carries the
- * status and the allow-listed name only, never response text.
- */
+/** An HTTP error from POST /AgentKeyRegister; null means an unreadable body or no recognized refusal. */
 export class FlairAgentKeyRegisterError extends Error {
   constructor(
     public readonly status: number,
@@ -621,9 +608,8 @@ export class FlairClient {
    * operator (Basic admin) credential. cli#512: this is Flair's supported
    * operation for a row whose key Flair's Agent PUT and PATCH do not store. A
    * non-OK response throws a FlairAgentKeyRegisterError carrying the status and
-   * the endpoint's refusal name (null when the body named none this client
-   * knows, which is how a response this client cannot recognize as this route's
-   * refusal is named). A transport failure throws a FlairRequestError (status 0).
+   * the endpoint's refusal name (null for an unreadable body or no recognized
+   * refusal). A transport failure throws a FlairRequestError (status 0).
    */
   async registerAgentKey(
     agentId: string,

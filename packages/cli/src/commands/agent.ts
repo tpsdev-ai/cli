@@ -409,20 +409,7 @@ const MIN_FLAIR_VERSION_FOR_KEY_REGISTER = "0.62.0";
 /** Flair's stored `publicKey` value for an Agent row seeded but not yet registered (flair#2266). */
 const PENDING_PUBLIC_KEY = "pending";
 
-/**
- * cli#512 — `create` refuses when POST /AgentKeyRegister names a refusal other
- * than `registration_unavailable`. `status`/`refusal` are the endpoint's own
- * response: the HTTP status and its refusal name, or null when the body named
- * none this client knows. A 404 or 405 with no refusal names no response this
- * client recognizes as the endpoint, so it is not proof the route is absent —
- * the route may be unavailable on this Flair.
- *
- * Every branch exits non-zero and none falls back to a write the old server
- * would mishandle; the slice-1 read-back remains the only source of success.
- * `registration_unavailable` does not reach here: Flair returns it both before
- * committing (nothing changed) and after committing when its own read-back
- * fails, so the caller reports it unconfirmed instead.
- */
+/** `refusal` is null when the body is unreadable or names no recognized refusal. */
 function refuseKeyRegistration(id: string, flairUrl: string, status: number, refusal: string | null): never {
   if (refusal === null && (status === 404 || status === 405)) {
     console.error(
@@ -443,11 +430,13 @@ function refuseKeyRegistration(id: string, flairUrl: string, status: number, ref
     agent_key_not_pending: `the stored key for '${id}' is not 'pending', so this operation does not apply; replacing a key is the key-rotation path, not create`,
     registration_conflict: "another write to this agent is in progress or already committed; re-run `tps agent create`",
   };
-  const name = refusal ?? "no refusal named";
-  const remedy = refusal !== null
-    ? (remedies[refusal] ?? "the endpoint refused the registration; re-run `tps agent create`")
-    : "the response named no refusal this client recognizes; check that Flair serves this route and its version";
-  console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: POST /AgentKeyRegister refused the registration (${name}) with HTTP ${status}.`);
+  if (refusal === null) {
+    console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: POST /AgentKeyRegister answered HTTP ${status} with no refusal this client recognizes; whether a key was stored is unknown.`);
+    console.error("   Remedy: check that Flair serves this route and its version.");
+    process.exit(1);
+  }
+  const remedy = remedies[refusal] ?? "the endpoint refused the registration; re-run `tps agent create`";
+  console.error(`❌ Agent '${id}' — this attempt to register a key in Flair at ${flairUrl} was not confirmed: POST /AgentKeyRegister refused the registration (${refusal}) with HTTP ${status}.`);
   console.error(`   Remedy: ${remedy}.`);
   process.exit(1);
 }

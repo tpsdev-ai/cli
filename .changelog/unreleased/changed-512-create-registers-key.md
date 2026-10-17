@@ -2,8 +2,9 @@
   /AgentKeyRegister` when the route accepts it and the stored key reads back
   equal.** It sends the generated key through that route over its operator
   credential. Definitive refusals exit non-zero with the agent, the Flair URL,
-  the refusal name and a remedy; a response this client cannot recognize as
-  that endpoint's refusal (404 or 405) exits non-zero naming the minimum Flair
+  the refusal name and a remedy; an error response with no recognized refusal,
+  or an unreadable error body, remains unconfirmed with its HTTP status; an
+  unrecognized 404 or 405 names the minimum Flair
   version that serves the route as the likely cause; and a transport failure, a
   success body that is not JSON, or a `registration_unavailable` is answered by
   that read-back: `create` reports success only when the key reads back equal,
