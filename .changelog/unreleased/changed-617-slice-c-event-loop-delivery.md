@@ -6,10 +6,9 @@
   to become available; until then the claim stays pending. A stop prevents
   the next `deliverNext()` call; a check already waiting can return a delivery,
   which the loop processes and attempts to settle before shutdown removes the
-  PID file. Deferred settlement is retried; a stop bounds the retries, so
-  settlement cannot hold shutdown open, and the last deferral or refusal is
-  logged. Any refusal can leave the intent pending, blocking that message until
-  resolved.
+  PID file. Deferred settlement is retried; a stop bounds the retries, and the
+  last deferral or refusal is logged. Any refusal can leave the intent pending,
+  blocking that message until resolved.
 
   A handler that never returns cannot reach the presentation or deadline checks.
 
