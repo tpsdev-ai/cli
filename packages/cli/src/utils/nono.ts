@@ -685,7 +685,7 @@ function appendUnresolved(ancestor: string, tail: string[]): string {
   return join(ancestor, ...components);
 }
 
-function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
+export function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
   if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
   const inputRoot = parse(p).root;
   const base = sep === "\\" && inputRoot ? resolve(cwd, inputRoot) : cwd;

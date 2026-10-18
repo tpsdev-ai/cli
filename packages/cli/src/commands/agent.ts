@@ -32,6 +32,7 @@ import {
   sandboxProfileGrantRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
+  canonicalPath,
 } from "../utils/nono.js";
 import { launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
@@ -1232,7 +1233,10 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
             // Carry the resolved config pathname through the re-exec (cli#516).
-            relaunch.push("--config", configPath);
+            // The child gets the canonical path, the same file the read-file
+            // grant names: macOS Seatbelt checks a symlink's own path, so a
+            // child opening the link would be denied a file it may read.
+            relaunch.push("--config", canonicalPath(configPath));
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
