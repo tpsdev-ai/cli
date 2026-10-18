@@ -358,7 +358,7 @@ export type WorktreeLaunchBinding =
  * carry a regular `.git` file; anything else is refused before any grant is
  * computed. An unregistered regular `.git` file is a worktree we do not
  * manage: it gets no metadata grants, but the caller still needs the trusted
- * base so grants can be checked against it.
+ * base to check launch options and explicit profile filesystem grants.
  */
 export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
   const workspace = resolve(workspacePath);

@@ -1012,7 +1012,7 @@ realNonoSuite(
   realNono ? `cli#516 — real nono (${realNono})` : `cli#516 — real nono SKIPPED: ${realNonoSkip}`,
   () => {
     for (const fromBase of [false, true]) {
-    test(`the launch grants deny an untracked base file with base cwd/config ${fromBase}`, () => {
+    test(`the fixture launch denies an untracked base file with base cwd/config ${fromBase}`, () => {
       const sb = makeRealNonoSandbox();
       try {
         // A trusted base location: the launch resolves the sibling `tps` next
@@ -1092,7 +1092,7 @@ realNonoSuite(
     }, 40_000);
     }
 
-    test("an unrelated worktree launched from the base cannot read or write a base file", () => {
+    test("an unrelated fixture worktree launched from the base is denied read and write of a base file", () => {
       const sb = makeRealNonoSandbox();
       try {
         // The trusted base sits beside the workspace, as it does for a launch

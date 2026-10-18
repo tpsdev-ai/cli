@@ -117,7 +117,7 @@ test("refuses a base grant declared by the selected profile", () => fixture((inp
   expect(() => agentLaunchOptions(input)).toThrow(WorktreeGrantError);
 }));
 
-test("an existing worktree is confined without a selected runtime", () => fixture((input, base) => {
+test("an existing worktree omits the base from explicit launch grants without a selected runtime", () => fixture((input, base) => {
   const result = agentLaunchOptions({ ...input, runtime: undefined, cwd: base });
   expect(result.refusal).toBeNull();
   expect(result.options.cwd).toBe(input.workspace);
