@@ -50,6 +50,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { worktreeLaunchGit } from "./agent-lifecycle.js";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -299,6 +300,7 @@ export function harnessReadFiles(agentId?: string, home: string = homedir()): st
 
 export interface AgentLaunchGrantInput {
   configPath: string;
+  cwd?: string;
   workspace: string;
   launchId: string;
   runtime?: string;
@@ -309,21 +311,10 @@ export interface AgentLaunchGrantInput {
   mailDir: string;
   tmpDir: string;
   agentDir: string;
-  /**
-   * A worktree this launch created with its checkout deferred. `gitDir` is
-   * writable (checkout writes index and HEAD there); `gitCommonDir` is the
-   * base repository's metadata directory, read-only. This grant does not
-   * include the base repository's working tree.
-   */
-  worktreeGit?: { gitDir: string; gitCommonDir: string };
 }
 
-/**
- * The nono grants for a sandboxed agent launch. Shared by the launch and its
- * fixtures so a test cannot assert a grant set the launch does not pass.
- */
-export function agentLaunchGrants(
-  input: AgentLaunchGrantInput,
+function agentLaunchGrants(
+  input: AgentLaunchGrantInput & { worktreeGit?: { gitDir: string; gitCommonDir: string } },
 ): { read: string[]; readFiles: string[]; allowFiles: string[]; allow: string[] } {
   const home = input.home ?? homedir();
   const runtimeGrants = runtimeNonoOptions(input.runtime, input.env);
@@ -331,11 +322,10 @@ export function agentLaunchGrants(
     read: [
       ...new Set([
         ...harnessReadPaths(home),
-        dirname(input.configPath),
         ...(input.worktreeGit ? [input.worktreeGit.gitCommonDir] : []),
       ]),
     ],
-    readFiles: harnessReadFiles(input.launchId, home),
+    readFiles: [...harnessReadFiles(input.launchId, home), canonicalPath(input.configPath)],
     allowFiles: runtimeGrants.allowFiles ?? [],
     allow: [
       ...new Set([
@@ -349,6 +339,36 @@ export function agentLaunchGrants(
       ]),
     ],
   };
+}
+
+export class WorktreeGrantError extends Error {
+  constructor(path: string) {
+    super(`WorktreeGrantError: grant contains the base working tree: ${path}`);
+    this.name = "WorktreeGrantError";
+  }
+}
+
+export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typeof approveRuntimeNonoOptions> {
+  const worktreeGit = worktreeLaunchGit(input.workspace);
+  const grants = {
+    ...agentLaunchGrants({ ...input, worktreeGit }),
+    cwd: worktreeGit ? input.workspace : input.cwd ?? process.cwd(),
+    workdir: input.workspace,
+  };
+  const approval = approveRuntimeNonoOptions(input.runtime, grants, input.env, input.launchId, input.configPath);
+  if (!worktreeGit) return approval;
+  const options = approval.refusal ? grants : approval.options;
+  const base = canonicalPath(worktreeGit.baseWorkingTree);
+  const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
+  const check = (path: string) => {
+    if (pathContainsOrEquals(compare(canonicalPath(path)), compare(base))) throw new WorktreeGrantError(path);
+  };
+  for (const key of ["cwd", "workdir", "read", "allow", "readFiles", "allowFiles"] as const) {
+    const value = options[key];
+    for (const path of typeof value === "string" ? [value] : value ?? []) check(path);
+  }
+  for (const grant of sandboxProfileGrants(runtimeNonoProfile(input.runtime), input.env ?? process.env)) check(grant.path);
+  return approval;
 }
 
 export function runtimeNonoProfile(runtime?: string): NonoProfile {
@@ -712,6 +732,7 @@ export function approveRuntimeNonoOptions(
   grants: NonoOptions,
   env: NodeJS.ProcessEnv = process.env,
   agentId?: string,
+  configPath?: string,
 ): { options: NonoOptions; runtimeDirectories: string[]; refusal: string | null } {
   const options: NonoOptions = {};
   const runtimeDirectories: string[] = [];
@@ -846,7 +867,7 @@ export function approveRuntimeNonoOptions(
       ? [...runtimeCredentialFiles(runtime as CredentialRuntime, env), ...(runtimeNonoOptions(runtime, env).allowFiles ?? [])]
       : [];
     const ownTargets = ownFiles.map((p) => join(canonical(dirname(resolve(p))), basename(p)));
-    const systemTargets = systemReadFiles().map(canonical);
+    const readOnlyTargets = [...systemReadFiles(), ...(configPath ? [configPath] : [])].map(canonical);
     const fileGrants = [
       ...(grants.readFiles ?? []).map((p) => ({ path: p, label: `the read-file grant '${p}'`, readOnly: true })),
       ...(grants.allowFiles ?? []).map((p) => ({ path: p, label: `the writable-file grant '${p}'`, readOnly: false })),
@@ -860,7 +881,7 @@ export function approveRuntimeNonoOptions(
       if (root && !permittedTpsFile) {
         return result(`${grant.label} (${canon}) overlaps the TPS credential root ${root.label} (${root.path})`);
       }
-      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && systemTargets.some((p) => equals(p, canon)))) {
+      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && readOnlyTargets.some((p) => equals(p, canon)))) {
         return result(`${grant.label} (${canon}) is not a permitted file for runtime '${runtime}'`);
       }
     }

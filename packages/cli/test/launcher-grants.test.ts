@@ -178,8 +178,6 @@ describe("writeRefusedForPermission", () => {
  *   - under $FAKE_GRANTED_UNDER: runs the payload as is, so `cat` prints the nonce;
  *   - anywhere else: runs the payload with a `cat` that is denied, so the
  *     payload's own `||` branch prints the marker.
- * The fake never knows the nonce or the marker: each answer comes from running
- * the probe's own payload.
  */
 function fakeProbeNono(dir: string): string {
   const denyBin = join(dir, "deny-bin");

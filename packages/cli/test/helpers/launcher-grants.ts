@@ -160,21 +160,12 @@ export function probeNonoBuiltinRead(
 
 /** The default candidates for a real-nono fixture base, in order of preference. */
 export function realNonoHomeBaseCandidates(platform: NodeJS.Platform = process.platform): string[] {
-  // /var/tmp is outside nono's Linux groups. On macOS, system_read_macos grants
-  // /private, /var, /tmp and /Volumes, so neither /var/tmp nor a /var/folders
-  // TMPDIR qualifies there; /Users/Shared is the stock world-writable directory
-  // outside every macOS group.
   return ["/var/tmp", tmpdir(), ...(platform === "darwin" ? ["/Users/Shared"] : [])];
 }
 
 /**
- * A base for a fixture HOME that REAL nono confines (cli#516): a writable
- * directory outside every launcher grant, as sandboxHomeBase() requires, where
- * real nono (probeNonoBuiltinRead) denies a sandboxed read of a scratch file
- * under it. Inside a granted base the fixture tests nothing real: the probe
- * produces no output with a nonzero exit (a fixture HOME under a grant that
- * overlaps nono's state root appears this way), or the launcher refuses the
- * profile (nono reports read access to the fixture HOME's credential files).
+ * A writable directory outside the launcher's grants where real nono denies
+ * a sandboxed read of a scratch file.
  * A candidate is probed only once it is a writable directory
  * outside the launcher's grants; when none qualifies this throws, naming each
  * candidate and what ruled it out. An unknown probe answer throws at once

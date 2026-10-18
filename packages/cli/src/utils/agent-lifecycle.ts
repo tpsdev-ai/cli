@@ -224,11 +224,7 @@ export async function writeTaskMemory(
 export interface AgentLifecycleResult {
   changed: boolean;
   reason: string;
-  /**
-   * Absolute path of the created worktree's git directory. Present only when
-   * this call created the worktree and deferred its checkout to the caller
-   * (cli#516): the caller needs it to grant the checking-out side access.
-   */
+  /** Git metadata for a worktree launch with deferred checkout. */
   gitDir?: string;
   /**
    * Absolute path of the worktree's git common directory — the base
@@ -236,6 +232,7 @@ export interface AgentLifecycleResult {
    * in the same case as `gitDir`.
    */
   gitCommonDir?: string;
+  baseWorkingTree?: string;
 }
 
 /**
@@ -345,6 +342,22 @@ function resolveBaseRepo(workspacePath: string): string | null {
   return null;
 }
 
+export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
+  const workspace = resolve(workspacePath);
+  let marker;
+  try {
+    marker = lstatSync(join(workspace, ".git"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+  }
+  if (marker.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
+  if (!marker.isFile()) return undefined;
+  const base = parseWorktreePaths(workspace).values().next().value;
+  if (!base || base === workspace) return undefined;
+  return worktreeGitMetadata(workspace, base);
+}
+
 /**
  * Create the agent's worktree when a base repository exists and the workspace
  * is absent. An existing worktree, an existing ordinary workspace, the base
@@ -377,7 +390,7 @@ export function onStart(
 
   const worktrees = parseWorktreePaths(baseRepo);
   if (worktrees.has(workspace)) {
-    return { changed: false, reason: "worktree already exists" };
+    return { changed: false, reason: "worktree already exists", ...(opts.deferCheckout ? worktreeGitMetadata(workspace, baseRepo) : {}) };
   }
 
   if (existsSync(workspace)) {
@@ -404,10 +417,23 @@ export function onStart(
     );
   }
 
-  if (!defer) {
-    return { changed: true, reason: "worktree created" };
+  const rollback = () => git(baseRepo, ["worktree", "remove", "--force", workspace]);
+  try {
+    return {
+      changed: true,
+      reason: defer ? "worktree created; checkout deferred" : "worktree created",
+      ...(defer ? worktreeGitMetadata(workspace, baseRepo) : {}),
+    };
+  } catch (err) {
+    const removed = rollback();
+    if (!removed.ok) {
+      throw new WorktreeLifecycleError(`${(err as Error).message}; worktree cleanup failed: ${removed.stderr || removed.stdout}`);
+    }
+    throw err;
   }
+}
 
+function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } {
   const gitDir = git(workspace, ["rev-parse", "--absolute-git-dir"]);
   if (!gitDir.ok || !gitDir.stdout) {
     throw new WorktreeLifecycleError(
@@ -426,10 +452,9 @@ export function onStart(
     );
   }
   return {
-    changed: true,
-    reason: "worktree created; checkout deferred",
     gitDir: gitDir.stdout,
     gitCommonDir: commonDir,
+    baseWorkingTree: baseRepo,
   };
 }
 

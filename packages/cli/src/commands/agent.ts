@@ -25,10 +25,9 @@ import {
   isNonoStrict,
   isInteractiveTty,
   isSupervised,
-  agentLaunchGrants,
+  agentLaunchOptions,
   runtimeNonoOptions,
   runtimeNonoProfile,
-  approveRuntimeNonoOptions,
   sandboxProfileGrantRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
@@ -1111,9 +1110,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         console.error("   or: tps agent run --config <path> --message <text>");
         process.exit(1);
       }
-      // cli#516 — resolve to ONE absolute path BEFORE any read, so the pathname
-      // this process loads, the read grant it derives, and the pathname the
-      // re-exec child reopens are the same, even for a relative `--config`.
+      // Resolve relative --config before reading or re-executing (cli#516).
       configPath = resolvePathMod(configPath);
       if (!existsSync(configPath)) {
         console.error(`Config not found: ${configPath}`);
@@ -1239,63 +1236,42 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // and releases the child over its own socket only after `nono ps`
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
-            const launchOptions = {
-              workdir: config.workspace,
-              ...agentLaunchGrants({
-                configPath,
-                workspace: config.workspace,
-                launchId,
-                runtime: selectedRuntime,
-                mailDir,
-                tmpDir,
-                agentDir,
-              }),
-            };
             const profile = runtimeNonoProfile(selectedRuntime);
-            let approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
-            if (approval.refusal) {
-              console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
-              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
-            }
-            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
-            if (profileRefusal) {
-              console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
-              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
-            }
-            // With deferCheckout: true, when a base repository exists and the
-            // workspace is absent, the parent creates the worktree without
-            // checkout; the sandboxed child checks it out (cli#516). Grant read
-            // of the base repository's git metadata and write of the worktree's
-            // git directory, rather than the base repository's working tree.
+            const launchInput = {
+              configPath,
+              cwd: process.cwd(),
+              workspace: config.workspace,
+              launchId,
+              runtime: selectedRuntime,
+              mailDir,
+              tmpDir,
+              agentDir,
+            };
+            const approveLaunch = () => {
+              const result = agentLaunchOptions(launchInput);
+              if (result.refusal) throw new Error(`refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${result.refusal}`);
+              return result;
+            };
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
-            let worktreeGitDir: string | undefined;
-            let worktreeGitCommonDir: string | undefined;
-            if (selectedRuntime) {
-              try {
-                const startResult = onStart(launchId, config.workspace, { deferCheckout: true });
-                worktreeCreated = startResult.changed;
-                worktreeGitDir = startResult.gitDir;
-                worktreeGitCommonDir = startResult.gitCommonDir;
-              } catch (err) {
-                console.error(`❌ ${(err as Error).message}`);
-                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
-              }
-            }
-            if (worktreeGitDir && worktreeGitCommonDir) {
-              launchOptions.read.push(worktreeGitCommonDir);
-              launchOptions.allow.push(worktreeGitDir);
-              const recheck = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
-              if (recheck.refusal) {
-                console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${recheck.refusal}`);
+            let approval: ReturnType<typeof agentLaunchOptions>;
+            try {
+              approval = approveLaunch();
+              const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
+              if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
+              const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
+              worktreeCreated = start?.changed ?? false;
+              approval = approveLaunch();
+            } catch (err) {
+              console.error(`❌ ${(err as Error).message}`);
+              if (worktreeCreated) {
                 try {
                   onStop(launchId, config.workspace);
                 } catch (cleanupErr) {
                   console.error(`❌ ${(cleanupErr as Error).message}`);
                 }
-                process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
               }
-              approval = recheck;
+              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             // The child checks the worktree out only when THIS launch created
             // it. Remove any inherited TPS_WORKTREE_PENDING before launch and

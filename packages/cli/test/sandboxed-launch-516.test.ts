@@ -21,14 +21,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
-  agentLaunchGrants,
-  approveRuntimeNonoOptions,
+  agentLaunchOptions,
   buildNonoArgs,
   nonoVersion,
   runtimeNonoProfile,
   versionAtLeast,
 } from "../src/utils/nono.js";
-import { checkoutWorktree, onStart, onStop, WorktreeLifecycleError, worktreeCommonDir } from "../src/utils/agent-lifecycle.js";
+import { checkoutWorktree, onStart, onStop, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { realNonoHomeBase, sandboxHomeBase, NONO_PROBE_DENIED_PREFIX } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -126,8 +125,6 @@ interface Sandbox {
 function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
   // The base must sit outside every launcher grant (cli#558): a HOME inside one
   // makes the launcher's runtime-options gate refuse before the case under test.
-  // The real-nono cases pass realNonoHomeBase(), which is also outside nono's
-  // own built-in grants.
   const root = mkdtempSync(join(base, "tps-516-"));
   const home = join(root, "home");
   const run = join(root, "run");
@@ -191,7 +188,7 @@ function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Re
 // ---------------------------------------------------------------------------
 
 describe("cli#516 (1) — the attested re-exec keeps --config", () => {
-  test("agent start --config <file> re-execs with that --config and grants its directory", () => {
+  test("agent start --config <file> re-execs with that --config and grants its file", () => {
     const sb = makeSandbox();
     try {
       installFakeNono(sb, "  :");
@@ -205,15 +202,14 @@ describe("cli#516 (1) — the attested re-exec keeps --config", () => {
       mkdirSync(customDir, { recursive: true });
       writeFileSync(customConfig, agentYaml(sb, sb.ws));
 
-      runLauncher(
+      const result = runLauncher(
         ["agent", "start", "--config", customConfig, SANDBOX_REQUIRED],
         { cwd: sb.run, env: cliEnv(sb) },
       );
 
       const child = fakeNonoRuns(sb.root).find((l) => l.includes("agent start")) ?? "";
-      expect(child).toContain(`--config ${customConfig}`);
-      // The child is granted read of the directory, so it can re-read the file.
-      expect(child).toContain(`--read ${customDir}`);
+      expect(child, output(result)).toContain(`--config ${customConfig}`);
+      expect(child).toContain(`--read-file ${customConfig}`);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -237,7 +233,7 @@ describe("cli#516 (1) — the attested re-exec keeps --config", () => {
 
       const child = fakeNonoRuns(sb.root).find((l) => l.includes("agent start")) ?? "";
       expect(child).toContain(`--config ${customAbs}`);
-      expect(child).toContain(`--read ${customDir}`);
+      expect(child).toContain(`--read-file ${customAbs}`);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -292,7 +288,7 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
     }
   });
 
-  test("a worktree setup failure is reported, and the launch stops before the sandbox", () => {
+  test("a blocked workspace parent stops launch before the sandbox", () => {
     const sb = makeSandbox();
     try {
       const base = join(sb.home, "ops", "tps");
@@ -304,8 +300,6 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
       writeFileSync(join(base, "README.md"), "# base\n");
       g(["add", "README.md"]);
       g(["commit", "-qm", "init"]);
-      // A regular file blocks the workspace's parent, so `git worktree add`
-      // cannot create it — on any uid, so the case also holds as root.
       const blocker = join(sb.root, "blocker");
       writeFileSync(blocker, "not a directory\n");
       const blockedWs = join(blocker, "ws");
@@ -321,8 +315,44 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
         ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
         { cwd: sb.run, env: cliEnv(sb) },
       );
-      expect(output(r)).toContain("worktree setup failed");
+      expect(output(r)).toContain("worktree marker probe failed");
       expect(fakeNonoRuns(sb.root)).toEqual([]);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a metadata failure after worktree creation removes the worktree", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const gitBin = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+      const g = (args: string[]) => spawnSync(gitBin, args, { cwd: base, encoding: "utf8" });
+      expect(g(["init", "-q"]).status).toBe(0);
+      expect(g(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]).status).toBe(0);
+      rmSync(sb.ws, { recursive: true });
+      const bin = join(sb.root, "bin");
+      mkdirSync(bin);
+      const wrapper = join(bin, "git");
+      writeFileSync(wrapper, [
+        "#!/bin/sh",
+        'if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ]; then echo "injected metadata failure" >&2; exit 79; fi',
+        `exec "${gitBin}" "$@"`,
+        "",
+      ].join("\n"));
+      chmodSync(wrapper, 0o755);
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, sb.ws));
+      const result = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb, { PATH: `${bin}:${process.env.PATH}` }) },
+      );
+      expect(output(result)).toContain("injected metadata failure");
+      expect(fakeNonoRuns(sb.root)).toEqual([]);
+      expect(existsSync(sb.ws)).toBe(false);
+      expect(g(["worktree", "list", "--porcelain"]).stdout).not.toContain(sb.ws);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -869,9 +899,6 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
   return predicate();
 }
 
-/** Where the real-nono fixtures live: outside the launcher's grants AND nono's
- * own built-in grants (on macOS, system_read_macos covers /var/tmp). Resolved on
- * first use, so a host without nono never queries it. */
 let realNonoBase: string | undefined;
 function makeRealNonoSandbox(): Sandbox {
   realNonoBase ??= realNonoHomeBase(realNono as string);
@@ -895,7 +922,8 @@ const realNonoSuite = realNono ? describe : describe.skip;
 realNonoSuite(
   realNono ? `cli#516 — real nono (${realNono})` : `cli#516 — real nono SKIPPED: ${realNonoSkip}`,
   () => {
-    test("the launch's grants read the worktree and deny an untracked base-repository file", () => {
+    for (const fromBase of [false, true]) {
+    test(`the launch grants deny an untracked base file with base cwd/config ${fromBase}`, () => {
       const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.root, "base");
@@ -918,21 +946,18 @@ realNonoSuite(
         g(["-C", base, "worktree", "add", "--no-checkout", sb.ws, "--detach"]);
         const gitDir = g(["-C", sb.ws, "rev-parse", "--absolute-git-dir"]).stdout.trim();
         expect(gitDir).not.toBe("");
-        const gitCommonDir = worktreeCommonDir(gitDir);
         checkoutWorktree(sb.ws);
 
-        seedRealNonoProfiles(sb.home);
+        rmSync(join(sb.home, ".config", "nono", "profiles"), { recursive: true });
         // The launch grants ~/.bun; create it so nono does not warn on stdout.
         mkdirSync(join(sb.home, ".bun"), { recursive: true });
         const env = { ...process.env, HOME: sb.home, XDG_STATE_HOME: join(sb.root, "nono-state") };
-        const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        const cfg = fromBase ? join(base, "agent.yaml") : join(sb.home, ".tps", "agents", "probe", "agent.yaml");
         writeFileSync(cfg, agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"));
 
-        // The grants and profile are built by the same functions the launch
-        // uses, so this cannot pass against a grant set the launch does not
-        // pass. The payload is a probe instead of the re-exec.
-        const grants = agentLaunchGrants({
+        const approval = agentLaunchOptions({
           configPath: cfg,
+          cwd: fromBase ? base : sb.run,
           workspace: sb.ws,
           launchId: "probe",
           runtime: "codex",
@@ -941,14 +966,7 @@ realNonoSuite(
           mailDir: join(sb.home, ".tps", "mail"),
           tmpDir: sb.tmp,
           agentDir: join(sb.home, ".tps", "agents", "probe"),
-          worktreeGit: { gitDir, gitCommonDir },
         });
-        const approval = approveRuntimeNonoOptions(
-          "codex",
-          { ...grants, workdir: sb.ws, cwd: sb.run },
-          env,
-          "probe",
-        );
         expect(approval.refusal).toBeNull();
         for (const dir of approval.runtimeDirectories) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
@@ -970,7 +988,7 @@ realNonoSuite(
             ],
             env,
           ),
-          { cwd: sb.run, encoding: "utf-8", env },
+          { cwd: fromBase ? base : sb.run, encoding: "utf-8", env },
         );
         const lines = probe.stdout.trim().split("\n");
         expect(probe.status, `nono run exited ${probe.status}: ${probe.stderr}`).toBe(0);
@@ -980,8 +998,10 @@ realNonoSuite(
         rmSync(sb.root, { recursive: true, force: true });
       }
     }, 40_000);
+    }
 
-    test("the re-exec child loads the custom --config, not the default", async () => {
+    for (const symlink of [false, true]) {
+    test(`the re-exec child loads the custom config with symlink ${symlink}`, async () => {
       const sb = makeRealNonoSandbox();
       try {
         // The default config points at one workspace and the custom config at a
@@ -993,8 +1013,10 @@ realNonoSuite(
         for (const d of [wsDefault, wsCustom, customDir]) mkdirSync(d, { recursive: true });
         seedRealNonoProfiles(sb.home);
         writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, wsDefault));
-        const customConfig = join(customDir, "agent.yaml");
-        writeFileSync(customConfig, agentYaml(sb, wsCustom));
+        const target = join(customDir, "agent.yaml");
+        writeFileSync(target, agentYaml(sb, wsCustom));
+        const customConfig = symlink ? join(sb.root, "config-link.yaml") : target;
+        if (symlink) symlinkSync(target, customConfig);
 
         const child = spawn(
           NODE,
@@ -1045,6 +1067,8 @@ realNonoSuite(
         rmSync(sb.root, { recursive: true, force: true });
       }
     }, 60_000);
+
+    }
 
     test("the sandboxed child checks the worktree out inside the sandbox", async () => {
       const sb = makeRealNonoSandbox();
