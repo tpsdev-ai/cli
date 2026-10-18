@@ -173,6 +173,18 @@ interface RunCodexOptions {
   onStall?: () => void;
 }
 
+export function codexExecArgs(config: CodexRuntimeConfig): string[] {
+  const args = [
+    "exec", "--json", "--ephemeral",
+    ...(config.model ? ["--model", config.model] : []),
+    "--sandbox", config.sandboxMode ?? "workspace-write",
+    "--cd", config.workspace,
+    "-",
+  ];
+  for (const dir of config.extraDirs ?? []) args.push("--add-dir", dir);
+  return args;
+}
+
 async function runCodex(
   message: MailMessage,
   config: CodexRuntimeConfig,
@@ -181,18 +193,10 @@ async function runCodex(
 ): Promise<string> {
   await syncWorkspaceBeforeTask(config);
   const systemPrompt = await buildSystemPrompt(message, config);
-  const sandboxMode = config.sandboxMode ?? "workspace-write";
 
   const prompt = [systemPrompt, "", `[Mail from: ${message.from}]`, message.body].join("\n");
 
-  const args = [
-    "exec", "--json", "--ephemeral",
-    ...(config.model ? ["--model", config.model] : []),
-    "--sandbox", sandboxMode,
-    "--cd", config.workspace,
-    "-",
-  ];
-  for (const dir of config.extraDirs ?? []) args.push("--add-dir", dir);
+  const args = codexExecArgs(config);
 
   const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (codex)\n${"=".repeat(60)}\n`, "utf-8");

@@ -1297,6 +1297,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
                 relaunch,
                 {
                   runtimeDirectories: approval.runtimeDirectories,
+                  worktreeBinding: approval.worktreeBinding,
                   env: launchEnv,
                 },
               );

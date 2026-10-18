@@ -50,7 +50,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { worktreeLaunchBinding } from "./agent-lifecycle.js";
+import { worktreeLaunchBinding, worktreeLaunchGit, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -348,9 +348,9 @@ export class WorktreeGrantError extends Error {
   }
 }
 
-export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typeof approveRuntimeNonoOptions> {
+export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typeof approveRuntimeNonoOptions> & { worktreeBinding: WorktreeLaunchBinding } {
   const binding = worktreeLaunchBinding(input.workspace);
-  const worktreeGit = binding.kind === "registered" ? binding : undefined;
+  const worktreeGit = worktreeLaunchGit(binding);
   // An unregistered worktree gets no metadata grants and must not inherit the
   // caller's cwd as a writable grant: the sandbox's working directory is the
   // workspace in both worktree cases.
@@ -363,7 +363,7 @@ export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typ
     workdir: input.workspace,
   };
   const approval = approveRuntimeNonoOptions(input.runtime, grants, input.env, input.launchId, input.configPath);
-  if (binding.kind === "none") return approval;
+  if (binding.kind === "none") return { ...approval, worktreeBinding: binding };
   const options = approval.refusal ? grants : approval.options;
   const base = canonicalPath(binding.baseWorkingTree);
   const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
@@ -375,7 +375,7 @@ export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typ
     for (const path of typeof value === "string" ? [value] : value ?? []) check(path);
   }
   for (const grant of sandboxProfileGrants(runtimeNonoProfile(input.runtime), input.env ?? process.env)) check(grant.path);
-  return approval;
+  return { ...approval, worktreeBinding: binding };
 }
 
 export function runtimeNonoProfile(runtime?: string): NonoProfile {

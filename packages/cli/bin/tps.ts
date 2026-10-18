@@ -116,9 +116,11 @@ async function enforceLaunchControlOrExit() {
     "../src/utils/launch-attestation.js"
   );
   let confinement: { released: boolean; reason?: string } | undefined;
+  let worktreeBinding: import("../src/utils/agent-lifecycle.js").WorktreeLaunchBinding | undefined;
   if (ownFlag(ownArgv(), SANDBOXED_FLAG) && process.env[LAUNCH_SOCK_ENV]) {
     const attestation = await attestConfinement();
     confinement = { released: attestation.ok, reason: attestation.reason };
+    worktreeBinding = attestation.worktreeBinding;
   }
   const sandboxed = confinement?.released === true;
   enforceLaunchControl({ command, rest, argv: ownArgv(), parsedFlags: cli.flags,
@@ -127,7 +129,7 @@ async function enforceLaunchControlOrExit() {
   if (flags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
-  return { ...flags, sandboxed };
+  return { ...flags, sandboxed, worktreeBinding: confinement?.released ? worktreeBinding : undefined };
 }
 
 // nono availability check (skip for --quiet-nono-check or office/mail relay commands)
@@ -494,11 +496,6 @@ async function main() {
             const { load: parseYaml } = await import("js-yaml");
             const cfgPath = configPath ?? join(homedir(), ".tps", "agents", agentId!, "agent.yaml");
 
-            /** Resolve the git worktree metadata dir for a workspace.
-             *  A worktree's .git is a file containing "gitdir: /path/to/.git/worktrees/<name>".
-             *  Codex workspace-write sandbox restricts writes to the workspace dir; the worktree
-             *  metadata dir (index, HEAD, etc.) is outside that boundary and must be added to
-             *  extraDirs so git commit/push can write index.lock. */
             function resolveWorktreeGitDir(workspace: string): string | null {
               try {
                 const dotGit = join(workspace, ".git");
@@ -546,7 +543,7 @@ async function main() {
             }
 
             // Complete this launch's deferred checkout before starting the runtime.
-            const { onStart, onStop, checkoutWorktree } = await import("../src/utils/agent-lifecycle.js");
+            const { onStart, onStop, checkoutWorktree, worktreeLaunchBinding, worktreeLaunchGit } = await import("../src/utils/agent-lifecycle.js");
             const pendingCheckout = process.env.TPS_WORKTREE_PENDING;
             let worktreeCreated = false;
             if (sandboxed && pendingCheckout !== undefined) {
@@ -560,6 +557,10 @@ async function main() {
 
             try {
               if (runtimeArg === "codex") {
+              const worktreeGit = worktreeLaunchGit(sandboxed
+                ? launchDecision.worktreeBinding ?? { kind: "none" }
+                : worktreeLaunchBinding(agentWorkspace));
+
               const { runCodexRuntime } = await import("../src/utils/codex-runtime.js");
               const { parseReviewTriggerConfig } = await import("../src/utils/pr-review-trigger.js");
               await runCodexRuntime({
@@ -571,7 +572,7 @@ async function main() {
                   join(homedir(), ".tps", "mail", agentId!),
                   join(homedir(), "ops", "tps"),
                   join(homedir(), "ops", "flair"),
-                  ...((worktreeGitDir) => worktreeGitDir ? [worktreeGitDir] : [])(resolveWorktreeGitDir(agentWorkspace)),
+                  ...(worktreeGit ? [worktreeGit.gitDir, worktreeGit.gitCommonDir] : []),
                   ...(agentCfg.codex?.extraDirs ?? []),
                 ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,

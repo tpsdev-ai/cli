@@ -182,6 +182,98 @@ function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Re
   };
 }
 
+for (const scenario of ["registered", "unregistered", "rewritten after setup", "no trusted base"] as const) {
+  test(`Codex metadata add-dir uses the setup registry binding: ${scenario}`, () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      const other = join(sb.root, "other");
+      const g = (cwd: string, args: string[]) => {
+        const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+        expect(result.status, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      for (const repo of scenario === "no trusted base" ? [other] : [base, other]) {
+        mkdirSync(repo, { recursive: true });
+        g(repo, ["init", "-q"]);
+        g(repo, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
+      }
+      const registered = scenario === "registered" || scenario === "rewritten after setup";
+      let expected: string[] = [];
+      if (registered) {
+        rmSync(sb.ws, { recursive: true });
+        g(base, ["worktree", "add", "--detach", sb.ws]);
+        expected = [g(sb.ws, ["rev-parse", "--absolute-git-dir"]), g(base, ["rev-parse", "--absolute-git-dir"])];
+      } else {
+        writeFileSync(join(sb.ws, ".git"), `gitdir: ${join(other, ".git")}\n`);
+      }
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws) + "workspaceProvider:\n  type: none\n");
+      const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
+      const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+      const codexModule = resolve(import.meta.dir, "../dist/src/utils/codex-runtime.js");
+      const preload = join(sb.root, "child-preload.ts");
+      writeFileSync(preload, `
+        import { mock } from 'bun:test';
+        const attestation = await import(${JSON.stringify(attestationModule)});
+        mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+          attestConfinement: async () => ({ ok: true, worktreeBinding: JSON.parse(process.env.FIXTURE_BINDING) }),
+        }));
+        const codex = await import(${JSON.stringify(codexModule)});
+        mock.module(${JSON.stringify(codexModule)}, () => ({ ...codex,
+          runCodexRuntime: async (config) => console.log('CODEX_ARGS ' + JSON.stringify(codex.codexExecArgs(config))),
+        }));
+      `);
+      const script = `
+        import { mock } from 'bun:test';
+        import { writeFileSync } from 'node:fs';
+        import { spawnSync } from 'node:child_process';
+        const attestation = await import(${JSON.stringify(attestationModule)});
+        mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+          launchAttested: async (_profile, options, cmd, opts) => {
+            console.log('SETUP_BINDING ' + JSON.stringify(opts.worktreeBinding));
+            if (${JSON.stringify(scenario)} === 'rewritten after setup') {
+              writeFileSync(${JSON.stringify(join(sb.ws, ".git"))}, ${JSON.stringify(`gitdir: ${join(other, ".git")}\n`)});
+            }
+            const child = spawnSync('bun', ['--preload', ${JSON.stringify(preload)}, ${JSON.stringify(TPS_BIN)}, ...cmd.slice(cmd.indexOf('agent'))], {
+              encoding: 'utf8', cwd: ${JSON.stringify(sb.ws)},
+              env: { ...opts.env, TPS_LAUNCH_SOCK: 'fixture', FIXTURE_BINDING: JSON.stringify(opts.worktreeBinding) },
+            });
+            process.stdout.write(child.stdout); process.stderr.write(child.stderr);
+            return child.status ?? 1;
+          },
+        }));
+        const { runAgent } = await import(${JSON.stringify(agentModule)});
+        await runAgent({ action: 'start', id: 'probe', runtime: 'codex', sandboxRequired: true });
+      `;
+      const result = spawnSync("bun", ["-e", script], {
+        cwd: sb.run, encoding: "utf8", timeout: 20_000, env: cliEnv(sb),
+      });
+      expect(result.status, output(result)).toBe(0);
+      const bindingLine = result.stdout.split("\n").find((line) => line.startsWith("SETUP_BINDING "));
+      expect(bindingLine, output(result)).toBeDefined();
+      const binding = JSON.parse(bindingLine!.slice("SETUP_BINDING ".length));
+      expect(binding.kind).toBe(registered ? "registered" : scenario === "unregistered" ? "unregistered" : "none");
+      if (registered) expect([binding.gitDir, binding.gitCommonDir]).toEqual(expected);
+      const argsLine = result.stdout.split("\n").find((line) => line.startsWith("CODEX_ARGS "));
+      expect(argsLine, output(result)).toBeDefined();
+      const args: string[] = JSON.parse(argsLine!.slice("CODEX_ARGS ".length));
+      const addDirs = args.flatMap((arg, index) => arg === "--add-dir" ? [args[index + 1]!] : []);
+      expect(addDirs).toEqual([
+        join(sb.home, ".tps", "mail", "probe"), join(sb.home, "ops", "tps"), join(sb.home, "ops", "flair"), ...expected,
+      ]);
+      expect(addDirs).not.toContain(join(other, ".git"));
+      if (scenario === "rewritten after setup") {
+        expect(readFileSync(join(sb.ws, ".git"), "utf8")).toBe(`gitdir: ${join(other, ".git")}\n`);
+      }
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // (1) — `--config` survives the attested re-exec
 // ---------------------------------------------------------------------------

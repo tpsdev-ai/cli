@@ -421,8 +421,7 @@ export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBind
   return { kind: "unregistered", baseWorkingTree: trustedBase };
 }
 
-export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
-  const binding = worktreeLaunchBinding(workspacePath);
+export function worktreeLaunchGit(binding: WorktreeLaunchBinding): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
   if (binding.kind !== "registered") return undefined;
   return { gitDir: binding.gitDir, gitCommonDir: binding.gitCommonDir, baseWorkingTree: binding.baseWorkingTree };
 }
